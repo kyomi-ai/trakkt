@@ -1,0 +1,52 @@
+[package]
+name = "tane-server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "tane"
+path = "src/main.rs"
+
+[dependencies]
+tane-core = { workspace = true }
+tane-auth = { workspace = true }
+tane-types = { workspace = true }
+tane-ui = { workspace = true, features = ["ssr"] }
+leptos = "0.8"
+leptos_axum = "0.8"
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+redis = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+webauthn-rs = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+futures-util = { workspace = true }
+dashmap = { workspace = true }
+async-trait = { workspace = true }
+rust-embed = "8"
+any_spawner = { version = "0.3", features = ["tokio"] }
+tokio-tungstenite = { version = "0.28", default-features = false }
+
+[dev-dependencies]
+tane-core = { workspace = true, features = ["test-helpers"] }
+tane-auth = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+
+[lints]

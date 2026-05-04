@@ -1,0 +1,8 @@
+/target
+/crates/trakkt-ui/dist
+*.swp
+*.swo
+.env
+.env.local
+data/
+.gstack/
