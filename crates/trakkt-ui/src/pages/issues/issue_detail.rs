@@ -23,7 +23,8 @@ use crate::components::{
     Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, LabelBadge, Skeleton, StyledSelect,
 };
 use crate::server_fns::comments::{create_comment, list_comments};
-use crate::server_fns::issues::{get_issue, update_issue};
+use crate::server_fns::issues::{get_issue, set_issue_labels, update_issue};
+use crate::server_fns::labels::list_labels;
 use trakkt_types::models::{Comment, IssueWithDetails};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -487,28 +488,12 @@ fn MetadataBar(
                 }}
             </div>
 
-            // ── Labels (display only — picker is future work) ──────────
-            <div class="flex items-center gap-2">
-                <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Labels"</span>
-                {if issue.labels.is_empty() {
-                    view! {
-                        <span class="text-sm text-muted-foreground">"None"</span>
-                    }.into_any()
-                } else {
-                    view! {
-                        <div class="flex items-center gap-1">
-                            {issue.labels.iter().map(|label| {
-                                view! {
-                                    <LabelBadge
-                                        name=label.name.clone()
-                                        color=label.color.clone()
-                                    />
-                                }
-                            }).collect_view()}
-                        </div>
-                    }.into_any()
-                }}
-            </div>
+            // ── Labels ─────────────────────────────────────────────────
+            <LabelPicker
+                number=number
+                current_labels=issue.labels.clone()
+                on_change=on_change
+            />
 
             // ── Due date (display only — date picker is future work) ───
             {issue.due_date.as_ref().map(|date| {
@@ -526,6 +511,131 @@ fn MetadataBar(
 // ─────────────────────────────────────────────────────────────────────────────
 // Description Editor (kode WYSIWYG)
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Label Picker
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[component]
+fn LabelPicker(
+    number: i32,
+    current_labels: Vec<trakkt_types::models::Label>,
+    on_change: Callback<()>,
+) -> impl IntoView {
+    let (show_picker, set_show_picker) = signal(false);
+    let current_ids = RwSignal::new(
+        current_labels.iter().map(|l| l.label_id.clone()).collect::<Vec<_>>()
+    );
+    let current_display = RwSignal::new(current_labels);
+
+    let all_labels = LocalResource::new(list_labels);
+
+    let toggle_label = move |label: trakkt_types::models::Label| {
+        let mut ids = current_ids.get_untracked();
+        let mut display = current_display.get_untracked();
+        if ids.contains(&label.label_id) {
+            ids.retain(|id| id != &label.label_id);
+            display.retain(|l| l.label_id != label.label_id);
+        } else {
+            ids.push(label.label_id.clone());
+            display.push(label);
+        }
+        current_ids.set(ids.clone());
+        current_display.set(display);
+
+        let label_ids_str = ids.join(",");
+        leptos::task::spawn_local(async move {
+            let _ = set_issue_labels(number, label_ids_str).await;
+            on_change.run(());
+        });
+    };
+
+    view! {
+        <div class="flex items-center gap-2 relative">
+            <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Labels"</span>
+            <div class="flex items-center gap-1">
+                {move || {
+                    let labels = current_display.get();
+                    if labels.is_empty() {
+                        view! {
+                            <span class="text-sm text-muted-foreground">"None"</span>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="flex items-center gap-1">
+                                {labels.iter().map(|label| {
+                                    view! {
+                                        <LabelBadge
+                                            name=label.name.clone()
+                                            color=label.color.clone()
+                                        />
+                                    }
+                                }).collect_view()}
+                            </div>
+                        }.into_any()
+                    }
+                }}
+                <button
+                    class="w-5 h-5 rounded flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition-colors text-xs"
+                    on:click=move |_| set_show_picker.update(|v| *v = !*v)
+                    title="Edit labels"
+                >
+                    "+"
+                </button>
+            </div>
+
+            // Dropdown picker
+            <Show when=move || show_picker.get()>
+                <div class="absolute top-full left-0 mt-1 z-50 bg-popover border border-border rounded-lg shadow-lg py-1 min-w-[200px]">
+                    <Suspense fallback=|| view! { <div class="px-3 py-2 text-sm text-muted-foreground">"Loading..."</div> }>
+                        {move || all_labels.get().map(|result| {
+                            match result {
+                                Ok(labels) => {
+                                    if labels.is_empty() {
+                                        view! {
+                                            <div class="px-3 py-2 text-sm text-muted-foreground">"No labels. Create one in Settings → Labels."</div>
+                                        }.into_any()
+                                    } else {
+                                        let items = labels.clone();
+                                        view! {
+                                            <div>
+                                                {items.into_iter().map(|label| {
+                                                    let label_for_click = label.clone();
+                                                    let label_id = label.label_id.clone();
+                                                    let is_selected = move || current_ids.get().contains(&label_id);
+                                                    view! {
+                                                        <button
+                                                            class="w-full text-left px-3 py-1.5 text-sm hover:bg-muted transition-colors flex items-center gap-2"
+                                                            on:click=move |_| toggle_label(label_for_click.clone())
+                                                        >
+                                                            <span
+                                                                class="w-3 h-3 rounded-sm shrink-0"
+                                                                style=format!("background-color: {}", label.color)
+                                                            />
+                                                            <span class="flex-1">{label.name.clone()}</span>
+                                                            {move || if is_selected() {
+                                                                view! { <span class="text-primary text-xs">"✓"</span> }.into_any()
+                                                            } else {
+                                                                ().into_any()
+                                                            }}
+                                                        </button>
+                                                    }
+                                                }).collect_view()}
+                                            </div>
+                                        }.into_any()
+                                    }
+                                },
+                                Err(_) => view! {
+                                    <div class="px-3 py-2 text-sm text-destructive-foreground">"Failed to load labels"</div>
+                                }.into_any(),
+                            }
+                        })}
+                    </Suspense>
+                </div>
+            </Show>
+        </div>
+    }
+}
 
 /// Description section using the kode WYSIWYG markdown editor.
 ///
@@ -577,7 +687,7 @@ fn DescriptionEditor(
     });
 
     let mut theme = trakkt_kode_theme();
-    theme.content_padding = Some("0");
+    theme.content_padding = Some("1rem 1.25rem");
     let theme_signal = Signal::stored(theme);
 
     view! {
