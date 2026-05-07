@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
-const MCP_SERVER_NAME: &str = "tane-mcp";
+const MCP_SERVER_NAME: &str = "trakkt-mcp";
 const MCP_SERVER_VERSION: &str = "0.1.0";
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
@@ -198,7 +198,7 @@ fn handle_tools_call(id: Option<Value>, params: Option<Value>) -> JsonRpcRespons
                 "content": [
                     {
                         "type": "text",
-                        "text": format!("Hello, {name}! Tane MCP server is running.")
+                        "text": format!("Hello, {name}! Trakkt MCP server is running.")
                     }
                 ]
             }))

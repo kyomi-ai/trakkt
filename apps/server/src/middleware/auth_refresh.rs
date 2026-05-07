@@ -14,7 +14,7 @@
 //! Concurrency: no locks. When multiple concurrent requests from the same
 //! tab/session hit this middleware with an expired access token, each one
 //! independently mints a new access token and rotates the refresh token.
-//! [`tane_auth::token_service::verify_refresh_token`]'s grace-period +
+//! [`trakkt_auth::token_service::verify_refresh_token`]'s grace-period +
 //! theft-detection semantics make this safe — all concurrent refreshes see
 //! either `Valid` or `GracePeriod` and succeed. Accept the small
 //! token-rotation churn; locking here would cascade into user-visible latency
@@ -38,7 +38,7 @@ pub async fn auth_refresh_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    let cookie_names = &tane_core::constants::get().cookies;
+    let cookie_names = &trakkt_core::constants::get().cookies;
     let access_cookie_name = cookie_names.access_token_name.as_str();
     let refresh_cookie_name = cookie_names.refresh_token_name.as_str();
 
@@ -53,7 +53,7 @@ pub async fn auth_refresh_middleware(
     // Fast path: if access_token is present AND valid, pass through with no
     // work. This is the common case on every request and must stay cheap.
     let access_ok = extract_cookie(req.headers(), access_cookie_name)
-        .map(|tok| tane_auth::jwt::validate_token(&tok, &state.config.jwt_secret).is_ok())
+        .map(|tok| trakkt_auth::jwt::validate_token(&tok, &state.config.jwt_secret).is_ok())
         .unwrap_or(false);
 
     if access_ok {
@@ -64,13 +64,13 @@ pub async fn auth_refresh_middleware(
     let refresh_cookie = extract_cookie(req.headers(), refresh_cookie_name);
 
     let refreshed = if let Some(refresh_value) = refresh_cookie {
-        let device = tane_auth::token_service::DeviceInfo {
+        let device = trakkt_auth::token_service::DeviceInfo {
             user_agent: req.headers().get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
             ip_address: Some("unknown".to_string()),
             country_code: None,
             oauth_client_id: None,
         };
-        match tane_auth::token_refresh::refresh_tokens(
+        match trakkt_auth::token_refresh::refresh_tokens(
             &state.db,
             &state.config.jwt_secret,
             &refresh_value,
@@ -102,7 +102,7 @@ pub async fn auth_refresh_middleware(
     let mut response = next.run(req).await;
 
     if let Some(tokens) = refreshed {
-        tane_auth::cookies::set_token_cookies(
+        trakkt_auth::cookies::set_token_cookies(
             response.headers_mut(),
             Some(&tokens.access_token),
             Some(&tokens.raw_refresh_token),

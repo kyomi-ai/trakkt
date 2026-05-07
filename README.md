@@ -60,10 +60,10 @@ Built with the same stack as [Kyomi](https://kyomi.ai) -- battle-tested patterns
 tane/
 ├── Cargo.toml              # Workspace root
 ├── crates/
-│   ├── tane-core/          # Config, database, KV store, models, error types
-│   ├── tane-auth/          # Auth service, sessions, user/workspace/email services
-│   ├── tane-types/         # Shared DTOs (serde-only, WASM-safe)
-│   └── tane-ui/            # Leptos frontend (pages, components, server functions)
+│   ├── trakkt-core/          # Config, database, KV store, models, error types
+│   ├── trakkt-auth/          # Auth service, sessions, user/workspace/email services
+│   ├── trakkt-types/         # Shared DTOs (serde-only, WASM-safe)
+│   └── trakkt-ui/            # Leptos frontend (pages, components, server functions)
 │       └── Trunk.toml      # WASM build config
 ├── apps/
 │   └── server/             # Axum binary (routes, middleware, MCP, state)
@@ -74,9 +74,9 @@ tane/
 
 ## Deployment Modes
 
-Set via the `TANE_MODE` environment variable:
+Set via the `TRAKKT_MODE` environment variable:
 
-| Mode | `TANE_MODE` | Database | Auth Behavior |
+| Mode | `TRAKKT_MODE` | Database | Auth Behavior |
 |------|-------------|----------|---------------|
 | **SaaS** | `saas` | PostgreSQL + Redis | Full auth, email verification required |
 | **Self-hosted** | `self_hosted` | SQLite | Full auth; if no SMTP, first user creates account directly (no email verification) |
@@ -97,12 +97,12 @@ Create a `.env` file or export these:
 
 ```bash
 # Required
-DATABASE_URL=postgres://user:pass@localhost:5432/tane   # or sqlite://./data/tane.db
+DATABASE_URL=postgres://user:pass@localhost:5432/tane   # or sqlite://./data/trakkt.db
 JWT_SECRET_KEY=your-secret-key-here
 ENCRYPTION_KEY=base64-encoded-32-byte-key
 
 # Optional
-TANE_MODE=self_hosted                    # saas | self_hosted | personal
+TRAKKT_MODE=self_hosted                    # saas | self_hosted | personal
 PORT=8003                                # default: 8003
 FRONTEND_URL=http://localhost:5173       # Trunk dev server
 BASE_URL=http://localhost:8003           # Backend URL
@@ -126,11 +126,11 @@ WEBAUTHN_RP_NAME=Tane
 
 ```bash
 # Terminal 1: Build the WASM frontend (watches for changes)
-cd crates/tane-ui
+cd crates/trakkt-ui
 trunk build --watch
 
 # Terminal 2: Run the server
-cargo run --package tane-server
+cargo run --package trakkt-server
 ```
 
 The server starts at `http://localhost:8003`. In development with Trunk, the frontend is served from `http://localhost:5173` with proxy to the backend.
@@ -146,28 +146,28 @@ The server starts at `http://localhost:8003`. In development with Trunk, the fro
 2. Rename the crates (replace `tane` with your app name, e.g., `myapp`):
    ```bash
    # Rename directories
-   mv crates/tane-core crates/myapp-core
-   mv crates/tane-auth crates/myapp-auth
-   mv crates/tane-types crates/myapp-types
-   mv crates/tane-ui crates/myapp-ui
+   mv crates/trakkt-core crates/myapp-core
+   mv crates/trakkt-auth crates/myapp-auth
+   mv crates/trakkt-types crates/myapp-types
+   mv crates/trakkt-ui crates/myapp-ui
 
    # Rename in all files
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane-core/myapp-core/g'
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane-auth/myapp-auth/g'
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane-types/myapp-types/g'
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane-ui/myapp-ui/g'
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane-server/myapp-server/g'
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane_core/myapp_core/g'
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane_auth/myapp_auth/g'
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane_types/myapp_types/g'
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane_ui/myapp_ui/g'
-   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/tane_server/myapp_server/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt-core/myapp-core/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt-auth/myapp-auth/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt-types/myapp-types/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt-ui/myapp-ui/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt-server/myapp-server/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt_core/myapp_core/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt_auth/myapp_auth/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt_types/myapp_types/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt_ui/myapp_ui/g'
+   find . -name "*.toml" -o -name "*.rs" | xargs sed -i 's/trakkt_server/myapp_server/g'
 
    # Update binary name in apps/server/Cargo.toml
    sed -i 's/name = "tane"/name = "myapp"/' apps/server/Cargo.toml
 
    # Update env var prefix if desired
-   find . -name "*.rs" | xargs sed -i 's/TANE_MODE/MYAPP_MODE/g'
+   find . -name "*.rs" | xargs sed -i 's/TRAKKT_MODE/MYAPP_MODE/g'
    ```
 
 3. Add your domain code:

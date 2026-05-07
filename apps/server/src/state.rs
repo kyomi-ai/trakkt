@@ -3,18 +3,18 @@
 //! Shared application state passed to all axum handlers.
 
 use axum::extract::FromRef;
-use tane_auth::mcp_session_manager::MCPSessionManager;
-use tane_auth::middleware::AuthState;
-use tane_auth::websocket::WebSocketManager;
+use trakkt_auth::mcp_session_manager::MCPSessionManager;
+use trakkt_auth::middleware::AuthState;
+use trakkt_auth::websocket::WebSocketManager;
 use webauthn_rs::Webauthn;
 
 /// Application-wide shared state.
 #[derive(Clone)]
 pub struct AppState {
-    pub db: tane_core::DbPool,
-    pub kv: tane_core::KVPool,
-    pub redis: Option<tane_core::RedisPool>,
-    pub config: std::sync::Arc<tane_core::Config>,
+    pub db: trakkt_core::DbPool,
+    pub kv: trakkt_core::KVPool,
+    pub redis: Option<trakkt_core::RedisPool>,
+    pub config: std::sync::Arc<trakkt_core::Config>,
     pub encryption_key: std::sync::Arc<[u8; 32]>,
     pub webauthn: std::sync::Arc<Webauthn>,
     pub ws_manager: WebSocketManager,

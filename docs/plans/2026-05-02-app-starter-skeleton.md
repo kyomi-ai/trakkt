@@ -8,7 +8,7 @@ For every task: `cp` the file from Kyomi, `sed` rename, then compile and fix err
 
 ## Task 1: Add back missing auth service files
 
-Copy from `/home/jason/repos/kyomi/crates/kyomi-auth/src/` to `crates/tane-auth/src/`:
+Copy from `/home/jason/repos/kyomi/crates/kyomi-auth/src/` to `crates/trakkt-auth/src/`:
 
 **Files to copy:**
 - `google_oauth.rs` — Google OAuth login flow
@@ -19,7 +19,7 @@ Copy from `/home/jason/repos/kyomi/crates/kyomi-auth/src/` to `crates/tane-auth/
 - `credential_service.rs` — manages user auth methods (password, passkey, Google)
 - `onboarding_service.rs` — new user setup flow
 
-**After copying:** `sed -i 's/kyomi/tane/g'` on each file, update `lib.rs` to export them, `cargo check -p tane-auth` and fix errors.
+**After copying:** `sed -i 's/kyomi/tane/g'` on each file, update `lib.rs` to export them, `cargo check -p trakkt-auth` and fix errors.
 
 **Do NOT copy:** analytics, billing, chat, collection, copilot, dashboard, datasource, embedding, feedback, learning, linear, push, sql_history, stripe, subscription, watch, workspace_ai_config, workspace_secrets, connect_token. These are Kyomi domain-specific.
 
@@ -49,19 +49,19 @@ Also create the SQLite equivalent.
 
 ## Task 3: Copy Kyomi UI components library
 
-Copy the full `kyomi-ui-components` crate as part of `tane-ui`:
+Copy the full `kyomi-ui-components` crate as part of `trakkt-ui`:
 
-`cp -r /home/jason/repos/kyomi/crates/kyomi-ui-components/src/components/* crates/tane-ui/src/components/`
+`cp -r /home/jason/repos/kyomi/crates/kyomi-ui-components/src/components/* crates/trakkt-ui/src/components/`
 
 These are generic UI components (Button, Modal, Card, Toast, etc.) — not domain-specific.
 
-Also copy the component Cargo.toml deps and wire into tane-ui.
+Also copy the component Cargo.toml deps and wire into trakkt-ui.
 
 ## Task 4: Copy auth pages from Kyomi UI
 
 Copy the login/signup/auth pages:
 
-`cp -r /home/jason/repos/kyomi/crates/kyomi-ui/src/pages/auth/* crates/tane-ui/src/pages/auth/`
+`cp -r /home/jason/repos/kyomi/crates/kyomi-ui/src/pages/auth/* crates/trakkt-ui/src/pages/auth/`
 
 These handle: login, signup, passkey flows, Google OAuth callback, account recovery.
 
@@ -89,8 +89,8 @@ These call the auth services we're copying in Task 1.
 
 ## Task 7: Wire everything together and boot
 
-- Update `tane-ui/src/lib.rs` to export all new modules
-- Update `tane-ui/src/app.rs` with routes for login, settings
+- Update `trakkt-ui/src/lib.rs` to export all new modules
+- Update `trakkt-ui/src/app.rs` with routes for login, settings
 - Update `apps/server/src/lib.rs` to mount all routes
 - Copy Kyomi's leptos_frontend.rs patterns for SSR login
 - `trunk build` the frontend
@@ -103,6 +103,6 @@ Wire the MCP route handler to use a real (but empty) tool registry. The MCP serv
 ## For each task
 
 1. `cp` file from Kyomi
-2. `sed -i 's/kyomi_core/tane_core/g; s/kyomi-core/tane-core/g; s/kyomi_auth/tane_auth/g; s/kyomi-auth/tane-auth/g; s/kyomi_ui/tane_ui/g; s/kyomi-ui/tane-ui/g; s/kyomi_types/tane_types/g; s/Kyomi/Tane/g; s/kyomi/tane/g'`
+2. `sed -i 's/kyomi_core/trakkt_core/g; s/kyomi-core/trakkt-core/g; s/kyomi_auth/trakkt_auth/g; s/kyomi-auth/trakkt-auth/g; s/kyomi_ui/trakkt_ui/g; s/kyomi-ui/trakkt-ui/g; s/kyomi_types/trakkt_types/g; s/Kyomi/Tane/g; s/kyomi/tane/g'`
 3. `cargo check` and fix compile errors by removing references to missing modules
 4. Do NOT rewrite any function

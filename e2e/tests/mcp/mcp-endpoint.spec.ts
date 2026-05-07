@@ -22,7 +22,7 @@ test.describe('TC-022: MCP Endpoint — JSON-RPC over HTTP', () => {
 
     const result = (body as any).result;
     expect(result.protocolVersion).toBe('2025-03-26');
-    expect(result.serverInfo.name).toBe('tane-mcp');
+    expect(result.serverInfo.name).toBe('trakkt-mcp');
     expect(result.serverInfo.version).toBe('0.1.0');
     expect(result.capabilities.tools).toBeDefined();
     expect(result.capabilities.tools.listChanged).toBe(true);
@@ -59,7 +59,7 @@ test.describe('TC-022: MCP Endpoint — JSON-RPC over HTTP', () => {
     expect(Array.isArray(content)).toBe(true);
     expect(content[0].type).toBe('text');
     expect(content[0].text).toContain('Hello, Playwright!');
-    expect(content[0].text).toContain('Tane MCP server is running');
+    expect(content[0].text).toContain('Trakkt MCP server is running');
   });
 
   test('tools/call with hello tool defaults name to "world"', async ({ page }) => {

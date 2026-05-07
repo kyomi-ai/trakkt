@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Tane Rust backend — entry point.
+//! Trakkt Rust backend — entry point.
 
-use tane_core::Config;
+use trakkt_core::Config;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
@@ -24,26 +24,26 @@ async fn serve() {
     let port = config.port;
 
     // Connect to database and run migrations
-    let db = tane_core::db::DbPool::connect(&config.database_url)
+    let db = trakkt_core::db::DbPool::connect(&config.database_url)
         .await
         .expect("failed to connect to database");
 
     // Personal mode: auto-provision local user and workspace on first boot
     if config.is_personal() {
-        tane_server::auto_provision_personal_mode(&db)
+        trakkt_server::auto_provision_personal_mode(&db)
             .await
             .expect("failed to auto-provision personal mode");
     }
 
     // KVStore
     let redis_url = config.redis_url.clone();
-    let kv = tane_core::create_kv_store(redis_url.as_deref())
+    let kv = trakkt_core::create_kv_store(redis_url.as_deref())
         .await
         .expect("failed to initialise KV store");
 
     // Raw Redis pool (optional)
-    let redis: Option<tane_core::RedisPool> = if let Some(ref url) = redis_url {
-        match tane_core::redis::create_pool(url).await {
+    let redis: Option<trakkt_core::RedisPool> = if let Some(ref url) = redis_url {
+        match trakkt_core::redis::create_pool(url).await {
             Ok(pool) => Some(pool),
             Err(e) => {
                 tracing::error!(error = %e, "Failed to connect to Redis");
@@ -58,7 +58,7 @@ async fn serve() {
     // WebAuthn
     let rp_origin = url::Url::parse(&config.frontend_url)
         .expect("FRONTEND_URL must be a valid URL");
-    let webauthn = match tane_auth::webauthn::build_webauthn(
+    let webauthn = match trakkt_auth::webauthn::build_webauthn(
         &config.webauthn_rp_id,
         &config.webauthn_rp_name,
         &rp_origin,
@@ -67,7 +67,7 @@ async fn serve() {
         Err(e) if config.self_hosted => {
             tracing::warn!("WebAuthn unavailable ({e}) — passkeys disabled.");
             let localhost_origin = url::Url::parse("http://localhost").expect("hardcoded");
-            tane_auth::webauthn::build_webauthn("localhost", &config.webauthn_rp_name, &localhost_origin)
+            trakkt_auth::webauthn::build_webauthn("localhost", &config.webauthn_rp_name, &localhost_origin)
                 .expect("fallback WebAuthn should succeed")
         }
         Err(e) => panic!("failed to build WebAuthn: {e}"),
@@ -86,12 +86,12 @@ async fn serve() {
 
     // WebSocket manager
     let ws_redis = redis.as_ref().map(|pool| (pool.clone(), redis_url.clone().expect("redis pool implies url")));
-    let ws_manager = tane_auth::websocket::WebSocketManager::new(ws_redis, db.clone());
+    let ws_manager = trakkt_auth::websocket::WebSocketManager::new(ws_redis, db.clone());
 
     // MCP session manager
-    let mcp_sessions = tane_auth::mcp_session_manager::MCPSessionManager::new(kv.clone());
+    let mcp_sessions = trakkt_auth::mcp_session_manager::MCPSessionManager::new(kv.clone());
 
-    let state = tane_server::state::AppState {
+    let state = trakkt_server::state::AppState {
         db: db.clone(),
         kv: kv.clone(),
         redis,
@@ -103,21 +103,21 @@ async fn serve() {
     };
 
     // Register Leptos server functions
-    tane_ui::register_server_functions();
+    trakkt_ui::register_server_functions();
 
-    let router = tane_server::build_router(state);
-    let app = tane_server::wrap_service(router);
+    let router = trakkt_server::build_router(state);
+    let app = trakkt_server::wrap_service(router);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
         .expect("failed to bind");
 
     eprintln!();
-    eprintln!("  Tane Issue Tracker");
+    eprintln!("  Trakkt Issue Tracker");
     eprintln!("  URL: http://localhost:{port}");
     eprintln!();
 
-    tracing::info!("Tane listening on port {port}");
+    tracing::info!("Trakkt listening on port {port}");
 
     axum::serve(listener, app)
         .await

@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/tane-core",
-    "crates/tane-auth",
-    "crates/tane-types",
-    "crates/tane-ui",
+    "crates/trakkt-core",
+    "crates/trakkt-auth",
+    "crates/trakkt-types",
+    "crates/trakkt-ui",
     "apps/server",
 ]
 resolver = "3"
@@ -69,11 +69,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Internal crates
-tane-core = { path = "crates/tane-core" }
-tane-auth = { path = "crates/tane-auth" }
-tane-ui = { path = "crates/tane-ui" }
-tane-server = { path = "apps/server" }
-tane-types = { path = "crates/tane-types" }
+trakkt-core = { path = "crates/trakkt-core" }
+trakkt-auth = { path = "crates/trakkt-auth" }
+trakkt-ui = { path = "crates/trakkt-ui" }
+trakkt-server = { path = "apps/server" }
+trakkt-types = { path = "crates/trakkt-types" }
 # Async trait
 async-trait = "0.1"
 
@@ -109,7 +109,7 @@ codegen-units = 16
 debug-assertions = true
 
 # Fast WASM builds for dev iteration. Saves ~5 min per incremental build vs release
-# at a cost of ~1.4 MB extra brotli transfer. Use for dev.tane.ai; use release for prod.
+# at a cost of ~1.4 MB extra brotli transfer. Use for dev.trakkt.app; use release for prod.
 [profile.wasm-dev]
 inherits = "release"
 lto = false

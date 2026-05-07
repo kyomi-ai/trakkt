@@ -12,18 +12,18 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 
 ### Service Layer
 - All service functions are free functions with `db: &DbPool` as the first argument.
-- Service functions return `tane_core::Result<T>`, never `ServerFnError`.
+- Service functions return `trakkt_core::Result<T>`, never `ServerFnError`.
 - Every write operation must append to `sync_log` after the main write.
 
 ### Server Functions (Leptos)
 - Server functions are thin wrappers: extract auth, extract context, call service, return.
-- No business logic in server functions — delegate to `tane-auth` services.
+- No business logic in server functions — delegate to `trakkt-auth` services.
 - Use `#[server(prefix = "/leptos-api")]` for all server functions.
 - Return typed Rust enums (not HTTP status codes). UI pattern-matches on variants.
 
 ### Error Handling
 - Never silently discard errors with `let _ =`. At minimum, log with `tracing::warn!`.
-- Service errors propagate as `tane_core::Error` variants.
+- Service errors propagate as `trakkt_core::Error` variants.
 - Server function errors convert via `IntoServerFnError` trait.
 
 ### No Banned Patterns

@@ -3,15 +3,15 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 const BASE_URL = process.env.BASE_URL ?? 'http://localhost:8099';
-const DB_PATH = path.resolve(__dirname, '../data/tane.db');
+const DB_PATH = path.resolve(__dirname, '../data/trakkt.db');
 const AUTH_STATE_PATH = path.resolve(__dirname, '.auth-state.json');
 
-function getTaneMode(): string {
-  if (process.env.TANE_MODE) return process.env.TANE_MODE;
+function getTrakktMode(): string {
+  if (process.env.TRAKKT_MODE) return process.env.TRAKKT_MODE;
   try {
     const envPath = path.resolve(__dirname, '../.env');
     const envContent = fs.readFileSync(envPath, 'utf-8');
-    const match = envContent.match(/^TANE_MODE=(.+)$/m);
+    const match = envContent.match(/^TRAKKT_MODE=(.+)$/m);
     return match?.[1]?.trim() ?? 'saas';
   } catch {
     return 'saas';
@@ -26,8 +26,8 @@ function sqliteExec(sql: string): string {
 }
 
 export default async function globalSetup() {
-  const mode = getTaneMode();
-  console.log(`[global-setup] TANE_MODE=${mode}`);
+  const mode = getTrakktMode();
+  console.log(`[global-setup] TRAKKT_MODE=${mode}`);
 
   if (mode === 'personal') {
     try { fs.unlinkSync(AUTH_STATE_PATH); } catch {}

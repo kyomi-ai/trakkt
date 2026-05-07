@@ -521,7 +521,7 @@ Comprehensive test plan for the Tane app starter template. Covers all user-facin
 **Description:** In personal mode, no login is required and a user/workspace is auto-provisioned.
 
 **Steps:**
-1. Start the server with `TANE_MODE=personal`
+1. Start the server with `TRAKKT_MODE=personal`
 2. Navigate to the root URL (e.g., `http://localhost:8003`)
 3. Verify no login page is shown
 4. Verify the user lands directly in the application
@@ -539,7 +539,7 @@ Comprehensive test plan for the Tane app starter template. Covers all user-facin
 **Description:** In self-hosted mode without SMTP configured, the first user can create an account directly without email verification.
 
 **Steps:**
-1. Start the server with `TANE_MODE=self_hosted` and no `SMTP_HOST` / `SMTP_USER` environment variables
+1. Start the server with `TRAKKT_MODE=self_hosted` and no `SMTP_HOST` / `SMTP_USER` environment variables
 2. Navigate to `/signup`
 3. Enter an email address
 4. Verify that instead of "check your email," the user is taken directly to the account completion form (or account is created immediately)

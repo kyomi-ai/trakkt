@@ -8,7 +8,7 @@
 - Kyomi sync engine: `/home/jason/repos/kyomi/crates/kyomi-auth/src/websocket/`, `sync_log_service.rs`
 - Kyomi client cache: `/home/jason/repos/kyomi/crates/kyomi-ui/src/cache/`
 - Kyomi WS route: `/home/jason/repos/kyomi/apps/server/src/routes/websocket.rs`
-- Tane types: `crates/tane-types/src/sync.rs` (SyncRequest, SyncResponse, SyncAction, entity_types)
+- Tane types: `crates/trakkt-types/src/sync.rs` (SyncRequest, SyncResponse, SyncAction, entity_types)
 
 ## Tasks
 
@@ -18,8 +18,8 @@ Create a WebSocket connection manager that tracks connected clients and broadcas
 
 **Files to create:**
 
-1. `crates/tane-auth/src/websocket/mod.rs` — Module declaration, re-exports
-2. `crates/tane-auth/src/websocket/manager.rs` — WebSocketManager:
+1. `crates/trakkt-auth/src/websocket/mod.rs` — Module declaration, re-exports
+2. `crates/trakkt-auth/src/websocket/manager.rs` — WebSocketManager:
    - Copy from `/home/jason/repos/kyomi/crates/kyomi-auth/src/websocket/manager.rs`
    - `WebSocketManager { inner: Arc<Inner> }` — Clone-able handle
    - `Inner { connections: DashMap<String, HashSet<TrackedConnection>>, next_id: AtomicU64 }`
@@ -31,9 +31,9 @@ Create a WebSocket connection manager that tracks connected clients and broadcas
    - Channel capacity: 256 messages, max 10 connections per user
    - **Simplification from Kyomi:** No Redis pub/sub for v1. Single-instance local delivery only. The trait/interface should allow adding Redis later but don't implement it now.
 
-3. Update `crates/tane-auth/src/lib.rs` — Add `pub mod websocket;`
+3. Update `crates/trakkt-auth/src/lib.rs` — Add `pub mod websocket;`
 
-**Dependencies:** tane-core (DbPool for member lookup), tokio (mpsc), dashmap, tracing
+**Dependencies:** trakkt-core (DbPool for member lookup), tokio (mpsc), dashmap, tracing
 
 ### Task 2: WebSocket Route Handler (server-side)
 
@@ -67,10 +67,10 @@ Wire the WebSocket manager into the service layer so mutations broadcast to conn
 
 **Files to modify:**
 
-1. Update `crates/tane-auth/src/issue_service.rs` — After each sync_log append, broadcast the SyncAction to the workspace via ws_manager
-2. Update `crates/tane-auth/src/label_service.rs` — Same
-3. Update `crates/tane-auth/src/comment_service.rs` — Same
-4. Update `crates/tane-auth/src/notification_service.rs` — Same
+1. Update `crates/trakkt-auth/src/issue_service.rs` — After each sync_log append, broadcast the SyncAction to the workspace via ws_manager
+2. Update `crates/trakkt-auth/src/label_service.rs` — Same
+3. Update `crates/trakkt-auth/src/comment_service.rs` — Same
+4. Update `crates/trakkt-auth/src/notification_service.rs` — Same
 
 **Pattern:** Each service function that writes to sync_log should also broadcast:
 ```rust
@@ -88,13 +88,13 @@ if let Some(ws) = ws_manager {
 - Pass `ws_manager: Option<&WebSocketManager>` as an additional parameter to write functions
 - Use a context struct that bundles db + ws_manager
 
-**Recommendation:** Add `ws_manager: Option<&tane_auth::websocket::WebSocketManager>` parameter to write functions. Read functions don't need it. The Option allows calling without a manager (e.g., in tests).
+**Recommendation:** Add `ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>` parameter to write functions. Read functions don't need it. The Option allows calling without a manager (e.g., in tests).
 
 ### Task 4: Client-Side IndexedDB Cache
 
 Create the IndexedDB persistence layer for offline-first data.
 
-**Files to create in `crates/tane-ui/src/cache/`:**
+**Files to create in `crates/trakkt-ui/src/cache/`:**
 
 1. `mod.rs` — Module declarations
 2. `db.rs` — IndexedDB operations:
@@ -120,7 +120,7 @@ Create the reactive store that holds in-memory state derived from IndexedDB + li
 
 **Files to create:**
 
-1. `crates/tane-ui/src/cache/store.rs` — SyncStore:
+1. `crates/trakkt-ui/src/cache/store.rs` — SyncStore:
    - Copy pattern from `/home/jason/repos/kyomi/crates/kyomi-ui/src/cache/store.rs`
    - `SyncStore` wraps inner signals in `StoredValue<SendWrapper<SyncStoreInner>>`
    - Signals:
@@ -147,7 +147,7 @@ Create the WebSocket connection manager and sync engine that ties everything tog
 
 **Files to create:**
 
-1. `crates/tane-ui/src/cache/websocket.rs` — WebSocket client:
+1. `crates/trakkt-ui/src/cache/websocket.rs` — WebSocket client:
    - Copy pattern from Kyomi's websocket_client
    - `WebSocketContext` — holds connection state signal, send function, subscribe system
    - `ConnectionState` enum: Disconnected, Connecting, Connected, Reconnecting
@@ -155,7 +155,7 @@ Create the WebSocket connection manager and sync engine that ties everything tog
    - `build_ws_url(user_id, workspace_id, token)` — derive ws/wss from location.protocol
    - Subscribe/unsubscribe pattern for typed message routing
 
-2. `crates/tane-ui/src/cache/sync_engine.rs` — Sync engine:
+2. `crates/trakkt-ui/src/cache/sync_engine.rs` — Sync engine:
    - Copy pattern from `/home/jason/repos/kyomi/crates/kyomi-ui/src/cache/sync_engine.rs`
    - `start_sync_engine(ws: WebSocketContext, store: SyncStore, workspace_id: String)`
    - On Connected: check IDB cursor, send bootstrap or delta request
@@ -167,16 +167,16 @@ Create the WebSocket connection manager and sync engine that ties everything tog
 
 **Integration — update existing files:**
 
-3. Update `crates/tane-ui/src/lib.rs` — Add `pub mod cache;`
-4. Update `crates/tane-ui/src/components/layout.rs` — Initialize sync:
+3. Update `crates/trakkt-ui/src/lib.rs` — Add `pub mod cache;`
+4. Update `crates/trakkt-ui/src/components/layout.rs` — Initialize sync:
    - Get current user (for user_id, workspace_id)
    - Init IDB cache
    - Hydrate store from IDB
    - Connect WebSocket
    - Start sync engine
    - Provide SyncStore via context
-5. Update `crates/tane-ui/src/pages/issue_list.rs` — Read from SyncStore instead of server function for the list (fall back to server fn if store not initialized)
-6. Update `crates/tane-ui/src/components/sidebar.rs` — Show notification count from SyncStore
+5. Update `crates/trakkt-ui/src/pages/issue_list.rs` — Read from SyncStore instead of server function for the list (fall back to server fn if store not initialized)
+6. Update `crates/trakkt-ui/src/components/sidebar.rs` — Show notification count from SyncStore
 
 ## Compilation & Testing
 

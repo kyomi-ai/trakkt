@@ -224,10 +224,10 @@ CREATE TABLE sessions (
 tane/
 ├── Cargo.toml                  # workspace root
 ├── crates/
-│   ├── tane-core/            # db.rs, kv_store.rs, config.rs, error.rs
-│   ├── tane-auth/            # auth, sessions, workspace/user/issue services
-│   ├── tane-types/           # shared DTOs (serde-only, WASM-safe)
-│   └── tane-ui/              # Leptos frontend + server functions
+│   ├── trakkt-core/            # db.rs, kv_store.rs, config.rs, error.rs
+│   ├── trakkt-auth/            # auth, sessions, workspace/user/issue services
+│   ├── trakkt-types/           # shared DTOs (serde-only, WASM-safe)
+│   └── trakkt-ui/              # Leptos frontend + server functions
 │       ├── src/
 │       │   ├── pages/
 │       │   │   ├── issue_list.rs
@@ -368,7 +368,7 @@ All list endpoints support `?status=`, `?priority=`, `?label=`, `?assignee=`, `?
 
 | Mode | Trigger | Database | KV | Auth |
 |------|---------|----------|-----|------|
-| **Self-hosted** | No `DATABASE_URL` | SQLite in `./data/tane.db` | In-memory | Password + passkey |
+| **Self-hosted** | No `DATABASE_URL` | SQLite in `./data/trakkt.db` | In-memory | Password + passkey |
 | **SaaS** | `DATABASE_URL` set | Postgres | Redis | Password + passkey + invite |
 
 Same pattern as Kyomi. Single binary, behavior switches on environment variables.
@@ -378,7 +378,7 @@ Same pattern as Kyomi. Single binary, behavior switches on environment variables
 # Download binary
 curl -L https://github.com/jasadams/tane/releases/latest/download/tane-linux-amd64.tar.gz | tar xz
 
-# Run (creates ./data/tane.db on first boot)
+# Run (creates ./data/trakkt.db on first boot)
 ./tane
 # → listening on http://localhost:3000
 ```

@@ -10,10 +10,10 @@ use axum::response::{Html, IntoResponse, Response};
 use tower_http::services::ServeDir;
 
 /// Path to Trunk dist directory (relative to where the binary runs).
-/// Set via TRUNK_DIST_DIR env var, or defaults to crates/tane-ui/dist.
+/// Set via TRUNK_DIST_DIR env var, or defaults to crates/trakkt-ui/dist.
 fn dist_dir() -> String {
     std::env::var("TRUNK_DIST_DIR")
-        .unwrap_or_else(|_| "crates/tane-ui/dist".to_string())
+        .unwrap_or_else(|_| "crates/trakkt-ui/dist".to_string())
 }
 
 /// Build a ServeDir service for static assets from trunk dist.
@@ -26,7 +26,7 @@ pub async fn serve() -> Response {
     let index_path = format!("{}/index.html", dist_dir());
     match tokio::fs::read_to_string(&index_path).await {
         Ok(html) => Html(html).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "Frontend not built. Run: cd crates/tane-ui && trunk build").into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Frontend not built. Run: cd crates/trakkt-ui && trunk build").into_response(),
     }
 }
 

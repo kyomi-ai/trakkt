@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 import * as path from 'path';
 import { execSync } from 'child_process';
 
-const DB_PATH = path.resolve(__dirname, '../../data/tane.db');
+const DB_PATH = path.resolve(__dirname, '../../data/trakkt.db');
 
 function sqliteExec(sql: string): string {
   return execSync(`sqlite3 "${DB_PATH}" ".timeout 5000" "${sql.replace(/"/g, '\\"')}"`, {
@@ -21,7 +21,7 @@ export function hashPassword(password: string): string {
   if (bcrypt) {
     return (bcrypt as any).hashSync(password, 10);
   }
-  // Fallback: use argon2-style hash that tane-auth accepts
+  // Fallback: use argon2-style hash that trakkt-auth accepts
   // For test seeding we insert a bcrypt hash directly
   throw new Error('bcrypt not available — install it or use API-based seeding');
 }
@@ -86,7 +86,7 @@ export function seedUser(opts: {
   );
 
   if (opts.password) {
-    // Use argon2 format that tane-auth expects — but for test simplicity,
+    // Use argon2 format that trakkt-auth expects — but for test simplicity,
     // we rely on the signup/login API to set passwords properly.
     // For direct seeding, we insert a bcrypt hash.
     const hash = crypto.createHash('sha256').update(opts.password).digest('hex');
@@ -589,7 +589,7 @@ let cachedAuthConfig: AuthConfig | null = null;
 export async function fetchAuthConfig(_page?: Page): Promise<AuthConfig> {
   if (cachedAuthConfig) return cachedAuthConfig;
 
-  const mode = getTaneMode();
+  const mode = getTrakktMode();
   const selfHosted = mode === 'self_hosted';
   const personal = mode === 'personal';
 
@@ -611,12 +611,12 @@ export async function fetchAuthConfig(_page?: Page): Promise<AuthConfig> {
   return cachedAuthConfig;
 }
 
-export function getTaneMode(): string {
-  if (process.env.TANE_MODE) return process.env.TANE_MODE;
+export function getTrakktMode(): string {
+  if (process.env.TRAKKT_MODE) return process.env.TRAKKT_MODE;
   try {
     const envPath = path.resolve(__dirname, '../../.env');
     const envContent = require('fs').readFileSync(envPath, 'utf-8');
-    const match = envContent.match(/^TANE_MODE=(.+)$/m);
+    const match = envContent.match(/^TRAKKT_MODE=(.+)$/m);
     return match?.[1]?.trim() ?? 'saas';
   } catch {
     return 'saas';
@@ -624,15 +624,15 @@ export function getTaneMode(): string {
 }
 
 export function isPersonalMode(): boolean {
-  return getTaneMode() === 'personal';
+  return getTrakktMode() === 'personal';
 }
 
 export function isSelfHostedMode(): boolean {
-  return getTaneMode() === 'self_hosted';
+  return getTrakktMode() === 'self_hosted';
 }
 
 export function isSelfHostedNoSmtp(_config?: AuthConfig): boolean {
-  return getTaneMode() === 'self_hosted' && !isSmtpConfigured();
+  return getTrakktMode() === 'self_hosted' && !isSmtpConfigured();
 }
 
 function isSmtpConfigured(): boolean {

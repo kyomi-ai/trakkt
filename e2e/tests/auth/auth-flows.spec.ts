@@ -59,11 +59,11 @@ async function fetchAuthConfig(page: Page): Promise<AuthConfig> {
 }
 
 function isPersonalMode(): boolean {
-  if (process.env.TANE_MODE) return process.env.TANE_MODE === 'personal';
+  if (process.env.TRAKKT_MODE) return process.env.TRAKKT_MODE === 'personal';
   try {
     const envPath = require('path').resolve(__dirname, '../../../.env');
     const envContent = require('fs').readFileSync(envPath, 'utf-8');
-    const match = envContent.match(/^TANE_MODE=(.+)$/m);
+    const match = envContent.match(/^TRAKKT_MODE=(.+)$/m);
     return match?.[1]?.trim() === 'personal';
   } catch {
     return false;
@@ -151,7 +151,7 @@ test.describe('TC-001: Signup Flow', () => {
 
   test.describe('Personal mode', () => {
     test('visiting /signup redirects to authenticated area', async ({ page }) => {
-      test.skip(!isPersonalMode(), 'Personal mode test — only runs when TANE_MODE=personal');
+      test.skip(!isPersonalMode(), 'Personal mode test — only runs when TRAKKT_MODE=personal');
 
       await page.goto('/signup');
       await waitForWasm(page);

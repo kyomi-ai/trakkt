@@ -1,5 +1,5 @@
 [package]
-name = "tane-server"
+name = "trakkt-server"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,10 +8,10 @@ name = "tane"
 path = "src/main.rs"
 
 [dependencies]
-tane-core = { workspace = true }
-tane-auth = { workspace = true }
-tane-types = { workspace = true }
-tane-ui = { workspace = true, features = ["ssr"] }
+trakkt-core = { workspace = true }
+trakkt-auth = { workspace = true }
+trakkt-types = { workspace = true }
+trakkt-ui = { workspace = true, features = ["ssr"] }
 leptos = "0.8"
 leptos_axum = "0.8"
 axum = { workspace = true }
@@ -39,8 +39,8 @@ any_spawner = { version = "0.3", features = ["tokio"] }
 tokio-tungstenite = { version = "0.28", default-features = false }
 
 [dev-dependencies]
-tane-core = { workspace = true, features = ["test-helpers"] }
-tane-auth = { workspace = true }
+trakkt-core = { workspace = true, features = ["test-helpers"] }
+trakkt-auth = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tokio = { workspace = true }

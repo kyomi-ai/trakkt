@@ -87,7 +87,7 @@ test.describe('TC-031: Workspace Settings - ChartML Configuration', () => {
   });
 
   test('different palettes can be set and read back sequentially', () => {
-    const palettes = ['tane', 'balanced', 'vibrant', 'monochrome'];
+    const palettes = ['trakkt', 'balanced', 'vibrant', 'monochrome'];
 
     for (const palette of palettes) {
       const configValue = JSON.stringify({
@@ -116,7 +116,7 @@ test.describe('TC-031: Workspace Settings - ChartML Configuration', () => {
     const configValue = JSON.stringify({
       type: 'config',
       version: 1,
-      style: 'tane',
+      style: 'trakkt',
     });
 
     db.exec(

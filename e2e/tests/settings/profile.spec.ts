@@ -20,7 +20,7 @@ test.describe('TC-009: Profile Settings', () => {
     const appearanceTitle = page.locator('text=Appearance');
     await expect(appearanceTitle).toBeVisible();
 
-    const description = page.locator('text=Choose how Tane looks to you.');
+    const description = page.locator('text=Choose how Trakkt looks to you.');
     await expect(description).toBeVisible();
   });
 

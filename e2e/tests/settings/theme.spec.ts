@@ -122,14 +122,14 @@ test.describe('TC-010: Appearance (Theme Switching)', () => {
     await darkButton.click();
     await page.waitForTimeout(500);
 
-    const storedTheme = await page.evaluate(() => localStorage.getItem('tane-theme'));
+    const storedTheme = await page.evaluate(() => localStorage.getItem('trakkt-theme'));
     expect(storedTheme).toBe('dark');
 
     const lightButton = page.locator('button', { hasText: 'Light' });
     await lightButton.click();
     await page.waitForTimeout(500);
 
-    const storedThemeAfter = await page.evaluate(() => localStorage.getItem('tane-theme'));
+    const storedThemeAfter = await page.evaluate(() => localStorage.getItem('trakkt-theme'));
     expect(storedThemeAfter).toBe('light');
   });
 

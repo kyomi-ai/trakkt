@@ -11,7 +11,7 @@
 
 ## Strategy
 
-Copy Kyomi's proven patterns (dual DB, KV store, auth, server functions, Leptos setup, Trunk build, Tailwind config). Adapt for Tane's simpler data model. Postgres is first-class (SaaS deployment on K8s). SQLite supported for self-hosted mode.
+Copy Kyomi's proven patterns (dual DB, KV store, auth, server functions, Leptos setup, Trunk build, Tailwind config). Adapt for Trakkt's simpler data model. Postgres is first-class (SaaS deployment on K8s). SQLite supported for self-hosted mode.
 
 ## Tasks
 
@@ -21,22 +21,22 @@ Tasks are ordered by dependency. Tasks within the same group can be parallelized
 
 ### GROUP 1: Foundation (parallel)
 
-#### Task 1: Cargo Workspace + tane-core
+#### Task 1: Cargo Workspace + trakkt-core
 
-Create the Cargo workspace root and the `tane-core` crate with database abstraction, KV store, config, and error types.
+Create the Cargo workspace root and the `trakkt-core` crate with database abstraction, KV store, config, and error types.
 
 **Files to create:**
 
 1. `/Cargo.toml` — workspace root
-   - Members: `crates/tane-core`, `crates/tane-auth`, `crates/tane-types`, `crates/tane-ui`, `apps/server`
+   - Members: `crates/trakkt-core`, `crates/trakkt-auth`, `crates/trakkt-types`, `crates/trakkt-ui`, `apps/server`
    - Workspace dependencies (pinned versions): axum 0.8, tower, tower-http, sqlx 0.8 (postgres+sqlite+runtime-tokio), jsonwebtoken, argon2, serde, serde_json, tokio, tracing, tracing-subscriber, uuid, chrono, rand, base64, reqwest, redis, dashmap, async-trait, thiserror, leptos 0.8, leptos_router, leptos_meta, leptos_axum, phosphor-leptos, web-sys, wasm-bindgen, js-sys, send_wrapper, gloo-timers, indexed_db_futures, rust-embed, any_spawner
    - Profiles: dev, release (opt-level=z, lto=true, codegen-units=1, strip=true, panic=abort), dev-server (inherits dev, opt-level=1), wasm-dev (inherits dev, opt-level=s)
 
-2. `crates/tane-core/Cargo.toml` — dependencies: sqlx, redis, dashmap, tokio, tracing, serde, serde_json, uuid, chrono, async-trait, thiserror, rand, base64, argon2
+2. `crates/trakkt-core/Cargo.toml` — dependencies: sqlx, redis, dashmap, tokio, tracing, serde, serde_json, uuid, chrono, async-trait, thiserror, rand, base64, argon2
 
-3. `crates/tane-core/src/lib.rs` — public modules: config, db, error, kv_store, kv_store_memory, kv_store_redis, sql_compat. Re-export Config, DbPool, Error, Result, KVPool, KVStore.
+3. `crates/trakkt-core/src/lib.rs` — public modules: config, db, error, kv_store, kv_store_memory, kv_store_redis, sql_compat. Re-export Config, DbPool, Error, Result, KVPool, KVStore.
 
-4. `crates/tane-core/src/db.rs` — Copy Kyomi's DbPool enum pattern:
+4. `crates/trakkt-core/src/db.rs` — Copy Kyomi's DbPool enum pattern:
    - `DbPool::Postgres(PgPool)` / `DbPool::Sqlite(SqlitePool)`
    - `connect(url)` — auto-detect from URL prefix, run migrations, configure pools (Postgres: max 10, SQLite: max 1 + WAL + foreign_keys)
    - `is_postgres()`, `is_sqlite()`, `pg_pool()`, `ping()`
@@ -44,16 +44,16 @@ Create the Cargo workspace root and the `tane-core` crate with database abstract
    - Macros: `db_fetch_all!`, `db_fetch_one!`, `db_fetch_optional!`, `db_execute!`, `db_fetch_scalar!`, `db_with_pool!`
    - Migration paths: `../../apps/server/migrations` (Postgres), `../../apps/server/migrations-sqlite` (SQLite)
 
-5. `crates/tane-core/src/kv_store.rs` — Copy Kyomi's KVStore trait:
+5. `crates/trakkt-core/src/kv_store.rs` — Copy Kyomi's KVStore trait:
    - Methods: set, get, del, getdel, incr, expire, sadd, srem, smembers, sdel, ping
    - `KVPool = Arc<dyn KVStore>`
    - `create_kv_store(redis_url: Option<&str>)` factory
 
-6. `crates/tane-core/src/kv_store_redis.rs` — RedisKVStore using redis::aio::ConnectionManager
+6. `crates/trakkt-core/src/kv_store_redis.rs` — RedisKVStore using redis::aio::ConnectionManager
 
-7. `crates/tane-core/src/kv_store_memory.rs` — InMemoryKVStore with RwLock<HashMap>, 30-second expiry sweep
+7. `crates/trakkt-core/src/kv_store_memory.rs` — InMemoryKVStore with RwLock<HashMap>, 30-second expiry sweep
 
-8. `crates/tane-core/src/config.rs` — Config struct:
+8. `crates/trakkt-core/src/config.rs` — Config struct:
    - `database_url` (required)
    - `redis_url` (optional)
    - `jwt_secret` (required)
@@ -68,12 +68,12 @@ Create the Cargo workspace root and the `tane-core` crate with database abstract
    - `Config::from_env()` entry point
    - `Config::test_config()` for tests
 
-9. `crates/tane-core/src/error.rs` — Error enum:
+9. `crates/trakkt-core/src/error.rs` — Error enum:
    - NotFound, Unauthorized, Forbidden, BadRequest, Conflict, TooManyRequests, NotImplemented, ServiceUnavailable, Internal, Sqlx, Migrate, Redis, SerdeJson
    - `is_transient()` method
    - `IntoResponse` impl for Axum
 
-10. `crates/tane-core/src/sql_compat.rs` — Copy essential helpers:
+10. `crates/trakkt-core/src/sql_compat.rs` — Copy essential helpers:
     - `now()`, `bool_true()`, `bool_false()`, `ilike()`, `cast_to_text()`, `coalesce_now()`, `json_extract_text()`
 
 **Reference files in Kyomi:**
@@ -88,22 +88,22 @@ Create the Cargo workspace root and the `tane-core` crate with database abstract
 
 ---
 
-#### Task 2: tane-types
+#### Task 2: trakkt-types
 
 Shared DTOs and enums, WASM-safe (no server dependencies).
 
 **Files to create:**
 
-1. `crates/tane-types/Cargo.toml` — dependencies: serde, serde_json, chrono (optional, not on wasm)
+1. `crates/trakkt-types/Cargo.toml` — dependencies: serde, serde_json, chrono (optional, not on wasm)
 
-2. `crates/tane-types/src/lib.rs` — module declarations + re-exports
+2. `crates/trakkt-types/src/lib.rs` — module declarations + re-exports
 
-3. `crates/tane-types/src/enums.rs`:
+3. `crates/trakkt-types/src/enums.rs`:
    - `IssueStatus` — Backlog, Todo, InProgress, Done, Cancelled. Serialize as lowercase snake_case. Display, ordering.
    - `Priority` — None=0, Urgent=1, High=2, Medium=3, Low=4. Serialize as integer. Display names.
    - `WorkspaceRole` — Owner, Admin, Member. Serialize as lowercase.
 
-4. `crates/tane-types/src/models.rs` — DTOs (all Serialize + Deserialize + Clone + Debug):
+4. `crates/trakkt-types/src/models.rs` — DTOs (all Serialize + Deserialize + Clone + Debug):
    - `Workspace { workspace_id, name, slug, created_at, updated_at }`
    - `User { user_id, email, display_name, avatar_url, created_at }`
    - `WorkspaceMember { workspace_id, user_id, role, joined_at, display_name, email }`
@@ -114,7 +114,7 @@ Shared DTOs and enums, WASM-safe (no server dependencies).
    - `Notification { notification_id, workspace_id, user_id, issue_id, notification_type, read, created_at, issue_title, issue_number }`
    - `ApiToken { token_id, workspace_id, user_id, name, token_prefix, scopes, last_used_at, expires_at, created_at }`
 
-5. `crates/tane-types/src/sync.rs` — Sync protocol types (copy from Kyomi):
+5. `crates/trakkt-types/src/sync.rs` — Sync protocol types (copy from Kyomi):
    - `SyncRequest` enum: SyncBootstrap, SyncDelta { last_sync_id }
    - `SyncResponse` enum: SyncAction, SyncComplete { last_sync_id }, SyncReset
    - `SyncAction { sync_id, entity_type, entity_id, workspace_id, action, data, timestamp }`
@@ -125,18 +125,18 @@ Shared DTOs and enums, WASM-safe (no server dependencies).
 
 ---
 
-#### Task 3: tane-ui Scaffold + Design System
+#### Task 3: trakkt-ui Scaffold + Design System
 
 Set up the Leptos frontend with Trunk, Tailwind CSS 4, and the full Tane design system.
 
 **Files to create:**
 
-1. `crates/tane-ui/Cargo.toml`:
+1. `crates/trakkt-ui/Cargo.toml`:
    - Features: `ssr` (enables leptos_axum, server-side deps), `hydrate` (enables leptos hydrate+csr)
-   - Dependencies: leptos, leptos_router, leptos_meta, phosphor-leptos, web-sys, wasm-bindgen, js-sys, send_wrapper, gloo-timers, indexed_db_futures, serde, serde_json, chrono, base64, tane-types
-   - SSR deps (optional): leptos_axum, tane-core, tane-auth, axum, sqlx, tokio, tracing, uuid
+   - Dependencies: leptos, leptos_router, leptos_meta, phosphor-leptos, web-sys, wasm-bindgen, js-sys, send_wrapper, gloo-timers, indexed_db_futures, serde, serde_json, chrono, base64, trakkt-types
+   - SSR deps (optional): leptos_axum, trakkt-core, trakkt-auth, axum, sqlx, tokio, tracing, uuid
 
-2. `crates/tane-ui/Trunk.toml` — Copy Kyomi's config:
+2. `crates/trakkt-ui/Trunk.toml` — Copy Kyomi's config:
    ```toml
    [build]
    dist = "dist"
@@ -149,8 +149,8 @@ Set up the Leptos frontend with Trunk, Tailwind CSS 4, and the full Tane design 
    ```
    Skip the brotli/gzip post-build hook for dev (add later for production).
 
-3. `crates/tane-ui/index.html` — Adapted from Kyomi:
-   - Theme detection script (localStorage key: `tane-theme`)
+3. `crates/trakkt-ui/index.html` — Adapted from Kyomi:
+   - Theme detection script (localStorage key: `trakkt-theme`)
    - Google Fonts: DM Sans, Instrument Serif, Geist Mono
    - Link to output.css
    - Copy public dir
@@ -160,14 +160,14 @@ Set up the Leptos frontend with Trunk, Tailwind CSS 4, and the full Tane design 
    - Body: `min-h-screen bg-background text-foreground antialiased`
    - Remove Stripe.js (not needed)
 
-4. `crates/tane-ui/style/main.css` — Full design system from DESIGN.md:
+4. `crates/trakkt-ui/style/main.css` — Full design system from DESIGN.md:
    ```css
    @import "tailwindcss" source(none);
    @source "../src";
    @custom-variant dark (&:where(.dark, .dark *));
    html { font-size: 15px; }
    ```
-   All @theme tokens from DESIGN.md adapted for Tane:
+   All @theme tokens from DESIGN.md adapted for Trakkt:
    - Fonts: DM Sans (sans), Geist Mono (mono), Instrument Serif (display)
    - Colors: Teal accent (#0D9488), warm grays, semantic colors, priority colors, status colors
    - `--color-primary: #0D9488` (teal, NOT amber)
@@ -179,7 +179,7 @@ Set up the Leptos frontend with Trunk, Tailwind CSS 4, and the full Tane design 
    - Utility classes: .animate-fade-in, .animate-zoom-fade-in
    - Font-display class for Instrument Serif
 
-5. `crates/tane-ui/src/lib.rs` — Module declarations:
+5. `crates/trakkt-ui/src/lib.rs` — Module declarations:
    ```rust
    pub mod app;
    pub mod components;
@@ -190,7 +190,7 @@ Set up the Leptos frontend with Trunk, Tailwind CSS 4, and the full Tane design 
    Re-export App.
    `register_server_functions()` stub (SSR feature).
 
-6. `crates/tane-ui/src/app.rs` — Minimal router:
+6. `crates/trakkt-ui/src/app.rs` — Minimal router:
    ```rust
    pub fn Shell(children: Option<Children>) -> impl IntoView { ... }
    pub fn App() -> impl IntoView {
@@ -200,9 +200,9 @@ Set up the Leptos frontend with Trunk, Tailwind CSS 4, and the full Tane design 
    }
    ```
 
-7. `crates/tane-ui/src/components/mod.rs` — Empty module declarations
-8. `crates/tane-ui/src/pages/mod.rs` — Empty module declarations
-9. `crates/tane-ui/src/server_fns/mod.rs` — Empty module declarations, `extract_context()` and `extract_auth()` helpers (SSR)
+7. `crates/trakkt-ui/src/components/mod.rs` — Empty module declarations
+8. `crates/trakkt-ui/src/pages/mod.rs` — Empty module declarations
+9. `crates/trakkt-ui/src/server_fns/mod.rs` — Empty module declarations, `extract_context()` and `extract_auth()` helpers (SSR)
 
 **Reference files:**
 - `/home/jason/repos/kyomi/crates/kyomi-ui/Trunk.toml`
@@ -283,7 +283,7 @@ Create the Axum server binary that boots, runs migrations, and serves the Leptos
    ```
 
 5. `apps/server/src/leptos_frontend.rs` — Copy Kyomi's pattern:
-   - `#[derive(Embed)]` for `../../crates/tane-ui/dist/`
+   - `#[derive(Embed)]` for `../../crates/trakkt-ui/dist/`
    - `serve_protected_page()` — check auth cookie, redirect to /login
    - `serve_leptos_shell()` — serve index.html with no-cache
    - `serve_leptos_asset()` — serve assets with immutable cache
@@ -305,9 +305,9 @@ Create the Axum server binary that boots, runs migrations, and serves the Leptos
 
 Password auth, JWT sessions, cookies. No passkeys yet (Phase 6).
 
-**Files to create in `crates/tane-auth/`:**
+**Files to create in `crates/trakkt-auth/`:**
 
-1. `Cargo.toml` — dependencies: tane-core, tane-types, axum, sqlx, async-trait, jsonwebtoken, argon2, serde, serde_json, tokio, tracing, uuid, chrono, rand, base64, redis
+1. `Cargo.toml` — dependencies: trakkt-core, trakkt-types, axum, sqlx, async-trait, jsonwebtoken, argon2, serde, serde_json, tokio, tracing, uuid, chrono, rand, base64, redis
 
 2. `src/lib.rs` — public modules: auth_service, password, jwt, session, cookies, user_service, workspace_service, issue_service, label_service, comment_service, notification_service, sync_log_service, rate_limiter, middleware
 
@@ -351,7 +351,7 @@ Password auth, JWT sessions, cookies. No passkeys yet (Phase 6).
 
 Issue, workspace, label, comment, notification, and sync log services.
 
-**Files to create in `crates/tane-auth/src/`:**
+**Files to create in `crates/trakkt-auth/src/`:**
 
 1. `src/user_service.rs`:
    - `get_user_by_id(db, user_id) -> Result<User>`
@@ -415,12 +415,12 @@ Issue, workspace, label, comment, notification, and sync log services.
 
 Thin wrappers over the service layer. These are the RPC bridge between Leptos UI and the backend.
 
-**Files to create in `crates/tane-ui/src/server_fns/`:**
+**Files to create in `crates/trakkt-ui/src/server_fns/`:**
 
 1. `mod.rs`:
    - `extract_context()` — extract AppState from Leptos context (SSR)
    - `extract_auth()` — extract JWT claims from cookie (SSR)
-   - `IntoServerFnError` trait for converting tane_core::Error to ServerFnError
+   - `IntoServerFnError` trait for converting trakkt_core::Error to ServerFnError
 
 2. `auth.rs`:
    - `get_auth_config() -> AuthConfig` (public, no auth)
@@ -460,9 +460,9 @@ Thin wrappers over the service layer. These are the RPC bridge between Leptos UI
    - `mark_all_read() -> ()`
    - `count_unread() -> i64`
 
-All server functions use `#[server(prefix = "/leptos-api")]`, extract auth via `extract_auth()`, get workspace_id from auth claims, delegate to tane-auth services.
+All server functions use `#[server(prefix = "/leptos-api")]`, extract auth via `extract_auth()`, get workspace_id from auth claims, delegate to trakkt-auth services.
 
-**Update `crates/tane-ui/src/lib.rs`:** Add `register_server_functions()` that calls `leptos::server_fn::axum::register_explicit::<T>()` for every server function.
+**Update `crates/trakkt-ui/src/lib.rs`:** Add `register_server_functions()` that calls `leptos::server_fn::axum::register_explicit::<T>()` for every server function.
 
 **Reference:** `/home/jason/repos/kyomi/crates/kyomi-ui/src/server_fns/auth.rs`
 
@@ -470,7 +470,7 @@ All server functions use `#[server(prefix = "/leptos-api")]`, extract auth via `
 
 #### Task 9: UI Components
 
-Tane-specific UI components, following the design system. These live in `crates/tane-ui/src/components/`.
+Tane-specific UI components, following the design system. These live in `crates/trakkt-ui/src/components/`.
 
 **Files to create:**
 
@@ -555,9 +555,9 @@ Tane-specific UI components, following the design system. These live in `crates/
 
 **Files to create/update:**
 
-1. `crates/tane-ui/src/pages/mod.rs` — module declarations
+1. `crates/trakkt-ui/src/pages/mod.rs` — module declarations
 
-2. `crates/tane-ui/src/pages/login.rs` — Login/Signup page:
+2. `crates/trakkt-ui/src/pages/login.rs` — Login/Signup page:
    - Email + password form
    - Toggle between login and signup mode
    - Error display
@@ -565,7 +565,7 @@ Tane-specific UI components, following the design system. These live in `crates/
    - On success, redirect to /issues
    - Styled per design system (centered card, teal accent)
 
-3. Update `crates/tane-ui/src/app.rs` — Wire up all routes:
+3. Update `crates/trakkt-ui/src/app.rs` — Wire up all routes:
    - `/login` → LoginPage (no layout)
    - `/signup` → LoginPage with signup_mode
    - ParentRoute `""` with Layout:
@@ -583,7 +583,7 @@ Tane-specific UI components, following the design system. These live in `crates/
 
 **Files to create:**
 
-1. `crates/tane-ui/src/pages/issue_list.rs` — Issue List page:
+1. `crates/trakkt-ui/src/pages/issue_list.rs` — Issue List page:
    - Page header: "Issues" title + "New Issue" button
    - Toolbar: SearchInput + filter dropdowns (status, priority, label, assignee)
    - Issue rows: status dot, issue number (Geist Mono), title, labels, priority icon, assignee avatar
@@ -593,7 +593,7 @@ Tane-specific UI components, following the design system. These live in `crates/
    - Loading skeleton while fetching
    - New issue modal (opened by button or 'c' key)
 
-2. `crates/tane-ui/src/pages/issue_detail.rs` — Issue Detail page:
+2. `crates/trakkt-ui/src/pages/issue_detail.rs` — Issue Detail page:
    - Back button (ghost icon button)
    - Issue number (Geist Mono, text-xs)
    - Title (text-2xl font-display, inline-editable)
@@ -612,7 +612,7 @@ Tane-specific UI components, following the design system. These live in `crates/
 
 **Files to create:**
 
-1. `crates/tane-ui/src/pages/board.rs` — Kanban Board page:
+1. `crates/trakkt-ui/src/pages/board.rs` — Kanban Board page:
    - Page header: "Board" title
    - Columns: one per status (Backlog, Todo, In Progress, Done, Cancelled)
    - Column header: status name + issue count, sticky
@@ -626,7 +626,7 @@ Tane-specific UI components, following the design system. These live in `crates/
    - Horizontal scroll for columns
    - Each column: min-w-[280px] max-w-[320px]
 
-2. `crates/tane-ui/src/pages/settings.rs` — Settings page:
+2. `crates/trakkt-ui/src/pages/settings.rs` — Settings page:
    - Workspace settings: name, slug (read-only after creation)
    - Labels management: list, create, edit, delete labels with color picker
    - Members: list members, roles, invite (future)
@@ -640,7 +640,7 @@ Tane-specific UI components, following the design system. These live in `crates/
 After all tasks complete:
 
 1. `cargo build` — must compile with no errors
-2. `trunk build` in `crates/tane-ui/` — must produce dist/
+2. `trunk build` in `crates/trakkt-ui/` — must produce dist/
 3. `DATABASE_URL=postgres://... cargo run` — must boot, run migrations, serve UI
 4. Browser test: register, login, create workspace, create issue, view list, view detail, use board, manage labels
 
