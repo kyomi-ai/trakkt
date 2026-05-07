@@ -19,7 +19,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "ssr")]
-use super::{extract_context, IntoServerFnError};
+use super::{extract_context, AuthFlowContext, IntoServerFnError};
 
 /// Auth configuration — which authentication methods are available.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -136,29 +136,20 @@ pub async fn login_with_password(
 ) -> Result<LoginResult, ServerFnError> {
     use tane_auth::auth_service::{login_with_password_service, LoginServiceResult};
 
-    let ctx = extract_context()?;
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let afc = AuthFlowContext::extract().await?;
 
     let email = email.to_lowercase();
     let email = email.trim();
-    let ip = extract_client_ip(&headers);
-    let device = extract_device_info(&headers);
 
     let result = login_with_password_service(tane_auth::auth_service::LoginWithPasswordParams {
-        db: &ctx.db,
-        kv: &kv,
-        jwt_secret: &ctx.config.jwt_secret,
+        db: &afc.ctx.db,
+        kv: &afc.kv,
+        jwt_secret: &afc.ctx.config.jwt_secret,
         email,
         password: &password,
         totp_code: totp_code.as_deref(),
-        ip: &ip,
-        device: &device,
+        ip: &afc.ip,
+        device: &afc.device,
     })
     .await
     .map_err(|e| {
@@ -204,36 +195,27 @@ pub async fn signup_start(
 ) -> Result<SignupResult, ServerFnError> {
     use tane_auth::auth_service::{signup_start_service, SignupStartServiceResult};
 
-    let ctx = extract_context()?;
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let afc = AuthFlowContext::extract().await?;
 
     let email = email.to_lowercase();
     let email = email.trim();
-    let ip = extract_client_ip(&headers);
-    let device = extract_device_info(&headers);
     let success_message = "If this email is not already registered, a verification link has been sent. Please check your inbox.";
 
     let result = signup_start_service(tane_auth::auth_service::SignupStartParams {
-        db: &ctx.db,
-        kv: &kv,
-        jwt_secret: &ctx.config.jwt_secret,
+        db: &afc.ctx.db,
+        kv: &afc.kv,
+        jwt_secret: &afc.ctx.config.jwt_secret,
         email,
         name: name.as_deref(),
         password: password.as_deref(),
-        ip: &ip,
-        device: &device,
-        self_hosted: ctx.config.self_hosted,
-        smtp_configured: ctx.config.smtp_configured(),
-        frontend_url: &ctx.config.frontend_url,
-        slack_feedback_webhook_url: ctx.config.slack_feedback_webhook_url.as_deref(),
-        support_email: &ctx.config.support_email,
-        config: Some(&ctx.config),
+        ip: &afc.ip,
+        device: &afc.device,
+        self_hosted: afc.ctx.config.self_hosted,
+        smtp_configured: afc.ctx.config.smtp_configured(),
+        frontend_url: &afc.ctx.config.frontend_url,
+        slack_feedback_webhook_url: afc.ctx.config.slack_feedback_webhook_url.as_deref(),
+        support_email: &afc.ctx.config.support_email,
+        config: Some(&afc.ctx.config),
     })
     .await
     .map_err(|e| {
@@ -274,27 +256,19 @@ pub async fn signup_complete(
 ) -> Result<SignupCompleteResult, ServerFnError> {
     use tane_auth::auth_service::{signup_complete_service, SignupCompleteServiceResult};
 
-    let ctx = extract_context()?;
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
-    let device = extract_device_info(&headers);
+    let afc = AuthFlowContext::extract().await?;
 
     let result = signup_complete_service(tane_auth::auth_service::SignupCompleteParams {
-        db: &ctx.db,
-        kv: &kv,
-        jwt_secret: &ctx.config.jwt_secret,
+        db: &afc.ctx.db,
+        kv: &afc.kv,
+        jwt_secret: &afc.ctx.config.jwt_secret,
         token: &token,
         name: &name,
         password: &password,
         terms_accepted,
         marketing_consent,
-        device: &device,
-        config: Some(&ctx.config),
+        device: &afc.device,
+        config: Some(&afc.ctx.config),
     })
     .await
     .map_err(|e| {
@@ -331,47 +305,40 @@ pub async fn google_oauth_callback(
 ) -> Result<GoogleCallbackResult, ServerFnError> {
     use tane_auth::auth_service::{google_oauth_callback_service, GoogleOAuthServiceResult};
 
-    let ctx = extract_context()?;
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
-    let encryption_key = ctx
+    let afc = AuthFlowContext::extract().await?;
+    let encryption_key = afc
+        .ctx
         .encryption_key
         .clone()
         .ok_or_else(|| ServerFnError::new("Encryption key not available"))?;
-    let client_id = ctx
+    let client_id = afc
+        .ctx
         .config
         .google_oauth_client_id
         .as_ref()
         .ok_or_else(|| ServerFnError::new("GOOGLE_OAUTH_CLIENT_ID not configured"))?
         .clone();
-    let client_secret = ctx
+    let client_secret = afc
+        .ctx
         .config
         .google_oauth_client_secret
         .as_ref()
         .ok_or_else(|| ServerFnError::new("GOOGLE_OAUTH_CLIENT_SECRET not configured"))?
         .clone();
 
-    let ip = extract_client_ip(&headers);
-    let device = extract_device_info(&headers);
-
     let result = google_oauth_callback_service(tane_auth::auth_service::GoogleOAuthCallbackParams {
-        db: &ctx.db,
-        kv: &kv,
-        jwt_secret: &ctx.config.jwt_secret,
+        db: &afc.ctx.db,
+        kv: &afc.kv,
+        jwt_secret: &afc.ctx.config.jwt_secret,
         code: &code,
         state: state.as_deref(),
-        ip: &ip,
-        device: &device,
+        ip: &afc.ip,
+        device: &afc.device,
         client_id: &client_id,
         client_secret: &client_secret,
-        frontend_url: &ctx.config.frontend_url,
+        frontend_url: &afc.ctx.config.frontend_url,
         encryption_key: &encryption_key,
-        config: Some(&ctx.config),
+        config: Some(&afc.ctx.config),
     })
     .await
     .map_err(|e| {
@@ -405,26 +372,16 @@ pub async fn google_oauth_callback(
 /// in `apps/server/src/routes/auth_password.rs`.
 #[server(prefix = "/leptos-api")]
 pub async fn resend_verification(email: String) -> Result<(), ServerFnError> {
-    let ctx = extract_context()?;
+    let afc = AuthFlowContext::extract().await?;
 
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
-
-    if ctx.config.self_hosted && !ctx.config.smtp_configured() {
+    if afc.ctx.config.self_hosted && !afc.ctx.config.smtp_configured() {
         return Ok(());
     }
 
     let email = email.to_lowercase().trim().to_string();
-    let ip = extract_client_ip(&headers);
 
     let result = tane_auth::auth_service::resend_verification_service(
-        &ctx.db, &kv, &ip, &email,
+        &afc.ctx.db, &afc.kv, &afc.ip, &email,
     )
     .await
     .map_err(|e| {
@@ -435,7 +392,7 @@ pub async fn resend_verification(email: String) -> Result<(), ServerFnError> {
     if let Some(r) = result {
         let verification_url = format!(
             "{}/verify-email?token={}",
-            ctx.config.frontend_url.trim_end_matches('/'),
+            afc.ctx.config.frontend_url.trim_end_matches('/'),
             r.raw_token
         );
         tokio::spawn(async move {
@@ -486,28 +443,19 @@ pub enum RecoverySetPasswordResult {
 /// delegates email dispatch to a background task inline.
 #[server(prefix = "/leptos-api")]
 pub async fn recovery_start(email: String) -> Result<(), ServerFnError> {
-    let ctx = extract_context()?;
+    let afc = AuthFlowContext::extract().await?;
 
-    if ctx.config.self_hosted && !ctx.config.smtp_configured() {
+    if afc.ctx.config.self_hosted && !afc.ctx.config.smtp_configured() {
         return Err(ServerFnError::new(
             "Password reset requires email. Ask your administrator to configure SMTP.",
         ));
     }
 
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
-
-    let ip = extract_client_ip(&headers);
     let email = email.to_lowercase();
     let email = email.trim();
 
     let result = tane_auth::auth_service::recovery_start_service(
-        &ctx.db, &kv, &ip, email,
+        &afc.ctx.db, &afc.kv, &afc.ip, email,
     )
     .await
     .into_sfn()?;
@@ -515,7 +463,7 @@ pub async fn recovery_start(email: String) -> Result<(), ServerFnError> {
     if let Some(r) = result {
         let recovery_url = format!(
             "{}/account/recover/complete?token={}",
-            ctx.config.frontend_url.trim_end_matches('/'),
+            afc.ctx.config.frontend_url.trim_end_matches('/'),
             r.raw_token
         );
         let email_clone = email.to_string();
@@ -549,10 +497,7 @@ pub async fn recovery_verify(
     use tane_auth::auth_service::{recovery_verify_service, RecoveryVerifyServiceResult};
 
     let ctx = extract_context()?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let kv = ctx.kv()?;
 
     let result = recovery_verify_service(&ctx.db, &kv, &token)
         .await
@@ -596,23 +541,15 @@ pub async fn recovery_set_password(
         recovery_set_password_service, RecoverySetPasswordServiceResult,
     };
 
-    let ctx = extract_context()?;
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
-    let device = extract_device_info(&headers);
+    let afc = AuthFlowContext::extract().await?;
 
     let result = recovery_set_password_service(
-        &ctx.db,
-        &kv,
-        &ctx.config.jwt_secret,
+        &afc.ctx.db,
+        &afc.kv,
+        &afc.ctx.config.jwt_secret,
         &recovery_session_id,
         &new_password,
-        &device,
+        &afc.device,
     )
     .await
     .map_err(|e| {
@@ -671,16 +608,8 @@ pub struct PasskeyRegisterStartResult {
 #[server(prefix = "/leptos-api")]
 pub async fn passkey_login_start() -> Result<PasskeyLoginStartResult, ServerFnError> {
     let ctx = extract_context()?;
-
-    let webauthn = ctx
-        .webauthn
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not configured"))?;
-
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let webauthn = ctx.webauthn()?;
+    let kv = ctx.kv()?;
 
     // Use discoverable credential flow — no email required.
     // The browser will show all available passkeys for this relying party.
@@ -725,30 +654,18 @@ pub async fn passkey_login_complete(
 ) -> Result<LoginResult, ServerFnError> {
     use tane_auth::auth_service::{passkey_login_complete_service, PasskeyLoginServiceResult};
 
-    let ctx = extract_context()?;
-    let webauthn = ctx
-        .webauthn
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not configured"))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-    let ip = extract_client_ip(&headers);
-    let device = extract_device_info(&headers);
+    let afc = AuthFlowContext::extract().await?;
+    let webauthn = afc.ctx.webauthn()?;
 
     let result = passkey_login_complete_service(tane_auth::auth_service::PasskeyLoginCompleteParams {
-        db: &ctx.db,
-        kv: &kv,
-        jwt_secret: &ctx.config.jwt_secret,
+        db: &afc.ctx.db,
+        kv: &afc.kv,
+        jwt_secret: &afc.ctx.config.jwt_secret,
         webauthn,
         challenge_id: &challenge_id,
         assertion_json: &assertion_json,
-        ip: &ip,
-        device: &device,
+        ip: &afc.ip,
+        device: &afc.device,
     })
     .await
     .map_err(|e| {
@@ -800,19 +717,8 @@ pub async fn passkey_register_start(
         passkey_register_start_service, PasskeyRegisterStartServiceResult,
     };
 
-    let ctx = extract_context()?;
-    let webauthn = ctx
-        .webauthn
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not configured"))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-    let ip = extract_client_ip(&headers);
+    let afc = AuthFlowContext::extract().await?;
+    let webauthn = afc.ctx.webauthn()?;
 
     let email_lower = email.to_lowercase();
     let email_trimmed = email_lower.trim();
@@ -824,16 +730,16 @@ pub async fn passkey_register_start(
     };
 
     let result = passkey_register_start_service(tane_auth::auth_service::PasskeyRegisterStartParams {
-        db: &ctx.db,
-        kv: &kv,
+        db: &afc.ctx.db,
+        kv: &afc.kv,
         webauthn,
         email: email_trimmed,
         name: &name_str,
         device_name: &device_name_str,
-        ip: &ip,
-        self_hosted: ctx.config.self_hosted,
-        smtp_configured: ctx.config.smtp_configured(),
-        frontend_url: &ctx.config.frontend_url,
+        ip: &afc.ip,
+        self_hosted: afc.ctx.config.self_hosted,
+        smtp_configured: afc.ctx.config.smtp_configured(),
+        frontend_url: &afc.ctx.config.frontend_url,
     })
     .await
     .map_err(|e| {
@@ -874,28 +780,17 @@ pub async fn passkey_register_complete(
     challenge_id: String,
     credential_json: String,
 ) -> Result<LoginResult, ServerFnError> {
-    let ctx = extract_context()?;
-    let webauthn = ctx
-        .webauthn
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not configured"))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
-    let headers: axum::http::HeaderMap = leptos_axum::extract()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Failed to extract headers: {e}")))?;
-    let device = extract_device_info(&headers);
+    let afc = AuthFlowContext::extract().await?;
+    let webauthn = afc.ctx.webauthn()?;
 
     let sess = tane_auth::auth_service::passkey_register_complete_service(
-        &ctx.db,
-        &kv,
-        &ctx.config.jwt_secret,
+        &afc.ctx.db,
+        &afc.kv,
+        &afc.ctx.config.jwt_secret,
         webauthn,
         &challenge_id,
         &credential_json,
-        &device,
+        &afc.device,
     )
     .await
     .map_err(|e| {
@@ -942,14 +837,8 @@ pub async fn passkey_signup_complete(
     marketing_consent: bool,
 ) -> Result<PasskeyRegisterStartResult, ServerFnError> {
     let ctx = extract_context()?;
-    let webauthn = ctx
-        .webauthn
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not configured"))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let webauthn = ctx.webauthn()?;
+    let kv = ctx.kv()?;
 
     let result = tane_auth::auth_service::passkey_signup_complete_service(
         tane_auth::auth_service::PasskeySignupCompleteParams {
@@ -989,14 +878,8 @@ pub async fn passkey_recovery_verify(
     token: String,
 ) -> Result<PasskeyRecoveryVerifyResult, ServerFnError> {
     let ctx = extract_context()?;
-    let webauthn = ctx
-        .webauthn
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not configured"))?;
-    let kv = ctx
-        .kv
-        .clone()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let webauthn = ctx.webauthn()?;
+    let kv = ctx.kv()?;
 
     let result = tane_auth::auth_service::passkey_recovery_verify_service(
         &ctx.db,

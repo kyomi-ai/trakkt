@@ -67,7 +67,17 @@ pub fn App() -> impl IntoView {
     view! {
         <crate::components::theme::ThemeProvider initial_preference="system".to_string()>
         <Router>
-            <Routes fallback=|| view! { <p>"404 — Not Found"</p> }>
+            <Routes fallback=|| view! {
+                <div class="min-h-screen bg-background flex items-center justify-center p-8">
+                    <div class="text-center max-w-md">
+                        <h1 class="text-6xl font-display text-foreground mb-4">"404"</h1>
+                        <p class="text-lg text-muted-foreground mb-8">"This page doesn\u{2019}t exist."</p>
+                        <a href="/" class="inline-flex items-center justify-center px-5 py-3 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors">
+                            "Go home"
+                        </a>
+                    </div>
+                </div>
+            }>
                 // ── Public routes (no auth required) ─────────────────────────
                 <Route path=path!("/login") view=|| view! { <LoginPage/> }/>
                 <Route path=path!("/signup") view=|| view! { <LoginPage signup_mode=true/> }/>

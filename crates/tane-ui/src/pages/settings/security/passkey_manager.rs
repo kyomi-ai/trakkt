@@ -732,8 +732,8 @@ pub fn PasskeyManager() -> impl IntoView {
         // Delete Confirm Dialog
         <ConfirmDialog
             open=Signal::from(dialog_open)
-            title=dialog_title.get_untracked()
-            message=dialog_message.get_untracked()
+            title=Signal::derive(move || dialog_title.get())
+            message=Signal::derive(move || dialog_message.get())
             confirm_text="Delete"
             on_confirm=on_confirm_delete
             on_cancel=on_cancel_delete

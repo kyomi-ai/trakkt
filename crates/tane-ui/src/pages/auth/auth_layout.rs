@@ -39,14 +39,14 @@ pub fn AuthLayout(
                 aria-hidden="true"
             >
                 <img
-                    src="/tane_full_logo_white.svg"
+                    src="/public/tane_full_logo_white.svg"
                     alt=""
                     class="h-48 xl:h-56 w-auto select-none"
                 />
 
                 // Bottom marginalia
                 <div class="absolute bottom-10 left-12 right-12 z-10 flex items-center justify-between font-mono text-[10px] uppercase text-[color:rgba(245,243,239,0.30)]" style="letter-spacing:0.18em;">
-                    <span>"APP STARTER"</span>
+                    <span>"TANE"</span>
                     <span>"種 \u{00B7} TANE"</span>
                 </div>
             </div>
@@ -62,19 +62,14 @@ pub fn AuthLayout(
                     <div class="text-center mb-8">
                         // Mobile logo — React: className="lg:hidden mb-6"
                         <div class="lg:hidden mb-6">
-                            <img src="/tane_full_logo.svg" alt="Tane" class="h-12 mx-auto dark:hidden"/>
-                            <img src="/tane_full_logo_white.svg" alt="Tane" class="h-12 mx-auto hidden dark:block"/>
+                            <img src="/public/tane_full_logo.svg" alt="Tane" class="h-12 mx-auto dark:hidden"/>
+                            <img src="/public/tane_full_logo_white.svg" alt="Tane" class="h-12 mx-auto hidden dark:block"/>
                         </div>
                         // Title — page-level landmark, DESIGN.md: 2xl token = 30px = text-3xl, Instrument Serif
                         <h1 class="text-3xl font-display text-foreground mb-2">
                             {title}
                         </h1>
-                        // Subtitle — editorial voice: Instrument Serif italic 18px.
-                        // Literal #3D3835 per Phase 3 plan spec: pinned warm-stone
-                        // tone that stays correct regardless of dark-mode theme
-                        // state (the tokenised `--color-secondary-foreground`
-                        // flips to cool slate in dark mode).
-                        <p class="text-[18px] text-[color:#3D3835] italic font-display leading-tight mb-8">
+                        <p class="text-[18px] text-muted-foreground italic font-display leading-tight mb-8">
                             {subtitle}
                         </p>
                     </div>

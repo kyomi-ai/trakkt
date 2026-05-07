@@ -93,14 +93,13 @@ fn variant_classes(variant: ButtonVariant) -> &'static str {
 
 fn size_classes(size: ButtonSize) -> &'static str {
     match size {
-        // Default: 10px 20px (py-2.5 px-5)
-        ButtonSize::Default => "px-5 py-2.5",
+        ButtonSize::Default => "px-5 py-3",
         // Small: 8px 14px (py-2 px-3.5), 13px font — py-2 gives ~36px height for touch accessibility
         ButtonSize::Sm => "px-3.5 py-2 text-[13px]",
         // Large
         ButtonSize::Lg => "px-8 py-3",
         // Icon-only: square
-        ButtonSize::Icon => "h-9 w-9 p-0",
+        ButtonSize::Icon => "h-11 w-11 p-0",
         // Compact icon-only: 28px square for dense action rows
         ButtonSize::IconSm => "h-7 w-7 p-0",
         // Extra-small icon-only: 20px square for inline tab/chip actions

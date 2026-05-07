@@ -216,7 +216,7 @@ pub fn GoogleCallbackPage() -> impl IntoView {
                             // Branded moment (auth page) — DESIGN.md Loading State Pattern
                             view! {
                                 <img
-                                    src="/tane_animated_logo.svg"
+                                    src="/public/tane_animated_logo.svg"
                                     alt="Processing"
                                     class="w-12 h-12"
                                 />

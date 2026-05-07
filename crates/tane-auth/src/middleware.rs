@@ -26,25 +26,13 @@ pub struct AuthState {
 }
 
 /// Workspace context enriched from the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WorkspaceContext {
     pub workspace_id: Option<String>,
     pub workspace_name: Option<String>,
     pub workspace_roles: Vec<WorkspaceRole>,
     pub workspace_status: Option<WorkspaceStatus>,
     pub is_owner: bool,
-}
-
-impl Default for WorkspaceContext {
-    fn default() -> Self {
-        Self {
-            workspace_id: None,
-            workspace_name: None,
-            workspace_roles: Vec::new(),
-            workspace_status: None,
-            is_owner: false,
-        }
-    }
 }
 
 /// Authenticated user extracted from the request.

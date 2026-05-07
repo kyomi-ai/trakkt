@@ -50,3 +50,4 @@ sqlx = { workspace = true }
 uuid = { workspace = true }
 
 [lints]
+workspace = true

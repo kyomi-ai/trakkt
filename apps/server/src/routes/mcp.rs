@@ -122,7 +122,7 @@ async fn handle_post(
 // GET /mcp — SSE stream (placeholder)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn handle_sse(headers: HeaderMap) -> impl IntoResponse {
+async fn handle_sse(_headers: HeaderMap) -> impl IntoResponse {
     (StatusCode::OK, "event: ping\ndata: {}\n\n")
 }
 
@@ -135,7 +135,7 @@ async fn handle_delete(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Some(session_id) = headers.get(MCP_SESSION_ID_HEADER).and_then(|v| v.to_str().ok()) {
-        state.mcp_sessions.remove_session(session_id);
+        state.mcp_sessions.remove_session(session_id).await;
     }
     StatusCode::NO_CONTENT
 }

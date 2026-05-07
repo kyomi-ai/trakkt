@@ -151,13 +151,10 @@ pub async fn setup_totp() -> Result<TotpSetup, ServerFnError> {
     let auth = extract_auth().await?;
     let ctx = extract_context()?;
 
-    let kv = ctx
-        .kv
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let kv = ctx.kv()?;
 
     let result =
-        tane_auth::security_service::setup_totp(&ctx.db, kv, &auth.user_id, &auth.email)
+        tane_auth::security_service::setup_totp(&ctx.db, &kv, &auth.user_id, &auth.email)
             .await
             .into_sfn()?;
 
@@ -178,12 +175,9 @@ pub async fn enable_totp(code: String) -> Result<String, ServerFnError> {
     let auth = extract_auth().await?;
     let ctx = extract_context()?;
 
-    let kv = ctx
-        .kv
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let kv = ctx.kv()?;
 
-    tane_auth::security_service::enable_totp(&ctx.db, kv, &auth.user_id, &code)
+    tane_auth::security_service::enable_totp(&ctx.db, &kv, &auth.user_id, &code)
         .await
         .into_sfn()?;
 
@@ -427,15 +421,8 @@ pub async fn start_passkey_registration(
     let auth = extract_auth().await?;
     let ctx = extract_context()?;
 
-    let webauthn = ctx
-        .webauthn
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not configured"))?;
-
-    let kv = ctx
-        .kv
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let webauthn = ctx.webauthn()?;
+    let kv = ctx.kv()?;
 
     let device_name = if device_name.trim().is_empty() {
         "Unknown Device".to_string()
@@ -445,7 +432,7 @@ pub async fn start_passkey_registration(
 
     let (ccr, challenge_id) = tane_auth::security_service::start_passkey_registration(
         &ctx.db,
-        kv,
+        &kv,
         webauthn,
         &auth.user_id,
         &device_name,
@@ -476,15 +463,8 @@ pub async fn complete_passkey_registration(
     let auth = extract_auth().await?;
     let ctx = extract_context()?;
 
-    let webauthn = ctx
-        .webauthn
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not configured"))?;
-
-    let kv = ctx
-        .kv
-        .as_ref()
-        .ok_or_else(|| ServerFnError::new("KV store not available"))?;
+    let webauthn = ctx.webauthn()?;
+    let kv = ctx.kv()?;
 
     let data: serde_json::Value = serde_json::from_str(&credential_json)
         .map_err(|e| ServerFnError::new(format!("Invalid credential JSON: {e}")))?;
@@ -499,7 +479,7 @@ pub async fn complete_passkey_registration(
 
     let device_name = tane_auth::security_service::complete_passkey_registration(
         &ctx.db,
-        kv,
+        &kv,
         webauthn,
         &auth.user_id,
         challenge_id,

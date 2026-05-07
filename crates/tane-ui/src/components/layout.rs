@@ -15,6 +15,7 @@ pub fn Layout() -> impl IntoView {
     let user_ctx = expect_context::<LocalResource<Result<UserContext, ServerFnError>>>();
     let user_info = LocalResource::new(get_sidebar_user);
     let (user_menu_open, set_user_menu_open) = signal(false);
+    let (mobile_sidebar_open, set_mobile_sidebar_open) = signal(false);
 
     let auth_confirmed = RwSignal::new(false);
     let nav = leptos_router::hooks::use_navigate();
@@ -39,10 +40,45 @@ pub fn Layout() -> impl IntoView {
             }
         >
             <div class="h-dvh flex bg-background">
-                <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open/>
-                <main class="flex-1 overflow-y-auto">
-                    <Outlet/>
-                </main>
+                // Desktop sidebar
+                <div class="hidden md:block">
+                    <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open/>
+                </div>
+
+                // Mobile sidebar overlay
+                <Show when=move || mobile_sidebar_open.get()>
+                    <div class="fixed inset-0 z-40 md:hidden">
+                        <div
+                            class="fixed inset-0 bg-black/50"
+                            on:click=move |_| set_mobile_sidebar_open.set(false)
+                        />
+                        <div class="fixed inset-y-0 left-0 z-50 w-64">
+                            <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open/>
+                        </div>
+                    </div>
+                </Show>
+
+                <div class="flex-1 flex flex-col overflow-hidden">
+                    // Mobile header bar
+                    <div class="md:hidden flex items-center gap-3 px-4 py-3 border-b border-border bg-background">
+                        <button
+                            class="p-2 rounded-md hover:bg-secondary transition-colors"
+                            on:click=move |_| set_mobile_sidebar_open.update(|v| *v = !*v)
+                            aria-label="Toggle menu"
+                        >
+                            <svg class="w-5 h-5 text-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+                            </svg>
+                        </button>
+                        <a href="/">
+                            <img src="/public/tane_full_logo.svg" alt="Tane" class="h-6 dark:hidden"/>
+                            <img src="/public/tane_full_logo_white.svg" alt="Tane" class="h-6 hidden dark:block"/>
+                        </a>
+                    </div>
+                    <main class="flex-1 overflow-y-auto">
+                        <Outlet/>
+                    </main>
+                </div>
             </div>
         </Show>
     }
@@ -61,7 +97,7 @@ fn Sidebar(
             // Logo
             <div class="p-4 border-b border-[var(--color-sidebar-border)]">
                 <a href="/">
-                    <img src="/tane_full_logo_white.svg" alt="Tane" class="h-8"/>
+                    <img src="/public/tane_full_logo_white.svg" alt="Tane" class="h-8"/>
                 </a>
             </div>
 

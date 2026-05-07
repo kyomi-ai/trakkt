@@ -355,7 +355,7 @@ fn success_view() -> impl IntoView {
                 </div>
             </div>
             // Branded moment (auth page) — DESIGN.md Loading State Pattern
-            <img src="/tane_animated_logo.svg" alt="Processing" class="w-8 h-8 mx-auto"/>
+            <img src="/public/tane_animated_logo.svg" alt="Processing" class="w-8 h-8 mx-auto"/>
         </div>
     }
 }
@@ -368,7 +368,7 @@ fn creating_view() -> impl IntoView {
     view! {
         <div class="text-center space-y-4">
             // Branded moment (auth page) — DESIGN.md Loading State Pattern
-            <img src="/tane_animated_logo.svg" alt="Processing" class="w-12 h-12 mx-auto"/>
+            <img src="/public/tane_animated_logo.svg" alt="Processing" class="w-12 h-12 mx-auto"/>
         </div>
     }
 }

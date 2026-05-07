@@ -117,6 +117,11 @@ impl Config {
             }
         };
 
+        let base_url = env::var("BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:8003".into());
+        let frontend_url = env::var("FRONTEND_URL")
+            .unwrap_or_else(|_| base_url.clone());
+
         Self {
             database_url: required_env("DATABASE_URL"),
             redis_url: env::var("REDIS_URL").ok(),
@@ -140,9 +145,7 @@ impl Config {
             google_oauth_client_id: env::var("GOOGLE_OAUTH_CLIENT_ID").ok(),
             google_oauth_client_secret: env::var("GOOGLE_OAUTH_CLIENT_SECRET").ok(),
             webauthn_rp_id: env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| {
-                let frontend = env::var("FRONTEND_URL")
-                    .unwrap_or_else(|_| "http://localhost:5173".into());
-                url::Url::parse(&frontend)
+                url::Url::parse(&frontend_url)
                     .ok()
                     .and_then(|u| u.host_str().map(String::from))
                     .unwrap_or_else(|| "localhost".into())
@@ -152,10 +155,8 @@ impl Config {
             slack_feedback_webhook_url: env::var("SLACK_FEEDBACK_WEBHOOK_URL").ok(),
             support_email: env::var("SUPPORT_EMAIL")
                 .unwrap_or_else(|_| "support@tane.ai".into()),
-            frontend_url: env::var("FRONTEND_URL")
-                .unwrap_or_else(|_| "http://localhost:5173".into()),
-            base_url: env::var("BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:8003".into()),
+            frontend_url,
+            base_url,
         }
     }
 

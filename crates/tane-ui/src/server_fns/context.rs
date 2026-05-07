@@ -8,7 +8,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "ssr")]
-use super::{extract_auth, extract_context, IntoServerFnError};
+use super::{extract_auth, extract_context};
 
 /// Combined user, workspace, and capability context.
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -569,9 +569,9 @@ fn TeamPageInner() -> impl IntoView {
             // Confirm Dialog
             <ConfirmDialog
                 open=Signal::from(dialog_open)
-                title=dialog_title.get_untracked()
-                message=dialog_message.get_untracked()
-                confirm_text=dialog_confirm_text.get_untracked()
+                title=Signal::derive(move || dialog_title.get())
+                message=Signal::derive(move || dialog_message.get())
+                confirm_text=Signal::derive(move || dialog_confirm_text.get())
                 on_confirm=on_confirm
                 on_cancel=on_cancel
             />
@@ -916,7 +916,7 @@ fn TransferOwnershipModal(
     let transfer_modal_footer: Arc<dyn Fn() -> AnyView + Send + Sync> =
         Arc::new(move || {
             let step = transfer_step.get();
-            let ws_name = workspace_name.get();
+            let _ws_name = workspace_name.get();
 
             if step == 1 {
                 let no_selection = transfer_selected_user_id.get().is_empty();

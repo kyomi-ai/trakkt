@@ -18,7 +18,7 @@ use leptos::prelude::*;
 use phosphor_leptos::Icon;
 /// Classes kept for backward compatibility with code that uses raw `<select>` elements
 /// with `SELECT_CLASS` and `CHEVRON_STYLE` directly.
-pub const SELECT_CLASS: &str = "flex h-9 w-full items-center justify-between whitespace-nowrap rounded-md border border-input bg-transparent px-3 py-2 text-sm text-foreground shadow-sm ring-offset-background focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50 appearance-none cursor-pointer";
+pub const SELECT_CLASS: &str = "flex h-11 w-full items-center justify-between whitespace-nowrap rounded-md border border-input bg-transparent px-3 py-2 text-sm text-foreground shadow-sm ring-offset-background focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50 appearance-none cursor-pointer";
 
 /// Inline chevron SVG as background image (for raw `<select>` elements).
 pub const CHEVRON_STYLE: &str = "background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\"); background-repeat: no-repeat; background-position: right 0.75rem center; padding-right: 2.5rem;";
@@ -28,7 +28,7 @@ pub const CHEVRON_STYLE: &str = "background-image: url(\"data:image/svg+xml,%3Cs
 // ---------------------------------------------------------------------------
 
 /// SelectTrigger classes from React source.
-const TRIGGER_CLASS: &str = "flex h-9 w-full items-center justify-between whitespace-nowrap rounded-md border border-input bg-transparent px-3 py-2 text-sm text-foreground shadow-sm ring-offset-background focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer";
+const TRIGGER_CLASS: &str = "flex h-11 w-full items-center justify-between whitespace-nowrap rounded-md border border-input bg-transparent px-3 py-2 text-sm text-foreground shadow-sm ring-offset-background focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer";
 
 /// SelectContent classes — visual chrome only. Positioning is handled by
 /// the shared `Popover` helper, which portals the content to `document.body`

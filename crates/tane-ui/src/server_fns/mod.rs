@@ -26,6 +26,17 @@ pub struct ServerContext {
     pub mcp_sessions: Option<tane_auth::mcp_session_manager::MCPSessionManager>,
 }
 
+#[cfg(feature = "ssr")]
+impl ServerContext {
+    pub(crate) fn webauthn(&self) -> Result<&std::sync::Arc<webauthn_rs::Webauthn>, leptos::prelude::ServerFnError> {
+        self.webauthn.as_ref().ok_or_else(|| leptos::prelude::ServerFnError::new("WebAuthn not configured"))
+    }
+
+    pub(crate) fn kv(&self) -> Result<tane_core::KVPool, leptos::prelude::ServerFnError> {
+        self.kv.clone().ok_or_else(|| leptos::prelude::ServerFnError::new("KV store not available"))
+    }
+}
+
 /// Extract the authenticated user from the Axum request.
 #[cfg(feature = "ssr")]
 pub(crate) async fn extract_auth() -> Result<tane_auth::middleware::AuthUser, leptos::prelude::ServerFnError> {
@@ -80,6 +91,30 @@ impl AuthenticatedContext {
 
     pub(crate) fn db(&self) -> &tane_core::DbPool {
         &self.ctx.db
+    }
+}
+
+/// Bundles headers, KV pool, client IP, and device info — the common preamble
+/// for auth server functions that need request context beyond just `ServerContext`.
+#[cfg(feature = "ssr")]
+pub(crate) struct AuthFlowContext {
+    pub ctx: ServerContext,
+    pub kv: tane_core::KVPool,
+    pub ip: String,
+    pub device: tane_auth::token_service::DeviceInfo,
+}
+
+#[cfg(feature = "ssr")]
+impl AuthFlowContext {
+    pub(crate) async fn extract() -> Result<Self, leptos::prelude::ServerFnError> {
+        let ctx = extract_context()?;
+        let headers: axum::http::HeaderMap = leptos_axum::extract()
+            .await
+            .map_err(|e| leptos::prelude::ServerFnError::new(format!("Failed to extract headers: {e}")))?;
+        let kv = ctx.kv()?;
+        let ip = auth::extract_client_ip(&headers);
+        let device = auth::extract_device_info(&headers);
+        Ok(Self { ctx, kv, ip, device })
     }
 }
 

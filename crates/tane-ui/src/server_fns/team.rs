@@ -128,7 +128,7 @@ pub async fn update_member_role(user_id: String, role: String) -> Result<(), Ser
     }
 
     // Verify member exists
-    let target = tane_auth::workspace_service::get_workspace_user(ac.db(), &ac.ws_id, &user_id)
+    let target = tane_auth::user_service::get_workspace_user(ac.db(), &ac.ws_id, &user_id)
         .await
         .into_sfn()?;
     if target.is_none() {

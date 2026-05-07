@@ -552,6 +552,326 @@ Comprehensive test plan for the Tane app starter template. Covers all user-facin
 
 ---
 
+## TC-025: Onboarding Flow
+
+**Description:** New user completing signup is guided through the onboarding flow before reaching the main app.
+
+**Steps:**
+1. Create a new user account (via direct DB seeding or API)
+2. Log in as the new user
+3. Verify the user is redirected to `/onboarding`
+4. Complete each onboarding step (fill required fields, click "Next" / "Continue")
+5. After the final step, verify the user is redirected to the main app (e.g., `/settings/profile`)
+6. Log out and log back in
+7. Verify the user is NOT shown onboarding again (goes directly to the app)
+
+**Expected Result:** Onboarding is shown once for new users, and once completed it is not repeated.
+
+---
+
+## TC-026: Rate Limiting (Login)
+
+**Description:** Excessive failed login attempts trigger rate limiting.
+
+**Steps:**
+1. Navigate to `/login`
+2. Enter a valid email with an incorrect password
+3. Submit the form repeatedly (exceed the configured rate limit threshold, e.g., 10 attempts)
+4. Verify that after exceeding the threshold, subsequent attempts return a rate limit error (429 or inline error message)
+5. Verify the error message indicates too many attempts (e.g., "Too many login attempts, please try again later")
+6. Wait for the rate limit window to expire (or use a fresh IP/context)
+7. Verify login works again with correct credentials
+
+**Expected Result:** Login is rate-limited after excessive failed attempts. The user is informed and can retry after the cooldown period.
+
+---
+
+## TC-027: Rate Limiting (Signup)
+
+**Description:** Excessive signup attempts from the same source trigger rate limiting.
+
+**Steps:**
+1. Navigate to `/signup`
+2. Submit the signup form repeatedly with different email addresses (exceed the configured threshold)
+3. Verify that after exceeding the threshold, subsequent attempts return a rate limit error
+4. Verify the error message indicates too many attempts
+
+**Expected Result:** Signup is rate-limited to prevent abuse.
+
+---
+
+## TC-028: Token Refresh (Silent Re-authentication)
+
+**Description:** An expired access token is automatically refreshed without user interaction.
+
+**Steps:**
+1. Log in as an existing user
+2. Verify the user is authenticated (can access `/settings/profile`)
+3. Expire the access token (e.g., manipulate the cookie expiry or wait for short-lived token to expire in a test configuration)
+4. Attempt to perform an authenticated action (e.g., navigate to `/settings/profile` or call a server function)
+5. Verify the action succeeds without showing a login page
+6. Verify the access token cookie has been refreshed (new expiry time)
+
+**Expected Result:** Expired access tokens are silently refreshed using the refresh token. The user experiences no interruption.
+
+---
+
+## TC-029: Token Refresh - Rotation Detection
+
+**Description:** Reusing a refresh token that has already been rotated invalidates the entire token family.
+
+**Steps:**
+1. Log in as an existing user
+2. Capture the current refresh token value
+3. Trigger a token refresh (manually call `POST /api/v1/auth/refresh`)
+4. Verify a new refresh token is issued (the old one is consumed)
+5. Attempt to use the OLD refresh token again (replay attack)
+6. Verify the server rejects the old token
+7. Verify the ENTIRE token family is invalidated (the new token also stops working)
+8. Verify the user must re-authenticate (next protected page request redirects to `/login`)
+
+**Expected Result:** Token reuse detection invalidates all tokens in the family, forcing re-authentication.
+
+---
+
+## TC-030: Workspace Settings - Model Selection
+
+**Description:** Workspace owner can change the configured Anthropic model.
+
+**Steps:**
+1. Log in as workspace owner
+2. Navigate to `/settings/workspace`
+3. Locate the model selection field
+4. Note the current model value
+5. Select a different model from the available options
+6. Click "Save" / submit
+7. Verify a success indicator appears
+8. Refresh the page
+9. Verify the new model selection persists
+
+**Expected Result:** Workspace model selection is saved and persists across page loads.
+
+---
+
+## TC-031: Workspace Settings - ChartML Configuration
+
+**Description:** Workspace owner can update the ChartML palette configuration.
+
+**Steps:**
+1. Log in as workspace owner
+2. Navigate to `/settings/workspace`
+3. Locate the ChartML configuration section
+4. Modify the palette setting (e.g., select a different color palette)
+5. Click "Save" / submit
+6. Verify a success indicator appears
+7. Refresh the page
+8. Verify the new ChartML configuration persists
+
+**Expected Result:** ChartML palette configuration is saved and persists.
+
+---
+
+## TC-032: Team - Cancel Invitation
+
+**Description:** Workspace owner can cancel a pending invitation before it is accepted.
+
+**Steps:**
+1. Log in as workspace owner
+2. Navigate to `/settings/team`
+3. Invite a new email address (create a pending invitation)
+4. Verify the invitation appears in the pending invitations list
+5. Click "Cancel" (or equivalent) on the pending invitation
+6. Confirm the cancellation if prompted
+7. Verify the invitation is removed from the pending list
+8. (If possible) Verify that navigating to the invitation link now fails or shows an error
+
+**Expected Result:** Pending invitations can be cancelled by the workspace owner, and cancelled invitation links no longer work.
+
+---
+
+## TC-033: Team - Invitation Expiry
+
+**Description:** Workspace invitations expire after the configured time period (7 days).
+
+**Steps:**
+1. Log in as workspace owner
+2. Navigate to `/settings/team`
+3. Invite a new email address
+4. Verify the invitation appears as pending
+5. Advance the system clock or modify the invitation's `created_at` timestamp in the database to be older than 7 days
+6. Attempt to use the invitation token (via the API or a signup attempt)
+7. Verify the invitation is rejected as expired
+8. Return to the team settings page
+9. Verify the expired invitation is shown as expired or removed from the active list
+
+**Expected Result:** Invitations older than 7 days are rejected and no longer usable.
+
+---
+
+## TC-034: Team - Ownership Transfer Decline
+
+**Description:** The recipient of an ownership transfer can decline it.
+
+**Steps:**
+1. Log in as workspace owner
+2. Navigate to `/settings/team`
+3. Initiate an ownership transfer to another member
+4. Verify the pending transfer is shown in the UI
+5. Log in as the transfer recipient
+6. Navigate to the accept ownership page (`/accept-ownership/:transfer_id`)
+7. Click "Decline" (or equivalent)
+8. Verify the transfer is marked as declined
+9. Log in as the original owner
+10. Verify the owner still retains ownership
+11. Verify the transfer is no longer shown as pending
+
+**Expected Result:** Ownership transfers can be declined by the recipient. The original owner retains ownership.
+
+---
+
+## TC-035: Team - Ownership Transfer Expiry
+
+**Description:** Ownership transfers expire after the configured time period (7 days).
+
+**Steps:**
+1. Log in as workspace owner
+2. Initiate an ownership transfer to another member
+3. Verify the pending transfer exists
+4. Advance the system clock or modify the transfer's `created_at` timestamp to be older than 7 days
+5. As the recipient, attempt to accept the transfer
+6. Verify the transfer is rejected as expired
+7. Verify the original owner still retains ownership
+8. Verify the expired transfer is no longer shown as pending
+
+**Expected Result:** Ownership transfers expire after 7 days and can no longer be accepted.
+
+---
+
+## TC-036: Team - Ownership Transfer Cancellation
+
+**Description:** The workspace owner can cancel a pending ownership transfer before it is accepted.
+
+**Steps:**
+1. Log in as workspace owner
+2. Navigate to `/settings/team`
+3. Initiate an ownership transfer to another member
+4. Verify the pending transfer is shown
+5. Click "Cancel Transfer" (or equivalent)
+6. Confirm the cancellation
+7. Verify the transfer is removed from the pending list
+8. As the recipient, attempt to accept the now-cancelled transfer
+9. Verify it is rejected
+
+**Expected Result:** Pending ownership transfers can be cancelled by the initiating owner.
+
+---
+
+## TC-037: Role-Based Access Control - Member Cannot Access Admin Operations
+
+**Description:** A workspace member (non-admin, non-owner) cannot perform admin-only operations.
+
+**Steps:**
+1. Log in as a user with "member" role in a workspace
+2. Navigate to `/settings/workspace`
+3. Verify the workspace name field is read-only or the save button is disabled (or the page shows an access denied message)
+4. Attempt to update the workspace name via the server function directly (if possible)
+5. Verify the server rejects the request with a permission error
+6. Navigate to `/settings/team`
+7. Verify the "Invite" button is not shown or is disabled
+8. Verify the role change controls are not visible for other members
+9. Verify "Remove" buttons are not shown for other members
+
+**Expected Result:** Members without admin/owner role cannot modify workspace settings, invite members, change roles, or remove members.
+
+---
+
+## TC-038: Role-Based Access Control - Admin Permissions
+
+**Description:** A workspace admin can manage members but cannot transfer ownership or perform owner-only actions.
+
+**Steps:**
+1. Log in as a user with "admin" role in a workspace
+2. Navigate to `/settings/team`
+3. Verify the admin CAN invite new members
+4. Verify the admin CAN remove members (but not the owner)
+5. Verify the admin CAN change member roles (but cannot change the owner's role)
+6. Verify "Transfer Ownership" is NOT available to the admin
+7. Navigate to `/settings/workspace`
+8. Verify the admin CAN update the workspace name
+
+**Expected Result:** Admins have elevated permissions for team and workspace management but cannot transfer ownership.
+
+---
+
+## TC-039: Workspace Switcher - Context Isolation
+
+**Description:** Switching workspaces fully isolates data between workspace contexts.
+
+**Steps:**
+1. Create a user who is a member of two workspaces (Workspace A and Workspace B)
+2. As workspace owner of A, invite a unique member (member-A-only)
+3. As workspace owner of B, invite a different unique member (member-B-only)
+4. Log in as the multi-workspace user
+5. Switch to Workspace A
+6. Navigate to `/settings/team`
+7. Verify member-A-only is listed, member-B-only is NOT listed
+8. Switch to Workspace B
+9. Navigate to `/settings/team`
+10. Verify member-B-only is listed, member-A-only is NOT listed
+
+**Expected Result:** Team member lists and workspace data are fully isolated between workspaces.
+
+---
+
+## TC-040: Duplicate Workspace Invitation
+
+**Description:** Inviting an email that already has a pending invitation is handled gracefully.
+
+**Steps:**
+1. Log in as workspace owner
+2. Navigate to `/settings/team`
+3. Invite `duplicate@example.com`
+4. Verify the invitation appears as pending
+5. Attempt to invite `duplicate@example.com` again
+6. Verify an appropriate error message is displayed (e.g., "Already invited" or "Invitation already pending")
+7. Verify only one invitation exists for that email in the list
+
+**Expected Result:** Duplicate invitations are rejected with a clear error message.
+
+---
+
+## TC-041: Invite Existing Workspace Member
+
+**Description:** Inviting an email that already belongs to the workspace is handled gracefully.
+
+**Steps:**
+1. Log in as workspace owner
+2. Navigate to `/settings/team`
+3. Note an existing member's email address
+4. Attempt to invite that email address
+5. Verify an appropriate error message is displayed (e.g., "Already a member")
+6. Verify no duplicate invitation is created
+
+**Expected Result:** Inviting an existing member is rejected with a clear error message.
+
+---
+
+## TC-042: Session Persistence Across Browser Restart
+
+**Description:** User session survives browser closure (persistent auth cookies).
+
+**Steps:**
+1. Log in as an existing user
+2. Verify authentication succeeds
+3. Close the browser context (simulating browser restart) and create a new context with the same cookie storage
+4. Navigate to `/settings/profile`
+5. Verify the user is still authenticated (no redirect to login)
+6. Verify the correct user context is loaded (display name matches)
+
+**Expected Result:** Auth cookies persist across browser sessions, keeping the user logged in.
+
+---
+
 ## Notes for Test Implementation
 
 - **Parallel isolation:** Each test should use a fresh database state or unique email addresses to avoid cross-test contamination.

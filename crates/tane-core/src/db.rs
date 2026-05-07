@@ -2,6 +2,8 @@
 
 //! Database pool abstraction — supports Postgres and SQLite at runtime.
 
+use std::str::FromStr;
+
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
@@ -30,9 +32,11 @@ impl DbPool {
             Ok(Self::Postgres(pool))
         } else {
             // SQLite WAL mode serialises writes; a single connection avoids contention.
+            let opts = sqlx::sqlite::SqliteConnectOptions::from_str(url)?
+                .create_if_missing(true);
             let pool = SqlitePoolOptions::new()
                 .max_connections(1)
-                .connect(url)
+                .connect_with(opts)
                 .await?;
             sqlx::query("PRAGMA journal_mode=WAL")
                 .execute(&pool)

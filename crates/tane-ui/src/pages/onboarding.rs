@@ -10,8 +10,8 @@ pub fn OnboardingPage() -> impl IntoView {
             <Card class="w-full max-w-lg".to_string()>
                 <CardHeader>
                     <div class="flex justify-center mb-4">
-                        <img src="/tane_full_logo.svg" alt="Tane" class="h-10 dark:hidden"/>
-                        <img src="/tane_full_logo_white.svg" alt="Tane" class="h-10 hidden dark:block"/>
+                        <img src="/public/tane_full_logo.svg" alt="Tane" class="h-10 dark:hidden"/>
+                        <img src="/public/tane_full_logo_white.svg" alt="Tane" class="h-10 hidden dark:block"/>
                     </div>
                     <CardTitle class="text-center".to_string()>"Welcome aboard!"</CardTitle>
                     <CardDescription class="text-center".to_string()>

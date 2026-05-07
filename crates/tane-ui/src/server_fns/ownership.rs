@@ -7,25 +7,28 @@
 //! does not use the main layout wrapper.
 
 use leptos::prelude::*;
-use serde::{Deserialize, Serialize};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Types
-// ─────────────────────────────────────────────────────────────────────────────
+// On the server, re-export the canonical definition from `tane-auth`.
+// On the client (WASM), provide an identical definition for deserialization.
+// The auth crate owns the struct shape; the client mirror exists only because
+// `tane-auth` is not compiled for the WASM target.
+#[cfg(feature = "ssr")]
+pub use tane_auth::workspace_service::OwnershipTransferDetail;
 
-/// Transfer details for display on the accept-ownership page.
-///
-/// This is a slimmer type than `OwnershipTransferData` in `types.rs` — it
-/// includes the workspace name (resolved from the workspace record) and
-/// only the fields the page actually needs.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct OwnershipTransfer {
+/// Client-side mirror of `tane_auth::workspace_service::OwnershipTransferDetail`.
+/// Must be kept in sync with the canonical definition.
+#[cfg(not(feature = "ssr"))]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OwnershipTransferDetail {
     pub transfer_id: String,
     pub workspace_name: String,
     pub from_user_email: String,
     pub expires_at: String,
     pub status: String,
 }
+
+/// Convenience alias so page modules can keep importing `OwnershipTransfer`.
+pub type OwnershipTransfer = OwnershipTransferDetail;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Server functions
@@ -41,25 +44,17 @@ pub struct OwnershipTransfer {
 #[server(prefix = "/leptos-api")]
 pub async fn get_ownership_transfer(
     transfer_id: String,
-) -> Result<Option<OwnershipTransfer>, ServerFnError> {
+) -> Result<Option<OwnershipTransferDetail>, ServerFnError> {
     let auth = extract_auth().await?;
     let ctx = extract_context()?;
 
-    let detail = tane_auth::workspace_service::get_transfer_for_recipient(
+    tane_auth::workspace_service::get_transfer_for_recipient(
         &ctx.db,
         &transfer_id,
         &auth.user_id,
     )
     .await
-    .into_sfn()?;
-
-    Ok(detail.map(|d| OwnershipTransfer {
-        transfer_id: d.transfer_id,
-        workspace_name: d.workspace_name,
-        from_user_email: d.from_user_email,
-        expires_at: d.expires_at.to_rfc3339(),
-        status: d.status.to_string(),
-    }))
+    .into_sfn()
 }
 
 /// Accept an ownership transfer. Only the recipient can accept.

@@ -18,25 +18,13 @@ pub fn get() -> &'static Constants {
     CONSTANTS.get_or_init(Constants::default)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Constants {
     pub jwt: JwtConstants,
     pub cookies: CookieConstants,
     pub redis: RedisConstants,
     pub rate_limits: RateLimitConstants,
     pub workspace: WorkspaceConstants,
-}
-
-impl Default for Constants {
-    fn default() -> Self {
-        Self {
-            jwt: JwtConstants::default(),
-            cookies: CookieConstants::default(),
-            redis: RedisConstants::default(),
-            rate_limits: RateLimitConstants::default(),
-            workspace: WorkspaceConstants::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +62,7 @@ impl Default for CookieConstants {
     fn default() -> Self {
         let secure = std::env::var("FRONTEND_URL")
             .map(|u| u.starts_with("https://"))
-            .unwrap_or(true);
+            .unwrap_or(false);
         Self {
             access_token_name: "access_token".into(),
             refresh_token_name: "refresh_token".into(),
@@ -86,19 +74,10 @@ impl Default for CookieConstants {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RedisConstants {
     pub key_prefixes: RedisKeyPrefixes,
     pub ttls: RedisTtls,
-}
-
-impl Default for RedisConstants {
-    fn default() -> Self {
-        Self {
-            key_prefixes: RedisKeyPrefixes::default(),
-            ttls: RedisTtls::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -175,17 +154,9 @@ pub struct RateLimitBucket {
     pub window_seconds: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WorkspaceConstants {
     pub roles: WorkspaceRoles,
-}
-
-impl Default for WorkspaceConstants {
-    fn default() -> Self {
-        Self {
-            roles: WorkspaceRoles::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

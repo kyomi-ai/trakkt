@@ -275,8 +275,442 @@ impl EmailService {
         let frontend_url = &self.frontend_url;
         let subject = format!("You've been invited to join {} on Tane", workspace_name);
 
+        let escaped_email = html_escape(email);
+        let escaped_inviter = html_escape(inviter_name);
+        let escaped_workspace = html_escape(workspace_name);
+
+        let body_html = format!(
+            r#"<h1>You're Invited!</h1>
+
+        <p><strong>{escaped_inviter}</strong> has invited you to join <strong>{escaped_workspace}</strong> as {role_display}.</p>
+
+        <p>To accept this invitation, sign in with the email address this was sent to ({escaped_email}).</p>
+
+        <div class="cta">
+            <a href="{frontend_url}/login" class="button">Accept Invitation</a>
+        </div>
+
+        <p>This invitation will expire in 7 days.</p>"#
+        );
+
+        let footer_html = format!(
+            r#"<p style="margin: 0 0 8px 0;">
+            You're receiving this because you were invited to join a workspace on Tane.
+        </p>
+        <p style="margin: 0;">
+            <a href="{frontend_url}/unsubscribe?email={escaped_email}">Unsubscribe</a> &middot;
+            <a href="{frontend_url}/privacy">Privacy</a> &middot;
+            <a href="{frontend_url}/terms">Terms</a> &middot;
+            <a href="{frontend_url}" style="color: #4f46e5;">tane.ai</a>
+        </p>"#
+        );
+
+        let html_body = email_template(frontend_url, &body_html, &footer_html);
+
+        let text_body = format!(
+            "\
+You're Invited!
+
+{inviter_name} has invited you to join {workspace_name} as {role_display}.
+
+To accept, sign in with this email address ({email}):
+{frontend_url}/login
+
+This invitation will expire in 7 days.
+",
+        );
+
+        self.send_email(email, &subject, &html_body, Some(&text_body), None, &[])
+            .await
+    }
+
+    /// Send an ownership transfer notification email.
+    ///
+    /// `variant` is either "initiated" (sent to recipient) or "confirmation" (sent to current owner).
+    pub async fn send_ownership_transfer(
+        &self,
+        email: &str,
+        workspace_name: &str,
+        from_name: &str,
+        to_name: &str,
+        variant: &str,
+    ) -> bool {
+        let (subject, body_text) = if variant == "initiated" {
+            (
+                format!("You've been offered ownership of {workspace_name}"),
+                format!(
+                    "{from_name} wants to transfer ownership of {workspace_name} to you. \
+                     Log in to review and accept or decline this transfer."
+                ),
+            )
+        } else {
+            (
+                format!("Ownership transfer initiated for {workspace_name}"),
+                format!(
+                    "You initiated an ownership transfer of {workspace_name} to {to_name}. \
+                     They have 7 days to accept. You can cancel this transfer from workspace settings."
+                ),
+            )
+        };
+
         let html_body = format!(
-            r#"<!DOCTYPE html>
+            r#"
+        <h1>{subject}</h1>
+        <p>{body_text}</p>
+        <div class="cta">
+            <a href="{frontend_url}/settings/team" class="button">View in Settings</a>
+        </div>
+"#,
+            subject = subject,
+            body_text = body_text,
+            frontend_url = self.frontend_url,
+        );
+
+        let text_body = format!("{subject}\n\n{body_text}\n\nView: {}/settings/team\n", self.frontend_url);
+
+        self.send_email(email, &subject, &html_body, Some(&text_body), None, &[])
+            .await
+    }
+
+    /// Send a passkey recovery email.
+    ///
+    /// Returns `true` if sent successfully.
+    pub async fn send_passkey_recovery(
+        &self,
+        email: &str,
+        name: &str,
+        recovery_link: &str,
+    ) -> bool {
+        let display_name = if name.is_empty() { "there" } else { name };
+        let frontend_url = &self.frontend_url;
+        let subject = "Recover your Tane account";
+
+        let escaped_frontend = html_escape(frontend_url);
+        let escaped_name = html_escape(display_name);
+        let escaped_link = html_escape(recovery_link);
+
+        let body_html = format!(
+            r#"<h1>Recover Your Account</h1>
+
+        <p>Hi {escaped_name},</p>
+
+        <p>Click the button below to recover your account and create a new passkey:</p>
+
+        <div class="cta">
+            <a href="{escaped_link}" class="button">Create New Passkey</a>
+        </div>
+
+        <p style="color: #e74c3c; font-size: 14px;"><strong>This link expires in 15 minutes and can only be used once.</strong></p>
+
+        <p>If you didn't request this, please ignore this email. Your account is secure—no changes have been made.</p>
+
+        <p>Thanks,<br>The Tane Team</p>"#
+        );
+
+        let footer_html = format!(
+            r#"<p style="margin: 0 0 8px 0;">
+            You're receiving this because you requested account recovery for Tane.
+        </p>
+        <p style="margin: 0;">
+            <a href="{escaped_frontend}" style="color: #4f46e5;">tane.ai</a>
+        </p>"#
+        );
+
+        let html_body = email_template(&escaped_frontend, &body_html, &footer_html);
+
+        let text_body = format!(
+            "\
+Recover Your Account
+
+Hi {display_name},
+
+Click the link below to recover your account and create a new passkey:
+
+{recovery_link}
+
+IMPORTANT: This link expires in 15 minutes and can only be used once.
+
+If you didn't request this, please ignore this email. Your account is secure\u{2014}no changes have been made.
+
+Thanks,
+The Tane Team
+
+---
+You're receiving this email because you requested account recovery for Tane.
+{frontend_url}
+",
+        );
+
+        self.send_email(email, subject, &html_body, Some(&text_body), None, &[])
+            .await
+    }
+
+    /// Send an account recovery email.
+    ///
+    /// Returns `true` if sent successfully.
+    pub async fn send_account_recovery(
+        &self,
+        email: &str,
+        name: &str,
+        recovery_link: &str,
+    ) -> bool {
+        let display_name = if name.is_empty() { "there" } else { name };
+        let frontend_url = &self.frontend_url;
+        let subject = "Recover your Tane account";
+
+        let escaped_frontend = html_escape(frontend_url);
+        let escaped_name = html_escape(display_name);
+        let escaped_link = html_escape(recovery_link);
+
+        let body_html = format!(
+            r#"<h1>Recover Your Account</h1>
+
+        <p>Hi {escaped_name},</p>
+
+        <p>Click the button below to recover your account and set a new password:</p>
+
+        <div class="cta">
+            <a href="{escaped_link}" class="button">Recover Account</a>
+        </div>
+
+        <p style="color: #e74c3c; font-size: 14px;"><strong>This link expires in 15 minutes and can only be used once.</strong></p>
+
+        <p>If you didn't request this, please ignore this email. Your account is secure—no changes have been made.</p>
+
+        <p>Thanks,<br>The Tane Team</p>"#
+        );
+
+        let footer_html = format!(
+            r#"<p style="margin: 0 0 8px 0;">
+            You're receiving this because you requested account recovery for Tane.
+        </p>
+        <p style="margin: 0;">
+            <a href="{escaped_frontend}" style="color: #4f46e5;">tane.ai</a>
+        </p>"#
+        );
+
+        let html_body = email_template(&escaped_frontend, &body_html, &footer_html);
+
+        let text_body = format!(
+            "\
+Recover Your Account
+
+Hi {display_name},
+
+Click the link below to recover your account and set a new password:
+
+{recovery_link}
+
+IMPORTANT: This link expires in 15 minutes and can only be used once.
+
+If you didn't request this, please ignore this email. Your account is secure\u{2014}no changes have been made.
+
+Thanks,
+The Tane Team
+
+---
+You're receiving this email because you requested account recovery for Tane.
+{frontend_url}
+",
+        );
+
+        self.send_email(email, subject, &html_body, Some(&text_body), None, &[])
+            .await
+    }
+
+    /// Send a verification email for account signup.
+    ///
+    /// Returns `true` if sent successfully.
+    pub async fn send_verification_email(
+        &self,
+        email: &str,
+        name: &str,
+        verification_link: &str,
+    ) -> bool {
+        let display_name = if name.is_empty() { "there" } else { name };
+        let frontend_url = &self.frontend_url;
+        let subject = "Verify your Tane account";
+
+        let escaped_frontend = html_escape(frontend_url);
+        let escaped_name = html_escape(display_name);
+        let escaped_link = html_escape(verification_link);
+
+        let body_html = format!(
+            r#"<h1>Verify Your Email</h1>
+
+        <p>Hi {escaped_name},</p>
+
+        <p>Thanks for signing up for Tane! Click the button below to verify your email address and complete your account setup:</p>
+
+        <div class="cta">
+            <a href="{escaped_link}" class="button">Verify Email Address</a>
+        </div>
+
+        <p style="color: #e74c3c; font-size: 14px;"><strong>This link expires in 24 hours.</strong></p>
+
+        <p>If you didn't create a Tane account, please ignore this email.</p>
+
+        <p>Thanks,<br>The Tane Team</p>"#
+        );
+
+        let footer_html = format!(
+            r#"<p style="margin: 0 0 8px 0;">
+            You're receiving this because someone signed up for Tane with this email address.
+        </p>
+        <p style="margin: 0;">
+            <a href="{escaped_frontend}" style="color: #4f46e5;">tane.ai</a>
+        </p>"#
+        );
+
+        let html_body = email_template(&escaped_frontend, &body_html, &footer_html);
+
+        let text_body = format!(
+            "\
+Verify Your Email
+
+Hi {display_name},
+
+Thanks for signing up for Tane! Click the link below to verify your email address and complete your account setup:
+
+{verification_link}
+
+IMPORTANT: This link expires in 24 hours.
+
+If you didn't create a Tane account, please ignore this email.
+
+Thanks,
+The Tane Team
+
+---
+You're receiving this because someone signed up for Tane with this email address.
+{frontend_url}
+",
+        );
+
+        self.send_email(email, subject, &html_body, Some(&text_body), None, &[])
+            .await
+    }
+
+    /// Send a welcome email to a new newsletter subscriber.
+    ///
+    /// Returns `true` if sent successfully.
+    pub async fn send_subscription_welcome(
+        &self,
+        email: &str,
+    ) -> bool {
+        let frontend_url = &self.frontend_url;
+        let subject = "Welcome to Tane!";
+
+        let escaped_email = html_escape(email);
+
+        let body_html = format!(
+            r#"<h1>Welcome to Tane!</h1>
+
+        <p>Thanks for signing up! We're excited to have you on board.</p>
+
+        <p>Your team uses Tane to collaborate and get work done together.</p>
+
+        <p>We'll keep you updated on new features and when your account is ready.</p>
+
+        <div class="cta">
+            <a href="{frontend_url}" class="button">Visit Tane</a>
+        </div>
+
+        <p>Thanks,<br>The Tane Team</p>"#
+        );
+
+        let footer_html = format!(
+            r#"<p style="margin: 0 0 8px 0;">
+            You're receiving this because you signed up for updates from Tane.
+        </p>
+        <p style="margin: 0;">
+            <a href="{frontend_url}/unsubscribe?email={escaped_email}">Unsubscribe</a> &middot;
+            <a href="{frontend_url}" style="color: #4f46e5;">tane.ai</a>
+        </p>"#
+        );
+
+        let html_body = email_template(frontend_url, &body_html, &footer_html);
+
+        let text_body = format!(
+            "\
+Welcome to Tane!
+
+Thanks for signing up! We're excited to have you on board.
+
+Your team uses Tane to collaborate and get work done together.
+
+We'll keep you updated on new features and when your account is ready.
+
+Visit Tane: {frontend_url}
+
+Thanks,
+The Tane Team
+
+---
+You're receiving this because you signed up for updates from Tane.
+Unsubscribe: {frontend_url}/unsubscribe?email={email}
+{frontend_url}
+",
+        );
+
+        self.send_email(email, subject, &html_body, Some(&text_body), None, &[])
+            .await
+    }
+
+    /// Send a plain admin notification email (feedback alerts, signup alerts).
+    ///
+    /// Uses minimal styling — these are internal notifications, not user-facing emails.
+    /// `reply_to` sets the Reply-To header so support can reply directly to the user.
+    pub async fn send_admin_notification(
+        &self,
+        to_email: &str,
+        subject: &str,
+        sections: &[(& str, &str)],
+        reply_to: Option<&str>,
+    ) -> bool {
+        let frontend_url = &self.frontend_url;
+
+        // Build HTML sections
+        let html_sections: String = sections
+            .iter()
+            .map(|(label, value)| {
+                format!(
+                    r#"<tr><td style="padding:4px 12px 4px 0;font-weight:600;vertical-align:top;white-space:nowrap;">{}</td><td style="padding:4px 0;">{}</td></tr>"#,
+                    html_escape(label),
+                    html_escape(value),
+                )
+            })
+            .collect();
+
+        let escaped_subject = html_escape(subject);
+        let html_body = admin_email_template(frontend_url, &escaped_subject, &html_sections);
+
+        // Build text sections
+        let text_sections: String = sections
+            .iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let text_body = format!("{subject}\n\n{text_sections}\n\n---\ntane.ai\n");
+
+        self.send_email(to_email, subject, &html_body, Some(&text_body), reply_to, &[])
+            .await
+    }
+}
+
+/// Produce a full HTML email document with the shared Tane branding.
+///
+/// `frontend_url` — base URL used for logo link and footer links.
+/// `body_html`    — unique content inserted inside `<div class="content">…</div>`.
+/// `footer_html`  — content inserted inside `<div class="footer">…</div>`.
+///
+/// The returned string includes `<!DOCTYPE html>`, the shared `<style>` block with
+/// all CSS classes used by any user-facing template (including dark-mode media query),
+/// the CID-referenced logo header, and all closing tags.
+fn email_template(frontend_url: &str, body_html: &str, footer_html: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -385,770 +819,23 @@ impl EmailService {
         </a>
     </div>
     <div class="content">
-        <h1>You're Invited!</h1>
-
-        <p><strong>{inviter_name}</strong> has invited you to join <strong>{workspace_name}</strong> as {role_display}.</p>
-
-        <p>To accept this invitation, sign in with the email address this was sent to ({email}).</p>
-
-        <div class="cta">
-            <a href="{frontend_url}/login" class="button">Accept Invitation</a>
-        </div>
-
-        <p>This invitation will expire in 7 days.</p>
+        {body_html}
     </div>
     <div class="footer">
-        <p style="margin: 0 0 8px 0;">
-            You're receiving this because you were invited to join a workspace on Tane.
-        </p>
-        <p style="margin: 0;">
-            <a href="{frontend_url}/unsubscribe?email={email}">Unsubscribe</a> &middot;
-            <a href="{frontend_url}/privacy">Privacy</a> &middot;
-            <a href="{frontend_url}/terms">Terms</a> &middot;
-            <a href="{frontend_url}" style="color: #4f46e5;">tane.ai</a>
-        </p>
+        {footer_html}
     </div>
 </body>
-</html>"#,
-            inviter_name = html_escape(inviter_name),
-            workspace_name = html_escape(workspace_name),
-            role_display = role_display,
-            email = html_escape(email),
-        );
-
-        let text_body = format!(
-            "\
-You're Invited!
-
-{inviter_name} has invited you to join {workspace_name} as {role_display}.
-
-To accept, sign in with this email address ({email}):
-{frontend_url}/login
-
-This invitation will expire in 7 days.
-",
-        );
-
-        self.send_email(email, &subject, &html_body, Some(&text_body), None, &[])
-            .await
-    }
-
-    /// Send an ownership transfer notification email.
-    ///
-    /// `variant` is either "initiated" (sent to recipient) or "confirmation" (sent to current owner).
-    pub async fn send_ownership_transfer(
-        &self,
-        email: &str,
-        workspace_name: &str,
-        from_name: &str,
-        to_name: &str,
-        variant: &str,
-    ) -> bool {
-        let (subject, body_text) = if variant == "initiated" {
-            (
-                format!("You've been offered ownership of {workspace_name}"),
-                format!(
-                    "{from_name} wants to transfer ownership of {workspace_name} to you. \
-                     Log in to review and accept or decline this transfer."
-                ),
-            )
-        } else {
-            (
-                format!("Ownership transfer initiated for {workspace_name}"),
-                format!(
-                    "You initiated an ownership transfer of {workspace_name} to {to_name}. \
-                     They have 7 days to accept. You can cancel this transfer from workspace settings."
-                ),
-            )
-        };
-
-        let html_body = format!(
-            r#"
-        <h1>{subject}</h1>
-        <p>{body_text}</p>
-        <div class="cta">
-            <a href="{frontend_url}/settings/team" class="button">View in Settings</a>
-        </div>
-"#,
-            subject = subject,
-            body_text = body_text,
-            frontend_url = self.frontend_url,
-        );
-
-        let text_body = format!("{subject}\n\n{body_text}\n\nView: {}/settings/team\n", self.frontend_url);
-
-        self.send_email(email, &subject, &html_body, Some(&text_body), None, &[])
-            .await
-    }
-
-    /// Send a passkey recovery email.
-    ///
-    /// Returns `true` if sent successfully.
-    pub async fn send_passkey_recovery(
-        &self,
-        email: &str,
-        name: &str,
-        recovery_link: &str,
-    ) -> bool {
-        let display_name = if name.is_empty() { "there" } else { name };
-        let frontend_url = &self.frontend_url;
-        let subject = "Recover your Tane account";
-
-        let html_body = format!(
-            r#"<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="color-scheme" content="light dark">
-    <meta name="supported-color-schemes" content="light dark">
-    <style>
-        :root {{ color-scheme: light dark; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #1C1917;
-            max-width: 600px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #FAFAF8;
-        }}
-        .header {{
-            text-align: center;
-            margin-bottom: 16px;
-            padding: 16px 0;
-            border-bottom: 1px solid #E8E5DE;
-        }}
-        .logo-img {{
-            height: 48px;
-            width: auto;
-        }}
-        .content {{
-            padding: 20px 0;
-        }}
-        h1 {{
-            color: #1C1917;
-            font-size: 24px;
-            font-weight: 700;
-            margin-bottom: 16px;
-        }}
-        p {{
-            color: #6B6660;
-            font-size: 14px;
-            margin: 12px 0;
-        }}
-        .cta {{
-            text-align: center;
-            margin: 32px 0;
-        }}
-        .button {{
-            display: inline-block;
-            background-color: #4f46e5;
-            color: #ffffff !important;
-            padding: 14px 28px;
-            text-decoration: none;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 14px;
-        }}
-        .footer {{
-            margin-top: 20px;
-            padding-top: 16px;
-            border-top: 1px solid #E8E5DE;
-            text-align: center;
-            color: #9C9790;
-            font-size: 12px;
-        }}
-        .footer a {{
-            color: #6B6660;
-            text-decoration: none;
-        }}
-        .footer a:hover {{
-            text-decoration: underline;
-        }}
-        @media (prefers-color-scheme: dark) {{
-            body {{ background-color: #12100F !important; color: #F5F3EF !important; }}
-            h1, h2, h3 {{ color: #F5F3EF !important; }}
-            p {{ color: #A8A29E !important; }}
-            .header {{ border-bottom-color: #2E2925 !important; }}
-            .highlight {{ background-color: #2C241E !important; }}
-            .feature {{ color: #A8A29E !important; }}
-            .footer {{ border-top-color: #2E2925 !important; color: #78716C !important; }}
-            .footer a {{ color: #A8A29E !important; }}
-        }}
-    </style>
-</head>
-<body style="background-color: #FAFAF8; color: #1C1917;">
-    <div class="header">
-        <a href="{frontend_url}" style="text-decoration: none;">
-            <img src="cid:tane_logo" alt="Tane" class="logo-img" style="height: 48px; width: auto;">
-        </a>
-    </div>
-    <div class="content">
-        <h1>Recover Your Account</h1>
-
-        <p>Hi {display_name},</p>
-
-        <p>Click the button below to recover your account and create a new passkey:</p>
-
-        <div class="cta">
-            <a href="{recovery_link}" class="button">Create New Passkey</a>
-        </div>
-
-        <p style="color: #e74c3c; font-size: 14px;"><strong>This link expires in 15 minutes and can only be used once.</strong></p>
-
-        <p>If you didn't request this, please ignore this email. Your account is secure—no changes have been made.</p>
-
-        <p>Thanks,<br>The Tane Team</p>
-    </div>
-    <div class="footer">
-        <p style="margin: 0 0 8px 0;">
-            You're receiving this because you requested account recovery for Tane.
-        </p>
-        <p style="margin: 0;">
-            <a href="{frontend_url}" style="color: #4f46e5;">tane.ai</a>
-        </p>
-    </div>
-</body>
-</html>"#,
-            frontend_url = html_escape(frontend_url),
-            display_name = html_escape(display_name),
-            recovery_link = html_escape(recovery_link),
-        );
-
-        let text_body = format!(
-            "\
-Recover Your Account
-
-Hi {display_name},
-
-Click the link below to recover your account and create a new passkey:
-
-{recovery_link}
-
-IMPORTANT: This link expires in 15 minutes and can only be used once.
-
-If you didn't request this, please ignore this email. Your account is secure\u{2014}no changes have been made.
-
-Thanks,
-The Tane Team
-
----
-You're receiving this email because you requested account recovery for Tane.
-{frontend_url}
-",
-        );
-
-        self.send_email(email, subject, &html_body, Some(&text_body), None, &[])
-            .await
-    }
-
-    /// Send an account recovery email.
-    ///
-    /// Returns `true` if sent successfully.
-    pub async fn send_account_recovery(
-        &self,
-        email: &str,
-        name: &str,
-        recovery_link: &str,
-    ) -> bool {
-        let display_name = if name.is_empty() { "there" } else { name };
-        let frontend_url = &self.frontend_url;
-        let subject = "Recover your Tane account";
-
-        let html_body = format!(
-            r#"<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="color-scheme" content="light dark">
-    <meta name="supported-color-schemes" content="light dark">
-    <style>
-        :root {{ color-scheme: light dark; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #1C1917;
-            max-width: 600px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #FAFAF8;
-        }}
-        .header {{
-            text-align: center;
-            margin-bottom: 16px;
-            padding: 16px 0;
-            border-bottom: 1px solid #E8E5DE;
-        }}
-        .logo-img {{
-            height: 48px;
-            width: auto;
-        }}
-        .content {{
-            padding: 20px 0;
-        }}
-        h1 {{
-            color: #1C1917;
-            font-size: 24px;
-            font-weight: 700;
-            margin-bottom: 16px;
-        }}
-        p {{
-            color: #6B6660;
-            font-size: 14px;
-            margin: 12px 0;
-        }}
-        .cta {{
-            text-align: center;
-            margin: 32px 0;
-        }}
-        .button {{
-            display: inline-block;
-            background-color: #4f46e5;
-            color: #ffffff !important;
-            padding: 14px 28px;
-            text-decoration: none;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 14px;
-        }}
-        .footer {{
-            margin-top: 20px;
-            padding-top: 16px;
-            border-top: 1px solid #E8E5DE;
-            text-align: center;
-            color: #9C9790;
-            font-size: 12px;
-        }}
-        .footer a {{
-            color: #6B6660;
-            text-decoration: none;
-        }}
-        .footer a:hover {{
-            text-decoration: underline;
-        }}
-        @media (prefers-color-scheme: dark) {{
-            body {{ background-color: #12100F !important; color: #F5F3EF !important; }}
-            h1, h2, h3 {{ color: #F5F3EF !important; }}
-            p {{ color: #A8A29E !important; }}
-            .header {{ border-bottom-color: #2E2925 !important; }}
-            .highlight {{ background-color: #2C241E !important; }}
-            .feature {{ color: #A8A29E !important; }}
-            .footer {{ border-top-color: #2E2925 !important; color: #78716C !important; }}
-            .footer a {{ color: #A8A29E !important; }}
-        }}
-    </style>
-</head>
-<body style="background-color: #FAFAF8; color: #1C1917;">
-    <div class="header">
-        <a href="{frontend_url}" style="text-decoration: none;">
-            <img src="cid:tane_logo" alt="Tane" class="logo-img" style="height: 48px; width: auto;">
-        </a>
-    </div>
-    <div class="content">
-        <h1>Recover Your Account</h1>
-
-        <p>Hi {display_name},</p>
-
-        <p>Click the button below to recover your account and set a new password:</p>
-
-        <div class="cta">
-            <a href="{recovery_link}" class="button">Recover Account</a>
-        </div>
-
-        <p style="color: #e74c3c; font-size: 14px;"><strong>This link expires in 15 minutes and can only be used once.</strong></p>
-
-        <p>If you didn't request this, please ignore this email. Your account is secure—no changes have been made.</p>
-
-        <p>Thanks,<br>The Tane Team</p>
-    </div>
-    <div class="footer">
-        <p style="margin: 0 0 8px 0;">
-            You're receiving this because you requested account recovery for Tane.
-        </p>
-        <p style="margin: 0;">
-            <a href="{frontend_url}" style="color: #4f46e5;">tane.ai</a>
-        </p>
-    </div>
-</body>
-</html>"#,
-            frontend_url = html_escape(frontend_url),
-            display_name = html_escape(display_name),
-            recovery_link = html_escape(recovery_link),
-        );
-
-        let text_body = format!(
-            "\
-Recover Your Account
-
-Hi {display_name},
-
-Click the link below to recover your account and set a new password:
-
-{recovery_link}
-
-IMPORTANT: This link expires in 15 minutes and can only be used once.
-
-If you didn't request this, please ignore this email. Your account is secure\u{2014}no changes have been made.
-
-Thanks,
-The Tane Team
-
----
-You're receiving this email because you requested account recovery for Tane.
-{frontend_url}
-",
-        );
-
-        self.send_email(email, subject, &html_body, Some(&text_body), None, &[])
-            .await
-    }
-
-    /// Send a verification email for account signup.
-    ///
-    /// Returns `true` if sent successfully.
-    pub async fn send_verification_email(
-        &self,
-        email: &str,
-        name: &str,
-        verification_link: &str,
-    ) -> bool {
-        let display_name = if name.is_empty() { "there" } else { name };
-        let frontend_url = &self.frontend_url;
-        let subject = "Verify your Tane account";
-
-        let html_body = format!(
-            r#"<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="color-scheme" content="light dark">
-    <meta name="supported-color-schemes" content="light dark">
-    <style>
-        :root {{ color-scheme: light dark; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #1C1917;
-            max-width: 600px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #FAFAF8;
-        }}
-        .header {{
-            text-align: center;
-            margin-bottom: 16px;
-            padding: 16px 0;
-            border-bottom: 1px solid #E8E5DE;
-        }}
-        .logo-img {{
-            height: 48px;
-            width: auto;
-        }}
-        .content {{
-            padding: 20px 0;
-        }}
-        h1 {{
-            color: #1C1917;
-            font-size: 24px;
-            font-weight: 700;
-            margin-bottom: 16px;
-        }}
-        p {{
-            color: #6B6660;
-            font-size: 14px;
-            margin: 12px 0;
-        }}
-        .cta {{
-            text-align: center;
-            margin: 32px 0;
-        }}
-        .button {{
-            display: inline-block;
-            background-color: #4f46e5;
-            color: #ffffff !important;
-            padding: 14px 28px;
-            text-decoration: none;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 14px;
-        }}
-        .footer {{
-            margin-top: 20px;
-            padding-top: 16px;
-            border-top: 1px solid #E8E5DE;
-            text-align: center;
-            color: #9C9790;
-            font-size: 12px;
-        }}
-        .footer a {{
-            color: #6B6660;
-            text-decoration: none;
-        }}
-        .footer a:hover {{
-            text-decoration: underline;
-        }}
-        @media (prefers-color-scheme: dark) {{
-            body {{ background-color: #12100F !important; color: #F5F3EF !important; }}
-            h1, h2, h3 {{ color: #F5F3EF !important; }}
-            p {{ color: #A8A29E !important; }}
-            .header {{ border-bottom-color: #2E2925 !important; }}
-            .highlight {{ background-color: #2C241E !important; }}
-            .feature {{ color: #A8A29E !important; }}
-            .footer {{ border-top-color: #2E2925 !important; color: #78716C !important; }}
-            .footer a {{ color: #A8A29E !important; }}
-        }}
-    </style>
-</head>
-<body style="background-color: #FAFAF8; color: #1C1917;">
-    <div class="header">
-        <a href="{frontend_url}" style="text-decoration: none;">
-            <img src="cid:tane_logo" alt="Tane" class="logo-img" style="height: 48px; width: auto;">
-        </a>
-    </div>
-    <div class="content">
-        <h1>Verify Your Email</h1>
-
-        <p>Hi {display_name},</p>
-
-        <p>Thanks for signing up for Tane! Click the button below to verify your email address and complete your account setup:</p>
-
-        <div class="cta">
-            <a href="{verification_link}" class="button">Verify Email Address</a>
-        </div>
-
-        <p style="color: #e74c3c; font-size: 14px;"><strong>This link expires in 24 hours.</strong></p>
-
-        <p>If you didn't create a Tane account, please ignore this email.</p>
-
-        <p>Thanks,<br>The Tane Team</p>
-    </div>
-    <div class="footer">
-        <p style="margin: 0 0 8px 0;">
-            You're receiving this because someone signed up for Tane with this email address.
-        </p>
-        <p style="margin: 0;">
-            <a href="{frontend_url}" style="color: #4f46e5;">tane.ai</a>
-        </p>
-    </div>
-</body>
-</html>"#,
-            frontend_url = html_escape(frontend_url),
-            display_name = html_escape(display_name),
-            verification_link = html_escape(verification_link),
-        );
-
-        let text_body = format!(
-            "\
-Verify Your Email
-
-Hi {display_name},
-
-Thanks for signing up for Tane! Click the link below to verify your email address and complete your account setup:
-
-{verification_link}
-
-IMPORTANT: This link expires in 24 hours.
-
-If you didn't create a Tane account, please ignore this email.
-
-Thanks,
-The Tane Team
-
----
-You're receiving this because someone signed up for Tane with this email address.
-{frontend_url}
-",
-        );
-
-        self.send_email(email, subject, &html_body, Some(&text_body), None, &[])
-            .await
-    }
-
-    /// Send a welcome email to a new newsletter subscriber.
-    ///
-    /// Returns `true` if sent successfully.
-    pub async fn send_subscription_welcome(
-        &self,
-        email: &str,
-    ) -> bool {
-        let frontend_url = &self.frontend_url;
-        let subject = "Welcome to Tane!";
-
-        let html_body = format!(
-            r#"<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="color-scheme" content="light dark">
-    <meta name="supported-color-schemes" content="light dark">
-    <style>
-        :root {{ color-scheme: light dark; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #1C1917;
-            max-width: 600px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #FAFAF8;
-        }}
-        .header {{
-            text-align: center;
-            margin-bottom: 16px;
-            padding: 16px 0;
-            border-bottom: 1px solid #E8E5DE;
-        }}
-        .logo-img {{
-            height: 48px;
-            width: auto;
-        }}
-        .content {{
-            padding: 20px 0;
-        }}
-        h1 {{
-            color: #1C1917;
-            font-size: 24px;
-            font-weight: 700;
-            margin-bottom: 16px;
-        }}
-        p {{
-            color: #6B6660;
-            font-size: 14px;
-            margin: 12px 0;
-        }}
-        .cta {{
-            text-align: center;
-            margin: 32px 0;
-        }}
-        .button {{
-            display: inline-block;
-            background-color: #4f46e5;
-            color: #ffffff !important;
-            padding: 14px 28px;
-            text-decoration: none;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 14px;
-        }}
-        .footer {{
-            margin-top: 20px;
-            padding-top: 16px;
-            border-top: 1px solid #E8E5DE;
-            text-align: center;
-            color: #9C9790;
-            font-size: 12px;
-        }}
-        .footer a {{
-            color: #6B6660;
-            text-decoration: none;
-        }}
-        .footer a:hover {{
-            text-decoration: underline;
-        }}
-        @media (prefers-color-scheme: dark) {{
-            body {{ background-color: #12100F !important; color: #F5F3EF !important; }}
-            h1, h2, h3 {{ color: #F5F3EF !important; }}
-            p {{ color: #A8A29E !important; }}
-            .header {{ border-bottom-color: #2E2925 !important; }}
-            .highlight {{ background-color: #2C241E !important; }}
-            .feature {{ color: #A8A29E !important; }}
-            .footer {{ border-top-color: #2E2925 !important; color: #78716C !important; }}
-            .footer a {{ color: #A8A29E !important; }}
-        }}
-    </style>
-</head>
-<body style="background-color: #FAFAF8; color: #1C1917;">
-    <div class="header">
-        <a href="{frontend_url}" style="text-decoration: none;">
-            <img src="cid:tane_logo" alt="Tane" class="logo-img" style="height: 48px; width: auto;">
-        </a>
-    </div>
-    <div class="content">
-        <h1>Welcome to Tane!</h1>
-
-        <p>Thanks for signing up! We're excited to have you on board.</p>
-
-        <p>Your team uses Tane to collaborate and get work done together.</p>
-
-        <p>We'll keep you updated on new features and when your account is ready.</p>
-
-        <div class="cta">
-            <a href="{frontend_url}" class="button">Visit Tane</a>
-        </div>
-
-        <p>Thanks,<br>The Tane Team</p>
-    </div>
-    <div class="footer">
-        <p style="margin: 0 0 8px 0;">
-            You're receiving this because you signed up for updates from Tane.
-        </p>
-        <p style="margin: 0;">
-            <a href="{frontend_url}/unsubscribe?email={email}">Unsubscribe</a> &middot;
-            <a href="{frontend_url}" style="color: #4f46e5;">tane.ai</a>
-        </p>
-    </div>
-</body>
-</html>"#,
-            email = html_escape(email),
-        );
-
-        let text_body = format!(
-            "\
-Welcome to Tane!
-
-Thanks for signing up! We're excited to have you on board.
-
-Your team uses Tane to collaborate and get work done together.
-
-We'll keep you updated on new features and when your account is ready.
-
-Visit Tane: {frontend_url}
-
-Thanks,
-The Tane Team
-
----
-You're receiving this because you signed up for updates from Tane.
-Unsubscribe: {frontend_url}/unsubscribe?email={email}
-{frontend_url}
-",
-        );
-
-        self.send_email(email, subject, &html_body, Some(&text_body), None, &[])
-            .await
-    }
-
-    /// Send a plain admin notification email (feedback alerts, signup alerts).
-    ///
-    /// Uses minimal styling — these are internal notifications, not user-facing emails.
-    /// `reply_to` sets the Reply-To header so support can reply directly to the user.
-    pub async fn send_admin_notification(
-        &self,
-        to_email: &str,
-        subject: &str,
-        sections: &[(& str, &str)],
-        reply_to: Option<&str>,
-    ) -> bool {
-        let frontend_url = &self.frontend_url;
-
-        // Build HTML sections
-        let html_sections: String = sections
-            .iter()
-            .map(|(label, value)| {
-                format!(
-                    r#"<tr><td style="padding:4px 12px 4px 0;font-weight:600;vertical-align:top;white-space:nowrap;">{}</td><td style="padding:4px 0;">{}</td></tr>"#,
-                    html_escape(label),
-                    html_escape(value),
-                )
-            })
-            .collect();
-
-        let html_body = format!(
-            r#"<!DOCTYPE html>
+</html>"#
+    )
+}
+
+/// Produce a full HTML email document for internal admin notifications.
+///
+/// Uses a distinct, minimal template: table layout for key-value sections,
+/// no `.content` wrapper, and `td`-specific dark-mode rules.
+fn admin_email_template(frontend_url: &str, subject: &str, sections_html: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -1208,28 +895,14 @@ Unsubscribe: {frontend_url}/unsubscribe?email={email}
     </div>
     <h2 style="margin:0 0 16px 0;">{subject}</h2>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
-        {html_sections}
+        {sections_html}
     </table>
     <div class="footer">
         <p style="margin:0;"><a href="{frontend_url}" style="color: #4f46e5;">tane.ai</a></p>
     </div>
 </body>
-</html>"#,
-            subject = html_escape(subject),
-        );
-
-        // Build text sections
-        let text_sections: String = sections
-            .iter()
-            .map(|(label, value)| format!("{label}: {value}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let text_body = format!("{subject}\n\n{text_sections}\n\n---\ntane.ai\n");
-
-        self.send_email(to_email, subject, &html_body, Some(&text_body), reply_to, &[])
-            .await
-    }
+</html>"#
+    )
 }
 
 /// HTML escaping for user-provided strings inserted into email templates.

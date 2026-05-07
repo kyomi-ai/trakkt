@@ -12,7 +12,6 @@
 //! `&webauthn_rs::Webauthn`.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use sha2::{Digest, Sha256};
 use webauthn_rs::prelude::*;
 
 use tane_core::{DbPool, KVPool};
@@ -235,14 +234,8 @@ pub async fn start_passkey_registration(
     let email = &db_user.email;
     let display_name = db_user.name.as_deref().unwrap_or(email);
 
-    // Generate deterministic user handle from email (same as auth_passkeys.rs).
-    let user_unique_id = {
-        let mut hasher = Sha256::new();
-        hasher.update(email.as_bytes());
-        let hash = hasher.finalize();
-        let bytes: [u8; 16] = hash[..16].try_into().expect("16 bytes");
-        Uuid::from_bytes(bytes)
-    };
+    // Deterministic user handle from email — shared helper in auth_service.
+    let user_unique_id = crate::auth_service::webauthn_user_id(email);
 
     let creds = crate::user_service::get_passkey_credentials(pool, user_id).await?;
 

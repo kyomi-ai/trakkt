@@ -4,8 +4,8 @@
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
     <title>Tane</title>
-    <link rel="icon" type="image/svg+xml" href="/tane_small_logo.svg"/>
-    <link rel="apple-touch-icon" href="/tane_icon_192.png"/>
+    <link rel="icon" type="image/svg+xml" href="/public/tane_small_logo.svg"/>
+    <link rel="apple-touch-icon" href="/public/tane_icon_192.png"/>
 
     <!-- Detect theme before CSS loads — prevents flash of wrong theme.
          Reads tane-theme from localStorage (light|dark|system).
@@ -39,7 +39,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Instrument+Serif:ital@0;1&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/output-10201147765f0553.css" integrity="sha384-XkfjGrywbGRR21QIH55MEp45yNV7T1mNDoMnyD1vnvDF8uH51kE9qnystUE6ieTX"/>
+    <link rel="stylesheet" href="/output-9a380873fcb510a8.css" integrity="sha384-RNQRZeY21RqgXXiCJrLvv6khtQSFRGyDhYxr5WQX0Da4d5WdEN/1JNagJ9g1fI0d"/>
     
 
 
@@ -98,8 +98,8 @@
     </script>
     
 <script type="module">
-import init, * as bindings from '/tane-ui-c20b5ba6ae6aaf32.js';
-const wasm = await init({ module_or_path: '/tane-ui-c20b5ba6ae6aaf32_bg.wasm' });
+import init, * as bindings from '/tane-ui-3563d34b0b9215a.js';
+const wasm = await init({ module_or_path: '/tane-ui-3563d34b0b9215a_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -108,7 +108,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-<link rel="modulepreload" href="/tane-ui-c20b5ba6ae6aaf32.js" crossorigin="anonymous" integrity="sha384-gHFqkANOFiuSlH+8gjwBXoaoEyN+gMw8BMLtx0OJDn5wdbzwxn/CtQZz4sug4w7W"><link rel="preload" href="/tane-ui-c20b5ba6ae6aaf32_bg.wasm" crossorigin="anonymous" integrity="sha384-3haQ1Xa0vwVudt7n+ylcro/mX17frqf0sILZtgwNyKxB4jEKcOZ/Hh8fTF+GedBE" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/tane-ui-3563d34b0b9215a.js" crossorigin="anonymous" integrity="sha384-fc2Jv3Ux3B4pi9KUSg9F1fah4H82Dy0D7pcFSf371sVEWPpTwMsgoIugPrWJgGRz"><link rel="preload" href="/tane-ui-3563d34b0b9215a_bg.wasm" crossorigin="anonymous" integrity="sha384-AI4dabmH7FR81gLUXVIWr5AZV8lYKC1xyNaeS1eGexyd07a9upCd8hU9PKjKQ8CS" as="fetch" type="application/wasm"></head>
 <body class="min-h-screen bg-background text-foreground antialiased">
 
 <!-- Loading screen — visible immediately, replaced when WASM mounts -->

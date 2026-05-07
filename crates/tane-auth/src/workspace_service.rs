@@ -3,10 +3,10 @@
 //! Workspace service — query functions for workspace management.
 //!
 //! Used by workspace endpoints (4C/4D) and user endpoints that need
-//! workspace context. Complements `user_service.rs` which already has
-//! `get_workspace` and `get_workspace_user` for single-record lookups.
+//! workspace context. Single-record lookups (`get_workspace`,
+//! `get_workspace_user`) live in `user_service.rs`.
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use tane_core::enums::TransferStatus;
 use tane_core::models::{
     OwnershipTransfer, Workspace, WorkspaceInvitation, WorkspaceUser,
@@ -275,22 +275,6 @@ pub async fn get_workspace_members_with_users(
     );
     let members = tane_core::db_fetch_all!(pool, MemberWithUser, &sql, workspace_id)?;
     Ok(members)
-}
-
-/// Get a single workspace membership record.
-pub async fn get_workspace_user(
-    pool: &DbPool,
-    workspace_id: &str,
-    user_id: &str,
-) -> tane_core::Result<Option<WorkspaceUser>> {
-    let is_pg = pool.is_postgres();
-    let bt = sql_compat::bool_true(is_pg);
-    let sql = format!(
-        "SELECT * FROM workspace_users \
-         WHERE workspace_id = $1 AND user_id = $2 AND active = {bt}"
-    );
-    let wu = tane_core::db_fetch_optional!(pool, WorkspaceUser, &sql, workspace_id, user_id)?;
-    Ok(wu)
 }
 
 /// Update a member's role in a workspace.
@@ -701,13 +685,16 @@ pub async fn update_workspace_owner(
 // ─── Orchestration ─────────────────────────────────────────────────────────
 
 /// Enriched ownership transfer for display on the accept-ownership page.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// All fields are pre-formatted strings so this type can be used directly
+/// as a server-function return type (no chrono / enum deps on the client).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OwnershipTransferDetail {
     pub transfer_id: String,
     pub workspace_name: String,
     pub from_user_email: String,
-    pub expires_at: DateTime<Utc>,
-    pub status: TransferStatus,
+    pub expires_at: String,
+    pub status: String,
 }
 
 /// Fetch an ownership transfer for a specific recipient, auto-expiring if past
@@ -750,8 +737,8 @@ pub async fn get_transfer_for_recipient(
         transfer_id: transfer.transfer_id,
         workspace_name,
         from_user_email,
-        expires_at: transfer.expires_at,
-        status: transfer.status,
+        expires_at: transfer.expires_at.to_rfc3339(),
+        status: transfer.status.to_string(),
     }))
 }
 
@@ -780,21 +767,12 @@ pub async fn remove_workspace_member(
         }
     }
 
-    let target = get_workspace_user(pool, workspace_id, target_user_id).await?;
+    let target = crate::user_service::get_workspace_user(pool, workspace_id, target_user_id).await?;
     if target.is_none() {
         return Err(tane_core::Error::NotFound(
             "Member not found in workspace".into(),
         ));
     }
-
-    tane_core::db_execute!(
-        pool,
-        "UPDATE chat_sessions SET user_id = $1 \
-         WHERE user_id = $2 AND workspace_id = $3 AND shared = true",
-        owner_user_id,
-        target_user_id,
-        workspace_id
-    )?;
 
     remove_member(pool, workspace_id, target_user_id).await?;
     Ok(())

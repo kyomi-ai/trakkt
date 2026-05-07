@@ -131,7 +131,7 @@ pub fn LoginPage(
     #[cfg(target_arch = "wasm32")]
     {
         let redirect_for_check = redirect_url;
-        let nav_for_check = navigate.clone();
+        let nav_for_check = navigate;
         let user_ctx = leptos::prelude::expect_context::<leptos::prelude::LocalResource<Result<crate::server_fns::context::UserContext, leptos::prelude::ServerFnError>>>();
         Effect::new(move || {
             if let Some(Ok(_)) = user_ctx.get() {
@@ -268,8 +268,6 @@ pub fn LoginPage(
         set_passkey_loading.set(true);
         set_error.set(None);
 
-        let auth_version = leptos::prelude::expect_context::<RwSignal<u64>>();
-
         leptos::task::spawn_local(async move {
             // Step 1: Get challenge from server
             let start_result = passkey_login_start().await;
@@ -299,6 +297,7 @@ pub fn LoginPage(
                 Ok(LoginResult::Success { .. }) => {
                     #[cfg(target_arch = "wasm32")]
                     {
+                        let auth_version = leptos::prelude::expect_context::<RwSignal<u64>>();
                         auth_version.update(|v| *v += 1);
                     }
                 }
@@ -341,8 +340,6 @@ pub fn LoginPage(
             set_verification_needed.set(false);
             set_resend_success.set(false);
 
-            let auth_version = leptos::prelude::expect_context::<RwSignal<u64>>();
-
             leptos::task::spawn_local(async move {
                 let result = login_with_password(
                     current_email.clone(),
@@ -355,6 +352,7 @@ pub fn LoginPage(
                     Ok(LoginResult::Success { .. }) => {
                         #[cfg(target_arch = "wasm32")]
                         {
+                            let auth_version = leptos::prelude::expect_context::<RwSignal<u64>>();
                             auth_version.update(|v| *v += 1);
                         }
                     }

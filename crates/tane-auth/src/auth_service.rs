@@ -12,7 +12,6 @@
 
 use tane_core::{DbPool, KVPool};
 
-use crate::rate_limiter::RateLimitResult;
 use crate::session::{create_authenticated_session, AuthenticatedSession};
 use crate::token_service::DeviceInfo;
 
@@ -609,12 +608,12 @@ pub async fn google_oauth_callback_service(
     }
 
     // Verify CSRF state (optional)
-    let mut oauth_continue = None;
+    let mut _oauth_continue = None;
     if let Some(csrf_state) = state {
         let state_data =
             crate::redis_ops::verify_oauth_state(kv, "google", csrf_state).await?;
         if let Some(state_data) = state_data {
-            oauth_continue = state_data
+            _oauth_continue = state_data
                 .get("oauth_continue")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
@@ -627,37 +626,9 @@ pub async fn google_oauth_callback_service(
     Err(tane_core::Error::NotImplemented("Google OAuth not yet ported".into()))
 }
 
-/// Ensure `google_oauth` auth method exists for the user (idempotent upsert).
-async fn ensure_google_oauth_auth_method(
-    db: &DbPool,
-    user_id: &str,
-) -> tane_core::Result<()> {
-    let auth_method =
-        crate::user_service::get_auth_method(db, user_id, "google_oauth").await?;
-    if auth_method.is_none() {
-        let auth_data = serde_json::json!({
-            "linked_at": chrono::Utc::now().to_rfc3339(),
-        });
-        crate::user_service::upsert_auth_method(db, user_id, "google_oauth", &auth_data).await?;
-    }
-    Ok(())
-}
-
-/// Ensure the user has at least one workspace; create one if not.
-async fn ensure_user_has_workspace(
-    db: &DbPool,
-    user_id: &str,
-    user_name: Option<&str>,
-    email: &str,
-    config: Option<&tane_core::Config>,
-) -> tane_core::Result<()> {
-    let ws_ctx = crate::user_service::get_user_workspace_context(db, user_id).await?;
-    if ws_ctx.is_none() {
-        crate::user_service::create_workspace_for_user(db, user_id, user_name, email, config)
-            .await?;
-    }
-    Ok(())
-}
+// NOTE: ensure_google_oauth_auth_method and ensure_user_has_workspace were
+// removed — they were dead code (never called). They will be re-implemented
+// when the Google OAuth flow is ported from Kyomi.
 
 // TODO: port from Kyomi — update_google_oauth_data (crate::google_oauth)
 
@@ -1013,7 +984,7 @@ pub async fn passkey_register_start_service(
     };
 
     // Generate WebAuthn registration challenge
-    let user_unique_id = webauthn_user_id_inner(email);
+    let user_unique_id = webauthn_user_id(email);
     let display_name = user.name.as_deref().unwrap_or(email);
 
     let creds = crate::user_service::get_passkey_credentials(db, &user.user_id).await?;
@@ -1238,7 +1209,7 @@ pub async fn passkey_signup_complete_service(
     }
 
     // Generate WebAuthn registration challenge
-    let user_unique_id = webauthn_user_id_inner(&email);
+    let user_unique_id = webauthn_user_id(&email);
     let creds = crate::user_service::get_passkey_credentials(db, &user.user_id).await?;
     let exclude_ids = build_exclude_ids(&creds);
     let exclude_opt = if exclude_ids.is_empty() {
@@ -1304,7 +1275,7 @@ pub async fn passkey_recovery_verify_service(
         .await?
         .ok_or_else(|| tane_core::Error::Internal("User not found for recovery token".into()))?;
 
-    let user_unique_id = webauthn_user_id_inner(&email);
+    let user_unique_id = webauthn_user_id(&email);
     let display_name = user.name.as_deref().unwrap_or(&email);
 
     let creds = crate::user_service::get_passkey_credentials(db, &user.user_id).await?;
@@ -1353,15 +1324,6 @@ pub async fn passkey_recovery_verify_service(
 // recovery_start which only need the rate-limit check and some trivial work)
 // ---------------------------------------------------------------------------
 
-/// Check rate limit for a given IP and bucket, returning the result.
-pub async fn check_rate_limit(
-    kv: &KVPool,
-    ip: &str,
-    bucket: &str,
-) -> tane_core::Result<RateLimitResult> {
-    crate::rate_limiter::check_rate_limit(kv, ip, bucket, None).await
-}
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -1369,7 +1331,7 @@ pub async fn check_rate_limit(
 /// Generate a WebAuthn user handle from email (deterministic, matching the server route).
 ///
 /// `sha256(email)[:16]` interpreted as a UUID.
-fn webauthn_user_id_inner(email: &str) -> webauthn_rs::prelude::Uuid {
+pub fn webauthn_user_id(email: &str) -> webauthn_rs::prelude::Uuid {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -1477,7 +1439,7 @@ pub async fn resend_verification_service(
     ip: &str,
     email: &str,
 ) -> tane_core::Result<Option<ResendVerificationResult>> {
-    let rate = check_rate_limit(kv, ip, "register").await?;
+    let rate = crate::rate_limiter::check_rate_limit(kv, ip, "register", None).await?;
     if !rate.allowed {
         return Ok(None);
     }
@@ -1512,7 +1474,7 @@ pub async fn recovery_start_service(
     ip: &str,
     email: &str,
 ) -> tane_core::Result<Option<RecoveryStartResult>> {
-    let rate = check_rate_limit(kv, ip, "register").await?;
+    let rate = crate::rate_limiter::check_rate_limit(kv, ip, "register", None).await?;
     if !rate.allowed {
         return Err(tane_core::Error::BadRequest(format!(
             "Rate limited. Try again in {} seconds",
