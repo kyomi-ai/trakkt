@@ -538,25 +538,26 @@ fn DescriptionEditor(
     description: String,
     on_save: Callback<()>,
 ) -> impl IntoView {
-    use kode_leptos::{EditorMode, MarkdownEditorComponent};
+    use kode_leptos::TreeWysiwygEditor;
 
-    let content = RwSignal::new(description);
+    // Initial content — passed to the editor once, not updated reactively
+    // (updating the content signal would cause re-render and focus loss).
+    let initial_content = Signal::stored(description);
+    let latest_text = RwSignal::new(String::new());
     let edit_version = RwSignal::new(0u32);
 
     let on_change: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text: String| {
-        content.set(text);
+        latest_text.set(text);
         edit_version.update(|v| *v += 1);
         let snapshot = edit_version.get_untracked();
 
-        // Debounce: wait 500ms, then save only if no newer edits arrived
         leptos::task::spawn_local(async move {
             gloo_timers::future::TimeoutFuture::new(500).await;
             if edit_version.get_untracked() != snapshot {
-                return; // A newer edit supersedes this one
+                return;
             }
-            let current_text = content.get_untracked();
+            let current_text = latest_text.get_untracked();
             let desc = if current_text.trim().is_empty() {
-                // Send empty string sentinel to clear description
                 Some(String::new())
             } else {
                 Some(current_text)
@@ -583,10 +584,9 @@ fn DescriptionEditor(
         <div class="mt-6">
             <h2 class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-3">"Description"</h2>
             <div class="border border-border rounded-md overflow-hidden" style="min-height: 200px;">
-                <MarkdownEditorComponent
-                    content=content.read_only()
+                <TreeWysiwygEditor
+                    content=initial_content
                     on_change=on_change
-                    initial_mode=EditorMode::Wysiwyg
                     theme=theme_signal
                 />
             </div>
@@ -693,7 +693,7 @@ fn CommentItem(comment: Comment) -> impl IntoView {
 /// Form for adding a new comment with kode WYSIWYG editor.
 #[component]
 fn NewCommentForm(number: i32, on_created: Callback<()>) -> impl IntoView {
-    use kode_leptos::{EditorMode, MarkdownEditorComponent};
+    use kode_leptos::TreeWysiwygEditor;
 
     let content = RwSignal::new(String::new());
     let (submitting, set_submitting) = signal(false);
@@ -733,10 +733,9 @@ fn NewCommentForm(number: i32, on_created: Callback<()>) -> impl IntoView {
     view! {
         <div class="mt-6">
             <div class="border border-border rounded-md overflow-hidden" style="min-height: 120px;">
-                <MarkdownEditorComponent
+                <TreeWysiwygEditor
                     content=content.read_only()
                     on_change=on_change
-                    initial_mode=EditorMode::Wysiwyg
                     theme=theme_signal
                 />
             </div>

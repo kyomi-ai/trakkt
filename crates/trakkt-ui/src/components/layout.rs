@@ -8,6 +8,8 @@ use leptos_router::components::Outlet;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
+use phosphor_leptos::{Icon, IconWeight};
+
 use crate::components::{CommandPalette, Spinner};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
@@ -131,20 +133,16 @@ fn Sidebar(
         <div class="w-64 bg-[var(--color-sidebar)] border-r border-[var(--color-sidebar-border)] text-[var(--color-sidebar-foreground)] flex flex-col h-full">
             // Logo
             <div class="p-4 border-b border-[var(--color-sidebar-border)]">
-                <a href="/">
-                    <img src="/public/trakkt_full_logo_white.svg" alt="Trakkt" class="h-8"/>
+                <a href="/" class="text-lg font-semibold text-[var(--color-sidebar-foreground)] tracking-tight">
+                    "Trakkt"
                 </a>
             </div>
 
             // Navigation
             <nav class="flex-1 p-3 space-y-1">
-                <a href="/settings/profile" class="flex items-center gap-3 px-3 py-2 rounded-md text-sm text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
-                    </svg>
-                    "Settings"
-                </a>
+                <SidebarNavItem href="/issues" icon=phosphor_leptos::LIST_BULLETS label="Issues"/>
+                <SidebarNavItem href="/board" icon=phosphor_leptos::KANBAN label="Board"/>
+                <SidebarNavItem href="/settings" icon=phosphor_leptos::GEAR_SIX label="Settings"/>
             </nav>
 
             // User menu at bottom
@@ -268,5 +266,39 @@ fn WorkspaceSwitcher(set_user_menu_open: WriteSignal<bool>) -> impl IntoView {
                 }
             })}
         </Suspense>
+    }
+}
+
+#[component]
+fn SidebarNavItem(
+    href: &'static str,
+    icon: phosphor_leptos::IconData,
+    label: &'static str,
+) -> impl IntoView {
+    let path = leptos_router::hooks::use_location().pathname;
+    let is_active = Memo::new(move |_| {
+        let p = path.get();
+        if href == "/settings" {
+            p.starts_with("/settings")
+        } else {
+            p == href || p.starts_with(&format!("{href}/"))
+        }
+    });
+    let weight = Memo::new(move |_| {
+        if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
+    });
+    let class = move || {
+        let base = "flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors";
+        if is_active.get() {
+            format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
+        } else {
+            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)]")
+        }
+    };
+    view! {
+        <a href=href class=class>
+            <Icon icon=icon weight=weight size="18px"/>
+            {label}
+        </a>
     }
 }

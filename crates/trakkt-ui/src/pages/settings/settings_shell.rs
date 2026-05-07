@@ -65,13 +65,9 @@ fn visible_tabs(ctx: &UserContext) -> Vec<&'static str> {
         tabs.push("team");
     }
 
-    if is_admin && !ctx.is_personal_mode {
-        tabs.push("labels");
-    }
-
-    if is_admin && !ctx.is_personal_mode {
-        tabs.push("teams");
-    }
+    // Labels and teams are always visible — even personal mode needs them
+    tabs.push("labels");
+    tabs.push("teams");
 
     tabs
 }
