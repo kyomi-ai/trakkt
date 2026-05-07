@@ -38,7 +38,7 @@ impl IssueStatusVariant {
     }
 
     /// Tailwind background class for the colored dot.
-    fn dot_color(self) -> &'static str {
+    pub fn dot_color(self) -> &'static str {
         match self {
             Self::Backlog => "bg-[#9C9790]",
             Self::Todo => "bg-[#2563EB]",
