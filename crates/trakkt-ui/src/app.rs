@@ -21,6 +21,7 @@ use crate::pages::auth::{
     signup_complete::SignupCompletePage,
 };
 use crate::pages::accept_ownership::AcceptOwnershipPage;
+use crate::pages::issues::issue_detail::IssueDetailPage;
 use crate::pages::issues::issue_list::IssueListPage;
 use crate::pages::onboarding::OnboardingPage;
 use crate::pages::settings::{
@@ -99,11 +100,7 @@ pub fn App() -> impl IntoView {
 
                     // Issue tracker
                     <Route path=path!("/issues") view=IssueListPage/>
-                    <Route path=path!("/issues/:number") view=|| view! {
-                        <div class="flex items-center justify-center h-full text-muted-foreground">
-                            "Issue detail coming soon"
-                        </div>
-                    }/>
+                    <Route path=path!("/issues/:number") view=IssueDetailPage/>
                     <Route path=path!("/board") view=|| view! {
                         <div class="flex items-center justify-center h-full text-muted-foreground">
                             "Board view coming soon"

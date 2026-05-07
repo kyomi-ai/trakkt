@@ -48,6 +48,9 @@ console_error_panic_hook = "0.1"
 # Icons
 phosphor-leptos = "0.8"
 
+# WYSIWYG markdown editor (client-side only, compiles to WASM)
+kode-leptos = { path = "../../../kode/kode-leptos" }
+
 # Browser DOM access
 web-sys = { version = "0.3", features = [
     "Window", "Document", "HtmlElement", "HtmlInputElement",

@@ -97,6 +97,130 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arborium"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db65328fda517795f476b9d1b0794199cce180077e204629946a0705f0093093"
+dependencies = [
+ "arborium-highlight",
+ "arborium-theme",
+ "arborium-tree-sitter",
+ "dlmalloc",
+]
+
+[[package]]
+name = "arborium-css"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "356459e8f05e0d34f11130105a8b41b9ca8d50026d8491de9f8943e46fe4f4d8"
+dependencies = [
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "arborium-highlight"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "517a6778e29dc5d73d3c9993836bad9bc6fdd8bd8037fe7fd3f295e866d5cdab"
+dependencies = [
+ "arborium-theme",
+ "arborium-tree-sitter",
+ "streaming-iterator",
+]
+
+[[package]]
+name = "arborium-html"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10dc4b68331e73185be5ecefa85f14ddbc4cf708c387650046826b04811b7596"
+dependencies = [
+ "arborium-css",
+ "arborium-javascript",
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "arborium-javascript"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2bc4cd42b968c2ba2dbac049ce7e9c94611cad1ff13c0b1dc8c84b0f314f1ce"
+dependencies = [
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "arborium-markdown"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bc5fe5bc91e51a7ce97c48a30bdc84df64d0949c79b9cf2e22da553307a8378"
+dependencies = [
+ "arborium-html",
+ "arborium-sysroot",
+ "arborium-toml",
+ "arborium-yaml",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "arborium-sysroot"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43374e79fbeaedc2bf27eed475c26686c8ed8eef2180854eef22340b9e25b64a"
+dependencies = [
+ "cc",
+ "dlmalloc",
+]
+
+[[package]]
+name = "arborium-theme"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b6dc64ecabaad99640e27c351008b1fd6df46bcfaefab6c0e315aac3247d1d9"
+
+[[package]]
+name = "arborium-toml"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069ccfccf82bc3698431d3845b0398249c331898c04f6bb2c01a465d92821780"
+dependencies = [
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "arborium-tree-sitter"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5a9280a27a2fd42ffbf3b72b99d60122f2c28c55c16c39da8ba2d126d1856c4"
+dependencies = [
+ "arborium-sysroot",
+ "cc",
+ "regex",
+ "regex-syntax",
+ "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "arborium-yaml"
+version = "2.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6271e0c1be230902a18bc00ffc334bd6266c984e46a88a66ea9a13f0fea2b75c"
+dependencies = [
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -893,6 +1017,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "dlmalloc"
+version = "0.2.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f5b01c17f85ee988d832c40e549a64bd89ab2c9f8d8a613bdf5122ae507e294"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1867,6 +2002,51 @@ dependencies = [
  "sha2",
  "signature",
  "simple_asn1",
+]
+
+[[package]]
+name = "kode-core"
+version = "0.2.8"
+dependencies = [
+ "ropey",
+]
+
+[[package]]
+name = "kode-doc"
+version = "0.2.8"
+dependencies = [
+ "arborium-markdown",
+ "arborium-tree-sitter",
+ "smallvec",
+]
+
+[[package]]
+name = "kode-leptos"
+version = "0.2.8"
+dependencies = [
+ "arborium",
+ "arborium-theme",
+ "arborium-tree-sitter",
+ "gloo-timers",
+ "js-sys",
+ "kode-core",
+ "kode-doc",
+ "kode-markdown",
+ "leptos",
+ "log",
+ "send_wrapper",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "kode-markdown"
+version = "0.2.8"
+dependencies = [
+ "arborium-markdown",
+ "arborium-tree-sitter",
+ "kode-core",
 ]
 
 [[package]]
@@ -3260,6 +3440,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ropey"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
+dependencies = [
+ "smallvec",
+ "str_indices",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4030,6 +4220,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "str_indices"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
+
+[[package]]
+name = "streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4639,6 +4841,7 @@ dependencies = [
  "console_error_panic_hook",
  "gloo-timers",
  "js-sys",
+ "kode-leptos",
  "leptos",
  "leptos_axum",
  "leptos_meta",
@@ -4659,6 +4862,12 @@ dependencies = [
  "web-sys",
  "webauthn-rs",
 ]
+
+[[package]]
+name = "tree-sitter-language"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
 name = "try-lock"
