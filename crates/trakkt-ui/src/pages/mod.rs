@@ -2,5 +2,6 @@
 
 pub mod accept_ownership;
 pub mod auth;
+pub mod issues;
 pub mod onboarding;
 pub mod settings;

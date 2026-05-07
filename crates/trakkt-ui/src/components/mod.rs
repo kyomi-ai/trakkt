@@ -3,6 +3,7 @@
 //! Shared UI components — no server-side dependencies.
 
 pub mod action_status;
+pub mod avatar;
 pub mod layout;
 pub mod alert;
 pub mod badge;
@@ -12,10 +13,13 @@ pub mod checkbox;
 pub mod confirm_dialog;
 pub mod empty_state;
 pub mod input;
+pub mod issue_status_badge;
 pub mod label;
+pub mod label_badge;
 pub mod modal;
 pub mod navigation_progress;
 pub mod popover;
+pub mod priority_indicator;
 pub mod search_input;
 pub mod select;
 pub mod skeleton;
@@ -28,6 +32,7 @@ pub mod tooltip;
 
 pub use action_status::ActionStatus;
 pub use alert::{Alert, AlertDescription, AlertTitle, AlertVariant};
+pub use avatar::{Avatar, AvatarSize};
 pub use badge::{Badge, BadgeVariant};
 pub use button::{Button, ButtonLink, ButtonSize, ButtonVariant, ToggleButton};
 pub use card::{Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle};
@@ -35,9 +40,12 @@ pub use checkbox::Checkbox;
 pub use confirm_dialog::ConfirmDialog;
 pub use empty_state::{EmptyState, EmptyStateVariant};
 pub use input::INPUT_CLASS;
+pub use issue_status_badge::{IssueStatusBadge, IssueStatusVariant};
 pub use label::Label;
+pub use label_badge::LabelBadge;
 pub use modal::{Modal, ModalSize};
 pub use navigation_progress::NavigationProgress;
+pub use priority_indicator::PriorityIndicator;
 pub use search_input::SearchInput;
 pub use select::{DynSelect, StyledSelect};
 pub use skeleton::{Skeleton, SettingsPageSkeleton};

@@ -33,6 +33,7 @@ html {
   --color-primary-foreground: #ffffff;
   --color-secondary: #F5F3EF;
   --color-secondary-foreground: #3D3835;
+  --color-surface-alt: #F5F3EF;
   --color-accent: #FEF3C7;
   --color-accent-foreground: #1C1917;
   --color-destructive: #dc2626;
@@ -817,6 +818,7 @@ html {
   --color-primary-foreground: #ffffff;
   --color-secondary: #24201E;
   --color-secondary-foreground: #A8A29E;
+  --color-surface-alt: #2C241E;
   --color-accent: #451A03;
   --color-accent-foreground: #F5F3EF;
   --color-destructive: #dc2626;

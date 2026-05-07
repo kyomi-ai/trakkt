@@ -21,6 +21,7 @@ use crate::pages::auth::{
     signup_complete::SignupCompletePage,
 };
 use crate::pages::accept_ownership::AcceptOwnershipPage;
+use crate::pages::issues::issue_list::IssueListPage;
 use crate::pages::onboarding::OnboardingPage;
 use crate::pages::settings::{
     profile::ProfilePage,
@@ -92,9 +93,22 @@ pub fn App() -> impl IntoView {
 
                 // ── Authenticated routes (Layout provides sidebar + auth guard) ────
                 <ParentRoute path=path!("") view=Layout>
-                    <Route path=path!("/") view=|| view! { <Redirect path="/settings/profile"/> }/>
+                    <Route path=path!("/") view=|| view! { <Redirect path="/issues"/> }/>
                     <Route path=path!("/onboarding") view=OnboardingPage/>
                     <Route path=path!("/accept-ownership/:transfer_id") view=AcceptOwnershipPage/>
+
+                    // Issue tracker
+                    <Route path=path!("/issues") view=IssueListPage/>
+                    <Route path=path!("/issues/:number") view=|| view! {
+                        <div class="flex items-center justify-center h-full text-muted-foreground">
+                            "Issue detail coming soon"
+                        </div>
+                    }/>
+                    <Route path=path!("/board") view=|| view! {
+                        <div class="flex items-center justify-center h-full text-muted-foreground">
+                            "Board view coming soon"
+                        </div>
+                    }/>
 
                     // Settings
                     <ParentRoute path=path!("/settings") view=|| view! {
