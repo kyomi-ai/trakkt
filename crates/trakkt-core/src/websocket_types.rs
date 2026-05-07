@@ -35,6 +35,8 @@ pub enum MessageType {
     DashboardUpdate,
     DatasourceUpdate,
     SyncAction,
+    SyncComplete,
+    SyncReset,
 }
 
 /// A WebSocket message sent to clients.

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Action type for sync log entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SyncActionType {
     Insert,
     Update,
@@ -23,6 +24,18 @@ pub struct SyncAction {
     pub action: SyncActionType,
     pub data: Option<serde_json::Value>,
     pub timestamp: String,
+}
+
+/// Server->client sync response envelope.
+///
+/// Tagged enum serialized as `{"type": "sync_action", ...}` etc.
+/// Used by the WebSocket handler to stream bootstrap and delta data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SyncResponse {
+    SyncAction(SyncAction),
+    SyncComplete { last_sync_id: i64 },
+    SyncReset,
 }
 
 /// Well-known entity type constants for sync log entries.
