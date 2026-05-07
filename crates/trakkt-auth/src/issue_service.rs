@@ -13,6 +13,7 @@ use trakkt_types::models::{CreateIssueParams, Issue, IssueFilters, IssueUpdate, 
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::websocket::WebSocketManager;
 
 // ─── Row types ──────────────────────────────────────────────────────────────
 
@@ -185,6 +186,7 @@ async fn fetch_labels_for_issues(
 pub async fn create_issue(
     db: &DbPool,
     params: &CreateIssueParams,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Issue> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
@@ -237,6 +239,11 @@ pub async fn create_issue(
     .await
     {
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for issue create");
+    }
+
+    // WebSocket broadcast — best-effort.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_notify(ws, entity_types::ISSUE, &params.workspace_id).await;
     }
 
     // Re-fetch to get DB-assigned timestamps.
@@ -412,6 +419,7 @@ pub async fn update_issue(
     workspace_id: &str,
     number: i32,
     updates: &IssueUpdate,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Issue> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
@@ -534,6 +542,11 @@ pub async fn update_issue(
         tracing::warn!(error = %e, issue_id = %issue.issue_id, "Failed to write sync log entry for issue update");
     }
 
+    // WebSocket broadcast — best-effort.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_notify(ws, entity_types::ISSUE, workspace_id).await;
+    }
+
     Ok(issue)
 }
 
@@ -544,6 +557,7 @@ pub async fn delete_issue(
     db: &DbPool,
     workspace_id: &str,
     number: i32,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // Fetch the issue_id first for the sync log entry.
     let issue_row = trakkt_core::db_fetch_optional!(
@@ -587,6 +601,11 @@ pub async fn delete_issue(
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for issue delete");
     }
 
+    // WebSocket broadcast — best-effort.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_notify(ws, entity_types::ISSUE, workspace_id).await;
+    }
+
     Ok(())
 }
 
@@ -598,6 +617,7 @@ pub async fn set_issue_labels(
     db: &DbPool,
     issue_id: &str,
     label_ids: &[String],
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // Remove existing labels.
     trakkt_core::db_execute!(
@@ -636,6 +656,11 @@ pub async fn set_issue_labels(
     .await
     {
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for label update");
+    }
+
+    // WebSocket broadcast — best-effort.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_notify(ws, entity_types::ISSUE, &ws_id).await;
     }
 
     Ok(())

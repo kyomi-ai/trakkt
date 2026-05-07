@@ -11,6 +11,7 @@ use trakkt_types::models::Label;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
 
@@ -44,6 +45,7 @@ pub async fn create_label(
     workspace_id: &str,
     name: &str,
     color: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Label> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
@@ -67,6 +69,11 @@ pub async fn create_label(
     .await
     {
         tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label create");
+    }
+
+    // WebSocket broadcast — best-effort.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_notify(ws, entity_types::LABEL, workspace_id).await;
     }
 
     // Re-fetch to get the DB-assigned created_at.
@@ -119,6 +126,7 @@ pub async fn update_label(
     label_id: &str,
     name: &str,
     color: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Label> {
     let result = trakkt_core::db_execute!(
         db,
@@ -159,6 +167,11 @@ pub async fn update_label(
         tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label update");
     }
 
+    // WebSocket broadcast — best-effort.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_notify(ws, entity_types::LABEL, &label.workspace_id).await;
+    }
+
     Ok(label)
 }
 
@@ -168,6 +181,7 @@ pub async fn update_label(
 pub async fn delete_label(
     db: &DbPool,
     label_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // Fetch workspace_id before delete for the sync log.
     let row = trakkt_core::db_fetch_optional!(
@@ -201,6 +215,11 @@ pub async fn delete_label(
     .await
     {
         tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label delete");
+    }
+
+    // WebSocket broadcast — best-effort.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_notify(ws, entity_types::LABEL, &label.workspace_id).await;
     }
 
     Ok(())

@@ -43,7 +43,7 @@ pub async fn get_default_team() -> Result<Team, ServerFnError> {
 #[server(prefix = "/leptos-api")]
 pub async fn create_team(name: String, key: String) -> Result<Team, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let team = trakkt_auth::team_service::create_team(ac.db(), &ac.ws_id, &name, &key)
+    let team = trakkt_auth::team_service::create_team(ac.db(), &ac.ws_id, &name, &key, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(team)

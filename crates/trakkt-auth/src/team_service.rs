@@ -12,6 +12,7 @@ use trakkt_types::models::Team;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ pub async fn create_team(
     workspace_id: &str,
     name: &str,
     key: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Team> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
@@ -67,6 +69,11 @@ pub async fn create_team(
     .await
     {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team create");
+    }
+
+    // WebSocket broadcast — best-effort.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_notify(ws, entity_types::TEAM, workspace_id).await;
     }
 
     // Re-fetch to get the DB-assigned created_at.

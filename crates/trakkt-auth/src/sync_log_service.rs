@@ -14,8 +14,10 @@
 //! - `data` is stored as JSONB on Postgres and TEXT on SQLite
 
 use trakkt_core::sql_compat;
-use trakkt_core::{db_execute, db_fetch_all, db_fetch_scalar, DbPool};
+use trakkt_core::{db_execute, db_fetch_all, db_fetch_scalar, DbPool, MessageType, WebSocketMessage};
 use trakkt_types::sync::{SyncAction, SyncActionType};
+
+use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
 
@@ -279,6 +281,33 @@ pub async fn prune_old_entries(
     tracing::info!(deleted, retention_days, "Pruned old sync log entries");
 
     Ok(deleted)
+}
+
+// ─── Broadcast helper ────────────────────────────────────────────────────────
+
+/// Broadcast a sync notification to all connected workspace members via WebSocket.
+///
+/// This is a best-effort operation: failures are logged but never propagated.
+/// The message tells clients "something changed for this entity type in this
+/// workspace" so they can perform a delta sync to fetch the actual data.
+///
+/// Called by service functions after a successful `write_sync_entry` to push
+/// real-time updates to connected users.
+pub async fn broadcast_sync_notify(
+    ws_manager: &WebSocketManager,
+    entity_type: &str,
+    workspace_id: &str,
+) {
+    let message = WebSocketMessage::new(MessageType::SyncAction).with_data(
+        serde_json::json!({
+            "entity_type": entity_type,
+            "workspace_id": workspace_id,
+        }),
+    );
+
+    ws_manager
+        .broadcast_to_workspace(workspace_id, message, None)
+        .await;
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

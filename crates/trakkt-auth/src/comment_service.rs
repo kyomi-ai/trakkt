@@ -11,6 +11,7 @@ use trakkt_types::models::Comment;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
 
@@ -69,6 +70,7 @@ pub async fn create_comment(
     user_id: &str,
     body: &str,
     parent_id: Option<&str>,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Comment> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
@@ -80,19 +82,28 @@ pub async fn create_comment(
     );
     trakkt_core::db_execute!(db, &sql, &comment_id, issue_id, user_id, body, parent_id)?;
 
-    // Sync log — best-effort.
-    let workspace_id = get_workspace_for_issue(db, issue_id).await?;
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::COMMENT,
-        &comment_id,
-        &workspace_id,
-        SyncActionType::Insert,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment create");
+    // Sync log + broadcast — best-effort.
+    match get_workspace_for_issue(db, issue_id).await {
+        Ok(workspace_id) => {
+            if let Err(e) = sync_log_service::write_sync_entry(
+                db,
+                entity_types::COMMENT,
+                &comment_id,
+                &workspace_id,
+                SyncActionType::Insert,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment create");
+            }
+            if let Some(ws) = ws_manager {
+                sync_log_service::broadcast_sync_notify(ws, entity_types::COMMENT, &workspace_id).await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, comment_id = %comment_id, "Failed to resolve workspace for sync log");
+        }
     }
 
     // Re-fetch with joined user data.
@@ -140,6 +151,7 @@ pub async fn update_comment(
     comment_id: &str,
     user_id: &str,
     body: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Comment> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
@@ -183,19 +195,28 @@ pub async fn update_comment(
     )?;
     let comment = row.into_dto();
 
-    // Sync log — best-effort.
-    let workspace_id = get_workspace_for_issue(db, &comment.issue_id).await?;
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::COMMENT,
-        comment_id,
-        &workspace_id,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment update");
+    // Sync log + broadcast — best-effort.
+    match get_workspace_for_issue(db, &comment.issue_id).await {
+        Ok(workspace_id) => {
+            if let Err(e) = sync_log_service::write_sync_entry(
+                db,
+                entity_types::COMMENT,
+                comment_id,
+                &workspace_id,
+                SyncActionType::Update,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment update");
+            }
+            if let Some(ws) = ws_manager {
+                sync_log_service::broadcast_sync_notify(ws, entity_types::COMMENT, &workspace_id).await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, comment_id = %comment_id, "Failed to resolve workspace for sync log");
+        }
     }
 
     Ok(comment)
@@ -206,6 +227,7 @@ pub async fn delete_comment(
     db: &DbPool,
     comment_id: &str,
     user_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // Fetch the comment first for ownership check and sync log.
     let row = trakkt_core::db_fetch_optional!(
@@ -237,19 +259,28 @@ pub async fn delete_comment(
         comment_id
     )?;
 
-    // Sync log — best-effort.
-    let workspace_id = get_workspace_for_issue(db, &comment.issue_id).await?;
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::COMMENT,
-        comment_id,
-        &workspace_id,
-        SyncActionType::Delete,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment delete");
+    // Sync log + broadcast — best-effort.
+    match get_workspace_for_issue(db, &comment.issue_id).await {
+        Ok(workspace_id) => {
+            if let Err(e) = sync_log_service::write_sync_entry(
+                db,
+                entity_types::COMMENT,
+                comment_id,
+                &workspace_id,
+                SyncActionType::Delete,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment delete");
+            }
+            if let Some(ws) = ws_manager {
+                sync_log_service::broadcast_sync_notify(ws, entity_types::COMMENT, &workspace_id).await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, comment_id = %comment_id, "Failed to resolve workspace for sync log");
+        }
     }
 
     Ok(())

@@ -30,7 +30,7 @@ pub async fn list_labels() -> Result<Vec<Label>, ServerFnError> {
 #[server(prefix = "/leptos-api")]
 pub async fn create_label(name: String, color: String) -> Result<Label, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let label = trakkt_auth::label_service::create_label(ac.db(), &ac.ws_id, &name, &color)
+    let label = trakkt_auth::label_service::create_label(ac.db(), &ac.ws_id, &name, &color, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(label)
@@ -45,7 +45,7 @@ pub async fn update_label(
 ) -> Result<Label, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     verify_label_ownership(ac.db(), &ac.ws_id, &label_id).await?;
-    let label = trakkt_auth::label_service::update_label(ac.db(), &label_id, &name, &color)
+    let label = trakkt_auth::label_service::update_label(ac.db(), &label_id, &name, &color, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(label)
@@ -56,7 +56,7 @@ pub async fn update_label(
 pub async fn delete_label(label_id: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     verify_label_ownership(ac.db(), &ac.ws_id, &label_id).await?;
-    trakkt_auth::label_service::delete_label(ac.db(), &label_id)
+    trakkt_auth::label_service::delete_label(ac.db(), &label_id, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(())

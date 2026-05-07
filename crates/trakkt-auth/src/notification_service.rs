@@ -12,6 +12,7 @@ use trakkt_types::models::Notification;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::websocket::WebSocketManager;
 
 const DEFAULT_NOTIFICATION_LIMIT: i64 = 50;
 
@@ -59,6 +60,7 @@ pub async fn create_notification(
     user_id: &str,
     issue_id: &str,
     notification_type: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
@@ -91,6 +93,11 @@ pub async fn create_notification(
     .await
     {
         tracing::warn!(error = %e, notification_id = %notification_id, "Failed to write sync log entry for notification create");
+    }
+
+    // WebSocket broadcast — best-effort.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_notify(ws, entity_types::NOTIFICATION, workspace_id).await;
     }
 
     Ok(())

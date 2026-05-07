@@ -42,6 +42,7 @@ pub async fn create_comment(
         &ac.auth.user_id,
         &body,
         parent_id.as_deref(),
+        ac.ctx.ws_manager.as_ref(),
     )
     .await
     .into_sfn()?;
@@ -60,6 +61,7 @@ pub async fn update_comment(
         &comment_id,
         &ac.auth.user_id,
         &body,
+        ac.ctx.ws_manager.as_ref(),
     )
     .await
     .into_sfn()?;
@@ -70,7 +72,7 @@ pub async fn update_comment(
 #[server(prefix = "/leptos-api")]
 pub async fn delete_comment(comment_id: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    trakkt_auth::comment_service::delete_comment(ac.db(), &comment_id, &ac.auth.user_id)
+    trakkt_auth::comment_service::delete_comment(ac.db(), &comment_id, &ac.auth.user_id, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(())

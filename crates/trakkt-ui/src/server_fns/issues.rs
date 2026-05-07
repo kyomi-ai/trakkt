@@ -119,7 +119,7 @@ pub async fn create_issue(
         label_ids: parsed_label_ids,
     };
 
-    let issue = trakkt_auth::issue_service::create_issue(ac.db(), &params)
+    let issue = trakkt_auth::issue_service::create_issue(ac.db(), &params, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(issue)
@@ -154,7 +154,7 @@ pub async fn update_issue(
         assignee_id: assignee_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         due_date: due_date.map(|s| if s.is_empty() { None } else { Some(s) }),
     };
-    let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, number, &updates)
+    let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, number, &updates, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(issue)
@@ -164,7 +164,7 @@ pub async fn update_issue(
 #[server(prefix = "/leptos-api")]
 pub async fn delete_issue(number: i32) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    trakkt_auth::issue_service::delete_issue(ac.db(), &ac.ws_id, number)
+    trakkt_auth::issue_service::delete_issue(ac.db(), &ac.ws_id, number, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(())
@@ -185,7 +185,7 @@ pub async fn set_issue_labels(
 
     let parsed_label_ids = parse_label_ids(&label_ids);
 
-    trakkt_auth::issue_service::set_issue_labels(ac.db(), &issue_id, &parsed_label_ids)
+    trakkt_auth::issue_service::set_issue_labels(ac.db(), &issue_id, &parsed_label_ids, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(())
