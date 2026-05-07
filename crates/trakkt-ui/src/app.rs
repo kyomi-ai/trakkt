@@ -26,10 +26,12 @@ use crate::pages::issues::issue_detail::IssueDetailPage;
 use crate::pages::issues::issue_list::IssueListPage;
 use crate::pages::onboarding::OnboardingPage;
 use crate::pages::settings::{
+    labels::LabelsPage,
     profile::ProfilePage,
     security::security_tab::SecurityTab,
     settings_shell::SettingsShell,
     team::TeamPage,
+    teams_settings::TeamsSettingsPage,
     workspace::WorkspacePage,
 };
 
@@ -142,6 +144,8 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/security") view=SecurityTab/>
                         <Route path=path!("/workspace") view=WorkspacePage/>
                         <Route path=path!("/team") view=TeamPage/>
+                        <Route path=path!("/labels") view=LabelsPage/>
+                        <Route path=path!("/teams") view=TeamsSettingsPage/>
                     </ParentRoute>
                 </ParentRoute>
             </Routes>

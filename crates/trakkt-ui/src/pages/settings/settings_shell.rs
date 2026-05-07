@@ -39,6 +39,8 @@ const TABS: &[SettingsTab] = &[
     SettingsTab { id: "security", name: "Security", icon: phosphor_leptos::SHIELD, path: "security" },
     SettingsTab { id: "workspace", name: "Workspace", icon: phosphor_leptos::GEAR, path: "workspace" },
     SettingsTab { id: "team", name: "Team", icon: phosphor_leptos::USERS, path: "team" },
+    SettingsTab { id: "labels", name: "Labels", icon: phosphor_leptos::TAG, path: "labels" },
+    SettingsTab { id: "teams", name: "Teams", icon: phosphor_leptos::USERS_FOUR, path: "teams" },
 ];
 
 /// Return the list of tab IDs that should be visible for the given user context.
@@ -61,6 +63,14 @@ fn visible_tabs(ctx: &UserContext) -> Vec<&'static str> {
 
     if is_admin && !ctx.is_personal_mode {
         tabs.push("team");
+    }
+
+    if is_admin && !ctx.is_personal_mode {
+        tabs.push("labels");
+    }
+
+    if is_admin && !ctx.is_personal_mode {
+        tabs.push("teams");
     }
 
     tabs
@@ -108,7 +118,7 @@ pub fn SettingsShell() -> impl IntoView {
                         <Transition fallback=move || {
                             // While user_ctx loads, show always-visible tabs.
                             TABS.iter()
-                                .filter(|tab| matches!(tab.id, "profile" | "security" | "workspace" | "team"))
+                                .filter(|tab| matches!(tab.id, "profile" | "security"))
                                 .map(|tab| {
                                     let tab_path = tab.path;
                                     let tab_class = move || {
@@ -134,7 +144,7 @@ pub fn SettingsShell() -> impl IntoView {
                             {move || Suspend::new(async move {
                                 let visible_ids: Vec<&'static str> = match user_ctx.await {
                                     Ok(ctx) => visible_tabs(&ctx),
-                                    _ => vec!["profile", "security", "workspace", "datasources"],
+                                    _ => vec!["profile", "security"],
                                 };
 
                                 TABS.iter()
