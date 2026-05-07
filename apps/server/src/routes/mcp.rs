@@ -493,15 +493,23 @@ async fn handle_tools_call(
         .cloned()
         .unwrap_or(json!({}));
 
-    // Authenticate — all tools require a valid Bearer token.
-    let auth = match authenticate_bearer(headers, &state.db).await {
-        Some(auth) => auth,
-        None => {
-            return JsonRpcResponse::error(
-                id,
-                -32001,
-                "Authentication required. Provide a valid Bearer token in the Authorization header.",
-            );
+    // Authenticate — personal mode skips token auth (single-user, no login).
+    let auth = if state.config.is_personal() {
+        McpAuth {
+            workspace_id: "workspace-local".to_string(),
+            user_id: "user-local".to_string(),
+            scopes: vec![],
+        }
+    } else {
+        match authenticate_bearer(headers, &state.db).await {
+            Some(auth) => auth,
+            None => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32001,
+                    "Authentication required. Provide a valid Bearer token in the Authorization header.",
+                );
+            }
         }
     };
 
