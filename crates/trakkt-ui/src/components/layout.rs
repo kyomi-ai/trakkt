@@ -5,7 +5,10 @@
 use leptos::prelude::*;
 use leptos_router::components::Outlet;
 
-use crate::components::Spinner;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
+
+use crate::components::{CommandPalette, Spinner};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
 
@@ -16,6 +19,7 @@ pub fn Layout() -> impl IntoView {
     let user_info = LocalResource::new(get_sidebar_user);
     let (user_menu_open, set_user_menu_open) = signal(false);
     let (mobile_sidebar_open, set_mobile_sidebar_open) = signal(false);
+    let (show_palette, set_show_palette) = signal(false);
 
     let auth_confirmed = RwSignal::new(false);
     let nav = leptos_router::hooks::use_navigate();
@@ -28,6 +32,31 @@ pub fn Layout() -> impl IntoView {
             }
             None => {}
         }
+    });
+
+    // ── Global Cmd+K / Ctrl+K listener ─────────────────────────────────────
+    Effect::new(move |_| {
+        let Some(window) = web_sys::window() else { return };
+        let cb = Closure::<dyn Fn(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
+            // Cmd+K (macOS) or Ctrl+K (Linux/Windows) toggles the command palette.
+            if ev.key() == "k" && (ev.meta_key() || ev.ctrl_key()) {
+                ev.prevent_default();
+                set_show_palette.update(|v| *v = !*v);
+            }
+        });
+        let _ = window.add_event_listener_with_callback(
+            "keydown",
+            cb.as_ref().unchecked_ref(),
+        );
+        let cb_cleanup = send_wrapper::SendWrapper::new(cb);
+        on_cleanup(move || {
+            let Some(window) = web_sys::window() else { return };
+            let cb = cb_cleanup.take();
+            let _ = window.remove_event_listener_with_callback(
+                "keydown",
+                cb.as_ref().unchecked_ref(),
+            );
+        });
     });
 
     view! {
@@ -80,6 +109,12 @@ pub fn Layout() -> impl IntoView {
                     </main>
                 </div>
             </div>
+
+            // Command palette — rendered at the app level so it's available on all pages.
+            <CommandPalette
+                show=Signal::derive(move || show_palette.get())
+                on_close=Callback::new(move |()| set_show_palette.set(false))
+            />
         </Show>
     }
 }

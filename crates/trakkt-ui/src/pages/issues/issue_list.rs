@@ -16,6 +16,8 @@ use std::sync::Arc;
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use phosphor_leptos::Icon;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
 
 use crate::components::{
     Avatar, Button, ButtonSize, ButtonVariant, EmptyState, IssueStatusBadge, IssueStatusVariant,
@@ -24,6 +26,28 @@ use crate::components::{
 };
 use crate::server_fns::issues::{create_issue, list_issues};
 use trakkt_types::models::IssueWithDetails;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if the keyboard event target is an input, textarea, select,
+/// or contenteditable element — meaning single-key shortcuts (j/k/c) should
+/// NOT fire so they don't interfere with text editing.
+fn is_input_focused(ev: &web_sys::KeyboardEvent) -> bool {
+    use wasm_bindgen::JsCast;
+    let Some(target) = ev.target() else { return false };
+    let Some(el) = target.dyn_ref::<web_sys::HtmlElement>() else { return false };
+    let tag = el.tag_name().to_uppercase();
+    if matches!(tag.as_str(), "INPUT" | "TEXTAREA" | "SELECT") {
+        return true;
+    }
+    // Check for contenteditable (kode editor, rich text fields).
+    if el.is_content_editable() {
+        return true;
+    }
+    false
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue List Page
@@ -62,6 +86,81 @@ pub fn IssueListPage() -> impl IntoView {
     let on_issue_created = Callback::new(move |()| {
         set_show_new_issue.set(false);
         set_version.update(|v| *v += 1);
+    });
+
+    // ── Keyboard navigation state ──────────────────────────────────────────
+    let (selected_index, set_selected_index) = signal(Option::<usize>::None);
+
+    // Track the current issue count so keyboard handlers know the bounds.
+    let issue_count = RwSignal::new(0usize);
+
+    // Track issue numbers so Enter can navigate to the selected issue.
+    let issue_numbers = RwSignal::new(Vec::<i32>::new());
+
+    // ── j/k/Enter/c keyboard listener (window-level, active on this page) ──
+    Effect::new(move |_| {
+        let Some(window) = web_sys::window() else { return };
+        let cb = Closure::<dyn Fn(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
+            // Skip keyboard shortcuts when the user is typing in an input,
+            // textarea, select, or contenteditable element.
+            if is_input_focused(&ev) {
+                return;
+            }
+
+            let key = ev.key();
+            match key.as_str() {
+                "j" => {
+                    ev.prevent_default();
+                    let count = issue_count.get_untracked();
+                    if count == 0 { return; }
+                    set_selected_index.update(|idx| {
+                        *idx = Some(match *idx {
+                            None => 0,
+                            Some(i) => (i + 1).min(count - 1),
+                        });
+                    });
+                }
+                "k" => {
+                    ev.prevent_default();
+                    let count = issue_count.get_untracked();
+                    if count == 0 { return; }
+                    set_selected_index.update(|idx| {
+                        *idx = Some(match *idx {
+                            None => 0,
+                            Some(i) => i.saturating_sub(1),
+                        });
+                    });
+                }
+                "Enter" => {
+                    if let Some(idx) = selected_index.get_untracked() {
+                        let numbers = issue_numbers.get_untracked();
+                        if let Some(&number) = numbers.get(idx) {
+                            ev.prevent_default();
+                            let nav = use_navigate();
+                            nav(&format!("/issues/{number}"), Default::default());
+                        }
+                    }
+                }
+                "c" => {
+                    ev.prevent_default();
+                    set_show_new_issue.set(true);
+                }
+                _ => {}
+            }
+        });
+        let _ = window.add_event_listener_with_callback(
+            "keydown",
+            cb.as_ref().unchecked_ref(),
+        );
+        let cb_cleanup = send_wrapper::SendWrapper::new(cb);
+        on_cleanup(move || {
+            let Some(window) = web_sys::window() else { return };
+            let cb = cb_cleanup.take();
+            let _ = window.remove_event_listener_with_callback(
+                "keydown",
+                cb.as_ref().unchecked_ref(),
+            );
+        });
     });
 
     // ── Render ──────────────────────────────────────────────────────────────
@@ -122,6 +221,11 @@ pub fn IssueListPage() -> impl IntoView {
                     {move || Suspend::new(async move {
                         match issues.await {
                             Ok(ref list) if list.is_empty() => {
+                                // Reset keyboard navigation state when list is empty.
+                                issue_count.set(0);
+                                issue_numbers.set(Vec::new());
+                                set_selected_index.set(None);
+
                                 let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
                                     view! {
                                         <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
@@ -147,8 +251,19 @@ pub fn IssueListPage() -> impl IntoView {
                                 }.into_any()
                             }
                             Ok(ref list) => {
-                                let rows = list.iter().map(|issue| {
-                                    view! { <IssueRow issue=issue.clone()/> }
+                                // Update keyboard navigation bounds.
+                                issue_count.set(list.len());
+                                issue_numbers.set(list.iter().map(|i| i.number).collect());
+
+                                // Clamp selected index if the list shrank.
+                                if let Some(idx) = selected_index.get_untracked()
+                                    && idx >= list.len()
+                                {
+                                    set_selected_index.set(if list.is_empty() { None } else { Some(list.len() - 1) });
+                                }
+
+                                let rows = list.iter().enumerate().map(|(idx, issue)| {
+                                    view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index/> }
                                 }).collect_view();
                                 view! {
                                     <div role="list">
@@ -157,6 +272,9 @@ pub fn IssueListPage() -> impl IntoView {
                                 }.into_any()
                             }
                             Err(_) => {
+                                issue_count.set(0);
+                                issue_numbers.set(Vec::new());
+                                set_selected_index.set(None);
                                 view! {
                                     <div class="p-4 md:p-6">
                                         <EmptyState
@@ -191,19 +309,50 @@ pub fn IssueListPage() -> impl IntoView {
 /// ```text
 /// [status_dot] TRK-42  Fix login redirect loop    [bug] [auth]  priority  @assignee
 /// ```
+///
+/// Supports keyboard navigation highlighting: when `selected_index` matches
+/// `index`, the row renders with a distinct selected background.
 #[component]
-fn IssueRow(issue: IssueWithDetails) -> impl IntoView {
+fn IssueRow(
+    issue: IssueWithDetails,
+    /// This row's index in the list.
+    index: usize,
+    /// The currently keyboard-selected index (None = no selection).
+    #[prop(into)]
+    selected_index: Signal<Option<usize>>,
+) -> impl IntoView {
     let number = issue.number;
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
     let status = IssueStatusVariant::parse(&issue.status);
+    let row_ref = NodeRef::<leptos::html::Div>::new();
     let go_to_issue = move || {
         let nav = use_navigate();
         nav(&format!("/issues/{number}"), Default::default());
     };
 
+    let is_selected = Memo::new(move |_| selected_index.get() == Some(index));
+
+    // Scroll the selected row into view when keyboard-navigated.
+    Effect::new(move || {
+        if is_selected.get() && let Some(el) = row_ref.get() {
+            let opts = web_sys::ScrollIntoViewOptions::new();
+            opts.set_block(web_sys::ScrollLogicalPosition::Nearest);
+            el.scroll_into_view_with_scroll_into_view_options(&opts);
+        }
+    });
+
+    let row_class = move || {
+        if is_selected.get() {
+            "px-4 md:px-6 py-3 flex items-center gap-3 border-b border-border bg-primary/5 ring-1 ring-primary/20 focus-visible:outline-none transition-colors cursor-pointer"
+        } else {
+            "px-4 md:px-6 py-3 flex items-center gap-3 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer"
+        }
+    };
+
     view! {
         <div
-            class="px-4 md:px-6 py-3 flex items-center gap-3 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer"
+            node_ref=row_ref
+            class=row_class
             role="listitem"
             tabindex="0"
             on:click=move |_| go_to_issue()
