@@ -3,12 +3,17 @@
 //! Server functions — typed RPC that replaces REST API calls.
 
 pub mod auth;
+pub mod comments;
 pub mod context;
+pub mod issues;
+pub mod labels;
+pub mod notifications;
 pub mod ownership;
 pub mod profile;
 pub mod security;
 pub mod sidebar;
 pub mod team;
+pub mod teams;
 pub mod workspace;
 
 /// State provided to server functions via Leptos context.

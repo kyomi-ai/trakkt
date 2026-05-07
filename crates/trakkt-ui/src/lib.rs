@@ -104,4 +104,40 @@ pub fn register_server_functions() {
     register_explicit::<UpdateWorkspaceName>();
     register_explicit::<UpdateWorkspaceModel>();
     register_explicit::<UpdateWorkspaceChartmlConfig>();
+
+    // Issues
+    use server_fns::issues::*;
+    register_explicit::<ListIssues>();
+    register_explicit::<GetIssue>();
+    register_explicit::<CreateIssue>();
+    register_explicit::<UpdateIssue>();
+    register_explicit::<DeleteIssue>();
+    register_explicit::<SetIssueLabels>();
+
+    // Comments
+    use server_fns::comments::*;
+    register_explicit::<ListComments>();
+    register_explicit::<CreateComment>();
+    register_explicit::<UpdateComment>();
+    register_explicit::<DeleteComment>();
+
+    // Labels
+    use server_fns::labels::*;
+    register_explicit::<ListLabels>();
+    register_explicit::<CreateLabel>();
+    register_explicit::<UpdateLabel>();
+    register_explicit::<DeleteLabel>();
+
+    // Notifications
+    use server_fns::notifications::*;
+    register_explicit::<ListNotifications>();
+    register_explicit::<MarkNotificationRead>();
+    register_explicit::<MarkAllNotificationsRead>();
+    register_explicit::<CountUnreadNotifications>();
+
+    // Teams (issue tracker)
+    use server_fns::teams::*;
+    register_explicit::<ListTeams>();
+    register_explicit::<CreateTeam>();
+    register_explicit::<GetDefaultTeam>();
 }

@@ -97,6 +97,22 @@ pub async fn list_labels(
     Ok(rows.into_iter().map(LabelRow::into_dto).collect())
 }
 
+/// Get a single label by its ID.
+pub async fn get_label_by_id(
+    db: &DbPool,
+    label_id: &str,
+) -> trakkt_core::Result<Option<Label>> {
+    let row = trakkt_core::db_fetch_optional!(
+        db,
+        LabelRow,
+        "SELECT label_id, workspace_id, name, color, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM labels WHERE label_id = $1",
+        label_id
+    )?;
+    Ok(row.map(LabelRow::into_dto))
+}
+
 /// Update a label's name and color.
 pub async fn update_label(
     db: &DbPool,
