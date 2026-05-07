@@ -28,4 +28,9 @@ pub struct SyncAction {
 /// Well-known entity type constants for sync log entries.
 pub mod entity_types {
     pub const WORKSPACE_SETTINGS: &str = "workspace_settings";
+    pub const ISSUE: &str = "issue";
+    pub const COMMENT: &str = "comment";
+    pub const LABEL: &str = "label";
+    pub const NOTIFICATION: &str = "notification";
+    pub const TEAM: &str = "team";
 }

@@ -3,13 +3,17 @@
 //! trakkt-auth — Authentication & encryption for the Trakkt backend.
 
 pub mod auth_service;
+pub mod comment_service;
 pub mod cookies;
 pub mod email_service;
 pub mod encryption;
 pub mod google_oauth;
+pub mod issue_service;
 pub mod jwt;
+pub mod label_service;
 pub mod mcp_session_manager;
 pub mod middleware;
+pub mod notification_service;
 pub mod notifications;
 pub mod onboarding_service;
 pub mod password;
@@ -18,6 +22,7 @@ pub mod redis_ops;
 pub mod security_service;
 pub mod session;
 pub mod sync_log_service;
+pub mod team_service;
 pub mod token_refresh;
 pub mod token_service;
 pub mod totp;
