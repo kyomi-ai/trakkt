@@ -100,7 +100,7 @@
 </head>
 <body class="min-h-screen bg-background text-foreground antialiased">
 
-<!-- Loading screen — visible immediately, replaced when WASM mounts -->
+<!-- Loading screen — visible immediately, removed when WASM app mounts -->
 <div class="trakkt-loading" id="trakkt-loading">
     <svg width="40" height="40" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
         <circle cx="20" cy="20" r="16" fill="none" stroke="#4f46e5" stroke-width="3" opacity="0.2"/>
@@ -111,6 +111,12 @@
         </circle>
     </svg>
 </div>
+<script>
+    addEventListener('TrunkApplicationStarted', function() {
+        var el = document.getElementById('trakkt-loading');
+        if (el) { el.style.opacity = '0'; setTimeout(function() { el.remove(); }, 300); }
+    });
+</script>
 
 </body>
 </html>
