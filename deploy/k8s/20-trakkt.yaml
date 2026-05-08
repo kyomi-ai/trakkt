@@ -30,15 +30,13 @@ spec:
       serviceAccountName: default
       containers:
         - name: trakkt
-          image: trakkt:latest
-          imagePullPolicy: IfNotPresent
+          image: localhost/trakkt:latest
+          imagePullPolicy: Never
           ports:
             - name: http
               containerPort: 8003
           env:
-            # Database
-            - name: DATABASE_URL
-              value: "postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)"
+            # Database — individual vars first so $(VAR) substitution works in DATABASE_URL
             - name: DB_HOST
               valueFrom:
                 configMapKeyRef:
@@ -64,6 +62,8 @@ spec:
                 secretKeyRef:
                   name: trakkt-secrets
                   key: db-password
+            - name: DATABASE_URL
+              value: "postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)"
 
             # Redis
             - name: REDIS_URL
@@ -127,7 +127,7 @@ spec:
 
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /health
               port: 8003
             initialDelaySeconds: 30
             periodSeconds: 30
@@ -136,7 +136,7 @@ spec:
 
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /health
               port: 8003
             initialDelaySeconds: 10
             periodSeconds: 10

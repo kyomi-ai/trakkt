@@ -1,68 +1,42 @@
 # ---------------------------------------------------------------------------
-# Trakkt — unified Docker image for k8s and self-hosted deployments
+# Trakkt — packaging-only Docker image
 # ---------------------------------------------------------------------------
 #
-# Mode is determined at runtime by environment variables (DATABASE_URL,
-# REDIS_URL, TRAKKT_MODE, etc.) — the compiled binary is identical.
+# Prerequisites: build artifacts must be produced on the HOST before running
+# docker build. Use the build script:
 #
-# Build prerequisites: Rust stable toolchain with trunk for Leptos builds.
-# Builds in one stage: frontend (Leptos/WASM) + server binary.
+#   ./scripts/build-image.sh
 #
-# Build context must be the repo root:
-#   docker build -t trakkt .
+# That script:
+#   1. Strips BEGIN_LOCAL_DEV_PATCHES from Cargo.toml
+#   2. Runs: cargo build --profile dev-server --bin trakkt
+#   3. Runs: cd crates/trakkt-ui && trunk build --release
+#   4. Calls: docker build -t trakkt:latest .
 #
-# Build arguments:
-#   CARGO_PROFILE: cargo profile to use (default: release)
-#
-# Self-hosted quickstart:
-#   docker run -e DATABASE_URL=sqlite:///data/trakkt.db -e TRAKKT_MODE=personal -p 8003:8003 trakkt
-#
-# Kubernetes: use deploy/k8s/ manifests with ConfigMap + Secrets for env vars.
+# IMPORTANT: Binary and WASM frontend must be compiled on the same host so
+# that CARGO_MANIFEST_DIR is identical for both. Leptos server_fn hashes
+# include this path — mismatched builds break the app.
 # ---------------------------------------------------------------------------
 
-FROM rust:latest as builder
-
-RUN apt-get update && apt-get install -y \
-    brotli \
-    npm \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install trunk for Leptos builds
-RUN cargo install trunk
-
-# Install Tailwind CSS CLI
-RUN npm install -g tailwindcss
-
-WORKDIR /build
-
-# Copy workspace and source
-COPY . .
-
-# Build frontend with Leptos (release mode by default)
-WORKDIR /build/crates/trakkt-ui
-RUN trunk build --release
-
-# Build server binary (release mode)
-WORKDIR /build
-RUN cargo build --release --bin trakkt
-
-# Runtime image
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root user
+RUN useradd -m -u 1000 -s /bin/sh trakkt
+
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /build/target/release/trakkt /app/trakkt
+# Copy pre-built server binary (built with dev-server or release profile)
+# dev-server: cargo build --profile dev-server --bin trakkt
+# release:    cargo build --release --bin trakkt
+ARG PROFILE=dev-server
+COPY target/${PROFILE}/trakkt /app/trakkt
 
-# Copy frontend assets to expected location
-COPY --from=builder /build/crates/trakkt-ui/dist /app/dist
-
-# Non-root user
-RUN useradd -m -u 1000 trakkt
+# Copy pre-built Leptos frontend assets
+COPY crates/trakkt-ui/dist /app/dist
 
 ENV PORT=8003 \
     TRUNK_DIST_DIR=/app/dist \
@@ -73,7 +47,7 @@ ENV PORT=8003 \
 EXPOSE 8003
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD /app/trakkt health || exit 1
+    CMD ["/bin/sh", "-c", "wget -qO- http://localhost:8003/health || exit 1"]
 
 USER trakkt
 

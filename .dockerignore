@@ -1,0 +1,15 @@
+# Exclude heavy build artifacts from context
+target/
+# Allow pre-built binaries
+!target/dev-server/trakkt
+!target/release/trakkt
+
+# Other exclusions
+data/
+.git/
+.gstack/
+.claude/
+e2e/
+node_modules/
+.env
+.env.*
