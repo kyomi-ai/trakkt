@@ -285,6 +285,34 @@ impl WebSocketManager {
         }
     }
 
+    /// Broadcast a pre-serialized JSON string to all members of a workspace.
+    ///
+    /// Same as `broadcast_to_workspace` but accepts raw JSON instead of a
+    /// `WebSocketMessage`. Used by the sync protocol to broadcast
+    /// `SyncResponse` messages that don't wrap in the `WebSocketMessage` envelope.
+    pub async fn broadcast_raw_to_workspace(
+        &self,
+        workspace_id: &str,
+        json: &str,
+    ) {
+        let members: Vec<(String,)> = match trakkt_core::db_fetch_all!(
+            &self.inner.db,
+            (String,),
+            "SELECT user_id FROM workspace_users WHERE workspace_id = $1",
+            workspace_id
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!("Failed to query workspace members for broadcast: {e}");
+                return;
+            }
+        };
+
+        for (member_user_id,) in members {
+            self.deliver(&member_user_id, json).await;
+        }
+    }
+
     /// Get the count of local connections across all users on this pod.
     pub fn local_connection_count(&self) -> usize {
         self.inner

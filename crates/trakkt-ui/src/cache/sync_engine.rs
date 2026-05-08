@@ -121,20 +121,13 @@ pub fn start_sync_engine(
 
     // ── Watch connection state to send bootstrap or delta on connect ────────
     let ws_for_state = ws.clone();
-    let wid_for_state = workspace_id.to_owned();
 
     Effect::new(move |_| {
         let state = ws_for_state.connection_state.get();
-        web_sys::console::log_1(&format!("[trakkt-sync] connection state changed: {state}").into());
         if state != ConnectionState::Connected {
             return;
         }
-        web_sys::console::log_1(&"[trakkt-sync] CONNECTED — will send bootstrap/delta".into());
-        let ws_send = ws_for_state.clone();
-        let wid = wid_for_state.clone();
 
-        // Send bootstrap immediately — IDB cursor lookup is deferred to
-        // avoid blocking on IDB open which can hang in some contexts.
         web_sys::console::log_1(&"[trakkt-sync] sending sync_bootstrap".into());
         if !ws_for_state.send(serde_json::json!({"type": "sync_bootstrap"})) {
             web_sys::console::warn_1(&"[trakkt-sync] failed to send sync_bootstrap".into());

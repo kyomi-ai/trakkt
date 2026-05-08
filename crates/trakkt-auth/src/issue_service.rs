@@ -241,9 +241,19 @@ pub async fn create_issue(
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for issue create");
     }
 
-    // WebSocket broadcast — best-effort.
+    // WebSocket broadcast — fetch full entity data and send as SyncResponse.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::ISSUE, &params.workspace_id).await;
+        if let Ok(Some(full_issue)) = get_issue_by_id(db, &issue_id).await {
+            sync_log_service::broadcast_sync_action(
+                ws,
+                &params.workspace_id,
+                entity_types::ISSUE,
+                &issue_id,
+                SyncActionType::Insert,
+                serde_json::to_value(&full_issue).ok(),
+            )
+            .await;
+        }
     }
 
     // Re-fetch to get DB-assigned timestamps.
@@ -259,6 +269,34 @@ pub async fn create_issue(
         &issue_id
     )?;
     Ok(row.into_dto())
+}
+
+/// Get a single issue by its UUID, with full details.
+pub async fn get_issue_by_id(
+    db: &DbPool,
+    issue_id: &str,
+) -> trakkt_core::Result<Option<IssueWithDetails>> {
+    let sql = format!(
+        "{ISSUE_DETAIL_SELECT} WHERE i.issue_id = $1"
+    );
+    let row = trakkt_core::db_fetch_optional!(
+        db,
+        IssueDetailRow,
+        &sql,
+        issue_id
+    )?;
+
+    match row {
+        Some(r) => {
+            let labels = fetch_labels_for_issues(db, std::slice::from_ref(&r.issue_id)).await?;
+            let issue_labels = labels
+                .into_values()
+                .next()
+                .unwrap_or_default();
+            Ok(Some(r.into_dto(issue_labels)))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Get a single issue by workspace-scoped number, with full details.
@@ -542,9 +580,19 @@ pub async fn update_issue(
         tracing::warn!(error = %e, issue_id = %issue.issue_id, "Failed to write sync log entry for issue update");
     }
 
-    // WebSocket broadcast — best-effort.
+    // WebSocket broadcast — fetch full entity data and send as SyncResponse.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::ISSUE, workspace_id).await;
+        if let Ok(Some(full_issue)) = get_issue_by_id(db, &issue.issue_id).await {
+            sync_log_service::broadcast_sync_action(
+                ws,
+                workspace_id,
+                entity_types::ISSUE,
+                &issue.issue_id,
+                SyncActionType::Update,
+                serde_json::to_value(&full_issue).ok(),
+            )
+            .await;
+        }
     }
 
     Ok(issue)
@@ -601,9 +649,17 @@ pub async fn delete_issue(
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for issue delete");
     }
 
-    // WebSocket broadcast — best-effort.
+    // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::ISSUE, workspace_id).await;
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::ISSUE,
+            &issue_id,
+            SyncActionType::Delete,
+            None,
+        )
+        .await;
     }
 
     Ok(())
@@ -658,9 +714,19 @@ pub async fn set_issue_labels(
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for label update");
     }
 
-    // WebSocket broadcast — best-effort.
+    // WebSocket broadcast — fetch full entity data with updated labels.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::ISSUE, &ws_id).await;
+        if let Ok(Some(full_issue)) = get_issue_by_id(db, issue_id).await {
+            sync_log_service::broadcast_sync_action(
+                ws,
+                &ws_id,
+                entity_types::ISSUE,
+                issue_id,
+                SyncActionType::Update,
+                serde_json::to_value(&full_issue).ok(),
+            )
+            .await;
+        }
     }
 
     Ok(())

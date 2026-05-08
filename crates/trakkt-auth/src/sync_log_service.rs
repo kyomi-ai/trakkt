@@ -287,12 +287,11 @@ pub async fn prune_old_entries(
 
 /// Broadcast a sync notification to all connected workspace members via WebSocket.
 ///
-/// This is a best-effort operation: failures are logged but never propagated.
-/// The message tells clients "something changed for this entity type in this
-/// workspace" so they can perform a delta sync to fetch the actual data.
+/// Broadcast a notification that an entity changed. Clients receiving this
+/// should perform a delta sync to fetch the actual data.
 ///
-/// Called by service functions after a successful `write_sync_entry` to push
-/// real-time updates to connected users.
+/// Used by entity services that don't yet send full SyncResponse data
+/// (team, comment, notification).
 pub async fn broadcast_sync_notify(
     ws_manager: &WebSocketManager,
     entity_type: &str,
@@ -308,6 +307,45 @@ pub async fn broadcast_sync_notify(
     ws_manager
         .broadcast_to_workspace(workspace_id, message, None)
         .await;
+}
+
+/// Broadcast a `SyncResponse::SyncAction` with the full entity data to all
+/// connected clients in the workspace.
+///
+/// This sends the exact same format as bootstrap/delta sync, so the client's
+/// `onmessage` handler can deserialize and apply it directly to the SyncStore.
+///
+/// Best-effort: failures are logged but never propagated.
+pub async fn broadcast_sync_action(
+    ws_manager: &WebSocketManager,
+    workspace_id: &str,
+    entity_type: &str,
+    entity_id: &str,
+    action: SyncActionType,
+    data: Option<serde_json::Value>,
+) {
+    use trakkt_types::sync::SyncResponse;
+
+    let sync_action = SyncAction {
+        sync_id: 0,
+        entity_type: entity_type.to_string(),
+        entity_id: entity_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        action,
+        data,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let response = SyncResponse::SyncAction(sync_action);
+    let json = match serde_json::to_string(&response) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("Failed to serialize SyncResponse for broadcast: {e}");
+            return;
+        }
+    };
+
+    ws_manager.broadcast_raw_to_workspace(workspace_id, &json).await;
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

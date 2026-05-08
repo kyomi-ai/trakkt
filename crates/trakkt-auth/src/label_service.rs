@@ -71,11 +71,6 @@ pub async fn create_label(
         tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label create");
     }
 
-    // WebSocket broadcast — best-effort.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::LABEL, workspace_id).await;
-    }
-
     // Re-fetch to get the DB-assigned created_at.
     let row = trakkt_core::db_fetch_one!(
         db,
@@ -85,7 +80,22 @@ pub async fn create_label(
          FROM labels WHERE label_id = $1",
         &label_id
     )?;
-    Ok(row.into_dto())
+    let label = row.into_dto();
+
+    // WebSocket broadcast — send full entity data as SyncResponse.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::LABEL,
+            &label_id,
+            SyncActionType::Insert,
+            serde_json::to_value(&label).ok(),
+        )
+        .await;
+    }
+
+    Ok(label)
 }
 
 /// List all labels in a workspace, ordered by name.
@@ -167,9 +177,17 @@ pub async fn update_label(
         tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label update");
     }
 
-    // WebSocket broadcast — best-effort.
+    // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::LABEL, &label.workspace_id).await;
+        sync_log_service::broadcast_sync_action(
+            ws,
+            &label.workspace_id,
+            entity_types::LABEL,
+            label_id,
+            SyncActionType::Update,
+            serde_json::to_value(&label).ok(),
+        )
+        .await;
     }
 
     Ok(label)
@@ -217,9 +235,17 @@ pub async fn delete_label(
         tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label delete");
     }
 
-    // WebSocket broadcast — best-effort.
+    // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::LABEL, &label.workspace_id).await;
+        sync_log_service::broadcast_sync_action(
+            ws,
+            &label.workspace_id,
+            entity_types::LABEL,
+            label_id,
+            SyncActionType::Delete,
+            None,
+        )
+        .await;
     }
 
     Ok(())

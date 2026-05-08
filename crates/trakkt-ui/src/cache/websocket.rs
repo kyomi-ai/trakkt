@@ -2,9 +2,8 @@
 
 //! Centralized WebSocket client for the Trakkt sync engine.
 //!
-//! Ported from Kyomi's `websocket_client.rs`, stripped of chat-specific features
-//! (message deduplication, subscriber system, diagnostics panel) since Trakkt
-//! uses WebSocket only for the sync protocol.
+//! Handles WebSocket connection lifecycle for the sync protocol only
+//! (no chat, no message deduplication, no subscriber system).
 //!
 //! The client provides:
 //! - `ConnectionState` — reactive signal tracking the connection lifecycle
@@ -311,7 +310,6 @@ fn do_connect(
             return;
         };
 
-        // Skip non-sync messages (heartbeat, etc.) by checking the type field first.
         let raw: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => return,
