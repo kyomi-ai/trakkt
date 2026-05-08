@@ -38,11 +38,13 @@ pub fn AuthLayout(
                 class="hidden lg:flex lg:w-1/2 relative overflow-hidden auth-brand-panel items-center justify-center"
                 aria-hidden="true"
             >
-                <img
-                    src="/public/trakkt_full_logo_white.svg"
-                    alt=""
-                    class="h-48 xl:h-56 w-auto select-none"
-                />
+                <div class="flex flex-col items-center select-none">
+                    <svg viewBox="0 0 180 180" width="48" height="48" aria-label="Trakkt">
+                        <path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="white"/>
+                        <path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="white"/>
+                    </svg>
+                    <div class="text-xl font-bold text-white mt-3">"Trakkt"</div>
+                </div>
 
                 // Bottom marginalia
                 <div class="absolute bottom-10 left-12 right-12 z-10 flex items-center justify-between font-mono text-[10px] uppercase text-[color:rgba(245,243,239,0.30)]" style="letter-spacing:0.18em;">
@@ -61,9 +63,18 @@ pub fn AuthLayout(
                     // React: className="text-center mb-8"
                     <div class="text-center mb-8">
                         // Mobile logo — React: className="lg:hidden mb-6"
-                        <div class="lg:hidden mb-6">
-                            <img src="/public/trakkt_full_logo.svg" alt="Trakkt" class="h-12 mx-auto dark:hidden"/>
-                            <img src="/public/trakkt_full_logo_white.svg" alt="Trakkt" class="h-12 mx-auto hidden dark:block"/>
+                        <div class="lg:hidden mb-6 flex flex-col items-center">
+                            // Light mode: teal logo
+                            <svg viewBox="0 0 180 180" width="36" height="36" aria-label="Trakkt" class="dark:hidden">
+                                <path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/>
+                                <path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/>
+                            </svg>
+                            // Dark mode: white logo
+                            <svg viewBox="0 0 180 180" width="36" height="36" aria-label="Trakkt" class="hidden dark:block">
+                                <path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="white"/>
+                                <path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="white"/>
+                            </svg>
+                            <div class="text-base font-bold text-foreground mt-2">"Trakkt"</div>
                         </div>
                         // Title — page-level landmark, DESIGN.md: 2xl token = 30px = text-3xl, Instrument Serif
                         <h1 class="text-3xl font-display text-foreground mb-2">

@@ -173,9 +173,18 @@ pub fn Layout() -> impl IntoView {
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
                             </svg>
                         </button>
-                        <a href="/">
-                            <img src="/public/trakkt_full_logo.svg" alt="Trakkt" class="h-6 dark:hidden"/>
-                            <img src="/public/trakkt_full_logo_white.svg" alt="Trakkt" class="h-6 hidden dark:block"/>
+                        <a href="/" class="flex items-center gap-2">
+                            // Light mode: teal logo
+                            <svg viewBox="0 0 180 180" width="18" height="18" aria-label="Trakkt" class="dark:hidden">
+                                <path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/>
+                                <path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/>
+                            </svg>
+                            // Dark mode: white logo
+                            <svg viewBox="0 0 180 180" width="18" height="18" aria-label="Trakkt" class="hidden dark:block">
+                                <path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="white"/>
+                                <path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="white"/>
+                            </svg>
+                            <span class="text-sm font-bold text-foreground">"Trakkt"</span>
                         </a>
                     </div>
                     <main class="flex-1 overflow-y-auto">
@@ -205,8 +214,12 @@ fn Sidebar(
         <div class="w-[220px] bg-[var(--color-sidebar)] border-r border-[var(--color-sidebar-border)] text-[var(--color-sidebar-foreground)] flex flex-col h-full">
             // Logo
             <div class="p-4 border-b border-[var(--color-sidebar-border)]">
-                <a href="/" class="text-lg font-semibold text-[var(--color-sidebar-foreground)] tracking-tight">
-                    "Trakkt"
+                <a href="/" class="flex items-center gap-2">
+                    <svg viewBox="0 0 180 180" width="18" height="18" aria-label="Trakkt">
+                        <path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#F5F3EF"/>
+                        <path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#F5F3EF"/>
+                    </svg>
+                    <span class="text-sm font-bold text-[var(--color-sidebar-foreground)]">"Trakkt"</span>
                 </a>
             </div>
 

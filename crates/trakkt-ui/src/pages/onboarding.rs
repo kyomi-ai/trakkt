@@ -9,9 +9,16 @@ pub fn OnboardingPage() -> impl IntoView {
         <div class="min-h-screen bg-background flex items-center justify-center p-8">
             <Card class="w-full max-w-lg".to_string()>
                 <CardHeader>
-                    <div class="flex justify-center mb-4">
-                        <img src="/public/trakkt_full_logo.svg" alt="Trakkt" class="h-10 dark:hidden"/>
-                        <img src="/public/trakkt_full_logo_white.svg" alt="Trakkt" class="h-10 hidden dark:block"/>
+                    <div class="flex flex-col items-center mb-4">
+                        <svg viewBox="0 0 180 180" width="32" height="32" aria-label="Trakkt" class="dark:hidden">
+                            <path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/>
+                            <path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/>
+                        </svg>
+                        <svg viewBox="0 0 180 180" width="32" height="32" aria-label="Trakkt" class="hidden dark:block">
+                            <path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="white"/>
+                            <path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="white"/>
+                        </svg>
+                        <div class="text-sm font-bold text-foreground mt-1.5">"Trakkt"</div>
                     </div>
                     <CardTitle class="text-center".to_string()>"Welcome aboard!"</CardTitle>
                     <CardDescription class="text-center".to_string()>
