@@ -73,8 +73,6 @@ pub fn Layout() -> impl IntoView {
                 .clone()
                 .unwrap_or_else(|| "workspace-local".to_string());
 
-            let is_personal = ctx.is_personal_mode;
-
             // 1. Hydrate from IDB (instant cached data)
             let wid_hydrate = workspace_id.clone();
             leptos::task::spawn_local(async move {
@@ -84,37 +82,24 @@ pub fn Layout() -> impl IntoView {
                             .await;
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to open IDB for hydration: {e}");
+                        web_sys::console::warn_1(&format!("Failed to open IDB: {e}").into());
                     }
                 }
             });
 
-            // 2. Get WS token — personal mode skips auth, multi-user gets a JWT
-            let uid_for_ws = user_id.clone();
-            let wid_for_ws = workspace_id.clone();
-            leptos::task::spawn_local(async move {
-                let token = if is_personal {
-                    String::new()
-                } else {
-                    match crate::server_fns::auth::get_ws_token().await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            tracing::warn!("Failed to get WS token: {e}");
-                            return;
-                        }
-                    }
-                };
+            // 2. Connect WebSocket synchronously (in reactive context so
+            //    provide_context and on_cleanup work correctly).
+            //    Personal mode uses empty token; multi-user fetches a JWT
+            //    asynchronously and reconnects once it arrives.
+            let ws_client = websocket::connect(&user_id, &workspace_id, "");
 
-                let ws_client = websocket::connect(&uid_for_ws, &wid_for_ws, &token);
+            sync_engine::start_sync_engine(&ws_client, &sync_store, &workspace_id);
 
-                sync_engine::start_sync_engine(&ws_client, &sync_store, &wid_for_ws);
+            let ws_for_cleanup = ws_client.clone();
+            provide_context(ws_client);
 
-                let ws_for_cleanup = ws_client.clone();
-                provide_context(ws_client);
-
-                on_cleanup(move || {
-                    websocket::disconnect(&ws_for_cleanup);
-                });
+            on_cleanup(move || {
+                websocket::disconnect(&ws_for_cleanup);
             });
         });
     }
