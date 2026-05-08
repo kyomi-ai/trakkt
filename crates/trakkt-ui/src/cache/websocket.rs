@@ -164,6 +164,7 @@ fn build_ws_url(user_id: &str, workspace_id: &str, token: &str) -> Result<String
 /// schedules automatic reconnection with exponential backoff unless
 /// `disconnect()` was called intentionally.
 pub fn connect(user_id: &str, workspace_id: &str, token: &str) -> WebSocketClient {
+    web_sys::console::log_1(&format!("[trakkt-sync] connect({user_id}, {workspace_id})").into());
     let connection_state = ArcRwSignal::new(ConnectionState::Disconnected);
     let state = Rc::new(RefCell::new(WsState::new()));
 
@@ -178,6 +179,7 @@ pub fn connect(user_id: &str, workspace_id: &str, token: &str) -> WebSocketClien
     let wid = workspace_id.to_owned();
     let tok = token.to_owned();
 
+    web_sys::console::log_1(&"[trakkt-sync] calling do_connect".into());
     do_connect(state, connection_state, &uid, &wid, &tok);
 
     client
@@ -250,9 +252,12 @@ fn do_connect(
     connection_state.set(ConnectionState::Connecting);
 
     let url = match build_ws_url(user_id, workspace_id, token) {
-        Ok(u) => u,
+        Ok(u) => {
+            web_sys::console::log_1(&format!("[trakkt-sync] WS URL: {u}").into());
+            u
+        }
         Err(e) => {
-            tracing::error!("Failed to build WebSocket URL: {e}");
+            web_sys::console::error_1(&format!("[trakkt-sync] Failed to build WS URL: {e}").into());
             state.borrow_mut().connecting = false;
             connection_state.set(ConnectionState::Disconnected);
             schedule_reconnect(
@@ -267,9 +272,12 @@ fn do_connect(
     };
 
     let ws = match WebSocket::new(&url) {
-        Ok(ws) => ws,
+        Ok(ws) => {
+            web_sys::console::log_1(&"[trakkt-sync] WebSocket::new succeeded".into());
+            ws
+        }
         Err(e) => {
-            tracing::error!("WebSocket::new failed: {:?}", e);
+            web_sys::console::error_1(&format!("[trakkt-sync] WebSocket::new FAILED: {:?}", e).into());
             state.borrow_mut().connecting = false;
             connection_state.set(ConnectionState::Disconnected);
             schedule_reconnect(
@@ -289,7 +297,7 @@ fn do_connect(
     let onopen_state = state.clone();
     let onopen_conn = connection_state.clone();
     let on_open = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
-        tracing::info!("WebSocket connected");
+        web_sys::console::log_1(&"[trakkt-sync] WS OPEN - connected!".into());
         onopen_conn.set(ConnectionState::Connected);
         onopen_state.borrow_mut().reconnect_attempts = 0;
     });
@@ -303,10 +311,20 @@ fn do_connect(
             return;
         };
 
-        let msg: SyncResponse = match serde_json::from_str(&text) {
+        // Skip non-sync messages (heartbeat, etc.) by checking the type field first.
+        let raw: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let msg_type = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(msg_type, "sync_action" | "sync_complete" | "sync_reset") {
+            return;
+        }
+
+        let msg: SyncResponse = match serde_json::from_value(raw) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("WebSocket: failed to parse message: {e}");
+                web_sys::console::warn_1(&format!("[trakkt-sync] parse error: {e}").into());
                 return;
             }
         };
@@ -322,7 +340,7 @@ fn do_connect(
     // -- onerror --------------------------------------------------------------
     let onerr_conn = connection_state.clone();
     let on_error = Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
-        tracing::error!("WebSocket error: {:?}", e);
+        web_sys::console::error_1(&format!("[trakkt-sync] WS ERROR: {:?}", e).into());
         onerr_conn.set(ConnectionState::Disconnected);
     });
     ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
@@ -337,8 +355,7 @@ fn do_connect(
     let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
         let code = event.code();
         let reason = event.reason();
-        let was_clean = event.was_clean();
-        tracing::info!("WebSocket closed: code={code}, reason={reason}, clean={was_clean}");
+        web_sys::console::log_1(&format!("[trakkt-sync] WS CLOSED code={code} reason={reason}").into());
 
         onclose_conn.set(ConnectionState::Disconnected);
         onclose_state.borrow_mut().ws = None;

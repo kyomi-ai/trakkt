@@ -493,23 +493,14 @@ async fn send_sync_response(
     user_id: &str,
     response: trakkt_types::sync::SyncResponse,
 ) {
-    use trakkt_core::{MessageType, WebSocketMessage};
-
-    let message = match &response {
-        trakkt_types::sync::SyncResponse::SyncAction(action) => {
-            WebSocketMessage::new(MessageType::SyncAction)
-                .with_data(serde_json::to_value(action).unwrap_or_default())
-        }
-        trakkt_types::sync::SyncResponse::SyncComplete { last_sync_id } => {
-            WebSocketMessage::new(MessageType::SyncComplete)
-                .with_data(serde_json::json!({ "last_sync_id": last_sync_id }))
-        }
-        trakkt_types::sync::SyncResponse::SyncReset => {
-            WebSocketMessage::new(MessageType::SyncReset)
+    let json = match serde_json::to_string(&response) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("Failed to serialize SyncResponse: {e}");
+            return;
         }
     };
-
-    manager.send_to_user(user_id, message).await;
+    manager.send_to_user_raw(user_id, &json).await;
 }
 
 // ===========================================================================

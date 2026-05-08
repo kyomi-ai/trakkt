@@ -234,6 +234,24 @@ impl WebSocketManager {
         }
     }
 
+    /// Send a pre-serialized JSON string to a specific user.
+    pub async fn send_to_user_raw(&self, user_id: &str, json: &str) {
+        if let Some((redis, _)) = &self.inner.redis {
+            let channel = format!("{REDIS_CHANNEL_PREFIX}{user_id}");
+            let mut conn = redis.clone();
+            if let Err(e) = redis::cmd("PUBLISH")
+                .arg(&channel)
+                .arg(json)
+                .query_async::<i64>(&mut conn)
+                .await
+            {
+                tracing::error!("Redis PUBLISH to {channel} failed: {e}");
+            }
+        } else {
+            self.deliver_to_local_user(user_id, json);
+        }
+    }
+
     /// Broadcast a message to all members of a workspace (via Redis PUBLISH for each).
     ///
     /// Optionally excludes one user (typically the sender).

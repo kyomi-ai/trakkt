@@ -57,12 +57,15 @@ pub fn Layout() -> impl IntoView {
         let sync_started = std::rc::Rc::new(std::cell::Cell::new(false));
 
         Effect::new(move |_| {
+            web_sys::console::log_1(&"[trakkt-sync] Effect fired, checking user_ctx".into());
             // Wait for user context to resolve successfully.
             let Some(Ok(ctx)) = user_ctx.get() else {
+                web_sys::console::log_1(&"[trakkt-sync] user_ctx not ready yet".into());
                 return;
             };
 
             if sync_started.get() {
+                web_sys::console::log_1(&"[trakkt-sync] already started, skipping".into());
                 return;
             }
             sync_started.set(true);
@@ -72,6 +75,7 @@ pub fn Layout() -> impl IntoView {
                 .workspace_id
                 .clone()
                 .unwrap_or_else(|| "workspace-local".to_string());
+            web_sys::console::log_1(&format!("[trakkt-sync] starting sync for {user_id} / {workspace_id}").into());
 
             // 1. Hydrate from IDB (instant cached data)
             let wid_hydrate = workspace_id.clone();
