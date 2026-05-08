@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Profile settings page — the first Leptos-rendered page in Tane.
+//! Profile settings page — the first Leptos-rendered page in Trakkt.
 //!
 //! Replaces `apps/frontend/src/components/settings/ProfileSettings.jsx`.
 //! All data fetching uses server functions instead of REST API calls.
@@ -260,11 +260,11 @@ fn McpConnectionCard(is_personal: bool) -> impl IntoView {
     };
 
     let claude_code_command = format!(
-        "claude mcp add --transport http tane http://localhost:{mcp_port}/mcp"
+        "claude mcp add --transport http trakkt http://localhost:{mcp_port}/mcp"
     );
 
     let claude_desktop_config = format!(
-        "{{\n  \"mcpServers\": {{\n    \"tane\": {{\n      \"url\": \"{mcp_url}\"\n    }}\n  }}\n}}"
+        "{{\n  \"mcpServers\": {{\n    \"trakkt\": {{\n      \"url\": \"{mcp_url}\"\n    }}\n  }}\n}}"
     );
 
     // Build the Cursor deep-link URL (base64-encoded config, client-only)
@@ -369,7 +369,7 @@ fn McpConnectionCard(is_personal: bool) -> impl IntoView {
                             #[cfg(target_arch = "wasm32")]
                             {
                                 let cursor_url = format!(
-                                    "cursor://anysphere.cursor-deeplink/mcp/install?name=tane&config={cursor_config_b64}"
+                                    "cursor://anysphere.cursor-deeplink/mcp/install?name=trakkt&config={cursor_config_b64}"
                                 );
                                 view! {
                                     <a

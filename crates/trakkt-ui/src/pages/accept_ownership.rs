@@ -239,8 +239,8 @@ pub fn AcceptOwnershipPage() -> impl IntoView {
                 <div class="text-center mt-8">
                     <p class="text-sm text-muted-foreground">
                         "Need help? Contact "
-                        <a href="mailto:support@tane.dev" class="text-primary hover:underline">
-                            "support@tane.dev"
+                        <a href="mailto:support@trakkt.app" class="text-primary hover:underline">
+                            "support@trakkt.app"
                         </a>
                     </p>
                 </div>

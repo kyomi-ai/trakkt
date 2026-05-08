@@ -31,7 +31,7 @@ pub fn AuthLayout(
         // Outer container — theme-aware, respects user's localStorage preference
         <div class="min-h-screen bg-background flex">
 
-            // ── Left side — Full Tane logo on warm-stone panel ─────────────
+            // ── Left side — Full Trakkt logo on warm-stone panel ─────────────
             // Hidden below 1024px (lg breakpoint); form fills the whole
             // viewport on mobile and tablets. Decorative — `aria-hidden`.
             <div
@@ -46,8 +46,8 @@ pub fn AuthLayout(
 
                 // Bottom marginalia
                 <div class="absolute bottom-10 left-12 right-12 z-10 flex items-center justify-between font-mono text-[10px] uppercase text-[color:rgba(245,243,239,0.30)]" style="letter-spacing:0.18em;">
-                    <span>"TANE"</span>
-                    <span>"種 \u{00B7} TANE"</span>
+                    <span>"TRAKKT"</span>
+                    <span>"TRAKKT"</span>
                 </div>
             </div>
 

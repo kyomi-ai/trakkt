@@ -32,7 +32,7 @@ pub struct SidebarUser {
 
 /// Load recent chat sessions for the sidebar.
 ///
-/// TODO: Chat service not yet implemented in tane — returns empty list.
+/// TODO: Chat service not yet implemented in trakkt — returns empty list.
 #[server(prefix = "/leptos-api")]
 pub async fn get_recent_sessions() -> Result<Vec<SidebarSession>, ServerFnError> {
     Ok(Vec::new())

@@ -12,7 +12,7 @@ fn main() {
 
     if let Some(window) = web_sys::window()
         && let Some(document) = window.document()
-        && let Some(loading) = document.get_element_by_id("tane-loading")
+        && let Some(loading) = document.get_element_by_id("trakkt-loading")
     {
         loading.remove();
     }

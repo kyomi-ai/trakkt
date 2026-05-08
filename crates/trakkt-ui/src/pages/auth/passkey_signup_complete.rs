@@ -290,7 +290,7 @@ pub fn PasskeySignupCompletePage() -> impl IntoView {
                                                 class="mt-0.5"
                                             />
                                             <span class="text-sm text-muted-foreground">
-                                                "I agree to receive product updates and announcements from Tane. You can unsubscribe anytime."
+                                                "I agree to receive product updates and announcements from Trakkt. You can unsubscribe anytime."
                                             </span>
                                         </div>
                                     </div>

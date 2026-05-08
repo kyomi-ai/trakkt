@@ -196,7 +196,7 @@ pub fn LoginPage(
     let subtitle = Signal::derive(move || {
         match view_state.get() {
             LoginView::Signup | LoginView::CheckEmail { .. } => {
-                "Get started with Tane".to_string()
+                "Get started with Trakkt".to_string()
             }
             _ => LOGIN_SUBTITLES[subtitle_idx.get_value()].to_string(),
         }

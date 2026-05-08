@@ -29,13 +29,13 @@ html {
   /* === Design System Color Tokens ===
    * Reference: DESIGN.md */
 
-  --color-primary: #4f46e5;
+  --color-primary: #0D9488;
   --color-primary-foreground: #ffffff;
   --color-secondary: #F5F3EF;
   --color-secondary-foreground: #3D3835;
   --color-surface-alt: #F5F3EF;
-  --color-accent: #FEF3C7;
-  --color-accent-foreground: #1C1917;
+  --color-accent: #CCFBF1;
+  --color-accent-foreground: #0D9488;
   --color-destructive: #dc2626;
   --color-destructive-foreground: #ffffff;
   --color-muted: #F5F3EF;
@@ -49,7 +49,7 @@ html {
   --color-border: #E8E5DE;
   --color-border-strong: #D4D0C8;
   --color-input: #E8E5DE;
-  --color-ring: #4f46e5;
+  --color-ring: #0D9488;
   --color-overlay: rgba(0, 0, 0, 0.5);
 
   /* Status Colors */
@@ -361,7 +361,7 @@ html {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * === Prose Tane — "Editorial Figure" markdown treatment ===
+ * === Prose Trakkt — "Editorial Figure" markdown treatment ===
  * ════════════════════════════════════════════════════════════════════════
  *
  * Applied by `MarkdownRenderer` to every surface that renders user
@@ -377,7 +377,7 @@ html {
  *   blockquotes, figure captions). Reserved for document content.
  * - DM Sans for body text at comfortable editorial line-height.
  * - Geist Mono for code, metadata rows, FIGURE labels, numeric tables.
- * - Amber accent used sparingly for emphasis (links, blockquote rules,
+ * - Teal accent used sparingly for emphasis (links, blockquote rules,
  *   list markers, horizontal rules).
  * - Warm neutrals for surfaces and separators.
  * - Charts, tables, code, and blockquotes span full container width.
@@ -385,7 +385,7 @@ html {
  *   gradients, no drop shadows, no rounded corners on content blocks.
  */
 
-.prose-tane {
+.prose-trakkt {
   color: var(--color-foreground);
   font-family: 'DM Sans', system-ui, sans-serif;
   font-size: 15px;
@@ -394,9 +394,9 @@ html {
 
 /* ── Headings ──────────────────────────────────────────────────── */
 
-.prose-tane h1,
-.prose-tane h2,
-.prose-tane h3 {
+.prose-trakkt h1,
+.prose-trakkt h2,
+.prose-trakkt h3 {
   font-family: 'Instrument Serif', Georgia, serif;
   font-weight: 400;
   color: var(--color-foreground);
@@ -404,39 +404,39 @@ html {
   line-height: 1.1;
 }
 
-.prose-tane h1 {
+.prose-trakkt h1 {
   font-size: 48px;
   margin: 0 0 32px;
 }
 
-.prose-tane h2 {
+.prose-trakkt h2 {
   font-size: 36px;
   margin: 56px 0 16px;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--color-border);
 }
 
-/* Italic emphasis inside headings — amber spot color for editorial
+/* Italic emphasis inside headings — teal spot color for editorial
  * "one-word pop" moments. Applies to h1/h2/h3; the smaller heading
- * levels (h4/h5/h6) aren't display-type so italic-amber there would
+ * levels (h4/h5/h6) aren't display-type so italic-teal there would
  * feel forced. Matches the kode wysiwyg rule below which uses
  * `--kode-heading-emphasis-color` on .wysiwyg-italic inside any
  * .wysiwyg-heading. */
-.prose-tane h1 em,
-.prose-tane h2 em,
-.prose-tane h3 em {
+.prose-trakkt h1 em,
+.prose-trakkt h2 em,
+.prose-trakkt h3 em {
   color: var(--color-primary);
   font-style: italic;
 }
 
-.prose-tane h3 {
+.prose-trakkt h3 {
   font-size: 24px;
   margin: 40px 0 12px;
 }
 
-.prose-tane h4,
-.prose-tane h5,
-.prose-tane h6 {
+.prose-trakkt h4,
+.prose-trakkt h5,
+.prose-trakkt h6 {
   font-family: 'DM Sans', system-ui, sans-serif;
   font-weight: 600;
   color: var(--color-foreground);
@@ -444,10 +444,10 @@ html {
   margin-bottom: 8px;
 }
 
-.prose-tane h4 { font-size: 18px; }
+.prose-trakkt h4 { font-size: 18px; }
 
-.prose-tane h5,
-.prose-tane h6 {
+.prose-trakkt h5,
+.prose-trakkt h6 {
   font-size: 11px;
   font-weight: 500;
   letter-spacing: 0.08em;
@@ -457,13 +457,13 @@ html {
 
 /* ── Paragraphs ────────────────────────────────────────────────── */
 
-.prose-tane p {
+.prose-trakkt p {
   margin: 0 0 12px;
 }
 
 /* Opt-in lead paragraph (editorial lede). Users add `class="lead"` to
  * the first <p> after an h1 when they want the larger-lighter treatment. */
-.prose-tane p.lead {
+.prose-trakkt p.lead {
   font-size: 20px;
   line-height: 1.50;
   color: var(--color-muted-foreground);
@@ -471,18 +471,18 @@ html {
   margin-bottom: 32px;
 }
 
-.prose-tane strong {
+.prose-trakkt strong {
   font-weight: 600;
   color: var(--color-foreground);
 }
 
-.prose-tane em {
+.prose-trakkt em {
   font-style: italic;
 }
 
 /* ── Links ─────────────────────────────────────────────────────── */
 
-.prose-tane a {
+.prose-trakkt a {
   color: var(--color-primary);
   text-decoration: underline;
   text-underline-offset: 3px;
@@ -490,54 +490,54 @@ html {
   transition: color 150ms ease;
 }
 
-.prose-tane a:hover {
-  color: #B45309; /* --accent-hover from DESIGN.md */
+.prose-trakkt a:hover {
+  color: #0F766E; /* --accent-hover from DESIGN.md */
 }
 
 /* ── Lists ─────────────────────────────────────────────────────── */
 
-.prose-tane ul,
-.prose-tane ol {
+.prose-trakkt ul,
+.prose-trakkt ol {
   margin: 0 0 12px;
   padding-left: 24px;
   /* Tailwind v4 preflight resets list-style to `none` on ul/ol by
    * default. Without these, the markers defined by
-   * `.prose-tane ul > li::marker` and `.prose-tane ol > li::marker`
+   * `.prose-trakkt ul > li::marker` and `.prose-trakkt ol > li::marker`
    * have no glyph to color — the list renders flush-left with no
    * bullets at all. Restoring the default disc/decimal types. */
 }
 
-.prose-tane ul {
+.prose-trakkt ul {
   list-style-type: disc;
 }
 
-.prose-tane ol {
+.prose-trakkt ol {
   list-style-type: decimal;
 }
 
-.prose-tane li {
+.prose-trakkt li {
   margin-bottom: 4px;
 }
 
-.prose-tane ul > li::marker {
+.prose-trakkt ul > li::marker {
   color: var(--color-primary);
 }
 
-.prose-tane ol > li::marker {
+.prose-trakkt ol > li::marker {
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
   color: var(--color-muted-foreground);
   font-size: 0.9em;
 }
 
-.prose-tane li > ul,
-.prose-tane li > ol {
+.prose-trakkt li > ul,
+.prose-trakkt li > ol {
   margin: 6px 0 6px;
 }
 
 /* ── Blockquote — ruled editorial aside ───────────────────────── */
 
-.prose-tane blockquote {
+.prose-trakkt blockquote {
   margin: 24px 0;
   padding: 4px 0 4px 24px;
   border-left: 3px solid var(--color-primary);
@@ -548,17 +548,17 @@ html {
   color: var(--color-foreground);
 }
 
-.prose-tane blockquote p {
+.prose-trakkt blockquote p {
   margin: 0 0 8px;
 }
 
-.prose-tane blockquote p:last-child {
+.prose-trakkt blockquote p:last-child {
   margin-bottom: 0;
 }
 
 /* ── Horizontal rule — editorial section break ────────────────── */
 
-.prose-tane hr {
+.prose-trakkt hr {
   border: none;
   border-top: 1px solid var(--color-border-strong);
   margin: 48px 0;
@@ -566,7 +566,7 @@ html {
 
 /* ── Inline code ───────────────────────────────────────────────── */
 
-.prose-tane code {
+.prose-trakkt code {
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-size: 0.875em;
   background: var(--color-secondary);
@@ -576,9 +576,9 @@ html {
 }
 
 /* Inside h1/h2/h3, code inherits size from the heading but stays mono */
-.prose-tane h1 code,
-.prose-tane h2 code,
-.prose-tane h3 code {
+.prose-trakkt h1 code,
+.prose-trakkt h2 code,
+.prose-trakkt h3 code {
   font-size: 0.85em;
   background: transparent;
   padding: 0;
@@ -587,7 +587,7 @@ html {
 
 /* ── Code blocks — editorial code sample ──────────────────────── */
 
-.prose-tane pre {
+.prose-trakkt pre {
   margin: 24px 0;
   padding: 16px 20px;
   background: var(--color-secondary);
@@ -599,7 +599,7 @@ html {
   line-height: 1.50;
 }
 
-.prose-tane pre code {
+.prose-trakkt pre code {
   background: transparent;
   padding: 0;
   border-radius: 0;
@@ -609,11 +609,11 @@ html {
 
 /* ── Tables — editorial ruling, no zebra ──────────────────────── */
 
-.prose-tane > div:has(> table) {
+.prose-trakkt > div:has(> table) {
   overflow-x: auto;
 }
 
-.prose-tane table {
+.prose-trakkt table {
   width: 100%;
   min-width: 480px;
   margin: 24px 0;
@@ -624,7 +624,7 @@ html {
   border-bottom: 1.5px solid var(--color-foreground);
 }
 
-.prose-tane table thead th {
+.prose-trakkt table thead th {
   font-weight: 500;
   font-size: 11px;
   letter-spacing: 0.08em;
@@ -635,23 +635,23 @@ html {
   border-bottom: 1.5px solid var(--color-foreground);
 }
 
-.prose-tane table tbody td {
+.prose-trakkt table tbody td {
   padding: 12px 16px;
   border-top: 1px solid var(--color-border);
   color: var(--color-foreground);
   vertical-align: top;
 }
 
-.prose-tane table tbody tr:first-child td {
+.prose-trakkt table tbody tr:first-child td {
   border-top: none;
 }
 
 /* Numeric cells — right-aligned tabular-nums monospace, auto-detected
  * via user-supplied class. Users can add `.num` to a <td> or <th>
  * when the content is a numeric value. */
-.prose-tane table .num,
-.prose-tane table td.num,
-.prose-tane table th.num {
+.prose-trakkt table .num,
+.prose-trakkt table td.num,
+.prose-trakkt table th.num {
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
   text-align: right;
@@ -659,11 +659,11 @@ html {
 
 /* ── Figures — chart/image wrappers with FIGURE rule treatment ── */
 
-.prose-tane figure {
+.prose-trakkt figure {
   margin: 48px 0;
 }
 
-.prose-tane figure > figcaption {
+.prose-trakkt figure > figcaption {
   margin-top: 12px;
   font-family: 'Instrument Serif', Georgia, serif;
   font-style: italic;
@@ -678,43 +678,43 @@ html {
 
 /* ── Breakout blocks — charts, tables, code, blockquotes */
 
-.prose-tane > figure,
-.prose-tane > pre,
-.prose-tane > table,
-.prose-tane > blockquote,
-.prose-tane .chart-container {
+.prose-trakkt > figure,
+.prose-trakkt > pre,
+.prose-trakkt > table,
+.prose-trakkt > blockquote,
+.prose-trakkt .chart-container {
   max-width: none;
-  /* The container the .prose-tane block lives inside provides its own
+  /* The container the .prose-trakkt block lives inside provides its own
    * padding; breakout blocks fill the full inner width. */
 }
 
 /* ── Dark mode adjustments ─────────────────────────────────────── */
 
-.dark .prose-tane h1 code,
-.dark .prose-tane h2 code,
-.dark .prose-tane h3 code {
+.dark .prose-trakkt h1 code,
+.dark .prose-trakkt h2 code,
+.dark .prose-trakkt h3 code {
   color: var(--color-primary);
 }
 
-.dark .prose-tane table,
-.dark .prose-tane table thead th {
+.dark .prose-trakkt table,
+.dark .prose-trakkt table thead th {
   border-color: var(--color-border-strong);
 }
 
-.dark .prose-tane pre,
-.dark .prose-tane code {
+.dark .prose-trakkt pre,
+.dark .prose-trakkt code {
   background: var(--color-muted);
   color: var(--color-foreground);
 }
 
 /* === Dark Mode Color Overrides === */
 .dark {
-  --color-primary: #4f46e5;
+  --color-primary: #0D9488;
   --color-primary-foreground: #ffffff;
   --color-secondary: #24201E;
   --color-secondary-foreground: #A8A29E;
   --color-surface-alt: #2C241E;
-  --color-accent: #451A03;
+  --color-accent: #042F2E;
   --color-accent-foreground: #F5F3EF;
   --color-destructive: #dc2626;
   --color-destructive-foreground: #ffffff;
@@ -728,11 +728,11 @@ html {
   --color-popover-foreground: #F5F3EF;
   --color-border: #2E2925;
   --color-input: #2E2925;
-  --color-ring: #4f46e5;
+  --color-ring: #0D9488;
   --color-overlay: rgba(0, 0, 0, 0.7);
 
   --color-warning: #422006;
-  --color-warning-border: #4f46e5;
+  --color-warning-border: #CA8A04;
   --color-warning-foreground: #f59e0b;
   --color-error: #450a0a;
   --color-error-border: #dc2626;
@@ -792,11 +792,11 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
  *
  * kode-leptos's TreeWysiwygEditor renders document blocks through its
  * own class system (.wysiwyg-h1, .wysiwyg-paragraph, .wysiwyg-blockquote,
- * etc.) rather than through Tane's MarkdownRenderer. To keep the editor
- * visually identical to the viewer, we set the same values as `.prose-tane`
+ * etc.) rather than through Trakkt's MarkdownRenderer. To keep the editor
+ * visually identical to the viewer, we set the same values as `.prose-trakkt`
  * (main.css above) but via kode's `--kode-*` CSS variable surface.
  *
- * Every field below has a matching rule in `.prose-tane`. If you edit
+ * Every field below has a matching rule in `.prose-trakkt`. If you edit
  * one, edit the other. There's no build-time drift detector — same
  * hand-maintained mirror pattern as the theme variables.
  *
@@ -805,7 +805,7 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
  * which uses monospace for its editing surface. */
 
 .wysiwyg-container {
-  /* Content shell — matches `.prose-tane` container in this file. */
+  /* Content shell — matches `.prose-trakkt` container in this file. */
   --kode-content-font-family: 'DM Sans', system-ui, sans-serif;
   --kode-content-font-size: 15px;
   --kode-content-line-height: 1.60;
@@ -813,7 +813,7 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
 
   /* Headings — Instrument Serif, Variant A sizes (h1/h2/h3).
    * h4 is DM Sans semibold 18px, h5/h6 are DM Sans uppercase tracked
-   * muted metadata labels — matching `.prose-tane h4/h5/h6`. */
+   * muted metadata labels — matching `.prose-trakkt h4/h5/h6`. */
   --kode-heading-font-family: 'Instrument Serif', Georgia, serif;
   --kode-heading-font-weight: 400;
   --kode-heading-line-height: 1.1;
@@ -822,7 +822,7 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
   --kode-heading-emphasis-color: var(--color-primary);
   /* Shared heading margins — applied to h4/h5/h6 which don't set
    * per-level overrides. h1/h2/h3 set their own --kode-hN-margin-* and
-   * take precedence. These values match `.prose-tane h4/h5/h6` above. */
+   * take precedence. These values match `.prose-trakkt h4/h5/h6` above. */
   --kode-heading-margin-top: 32px;
   --kode-heading-margin-bottom: 8px;
 
@@ -869,21 +869,21 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
   --kode-paragraph-margin: 0 0 12px;
   --kode-paragraph-line-height: 1.60;
 
-  /* Inline formatting — strong matches `.prose-tane strong` weight 600 */
+  /* Inline formatting — strong matches `.prose-trakkt strong` weight 600 */
   --kode-bold-font-weight: 600;
 
-  /* Links — match `.prose-tane a` underline offset + thickness */
+  /* Links — match `.prose-trakkt a` underline offset + thickness */
   --kode-link-underline-offset: 3px;
   --kode-link-decoration-thickness: 1px;
 
-  /* Lists — amber bullets, mono tabular-num ordered markers */
+  /* Lists — teal bullets, mono tabular-num ordered markers */
   --kode-list-marker-color: var(--color-primary);
   --kode-ul-marker-color: var(--color-primary);
   --kode-ol-marker-color: var(--color-muted-foreground);
   --kode-ol-marker-font-family: 'Geist Mono', ui-monospace, monospace;
   --kode-ol-marker-font-variant-numeric: tabular-nums;
 
-  /* Blockquote — amber rule + italic Instrument Serif */
+  /* Blockquote — teal rule + italic Instrument Serif */
   --kode-blockquote-border-width: 3px;
   --kode-blockquote-border-color: var(--color-primary);
   --kode-blockquote-background: transparent;
@@ -903,8 +903,8 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
   --kode-inline-code-padding: 1px 6px;
   --kode-inline-code-border-radius: 3px;
 
-  /* Inline code INSIDE a heading — transparent bg, amber color, no pill.
-   * Matches `.prose-tane h1/h2/h3 code`. */
+  /* Inline code INSIDE a heading — transparent bg, teal color, no pill.
+   * Matches `.prose-trakkt h1/h2/h3 code`. */
   --kode-heading-inline-code-background: transparent;
   --kode-heading-inline-code-color: var(--color-primary);
   --kode-heading-inline-code-padding: 0;
@@ -932,7 +932,7 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
   --kode-hr-margin: 48px 0;
 
   /* Tables — editorial ledger rules, uppercase tracked headers.
-   * Matches `.prose-tane table *` above. */
+   * Matches `.prose-trakkt table *` above. */
   --kode-table-border-top-width: 1.5px;
   --kode-table-border-top-color: var(--color-foreground);
   --kode-table-border-bottom-width: 1.5px;

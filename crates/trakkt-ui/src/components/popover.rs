@@ -450,7 +450,7 @@ pub fn Popover(
         }
     };
 
-    let class = format!("tane-popover {}", class);
+    let class = format!("trakkt-popover {}", class);
     let children_stored = StoredValue::new(children);
 
     view! {

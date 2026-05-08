@@ -67,7 +67,7 @@ pub fn Switch(
     label: Option<String>,
     /// CSS classes for the label text `<span>`. When empty, falls back to
     /// `"text-sm text-muted-foreground"`. When non-empty, the caller's value
-    /// fully replaces the default (no merge) — mirroring how other Tane
+    /// fully replaces the default (no merge) — mirroring how other Trakkt
     /// components treat optional class props.
     #[prop(optional, into)]
     label_class: String,

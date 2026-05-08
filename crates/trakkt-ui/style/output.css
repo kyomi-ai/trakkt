@@ -54,13 +54,13 @@
     --default-mono-font-family: var(--font-mono);
     --radius: 0.5rem;
     --font-display: 'Instrument Serif', Georgia, serif;
-    --color-primary: #4f46e5;
+    --color-primary: #0D9488;
     --color-primary-foreground: #ffffff;
     --color-secondary: #F5F3EF;
     --color-secondary-foreground: #3D3835;
     --color-surface-alt: #F5F3EF;
-    --color-accent: #FEF3C7;
-    --color-accent-foreground: #1C1917;
+    --color-accent: #CCFBF1;
+    --color-accent-foreground: #0D9488;
     --color-destructive: #dc2626;
     --color-destructive-foreground: #ffffff;
     --color-muted: #F5F3EF;
@@ -74,7 +74,7 @@
     --color-border: #E8E5DE;
     --color-border-strong: #D4D0C8;
     --color-input: #E8E5DE;
-    --color-ring: #4f46e5;
+    --color-ring: #0D9488;
     --color-overlay: rgba(0, 0, 0, 0.5);
     --color-success: #F0FDF4;
     --color-success-border: #BBF7D0;
@@ -978,7 +978,7 @@
     border-color: var(--color-primary);
   }
   .border-primary\/20 {
-    border-color: color-mix(in srgb, #4f46e5 20%, transparent);
+    border-color: color-mix(in srgb, #0D9488 20%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
       border-color: color-mix(in oklab, var(--color-primary) 20%, transparent);
     }
@@ -1083,13 +1083,13 @@
     background-color: var(--color-primary);
   }
   .bg-primary\/5 {
-    background-color: color-mix(in srgb, #4f46e5 5%, transparent);
+    background-color: color-mix(in srgb, #0D9488 5%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
       background-color: color-mix(in oklab, var(--color-primary) 5%, transparent);
     }
   }
   .bg-primary\/10 {
-    background-color: color-mix(in srgb, #4f46e5 10%, transparent);
+    background-color: color-mix(in srgb, #0D9488 10%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
       background-color: color-mix(in oklab, var(--color-primary) 10%, transparent);
     }
@@ -1509,7 +1509,7 @@
     --tw-ring-color: var(--color-primary);
   }
   .ring-primary\/20 {
-    --tw-ring-color: color-mix(in srgb, #4f46e5 20%, transparent);
+    --tw-ring-color: color-mix(in srgb, #0D9488 20%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
       --tw-ring-color: color-mix(in oklab, var(--color-primary) 20%, transparent);
     }
@@ -1753,7 +1753,7 @@
   .hover\:bg-primary\/80 {
     &:hover {
       @media (hover: hover) {
-        background-color: color-mix(in srgb, #4f46e5 80%, transparent);
+        background-color: color-mix(in srgb, #0D9488 80%, transparent);
         @supports (color: color-mix(in lab, red, red)) {
           background-color: color-mix(in oklab, var(--color-primary) 80%, transparent);
         }
@@ -1763,7 +1763,7 @@
   .hover\:bg-primary\/90 {
     &:hover {
       @media (hover: hover) {
-        background-color: color-mix(in srgb, #4f46e5 90%, transparent);
+        background-color: color-mix(in srgb, #0D9488 90%, transparent);
         @supports (color: color-mix(in lab, red, red)) {
           background-color: color-mix(in oklab, var(--color-primary) 90%, transparent);
         }
@@ -2331,13 +2331,13 @@ html {
   background-color: var(--color-sidebar);
 }
 .auth-brand-gradient-1 {
-  background: radial-gradient( ellipse at center, color-mix(in srgb, #4f46e5 10%, transparent) 0%, color-mix(in srgb, #1C1917 90%, transparent) 50%, var(--color-foreground) 100% ), linear-gradient( 135deg, color-mix(in srgb, #1C1917 80%, white) 0%, var(--color-foreground) 100% );
+  background: radial-gradient( ellipse at center, color-mix(in srgb, #0D9488 10%, transparent) 0%, color-mix(in srgb, #1C1917 90%, transparent) 50%, var(--color-foreground) 100% ), linear-gradient( 135deg, color-mix(in srgb, #1C1917 80%, white) 0%, var(--color-foreground) 100% );
   @supports (color: color-mix(in lab, red, red)) {
     background: radial-gradient( ellipse at center, color-mix(in srgb, var(--color-primary) 10%, transparent) 0%, color-mix(in srgb, var(--color-foreground) 90%, transparent) 50%, var(--color-foreground) 100% ), linear-gradient( 135deg, color-mix(in srgb, var(--color-foreground) 80%, white) 0%, var(--color-foreground) 100% );
   }
 }
 .auth-brand-gradient-2 {
-  background-image: radial-gradient( circle at 20% 80%, color-mix(in srgb, #4f46e5 15%, transparent) 0%, transparent 50% ), radial-gradient( circle at 80% 20%, color-mix(in srgb, #4f46e5 10%, transparent) 0%, transparent 50% );
+  background-image: radial-gradient( circle at 20% 80%, color-mix(in srgb, #0D9488 15%, transparent) 0%, transparent 50% ), radial-gradient( circle at 80% 20%, color-mix(in srgb, #0D9488 10%, transparent) 0%, transparent 50% );
   @supports (color: color-mix(in lab, red, red)) {
     background-image: radial-gradient( circle at 20% 80%, color-mix(in srgb, var(--color-primary) 15%, transparent) 0%, transparent 50% ), radial-gradient( circle at 80% 20%, color-mix(in srgb, var(--color-primary) 10%, transparent) 0%, transparent 50% );
   }
@@ -2439,107 +2439,107 @@ html {
     transition-duration: 0.01ms !important;
   }
 }
-.prose-tane {
+.prose-trakkt {
   color: var(--color-foreground);
   font-family: 'DM Sans', system-ui, sans-serif;
   font-size: 15px;
   line-height: 1.60;
 }
-.prose-tane h1, .prose-tane h2, .prose-tane h3 {
+.prose-trakkt h1, .prose-trakkt h2, .prose-trakkt h3 {
   font-family: 'Instrument Serif', Georgia, serif;
   font-weight: 400;
   color: var(--color-foreground);
   letter-spacing: -0.01em;
   line-height: 1.1;
 }
-.prose-tane h1 {
+.prose-trakkt h1 {
   font-size: 48px;
   margin: 0 0 32px;
 }
-.prose-tane h2 {
+.prose-trakkt h2 {
   font-size: 36px;
   margin: 56px 0 16px;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--color-border);
 }
-.prose-tane h1 em, .prose-tane h2 em, .prose-tane h3 em {
+.prose-trakkt h1 em, .prose-trakkt h2 em, .prose-trakkt h3 em {
   color: var(--color-primary);
   font-style: italic;
 }
-.prose-tane h3 {
+.prose-trakkt h3 {
   font-size: 24px;
   margin: 40px 0 12px;
 }
-.prose-tane h4, .prose-tane h5, .prose-tane h6 {
+.prose-trakkt h4, .prose-trakkt h5, .prose-trakkt h6 {
   font-family: 'DM Sans', system-ui, sans-serif;
   font-weight: 600;
   color: var(--color-foreground);
   margin-top: 32px;
   margin-bottom: 8px;
 }
-.prose-tane h4 {
+.prose-trakkt h4 {
   font-size: 18px;
 }
-.prose-tane h5, .prose-tane h6 {
+.prose-trakkt h5, .prose-trakkt h6 {
   font-size: 11px;
   font-weight: 500;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--color-muted-foreground);
 }
-.prose-tane p {
+.prose-trakkt p {
   margin: 0 0 12px;
 }
-.prose-tane p.lead {
+.prose-trakkt p.lead {
   font-size: 20px;
   line-height: 1.50;
   color: var(--color-muted-foreground);
   max-width: 60ch;
   margin-bottom: 32px;
 }
-.prose-tane strong {
+.prose-trakkt strong {
   font-weight: 600;
   color: var(--color-foreground);
 }
-.prose-tane em {
+.prose-trakkt em {
   font-style: italic;
 }
-.prose-tane a {
+.prose-trakkt a {
   color: var(--color-primary);
   text-decoration: underline;
   text-underline-offset: 3px;
   text-decoration-thickness: 1px;
   transition: color 150ms ease;
 }
-.prose-tane a:hover {
-  color: #B45309;
+.prose-trakkt a:hover {
+  color: #0F766E;
 }
-.prose-tane ul, .prose-tane ol {
+.prose-trakkt ul, .prose-trakkt ol {
   margin: 0 0 12px;
   padding-left: 24px;
 }
-.prose-tane ul {
+.prose-trakkt ul {
   list-style-type: disc;
 }
-.prose-tane ol {
+.prose-trakkt ol {
   list-style-type: decimal;
 }
-.prose-tane li {
+.prose-trakkt li {
   margin-bottom: 4px;
 }
-.prose-tane ul > li::marker {
+.prose-trakkt ul > li::marker {
   color: var(--color-primary);
 }
-.prose-tane ol > li::marker {
+.prose-trakkt ol > li::marker {
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
   color: var(--color-muted-foreground);
   font-size: 0.9em;
 }
-.prose-tane li > ul, .prose-tane li > ol {
+.prose-trakkt li > ul, .prose-trakkt li > ol {
   margin: 6px 0 6px;
 }
-.prose-tane blockquote {
+.prose-trakkt blockquote {
   margin: 24px 0;
   padding: 4px 0 4px 24px;
   border-left: 3px solid var(--color-primary);
@@ -2549,18 +2549,18 @@ html {
   line-height: 1.5;
   color: var(--color-foreground);
 }
-.prose-tane blockquote p {
+.prose-trakkt blockquote p {
   margin: 0 0 8px;
 }
-.prose-tane blockquote p:last-child {
+.prose-trakkt blockquote p:last-child {
   margin-bottom: 0;
 }
-.prose-tane hr {
+.prose-trakkt hr {
   border: none;
   border-top: 1px solid var(--color-border-strong);
   margin: 48px 0;
 }
-.prose-tane code {
+.prose-trakkt code {
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-size: 0.875em;
   background: var(--color-secondary);
@@ -2568,13 +2568,13 @@ html {
   border-radius: 3px;
   color: var(--color-foreground);
 }
-.prose-tane h1 code, .prose-tane h2 code, .prose-tane h3 code {
+.prose-trakkt h1 code, .prose-trakkt h2 code, .prose-trakkt h3 code {
   font-size: 0.85em;
   background: transparent;
   padding: 0;
   color: var(--color-primary);
 }
-.prose-tane pre {
+.prose-trakkt pre {
   margin: 24px 0;
   padding: 16px 20px;
   background: var(--color-secondary);
@@ -2585,17 +2585,17 @@ html {
   font-size: 13px;
   line-height: 1.50;
 }
-.prose-tane pre code {
+.prose-trakkt pre code {
   background: transparent;
   padding: 0;
   border-radius: 0;
   font-size: inherit;
   color: inherit;
 }
-.prose-tane > div:has(> table) {
+.prose-trakkt > div:has(> table) {
   overflow-x: auto;
 }
-.prose-tane table {
+.prose-trakkt table {
   width: 100%;
   min-width: 480px;
   margin: 24px 0;
@@ -2605,7 +2605,7 @@ html {
   border-top: 1.5px solid var(--color-foreground);
   border-bottom: 1.5px solid var(--color-foreground);
 }
-.prose-tane table thead th {
+.prose-trakkt table thead th {
   font-weight: 500;
   font-size: 11px;
   letter-spacing: 0.08em;
@@ -2615,24 +2615,24 @@ html {
   padding: 12px 16px 10px;
   border-bottom: 1.5px solid var(--color-foreground);
 }
-.prose-tane table tbody td {
+.prose-trakkt table tbody td {
   padding: 12px 16px;
   border-top: 1px solid var(--color-border);
   color: var(--color-foreground);
   vertical-align: top;
 }
-.prose-tane table tbody tr:first-child td {
+.prose-trakkt table tbody tr:first-child td {
   border-top: none;
 }
-.prose-tane table .num, .prose-tane table td.num, .prose-tane table th.num {
+.prose-trakkt table .num, .prose-trakkt table td.num, .prose-trakkt table th.num {
   font-family: 'Geist Mono', ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
-.prose-tane figure {
+.prose-trakkt figure {
   margin: 48px 0;
 }
-.prose-tane figure > figcaption {
+.prose-trakkt figure > figcaption {
   margin-top: 12px;
   font-family: 'Instrument Serif', Georgia, serif;
   font-style: italic;
@@ -2644,26 +2644,26 @@ html {
   margin-right: auto;
   line-height: 1.4;
 }
-.prose-tane > figure, .prose-tane > pre, .prose-tane > table, .prose-tane > blockquote, .prose-tane .chart-container {
+.prose-trakkt > figure, .prose-trakkt > pre, .prose-trakkt > table, .prose-trakkt > blockquote, .prose-trakkt .chart-container {
   max-width: none;
 }
-.dark .prose-tane h1 code, .dark .prose-tane h2 code, .dark .prose-tane h3 code {
+.dark .prose-trakkt h1 code, .dark .prose-trakkt h2 code, .dark .prose-trakkt h3 code {
   color: var(--color-primary);
 }
-.dark .prose-tane table, .dark .prose-tane table thead th {
+.dark .prose-trakkt table, .dark .prose-trakkt table thead th {
   border-color: var(--color-border-strong);
 }
-.dark .prose-tane pre, .dark .prose-tane code {
+.dark .prose-trakkt pre, .dark .prose-trakkt code {
   background: var(--color-muted);
   color: var(--color-foreground);
 }
 .dark {
-  --color-primary: #4f46e5;
+  --color-primary: #0D9488;
   --color-primary-foreground: #ffffff;
   --color-secondary: #24201E;
   --color-secondary-foreground: #A8A29E;
   --color-surface-alt: #2C241E;
-  --color-accent: #451A03;
+  --color-accent: #042F2E;
   --color-accent-foreground: #F5F3EF;
   --color-destructive: #dc2626;
   --color-destructive-foreground: #ffffff;
@@ -2677,10 +2677,10 @@ html {
   --color-popover-foreground: #F5F3EF;
   --color-border: #2E2925;
   --color-input: #2E2925;
-  --color-ring: #4f46e5;
+  --color-ring: #0D9488;
   --color-overlay: rgba(0, 0, 0, 0.7);
   --color-warning: #422006;
-  --color-warning-border: #4f46e5;
+  --color-warning-border: #CA8A04;
   --color-warning-foreground: #f59e0b;
   --color-error: #450a0a;
   --color-error-border: #dc2626;
