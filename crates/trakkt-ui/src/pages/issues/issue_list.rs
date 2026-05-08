@@ -444,7 +444,7 @@ fn IssueListSkeleton() -> impl IntoView {
                 // Label placeholder
                 <Skeleton class="hidden sm:block w-12 h-5 rounded-sm"/>
                 // Priority placeholder
-                <Skeleton class="w-2.5 h-2.5 rounded-[2px]"/>
+                <Skeleton class="w-3.5 h-3.5 rounded-[2px]"/>
                 // Avatar placeholder
                 <Skeleton class="w-5 h-5 rounded-full"/>
             </div>

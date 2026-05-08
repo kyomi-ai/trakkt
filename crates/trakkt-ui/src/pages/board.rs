@@ -533,7 +533,7 @@ fn BoardSkeleton() -> impl IntoView {
                     </div>
                     // Footer: priority + avatar
                     <div class="flex items-center justify-between">
-                        <Skeleton class="w-2.5 h-2.5 rounded-[2px]"/>
+                        <Skeleton class="w-3.5 h-3.5 rounded-[2px]"/>
                         <Skeleton class="w-5 h-5 rounded-full"/>
                     </div>
                 </div>
