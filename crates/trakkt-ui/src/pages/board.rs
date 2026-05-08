@@ -17,7 +17,7 @@ use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use wasm_bindgen::JsCast;
 
-use crate::components::{Avatar, IssueStatusVariant, LabelBadge, PriorityIndicator, Skeleton};
+use crate::components::{Avatar, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, Skeleton};
 use crate::server_fns::issues::{list_issues, update_issue};
 use trakkt_types::models::IssueWithDetails;
 
@@ -218,14 +218,14 @@ pub fn BoardPage() -> impl IntoView {
                                         {move || grouped().into_iter().map(|(col, issues)| {
                                             let col_key = col.key;
                                             let col_label = col.label;
-                                            let col_dot_color = col.variant.dot_color();
+                                            let col_variant = col.variant;
                                             let count = issues.len();
 
                                             view! {
                                                 <BoardColumn
                                                     status_key=col_key
                                                     label=col_label
-                                                    dot_color=col_dot_color
+                                                    status_variant=col_variant
                                                     count=count
                                                     issues=issues
                                                     dragging=dragging
@@ -262,8 +262,8 @@ fn BoardColumn(
     status_key: &'static str,
     /// Human-readable label (e.g. "In Progress").
     label: &'static str,
-    /// Tailwind class for the status color dot.
-    dot_color: &'static str,
+    /// Status variant for the SVG icon in the column header.
+    status_variant: IssueStatusVariant,
     /// Number of issues in this column.
     count: usize,
     /// Issues to render in this column.
@@ -298,8 +298,6 @@ fn BoardColumn(
             format!("{base} border-2 border-transparent")
         }
     };
-
-    let dot_class = format!("w-2 h-2 rounded-full shrink-0 {dot_color}");
 
     view! {
         <div
@@ -342,7 +340,7 @@ fn BoardColumn(
             // ── Column header ───────────────────────────────────────────────
             <div class="sticky top-0 bg-background pb-3 pt-1 px-2">
                 <div class="flex items-center gap-2">
-                    <span class=dot_class></span>
+                    <IssueStatusBadge status=status_variant/>
                     <span class="font-medium text-sm text-foreground">{label}</span>
                     <span class="text-muted-foreground text-xs">{count}</span>
                 </div>
@@ -545,7 +543,7 @@ fn BoardSkeleton() -> impl IntoView {
                 // Column header skeleton
                 <div class="pb-3 pt-1 px-2">
                     <div class="flex items-center gap-2">
-                        <Skeleton class="w-2 h-2 rounded-full"/>
+                        <Skeleton class="w-3.5 h-3.5 rounded-full"/>
                         <Skeleton class="w-20 h-4"/>
                         <Skeleton class="w-4 h-3"/>
                     </div>

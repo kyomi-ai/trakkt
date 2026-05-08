@@ -435,8 +435,8 @@ fn IssueListSkeleton() -> impl IntoView {
     let rows = (0..6).map(|_| {
         view! {
             <div class="px-4 md:px-6 py-3 flex items-center gap-3 border-b border-border">
-                // Status dot placeholder
-                <Skeleton class="w-2 h-2 rounded-full"/>
+                // Status icon placeholder
+                <Skeleton class="w-3.5 h-3.5 rounded-full"/>
                 // Issue number placeholder
                 <Skeleton class="w-14 h-4"/>
                 // Title placeholder
