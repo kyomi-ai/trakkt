@@ -22,7 +22,7 @@ use trakkt_types::models::{IssueWithDetails, Label};
 ///
 /// Wrapped in `SendWrapper` so it can be placed in a `StoredValue`, which
 /// requires `Send + Sync` even though this crate only ever runs on WASM
-/// (single-threaded). This matches the pattern used by Kyomi's `SyncStore`.
+/// (single-threaded).
 struct SyncStoreInner {
     issues: ArcRwSignal<Vec<IssueWithDetails>>,
     labels: ArcRwSignal<Vec<Label>>,

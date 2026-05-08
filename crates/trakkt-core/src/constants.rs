@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Application constants — hardcoded defaults matching shared/constants.toml from Kyomi.
+//! Application constants — hardcoded defaults.
 //!
-//! TODO: port constants.toml loading from Kyomi. For now, all values are inlined.
+//! TODO: support loading from a constants.toml file. For now, all values are inlined.
 
 use std::sync::OnceLock;
 

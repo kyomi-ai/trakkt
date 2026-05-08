@@ -246,43 +246,6 @@ html {
   scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
 }
 
-/* Chart cards — each chartml chart on dashboard surfaces gets card chrome:
- * border, background, rounded corners, subtle shadow. The outer grid on
- * `.prose-tane` handles inter-card spacing via `gap-4`, so cards themselves
- * carry no vertical margin. `overflow: hidden` ensures the ChartHeaderBar's
- * border-b is clipped to the card's rounded corners.
- * See DESIGN.md "Chart Container Pattern". */
-.dashboard-content .chart-card,
-.dashboard-wysiwyg .chart-card {
-  background-color: var(--color-card);
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  box-shadow: 0 1px 2px rgba(28, 25, 23, 0.05);
-  overflow: hidden;
-}
-
-.dashboard-content .chart-card > div:not(:first-child),
-.dashboard-wysiwyg .chart-card > div:not(:first-child) {
-  padding: 16px;
-}
-
-/* Table chartml extends flush to the card edge — axis-free charts don't
- * need the 16px breathing room that bar/line/scatter/pie need for tick
- * labels, so tables get `padding: 0` overriding the default above when
- * the chart content is a chartml-table. KYO-14. */
-.dashboard-content .chart-card:has(.chartml-table) > div:not(:first-child),
-.dashboard-wysiwyg .chart-card:has(.chartml-table) > div:not(:first-child) {
-  padding: 0;
-}
-
-/* Chart title — prevent long titles from overflowing their container at
- * narrow card widths. Rendered by chartml-leptos inside the chart area. */
-.chart-card .chart-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 /* ── Table styling ──────────────────────────────────────────────────
  * Tables in dashboard prose get card treatment + design system fonts. */
 
@@ -386,9 +349,7 @@ html {
 }
 
 /* Right-panel slide animations live inside <RightPanel> via Tailwind
- * transition classes (transform + opacity, duration-300). The previous
- * `.history-panel-*` / `.sidebar-slide-*` classes + `@keyframes sidebar-*`
- * were removed with the KYO-47 migration to the shared component. */
+ * transition classes (transform + opacity, duration-300). */
 
 /* Accessibility: respect reduced motion preferences */
 @media (prefers-reduced-motion: reduce) {
@@ -397,72 +358,6 @@ html {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
-}
-
-/* === ChartML Theme Overrides ===
- * Tane chart chrome — the "Editorial Figure" direction (Variant A).
- * See DESIGN.md "Chart Chrome" section for the visual thesis.
- *
- * The Rust `tane_theme()` in `crates/tane-chart-theme/src/lib.rs` writes
- * these same values as inline SVG presentation attributes (for SSR parity).
- * The CSS variables below provide the browser-side override path so light/
- * dark theme toggles update chart chrome instantly without re-rendering.
- * chartml-leptos's shipped CSS uses `var(--chartml-*, revert)` so if a
- * variable is unset the inline SVG attr wins — no values drift. */
-
-:root {
-  /* Chrome colors — Variant A editorial values.
-   * NOTE: every value in this `:root` block has a matching field in
-   * `tane_theme()` in `crates/tane-chart-theme/src/lib.rs`.
-   * If you edit one, edit the other. The Rust function is the source of truth
-   * for SSR paths (PDF export, email snapshots, MCP chart app) that don't have
-   * a CSS cascade; this block is the source of truth for browser rendering
-   * because chartml-leptos's shipped CSS rules win over SVG presentation attrs. */
-  --chartml-text: #1C1917;
-  --chartml-text-secondary: #6B6660;
-  --chartml-text-strong: #1C1917;
-  --chartml-grid: #EDE9E0;
-  --chartml-axis-line: #1C1917;
-  /* chartml-bg is the color used for element separators (dot outlines,
-   * pie slice gaps, stacked bar segment borders) — it must MATCH the
-   * page background so separators visually disappear into the surface. */
-  --chartml-bg: #FAFAF8;
-  --chartml-annotation: #9C9790;
-
-  /* Typography — title */
-  --chartml-title-font: 'Instrument Serif', Georgia, serif;
-  --chartml-title-font-size: 22px;
-  --chartml-title-font-weight: 400;
-  --chartml-title-font-style: normal;
-
-  /* Typography — category / axis labels */
-  --chartml-label-font: 'DM Sans', system-ui, sans-serif;
-  --chartml-label-font-size: 10px;
-  --chartml-label-font-weight: 500;
-  --chartml-label-letter-spacing: 1.2px;
-  --chartml-label-text-transform: uppercase;
-
-  /* Typography — numeric tick values */
-  --chartml-numeric-font: 'Geist Mono', ui-monospace, monospace;
-  --chartml-numeric-font-size: 11px;
-
-  /* Typography — legend */
-  --chartml-legend-font: 'DM Sans', system-ui, sans-serif;
-  --chartml-legend-font-size: 11px;
-  --chartml-legend-font-weight: 500;
-
-  /* Shape / stroke — mode-independent (same values in light and dark) */
-  --chartml-series-line-weight: 2px;
-  --chartml-bar-corner-radius: 2px;
-  --chartml-dot-radius: 4px;
-}
-
-/* Chart tooltip: warm dark background, Tane font */
-.chartml-tooltip {
-  background: rgba(15, 23, 42, 0.95);
-  font-family: 'DM Sans', sans-serif;
-  border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(28, 25, 23, 0.15);
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -474,8 +369,8 @@ html {
  * chat messages, copilot sidebar, trial chat, watches alerts, and
  * watches execution log. One class, consistent appearance everywhere.
  *
- * Visual reference: `/tmp/tane-chartml-variants.html` — the
- * editorial sample page this treatment is derived from.
+ * Visual reference: the editorial sample page this treatment is
+ * derived from.
  *
  * Design principles:
  * - Instrument Serif for headings and editorial moments (italic em,
@@ -849,16 +744,6 @@ html {
   --color-info-border: #2563eb;
   --color-info-foreground: #3b82f6;
 
-  /* ChartML dark theme — matches tane_theme(is_dark=true) in Rust.
-   * `--chartml-bg` is the page background (separator color that disappears
-   * into the surface), not a white chart fill. */
-  --chartml-text: #F5F3EF;
-  --chartml-text-secondary: #A8A29E;
-  --chartml-text-strong: #F5F3EF;
-  --chartml-grid: #2E2925;
-  --chartml-axis-line: #A8A29E;
-  --chartml-bg: #12100F;
-  --chartml-annotation: #78716C;
 }
 
 :root.dark { color-scheme: dark; }
@@ -913,7 +798,7 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
  *
  * Every field below has a matching rule in `.prose-tane`. If you edit
  * one, edit the other. There's no build-time drift detector — same
- * hand-maintained mirror pattern as the chartml variables.
+ * hand-maintained mirror pattern as the theme variables.
  *
  * The wysiwyg container is scoped so these overrides don't affect the
  * source-mode code editor (`.kode-editor` without `.wysiwyg-container`),
@@ -1084,24 +969,6 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
 
 .kode-toolbar { overflow-y: hidden; }
 
-
-/* KYO-214: chartml-container must grow to fill the height-reserve wrapper
- * so the absolutely-positioned loading indicator centers vertically within
- * the full chart tile, not just the container's natural content height. */
-.chart-card .chartml-container {
-  flex: 1 1 0%;
-  min-height: 0;
-}
-
-/* ChartML chart CSS (animations, tooltips, hover effects) is injected
- * automatically by chartml-leptos's ChartMLChart component on mount.
- * No manual CSS needed — styles are embedded in the chartml-leptos crate. */
-
-.dashboard-wysiwyg {
-  --kode-extension-block-padding: 0;
-  --kode-extension-block-border-width: 0;
-  --kode-extension-block-background: transparent;
-}
 
 /* PWA standalone safe-area insets — prevents OS chrome (status bar,
    home indicator, navigation bar) from overlapping app content.

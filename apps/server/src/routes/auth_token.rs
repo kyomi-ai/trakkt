@@ -11,8 +11,7 @@
 //!
 //! Token refresh must set `Set-Cookie` response headers with the rotated tokens,
 //! which requires a real HTTP handler — Leptos server functions cannot set
-//! arbitrary response headers. This file is therefore the single keeper from
-//! the auth bundle deletion (KYO-73 Group 1).
+//! arbitrary response headers.
 
 use axum::{
     extract::State,

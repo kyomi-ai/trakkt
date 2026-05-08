@@ -3,7 +3,7 @@
 //! Auth orchestration service functions — extracted from Leptos server_fns.
 //!
 //! These functions contain the business logic that was previously inlined in
-//! `crates/kyomi-ui/src/server_fns/auth.rs`. Server functions are now thin
+//! server functions. Server functions are now thin
 //! wrappers that delegate to these service functions and apply HTTP concerns
 //! (cookie setting via `ResponseOptions`) to the returned results.
 //!
@@ -109,7 +109,7 @@ pub async fn login_with_password_service(
                 });
             }
             Some(_code) => {
-                // TODO: port from Kyomi — crate::totp::verify_code
+                // TODO: implement TOTP verification (crate::totp::verify_code)
                 return Ok(LoginServiceResult::InvalidCredentials);
             }
         }
@@ -620,17 +620,14 @@ pub async fn google_oauth_callback_service(
         }
     }
 
-    // TODO: port from Kyomi — crate::google_oauth (exchange_code_for_tokens, get_user_info, etc.)
+    // TODO: implement Google OAuth (exchange_code_for_tokens, get_user_info, etc.)
     let _ = (db, kv, jwt_secret, code, state, ip, device, client_id, client_secret,
              frontend_url, encryption_key, config);
-    Err(trakkt_core::Error::NotImplemented("Google OAuth not yet ported".into()))
+    Err(trakkt_core::Error::NotImplemented("Google OAuth not yet implemented".into()))
 }
 
-// NOTE: ensure_google_oauth_auth_method and ensure_user_has_workspace were
-// removed — they were dead code (never called). They will be re-implemented
-// when the Google OAuth flow is ported from Kyomi.
-
-// TODO: port from Kyomi — update_google_oauth_data (crate::google_oauth)
+// TODO: implement Google OAuth helpers (ensure_google_oauth_auth_method,
+// ensure_user_has_workspace, update_google_oauth_data)
 
 // ---------------------------------------------------------------------------
 // Account recovery
@@ -1503,8 +1500,6 @@ pub async fn recovery_start_service(
 }
 
 /// Send a verification email in a background task (fire-and-forget).
-///
-/// TODO: port EmailService from Kyomi. For now, logs the URL.
 fn spawn_verification_email(email: String, name: String, url: String) {
     tokio::spawn(async move {
         let email_svc = crate::email_service::EmailService::from_env();

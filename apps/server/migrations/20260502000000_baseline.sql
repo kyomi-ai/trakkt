@@ -1,5 +1,4 @@
--- Tane baseline migration — auth and workspace tables only.
--- Extracted from Kyomi production schema.
+-- Trakkt baseline migration — auth and workspace tables only.
 -- Idempotent: safe to run on both empty and populated databases.
 
 -- ─────────────────────────────────────────────────────────────────────────────

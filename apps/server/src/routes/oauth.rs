@@ -2,7 +2,7 @@
 
 //! OAuth 2.0 endpoints for MCP client authentication.
 //!
-//! TODO: port OAuth routes from Kyomi
+//! TODO: implement OAuth routes
 
 use axum::Router;
 

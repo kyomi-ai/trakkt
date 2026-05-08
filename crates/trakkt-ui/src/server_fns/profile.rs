@@ -15,8 +15,8 @@ use crate::types::{InvitationData, ProfileData};
 
 /// Load the current user's profile data.
 ///
-/// Combines user info, preferences, chart config, and system config
-/// into a single response — replacing multiple separate REST calls.
+/// Combines user info, preferences, and system config into a single
+/// response — replacing multiple separate REST calls.
 #[server(prefix = "/leptos-api")]
 pub async fn get_profile() -> Result<ProfileData, ServerFnError> {
     let auth = extract_auth().await?;
@@ -41,27 +41,12 @@ pub async fn get_profile() -> Result<ProfileData, ServerFnError> {
         .unwrap_or("chat")
         .to_string();
 
-    let default_dashboard_id = metadata
-        .and_then(|m| m.get("default_dashboard_id"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let query_history_retention_days = metadata
-        .and_then(|m| m.get("query_history_retention_days"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(30) as i32;
-
-    let chart_palette = "tane".to_string();
-
     Ok(ProfileData {
         user_id: user.user_id,
         email: user.email,
         name: user.name,
         theme,
         landing_page,
-        default_dashboard_id,
-        query_history_retention_days,
-        chart_palette,
         is_personal_mode: ctx.config.is_personal(),
         is_self_hosted: ctx.config.self_hosted,
     })
@@ -137,10 +122,10 @@ pub async fn update_landing_page(page: String) -> Result<(), ServerFnError> {
     let auth = extract_auth().await?;
     let ctx = extract_context()?;
 
-    let valid = ["chat", "dashboards", "watches", "sql_editor"];
+    let valid = ["issues", "settings"];
     if !valid.contains(&page.as_str()) {
         return Err(ServerFnError::new(
-            "Invalid landing_page. Must be 'chat', 'dashboards', 'watches', or 'sql_editor'.",
+            "Invalid landing_page. Must be 'issues' or 'settings'.",
         ));
     }
 
@@ -149,52 +134,6 @@ pub async fn update_landing_page(page: String) -> Result<(), ServerFnError> {
         .await
         .into_sfn()?;
 
-    Ok(())
-}
-
-/// Update the user's default dashboard.
-#[server(prefix = "/leptos-api")]
-pub async fn update_default_dashboard(dashboard_id: Option<String>) -> Result<(), ServerFnError> {
-    let auth = extract_auth().await?;
-    let ctx = extract_context()?;
-
-    let value = match dashboard_id {
-        Some(id) if !id.is_empty() => serde_json::json!({ "default_dashboard_id": id }),
-        _ => serde_json::json!({ "default_dashboard_id": null }),
-    };
-
-    trakkt_auth::user_service::update_extra_metadata(&ctx.db, &auth.user_id, &value)
-        .await
-        .into_sfn()?;
-
-    Ok(())
-}
-
-/// Update the user's query history retention days.
-#[server(prefix = "/leptos-api")]
-pub async fn update_query_retention(days: i32) -> Result<(), ServerFnError> {
-    let auth = extract_auth().await?;
-    let ctx = extract_context()?;
-
-    if !(1..=365).contains(&days) {
-        return Err(ServerFnError::new(
-            "Retention days must be between 1 and 365",
-        ));
-    }
-
-    let metadata = serde_json::json!({ "query_history_retention_days": days });
-    trakkt_auth::user_service::update_extra_metadata(&ctx.db, &auth.user_id, &metadata)
-        .await
-        .into_sfn()?;
-
-    Ok(())
-}
-
-/// Update the user's chart color palette.
-#[server(prefix = "/leptos-api")]
-pub async fn update_chart_palette(_palette: String) -> Result<(), ServerFnError> {
-    // Per-user chart palette config (chartml_config) was removed from the User model.
-    // Workspace-level palette is stored in workspace settings instead.
     Ok(())
 }
 

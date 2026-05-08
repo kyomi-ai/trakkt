@@ -697,7 +697,7 @@ fn generate_token_id() -> String {
 
 /// Create an API token. Returns `(token_id, token_plaintext)`.
 ///
-/// The raw token is format `kyomi-{random_hex_32}`.
+/// The raw token is format `trakkt-{random_hex_32}`.
 /// Only the SHA-256 hash is stored — the plaintext is returned once.
 pub async fn create_api_token(
     pool: &DbPool,
@@ -708,7 +708,7 @@ pub async fn create_api_token(
 ) -> trakkt_core::Result<(String, String)> {
     let token_id = generate_token_id();
     let random_bytes: [u8; 32] = rand::rng().random();
-    let token_plaintext = format!("kyomi-{}", format_hex(&random_bytes));
+    let token_plaintext = format!("trakkt-{}", format_hex(&random_bytes));
 
     let mut hasher = Sha256::new();
     hasher.update(token_plaintext.as_bytes());
@@ -851,59 +851,3 @@ pub async fn delete_user(pool: &DbPool, user_id: &str) -> trakkt_core::Result<bo
     Ok(result.rows_affected() > 0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn extract_palette_style_flat() {
-        let v = json!({"type": "config", "version": 1, "style": "vibrant"});
-        assert_eq!(extract_palette_style(&v), Some("vibrant"));
-    }
-
-    #[test]
-    fn extract_palette_style_nested() {
-        let v = json!({"config": {"type": "config", "version": 1, "style": "balanced"}});
-        assert_eq!(extract_palette_style(&v), Some("balanced"));
-    }
-
-    #[test]
-    fn extract_palette_style_prefers_flat_over_nested_when_both_present() {
-        // Defensive: if a future writer accidentally emits both, flat wins,
-        // mirroring the pre-KYO-129 reader order.
-        let v = json!({"style": "vibrant", "config": {"style": "balanced"}});
-        assert_eq!(extract_palette_style(&v), Some("vibrant"));
-    }
-
-    #[test]
-    fn extract_palette_style_missing_returns_none() {
-        let v = json!({"type": "config", "version": 1});
-        assert_eq!(extract_palette_style(&v), None);
-    }
-
-    #[test]
-    fn extract_palette_style_empty_object_returns_none() {
-        assert_eq!(extract_palette_style(&json!({})), None);
-    }
-
-    #[test]
-    fn extract_palette_style_null_returns_none() {
-        assert_eq!(extract_palette_style(&json!(null)), None);
-    }
-
-    #[test]
-    fn extract_palette_style_non_object_returns_none() {
-        // Malformed data — e.g. a bare string accidentally stored.
-        assert_eq!(extract_palette_style(&json!("vibrant")), None);
-        assert_eq!(extract_palette_style(&json!(42)), None);
-        assert_eq!(extract_palette_style(&json!([1, 2, 3])), None);
-    }
-
-    #[test]
-    fn extract_palette_style_style_not_a_string_returns_none() {
-        // If `style` is present but isn't a string, we should ignore it.
-        let v = json!({"style": 42});
-        assert_eq!(extract_palette_style(&v), None);
-    }
-}

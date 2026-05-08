@@ -50,9 +50,6 @@ pub fn register_server_functions() {
     register_explicit::<UpdateProfileName>();
     register_explicit::<UpdateTheme>();
     register_explicit::<UpdateLandingPage>();
-    register_explicit::<UpdateDefaultDashboard>();
-    register_explicit::<UpdateQueryRetention>();
-    register_explicit::<UpdateChartPalette>();
     register_explicit::<AcceptInvitation>();
     register_explicit::<DeclineInvitation>();
 
@@ -104,8 +101,6 @@ pub fn register_server_functions() {
     use server_fns::workspace::*;
     register_explicit::<GetWorkspaceSettings>();
     register_explicit::<UpdateWorkspaceName>();
-    register_explicit::<UpdateWorkspaceModel>();
-    register_explicit::<UpdateWorkspaceChartmlConfig>();
 
     // Issues
     use server_fns::issues::*;

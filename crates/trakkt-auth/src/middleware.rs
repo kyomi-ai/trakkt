@@ -268,4 +268,4 @@ async fn load_personal_user(db: &trakkt_core::DbPool) -> trakkt_core::Result<Aut
 
 // Identity impl — when the state IS AuthState directly.
 // (Axum's FromRef blanket impl handles this for types that impl Clone.)
-// The AppState → AuthState impl is in kyomi-api/src/state.rs.
+// The AppState → AuthState impl is in apps/server/src/state.rs.

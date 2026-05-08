@@ -21,7 +21,7 @@ pub async fn notify_signup(
         );
     }
 
-    // TODO: port EmailService from Kyomi for email notification to support
+    // TODO: add email notification to support
 }
 
 /// Send a Slack webhook notification for a new signup.

@@ -48,7 +48,7 @@ pub enum Error {
     SerdeJson(#[from] serde_json::Error),
 }
 
-// TODO: port from Kyomi — tane_connect_protocol::Error conversion
+// TODO: add tane_connect_protocol::Error conversion if needed
 // impl From<tane_connect_protocol::Error> for Error { ... }
 
 impl Error {
