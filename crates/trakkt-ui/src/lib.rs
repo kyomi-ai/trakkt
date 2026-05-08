@@ -4,6 +4,7 @@
 //! trakkt-ui — Leptos frontend for Trakkt.
 
 pub mod app;
+pub mod cache;
 pub mod components;
 pub mod pages;
 pub mod server_fns;

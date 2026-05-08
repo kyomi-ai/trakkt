@@ -71,6 +71,9 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 # SendWrapper for non-Send JS values in Leptos reactive closures
 send_wrapper = "0.6"
 
+# IndexedDB persistence for client-side sync cache (WASM only, no-op on server)
+indexed_db_futures = { version = "0.6", features = ["serde"] }
+
 # WASM interop
 js-sys = "0.3"
 wasm-bindgen = "0.2"
