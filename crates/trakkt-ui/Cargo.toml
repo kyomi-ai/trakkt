@@ -63,6 +63,7 @@ web-sys = { version = "0.3", features = [
     "CredentialCreationOptions", "CredentialRequestOptions",
     "Clipboard", "HtmlDivElement", "DomRect",
     "ScrollIntoViewOptions", "ScrollLogicalPosition",
+    "WebSocket", "MessageEvent", "CloseEvent",
 ] }
 
 # Timers for WASM

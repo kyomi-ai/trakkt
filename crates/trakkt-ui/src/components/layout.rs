@@ -10,6 +10,7 @@ use wasm_bindgen::JsCast;
 
 use phosphor_leptos::{Icon, IconWeight};
 
+use crate::cache::store::SyncStore;
 use crate::components::{CommandPalette, Spinner};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
@@ -23,6 +24,11 @@ pub fn Layout() -> impl IntoView {
     let (mobile_sidebar_open, set_mobile_sidebar_open) = signal(false);
     let (show_palette, set_show_palette) = signal(false);
 
+    // Provide SyncStore on all targets so page components can reference it.
+    // On SSR it remains empty; on WASM the sync engine populates it.
+    let sync_store = SyncStore::new();
+    provide_context(sync_store);
+
     let auth_confirmed = RwSignal::new(false);
     let nav = leptos_router::hooks::use_navigate();
 
@@ -35,6 +41,83 @@ pub fn Layout() -> impl IntoView {
             None => {}
         }
     });
+
+    // ── Sync engine wiring (WASM only) ────────────────────────────────────
+    // Once auth is confirmed and user context is available:
+    // 1. Hydrate the store from IndexedDB for instant UI
+    // 2. Connect the WebSocket
+    // 3. Start the sync engine to keep data current
+    #[cfg(target_arch = "wasm32")]
+    {
+        use crate::cache::websocket;
+        use crate::cache::sync_engine;
+
+        // Track whether we've already started the sync engine to avoid
+        // re-connecting on every reactive re-fire.
+        let sync_started = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        Effect::new(move |_| {
+            // Wait for user context to resolve successfully.
+            let Some(Ok(ctx)) = user_ctx.get() else {
+                return;
+            };
+
+            if sync_started.get() {
+                return;
+            }
+            sync_started.set(true);
+
+            let user_id = ctx.user_id.clone();
+            let workspace_id = ctx
+                .workspace_id
+                .clone()
+                .unwrap_or_else(|| "workspace-local".to_string());
+
+            let is_personal = ctx.is_personal_mode;
+
+            // 1. Hydrate from IDB (instant cached data)
+            let wid_hydrate = workspace_id.clone();
+            leptos::task::spawn_local(async move {
+                match crate::cache::db::init_cache_db(&wid_hydrate).await {
+                    Ok(cache_db) => {
+                        sync_engine::hydrate_store_from_db(&cache_db, &wid_hydrate, &sync_store)
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to open IDB for hydration: {e}");
+                    }
+                }
+            });
+
+            // 2. Get WS token — personal mode skips auth, multi-user gets a JWT
+            let uid_for_ws = user_id.clone();
+            let wid_for_ws = workspace_id.clone();
+            leptos::task::spawn_local(async move {
+                let token = if is_personal {
+                    String::new()
+                } else {
+                    match crate::server_fns::auth::get_ws_token().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!("Failed to get WS token: {e}");
+                            return;
+                        }
+                    }
+                };
+
+                let ws_client = websocket::connect(&uid_for_ws, &wid_for_ws, &token);
+
+                sync_engine::start_sync_engine(&ws_client, &sync_store, &wid_for_ws);
+
+                let ws_for_cleanup = ws_client.clone();
+                provide_context(ws_client);
+
+                on_cleanup(move || {
+                    websocket::disconnect(&ws_for_cleanup);
+                });
+            });
+        });
+    }
 
     // ── Global Cmd+K / Ctrl+K listener ─────────────────────────────────────
     Effect::new(move |_| {

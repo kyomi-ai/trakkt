@@ -37,6 +37,7 @@ pub fn register_server_functions() {
     register_explicit::<PasskeyRegisterComplete>();
     register_explicit::<PasskeySignupComplete>();
     register_explicit::<PasskeyRecoveryVerify>();
+    register_explicit::<GetWsToken>();
 
     // Context
     use server_fns::context::*;

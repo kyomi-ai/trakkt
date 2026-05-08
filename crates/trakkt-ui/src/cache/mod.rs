@@ -23,4 +23,10 @@ pub mod store;
 pub mod db;
 
 #[cfg(target_arch = "wasm32")]
+pub mod websocket;
+
+#[cfg(target_arch = "wasm32")]
+pub mod sync_engine;
+
+#[cfg(target_arch = "wasm32")]
 pub use db::*;

@@ -990,3 +990,25 @@ pub(crate) fn extract_device_info(headers: &axum::http::HeaderMap) -> trakkt_aut
         oauth_client_id: None,
     }
 }
+
+// ─── WebSocket token ──────────────────────────────────────────────────────
+
+/// Issue a short-lived JWT for WebSocket authentication.
+///
+/// The client passes this token as a query parameter when connecting
+/// to the WebSocket endpoint. Personal mode skips this (empty token).
+#[server(prefix = "/leptos-api")]
+pub async fn get_ws_token() -> Result<String, ServerFnError> {
+    use super::{extract_auth, extract_context};
+    let auth = extract_auth().await?;
+    let ctx = extract_context()?;
+    let extra = std::collections::HashMap::new();
+    let token = trakkt_auth::jwt::create_access_token_str(
+        &auth.user_id,
+        &ctx.config.jwt_secret,
+        15,
+        extra,
+    )
+    .map_err(|e| ServerFnError::new(format!("Failed to create WS token: {e}")))?;
+    Ok(token)
+}
