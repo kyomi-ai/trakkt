@@ -203,39 +203,14 @@ impl WebSocketManager {
         }
     }
 
-    /// Send a message to a user.
+    // ── Delivery (private) ────────────────────────────────────────────────
+
+    /// Route a pre-serialized JSON message to a user.
     ///
-    /// In multi-replica mode (Redis configured): publishes via Redis so all pods receive it.
-    /// In single-instance mode (no Redis): delivers directly to local connections.
-    pub async fn send_to_user(&self, user_id: &str, message: WebSocketMessage) {
-        let json = match serde_json::to_string(&message) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!("Failed to serialize WS message: {e}");
-                return;
-            }
-        };
-
-        if let Some((redis, _)) = &self.inner.redis {
-            // Multi-replica: publish via Redis so all pods receive it.
-            let channel = format!("{REDIS_CHANNEL_PREFIX}{user_id}");
-            let mut conn = redis.clone();
-            if let Err(e) = redis::cmd("PUBLISH")
-                .arg(&channel)
-                .arg(&json)
-                .query_async::<i64>(&mut conn)
-                .await
-            {
-                tracing::error!("Redis PUBLISH to {channel} failed: {e}");
-            }
-        } else {
-            // Single-instance: deliver directly to local connections.
-            self.deliver_to_local_user(user_id, &json);
-        }
-    }
-
-    /// Send a pre-serialized JSON string to a specific user.
-    pub async fn send_to_user_raw(&self, user_id: &str, json: &str) {
+    /// The caller doesn't know or care whether delivery uses Redis pub/sub
+    /// (multi-pod) or direct local dispatch (single-instance). This is the
+    /// single decision point for that routing.
+    async fn deliver(&self, user_id: &str, json: &str) {
         if let Some((redis, _)) = &self.inner.redis {
             let channel = format!("{REDIS_CHANNEL_PREFIX}{user_id}");
             let mut conn = redis.clone();
@@ -252,16 +227,43 @@ impl WebSocketManager {
         }
     }
 
-    /// Broadcast a message to all members of a workspace (via Redis PUBLISH for each).
+    // ── Public send methods ─────────────────────────────────────────────
+
+    /// Send a typed WebSocketMessage to a user.
+    pub async fn send_to_user(&self, user_id: &str, message: WebSocketMessage) {
+        let json = match serde_json::to_string(&message) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!("Failed to serialize WS message: {e}");
+                return;
+            }
+        };
+        self.deliver(user_id, &json).await;
+    }
+
+    /// Send a pre-serialized JSON string to a user.
+    pub async fn send_to_user_raw(&self, user_id: &str, json: &str) {
+        self.deliver(user_id, json).await;
+    }
+
+    /// Broadcast a message to all members of a workspace.
     ///
-    /// Optionally excludes one user (typically the sender).
+    /// Serializes once, delivers to each member. Optionally excludes one
+    /// user (typically the sender to avoid echo).
     pub async fn broadcast_to_workspace(
         &self,
         workspace_id: &str,
         message: WebSocketMessage,
         exclude_user_id: Option<&str>,
     ) {
-        // Query workspace members from DB.
+        let json = match serde_json::to_string(&message) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!("Failed to serialize WS message for broadcast: {e}");
+                return;
+            }
+        };
+
         let members: Vec<(String,)> = match trakkt_core::db_fetch_all!(
             &self.inner.db,
             (String,),
@@ -279,7 +281,7 @@ impl WebSocketManager {
             if exclude_user_id == Some(member_user_id.as_str()) {
                 continue;
             }
-            self.send_to_user(&member_user_id, message.clone()).await;
+            self.deliver(&member_user_id, &json).await;
         }
     }
 
