@@ -63,7 +63,7 @@ struct WsState {
     /// The live WebSocket connection, if any.
     ws: Option<WebSocket>,
     /// Event handler closures — stored to prevent GC.
-    _closures: Vec<SendWrapper<JsValue>>,
+    _closures: Vec<JsValue>,
     /// Callback invoked on every incoming message.
     on_message: Option<MessageCallback>,
     /// Whether a `connect()` call is in progress (prevents concurrent connects).
@@ -291,7 +291,7 @@ fn do_connect(
         }
     };
 
-    let mut closures: Vec<SendWrapper<JsValue>> = Vec::new();
+    let mut closures: Vec<JsValue> = Vec::new();
 
     // -- onopen ---------------------------------------------------------------
     let onopen_state = state.clone();
@@ -302,7 +302,7 @@ fn do_connect(
         onopen_state.borrow_mut().reconnect_attempts = 0;
     });
     ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-    closures.push(SendWrapper::new(on_open.into_js_value()));
+    closures.push(on_open.into_js_value());
 
     // -- onmessage ------------------------------------------------------------
     let onmsg_state = state.clone();
@@ -335,7 +335,7 @@ fn do_connect(
         }
     });
     ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    closures.push(SendWrapper::new(on_message.into_js_value()));
+    closures.push(on_message.into_js_value());
 
     // -- onerror --------------------------------------------------------------
     let onerr_conn = connection_state.clone();
@@ -344,7 +344,7 @@ fn do_connect(
         onerr_conn.set(ConnectionState::Disconnected);
     });
     ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-    closures.push(SendWrapper::new(on_error.into_js_value()));
+    closures.push(on_error.into_js_value());
 
     // -- onclose --------------------------------------------------------------
     let onclose_state = state.clone();
@@ -373,7 +373,7 @@ fn do_connect(
         }
     });
     ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
-    closures.push(SendWrapper::new(on_close.into_js_value()));
+    closures.push(on_close.into_js_value());
 
     // Store the connection and clear the connecting guard.
     let mut s = state.borrow_mut();
