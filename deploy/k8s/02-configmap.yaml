@@ -20,11 +20,11 @@ data:
   port: "8003"
 
   # URLs
-  base-url: "https://app.trakkt.io"
-  frontend-url: "https://app.trakkt.io"
+  base-url: "https://app.trakkt.app"
+  frontend-url: "https://app.trakkt.app"
 
   # WebAuthn RP configuration
-  webauthn-rp-id: "app.trakkt.io"
+  webauthn-rp-id: "app.trakkt.app"
   webauthn-rp-name: "Trakkt"
 
   # Support email
