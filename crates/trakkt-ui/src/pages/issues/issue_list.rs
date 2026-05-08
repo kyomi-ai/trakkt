@@ -61,24 +61,65 @@ pub fn IssueListPage() -> impl IntoView {
     let (status_filter, set_status_filter) = signal(String::new());
     let (priority_filter, set_priority_filter) = signal(String::new());
 
-    // ── Data fetching ───────────────────────────────────────────────────────
+    // ── Data source: SyncStore (real-time) with server function fallback ───
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (version, set_version) = signal(0u32);
 
-    let issues = Resource::new(
-        move || (version.get(), search.get(), status_filter.get(), priority_filter.get()),
-        move |(_, search_val, status_val, priority_val)| {
-            let status = if status_val.is_empty() { None } else { Some(status_val) };
-            let priority = if priority_val.is_empty() {
-                None
-            } else {
-                priority_val.parse::<i32>().ok()
-            };
-            let search = if search_val.is_empty() { None } else { Some(search_val) };
-            async move {
-                list_issues(status, priority, None, None, search, None, None).await
-            }
+    // Server function fallback — used for initial load before sync is ready.
+    let server_issues = Resource::new(
+        move || version.get(),
+        move |_| async move {
+            list_issues(None, None, None, None, None, None, None).await
         },
     );
+
+    // Filtered issue list — reads from SyncStore when initialized, otherwise
+    // from the server function result. Filters are applied client-side for
+    // instant reactivity (no round-trip to the server on filter change).
+    let filtered_issues = Memo::new(move |_| {
+        let raw = if let Some(store) = sync_store {
+            let issues = store.issues().get();
+            if !issues.is_empty() || store.initialized().get() {
+                issues
+            } else {
+                // Store not initialized yet — use server function result
+                server_issues.get()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default()
+            }
+        } else {
+            // No store (SSR) — use server function
+            server_issues.get()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+        };
+
+        // Apply client-side filters
+        let search_val = search.get().to_lowercase();
+        let status_val = status_filter.get();
+        let priority_val = priority_filter.get();
+
+        raw.into_iter()
+            .filter(|issue| {
+                if !status_val.is_empty() && issue.status != status_val {
+                    return false;
+                }
+                if !priority_val.is_empty() {
+                    if let Ok(p) = priority_val.parse::<i32>() {
+                        if issue.priority != p {
+                            return false;
+                        }
+                    }
+                }
+                if !search_val.is_empty()
+                    && !issue.title.to_lowercase().contains(&search_val)
+                {
+                    return false;
+                }
+                true
+            })
+            .collect::<Vec<_>>()
+    });
 
     // ── New Issue modal state ───────────────────────────────────────────────
     let (show_new_issue, set_show_new_issue) = signal(false);
@@ -217,76 +258,53 @@ pub fn IssueListPage() -> impl IntoView {
 
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto">
-                <Suspense fallback=move || view! { <IssueListSkeleton/> }>
-                    {move || Suspend::new(async move {
-                        match issues.await {
-                            Ok(ref list) if list.is_empty() => {
-                                // Reset keyboard navigation state when list is empty.
-                                issue_count.set(0);
-                                issue_numbers.set(Vec::new());
-                                set_selected_index.set(None);
+                {move || {
+                    let list = filtered_issues.get();
 
-                                let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
-                                    view! {
-                                        <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
-                                    }.into_any()
-                                });
-                                let empty_action: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
-                                    view! {
-                                        <Button on:click=move |_| set_show_new_issue.set(true)>
-                                            <Icon icon=phosphor_leptos::PLUS size="14px"/>
-                                            "New Issue"
-                                        </Button>
-                                    }.into_any()
-                                });
-                                view! {
-                                    <div class="p-4 md:p-6">
-                                        <EmptyState
-                                            icon=empty_icon
-                                            title="No issues yet"
-                                            description="Create your first issue to get started"
-                                            action=empty_action
-                                        />
-                                    </div>
-                                }.into_any()
-                            }
-                            Ok(ref list) => {
-                                // Update keyboard navigation bounds.
-                                issue_count.set(list.len());
-                                issue_numbers.set(list.iter().map(|i| i.number).collect());
+                    // Update keyboard navigation bounds.
+                    issue_count.set(list.len());
+                    issue_numbers.set(list.iter().map(|i| i.number).collect());
+                    if let Some(idx) = selected_index.get_untracked()
+                        && idx >= list.len()
+                    {
+                        set_selected_index.set(if list.is_empty() { None } else { Some(list.len() - 1) });
+                    }
 
-                                // Clamp selected index if the list shrank.
-                                if let Some(idx) = selected_index.get_untracked()
-                                    && idx >= list.len()
-                                {
-                                    set_selected_index.set(if list.is_empty() { None } else { Some(list.len() - 1) });
-                                }
-
-                                let rows = list.iter().enumerate().map(|(idx, issue)| {
-                                    view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index/> }
-                                }).collect_view();
-                                view! {
-                                    <div role="list">
-                                        {rows}
-                                    </div>
-                                }.into_any()
-                            }
-                            Err(_) => {
-                                issue_count.set(0);
-                                issue_numbers.set(Vec::new());
-                                set_selected_index.set(None);
-                                view! {
-                                    <div class="p-4 md:p-6">
-                                        <EmptyState
-                                            title="Failed to load issues"
-                                            description="Something went wrong. Please try again."
-                                        />
-                                    </div>
-                                }.into_any()
-                            }
-                        }
-                    })}
-                </Suspense>
+                    if list.is_empty() {
+                        let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                            view! {
+                                <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+                            }.into_any()
+                        });
+                        let empty_action: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                            view! {
+                                <Button on:click=move |_| set_show_new_issue.set(true)>
+                                    <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                                    "New Issue"
+                                </Button>
+                            }.into_any()
+                        });
+                        view! {
+                            <div class="p-4 md:p-6">
+                                <EmptyState
+                                    icon=empty_icon
+                                    title="No issues yet"
+                                    description="Create your first issue to get started"
+                                    action=empty_action
+                                />
+                            </div>
+                        }.into_any()
+                    } else {
+                        let rows = list.iter().enumerate().map(|(idx, issue)| {
+                            view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index/> }
+                        }).collect_view();
+                        view! {
+                            <div role="list">
+                                {rows}
+                            </div>
+                        }.into_any()
+                    }
+                }}
             </div>
         </div>
 

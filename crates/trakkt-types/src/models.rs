@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A team within a workspace (e.g. "Engineering", "Design").
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Team {
     pub team_id: String,
     pub workspace_id: String,
@@ -22,7 +22,7 @@ pub struct Team {
 }
 
 /// An issue (task / bug / story) within a team.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
     pub issue_id: String,
     pub workspace_id: String,
@@ -40,7 +40,7 @@ pub struct Issue {
 }
 
 /// Issue with joined details: team key, assignee/creator names, and labels.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IssueWithDetails {
     pub issue_id: String,
     pub workspace_id: String,
@@ -62,7 +62,7 @@ pub struct IssueWithDetails {
 }
 
 /// A workspace-scoped label that can be applied to issues.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Label {
     pub label_id: String,
     pub workspace_id: String,
@@ -72,7 +72,7 @@ pub struct Label {
 }
 
 /// A comment on an issue, with optional author metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Comment {
     pub comment_id: String,
     pub issue_id: String,
@@ -86,7 +86,7 @@ pub struct Comment {
 }
 
 /// A notification for a user about an issue event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Notification {
     pub notification_id: String,
     pub workspace_id: String,
@@ -112,7 +112,7 @@ pub struct IssueFilters {
 }
 
 /// Parameters for creating a new issue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateIssueParams {
     pub workspace_id: String,
     pub team_id: String,
