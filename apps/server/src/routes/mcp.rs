@@ -444,6 +444,20 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                 }
             },
             {
+                "name": "delete_issue",
+                "description": "Delete an issue by its workspace-scoped number. This permanently removes the issue and all associated comments and labels.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "issue_number": {
+                            "type": "integer",
+                            "description": "The workspace-scoped issue number to delete"
+                        }
+                    },
+                    "required": ["issue_number"]
+                }
+            },
+            {
                 "name": "search_issues",
                 "description": "Search for issues by text query. Matches against issue titles. Returns results ordered by priority (urgent first), then by creation date (newest first).",
                 "inputSchema": {
@@ -516,7 +530,7 @@ async fn handle_tools_call(
     // Scope enforcement: map each tool to its required scope.
     let required_scope = match tool_name {
         "list_issues" | "get_issue" | "search_issues" => "issues:read",
-        "create_issue" | "update_issue" => "issues:write",
+        "create_issue" | "update_issue" | "delete_issue" => "issues:write",
         "add_comment" => "comments:write",
         "list_labels" => "labels:read",
         "create_label" => "labels:write",
@@ -535,6 +549,7 @@ async fn handle_tools_call(
         "get_issue" => tool_get_issue(&arguments, &auth, state).await,
         "create_issue" => tool_create_issue(&arguments, &auth, state).await,
         "update_issue" => tool_update_issue(&arguments, &auth, state).await,
+        "delete_issue" => tool_delete_issue(&arguments, &auth, state).await,
         "add_comment" => tool_add_comment(&arguments, &auth, state).await,
         "list_labels" => tool_list_labels(&auth, state).await,
         "create_label" => tool_create_label(&arguments, &auth, state).await,
@@ -717,6 +732,25 @@ async fn tool_update_issue(
         .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue #{number} not found")))?;
 
     serde_json::to_string_pretty(&updated).map_err(trakkt_core::Error::from)
+}
+
+/// delete_issue — permanently delete an issue.
+async fn tool_delete_issue(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let number = arg_i64(args, "issue_number")? as i32;
+
+    issue_service::delete_issue(
+        &state.db,
+        &auth.workspace_id,
+        number,
+        Some(&state.ws_manager),
+    )
+    .await?;
+
+    Ok(format!("Issue #{number} deleted"))
 }
 
 /// add_comment — add a comment to an issue.

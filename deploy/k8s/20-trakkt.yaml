@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: trakkt
+  namespace: trakkt
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 8003
+      protocol: TCP
+  selector:
+    app: trakkt
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trakkt
+  namespace: trakkt
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trakkt
+  template:
+    metadata:
+      labels:
+        app: trakkt
+    spec:
+      serviceAccountName: default
+      containers:
+        - name: trakkt
+          image: trakkt:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8003
+          env:
+            # Database
+            - name: DATABASE_URL
+              value: "postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)"
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: db-host
+            - name: DB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: db-port
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: db-name
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: db-user
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: db-password
+
+            # Redis
+            - name: REDIS_URL
+              value: "redis://redis.trakkt.svc.cluster.local:6379/0"
+
+            # Secrets
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: jwt-secret-key
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: encryption-key
+
+            # Server configuration
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: port
+            - name: TRAKKT_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: trakkt-mode
+            - name: BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: base-url
+            - name: FRONTEND_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: frontend-url
+            - name: WEBAUTHN_RP_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: webauthn-rp-id
+            - name: WEBAUTHN_RP_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: webauthn-rp-name
+            - name: SUPPORT_EMAIL
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: support-email
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: rust-log
+            - name: TRUNK_DIST_DIR
+              value: "/app/dist"
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8003
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8003
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
