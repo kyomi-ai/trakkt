@@ -19,12 +19,12 @@ data:
   # Server configuration
   port: "8003"
 
-  # URLs (adjust for your cluster)
-  base-url: "http://trakkt.local"
-  frontend-url: "http://trakkt.local"
+  # URLs
+  base-url: "https://app.trakkt.io"
+  frontend-url: "https://app.trakkt.io"
 
   # WebAuthn RP configuration
-  webauthn-rp-id: "trakkt.local"
+  webauthn-rp-id: "app.trakkt.io"
   webauthn-rp-name: "Trakkt"
 
   # Support email
