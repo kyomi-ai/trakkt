@@ -183,7 +183,7 @@ pub fn IssueDetailPage() -> impl IntoView {
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Header ─────────────────────────────────────────────────────
-            <div class="page-header h-16 px-4 md:px-6 flex items-center gap-3 shrink-0">
+            <div class="page-header h-14 px-5 flex items-center gap-3 shrink-0">
                 <Button
                     variant=ButtonVariant::GhostMuted
                     size=ButtonSize::IconSm

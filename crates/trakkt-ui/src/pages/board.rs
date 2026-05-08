@@ -188,8 +188,8 @@ pub fn BoardPage() -> impl IntoView {
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Page header ─────────────────────────────────────────────────
-            <div class="page-header h-16 px-4 md:px-6 flex items-center justify-between shrink-0">
-                <h1 class="text-3xl font-display text-foreground">"Board"</h1>
+            <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
+                <h1 class="text-sm font-semibold text-foreground">"Board"</h1>
             </div>
 
             // ── Content area ────────────────────────────────────────────────

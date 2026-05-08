@@ -155,7 +155,7 @@ pub fn Layout() -> impl IntoView {
                             class="fixed inset-0 bg-black/50"
                             on:click=move |_| set_mobile_sidebar_open.set(false)
                         />
-                        <div class="fixed inset-y-0 left-0 z-50 w-64">
+                        <div class="fixed inset-y-0 left-0 z-50 w-[220px]">
                             <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open/>
                         </div>
                     </div>
@@ -202,7 +202,7 @@ fn Sidebar(
 ) -> impl IntoView {
 
     view! {
-        <div class="w-64 bg-[var(--color-sidebar)] border-r border-[var(--color-sidebar-border)] text-[var(--color-sidebar-foreground)] flex flex-col h-full">
+        <div class="w-[220px] bg-[var(--color-sidebar)] border-r border-[var(--color-sidebar-border)] text-[var(--color-sidebar-foreground)] flex flex-col h-full">
             // Logo
             <div class="p-4 border-b border-[var(--color-sidebar-border)]">
                 <a href="/" class="text-lg font-semibold text-[var(--color-sidebar-foreground)] tracking-tight">

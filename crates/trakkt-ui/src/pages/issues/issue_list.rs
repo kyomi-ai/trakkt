@@ -8,8 +8,9 @@
 //! - Content: issue rows, loading skeletons, or empty state
 //!
 //! Issue Row follows DESIGN.md "Issue Row Pattern":
-//! `px-4 md:px-6 py-3 flex items-center gap-3 border-b border-border`
+//! `px-3 py-[6px] h-9 flex items-center gap-2.5 border-b border-border`
 //! hover:bg-surface-alt transition-colors cursor-pointer
+//! Order: Priority | Status | Issue ID | Title | Labels | Date | Assignee
 
 use std::sync::Arc;
 
@@ -30,6 +31,37 @@ use trakkt_types::models::IssueWithDetails;
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Formats a datetime string into a short date like "May 8".
+/// Expects ISO 8601 format (e.g. "2026-05-08T..."). Falls back to the
+/// first 10 characters if parsing fails.
+fn format_short_date(datetime: &str) -> String {
+    // Extract the date portion (YYYY-MM-DD).
+    let date_part = if datetime.len() >= 10 { &datetime[..10] } else { datetime };
+    let parts: Vec<&str> = date_part.split('-').collect();
+    if parts.len() == 3 {
+        let month = match parts[1] {
+            "01" => "Jan",
+            "02" => "Feb",
+            "03" => "Mar",
+            "04" => "Apr",
+            "05" => "May",
+            "06" => "Jun",
+            "07" => "Jul",
+            "08" => "Aug",
+            "09" => "Sep",
+            "10" => "Oct",
+            "11" => "Nov",
+            "12" => "Dec",
+            _ => return date_part.to_string(),
+        };
+        // Strip leading zero from the day.
+        let day = parts[2].trim_start_matches('0');
+        format!("{month} {day}")
+    } else {
+        date_part.to_string()
+    }
+}
 
 /// Returns `true` if the keyboard event target is an input, textarea, select,
 /// or contenteditable element — meaning single-key shortcuts (j/k/c) should
@@ -208,8 +240,8 @@ pub fn IssueListPage() -> impl IntoView {
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Page header ─────────────────────────────────────────────────
-            <div class="page-header h-16 px-4 md:px-6 flex items-center justify-between shrink-0">
-                <h1 class="text-3xl font-display text-foreground">"Issues"</h1>
+            <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
+                <h1 class="text-sm font-semibold text-foreground">"Issues"</h1>
                 <Button
                     size=ButtonSize::Sm
                     on:click=move |_| set_show_new_issue.set(true)
@@ -220,7 +252,7 @@ pub fn IssueListPage() -> impl IntoView {
             </div>
 
             // ── Toolbar ─────────────────────────────────────────────────────
-            <div class="bg-background px-4 md:px-6 py-3 flex items-center gap-3 shrink-0">
+            <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0">
                 <SearchInput
                     value=Signal::derive(move || search.get())
                     on_input=Callback::new(move |v: String| set_search.set(v))
@@ -325,8 +357,10 @@ pub fn IssueListPage() -> impl IntoView {
 ///
 /// DESIGN.md Issue Row Pattern:
 /// ```text
-/// [status_dot] TRK-42  Fix login redirect loop    [bug] [auth]  priority  @assignee
+/// [priority] [status] TRK-42  Fix login redirect loop  [bug] [auth]  May 8  @j
 /// ```
+///
+/// Row height: 36px (h-9), padding: px-3 py-[6px], gap: gap-2.5
 ///
 /// Supports keyboard navigation highlighting: when `selected_index` matches
 /// `index`, the row renders with a distinct selected background.
@@ -361,9 +395,9 @@ fn IssueRow(
 
     let row_class = move || {
         if is_selected.get() {
-            "px-4 md:px-6 py-3 flex items-center gap-3 border-b border-border bg-primary/5 ring-1 ring-primary/20 focus-visible:outline-none transition-colors cursor-pointer"
+            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border bg-primary/5 ring-1 ring-primary/20 focus-visible:outline-none transition-colors cursor-pointer"
         } else {
-            "px-4 md:px-6 py-3 flex items-center gap-3 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer"
+            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer"
         }
     };
 
@@ -380,10 +414,13 @@ fn IssueRow(
                 }
             }
         >
-            // Status dot
+            // Priority icon (first — most important for triage scanning)
+            <PriorityIndicator priority=issue.priority/>
+
+            // Status icon
             <IssueStatusBadge status=status/>
 
-            // Issue number (monospace)
+            // Issue ID (Geist Mono)
             <span class="font-mono text-xs text-muted-foreground shrink-0">
                 {issue_key}
             </span>
@@ -405,10 +442,12 @@ fn IssueRow(
                 }).collect_view()}
             </div>
 
-            // Priority
-            <PriorityIndicator priority=issue.priority/>
+            // Date (Geist Mono)
+            <span class="font-mono text-xs text-muted-foreground shrink-0 hidden sm:inline">
+                {format_short_date(&issue.created_at)}
+            </span>
 
-            // Assignee
+            // Assignee avatar (18px)
             {if issue.assignee_name.is_some() {
                 view! {
                     <Avatar name=issue.assignee_name.clone().unwrap_or_default()/>
@@ -416,7 +455,7 @@ fn IssueRow(
             } else {
                 // Empty placeholder to keep alignment
                 view! {
-                    <span class="w-5 h-5 shrink-0"></span>
+                    <span class="w-[18px] h-[18px] shrink-0"></span>
                 }.into_any()
             }}
         </div>
@@ -434,7 +473,9 @@ fn IssueRow(
 fn IssueListSkeleton() -> impl IntoView {
     let rows = (0..6).map(|_| {
         view! {
-            <div class="px-4 md:px-6 py-3 flex items-center gap-3 border-b border-border">
+            <div class="h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border">
+                // Priority icon placeholder
+                <Skeleton class="w-3.5 h-3.5 rounded-[2px]"/>
                 // Status icon placeholder
                 <Skeleton class="w-3.5 h-3.5 rounded-full"/>
                 // Issue number placeholder
@@ -443,10 +484,10 @@ fn IssueListSkeleton() -> impl IntoView {
                 <Skeleton class="flex-1 h-4 max-w-md"/>
                 // Label placeholder
                 <Skeleton class="hidden sm:block w-12 h-5 rounded-sm"/>
-                // Priority placeholder
-                <Skeleton class="w-3.5 h-3.5 rounded-[2px]"/>
+                // Date placeholder
+                <Skeleton class="hidden sm:block w-10 h-3"/>
                 // Avatar placeholder
-                <Skeleton class="w-5 h-5 rounded-full"/>
+                <Skeleton class="w-[18px] h-[18px] rounded-full"/>
             </div>
         }
     }).collect_view();

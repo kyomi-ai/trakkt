@@ -76,9 +76,9 @@ html {
   --color-sidebar-active: #2C241E;
   --color-sidebar-border: rgba(255, 255, 255, 0.08);
 
-  --radius: 0.5rem;
-  --radius-sm: 0.25rem;  /* 4px — inputs, buttons, chips */
-  --radius-md: 0.5rem;    /* 8px — cards, dropdowns, panels */
+  --radius: 0.4rem;
+  --radius-sm: 0.267rem;  /* 4px at 15px root */
+  --radius-md: 0.4rem;    /* 6px at 15px root — buttons, cards, dropdowns per DESIGN.md */
   --radius-lg: 0.75rem;   /* 12px — modals, dialogs, large containers */
 
   /* Animation tokens */

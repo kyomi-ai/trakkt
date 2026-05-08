@@ -464,7 +464,7 @@ Number keys `1-4` as quick-set shortcuts, `0` for no priority. Shown right-align
 | Select | - | Custom dropdown replacement for native select |
 | Checkbox | - | Toggle checkboxes |
 | Switch | - | Toggle switches |
-| Avatar | sm (20px), md (28px), lg (36px) | User avatars with initials fallback |
+| Avatar | sm (18px), md (28px), lg (36px) | User avatars with initials fallback |
 | Badge | - | Compact info badges |
 | Tooltip | - | CSS-only hover tooltips |
 | Popover | - | Positioned floating content |

@@ -2,10 +2,10 @@
 
 //! User avatar component with initials fallback.
 //!
-//! DESIGN.md: "Assignee: avatar circle or initials, w-5 h-5 rounded-full"
+//! DESIGN.md: "Assignee: avatar circle, w-[18px] h-[18px] rounded-full"
 //!
 //! Sizes:
-//! - Sm (20px): issue rows, compact lists
+//! - Sm (18px): issue rows, compact lists
 //! - Md (28px): comments, activity feed
 //! - Lg (36px): profile, user detail
 
@@ -14,7 +14,7 @@ use leptos::prelude::*;
 /// Avatar display size.
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum AvatarSize {
-    /// 20px — issue rows, compact lists.
+    /// 18px — issue rows, compact lists.
     #[default]
     Sm,
     /// 28px — comments, activity feed.
@@ -26,7 +26,7 @@ pub enum AvatarSize {
 impl AvatarSize {
     fn class(self) -> &'static str {
         match self {
-            Self::Sm => "w-5 h-5 text-[9px]",
+            Self::Sm => "w-[18px] h-[18px] text-[8px]",
             Self::Md => "w-7 h-7 text-[11px]",
             Self::Lg => "w-9 h-9 text-sm",
         }
@@ -56,7 +56,7 @@ pub fn Avatar(
     /// Avatar image URL (not yet used — renders initials for now).
     #[prop(into, optional)]
     image_url: Option<String>,
-    /// Size variant. Default: Sm (20px).
+    /// Size variant. Default: Sm (18px).
     #[prop(default = AvatarSize::Sm)]
     size: AvatarSize,
 ) -> impl IntoView {

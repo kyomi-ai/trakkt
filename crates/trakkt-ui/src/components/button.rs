@@ -53,13 +53,13 @@ pub enum ButtonSize {
 
 /// Base classes shared by all button variants.
 ///
-/// DESIGN.md: DM Sans 14px weight 600, rounded-md (8px), gap-1.5,
+/// DESIGN.md: DM Sans 13px weight 600, rounded-md (6px), gap-1.5,
 /// transition-colors 200ms, focus-visible ring-1, disabled states.
 // Note: per-variant `disabled:*` utilities (see `variant_classes` below) override
 // the default-enabled colors so disabled primary buttons read as neutral gray,
 // not "pale amber". Ghost / Link / Pill variants keep `opacity-50` for their
 // transparent disabled state.
-const BASE: &str = "inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md text-sm font-semibold transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 disabled:cursor-not-allowed [&_svg]:pointer-events-none [&_svg]:shrink-0";
+const BASE: &str = "inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md text-[13px] font-semibold transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 disabled:cursor-not-allowed [&_svg]:pointer-events-none [&_svg]:shrink-0";
 
 fn variant_classes(variant: ButtonVariant) -> &'static str {
     match variant {
@@ -93,9 +93,10 @@ fn variant_classes(variant: ButtonVariant) -> &'static str {
 
 fn size_classes(size: ButtonSize) -> &'static str {
     match size {
-        ButtonSize::Default => "px-5 py-3",
-        // Small: 8px 14px (py-2 px-3.5), 13px font — py-2 gives ~36px height for touch accessibility
-        ButtonSize::Sm => "px-3.5 py-2 text-[13px]",
+        // DESIGN.md: default px-3.5 py-[7px], 13px font (set in BASE)
+        ButtonSize::Default => "px-3.5 py-[7px]",
+        // DESIGN.md: small px-2.5 py-[5px], 12px font
+        ButtonSize::Sm => "px-2.5 py-[5px] text-xs gap-1",
         // Large
         ButtonSize::Lg => "px-8 py-3",
         // Icon-only: square
