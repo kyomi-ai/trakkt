@@ -102,9 +102,13 @@ view! {
 Both components are used in multiple places. Update the rendering in each:
 
 1. **Issue list rows** (`crates/trakkt-ui/src/pages/issues/issue_list.rs`)
-   - `<IssueStatusBadge status=status/>` — already used, will auto-update
-   - `<PriorityIndicator priority=issue.priority/>` — already used, will auto-update
-   - Verify spacing still looks good with 16x16 icons (currently `gap-3` between row elements)
+   - **Change the column order** to put both icons on the left, before the issue number:
+     ```
+     [priority] [status] TRK-42  Title text...  [labels] @assignee
+     ```
+     Currently the order is: `[status] TRK-42 Title [labels] [priority] @assignee` — the priority is on the far right. Move it to the left, immediately before the status icon.
+   - Both icons render at 16x16 (`w-4 h-4`)
+   - Verify spacing looks good with the new arrangement (may need `gap-2` between the two icons and `gap-3` to the issue number)
 
 2. **Issue detail metadata bar** (`crates/trakkt-ui/src/pages/issues/issue_detail.rs`)
    - Status and priority dropdowns — the selected value should show the icon next to the text
