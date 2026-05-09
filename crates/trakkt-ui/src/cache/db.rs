@@ -63,7 +63,7 @@ const DB_VERSION: u8 = 1;
 ///
 /// Bump this when: fields added/removed from list item structs, server-side
 /// sync queries change shape, entity types added/removed from bootstrap.
-pub const SCHEMA_HASH: &str = "trakkt-2026-05-v1";
+pub const SCHEMA_HASH: &str = "trakkt-2026-05-v2";
 
 /// Handle to the open IndexedDB database.
 ///

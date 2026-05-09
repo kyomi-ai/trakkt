@@ -29,7 +29,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use trakkt_types::models::{IssueWithDetails, Label, Status};
+use trakkt_types::models::{IssueWithDetails, Label, Project, Status, Team};
 use trakkt_types::sync::{SyncAction, SyncActionType, SyncResponse, entity_types};
 
 use crate::cache::db;
@@ -91,7 +91,7 @@ pub fn start_sync_engine(
                 spawn_local(async move {
                     match db::init_cache_db(&wid).await {
                         Ok(cache_db) => {
-                            for et in [entity_types::ISSUE, entity_types::LABEL, entity_types::STATUS] {
+                            for et in [entity_types::ISSUE, entity_types::LABEL, entity_types::STATUS, entity_types::TEAM, entity_types::PROJECT] {
                                 if let Err(e) =
                                     db::delete_all_of_type(&cache_db, et, &wid).await
                                 {
@@ -172,6 +172,12 @@ pub async fn hydrate_store_from_db(
     }
     if let Ok(entries) = db::read_all(cache_db, entity_types::STATUS, workspace_id).await {
         store.set_statuses(deser::<Status>(&entries, entity_types::STATUS));
+    }
+    if let Ok(entries) = db::read_all(cache_db, entity_types::TEAM, workspace_id).await {
+        store.set_teams(deser::<Team>(&entries, entity_types::TEAM));
+    }
+    if let Ok(entries) = db::read_all(cache_db, entity_types::PROJECT, workspace_id).await {
+        store.set_projects(deser::<Project>(&entries, entity_types::PROJECT));
     }
 
     if let Ok(Some(_cursor)) = db::get_last_sync_id(cache_db, workspace_id).await {
@@ -265,6 +271,26 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                         ),
                     }
                 }
+                et if et == entity_types::TEAM => {
+                    match serde_json::from_value::<Team>(entity_data.clone()) {
+                        Ok(item) => store.upsert_team(item),
+                        Err(e) => tracing::warn!(
+                            entity_type,
+                            entity_id,
+                            "sync_action: failed to deserialize team: {e}"
+                        ),
+                    }
+                }
+                et if et == entity_types::PROJECT => {
+                    match serde_json::from_value::<Project>(entity_data.clone()) {
+                        Ok(item) => store.upsert_project(item),
+                        Err(e) => tracing::warn!(
+                            entity_type,
+                            entity_id,
+                            "sync_action: failed to deserialize project: {e}"
+                        ),
+                    }
+                }
                 other => {
                     tracing::debug!(
                         entity_type = other,
@@ -300,6 +326,8 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                 et if et == entity_types::ISSUE => store.remove_issue(entity_id),
                 et if et == entity_types::LABEL => store.remove_label(entity_id),
                 et if et == entity_types::STATUS => store.remove_status(entity_id),
+                et if et == entity_types::TEAM => store.remove_team(entity_id),
+                et if et == entity_types::PROJECT => store.remove_project(entity_id),
                 other => {
                     tracing::debug!(
                         entity_type = other,
