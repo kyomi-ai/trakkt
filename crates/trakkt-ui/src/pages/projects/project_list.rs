@@ -13,7 +13,7 @@ use std::sync::Arc;
 use leptos::prelude::*;
 use phosphor_leptos::Icon;
 
-use crate::components::{EmptyState, StatusBadge};
+use crate::components::{Alert, AlertVariant, EmptyState, StatusBadge};
 use crate::server_fns::projects::list_projects;
 use crate::utils::date::format_date;
 use crate::utils::project::{status_label, status_variant};
@@ -28,6 +28,9 @@ pub fn ProjectListPage() -> impl IntoView {
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
+    // ── Error state for server function failures ──────────────────────────
+    let error_msg = RwSignal::new(Option::<String>::None);
+
     let server_projects = Resource::new(
         || (),
         move |_| async move { list_projects().await },
@@ -41,10 +44,17 @@ pub fn ProjectListPage() -> impl IntoView {
             }
         }
         // SSR or store not yet initialized — use server function
-        server_projects
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
+        match server_projects.get() {
+            Some(Ok(items)) => {
+                error_msg.set(None);
+                items
+            }
+            Some(Err(e)) => {
+                error_msg.set(Some(format!("Failed to load projects: {e}")));
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
     });
 
     // ── Render ──────────────────────────────────────────────────────────────
@@ -59,6 +69,15 @@ pub fn ProjectListPage() -> impl IntoView {
                     <h1 class="text-sm font-semibold text-foreground">"Projects"</h1>
                 </div>
             </div>
+
+            // ── Error alert ─────────────────────────────────────────────────
+            <Show when=move || error_msg.get().is_some()>
+                <div class="mx-4 mt-4">
+                    <Alert variant=AlertVariant::Error>
+                        {move || error_msg.get().unwrap_or_default()}
+                    </Alert>
+                </div>
+            </Show>
 
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto">
