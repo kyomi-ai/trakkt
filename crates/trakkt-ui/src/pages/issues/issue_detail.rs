@@ -228,22 +228,12 @@ pub fn IssueDetailPage() -> impl IntoView {
                                 .and_then(|r| r.ok())
                                 .unwrap_or_default();
                             let refetch = refetch;
-                            let created = relative_time(&issue.created_at);
-                            let updated = relative_time(&issue.updated_at);
                             view! {
-                                <div class="max-w-[860px] mx-auto w-full">
-                                    <IssueDetailContent
-                                        issue=issue
-                                        comments=comments
-                                        on_change=Callback::new(move |()| refetch())
-                                    />
-                                    <div class="mt-6 pb-4">
-                                        <div class="flex items-center gap-4 text-xs text-muted-foreground">
-                                            <span>{format!("Created {created}")}</span>
-                                            <span>{format!("Updated {updated}")}</span>
-                                        </div>
-                                    </div>
-                                </div>
+                                <IssueDetailContent
+                                    initial_issue=issue
+                                    comments=comments
+                                    on_change=Callback::new(move |()| refetch())
+                                />
                             }.into_any()
                         }
                         Some(Ok(None)) => {
@@ -271,28 +261,54 @@ pub fn IssueDetailPage() -> impl IntoView {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The main content of the issue detail page — rendered when issue data is loaded.
+///
+/// Reads from SyncStore reactively so external changes (MCP, other clients)
+/// update the UI in realtime without a page refresh.
 #[component]
 fn IssueDetailContent(
-    issue: IssueWithDetails,
+    initial_issue: IssueWithDetails,
     comments: Vec<Comment>,
     on_change: Callback<()>,
 ) -> impl IntoView {
-    let number = issue.number;
+    let number = initial_issue.number;
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+    let initial = RwSignal::new(initial_issue);
+
+    let issue = Signal::derive(move || {
+        if let Some(store) = sync_store {
+            let items = store.issues().get();
+            if let Some(found) = items.iter().find(|i| i.number == number) {
+                return found.clone();
+            }
+        }
+        initial.get()
+    });
 
     view! {
         <div class="max-w-[860px] mx-auto w-full">
             // ── Title ──────────────────────────────────────────────────
-            <EditableTitle number=number title=issue.title.clone() on_save=on_change/>
+            {move || {
+                let i = issue.get();
+                view! { <EditableTitle number=number title=i.title.clone() on_save=on_change/> }
+            }}
 
             // ── Metadata bar ───────────────────────────────────────────
-            <MetadataBar issue=issue.clone() on_change=on_change/>
+            {move || {
+                let i = issue.get();
+                view! { <MetadataBar issue=i on_change=on_change/> }
+            }}
 
             // ── Description ────────────────────────────────────────────
-            <DescriptionEditor
-                number=number
-                description=issue.description.clone().unwrap_or_default()
-                on_save=on_change
-            />
+            {move || {
+                let i = issue.get();
+                view! {
+                    <DescriptionEditor
+                        number=number
+                        description=i.description.clone().unwrap_or_default()
+                        on_save=on_change
+                    />
+                }
+            }}
 
             // ── Divider ────────────────────────────────────────────────
             <div class="border-t border-border my-6"></div>
@@ -303,6 +319,19 @@ fn IssueDetailContent(
                 comments=comments
                 on_comment_added=on_change
             />
+
+            // ── Footer: timestamps ────────────────────────────────────
+            {move || {
+                let i = issue.get();
+                view! {
+                    <div class="mt-6 pb-4">
+                        <div class="flex items-center gap-4 text-xs text-muted-foreground">
+                            <span>{format!("Created {}", relative_time(&i.created_at))}</span>
+                            <span>{format!("Updated {}", relative_time(&i.updated_at))}</span>
+                        </div>
+                    </div>
+                }
+            }}
         </div>
     }
 }
