@@ -23,7 +23,7 @@ pub enum ButtonVariant {
     /// Use with `opacity-0 group-hover:opacity-100` for hover-to-reveal on cards.
     GhostDestructive,
     Link,
-    /// Active/toggled-on state — amber tint.
+    /// Active/toggled-on state — teal tint.
     Active,
     /// Pill sub-tab — inactive state. Transparent, muted text.
     /// Use with `ToggleButton` for pill-style sub-tab switchers (chart builder, watch modal).
@@ -57,15 +57,15 @@ pub enum ButtonSize {
 /// transition-colors 200ms, focus-visible ring-1, disabled states.
 // Note: per-variant `disabled:*` utilities (see `variant_classes` below) override
 // the default-enabled colors so disabled primary buttons read as neutral gray,
-// not "pale amber". Ghost / Link / Pill variants keep `opacity-50` for their
+// not "pale teal". Ghost / Link / Pill variants keep `opacity-50` for their
 // transparent disabled state.
 const BASE: &str = "inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md text-[13px] font-semibold transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 disabled:cursor-not-allowed [&_svg]:pointer-events-none [&_svg]:shrink-0";
 
 fn variant_classes(variant: ButtonVariant) -> &'static str {
     match variant {
-        // Primary: amber bg, white text.
+        // Primary: teal bg, white text.
         // Disabled state is neutral gray (`bg-muted text-muted-foreground`) rather
-        // than faded amber — a disabled primary should not read as "enabled, low
+        // than faded teal — a disabled primary should not read as "enabled, low
         // priority". See DESIGN.md §Buttons "disabled states".
         ButtonVariant::Default => "bg-primary text-primary-foreground shadow hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:shadow-none disabled:opacity-100",
         // Destructive: red bg, white text
@@ -82,7 +82,7 @@ fn variant_classes(variant: ButtonVariant) -> &'static str {
         ButtonVariant::GhostDestructive => "bg-transparent text-muted-foreground hover:text-error-foreground hover:bg-error/10",
         // Link: underline style
         ButtonVariant::Link => "text-primary underline-offset-4 hover:underline",
-        // Active/toggled: amber tint
+        // Active/toggled: teal tint
         ButtonVariant::Active => "bg-primary/10 text-primary border border-primary/20",
         // Pill sub-tab: inactive — transparent, muted text
         ButtonVariant::Pill => "bg-transparent text-muted-foreground hover:text-foreground",
