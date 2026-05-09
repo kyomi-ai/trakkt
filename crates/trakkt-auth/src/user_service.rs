@@ -851,3 +851,28 @@ pub async fn delete_user(pool: &DbPool, user_id: &str) -> trakkt_core::Result<bo
     Ok(result.rows_affected() > 0)
 }
 
+/// Get the first active user in the database (for personal mode fallback).
+pub async fn get_first_user(pool: &DbPool) -> trakkt_core::Result<Option<User>> {
+    let user = trakkt_core::db_fetch_optional!(
+        pool, User,
+        "SELECT * FROM users ORDER BY created_at ASC LIMIT 1"
+    )?;
+    Ok(user)
+}
+
+/// Get the first workspace a user belongs to (for personal mode fallback).
+pub async fn get_first_workspace_for_user(
+    pool: &DbPool,
+    user_id: &str,
+) -> trakkt_core::Result<Option<Workspace>> {
+    let ws = trakkt_core::db_fetch_optional!(
+        pool, Workspace,
+        "SELECT w.* FROM workspaces w \
+         JOIN workspace_users wu ON wu.workspace_id = w.workspace_id \
+         WHERE wu.user_id = $1 \
+         ORDER BY w.created_at ASC LIMIT 1",
+        user_id
+    )?;
+    Ok(ws)
+}
+

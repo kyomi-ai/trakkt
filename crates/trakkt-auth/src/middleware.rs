@@ -218,31 +218,45 @@ fn extract_token(parts: &Parts) -> trakkt_core::Result<String> {
 ///
 /// Returns 503 if the local user doesn't exist yet (first-boot race condition).
 async fn load_personal_user(db: &trakkt_core::DbPool) -> trakkt_core::Result<AuthUser> {
-    let user = crate::user_service::get_user_by_id(db, "user-local")
-        .await
-        .map_err(|e| {
-            tracing::error!("personal mode: database error loading local user: {e}");
-            trakkt_core::Error::Internal("database error".into())
-        })?
-        .ok_or_else(|| {
-            tracing::warn!("personal mode: user-local not found — still initializing");
-            trakkt_core::Error::ServiceUnavailable(
-                "Personal mode initializing, please retry".into(),
-            )
-        })?;
+    // Try the dedicated personal-mode user first, then fall back to the first
+    // user in the database. This handles databases that were provisioned before
+    // personal mode was added (auto_provision skips when users already exist).
+    let user = match crate::user_service::get_user_by_id(db, "user-local").await {
+        Ok(Some(u)) => u,
+        _ => {
+            crate::user_service::get_first_user(db)
+                .await
+                .map_err(|e| {
+                    tracing::error!("personal mode: database error loading user: {e}");
+                    trakkt_core::Error::Internal("database error".into())
+                })?
+                .ok_or_else(|| {
+                    tracing::warn!("personal mode: no users found — database is empty");
+                    trakkt_core::Error::ServiceUnavailable(
+                        "Personal mode initializing, please retry".into(),
+                    )
+                })?
+        }
+    };
 
-    let workspace = crate::user_service::get_workspace(db, "workspace-local")
-        .await
-        .map_err(|e| {
-            tracing::error!("personal mode: database error loading local workspace: {e}");
-            trakkt_core::Error::Internal("database error".into())
-        })?
-        .ok_or_else(|| {
-            tracing::warn!("personal mode: workspace-local not found — still initializing");
-            trakkt_core::Error::ServiceUnavailable(
-                "Personal mode initializing, please retry".into(),
-            )
-        })?;
+    // Try dedicated workspace, fall back to first workspace the user belongs to.
+    let workspace = match crate::user_service::get_workspace(db, "workspace-local").await {
+        Ok(Some(w)) => w,
+        _ => {
+            crate::user_service::get_first_workspace_for_user(db, &user.user_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("personal mode: database error loading workspace: {e}");
+                    trakkt_core::Error::Internal("database error".into())
+                })?
+                .ok_or_else(|| {
+                    tracing::warn!("personal mode: no workspace found for user");
+                    trakkt_core::Error::ServiceUnavailable(
+                        "Personal mode initializing, please retry".into(),
+                    )
+                })?
+        }
+    };
 
     let workspace_ctx = WorkspaceContext {
         workspace_id: Some(workspace.workspace_id),
