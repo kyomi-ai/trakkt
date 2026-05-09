@@ -64,6 +64,21 @@ pub async fn join_team(team_id: String) -> Result<(), ServerFnError> {
     Ok(())
 }
 
+/// Leave a team. Removes the current user from the team's membership.
+#[server(prefix = "/leptos-api")]
+pub async fn leave_team(team_id: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    trakkt_auth::team_service::remove_team_member(
+        ac.db(),
+        &team_id,
+        &ac.auth.user_id,
+        &ac.ws_id,
+    )
+    .await
+    .into_sfn()?;
+    Ok(())
+}
+
 // ─── Write operations ──────────────────────────────────────────────────────
 
 /// Create a new issue-tracker team in the current workspace.
