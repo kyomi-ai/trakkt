@@ -16,7 +16,7 @@ use crate::components::{
 use crate::components::select::DynSelect;
 use crate::server_fns::context::UserContext;
 use crate::server_fns::team::*;
-use crate::types::{OwnershipTransferData, TeamInvitation, TeamMember};
+use crate::types::{OwnershipTransferData, TeamInvitation, WorkspaceMember};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Guard: checks subscription tier before rendering team management
@@ -154,7 +154,7 @@ fn TeamPageInner() -> impl IntoView {
             .unwrap_or_default()
             .into_iter()
             .filter(|m| !m.is_owner && m.user_id != current_user_id)
-            .collect::<Vec<TeamMember>>()
+            .collect::<Vec<WorkspaceMember>>()
     });
     // Memo to look up selected member details for step 2 summary
     let transfer_selected_member = Memo::new(move |_| {
@@ -753,7 +753,7 @@ fn TransferRow(
 
 #[component]
 fn MemberRow(
-    member: TeamMember,
+    member: WorkspaceMember,
     current_user_id: String,
     on_remove: impl Fn(String) + Clone + 'static,
     update_role_action: Action<(String, String), Result<(), ServerFnError>>,
@@ -899,9 +899,9 @@ fn TransferOwnershipModal(
     /// Reactive workspace name derived from user context in the parent.
     workspace_name: Memo<String>,
     /// Reactive list of eligible members (non-owners, not self) from the parent.
-    eligible_members: Memo<Vec<TeamMember>>,
+    eligible_members: Memo<Vec<WorkspaceMember>>,
     /// Reactive currently selected member (derived from members + selected_user_id).
-    selected_member: Memo<Option<TeamMember>>,
+    selected_member: Memo<Option<WorkspaceMember>>,
     initiate_transfer_action: Action<String, Result<(), ServerFnError>>,
 ) -> impl IntoView {
     let on_close_transfer = Callback::new(move |()| {

@@ -14,15 +14,24 @@
 //!
 //! ## Authentication
 //!
-//! Tool calls require a Bearer token in the `Authorization` header. Tokens are
-//! created from workspace settings and stored hashed (SHA-256) in the
-//! `api_tokens` table. The token resolves to a `(workspace_id, user_id)` pair
-//! that scopes all operations.
+//! Two auth methods are supported, tried in order:
+//!
+//! 1. **JWT (OAuth 2.0)** — `Authorization: Bearer <jwt>`. The `AuthUser`
+//!    extractor validates the JWT and loads workspace context from the database.
+//!    This is the standard path for MCP clients that use OAuth 2.0 (Claude Code,
+//!    Cursor).
+//!
+//! 2. **API token (legacy)** — `Authorization: Bearer <trakkt-...>`. Raw Bearer
+//!    tokens created in workspace settings, stored hashed (SHA-256) in the
+//!    `api_tokens` table. Kept as a fallback for users with existing API tokens.
+//!
+//! In personal mode, both are bypassed — a local user context is injected.
 
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -30,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use trakkt_auth::{comment_service, issue_service, label_service, team_service};
+use trakkt_auth::{comment_service, issue_service, label_service, status_service, team_service};
 use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate};
 
 use crate::state::AppState;
@@ -85,10 +94,13 @@ impl JsonRpcResponse {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Bearer token auth — resolves (workspace_id, user_id) from api_tokens table
+// Resolved MCP identity — from JWT or API token
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolved identity from a valid Bearer token.
+/// Resolved identity for MCP tool calls.
+///
+/// Populated from either a JWT `AuthUser` (OAuth 2.0) or a raw Bearer API
+/// token (legacy). Personal mode injects a local context.
 struct McpAuth {
     workspace_id: String,
     user_id: String,
@@ -101,6 +113,10 @@ impl McpAuth {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy Bearer API token auth (fallback)
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Internal row type for the api_tokens lookup query.
 #[derive(sqlx::FromRow)]
 struct ApiTokenLookupRow {
@@ -109,19 +125,87 @@ struct ApiTokenLookupRow {
     scopes: Option<String>,
 }
 
-/// Validate a Bearer token from the Authorization header.
+/// Try to authenticate the request via JWT (OAuth 2.0) or legacy API token.
+/// Returns `None` if neither succeeds.
 ///
-/// Hashes the plaintext token with SHA-256 and looks it up in `api_tokens`.
-/// Returns `None` if the header is missing, malformed, or the token is
-/// invalid/expired/revoked. Falls back to resolving workspace from
-/// workspace_members if the token was created before workspace_id was added.
-async fn authenticate_bearer(
+/// JWT is tried first because it produces a richer context (workspace context,
+/// user active/verified checks). The API token path is a simple hash lookup —
+/// kept for backward compatibility with existing API tokens.
+async fn resolve_mcp_auth(
     headers: &HeaderMap,
-    db: &trakkt_core::DbPool,
+    state: &AppState,
 ) -> Option<McpAuth> {
+    // Extract the raw token from Authorization header
     let auth_header = headers.get("authorization")?.to_str().ok()?;
     let token = auth_header.strip_prefix("Bearer ")?;
 
+    // 1. Try JWT validation first (OAuth 2.0 path).
+    //    If the token is a valid JWT, resolve user + workspace from the database
+    //    using the same logic as the AuthUser extractor.
+    if let Ok(decoded) = trakkt_auth::jwt::validate_token(token, &state.config.jwt_secret) {
+        let user_id = decoded
+            .claims
+            .extra
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| decoded.claims.sub.clone());
+
+        // Verify user exists and is active
+        let user = trakkt_auth::user_service::get_user_by_id(&state.db, &user_id)
+            .await
+            .ok()??;
+
+        if !user.active {
+            return None;
+        }
+
+        // Get workspace_id from JWT claims, fall back to user's workspace context
+        let workspace_id = decoded
+            .claims
+            .extra
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                // Synchronous fallback not possible here — but we can try
+                // the database lookup below if JWT didn't include workspace_id.
+                None
+            });
+
+        let workspace_id = match workspace_id {
+            Some(ws_id) => ws_id,
+            None => {
+                // Fall back to user's first workspace
+                let ctx = trakkt_auth::user_service::get_user_workspace_context(
+                    &state.db,
+                    &user_id,
+                )
+                .await
+                .ok()??;
+                ctx.0.workspace_id
+            }
+        };
+
+        return Some(McpAuth {
+            workspace_id,
+            user_id,
+            scopes: vec![], // JWT users have full access
+        });
+    }
+
+    // 2. Legacy API token path (SHA-256 hash lookup)
+    authenticate_bearer_token(token, &state.db).await
+}
+
+/// Validate a raw Bearer token against the `api_tokens` table (legacy path).
+///
+/// Hashes the plaintext token with SHA-256 and looks it up. Returns `None`
+/// if the token is invalid/expired/revoked.
+async fn authenticate_bearer_token(
+    token: &str,
+    db: &trakkt_core::DbPool,
+) -> Option<McpAuth> {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     let token_hash = format!("{:x}", hasher.finalize());
@@ -147,15 +231,15 @@ async fn authenticate_bearer(
 
     let row = row?;
 
-    // Parse scopes from JSON array string (e.g. '["issues:read","issues:write"]')
-    let scopes: Vec<String> = row.scopes
+    // Parse scopes from JSON array string
+    let scopes: Vec<String> = row
+        .scopes
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
     // Resolve workspace_id: prefer token's workspace_id, fall back to first
-    // workspace the user belongs to (handles tokens created before the
-    // workspace_id column was added).
+    // workspace the user belongs to.
     let workspace_id = match row.workspace_id {
         Some(ws_id) => ws_id,
         None => {
@@ -170,7 +254,50 @@ async fn authenticate_bearer(
         }
     };
 
-    Some(McpAuth { workspace_id, user_id: row.user_id, scopes })
+    Some(McpAuth {
+        workspace_id,
+        user_id: row.user_id,
+        scopes,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WWW-Authenticate middleware (RFC 6750)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Response layer that adds `WWW-Authenticate` to 401 responses per RFC 6750.
+///
+/// MCP clients (and directories like Glama) use this header to discover OAuth
+/// endpoints and distinguish "online, requires auth" from "broken/offline".
+/// The `resource_metadata` parameter points to the RFC 9728 protected resource
+/// metadata endpoint, which in turn references the authorization server.
+async fn mcp_www_authenticate_layer(request: Request, next: Next) -> Response {
+    // Capture the request's host/scheme before passing ownership to `next`.
+    let base_url = {
+        let headers = request.headers();
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("https");
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("app.trakkt.dev");
+        format!("{scheme}://{host}")
+    };
+
+    let mut response = next.run(request).await;
+
+    if response.status() == StatusCode::UNAUTHORIZED {
+        let www_auth = format!(
+            r#"Bearer realm="OAuth", resource_metadata="{base_url}/.well-known/oauth-protected-resource", error="invalid_token", error_description="Missing or invalid access token""#
+        );
+        if let Ok(val) = www_auth.parse() {
+            response.headers_mut().insert("www-authenticate", val);
+        }
+    }
+
+    response
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +309,11 @@ pub fn routes() -> Router<AppState> {
         .route("/", post(handle_post))
         .route("/", get(handle_sse))
         .route("/", delete(handle_delete))
+        .layer(middleware::from_fn(mcp_www_authenticate_layer))
+        .route(
+            "/.well-known/openid-configuration",
+            get(super::oauth::mcp_openid_configuration),
+        )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,8 +324,16 @@ async fn handle_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
-) -> impl IntoResponse {
+) -> Response {
     let is_initialize = request.method == "initialize";
+
+    // Authenticate all requests except `initialize` (which triggers the OAuth flow).
+    // In personal mode, bypass auth entirely.
+    if !is_initialize && request.method != "notifications/initialized" && !state.config.is_personal() {
+        if resolve_mcp_auth(&headers, &state).await.is_none() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
 
     let response = match request.method.as_str() {
         "initialize" => handle_initialize(request.id, request.params),
@@ -210,8 +350,7 @@ async fn handle_post(
     let mut resp_headers = HeaderMap::new();
 
     if is_initialize {
-        // Resolve workspace_id from Bearer token if present, otherwise "anonymous".
-        let workspace_id = match authenticate_bearer(&headers, &state.db).await {
+        let workspace_id = match resolve_mcp_auth(&headers, &state).await {
             Some(auth) => auth.workspace_id,
             None => "anonymous".to_string(),
         };
@@ -273,10 +412,9 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "status": {
+                        "status_id": {
                             "type": "string",
-                            "description": "Filter by status: backlog, todo, in_progress, done, cancelled",
-                            "enum": ["backlog", "todo", "in_progress", "done", "cancelled"]
+                            "description": "Filter by status ID (e.g. 'workspace-id::backlog'). Use list_statuses to get valid IDs."
                         },
                         "priority": {
                             "type": "integer",
@@ -372,10 +510,9 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                             "type": ["string", "null"],
                             "description": "New markdown description, or null to clear"
                         },
-                        "status": {
+                        "status_id": {
                             "type": "string",
-                            "description": "New status: backlog, todo, in_progress, done, cancelled",
-                            "enum": ["backlog", "todo", "in_progress", "done", "cancelled"]
+                            "description": "New status ID. Use list_statuses to get valid IDs."
                         },
                         "priority": {
                             "type": "integer",
@@ -476,6 +613,19 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                     },
                     "required": ["query"]
                 }
+            },
+            {
+                "name": "list_statuses",
+                "description": "List all statuses in the workspace, grouped by category (backlog, unstarted, started, completed, cancelled). Returns both global and optionally team-specific statuses.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "team_id": {
+                            "type": "string",
+                            "description": "Optional team ID to include team-specific statuses"
+                        }
+                    }
+                }
             }
         ]
     }))
@@ -515,7 +665,7 @@ async fn handle_tools_call(
             scopes: vec![],
         }
     } else {
-        match authenticate_bearer(headers, &state.db).await {
+        match resolve_mcp_auth(headers, state).await {
             Some(auth) => auth,
             None => {
                 return JsonRpcResponse::error(
@@ -534,6 +684,7 @@ async fn handle_tools_call(
         "add_comment" => "comments:write",
         "list_labels" => "labels:read",
         "create_label" => "labels:write",
+        "list_statuses" => "issues:read",
         _ => "",
     };
     if !required_scope.is_empty() && !auth.has_scope(required_scope) {
@@ -554,6 +705,7 @@ async fn handle_tools_call(
         "list_labels" => tool_list_labels(&auth, state).await,
         "create_label" => tool_create_label(&arguments, &auth, state).await,
         "search_issues" => tool_search_issues(&arguments, &auth, state).await,
+        "list_statuses" => tool_list_statuses(&arguments, &auth, state).await,
         _ => return JsonRpcResponse::error(id, -32602, format!("Unknown tool: {tool_name}")),
     };
 
@@ -606,7 +758,7 @@ async fn tool_list_issues(
     let limit = limit_raw.clamp(1, 100);
 
     let filters = IssueFilters {
-        status: args.get("status").and_then(|v| v.as_str()).map(String::from),
+        status_id: args.get("status_id").and_then(|v| v.as_str()).map(String::from),
         priority: args.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32),
         assignee_id: args.get("assignee").and_then(|v| v.as_str()).map(String::from),
         label_id: args.get("label").and_then(|v| v.as_str()).map(String::from),
@@ -615,7 +767,8 @@ async fn tool_list_issues(
         offset: None,
     };
 
-    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, &filters).await?;
+    let team_id = args.get("team_id").and_then(|v| v.as_str());
+    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, team_id, &filters).await?;
     serde_json::to_string_pretty(&issues).map_err(trakkt_core::Error::from)
 }
 
@@ -671,6 +824,8 @@ async fn tool_create_issue(
         assignee_id: args.get("assignee").and_then(|v| v.as_str()).map(String::from),
         due_date: args.get("due_date").and_then(|v| v.as_str()).map(String::from),
         label_ids,
+        project_id: args.get("project_id").and_then(|v| v.as_str()).map(String::from),
+        milestone_id: args.get("milestone_id").and_then(|v| v.as_str()).map(String::from),
     };
 
     let issue = issue_service::create_issue(&state.db, &params, Some(&state.ws_manager)).await?;
@@ -692,12 +847,18 @@ async fn tool_update_issue(
         description: args.get("description").map(|v| {
             v.as_str().map(String::from)
         }),
-        status: args.get("status").and_then(|v| v.as_str()).map(String::from),
+        status_id: args.get("status_id").and_then(|v| v.as_str()).map(String::from),
         priority: args.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32),
         assignee_id: args.get("assignee").map(|v| {
             v.as_str().map(String::from)
         }),
         due_date: args.get("due_date").map(|v| {
+            v.as_str().map(String::from)
+        }),
+        project_id: args.get("project_id").map(|v| {
+            v.as_str().map(String::from)
+        }),
+        milestone_id: args.get("milestone_id").map(|v| {
             v.as_str().map(String::from)
         }),
     };
@@ -803,6 +964,7 @@ async fn tool_create_label(
         &auth.workspace_id,
         name,
         color,
+        None, // team_id — MCP creates workspace-scoped labels
         Some(&state.ws_manager),
     )
     .await?;
@@ -826,6 +988,17 @@ async fn tool_search_issues(
         ..Default::default()
     };
 
-    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, &filters).await?;
+    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, None, &filters).await?;
     serde_json::to_string_pretty(&issues).map_err(trakkt_core::Error::from)
+}
+
+/// list_statuses — list all statuses in the workspace.
+async fn tool_list_statuses(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let team_id = args.get("team_id").and_then(|v| v.as_str());
+    let statuses = status_service::list_statuses(&state.db, &auth.workspace_id, team_id).await?;
+    serde_json::to_string_pretty(&statuses).map_err(trakkt_core::Error::from)
 }

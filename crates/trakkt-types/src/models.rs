@@ -18,6 +18,35 @@ pub struct Team {
     pub workspace_id: String,
     pub name: String,
     pub key: String,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub created_at: String,
+}
+
+/// A member of an issue-tracker team (team_members join table).
+///
+/// Distinct from workspace membership — this tracks which users belong to
+/// specific teams within a workspace, for defaults and notification routing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueTeamMember {
+    pub team_id: String,
+    pub user_id: String,
+    pub user_name: Option<String>,
+    pub user_email: String,
+    pub role: String,
+    pub created_at: String,
+}
+
+/// A first-class status with category grouping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Status {
+    pub status_id: String,
+    pub workspace_id: String,
+    pub team_id: Option<String>,
+    pub name: String,
+    pub category: String,
+    pub position: i32,
+    pub color: Option<String>,
     pub created_at: String,
 }
 
@@ -30,11 +59,13 @@ pub struct Issue {
     pub number: i32,
     pub title: String,
     pub description: Option<String>,
-    pub status: String,
+    pub status_id: String,
     pub priority: i32,
     pub assignee_id: Option<String>,
     pub creator_id: String,
     pub due_date: Option<String>,
+    pub project_id: Option<String>,
+    pub milestone_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -49,26 +80,95 @@ pub struct IssueWithDetails {
     pub number: i32,
     pub title: String,
     pub description: Option<String>,
-    pub status: String,
+    pub status_id: String,
+    pub status_name: String,
+    pub status_category: String,
     pub priority: i32,
     pub assignee_id: Option<String>,
     pub assignee_name: Option<String>,
     pub creator_id: String,
     pub creator_name: Option<String>,
     pub due_date: Option<String>,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub milestone_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub labels: Vec<Label>,
 }
 
-/// A workspace-scoped label that can be applied to issues.
+/// A label that can be applied to issues.
+///
+/// Labels are either workspace-scoped (`team_id = None`, available to all teams)
+/// or team-scoped (`team_id = Some(...)`, only available within that team).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Label {
     pub label_id: String,
     pub workspace_id: String,
+    pub team_id: Option<String>,
     pub name: String,
     pub color: String,
     pub created_at: String,
+}
+
+/// A project within a workspace (e.g. "Q3 Launch", "Mobile App").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Project {
+    pub project_id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub status: String,
+    pub lead_id: Option<String>,
+    pub lead_name: Option<String>,
+    pub start_date: Option<String>,
+    pub target_date: Option<String>,
+    pub sort_order: f64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A member of a project with a specific role.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectMember {
+    pub project_id: String,
+    pub user_id: String,
+    pub role: String,
+    pub created_at: String,
+}
+
+/// A milestone within a project — a target checkpoint with a due date.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectMilestone {
+    pub milestone_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub target_date: Option<String>,
+    pub sort_order: i32,
+    pub created_at: String,
+}
+
+/// A periodic status update on a project's health.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectUpdate {
+    pub update_id: String,
+    pub project_id: String,
+    pub user_id: String,
+    pub health: String,
+    pub body: Option<String>,
+    pub created_at: String,
+}
+
+/// Progress summary for a project — computed from issue status categories.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectProgress {
+    pub total: i64,
+    pub completed: i64,
+    pub cancelled: i64,
+    pub percent_done: f64,
 }
 
 /// A comment on an issue, with optional author metadata.
@@ -102,7 +202,7 @@ pub struct Notification {
 /// Filter criteria for listing issues.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IssueFilters {
-    pub status: Option<String>,
+    pub status_id: Option<String>,
     pub priority: Option<i32>,
     pub assignee_id: Option<String>,
     pub label_id: Option<String>,
@@ -123,6 +223,8 @@ pub struct CreateIssueParams {
     pub assignee_id: Option<String>,
     pub due_date: Option<String>,
     pub label_ids: Vec<String>,
+    pub project_id: Option<String>,
+    pub milestone_id: Option<String>,
 }
 
 /// Fields that can be updated on an issue.
@@ -135,8 +237,10 @@ pub struct CreateIssueParams {
 pub struct IssueUpdate {
     pub title: Option<String>,
     pub description: Option<Option<String>>,
-    pub status: Option<String>,
+    pub status_id: Option<String>,
     pub priority: Option<i32>,
     pub assignee_id: Option<Option<String>>,
     pub due_date: Option<Option<String>>,
+    pub project_id: Option<Option<String>>,
+    pub milestone_id: Option<Option<String>>,
 }

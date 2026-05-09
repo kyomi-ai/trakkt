@@ -133,6 +133,32 @@ impl WebSocketClient {
         });
     }
 
+    /// Reconnect with a new token (e.g., after fetching a JWT asynchronously).
+    ///
+    /// Closes the existing connection and opens a new one with the provided
+    /// credentials. The `on_message` callback is preserved across reconnects.
+    pub fn reconnect(&self, user_id: &str, workspace_id: &str, token: &str) {
+        let state = self.inner.with_value(|handle| handle.state.clone());
+        let conn_state = self.connection_state.clone();
+
+        // Close existing connection without triggering auto-reconnect.
+        {
+            let mut s = state.borrow_mut();
+            if let Some(ref ws) = s.ws {
+                ws.set_onclose(None);
+                ws.set_onerror(None);
+                ws.set_onopen(None);
+                let _ = ws.close();
+            }
+            s.ws = None;
+            s._closures.clear();
+            s.connecting = false;
+            s.reconnect_attempts = 0;
+        }
+
+        do_connect(state, conn_state, user_id, workspace_id, token);
+    }
+
     /// Access the raw `Rc<RefCell<WsState>>` for internal operations.
     /// Only used within this module by `disconnect()`.
     fn with_state<R>(&self, f: impl FnOnce(&Rc<RefCell<WsState>>) -> R) -> R {

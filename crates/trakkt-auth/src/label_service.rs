@@ -20,6 +20,7 @@ use crate::websocket::WebSocketManager;
 struct LabelRow {
     label_id: String,
     workspace_id: String,
+    team_id: Option<String>,
     name: String,
     color: String,
     created_at: String,
@@ -30,6 +31,7 @@ impl LabelRow {
         Label {
             label_id: self.label_id,
             workspace_id: self.workspace_id,
+            team_id: self.team_id,
             name: self.name,
             color: self.color,
             created_at: self.created_at,
@@ -39,12 +41,16 @@ impl LabelRow {
 
 // ─── Service functions ──────────────────────────────────────────────────────
 
-/// Create a new label in a workspace.
+/// Create a new label in a workspace, optionally scoped to a team.
+///
+/// If `team_id` is `None`, the label is workspace-scoped (available to all teams).
+/// If `team_id` is `Some(...)`, the label is team-scoped (only available within that team).
 pub async fn create_label(
     db: &DbPool,
     workspace_id: &str,
     name: &str,
     color: &str,
+    team_id: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Label> {
     let is_pg = db.is_postgres();
@@ -52,10 +58,10 @@ pub async fn create_label(
     let label_id = uuid::Uuid::new_v4().to_string();
 
     let sql = format!(
-        "INSERT INTO labels (label_id, workspace_id, name, color, created_at) \
-         VALUES ($1, $2, $3, $4, {now})"
+        "INSERT INTO labels (label_id, workspace_id, team_id, name, color, created_at) \
+         VALUES ($1, $2, $3, $4, $5, {now})"
     );
-    trakkt_core::db_execute!(db, &sql, &label_id, workspace_id, name, color)?;
+    trakkt_core::db_execute!(db, &sql, &label_id, workspace_id, team_id, name, color)?;
 
     // Sync log — best-effort.
     if let Err(e) = sync_log_service::write_sync_entry(
@@ -75,7 +81,7 @@ pub async fn create_label(
     let row = trakkt_core::db_fetch_one!(
         db,
         LabelRow,
-        "SELECT label_id, workspace_id, name, color, \
+        "SELECT label_id, workspace_id, team_id, name, color, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM labels WHERE label_id = $1",
         &label_id
@@ -106,10 +112,34 @@ pub async fn list_labels(
     let rows: Vec<LabelRow> = trakkt_core::db_fetch_all!(
         db,
         LabelRow,
-        "SELECT label_id, workspace_id, name, color, \
+        "SELECT label_id, workspace_id, team_id, name, color, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM labels WHERE workspace_id = $1 ORDER BY name ASC",
         workspace_id
+    )?;
+    Ok(rows.into_iter().map(LabelRow::into_dto).collect())
+}
+
+/// List labels available for a specific team.
+///
+/// Returns workspace-level labels (`team_id IS NULL`) plus team-specific labels
+/// (`team_id = team_id`). This gives teams access to shared workspace labels
+/// alongside their own team-scoped labels.
+pub async fn list_labels_for_team(
+    db: &DbPool,
+    workspace_id: &str,
+    team_id: &str,
+) -> trakkt_core::Result<Vec<Label>> {
+    let rows: Vec<LabelRow> = trakkt_core::db_fetch_all!(
+        db,
+        LabelRow,
+        "SELECT label_id, workspace_id, team_id, name, color, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM labels \
+         WHERE workspace_id = $1 AND (team_id IS NULL OR team_id = $2) \
+         ORDER BY name ASC",
+        workspace_id,
+        team_id
     )?;
     Ok(rows.into_iter().map(LabelRow::into_dto).collect())
 }
@@ -122,7 +152,7 @@ pub async fn get_label_by_id(
     let row = trakkt_core::db_fetch_optional!(
         db,
         LabelRow,
-        "SELECT label_id, workspace_id, name, color, \
+        "SELECT label_id, workspace_id, team_id, name, color, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM labels WHERE label_id = $1",
         label_id
@@ -156,7 +186,7 @@ pub async fn update_label(
     let row = trakkt_core::db_fetch_one!(
         db,
         LabelRow,
-        "SELECT label_id, workspace_id, name, color, \
+        "SELECT label_id, workspace_id, team_id, name, color, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM labels WHERE label_id = $1",
         label_id
@@ -205,7 +235,7 @@ pub async fn delete_label(
     let row = trakkt_core::db_fetch_optional!(
         db,
         LabelRow,
-        "SELECT label_id, workspace_id, name, color, \
+        "SELECT label_id, workspace_id, team_id, name, color, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM labels WHERE label_id = $1",
         label_id
@@ -259,7 +289,7 @@ pub async fn get_issue_labels(
     let rows: Vec<LabelRow> = trakkt_core::db_fetch_all!(
         db,
         LabelRow,
-        "SELECT l.label_id, l.workspace_id, l.name, l.color, \
+        "SELECT l.label_id, l.workspace_id, l.team_id, l.name, l.color, \
                 CAST(l.created_at AS TEXT) AS created_at \
          FROM labels l \
          JOIN issue_labels il ON l.label_id = il.label_id \

@@ -15,96 +15,88 @@
 use std::sync::Arc;
 
 use leptos::prelude::*;
-use leptos::children::ChildrenFn;
 use leptos_router::hooks::use_navigate;
 use phosphor_leptos::Icon;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::components::{
-    Avatar, Button, ButtonVariant, EmptyState, IssueStatusBadge, IssueStatusVariant,
-    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton, StyledSelect,
-    DropdownTrigger, DropdownMenu, DropdownItem,
-    INPUT_CLASS,
+    Alert, AlertVariant,
+    Button, ButtonVariant, EmptyState,
+    Modal, ModalSize,
+    SearchInput, StyledSelect, INPUT_CLASS,
 };
+use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown};
+use crate::pages::issues::issue_row::IssueRow;
 use crate::server_fns::issues::{create_issue, list_issues};
-use trakkt_types::models::IssueWithDetails;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Formats a datetime string into a short date like "May 8".
-/// Expects ISO 8601 format (e.g. "2026-05-08T..."). Falls back to the
-/// first 10 characters if parsing fails.
-fn format_short_date(datetime: &str) -> String {
-    // Extract the date portion (YYYY-MM-DD).
-    let date_part = if datetime.len() >= 10 { &datetime[..10] } else { datetime };
-    let parts: Vec<&str> = date_part.split('-').collect();
-    if parts.len() == 3 {
-        let month = match parts[1] {
-            "01" => "Jan",
-            "02" => "Feb",
-            "03" => "Mar",
-            "04" => "Apr",
-            "05" => "May",
-            "06" => "Jun",
-            "07" => "Jul",
-            "08" => "Aug",
-            "09" => "Sep",
-            "10" => "Oct",
-            "11" => "Nov",
-            "12" => "Dec",
-            _ => return date_part.to_string(),
-        };
-        // Strip leading zero from the day.
-        let day = parts[2].trim_start_matches('0');
-        format!("{month} {day}")
-    } else {
-        date_part.to_string()
-    }
-}
-
-/// Returns `true` if the keyboard event target is an input, textarea, select,
-/// or contenteditable element — meaning single-key shortcuts (j/k/c) should
-/// NOT fire so they don't interfere with text editing.
-fn is_input_focused(ev: &web_sys::KeyboardEvent) -> bool {
-    use wasm_bindgen::JsCast;
-    let Some(target) = ev.target() else { return false };
-    let Some(el) = target.dyn_ref::<web_sys::HtmlElement>() else { return false };
-    let tag = el.tag_name().to_uppercase();
-    if matches!(tag.as_str(), "INPUT" | "TEXTAREA" | "SELECT") {
-        return true;
-    }
-    // Check for contenteditable (kode editor, rich text fields).
-    if el.is_content_editable() {
-        return true;
-    }
-    false
-}
+use crate::utils::keyboard::is_input_focused;
+use trakkt_types::models::Team;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue List Page
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Main issue list page — displays all issues with search, filter, and create.
+/// Main issue list page — zero-arg entry point used by the router.
+///
+/// Shows all workspace issues (no team filtering). For team-scoped views,
+/// use `<IssueListForTeam team_key=.../>` instead.
 #[component]
 pub fn IssueListPage() -> impl IntoView {
+    view! { <IssueListInner/> }
+}
+
+/// Team-scoped issue list page — reads the `:key` route param internally.
+///
+/// Filters issues, statuses, and new issue creation to the resolved team.
+/// Follows the same pattern as `ProjectDetailPage` and `IssueDetailPage`:
+/// page components own their param extraction rather than receiving props.
+#[component]
+pub fn IssueListForTeam() -> impl IntoView {
+    let params = leptos_router::hooks::use_params_map();
+    let team_key = params.read().get("key").unwrap_or_default();
+    view! { <IssueListInner team_key=team_key/> }
+}
+
+/// Inner implementation shared by `IssueListPage` (no team) and
+/// `IssueListForTeam` (team-scoped). All filtering, title, and create-issue
+/// logic lives here.
+#[component]
+fn IssueListInner(
+    /// Optional team key. When `Some`, filters issues and statuses by team.
+    #[prop(optional, into)]
+    team_key: Option<String>,
+) -> impl IntoView {
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
     let (status_filter, set_status_filter) = signal(String::new());
     let (priority_filter, set_priority_filter) = signal(String::new());
 
+    // ── Error state for server function failures ──────────────────────────
+    let error_msg = RwSignal::new(Option::<String>::None);
+
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (version, set_version) = signal(0u32);
 
+    // ── Resolve team from SyncStore ─────────────────────────────────────────
+    let team_key_stored = StoredValue::new(team_key);
+    let resolved_team: Memo<Option<Team>> = Memo::new(move |_| {
+        let key = team_key_stored.get_value()?;
+        let key_lower = key.to_lowercase();
+        let store = sync_store?;
+        store
+            .teams()
+            .get()
+            .into_iter()
+            .find(|t| t.key.to_lowercase() == key_lower)
+    });
+
     // Server function fallback — used for initial load before sync is ready.
+    // When on a team-scoped page, pass the resolved team_id so the server
+    // returns only that team's issues (important for SSR initial load).
     let server_issues = Resource::new(
-        move || version.get(),
-        move |_| async move {
-            list_issues(None, None, None, None, None, None, None).await
-        },
+        move || (version.get(), resolved_team.get().map(|t| t.team_id.clone())),
+        move |(_, team_id)| async move { list_issues(team_id, None, None, None, None, None, None, None).await },
     );
 
     // Filtered issue list — reads from SyncStore when initialized, otherwise
@@ -117,25 +109,54 @@ pub fn IssueListPage() -> impl IntoView {
                 issues
             } else {
                 // Store not initialized yet — use server function result
-                server_issues.get()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default()
+                match server_issues.get() {
+                    Some(Ok(items)) => {
+                        error_msg.set(None);
+                        items
+                    }
+                    Some(Err(e)) => {
+                        error_msg.set(Some(format!("Failed to load issues: {e}")));
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
             }
         } else {
             // No store (SSR) — use server function
-            server_issues.get()
-                .and_then(|r| r.ok())
-                .unwrap_or_default()
+            match server_issues.get() {
+                Some(Ok(items)) => {
+                    error_msg.set(None);
+                    items
+                }
+                Some(Err(e)) => {
+                    error_msg.set(Some(format!("Failed to load issues: {e}")));
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
         };
+
+        // When a team_key was requested but hasn't resolved yet, return empty (loading state).
+        let team_key_present = team_key_stored.get_value().is_some();
+        if team_key_present && resolved_team.get().is_none() {
+            return vec![];
+        }
 
         // Apply client-side filters
         let search_val = search.get().to_lowercase();
         let status_val = status_filter.get();
         let priority_val = priority_filter.get();
+        let team = resolved_team.get();
 
         raw.into_iter()
             .filter(|issue| {
-                if !status_val.is_empty() && issue.status != status_val {
+                // Team filter: when on a team page, only show that team's issues.
+                if let Some(ref t) = team {
+                    if issue.team_id != t.team_id {
+                        return false;
+                    }
+                }
+                if !status_val.is_empty() && issue.status_id != status_val {
                     return false;
                 }
                 if !priority_val.is_empty() {
@@ -145,9 +166,7 @@ pub fn IssueListPage() -> impl IntoView {
                         }
                     }
                 }
-                if !search_val.is_empty()
-                    && !issue.title.to_lowercase().contains(&search_val)
-                {
+                if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
                     return false;
                 }
                 true
@@ -173,8 +192,11 @@ pub fn IssueListPage() -> impl IntoView {
     let issue_numbers = RwSignal::new(Vec::<i32>::new());
 
     // ── j/k/Enter/c keyboard listener (window-level, active on this page) ──
+    // Hoist use_navigate to component construction time (not inside closures).
+    let nav = use_navigate();
     Effect::new(move |_| {
         let Some(window) = web_sys::window() else { return };
+        let nav = nav.clone();
         let cb = Closure::<dyn Fn(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
             // Skip keyboard shortcuts when the user is typing in an input,
             // textarea, select, or contenteditable element.
@@ -211,7 +233,6 @@ pub fn IssueListPage() -> impl IntoView {
                         let numbers = issue_numbers.get_untracked();
                         if let Some(&number) = numbers.get(idx) {
                             ev.prevent_default();
-                            let nav = use_navigate();
                             nav(&format!("/issues/{number}"), Default::default());
                         }
                     }
@@ -243,7 +264,9 @@ pub fn IssueListPage() -> impl IntoView {
         <div class="bg-background flex flex-col h-full">
             // ── Page header ─────────────────────────────────────────────────
             <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
-                <h1 class="text-sm font-semibold text-foreground">"Issues"</h1>
+                <h1 class="text-sm font-semibold text-foreground">
+                    {move || resolved_team.get().map(|t| t.name.clone()).unwrap_or_else(|| "Issues".to_string())}
+                </h1>
                 <Button
                     on:click=move |_| set_show_new_issue.set(true)
                 >
@@ -260,9 +283,22 @@ pub fn IssueListPage() -> impl IntoView {
                     placeholder="Search issues..."
                     class="flex-1 max-w-sm"
                 />
-                <StatusFilterDropdown value=status_filter on_change=Callback::new(move |v: String| set_status_filter.set(v))/>
+                <StatusFilterDropdown
+                    value=status_filter
+                    on_change=Callback::new(move |v: String| set_status_filter.set(v))
+                    team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
+                />
                 <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
             </div>
+
+            // ── Error alert ─────────────────────────────────────────────────
+            <Show when=move || error_msg.get().is_some()>
+                <div class="mx-4 mt-4">
+                    <Alert variant=AlertVariant::Error>
+                        {move || error_msg.get().unwrap_or_default()}
+                    </Alert>
+                </div>
+            </Show>
 
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto">
@@ -321,322 +357,8 @@ pub fn IssueListPage() -> impl IntoView {
             show=Signal::derive(move || show_new_issue.get())
             on_close=Callback::new(move |()| set_show_new_issue.set(false))
             on_created=on_issue_created
+            team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
         />
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Issue Row
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A single issue row in the list.
-///
-/// DESIGN.md Issue Row Pattern:
-/// ```text
-/// [priority] [status] TRK-42  Fix login redirect loop  [bug] [auth]  May 8  @j
-/// ```
-///
-/// Row height: 36px (h-9), padding: px-3 py-[6px], gap: gap-2.5
-///
-/// Supports keyboard navigation highlighting: when `selected_index` matches
-/// `index`, the row renders with a distinct selected background.
-#[component]
-fn IssueRow(
-    issue: IssueWithDetails,
-    /// This row's index in the list.
-    index: usize,
-    /// The currently keyboard-selected index (None = no selection).
-    #[prop(into)]
-    selected_index: Signal<Option<usize>>,
-) -> impl IntoView {
-    let number = issue.number;
-    let issue_key = format!("{}-{}", issue.team_key, issue.number);
-    let issue_href = format!("/issues/{number}");
-    let status = IssueStatusVariant::parse(&issue.status);
-    let row_ref = NodeRef::<leptos::html::A>::new();
-
-    let is_selected = Memo::new(move |_| selected_index.get() == Some(index));
-
-    // Scroll the selected row into view when keyboard-navigated.
-    Effect::new(move || {
-        if is_selected.get() && let Some(el) = row_ref.get() {
-            let opts = web_sys::ScrollIntoViewOptions::new();
-            opts.set_block(web_sys::ScrollLogicalPosition::Nearest);
-            el.scroll_into_view_with_scroll_into_view_options(&opts);
-        }
-    });
-
-    let row_class = move || {
-        if is_selected.get() {
-            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border bg-primary/5 ring-1 ring-primary/20 focus-visible:outline-none transition-colors cursor-pointer no-underline text-inherit"
-        } else {
-            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer no-underline text-inherit"
-        }
-    };
-
-    view! {
-        <a
-            node_ref=row_ref
-            href=issue_href
-            class=row_class
-            role="listitem"
-            tabindex="0"
-        >
-            // Priority icon (first — most important for triage scanning)
-            <PriorityIndicator priority=issue.priority/>
-
-            // Status icon
-            <IssueStatusBadge status=status/>
-
-            // Issue ID (Geist Mono)
-            <span class="font-mono text-xs text-muted-foreground shrink-0">
-                {issue_key}
-            </span>
-
-            // Title
-            <span class="text-sm font-medium text-foreground flex-1 truncate">
-                {issue.title.clone()}
-            </span>
-
-            // Labels
-            <div class="hidden sm:flex items-center gap-1 shrink-0">
-                {issue.labels.iter().map(|label| {
-                    view! {
-                        <LabelBadge
-                            name=label.name.clone()
-                            color=label.color.clone()
-                        />
-                    }
-                }).collect_view()}
-            </div>
-
-            // Date (Geist Mono)
-            <span class="font-mono text-xs text-muted-foreground shrink-0 hidden sm:inline">
-                {format_short_date(&issue.created_at)}
-            </span>
-
-            // Assignee avatar (18px)
-            {if issue.assignee_name.is_some() {
-                view! {
-                    <Avatar name=issue.assignee_name.clone().unwrap_or_default()/>
-                }.into_any()
-            } else {
-                // Empty placeholder to keep alignment
-                view! {
-                    <span class="w-[18px] h-[18px] shrink-0"></span>
-                }.into_any()
-            }}
-        </a>
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Loading Skeleton
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Six skeleton rows matching the issue row shape for the loading state.
-///
-/// DESIGN.md Loading State Pattern: "Content-shaped Skeleton rectangles".
-#[component]
-fn IssueListSkeleton() -> impl IntoView {
-    let rows = (0..6).map(|_| {
-        view! {
-            <div class="h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border">
-                // Priority icon placeholder
-                <Skeleton class="w-3.5 h-3.5 rounded-[2px]"/>
-                // Status icon placeholder
-                <Skeleton class="w-3.5 h-3.5 rounded-full"/>
-                // Issue number placeholder
-                <Skeleton class="w-14 h-4"/>
-                // Title placeholder
-                <Skeleton class="flex-1 h-4 max-w-md"/>
-                // Label placeholder
-                <Skeleton class="hidden sm:block w-12 h-5 rounded-sm"/>
-                // Date placeholder
-                <Skeleton class="hidden sm:block w-10 h-3"/>
-                // Avatar placeholder
-                <Skeleton class="w-[18px] h-[18px] rounded-full"/>
-            </div>
-        }
-    }).collect_view();
-
-    view! { <div>{rows}</div> }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Filter Dropdowns (DESIGN.md § Dropdowns)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[component]
-fn StatusFilterDropdown(
-    #[prop(into)] value: Signal<String>,
-    on_change: Callback<String>,
-) -> impl IntoView {
-    let (open, set_open) = signal(false);
-    let trigger_ref = NodeRef::<leptos::html::Div>::new();
-
-    let statuses: Vec<(&str, &str, IssueStatusVariant)> = vec![
-        ("backlog", "Backlog", IssueStatusVariant::Backlog),
-        ("todo", "Todo", IssueStatusVariant::Todo),
-        ("in_progress", "In Progress", IssueStatusVariant::InProgress),
-        ("done", "Done", IssueStatusVariant::Done),
-        ("cancelled", "Cancelled", IssueStatusVariant::Cancelled),
-    ];
-
-    let display = Memo::new(move |_| {
-        let v = value.get();
-        if v.is_empty() { None } else {
-            match v.as_str() {
-                "backlog" => Some("Backlog".to_string()),
-                "todo" => Some("Todo".to_string()),
-                "in_progress" => Some("In Progress".to_string()),
-                "done" => Some("Done".to_string()),
-                "cancelled" => Some("Cancelled".to_string()),
-                _ => None,
-            }
-        }
-    });
-
-    let current_variant = Memo::new(move |_| {
-        match value.get().as_str() {
-            "backlog" => Some(IssueStatusVariant::Backlog),
-            "todo" => Some(IssueStatusVariant::Todo),
-            "in_progress" => Some(IssueStatusVariant::InProgress),
-            "done" => Some(IssueStatusVariant::Done),
-            "cancelled" => Some(IssueStatusVariant::Cancelled),
-            _ => None,
-        }
-    });
-
-    view! {
-        <div node_ref=trigger_ref>
-            <DropdownTrigger
-                label="All statuses"
-                value=Signal::derive(move || display.get())
-                icon=Arc::new(move || {
-                    current_variant.get().map(|v| {
-                        view! { <IssueStatusBadge status=v size=12/> }.into_any()
-                    }).unwrap_or_else(|| view! { <span/> }.into_any())
-                }) as ChildrenFn
-                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
-            />
-        </div>
-        <DropdownMenu
-            trigger_ref=trigger_ref
-            open=Signal::derive(move || open.get())
-            on_close=Callback::new(move |()| set_open.set(false))
-            search_placeholder="Filter status..."
-        >
-            <DropdownItem
-                label="All statuses"
-                selected=Signal::derive(move || value.get().is_empty())
-                on_select=Callback::new({
-                    let on_change = on_change.clone();
-                    move |()| { on_change.run(String::new()); set_open.set(false); }
-                })
-            />
-            {statuses.iter().map(|(key, label, variant)| {
-                let key_owned = key.to_string();
-                let key_check = key.to_string();
-                let label = label.to_string();
-                let variant = *variant;
-                view! {
-                    <DropdownItem
-                        label=label
-                        selected=Signal::derive(move || value.get() == key_check)
-                        on_select=Callback::new({
-                            let on_change = on_change.clone();
-                            let k = key_owned.clone();
-                            move |()| { on_change.run(k.clone()); set_open.set(false); }
-                        })
-                        icon=Arc::new(move || view! { <IssueStatusBadge status=variant size=14/> }.into_any()) as ChildrenFn
-                    />
-                }
-            }).collect_view()}
-        </DropdownMenu>
-    }
-}
-
-#[component]
-fn PriorityFilterDropdown(
-    #[prop(into)] value: Signal<String>,
-    on_change: Callback<String>,
-) -> impl IntoView {
-    let (open, set_open) = signal(false);
-    let trigger_ref = NodeRef::<leptos::html::Div>::new();
-
-    let priorities: Vec<(&str, &str, i32)> = vec![
-        ("1", "Urgent", 1),
-        ("2", "High", 2),
-        ("3", "Medium", 3),
-        ("4", "Low", 4),
-    ];
-
-    let display = Memo::new(move |_| {
-        let v = value.get();
-        if v.is_empty() { None } else {
-            match v.as_str() {
-                "1" => Some("Urgent".to_string()),
-                "2" => Some("High".to_string()),
-                "3" => Some("Medium".to_string()),
-                "4" => Some("Low".to_string()),
-                _ => None,
-            }
-        }
-    });
-
-    let current_priority = Memo::new(move |_| {
-        value.get().parse::<i32>().ok()
-    });
-
-    view! {
-        <div node_ref=trigger_ref>
-            <DropdownTrigger
-                label="All priorities"
-                value=Signal::derive(move || display.get())
-                icon=Arc::new(move || {
-                    current_priority.get().map(|p| {
-                        view! { <PriorityIndicator priority=p/> }.into_any()
-                    }).unwrap_or_else(|| view! { <span/> }.into_any())
-                }) as ChildrenFn
-                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
-            />
-        </div>
-        <DropdownMenu
-            trigger_ref=trigger_ref
-            open=Signal::derive(move || open.get())
-            on_close=Callback::new(move |()| set_open.set(false))
-            search_placeholder="Filter priority..."
-        >
-            <DropdownItem
-                label="All priorities"
-                selected=Signal::derive(move || value.get().is_empty())
-                on_select=Callback::new({
-                    let on_change = on_change.clone();
-                    move |()| { on_change.run(String::new()); set_open.set(false); }
-                })
-            />
-            {priorities.iter().map(|(key, label, priority_val)| {
-                let key_owned = key.to_string();
-                let key_check = key.to_string();
-                let label = label.to_string();
-                let shortcut = key.to_string();
-                let priority_val = *priority_val;
-                view! {
-                    <DropdownItem
-                        label=label
-                        selected=Signal::derive(move || value.get() == key_check)
-                        on_select=Callback::new({
-                            let on_change = on_change.clone();
-                            let k = key_owned.clone();
-                            move |()| { on_change.run(k.clone()); set_open.set(false); }
-                        })
-                        icon=Arc::new(move || view! { <PriorityIndicator priority=priority_val/> }.into_any()) as ChildrenFn
-                        shortcut=shortcut
-                    />
-                }
-            }).collect_view()}
-        </DropdownMenu>
     }
 }
 
@@ -656,6 +378,9 @@ fn NewIssueModal(
     on_close: Callback<()>,
     /// Called after an issue is successfully created.
     on_created: Callback<()>,
+    /// When on a team page, the team_id to assign to newly created issues.
+    #[prop(optional, into)]
+    team_id: Option<Signal<Option<String>>>,
 ) -> impl IntoView {
     let (title, set_title) = signal(String::new());
     let (description, set_description) = signal(String::new());
@@ -684,12 +409,13 @@ fn NewIssueModal(
         let desc_val = description.get_untracked();
         let desc = if desc_val.trim().is_empty() { None } else { Some(desc_val) };
         let prio = priority.get_untracked().parse::<i32>().unwrap_or(0);
+        let current_team_id = team_id.and_then(|s| s.get_untracked());
 
         set_submitting.set(true);
         set_error_msg.set(None);
 
         leptos::task::spawn_local(async move {
-            match create_issue(title_val, desc, prio, None, None, String::new()).await {
+            match create_issue(title_val, desc, prio, None, None, String::new(), None, None, current_team_id).await {
                 Ok(_) => {
                     set_submitting.set(false);
                     on_created.run(());

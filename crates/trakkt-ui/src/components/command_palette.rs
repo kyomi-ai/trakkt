@@ -12,6 +12,7 @@ use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use phosphor_leptos::Icon;
 
+use crate::cache::store::SyncStore;
 use crate::server_fns::issues::list_issues;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,10 +35,12 @@ struct PaletteAction {
 #[derive(Clone, PartialEq)]
 enum PaletteIcon {
     ListChecks,
+    ListBullets,
     Kanban,
     Gear,
     Plus,
     Article,
+    Folder,
 }
 
 #[derive(Clone, PartialEq)]
@@ -55,16 +58,10 @@ enum ActionKind {
 fn static_actions() -> Vec<PaletteAction> {
     vec![
         PaletteAction {
-            label: "Go to Issues".to_string(),
+            label: "Go to My Issues".to_string(),
             description: None,
             icon: PaletteIcon::ListChecks,
-            kind: ActionKind::Navigate("/issues".to_string()),
-        },
-        PaletteAction {
-            label: "Go to Board".to_string(),
-            description: None,
-            icon: PaletteIcon::Kanban,
-            kind: ActionKind::Navigate("/board".to_string()),
+            kind: ActionKind::Navigate("/my-issues".to_string()),
         },
         PaletteAction {
             label: "Go to Settings".to_string(),
@@ -125,21 +122,70 @@ pub fn CommandPalette(
             if query.len() < 2 {
                 return Vec::new();
             }
-            list_issues(None, None, None, None, Some(query), Some(10), None)
+            list_issues(None, None, None, None, None, Some(query), Some(10), None)
                 .await
                 .unwrap_or_default()
         },
     );
 
-    // ── Combined results (static + dynamic) ─────────────────────────────────
+    // ── SyncStore (SSR-safe: None on server, Some on client) ──────────────
+    let sync_store = use_context::<SyncStore>();
+
+    // ── Combined results (static + team + project + dynamic) ────────────
     let filtered_results = Memo::new(move |_| {
         let query = search.get().to_lowercase();
+
+        // 1. Static actions (My Issues, Settings, Create Issue).
         let mut results: Vec<PaletteAction> = static_actions()
             .into_iter()
             .filter(|a| query.is_empty() || a.label.to_lowercase().contains(&query))
             .collect();
 
-        // Append issue search results (converted from IssueWithDetails).
+        // 2. Team navigation actions (Issues + Board per team).
+        if let Some(store) = sync_store {
+            let teams = store.teams().get();
+            for team in &teams {
+                let issues_label = format!("Go to {} Issues", team.name);
+                let board_label = format!("Go to {} Board", team.name);
+                let key_lower = team.key.to_lowercase();
+
+                if query.is_empty() || issues_label.to_lowercase().contains(&query) {
+                    results.push(PaletteAction {
+                        label: issues_label,
+                        description: None,
+                        icon: PaletteIcon::ListBullets,
+                        kind: ActionKind::Navigate(format!("/teams/{key_lower}/issues")),
+                    });
+                }
+                if query.is_empty() || board_label.to_lowercase().contains(&query) {
+                    results.push(PaletteAction {
+                        label: board_label,
+                        description: None,
+                        icon: PaletteIcon::Kanban,
+                        kind: ActionKind::Navigate(format!("/teams/{key_lower}/board")),
+                    });
+                }
+            }
+
+            // 3. Project navigation actions.
+            let projects = store.projects().get();
+            for project in &projects {
+                let label = format!("Go to {}", project.name);
+                if query.is_empty() || label.to_lowercase().contains(&query) {
+                    results.push(PaletteAction {
+                        label,
+                        description: None,
+                        icon: PaletteIcon::Folder,
+                        kind: ActionKind::Navigate(format!(
+                            "/projects/{}",
+                            project.project_id
+                        )),
+                    });
+                }
+            }
+        }
+
+        // 4. Append issue search results (converted from IssueWithDetails).
         if let Some(issues) = issue_results.get() {
             results.extend(issues.into_iter().map(|issue| PaletteAction {
                 label: issue.title,
@@ -327,6 +373,9 @@ fn palette_icon_view(icon: PaletteIcon) -> AnyView {
         PaletteIcon::ListChecks => {
             view! { <Icon icon=phosphor_leptos::LIST_CHECKS size="16px"/> }.into_any()
         }
+        PaletteIcon::ListBullets => {
+            view! { <Icon icon=phosphor_leptos::LIST_BULLETS size="16px"/> }.into_any()
+        }
         PaletteIcon::Kanban => {
             view! { <Icon icon=phosphor_leptos::KANBAN size="16px"/> }.into_any()
         }
@@ -338,6 +387,9 @@ fn palette_icon_view(icon: PaletteIcon) -> AnyView {
         }
         PaletteIcon::Article => {
             view! { <Icon icon=phosphor_leptos::ARTICLE size="16px"/> }.into_any()
+        }
+        PaletteIcon::Folder => {
+            view! { <Icon icon=phosphor_leptos::FOLDER size="16px"/> }.into_any()
         }
     }
 }

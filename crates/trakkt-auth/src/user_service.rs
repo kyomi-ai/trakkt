@@ -252,12 +252,18 @@ pub async fn create_workspace_for_user(
 
     // Create default team so issues can be created immediately
     let team_id = format!("team-{}", uuid::Uuid::new_v4());
-    trakkt_core::db_execute!(
-        pool,
+    let team_now = sql_compat::now(is_pg);
+    let team_sql = format!(
         "INSERT INTO teams (team_id, workspace_id, name, key, created_at) \
-         VALUES ($1, $2, 'Default', 'TRK', NOW())",
-        &team_id, &workspace_id
-    )?;
+         VALUES ($1, $2, 'Default', 'TRK', {team_now})"
+    );
+    trakkt_core::db_execute!(pool, &team_sql, &team_id, &workspace_id)?;
+
+    // Add user as team lead of the default team
+    crate::team_service::add_team_member(pool, &team_id, user_id, "lead", &workspace_id).await?;
+
+    // Seed default statuses so issues can use status_id FK.
+    crate::status_service::seed_default_statuses(pool, &workspace_id).await?;
 
     // Set as last workspace
     update_last_workspace(pool, user_id, &workspace_id).await?;

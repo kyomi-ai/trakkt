@@ -20,11 +20,15 @@ use leptos_router::hooks::{use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, LabelBadge, Skeleton, StyledSelect,
+    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
+    DropdownItem, DropdownMenu, DropdownTrigger,
+    IssueStatusBadge, IssueStatusVariant,
+    LabelBadge, Skeleton, StyledSelect,
 };
 use crate::server_fns::comments::{create_comment, list_comments};
 use crate::server_fns::issues::{get_issue, set_issue_labels, update_issue};
 use crate::server_fns::labels::list_labels;
+use crate::server_fns::statuses::list_statuses;
 use trakkt_types::models::{Comment, IssueWithDetails};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -165,13 +169,28 @@ pub fn IssueDetailPage() -> impl IntoView {
             .unwrap_or(0)
     });
 
-    // ── Data fetching ───────────────────────────────────────────────────
+    // ── Data source: SyncStore (real-time) with server function fallback ───
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (version, set_version) = signal(0u32);
 
-    let issue_resource = Resource::new(
+    let server_issue = Resource::new(
         move || (number.get(), version.get()),
         move |(num, _)| async move { get_issue(num).await },
     );
+
+    let issue_data = Signal::derive(move || {
+        let num = number.get();
+        if let Some(store) = sync_store {
+            let items = store.issues().get();
+            if let Some(issue) = items.iter().find(|i| i.number == num) {
+                return Some(Ok(Some(issue.clone())));
+            }
+            if store.initialized().get() {
+                return Some(Ok(None));
+            }
+        }
+        server_issue.get()
+    });
 
     let comments_resource = Resource::new(
         move || (number.get(), version.get()),
@@ -202,46 +221,36 @@ pub fn IssueDetailPage() -> impl IntoView {
 
             // ── Content ────────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto p-4 md:p-6">
-                <Transition fallback=move || view! { <IssueDetailSkeleton/> }>
-                    {move || Suspend::new(async move {
-                        let issue_result = issue_resource.await;
-                        let comments_result = comments_resource.await;
-
-                        match issue_result {
-                            Ok(Some(ref issue)) => {
-                                let comments = comments_result.unwrap_or_default();
-                                let issue = issue.clone();
-                                let refetch = refetch;
-                                view! {
-                                    <IssueDetailContent
-                                        issue=issue.clone()
-                                        comments=comments
-                                        on_change=Callback::new(move |()| refetch())
-                                    />
-                                    // ── Footer: timestamps ─────────────────────
-                                    <div class="max-w-[860px] mx-auto w-full mt-6 pb-4">
-                                        <div class="flex items-center gap-4 text-xs text-muted-foreground">
-                                            <span>{format!("Created {}", relative_time(&issue.created_at))}</span>
-                                            <span>{format!("Updated {}", relative_time(&issue.updated_at))}</span>
-                                        </div>
-                                    </div>
-                                }.into_any()
-                            }
-                            Ok(None) => {
-                                view! {
-                                    <IssueNotFound number=number.get()/>
-                                }.into_any()
-                            }
-                            Err(_) => {
-                                view! {
-                                    <div class="max-w-[860px] mx-auto w-full text-center py-16">
-                                        <p class="text-muted-foreground">"Failed to load issue. Please try again."</p>
-                                    </div>
-                                }.into_any()
-                            }
+                {move || {
+                    match issue_data.get() {
+                        Some(Ok(Some(issue))) => {
+                            let comments = comments_resource.get()
+                                .and_then(|r| r.ok())
+                                .unwrap_or_default();
+                            let refetch = refetch;
+                            view! {
+                                <IssueDetailContent
+                                    initial_issue=issue
+                                    comments=comments
+                                    on_change=Callback::new(move |()| refetch())
+                                />
+                            }.into_any()
                         }
-                    })}
-                </Transition>
+                        Some(Ok(None)) => {
+                            view! { <IssueNotFound number=number.get()/> }.into_any()
+                        }
+                        Some(Err(_)) => {
+                            view! {
+                                <div class="max-w-[860px] mx-auto w-full text-center py-16">
+                                    <p class="text-muted-foreground">"Failed to load issue. Please try again."</p>
+                                </div>
+                            }.into_any()
+                        }
+                        None => {
+                            view! { <IssueDetailSkeleton/> }.into_any()
+                        }
+                    }
+                }}
             </div>
         </div>
     }
@@ -252,28 +261,54 @@ pub fn IssueDetailPage() -> impl IntoView {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The main content of the issue detail page — rendered when issue data is loaded.
+///
+/// Reads from SyncStore reactively so external changes (MCP, other clients)
+/// update the UI in realtime without a page refresh.
 #[component]
 fn IssueDetailContent(
-    issue: IssueWithDetails,
+    initial_issue: IssueWithDetails,
     comments: Vec<Comment>,
     on_change: Callback<()>,
 ) -> impl IntoView {
-    let number = issue.number;
+    let number = initial_issue.number;
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+    let initial = RwSignal::new(initial_issue);
+
+    let issue = Signal::derive(move || {
+        if let Some(store) = sync_store {
+            let items = store.issues().get();
+            if let Some(found) = items.iter().find(|i| i.number == number) {
+                return found.clone();
+            }
+        }
+        initial.get()
+    });
 
     view! {
         <div class="max-w-[860px] mx-auto w-full">
             // ── Title ──────────────────────────────────────────────────
-            <EditableTitle number=number title=issue.title.clone() on_save=on_change/>
+            {move || {
+                let i = issue.get();
+                view! { <EditableTitle number=number title=i.title.clone() on_save=on_change/> }
+            }}
 
             // ── Metadata bar ───────────────────────────────────────────
-            <MetadataBar issue=issue.clone() on_change=on_change/>
+            {move || {
+                let i = issue.get();
+                view! { <MetadataBar issue=i on_change=on_change/> }
+            }}
 
             // ── Description ────────────────────────────────────────────
-            <DescriptionEditor
-                number=number
-                description=issue.description.clone().unwrap_or_default()
-                on_save=on_change
-            />
+            {move || {
+                let i = issue.get();
+                view! {
+                    <DescriptionEditor
+                        number=number
+                        description=i.description.clone().unwrap_or_default()
+                        on_save=on_change
+                    />
+                }
+            }}
 
             // ── Divider ────────────────────────────────────────────────
             <div class="border-t border-border my-6"></div>
@@ -284,6 +319,19 @@ fn IssueDetailContent(
                 comments=comments
                 on_comment_added=on_change
             />
+
+            // ── Footer: timestamps ────────────────────────────────────
+            {move || {
+                let i = issue.get();
+                view! {
+                    <div class="mt-6 pb-4">
+                        <div class="flex items-center gap-4 text-xs text-muted-foreground">
+                            <span>{format!("Created {}", relative_time(&i.created_at))}</span>
+                            <span>{format!("Updated {}", relative_time(&i.updated_at))}</span>
+                        </div>
+                    </div>
+                }
+            }}
         </div>
     }
 }
@@ -318,10 +366,12 @@ fn EditableTitle(
                 number,
                 Some(new_title),
                 None, // description
-                None, // status
+                None, // status_id
                 None, // priority
                 None, // assignee_id
                 None, // due_date
+                None, // project_id
+                None, // milestone_id
             )
             .await;
             set_saving.set(false);
@@ -395,20 +445,26 @@ fn MetadataBar(
     on_change: Callback<()>,
 ) -> impl IntoView {
     let number = issue.number;
-    let status = issue.status.clone();
+    let current_status_id = issue.status_id.clone();
+    let current_status_category = issue.status_category.clone();
     let priority = issue.priority;
 
+    // Fetch statuses dynamically for the status dropdown.
+    let statuses_resource = LocalResource::new(move || list_statuses(None));
+
     // ── Status change handler ───────────────────────────────────────────
-    let on_status_change = move |new_status: String| {
+    let on_status_change = move |new_status_id: String| {
         leptos::task::spawn_local(async move {
             let _ = update_issue(
                 number,
                 None, // title
                 None, // description
-                Some(new_status),
+                Some(new_status_id),
                 None, // priority
                 None, // assignee_id
                 None, // due_date
+                None, // project_id
+                None, // milestone_id
             )
             .await;
             on_change.run(());
@@ -423,14 +479,36 @@ fn MetadataBar(
                 number,
                 None, // title
                 None, // description
-                None, // status
+                None, // status_id
                 Some(prio),
                 None, // assignee_id
                 None, // due_date
+                None, // project_id
+                None, // milestone_id
             )
             .await;
             on_change.run(());
         });
+    };
+
+    let status_variant = IssueStatusVariant::parse(&current_status_category);
+    let (status_open, set_status_open) = signal(false);
+    let status_trigger_ref = NodeRef::<leptos::html::Div>::new();
+    let statuses = RwSignal::new(Vec::<trakkt_types::models::Status>::new());
+
+    Effect::new(move || {
+        if let Some(Ok(loaded)) = statuses_resource.get() {
+            statuses.set(loaded);
+        }
+    });
+
+    let current_status_name = {
+        let id = current_status_id.clone();
+        move || {
+            statuses.get().iter()
+                .find(|s| s.status_id == id)
+                .map(|s| s.name.clone())
+        }
     };
 
     view! {
@@ -438,19 +516,50 @@ fn MetadataBar(
             // ── Status ─────────────────────────────────────────────────
             <div class="flex items-center gap-2">
                 <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Status"</span>
-                <div class="w-36">
-                    <StyledSelect
-                        value=status
-                        options=vec![
-                            ("backlog", "Backlog"),
-                            ("todo", "Todo"),
-                            ("in_progress", "In Progress"),
-                            ("done", "Done"),
-                            ("cancelled", "Cancelled"),
-                        ]
-                        on_change=on_status_change
+                <div node_ref=status_trigger_ref>
+                    <DropdownTrigger
+                        label="Status"
+                        value=Signal::derive(move || current_status_name())
+                        icon=Arc::new(move || {
+                            view! { <IssueStatusBadge status=status_variant size=12/> }.into_any()
+                        }) as ChildrenFn
+                        on_click=Callback::new(move |()| set_status_open.update(|o| *o = !*o))
                     />
                 </div>
+                <DropdownMenu
+                    trigger_ref=status_trigger_ref
+                    open=Signal::derive(move || status_open.get())
+                    on_close=Callback::new(move |()| set_status_open.set(false))
+                    search_placeholder="Filter status..."
+                >
+                    {
+                        let current_sid = current_status_id.clone();
+                        move || statuses.get().into_iter().map({
+                            let current_sid = current_sid.clone();
+                            move |status| {
+                                let status_id = status.status_id.clone();
+                                let status_id_check = status.status_id.clone();
+                                let label = status.name.clone();
+                                let variant = IssueStatusVariant::parse(&status.category);
+                                view! {
+                                    <DropdownItem
+                                        label=label
+                                        selected=Signal::derive({
+                                            let id = current_sid.clone();
+                                            move || id == status_id_check
+                                        })
+                                on_select=Callback::new({
+                                    let id = status_id.clone();
+                                    move |()| {
+                                        on_status_change(id.clone());
+                                        set_status_open.set(false);
+                                    }
+                                })
+                                icon=Arc::new(move || view! { <IssueStatusBadge status=variant size=14/> }.into_any()) as ChildrenFn
+                            />
+                        }
+                    }}).collect_view()}
+                </DropdownMenu>
             </div>
 
             // ── Priority ───────────────────────────────────────────────
@@ -491,6 +600,7 @@ fn MetadataBar(
             // ── Labels ─────────────────────────────────────────────────
             <LabelPicker
                 number=number
+                team_id=issue.team_id.clone()
                 current_labels=issue.labels.clone()
                 on_change=on_change
             />
@@ -519,6 +629,8 @@ fn MetadataBar(
 #[component]
 fn LabelPicker(
     number: i32,
+    /// The team_id of the issue, used to scope the label list.
+    team_id: String,
     current_labels: Vec<trakkt_types::models::Label>,
     on_change: Callback<()>,
 ) -> impl IntoView {
@@ -528,7 +640,11 @@ fn LabelPicker(
     );
     let current_display = RwSignal::new(current_labels);
 
-    let all_labels = LocalResource::new(list_labels);
+    let team_id_for_fetch = Some(team_id);
+    let all_labels = LocalResource::new(move || {
+        let tid = team_id_for_fetch.clone();
+        async move { list_labels(tid).await }
+    });
 
     let toggle_label = move |label: trakkt_types::models::Label| {
         let mut ids = current_ids.get_untracked();
@@ -676,10 +792,12 @@ fn DescriptionEditor(
                 number,
                 None, // title
                 desc,
-                None, // status
+                None, // status_id
                 None, // priority
                 None, // assignee_id
                 None, // due_date
+                None, // project_id
+                None, // milestone_id
             )
             .await;
             on_save.run(());

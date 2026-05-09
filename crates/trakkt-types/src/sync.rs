@@ -46,4 +46,7 @@ pub mod entity_types {
     pub const LABEL: &str = "label";
     pub const NOTIFICATION: &str = "notification";
     pub const TEAM: &str = "team";
+    pub const STATUS: &str = "status";
+    pub const PROJECT: &str = "project";
+    pub const PROJECT_MILESTONE: &str = "project_milestone";
 }

@@ -26,11 +26,13 @@ struct IssueRow {
     number: i32,
     title: String,
     description: Option<String>,
-    status: String,
+    status_id: String,
     priority: i32,
     assignee_id: Option<String>,
     creator_id: String,
     due_date: Option<String>,
+    project_id: Option<String>,
+    milestone_id: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -44,11 +46,13 @@ impl IssueRow {
             number: self.number,
             title: self.title,
             description: self.description,
-            status: self.status,
+            status_id: self.status_id,
             priority: self.priority,
             assignee_id: self.assignee_id,
             creator_id: self.creator_id,
             due_date: self.due_date,
+            project_id: self.project_id,
+            milestone_id: self.milestone_id,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -65,13 +69,18 @@ struct IssueDetailRow {
     number: i32,
     title: String,
     description: Option<String>,
-    status: String,
+    status_id: String,
+    status_name: String,
+    status_category: String,
     priority: i32,
     assignee_id: Option<String>,
     assignee_name: Option<String>,
     creator_id: String,
     creator_name: Option<String>,
     due_date: Option<String>,
+    project_id: Option<String>,
+    project_name: Option<String>,
+    milestone_id: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -86,13 +95,18 @@ impl IssueDetailRow {
             number: self.number,
             title: self.title,
             description: self.description,
-            status: self.status,
+            status_id: self.status_id,
+            status_name: self.status_name,
+            status_category: self.status_category,
             priority: self.priority,
             assignee_id: self.assignee_id,
             assignee_name: self.assignee_name,
             creator_id: self.creator_id,
             creator_name: self.creator_name,
             due_date: self.due_date,
+            project_id: self.project_id,
+            project_name: self.project_name,
+            milestone_id: self.milestone_id,
             created_at: self.created_at,
             updated_at: self.updated_at,
             labels,
@@ -102,19 +116,24 @@ impl IssueDetailRow {
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-/// Base SELECT for issue detail queries with JOINs to teams and users.
+/// Base SELECT for issue detail queries with JOINs to teams, users, statuses, and projects.
 const ISSUE_DETAIL_SELECT: &str = "\
     SELECT i.issue_id, i.workspace_id, i.team_id, t.key AS team_key, \
-           i.number, i.title, i.description, i.status, i.priority, \
+           i.number, i.title, i.description, i.status_id, \
+           s.name AS status_name, s.category AS status_category, \
+           i.priority, \
            i.assignee_id, assignee.name AS assignee_name, \
            i.creator_id, creator.name AS creator_name, \
            CAST(i.due_date AS TEXT) AS due_date, \
+           i.project_id, p.name AS project_name, i.milestone_id, \
            CAST(i.created_at AS TEXT) AS created_at, \
            CAST(i.updated_at AS TEXT) AS updated_at \
     FROM issues i \
     JOIN teams t ON t.team_id = i.team_id \
+    JOIN statuses s ON s.status_id = i.status_id \
     LEFT JOIN users assignee ON assignee.user_id = i.assignee_id \
-    JOIN users creator ON creator.user_id = i.creator_id";
+    JOIN users creator ON creator.user_id = i.creator_id \
+    LEFT JOIN projects p ON p.project_id = i.project_id";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -138,13 +157,14 @@ async fn fetch_labels_for_issues(
         issue_id: String,
         label_id: String,
         workspace_id: String,
+        team_id: Option<String>,
         name: String,
         color: String,
         created_at: String,
     }
 
     let sql = format!(
-        "SELECT il.issue_id, l.label_id, l.workspace_id, l.name, l.color, \
+        "SELECT il.issue_id, l.label_id, l.workspace_id, l.team_id, l.name, l.color, \
                 CAST(l.created_at AS TEXT) AS created_at \
          FROM labels l \
          JOIN issue_labels il ON l.label_id = il.label_id \
@@ -169,6 +189,7 @@ async fn fetch_labels_for_issues(
         map.entry(issue_id).or_default().push(Label {
             label_id: row.label_id,
             workspace_id: row.workspace_id,
+            team_id: row.team_id,
             name: row.name,
             color: row.color,
             created_at: row.created_at,
@@ -192,16 +213,21 @@ pub async fn create_issue(
     let now = sql_compat::now(is_pg);
     let issue_id = uuid::Uuid::new_v4().to_string();
 
+    // Look up the default status for this workspace.
+    let default_status = crate::status_service::get_default_status(db, &params.workspace_id).await?;
+
     // Atomic number generation: the subquery computes the next number inside the
     // INSERT statement so the MAX read and INSERT happen atomically, preventing
     // race conditions where concurrent creates read the same MAX.
+    let due_date_cast = if is_pg { "CAST($10 AS TIMESTAMPTZ)" } else { "$10" };
     let sql = format!(
         "INSERT INTO issues \
             (issue_id, workspace_id, team_id, number, title, description, \
-             status, priority, assignee_id, creator_id, due_date, created_at, updated_at) \
+             status_id, priority, assignee_id, creator_id, due_date, \
+             project_id, milestone_id, created_at, updated_at) \
          VALUES ($1, $2, $3, \
                  (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE workspace_id = $2), \
-                 $4, $5, 'backlog', $6, $7, $8, $9, {now}, {now})"
+                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, {now}, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -211,10 +237,13 @@ pub async fn create_issue(
         &params.team_id,
         &params.title,
         params.description.as_deref(),
+        &default_status.status_id,
         params.priority,
         params.assignee_id.as_deref(),
         &params.creator_id,
-        params.due_date.as_deref()
+        params.due_date.as_deref(),
+        params.project_id.as_deref(),
+        params.milestone_id.as_deref()
     )?;
 
     // Attach labels.
@@ -261,8 +290,9 @@ pub async fn create_issue(
         db,
         IssueRow,
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
-                status, priority, assignee_id, creator_id, \
+                status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
+                project_id, milestone_id, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE issue_id = $1",
@@ -336,6 +366,7 @@ pub async fn get_issue(
 pub async fn list_issues(
     db: &DbPool,
     workspace_id: &str,
+    team_id: Option<&str>,
     filters: &IssueFilters,
 ) -> trakkt_core::Result<Vec<IssueWithDetails>> {
     let is_pg = db.is_postgres();
@@ -349,8 +380,13 @@ pub async fn list_issues(
     // dynamically via db_with_pool! below. Params are bound in the same
     // order as they appear in the SQL.
 
-    if filters.status.is_some() {
-        conditions.push(format!("i.status = ${param_idx}"));
+    if team_id.is_some() {
+        conditions.push(format!("i.team_id = ${param_idx}"));
+        param_idx += 1;
+    }
+
+    if filters.status_id.is_some() {
+        conditions.push(format!("i.status_id = ${param_idx}"));
         param_idx += 1;
     }
 
@@ -411,7 +447,10 @@ pub async fn list_issues(
         query = query.bind(workspace_id);
 
         // Bind remaining params in order of their slot assignment.
-        if let Some(ref v) = filters.status {
+        if let Some(ref v) = team_id {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = filters.status_id {
             query = query.bind(v);
         }
         if let Some(v) = filters.priority {
@@ -476,8 +515,8 @@ pub async fn update_issue(
         param_idx += 1;
     }
 
-    if updates.status.is_some() {
-        set_parts.push(format!("status = ${param_idx}"));
+    if updates.status_id.is_some() {
+        set_parts.push(format!("status_id = ${param_idx}"));
         param_idx += 1;
     }
 
@@ -497,7 +536,21 @@ pub async fn update_issue(
     }
 
     if updates.due_date.is_some() {
-        set_parts.push(format!("due_date = ${param_idx}"));
+        if is_pg {
+            set_parts.push(format!("due_date = CAST(${param_idx} AS TIMESTAMPTZ)"));
+        } else {
+            set_parts.push(format!("due_date = ${param_idx}"));
+        }
+        param_idx += 1;
+    }
+
+    if updates.project_id.is_some() {
+        set_parts.push(format!("project_id = ${param_idx}"));
+        param_idx += 1;
+    }
+
+    if updates.milestone_id.is_some() {
+        set_parts.push(format!("milestone_id = ${param_idx}"));
         param_idx += 1;
     }
 
@@ -526,7 +579,7 @@ pub async fn update_issue(
             // Double-Option: bind the inner Option (None = NULL, Some = value)
             query = query.bind(v.as_deref());
         }
-        if let Some(ref v) = updates.status {
+        if let Some(ref v) = updates.status_id {
             query = query.bind(v);
         }
         if let Some(v) = updates.priority {
@@ -536,6 +589,12 @@ pub async fn update_issue(
             query = query.bind(v.as_deref());
         }
         if let Some(ref v) = updates.due_date {
+            query = query.bind(v.as_deref());
+        }
+        if let Some(ref v) = updates.project_id {
+            query = query.bind(v.as_deref());
+        }
+        if let Some(ref v) = updates.milestone_id {
             query = query.bind(v.as_deref());
         }
 
@@ -556,8 +615,9 @@ pub async fn update_issue(
         db,
         IssueRow,
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
-                status, priority, assignee_id, creator_id, \
+                status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
+                project_id, milestone_id, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE workspace_id = $1 AND number = $2",
@@ -612,8 +672,9 @@ pub async fn delete_issue(
         db,
         IssueRow,
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
-                status, priority, assignee_id, creator_id, \
+                status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
+                project_id, milestone_id, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE workspace_id = $1 AND number = $2",

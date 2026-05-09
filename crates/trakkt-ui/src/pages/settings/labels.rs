@@ -111,7 +111,7 @@ fn ColorPicker(
 pub fn LabelsPage() -> impl IntoView {
     // Data fetching with version-based refresh
     let (version, set_version) = signal(0u32);
-    let labels = Resource::new(move || version.get(), |_| list_labels());
+    let labels = Resource::new(move || version.get(), |_| list_labels(None));
 
     // Create label form state
     let (new_name, set_new_name) = signal(String::new());
@@ -134,7 +134,7 @@ pub fn LabelsPage() -> impl IntoView {
     let create_action = Action::new(move |(name, color): &(String, String)| {
         let name = name.clone();
         let color = color.clone();
-        async move { create_label(name, color).await }
+        async move { create_label(name, color, None).await }
     });
 
     let update_action = Action::new(move |(id, name, color): &(String, String, String)| {
@@ -293,9 +293,12 @@ pub fn LabelsPage() -> impl IntoView {
                                                         class="w-4 h-4 rounded-full flex-shrink-0"
                                                         style=format!("background-color: {}", label.color)
                                                     />
-                                                    // Name
+                                                    // Name + scope indicator
                                                     <span class="text-sm font-medium text-foreground flex-1 min-w-0 truncate">
                                                         {label.name}
+                                                    </span>
+                                                    <span class="text-xs text-muted-foreground shrink-0">
+                                                        {if label.team_id.is_some() { "team" } else { "workspace" }}
                                                     </span>
                                                     // Actions
                                                     <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">

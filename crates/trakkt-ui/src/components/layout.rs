@@ -12,13 +12,11 @@ use phosphor_leptos::{Icon, IconWeight};
 
 use crate::cache::store::SyncStore;
 use crate::components::{CommandPalette, Spinner};
-use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
 
 /// Main authenticated layout with sidebar and content area.
 #[component]
 pub fn Layout() -> impl IntoView {
-    let user_ctx = expect_context::<LocalResource<Result<UserContext, ServerFnError>>>();
     let user_info = LocalResource::new(get_sidebar_user);
     let (user_menu_open, set_user_menu_open) = signal(false);
     let (mobile_sidebar_open, set_mobile_sidebar_open) = signal(false);
@@ -51,6 +49,9 @@ pub fn Layout() -> impl IntoView {
     {
         use crate::cache::websocket;
         use crate::cache::sync_engine;
+        use crate::server_fns::context::UserContext;
+
+        let user_ctx = expect_context::<LocalResource<Result<UserContext, ServerFnError>>>();
 
         // Track whether we've already started the sync engine to avoid
         // re-connecting on every reactive re-fire.
@@ -91,19 +92,30 @@ pub fn Layout() -> impl IntoView {
                 }
             });
 
-            // 2. Connect WebSocket synchronously (in reactive context so
-            //    provide_context and on_cleanup work correctly).
-            //    Personal mode uses empty token; multi-user fetches a JWT
-            //    asynchronously and reconnects once it arrives.
+            // 2. Connect WebSocket — start with empty token (connects immediately
+            //    so provide_context works in the reactive scope). Then fetch a
+            //    JWT asynchronously and reconnect with it for multi-user mode.
             let ws_client = websocket::connect(&user_id, &workspace_id, "");
 
             sync_engine::start_sync_engine(&ws_client, &sync_store, &workspace_id);
 
             let ws_for_cleanup = ws_client.clone();
-            provide_context(ws_client);
+            provide_context(ws_client.clone());
 
             on_cleanup(move || {
                 websocket::disconnect(&ws_for_cleanup);
+            });
+
+            // Fetch JWT and reconnect with auth (multi-user mode only).
+            let ws_for_reconnect = ws_client;
+            let uid_reconnect = user_id.clone();
+            let wid_reconnect = workspace_id.clone();
+            leptos::task::spawn_local(async move {
+                if let Ok(token) = crate::server_fns::auth::get_ws_token().await {
+                    if !token.is_empty() {
+                        ws_for_reconnect.reconnect(&uid_reconnect, &wid_reconnect, &token);
+                    }
+                }
             });
         });
     }
@@ -224,9 +236,12 @@ fn Sidebar(
             </div>
 
             // Navigation
-            <nav class="flex-1 p-3 space-y-1">
-                <SidebarNavItem href="/issues" icon=phosphor_leptos::LIST_BULLETS label="Issues"/>
-                <SidebarNavItem href="/board" icon=phosphor_leptos::KANBAN label="Board"/>
+            <nav class="flex-1 p-3 space-y-1 overflow-y-auto">
+                <SidebarNavItem href="/my-issues" icon=phosphor_leptos::LIST_CHECKS label="My Issues"/>
+
+                <SidebarTeamsSection/>
+                <SidebarProjectsSection/>
+
                 <SidebarNavItem href="/settings" icon=phosphor_leptos::GEAR_SIX label="Settings"/>
             </nav>
 
@@ -351,6 +366,162 @@ fn WorkspaceSwitcher(set_user_menu_open: WriteSignal<bool>) -> impl IntoView {
                 }
             })}
         </Suspense>
+    }
+}
+
+/// Section header for "Teams" with dynamic team list from SyncStore.
+#[component]
+fn SidebarTeamsSection() -> impl IntoView {
+    let store = use_context::<SyncStore>();
+
+    view! {
+        {move || {
+            let Some(store) = store else { return view! { <span/> }.into_any() };
+            let teams = store.teams().get();
+            if teams.is_empty() {
+                return view! { <span/> }.into_any();
+            }
+            view! {
+                <SidebarSectionHeader label="Teams"/>
+                <div class="space-y-0.5">
+                    {teams.into_iter().map(|team| {
+                        let key = team.key.to_lowercase();
+                        let name = team.name.clone();
+                        let issues_href = format!("/teams/{key}/issues");
+                        let board_href = format!("/teams/{key}/board");
+                        view! {
+                            <SidebarTeamSubNav name=name issues_href=issues_href board_href=board_href/>
+                        }
+                    }).collect_view()}
+                </div>
+            }.into_any()
+        }}
+    }
+}
+
+/// Section header for "Projects" with dynamic project list from SyncStore.
+#[component]
+fn SidebarProjectsSection() -> impl IntoView {
+    let store = use_context::<SyncStore>();
+
+    view! {
+        {move || {
+            let Some(store) = store else { return view! { <span/> }.into_any() };
+            let projects = store.projects().get();
+            if projects.is_empty() {
+                return view! { <span/> }.into_any();
+            }
+            view! {
+                <SidebarSectionHeader label="Projects"/>
+                <div class="space-y-0.5">
+                    {projects.into_iter().map(|project| {
+                        let href = format!("/projects/{}", project.project_id);
+                        let name = project.name.clone();
+                        view! {
+                            <SidebarProjectItem href=href name=name/>
+                        }
+                    }).collect_view()}
+                </div>
+            }.into_any()
+        }}
+    }
+}
+
+/// A single project link in the sidebar with its own active-state tracking.
+#[component]
+fn SidebarProjectItem(
+    href: String,
+    name: String,
+) -> impl IntoView {
+    let path = leptos_router::hooks::use_location().pathname;
+    let href_match = href.clone();
+    let is_active = Signal::derive(move || {
+        path.get().starts_with(&href_match)
+    });
+    let weight = Signal::derive(move || {
+        if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
+    });
+    let class = move || {
+        let base = "flex items-center gap-3 px-3 py-1.5 rounded-md text-sm transition-colors";
+        if is_active.get() {
+            format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
+        } else {
+            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)]")
+        }
+    };
+    view! {
+        <a href=href class=class>
+            <Icon icon=phosphor_leptos::FOLDER weight=weight size="16px"/>
+            <span class="truncate">{name}</span>
+        </a>
+    }
+}
+
+/// Small, uppercase, muted section header (Linear-style).
+#[component]
+fn SidebarSectionHeader(label: &'static str) -> impl IntoView {
+    view! {
+        <div class="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
+            {label}
+        </div>
+    }
+}
+
+/// A team's sub-navigation: team name header + indented Issues/Board links.
+#[component]
+fn SidebarTeamSubNav(
+    name: String,
+    issues_href: String,
+    board_href: String,
+) -> impl IntoView {
+    let path = leptos_router::hooks::use_location().pathname;
+
+    let issues_href_match = issues_href.clone();
+    let issues_active = Signal::derive(move || path.get().starts_with(&issues_href_match));
+
+    let board_href_match = board_href.clone();
+    let board_active = Signal::derive(move || path.get().starts_with(&board_href_match));
+
+    view! {
+        <div class="mt-1">
+            // Team name header
+            <div class="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-[var(--color-sidebar-foreground)]">
+                <Icon icon=phosphor_leptos::USERS_THREE weight=IconWeight::Light size="16px"/>
+                <span class="truncate">{name}</span>
+            </div>
+            // Indented sub-items
+            <div class="ml-4">
+                <SidebarSubNavItem href=issues_href icon=phosphor_leptos::LIST_BULLETS label="Issues" is_active=issues_active/>
+                <SidebarSubNavItem href=board_href icon=phosphor_leptos::KANBAN label="Board" is_active=board_active/>
+            </div>
+        </div>
+    }
+}
+
+/// Indented sub-nav item used within team sections.
+#[component]
+fn SidebarSubNavItem(
+    href: String,
+    icon: phosphor_leptos::IconData,
+    label: &'static str,
+    is_active: Signal<bool>,
+) -> impl IntoView {
+    let weight = Signal::derive(move || {
+        if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
+    });
+    let class = move || {
+        let base = "flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-colors";
+        if is_active.get() {
+            format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
+        } else {
+            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)]")
+        }
+    };
+    view! {
+        <a href=href class=class>
+            <Icon icon=icon weight=weight size="14px"/>
+            {label}
+        </a>
     }
 }
 

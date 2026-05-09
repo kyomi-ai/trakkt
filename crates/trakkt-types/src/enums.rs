@@ -8,24 +8,24 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Issue lifecycle status.
+/// Status category — groups custom statuses into workflow stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum IssueStatus {
+pub enum StatusCategory {
     Backlog,
-    Todo,
-    InProgress,
-    Done,
+    Unstarted,
+    Started,
+    Completed,
     Cancelled,
 }
 
-impl IssueStatus {
-    pub fn all() -> &'static [IssueStatus] {
+impl StatusCategory {
+    pub fn all() -> &'static [StatusCategory] {
         &[
             Self::Backlog,
-            Self::Todo,
-            Self::InProgress,
-            Self::Done,
+            Self::Unstarted,
+            Self::Started,
+            Self::Completed,
             Self::Cancelled,
         ]
     }
@@ -33,15 +33,25 @@ impl IssueStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Backlog => "backlog",
-            Self::Todo => "todo",
-            Self::InProgress => "in_progress",
-            Self::Done => "done",
+            Self::Unstarted => "unstarted",
+            Self::Started => "started",
+            Self::Completed => "completed",
             Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn icon_name(&self) -> &'static str {
+        match self {
+            Self::Backlog => "status_backlog",
+            Self::Unstarted => "status_unstarted",
+            Self::Started => "status_started",
+            Self::Completed => "status_completed",
+            Self::Cancelled => "status_cancelled",
         }
     }
 }
 
-impl std::fmt::Display for IssueStatus {
+impl std::fmt::Display for StatusCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }

@@ -10,30 +10,30 @@
 //!
 //! Status icon colors per DESIGN.md:
 //! - Backlog:     text-muted-foreground (dashed circle)
-//! - Todo:        text-muted-foreground (empty circle)
-//! - In Progress: text-primary / teal   (half-filled circle)
-//! - Done:        text-primary / teal   (filled circle + checkmark)
+//! - Unstarted:   text-muted-foreground (empty circle)
+//! - Started:     text-primary / teal   (half-filled circle)
+//! - Completed:   text-primary / teal   (filled circle + checkmark)
 //! - Cancelled:   text-muted-foreground (circle + X)
 
 use leptos::prelude::*;
 
-/// Issue status variants matching the database `status` column values.
+/// Issue status variants matching `StatusCategory` values.
 #[derive(Clone, Copy, PartialEq)]
 pub enum IssueStatusVariant {
     Backlog,
-    Todo,
-    InProgress,
-    Done,
+    Unstarted,
+    Started,
+    Completed,
     Cancelled,
 }
 
 impl IssueStatusVariant {
-    /// Parse a database status string into a variant.
+    /// Parse a status category string into a variant.
     pub fn parse(s: &str) -> Self {
         match s {
-            "todo" => Self::Todo,
-            "in_progress" => Self::InProgress,
-            "done" => Self::Done,
+            "unstarted" => Self::Unstarted,
+            "started" => Self::Started,
+            "completed" => Self::Completed,
             "cancelled" => Self::Cancelled,
             _ => Self::Backlog,
         }
@@ -45,9 +45,9 @@ impl IssueStatusVariant {
             Self::Backlog => "text-muted-foreground",
             // DESIGN.md: --text-secondary (#6B6660). text-muted-foreground
             // maps to the same value today; update if tokens diverge.
-            Self::Todo => "text-muted-foreground",
-            Self::InProgress => "text-primary",
-            Self::Done => "text-primary",
+            Self::Unstarted => "text-muted-foreground",
+            Self::Started => "text-primary",
+            Self::Completed => "text-primary",
             Self::Cancelled => "text-muted-foreground",
         }
     }
@@ -56,9 +56,9 @@ impl IssueStatusVariant {
     fn label(self) -> &'static str {
         match self {
             Self::Backlog => "Backlog",
-            Self::Todo => "Todo",
-            Self::InProgress => "In Progress",
-            Self::Done => "Done",
+            Self::Unstarted => "Unstarted",
+            Self::Started => "Started",
+            Self::Completed => "Completed",
             Self::Cancelled => "Cancelled",
         }
     }
@@ -68,9 +68,9 @@ impl IssueStatusVariant {
 fn view_status_icon(variant: IssueStatusVariant, size: String) -> impl IntoView {
     match variant {
         IssueStatusVariant::Backlog => view_backlog(size).into_any(),
-        IssueStatusVariant::Todo => view_todo(size).into_any(),
-        IssueStatusVariant::InProgress => view_in_progress(size).into_any(),
-        IssueStatusVariant::Done => view_done(size).into_any(),
+        IssueStatusVariant::Unstarted => view_unstarted(size).into_any(),
+        IssueStatusVariant::Started => view_started(size).into_any(),
+        IssueStatusVariant::Completed => view_completed(size).into_any(),
         IssueStatusVariant::Cancelled => view_cancelled(size).into_any(),
     }
 }
@@ -90,8 +90,8 @@ fn view_backlog(size: String) -> impl IntoView {
     }
 }
 
-/// Todo: empty circle (stroke only).
-fn view_todo(size: String) -> impl IntoView {
+/// Unstarted: empty circle (stroke only).
+fn view_unstarted(size: String) -> impl IntoView {
     view! {
         <svg
             width=size.clone()
@@ -105,8 +105,8 @@ fn view_todo(size: String) -> impl IntoView {
     }
 }
 
-/// In Progress: half-filled circle (right half filled).
-fn view_in_progress(size: String) -> impl IntoView {
+/// Started: half-filled circle (right half filled).
+fn view_started(size: String) -> impl IntoView {
     view! {
         <svg
             width=size.clone()
@@ -121,8 +121,8 @@ fn view_in_progress(size: String) -> impl IntoView {
     }
 }
 
-/// Done: filled circle with white checkmark.
-fn view_done(size: String) -> impl IntoView {
+/// Completed: filled circle with white checkmark.
+fn view_completed(size: String) -> impl IntoView {
     view! {
         <svg
             width=size.clone()
