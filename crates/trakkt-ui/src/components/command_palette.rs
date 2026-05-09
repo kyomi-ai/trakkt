@@ -122,7 +122,7 @@ pub fn CommandPalette(
             if query.len() < 2 {
                 return Vec::new();
             }
-            list_issues(None, None, None, None, Some(query), Some(10), None)
+            list_issues(None, None, None, None, None, Some(query), Some(10), None)
                 .await
                 .unwrap_or_default()
         },

@@ -366,6 +366,7 @@ pub async fn get_issue(
 pub async fn list_issues(
     db: &DbPool,
     workspace_id: &str,
+    team_id: Option<&str>,
     filters: &IssueFilters,
 ) -> trakkt_core::Result<Vec<IssueWithDetails>> {
     let is_pg = db.is_postgres();
@@ -378,6 +379,11 @@ pub async fn list_issues(
     // We build the SQL string with numbered placeholders and bind values
     // dynamically via db_with_pool! below. Params are bound in the same
     // order as they appear in the SQL.
+
+    if team_id.is_some() {
+        conditions.push(format!("i.team_id = ${param_idx}"));
+        param_idx += 1;
+    }
 
     if filters.status_id.is_some() {
         conditions.push(format!("i.status_id = ${param_idx}"));
@@ -441,6 +447,9 @@ pub async fn list_issues(
         query = query.bind(workspace_id);
 
         // Bind remaining params in order of their slot assignment.
+        if let Some(ref v) = team_id {
+            query = query.bind(v);
+        }
         if let Some(ref v) = filters.status_id {
             query = query.bind(v);
         }

@@ -17,7 +17,7 @@ use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use wasm_bindgen::JsCast;
 
-use crate::components::{Avatar, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, Skeleton};
+use crate::components::{Alert, AlertVariant, Avatar, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, Skeleton};
 use crate::server_fns::issues::{list_issues, update_issue};
 use crate::server_fns::statuses::list_statuses;
 use trakkt_types::models::{IssueWithDetails, Status};
@@ -77,6 +77,10 @@ pub fn BoardPage() -> impl IntoView {
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
+    // ── Error state for server function failures ──────────────────────────
+    let issues_error = RwSignal::new(Option::<String>::None);
+    let statuses_error = RwSignal::new(Option::<String>::None);
+
     // ── Resolve team from SyncStore ────────────────────────────────────────
     let team_key_for_memo = team_key.clone();
     let team = Memo::new(move |_| {
@@ -87,7 +91,7 @@ pub fn BoardPage() -> impl IntoView {
 
     let server_issues = Resource::new(
         || (),
-        move |_| async move { list_issues(None, None, None, None, None, None, None).await },
+        move |_| async move { list_issues(None, None, None, None, None, None, None, None).await },
     );
 
     let all_issues = Memo::new(move |_| {
@@ -97,9 +101,17 @@ pub fn BoardPage() -> impl IntoView {
                 return items;
             }
         }
-        server_issues.get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
+        match server_issues.get() {
+            Some(Ok(items)) => {
+                issues_error.set(None);
+                items
+            }
+            Some(Err(e)) => {
+                issues_error.set(Some(format!("Failed to load issues: {e}")));
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
     });
 
     // Filter issues by team when a team is resolved.
@@ -119,9 +131,17 @@ pub fn BoardPage() -> impl IntoView {
     );
 
     let all_statuses = Memo::new(move |_| {
-        statuses_resource.get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
+        match statuses_resource.get() {
+            Some(Ok(items)) => {
+                statuses_error.set(None);
+                items
+            }
+            Some(Err(e)) => {
+                statuses_error.set(Some(format!("Failed to load statuses: {e}")));
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
     });
 
     // Filter statuses by team: show global (team_id=None) + team-specific.
@@ -203,6 +223,18 @@ pub fn BoardPage() -> impl IntoView {
                     }}
                 </h1>
             </div>
+
+            // ── Error alert ─────────────────────────────────────────────────
+            <Show when=move || issues_error.get().is_some() || statuses_error.get().is_some()>
+                <div class="mx-4 mt-4 space-y-2">
+                    {move || issues_error.get().map(|msg| view! {
+                        <Alert variant=AlertVariant::Error>{msg}</Alert>
+                    })}
+                    {move || statuses_error.get().map(|msg| view! {
+                        <Alert variant=AlertVariant::Error>{msg}</Alert>
+                    })}
+                </div>
+            </Show>
 
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-x-auto px-4 md:px-6 py-4" style="scrollbar-width: thin;">

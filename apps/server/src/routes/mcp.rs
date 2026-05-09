@@ -767,7 +767,8 @@ async fn tool_list_issues(
         offset: None,
     };
 
-    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, &filters).await?;
+    let team_id = args.get("team_id").and_then(|v| v.as_str());
+    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, team_id, &filters).await?;
     serde_json::to_string_pretty(&issues).map_err(trakkt_core::Error::from)
 }
 
@@ -987,7 +988,7 @@ async fn tool_search_issues(
         ..Default::default()
     };
 
-    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, &filters).await?;
+    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, None, &filters).await?;
     serde_json::to_string_pretty(&issues).map_err(trakkt_core::Error::from)
 }
 

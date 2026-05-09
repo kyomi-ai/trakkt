@@ -45,6 +45,7 @@ pub(crate) async fn resolve_issue_id(
 /// List issues in the current workspace with optional filters.
 #[server(prefix = "/leptos-api")]
 pub async fn list_issues(
+    team_id: Option<String>,
     status_id: Option<String>,
     priority: Option<i32>,
     assignee_id: Option<String>,
@@ -65,7 +66,7 @@ pub async fn list_issues(
         limit,
         offset,
     };
-    let issues = trakkt_auth::issue_service::list_issues(ac.db(), &ac.ws_id, &filters)
+    let issues = trakkt_auth::issue_service::list_issues(ac.db(), &ac.ws_id, team_id.as_deref(), &filters)
         .await
         .into_sfn()?;
     Ok(issues)

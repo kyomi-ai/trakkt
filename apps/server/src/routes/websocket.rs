@@ -328,7 +328,7 @@ async fn handle_sync_bootstrap(
     tracing::debug!(user_id, workspace_id, "Handling sync_bootstrap");
 
     // 1. Fetch all issues (empty filters = all issues).
-    let issues = trakkt_auth::issue_service::list_issues(db, workspace_id, &IssueFilters::default())
+    let issues = trakkt_auth::issue_service::list_issues(db, workspace_id, None, &IssueFilters::default())
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(user_id, workspace_id, error = %e, "list_issues failed during bootstrap");

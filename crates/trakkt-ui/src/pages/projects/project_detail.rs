@@ -54,7 +54,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
     let server_issues = Resource::new(
         || (),
         move |_| async move {
-            list_issues(None, None, None, None, None, None, None).await
+            list_issues(None, None, None, None, None, None, None, None).await
         },
     );
 
