@@ -7,7 +7,7 @@
 //! Configuration via environment variables:
 //! - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`
 //! - `SMTP_FROM_EMAIL` (default: `noreply@trakkt.app`)
-//! - `SMTP_FROM_NAME` (default: `Tane`)
+//! - `SMTP_FROM_NAME` (default: `Trakkt`)
 //!
 //! Graceful degradation: if SMTP is not configured, `send_email` logs a warning
 //! and returns `false` — it never fails the calling operation.
@@ -18,7 +18,7 @@ use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 
-/// Tane logo PNG, embedded at compile time.
+/// Trakkt logo PNG, embedded at compile time.
 static LOGO_BYTES: &[u8] =
     include_bytes!("../../../assets/trakkt_email_logo.png");
 
@@ -383,7 +383,7 @@ This invitation will expire in 7 days.
     ) -> bool {
         let display_name = if name.is_empty() { "there" } else { name };
         let frontend_url = &self.frontend_url;
-        let subject = "Recover your Tane account";
+        let subject = "Recover your Trakkt account";
 
         let escaped_frontend = html_escape(frontend_url);
         let escaped_name = html_escape(display_name);
@@ -456,7 +456,7 @@ You're receiving this email because you requested account recovery for Trakkt.
     ) -> bool {
         let display_name = if name.is_empty() { "there" } else { name };
         let frontend_url = &self.frontend_url;
-        let subject = "Recover your Tane account";
+        let subject = "Recover your Trakkt account";
 
         let escaped_frontend = html_escape(frontend_url);
         let escaped_name = html_escape(display_name);
@@ -529,7 +529,7 @@ You're receiving this email because you requested account recovery for Trakkt.
     ) -> bool {
         let display_name = if name.is_empty() { "there" } else { name };
         let frontend_url = &self.frontend_url;
-        let subject = "Verify your Tane account";
+        let subject = "Verify your Trakkt account";
 
         let escaped_frontend = html_escape(frontend_url);
         let escaped_name = html_escape(display_name);
@@ -608,12 +608,12 @@ You're receiving this because someone signed up for Trakkt with this email addre
 
         <p>Thanks for signing up! We're excited to have you on board.</p>
 
-        <p>Your team uses Tane to collaborate and get work done together.</p>
+        <p>Your team uses Trakkt to collaborate and get work done together.</p>
 
         <p>We'll keep you updated on new features and when your account is ready.</p>
 
         <div class="cta">
-            <a href="{frontend_url}" class="button">Visit Tane</a>
+            <a href="{frontend_url}" class="button">Visit Trakkt</a>
         </div>
 
         <p>Thanks,<br>The Trakkt Team</p>"#
@@ -621,7 +621,7 @@ You're receiving this because someone signed up for Trakkt with this email addre
 
         let footer_html = format!(
             r#"<p style="margin: 0 0 8px 0;">
-            You're receiving this because you signed up for updates from Tane.
+            You're receiving this because you signed up for updates from Trakkt.
         </p>
         <p style="margin: 0;">
             <a href="{frontend_url}/unsubscribe?email={escaped_email}">Unsubscribe</a> &middot;
@@ -637,17 +637,17 @@ Welcome to Trakkt!
 
 Thanks for signing up! We're excited to have you on board.
 
-Your team uses Tane to collaborate and get work done together.
+Your team uses Trakkt to collaborate and get work done together.
 
 We'll keep you updated on new features and when your account is ready.
 
-Visit Tane: {frontend_url}
+Visit Trakkt: {frontend_url}
 
 Thanks,
 The Trakkt Team
 
 ---
-You're receiving this because you signed up for updates from Tane.
+You're receiving this because you signed up for updates from Trakkt.
 Unsubscribe: {frontend_url}/unsubscribe?email={email}
 {frontend_url}
 ",
