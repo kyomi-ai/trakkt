@@ -193,7 +193,7 @@ pub fn BoardPage() -> impl IntoView {
             </div>
 
             // ── Content area ────────────────────────────────────────────────
-            <div class="flex-1 overflow-x-auto px-4 md:px-6 py-4">
+            <div class="flex-1 overflow-x-auto px-4 md:px-6 py-4" style="scrollbar-width: thin;">
                 <Transition fallback=move || view! { <BoardSkeleton/> }>
                     {move || {
                         let resource_state = issues_resource.get();
