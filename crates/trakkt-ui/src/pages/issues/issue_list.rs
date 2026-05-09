@@ -374,12 +374,9 @@ fn IssueRow(
 ) -> impl IntoView {
     let number = issue.number;
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
+    let issue_href = format!("/issues/{number}");
     let status = IssueStatusVariant::parse(&issue.status);
-    let row_ref = NodeRef::<leptos::html::Div>::new();
-    let go_to_issue = move || {
-        let nav = use_navigate();
-        nav(&format!("/issues/{number}"), Default::default());
-    };
+    let row_ref = NodeRef::<leptos::html::A>::new();
 
     let is_selected = Memo::new(move |_| selected_index.get() == Some(index));
 
@@ -394,24 +391,19 @@ fn IssueRow(
 
     let row_class = move || {
         if is_selected.get() {
-            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border bg-primary/5 ring-1 ring-primary/20 focus-visible:outline-none transition-colors cursor-pointer"
+            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border bg-primary/5 ring-1 ring-primary/20 focus-visible:outline-none transition-colors cursor-pointer no-underline text-inherit"
         } else {
-            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer"
+            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer no-underline text-inherit"
         }
     };
 
     view! {
-        <div
+        <a
             node_ref=row_ref
+            href=issue_href
             class=row_class
             role="listitem"
             tabindex="0"
-            on:click=move |_| go_to_issue()
-            on:keydown=move |ev: web_sys::KeyboardEvent| {
-                if ev.key() == "Enter" {
-                    go_to_issue();
-                }
-            }
         >
             // Priority icon (first — most important for triage scanning)
             <PriorityIndicator priority=issue.priority/>
@@ -457,7 +449,7 @@ fn IssueRow(
                     <span class="w-[18px] h-[18px] shrink-0"></span>
                 }.into_any()
             }}
-        </div>
+        </a>
     }
 }
 
