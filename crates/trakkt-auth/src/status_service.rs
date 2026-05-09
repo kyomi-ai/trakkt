@@ -193,7 +193,6 @@ pub async fn seed_default_statuses(
 
     let statuses: &[(&str, &str, &str, i32)] = &[
         ("backlog",      "Backlog",     "backlog",    0),
-        ("triage",       "Triage",      "backlog",    1),
         ("todo",         "Todo",        "unstarted",  0),
         ("in_progress",  "In Progress", "started",    0),
         ("done",         "Done",        "completed",  0),
