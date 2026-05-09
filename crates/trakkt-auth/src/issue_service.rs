@@ -219,6 +219,7 @@ pub async fn create_issue(
     // Atomic number generation: the subquery computes the next number inside the
     // INSERT statement so the MAX read and INSERT happen atomically, preventing
     // race conditions where concurrent creates read the same MAX.
+    let due_date_cast = if is_pg { "CAST($10 AS TIMESTAMPTZ)" } else { "$10" };
     let sql = format!(
         "INSERT INTO issues \
             (issue_id, workspace_id, team_id, number, title, description, \
@@ -226,7 +227,7 @@ pub async fn create_issue(
              project_id, milestone_id, created_at, updated_at) \
          VALUES ($1, $2, $3, \
                  (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE workspace_id = $2), \
-                 $4, $5, $6, $7, $8, $9, $10, $11, $12, {now}, {now})"
+                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, {now}, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -526,7 +527,11 @@ pub async fn update_issue(
     }
 
     if updates.due_date.is_some() {
-        set_parts.push(format!("due_date = ${param_idx}"));
+        if is_pg {
+            set_parts.push(format!("due_date = CAST(${param_idx} AS TIMESTAMPTZ)"));
+        } else {
+            set_parts.push(format!("due_date = ${param_idx}"));
+        }
         param_idx += 1;
     }
 
