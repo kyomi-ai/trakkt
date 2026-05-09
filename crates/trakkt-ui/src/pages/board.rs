@@ -150,6 +150,8 @@ pub fn BoardPage() -> impl IntoView {
                 None, // priority
                 None, // assignee_id
                 None, // due_date
+                None, // project_id
+                None, // milestone_id
             )
             .await
             {

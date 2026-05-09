@@ -14,25 +14,44 @@ use super::{AuthenticatedContext, IntoServerFnError};
 
 // ─── Read operations ───────────────────────────────────────────────────────
 
-/// List all labels in the current workspace.
+/// List labels in the current workspace.
+///
+/// If `team_id` is provided, returns workspace-level labels plus team-scoped
+/// labels for that team. If `None`, returns all labels in the workspace.
 #[server(prefix = "/leptos-api")]
-pub async fn list_labels() -> Result<Vec<Label>, ServerFnError> {
+pub async fn list_labels(team_id: Option<String>) -> Result<Vec<Label>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let labels = trakkt_auth::label_service::list_labels(ac.db(), &ac.ws_id)
-        .await
-        .into_sfn()?;
+    let labels = match team_id {
+        Some(ref tid) => {
+            trakkt_auth::label_service::list_labels_for_team(ac.db(), &ac.ws_id, tid)
+                .await
+                .into_sfn()?
+        }
+        None => {
+            trakkt_auth::label_service::list_labels(ac.db(), &ac.ws_id)
+                .await
+                .into_sfn()?
+        }
+    };
     Ok(labels)
 }
 
 // ─── Write operations ──────────────────────────────────────────────────────
 
-/// Create a new label in the current workspace.
+/// Create a new label in the current workspace, optionally scoped to a team.
 #[server(prefix = "/leptos-api")]
-pub async fn create_label(name: String, color: String) -> Result<Label, ServerFnError> {
+pub async fn create_label(name: String, color: String, team_id: Option<String>) -> Result<Label, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let label = trakkt_auth::label_service::create_label(ac.db(), &ac.ws_id, &name, &color, ac.ctx.ws_manager.as_ref())
-        .await
-        .into_sfn()?;
+    let label = trakkt_auth::label_service::create_label(
+        ac.db(),
+        &ac.ws_id,
+        &name,
+        &color,
+        team_id.as_deref(),
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(label)
 }
 

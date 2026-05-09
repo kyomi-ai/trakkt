@@ -17,6 +17,7 @@ pub mod notification_service;
 pub mod notifications;
 pub mod onboarding_service;
 pub mod password;
+pub mod project_service;
 pub mod rate_limiter;
 pub mod redis_ops;
 pub mod security_service;

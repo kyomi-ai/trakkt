@@ -684,6 +684,8 @@ async fn tool_create_issue(
         assignee_id: args.get("assignee").and_then(|v| v.as_str()).map(String::from),
         due_date: args.get("due_date").and_then(|v| v.as_str()).map(String::from),
         label_ids,
+        project_id: args.get("project_id").and_then(|v| v.as_str()).map(String::from),
+        milestone_id: args.get("milestone_id").and_then(|v| v.as_str()).map(String::from),
     };
 
     let issue = issue_service::create_issue(&state.db, &params, Some(&state.ws_manager)).await?;
@@ -711,6 +713,12 @@ async fn tool_update_issue(
             v.as_str().map(String::from)
         }),
         due_date: args.get("due_date").map(|v| {
+            v.as_str().map(String::from)
+        }),
+        project_id: args.get("project_id").map(|v| {
+            v.as_str().map(String::from)
+        }),
+        milestone_id: args.get("milestone_id").map(|v| {
             v.as_str().map(String::from)
         }),
     };
@@ -816,6 +824,7 @@ async fn tool_create_label(
         &auth.workspace_id,
         name,
         color,
+        None, // team_id — MCP creates workspace-scoped labels
         Some(&state.ws_manager),
     )
     .await?;

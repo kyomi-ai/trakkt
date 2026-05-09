@@ -666,7 +666,7 @@ fn NewIssueModal(
         set_error_msg.set(None);
 
         leptos::task::spawn_local(async move {
-            match create_issue(title_val, desc, prio, None, None, String::new()).await {
+            match create_issue(title_val, desc, prio, None, None, String::new(), None, None).await {
                 Ok(_) => {
                     set_submitting.set(false);
                     on_created.run(());

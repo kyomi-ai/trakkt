@@ -95,6 +95,8 @@ pub async fn create_issue(
     assignee_id: Option<String>,
     due_date: Option<String>,
     label_ids: String,
+    project_id: Option<String>,
+    milestone_id: Option<String>,
 ) -> Result<Issue, ServerFnError> {
     use trakkt_types::models::CreateIssueParams;
 
@@ -117,6 +119,8 @@ pub async fn create_issue(
         assignee_id,
         due_date,
         label_ids: parsed_label_ids,
+        project_id,
+        milestone_id,
     };
 
     let issue = trakkt_auth::issue_service::create_issue(ac.db(), &params, ac.ctx.ws_manager.as_ref())
@@ -142,6 +146,8 @@ pub async fn update_issue(
     priority: Option<i32>,
     assignee_id: Option<String>,
     due_date: Option<String>,
+    project_id: Option<String>,
+    milestone_id: Option<String>,
 ) -> Result<Issue, ServerFnError> {
     use trakkt_types::models::IssueUpdate;
 
@@ -153,6 +159,8 @@ pub async fn update_issue(
         priority,
         assignee_id: assignee_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         due_date: due_date.map(|s| if s.is_empty() { None } else { Some(s) }),
+        project_id: project_id.map(|s| if s.is_empty() { None } else { Some(s) }),
+        milestone_id: milestone_id.map(|s| if s.is_empty() { None } else { Some(s) }),
     };
     let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, number, &updates, ac.ctx.ws_manager.as_ref())
         .await

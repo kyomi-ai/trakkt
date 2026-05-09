@@ -326,6 +326,8 @@ fn EditableTitle(
                 None, // priority
                 None, // assignee_id
                 None, // due_date
+                None, // project_id
+                None, // milestone_id
             )
             .await;
             set_saving.set(false);
@@ -417,6 +419,8 @@ fn MetadataBar(
                 None, // priority
                 None, // assignee_id
                 None, // due_date
+                None, // project_id
+                None, // milestone_id
             )
             .await;
             on_change.run(());
@@ -435,6 +439,8 @@ fn MetadataBar(
                 Some(prio),
                 None, // assignee_id
                 None, // due_date
+                None, // project_id
+                None, // milestone_id
             )
             .await;
             on_change.run(());
@@ -550,6 +556,7 @@ fn MetadataBar(
             // ── Labels ─────────────────────────────────────────────────
             <LabelPicker
                 number=number
+                team_id=issue.team_id.clone()
                 current_labels=issue.labels.clone()
                 on_change=on_change
             />
@@ -578,6 +585,8 @@ fn MetadataBar(
 #[component]
 fn LabelPicker(
     number: i32,
+    /// The team_id of the issue, used to scope the label list.
+    team_id: String,
     current_labels: Vec<trakkt_types::models::Label>,
     on_change: Callback<()>,
 ) -> impl IntoView {
@@ -587,7 +596,11 @@ fn LabelPicker(
     );
     let current_display = RwSignal::new(current_labels);
 
-    let all_labels = LocalResource::new(list_labels);
+    let team_id_for_fetch = Some(team_id);
+    let all_labels = LocalResource::new(move || {
+        let tid = team_id_for_fetch.clone();
+        async move { list_labels(tid).await }
+    });
 
     let toggle_label = move |label: trakkt_types::models::Label| {
         let mut ids = current_ids.get_untracked();
@@ -739,6 +752,8 @@ fn DescriptionEditor(
                 None, // priority
                 None, // assignee_id
                 None, // due_date
+                None, // project_id
+                None, // milestone_id
             )
             .await;
             on_save.run(());

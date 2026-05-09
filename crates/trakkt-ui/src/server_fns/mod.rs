@@ -10,6 +10,7 @@ pub mod labels;
 pub mod notifications;
 pub mod ownership;
 pub mod profile;
+pub mod projects;
 pub mod security;
 pub mod sidebar;
 pub mod statuses;
