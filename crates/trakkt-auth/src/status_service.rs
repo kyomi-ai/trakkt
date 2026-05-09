@@ -66,7 +66,10 @@ pub async fn list_statuses(
                         CAST(created_at AS TEXT) AS created_at \
                  FROM statuses \
                  WHERE workspace_id = $1 AND (team_id IS NULL OR team_id = $2) \
-                 ORDER BY category, position",
+                 ORDER BY CASE category \
+                     WHEN 'backlog' THEN 0 WHEN 'unstarted' THEN 1 \
+                     WHEN 'started' THEN 2 WHEN 'completed' THEN 3 \
+                     WHEN 'cancelled' THEN 4 ELSE 5 END, position",
                 workspace_id,
                 tid
             )?
@@ -79,7 +82,10 @@ pub async fn list_statuses(
                         CAST(created_at AS TEXT) AS created_at \
                  FROM statuses \
                  WHERE workspace_id = $1 AND team_id IS NULL \
-                 ORDER BY category, position",
+                 ORDER BY CASE category \
+                     WHEN 'backlog' THEN 0 WHEN 'unstarted' THEN 1 \
+                     WHEN 'started' THEN 2 WHEN 'completed' THEN 3 \
+                     WHEN 'cancelled' THEN 4 ELSE 5 END, position",
                 workspace_id
             )?
         }
