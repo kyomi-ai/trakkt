@@ -2,3 +2,4 @@
 
 pub mod issue_detail;
 pub mod issue_list;
+pub mod my_issues;
