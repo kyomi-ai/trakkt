@@ -783,24 +783,43 @@ async fn register_client(
 
     let redirect_uris_json = json!(registration.redirect_uris);
     let scopes_json = json!(["mcp"]);
-    let new_id = uuid::Uuid::new_v4().to_string();
+    let new_id = uuid::Uuid::new_v4();
 
-    // Insert into database
+    // Insert into database — Postgres needs uuid type and jsonb; SQLite uses text.
     let is_pg = state.db.is_postgres();
     let bool_true = trakkt_core::sql_compat::bool_true(is_pg);
     let insert_sql = format!(
         "INSERT INTO oauth_clients (id, client_id, name, redirect_uris, scopes, client_type, active) \
          VALUES ($1, $2, $3, $4, $5, 'public', {bool_true})"
     );
-    trakkt_core::db_execute!(
-        &state.db,
-        &insert_sql,
-        &new_id,
-        &client_id,
-        &client_name,
-        &redirect_uris_json,
-        &scopes_json
-    )
+    let insert_result = match &state.db {
+        trakkt_core::DbPool::Postgres(pool) => {
+            sqlx::query(&insert_sql)
+                .bind(new_id)
+                .bind(&client_id)
+                .bind(&client_name)
+                .bind(&redirect_uris_json)
+                .bind(&scopes_json)
+                .execute(pool)
+                .await
+                .map(|_| ())
+        }
+        trakkt_core::DbPool::Sqlite(pool) => {
+            let id_str = new_id.to_string();
+            let redirect_str = serde_json::to_string(&redirect_uris_json).unwrap_or_default();
+            let scopes_str = serde_json::to_string(&scopes_json).unwrap_or_default();
+            sqlx::query(&insert_sql)
+                .bind(&id_str)
+                .bind(&client_id)
+                .bind(&client_name)
+                .bind(&redirect_str)
+                .bind(&scopes_str)
+                .execute(pool)
+                .await
+                .map(|_| ())
+        }
+    };
+    insert_result
     .map_err(|e| {
         tracing::error!(error = %e, "Failed to register OAuth client");
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
@@ -832,8 +851,8 @@ async fn lookup_active_client(
     let is_pg = state.db.is_postgres();
     let bool_true = trakkt_core::sql_compat::bool_true(is_pg);
     let select_sql = format!(
-        "SELECT id, client_id, client_secret_hash, name, redirect_uris, scopes, \
-                client_type, active, created_at \
+        "SELECT CAST(id AS TEXT) AS id, client_id, client_secret_hash, name, \
+                redirect_uris, scopes, client_type, active, created_at \
          FROM oauth_clients \
          WHERE client_id = $1 AND active = {bool_true}"
     );

@@ -324,8 +324,16 @@ async fn handle_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
-) -> impl IntoResponse {
+) -> Response {
     let is_initialize = request.method == "initialize";
+
+    // Authenticate all requests except `initialize` (which triggers the OAuth flow).
+    // In personal mode, bypass auth entirely.
+    if !is_initialize && request.method != "notifications/initialized" && !state.config.is_personal() {
+        if resolve_mcp_auth(&headers, &state).await.is_none() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
 
     let response = match request.method.as_str() {
         "initialize" => handle_initialize(request.id, request.params),
@@ -342,7 +350,6 @@ async fn handle_post(
     let mut resp_headers = HeaderMap::new();
 
     if is_initialize {
-        // Resolve workspace_id from auth if present, otherwise "anonymous".
         let workspace_id = match resolve_mcp_auth(&headers, &state).await {
             Some(auth) => auth.workspace_id,
             None => "anonymous".to_string(),
