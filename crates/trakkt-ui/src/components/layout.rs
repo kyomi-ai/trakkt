@@ -33,7 +33,7 @@ pub fn Layout() -> impl IntoView {
     let nav = leptos_router::hooks::use_navigate();
 
     Effect::new(move || {
-        match user_ctx.get() {
+        match user_info.get() {
             Some(Ok(_)) => auth_confirmed.set(true),
             Some(Err(_)) => {
                 nav("/login", Default::default());

@@ -122,6 +122,39 @@ spec:
                 configMapKeyRef:
                   name: trakkt-config
                   key: rust-log
+
+            # SMTP (AWS SES)
+            - name: SMTP_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: smtp-host
+            - name: SMTP_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: smtp-port
+            - name: SMTP_USER
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: smtp-user
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: smtp-password
+            - name: SMTP_FROM_EMAIL
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: smtp-from-email
+            - name: SMTP_FROM_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: smtp-from-name
+
             - name: TRUNK_DIST_DIR
               value: "/app/dist"
 

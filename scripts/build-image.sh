@@ -39,7 +39,7 @@ cd "$REPO_ROOT"
 
 echo ""
 echo "==> [3/3] Building Docker image..."
-docker build -t "$IMAGE_TAG" .
+docker build --build-arg PROFILE=release -t "$IMAGE_TAG" .
 
 echo ""
 echo "✅ Done! Image built: $IMAGE_TAG"

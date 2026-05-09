@@ -297,8 +297,14 @@ pub fn LoginPage(
                 Ok(LoginResult::Success { .. }) => {
                     #[cfg(target_arch = "wasm32")]
                     {
-                        let auth_version = leptos::prelude::expect_context::<RwSignal<u64>>();
-                        auth_version.update(|v| *v += 1);
+                        let dest = redirect_url();
+                        if dest.starts_with("/api/") {
+                            if let Some(window) = web_sys::window() {
+                                let _ = window.location().set_href(&dest);
+                            }
+                        } else {
+                            navigate.get_value()(&dest, Default::default());
+                        }
                     }
                 }
                 Ok(LoginResult::VerificationRequired { email }) => {
@@ -352,8 +358,14 @@ pub fn LoginPage(
                     Ok(LoginResult::Success { .. }) => {
                         #[cfg(target_arch = "wasm32")]
                         {
-                            let auth_version = leptos::prelude::expect_context::<RwSignal<u64>>();
-                            auth_version.update(|v| *v += 1);
+                            let dest = redirect_url();
+                            if dest.starts_with("/api/") {
+                                if let Some(window) = web_sys::window() {
+                                    let _ = window.location().set_href(&dest);
+                                }
+                            } else {
+                                navigate.get_value()(&dest, Default::default());
+                            }
                         }
                     }
                     Ok(LoginResult::TwoFactorRequired { email: user_email }) => {

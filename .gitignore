@@ -4,6 +4,7 @@
 *.swo
 .env
 .env.local
+deploy/k8s/01-secrets.yaml
 data/
 .gstack/
 .gstack-screenshots/

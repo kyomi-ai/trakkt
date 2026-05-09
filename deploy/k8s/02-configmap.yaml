@@ -27,8 +27,14 @@ data:
   webauthn-rp-id: "trakkt.app"
   webauthn-rp-name: "Trakkt"
 
+  # SMTP (AWS SES)
+  smtp-host: "email-smtp.us-west-2.amazonaws.com"
+  smtp-port: "465"
+  smtp-from-email: "noreply@trakkt.app"
+  smtp-from-name: "Trakkt"
+
   # Support email
-  support-email: "support@trakkt.local"
+  support-email: "support@trakkt.app"
 
   # Logging
   rust-log: "info"

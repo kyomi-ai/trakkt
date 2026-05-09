@@ -40,7 +40,7 @@ impl User {
 /// User auth method record from the `user_auth_methods` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct UserAuthMethod {
-    pub id: i64,
+    pub id: i32,
     pub user_id: String,
     pub auth_type: String,
     pub auth_data: serde_json::Value,
