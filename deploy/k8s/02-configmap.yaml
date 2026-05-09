@@ -5,7 +5,7 @@ metadata:
   namespace: trakkt
 data:
   # Deployment mode: personal, self_hosted, or saas
-  trakkt-mode: "self_hosted"
+  trakkt-mode: "saas"
 
   # Database configuration
   db-host: "postgres.trakkt.svc.cluster.local"
