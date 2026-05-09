@@ -37,6 +37,17 @@ pub async fn get_default_team() -> Result<Team, ServerFnError> {
     Ok(team)
 }
 
+/// Get an issue-tracker team by its short key (e.g. "ENG").
+#[server(prefix = "/leptos-api")]
+pub async fn get_team_by_key(key: String) -> Result<Team, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let team = trakkt_auth::team_service::get_team_by_key(ac.db(), &ac.ws_id, &key)
+        .await
+        .into_sfn()?
+        .ok_or_else(|| ServerFnError::new(format!("Team with key '{key}' not found")))?;
+    Ok(team)
+}
+
 // ─── Write operations ──────────────────────────────────────────────────────
 
 /// Create a new issue-tracker team in the current workspace.

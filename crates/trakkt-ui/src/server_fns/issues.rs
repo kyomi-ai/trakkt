@@ -83,7 +83,7 @@ pub async fn get_issue(number: i32) -> Result<Option<IssueWithDetails>, ServerFn
 
 // ─── Write operations ──────────────────────────────────────────────────────
 
-/// Create a new issue in the default team.
+/// Create a new issue in the specified team, or the default team if none given.
 ///
 /// `label_ids` is a comma-separated string of label UUIDs (per CODING_STANDARDS.md:
 /// never use `Vec<String>` as a server function parameter).
@@ -97,21 +97,28 @@ pub async fn create_issue(
     label_ids: String,
     project_id: Option<String>,
     milestone_id: Option<String>,
+    team_id: Option<String>,
 ) -> Result<Issue, ServerFnError> {
     use trakkt_types::models::CreateIssueParams;
 
     let ac = AuthenticatedContext::extract().await?;
 
-    // Get the default team for this workspace.
-    let team = trakkt_auth::team_service::get_default_team(ac.db(), &ac.ws_id)
-        .await
-        .into_sfn()?;
+    // Use the provided team_id, or fall back to the default team.
+    let resolved_team_id = match team_id {
+        Some(id) => id,
+        None => {
+            let team = trakkt_auth::team_service::get_default_team(ac.db(), &ac.ws_id)
+                .await
+                .into_sfn()?;
+            team.team_id
+        }
+    };
 
     let parsed_label_ids = parse_label_ids(&label_ids);
 
     let params = CreateIssueParams {
         workspace_id: ac.ws_id.clone(),
-        team_id: team.team_id,
+        team_id: resolved_team_id,
         creator_id: ac.auth.user_id.clone(),
         title,
         description,
