@@ -373,7 +373,7 @@ fn SidebarNavItem(
         if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
     });
     let class = move || {
-        let base = "flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors";
+        let base = "flex items-center gap-3 px-3 py-3 rounded-md text-sm transition-colors";
         if is_active.get() {
             format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
         } else {
