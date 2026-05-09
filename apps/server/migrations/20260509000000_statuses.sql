@@ -7,7 +7,7 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS public.statuses (
-    status_id character varying(50) NOT NULL,
+    status_id character varying(100) NOT NULL,
     workspace_id character varying(50) NOT NULL,
     team_id character varying(50),
     name character varying(100) NOT NULL,
@@ -43,7 +43,7 @@ END $$;
 -- 3. Add status_id column to issues (nullable for migration)
 -- ─────────────────────────────────────────────────────────────────────────────
 
-ALTER TABLE public.issues ADD COLUMN IF NOT EXISTS status_id character varying(50);
+ALTER TABLE public.issues ADD COLUMN IF NOT EXISTS status_id character varying(100);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 4. Seed global default statuses for every existing workspace
