@@ -91,19 +91,30 @@ pub fn Layout() -> impl IntoView {
                 }
             });
 
-            // 2. Connect WebSocket synchronously (in reactive context so
-            //    provide_context and on_cleanup work correctly).
-            //    Personal mode uses empty token; multi-user fetches a JWT
-            //    asynchronously and reconnects once it arrives.
+            // 2. Connect WebSocket — start with empty token (connects immediately
+            //    so provide_context works in the reactive scope). Then fetch a
+            //    JWT asynchronously and reconnect with it for multi-user mode.
             let ws_client = websocket::connect(&user_id, &workspace_id, "");
 
             sync_engine::start_sync_engine(&ws_client, &sync_store, &workspace_id);
 
             let ws_for_cleanup = ws_client.clone();
-            provide_context(ws_client);
+            provide_context(ws_client.clone());
 
             on_cleanup(move || {
                 websocket::disconnect(&ws_for_cleanup);
+            });
+
+            // Fetch JWT and reconnect with auth (multi-user mode only).
+            let ws_for_reconnect = ws_client;
+            let uid_reconnect = user_id.clone();
+            let wid_reconnect = workspace_id.clone();
+            leptos::task::spawn_local(async move {
+                if let Ok(token) = crate::server_fns::auth::get_ws_token().await {
+                    if !token.is_empty() {
+                        ws_for_reconnect.reconnect(&uid_reconnect, &wid_reconnect, &token);
+                    }
+                }
             });
         });
     }
