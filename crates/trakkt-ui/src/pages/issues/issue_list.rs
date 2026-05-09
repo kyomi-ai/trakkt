@@ -45,16 +45,15 @@ pub fn IssueListPage() -> impl IntoView {
     view! { <IssueListInner/> }
 }
 
-/// Team-scoped issue list page — accepts a team key from the parent route.
+/// Team-scoped issue list page — reads the `:key` route param internally.
 ///
 /// Filters issues, statuses, and new issue creation to the resolved team.
+/// Follows the same pattern as `ProjectDetailPage` and `IssueDetailPage`:
+/// page components own their param extraction rather than receiving props.
 #[component]
-pub fn IssueListForTeam(
-    /// Team key passed by the parent route (e.g. "eng" for the Engineering
-    /// team). Compared case-insensitively against `Team.key`.
-    #[prop(into)]
-    team_key: String,
-) -> impl IntoView {
+pub fn IssueListForTeam() -> impl IntoView {
+    let params = leptos_router::hooks::use_params_map();
+    let team_key = params.read().get("key").unwrap_or_default();
     view! { <IssueListInner team_key=team_key/> }
 }
 

@@ -23,8 +23,11 @@ use crate::pages::auth::{
 use crate::pages::accept_ownership::AcceptOwnershipPage;
 use crate::pages::board::BoardPage;
 use crate::pages::issues::issue_detail::IssueDetailPage;
-use crate::pages::issues::issue_list::IssueListPage;
+use crate::pages::issues::issue_list::IssueListForTeam;
+use crate::pages::issues::my_issues::MyIssuesPage;
 use crate::pages::onboarding::OnboardingPage;
+use crate::pages::projects::project_detail::ProjectDetailPage;
+use crate::pages::projects::project_list::ProjectListPage;
 use crate::pages::settings::{
     labels::LabelsPage,
     profile::ProfilePage,
@@ -97,13 +100,26 @@ pub fn App() -> impl IntoView {
 
                 // ── Authenticated routes (Layout provides sidebar + auth guard) ────
                 <ParentRoute path=path!("") view=Layout>
-                    <Route path=path!("/") view=|| view! { <Redirect path="/issues"/> }/>
+                    <Route path=path!("/") view=|| view! { <Redirect path="/my-issues"/> }/>
                     <Route path=path!("/onboarding") view=OnboardingPage/>
                     <Route path=path!("/accept-ownership/:transfer_id") view=AcceptOwnershipPage/>
 
-                    // Issue tracker
-                    <Route path=path!("/issues") view=IssueListPage/>
+                    // My Issues — cross-team view of issues assigned to the current user
+                    <Route path=path!("/my-issues") view=MyIssuesPage/>
+
+                    // Team-scoped views — components read :key from route params internally
+                    <Route path=path!("/teams/:key/issues") view=IssueListForTeam/>
+                    <Route path=path!("/teams/:key/board") view=BoardPage/>
+
+                    // Legacy /issues redirect — send to /my-issues
+                    <Route path=path!("/issues") view=|| view! { <Redirect path="/my-issues"/> }/>
                     <Route path=path!("/issues/:number") view=IssueDetailPage/>
+
+                    // Projects
+                    <Route path=path!("/projects") view=ProjectListPage/>
+                    <Route path=path!("/projects/:id") view=ProjectDetailPage/>
+
+                    // Global board (all issues, no team filter)
                     <Route path=path!("/board") view=|| view! { <BoardPage/> }/>
 
                     // Settings

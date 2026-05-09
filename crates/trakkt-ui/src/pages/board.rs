@@ -62,15 +62,18 @@ fn group_by_status(statuses: &[Status], all: &[IssueWithDetails]) -> Vec<(Status
 
 /// Kanban board page — issues arranged in status columns with drag-and-drop.
 ///
-/// When `team_key` is provided, the board is scoped to a single team:
-/// only that team's issues and applicable statuses (global + team-specific)
-/// are shown. When `None`, all workspace issues and statuses are shown.
+/// When mounted at `/teams/:key/board`, reads the `:key` route param to scope
+/// the board to a single team. When mounted at `/board` (no `:key` param),
+/// all workspace issues and statuses are shown.
 #[component]
-pub fn BoardPage(
-    /// Optional team key (lowercase from URL) to scope the board to a single team.
-    #[prop(optional, into)]
-    team_key: Option<String>,
-) -> impl IntoView {
+pub fn BoardPage() -> impl IntoView {
+    // If mounted under `/teams/:key/board`, read the team key from route params.
+    // At `/board` there is no `:key` param, so this yields None — global board.
+    let team_key = {
+        let params = leptos_router::hooks::use_params_map();
+        params.read().get("key")
+    };
+
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
