@@ -21,6 +21,19 @@ pub struct Team {
     pub created_at: String,
 }
 
+/// A first-class status with category grouping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Status {
+    pub status_id: String,
+    pub workspace_id: String,
+    pub team_id: Option<String>,
+    pub name: String,
+    pub category: String,
+    pub position: i32,
+    pub color: Option<String>,
+    pub created_at: String,
+}
+
 /// An issue (task / bug / story) within a team.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
@@ -30,7 +43,7 @@ pub struct Issue {
     pub number: i32,
     pub title: String,
     pub description: Option<String>,
-    pub status: String,
+    pub status_id: String,
     pub priority: i32,
     pub assignee_id: Option<String>,
     pub creator_id: String,
@@ -49,7 +62,9 @@ pub struct IssueWithDetails {
     pub number: i32,
     pub title: String,
     pub description: Option<String>,
-    pub status: String,
+    pub status_id: String,
+    pub status_name: String,
+    pub status_category: String,
     pub priority: i32,
     pub assignee_id: Option<String>,
     pub assignee_name: Option<String>,
@@ -102,7 +117,7 @@ pub struct Notification {
 /// Filter criteria for listing issues.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IssueFilters {
-    pub status: Option<String>,
+    pub status_id: Option<String>,
     pub priority: Option<i32>,
     pub assignee_id: Option<String>,
     pub label_id: Option<String>,
@@ -135,7 +150,7 @@ pub struct CreateIssueParams {
 pub struct IssueUpdate {
     pub title: Option<String>,
     pub description: Option<Option<String>>,
-    pub status: Option<String>,
+    pub status_id: Option<String>,
     pub priority: Option<i32>,
     pub assignee_id: Option<Option<String>>,
     pub due_date: Option<Option<String>>,

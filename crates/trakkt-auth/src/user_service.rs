@@ -259,6 +259,9 @@ pub async fn create_workspace_for_user(
         &team_id, &workspace_id
     )?;
 
+    // Seed default statuses so issues can use status_id FK.
+    crate::status_service::seed_default_statuses(pool, &workspace_id).await?;
+
     // Set as last workspace
     update_last_workspace(pool, user_id, &workspace_id).await?;
 

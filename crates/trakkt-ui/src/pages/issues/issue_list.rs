@@ -23,11 +23,12 @@ use wasm_bindgen::JsCast;
 
 use crate::components::{
     Avatar, Button, ButtonVariant, EmptyState, IssueStatusBadge, IssueStatusVariant,
-    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton, StyledSelect,
+    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, StyledSelect,
     DropdownTrigger, DropdownMenu, DropdownItem,
     INPUT_CLASS,
 };
 use crate::server_fns::issues::{create_issue, list_issues};
+use crate::server_fns::statuses::list_statuses;
 use trakkt_types::models::IssueWithDetails;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -135,7 +136,7 @@ pub fn IssueListPage() -> impl IntoView {
 
         raw.into_iter()
             .filter(|issue| {
-                if !status_val.is_empty() && issue.status != status_val {
+                if !status_val.is_empty() && issue.status_id != status_val {
                     return false;
                 }
                 if !priority_val.is_empty() {
@@ -352,7 +353,7 @@ fn IssueRow(
     let number = issue.number;
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
     let issue_href = format!("/issues/{number}");
-    let status = IssueStatusVariant::parse(&issue.status);
+    let status = IssueStatusVariant::parse(&issue.status_category);
     let row_ref = NodeRef::<leptos::html::A>::new();
 
     let is_selected = Memo::new(move |_| selected_index.get() == Some(index));
@@ -431,39 +432,6 @@ fn IssueRow(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Loading Skeleton
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Six skeleton rows matching the issue row shape for the loading state.
-///
-/// DESIGN.md Loading State Pattern: "Content-shaped Skeleton rectangles".
-#[component]
-fn IssueListSkeleton() -> impl IntoView {
-    let rows = (0..6).map(|_| {
-        view! {
-            <div class="h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border">
-                // Priority icon placeholder
-                <Skeleton class="w-3.5 h-3.5 rounded-[2px]"/>
-                // Status icon placeholder
-                <Skeleton class="w-3.5 h-3.5 rounded-full"/>
-                // Issue number placeholder
-                <Skeleton class="w-14 h-4"/>
-                // Title placeholder
-                <Skeleton class="flex-1 h-4 max-w-md"/>
-                // Label placeholder
-                <Skeleton class="hidden sm:block w-12 h-5 rounded-sm"/>
-                // Date placeholder
-                <Skeleton class="hidden sm:block w-10 h-3"/>
-                // Avatar placeholder
-                <Skeleton class="w-[18px] h-[18px] rounded-full"/>
-            </div>
-        }
-    }).collect_view();
-
-    view! { <div>{rows}</div> }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Filter Dropdowns (DESIGN.md § Dropdowns)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -475,36 +443,45 @@ fn StatusFilterDropdown(
     let (open, set_open) = signal(false);
     let trigger_ref = NodeRef::<leptos::html::Div>::new();
 
-    let statuses: Vec<(&str, &str, IssueStatusVariant)> = vec![
-        ("backlog", "Backlog", IssueStatusVariant::Backlog),
-        ("todo", "Todo", IssueStatusVariant::Todo),
-        ("in_progress", "In Progress", IssueStatusVariant::InProgress),
-        ("done", "Done", IssueStatusVariant::Done),
-        ("cancelled", "Cancelled", IssueStatusVariant::Cancelled),
-    ];
+    // Fetch statuses dynamically from the server.
+    let statuses_resource = Resource::new(
+        || (),
+        move |_| async move { list_statuses(None).await },
+    );
 
+    // Resolved statuses — empty until loaded.
+    let statuses = Memo::new(move |_| {
+        statuses_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+    });
+
+    // Display name for the current selection (looked up from loaded statuses).
     let display = Memo::new(move |_| {
         let v = value.get();
-        if v.is_empty() { None } else {
-            match v.as_str() {
-                "backlog" => Some("Backlog".to_string()),
-                "todo" => Some("Todo".to_string()),
-                "in_progress" => Some("In Progress".to_string()),
-                "done" => Some("Done".to_string()),
-                "cancelled" => Some("Cancelled".to_string()),
-                _ => None,
-            }
+        if v.is_empty() {
+            None
+        } else {
+            statuses
+                .get()
+                .iter()
+                .find(|s| s.status_id == v)
+                .map(|s| s.name.clone())
         }
     });
 
+    // Icon variant for the current selection.
     let current_variant = Memo::new(move |_| {
-        match value.get().as_str() {
-            "backlog" => Some(IssueStatusVariant::Backlog),
-            "todo" => Some(IssueStatusVariant::Todo),
-            "in_progress" => Some(IssueStatusVariant::InProgress),
-            "done" => Some(IssueStatusVariant::Done),
-            "cancelled" => Some(IssueStatusVariant::Cancelled),
-            _ => None,
+        let v = value.get();
+        if v.is_empty() {
+            None
+        } else {
+            statuses
+                .get()
+                .iter()
+                .find(|s| s.status_id == v)
+                .map(|s| IssueStatusVariant::parse(&s.category))
         }
     });
 
@@ -535,19 +512,19 @@ fn StatusFilterDropdown(
                     move |()| { on_change.run(String::new()); set_open.set(false); }
                 })
             />
-            {statuses.iter().map(|(key, label, variant)| {
-                let key_owned = key.to_string();
-                let key_check = key.to_string();
-                let label = label.to_string();
-                let variant = *variant;
+            {move || statuses.get().into_iter().map(|status| {
+                let status_id = status.status_id.clone();
+                let status_id_check = status.status_id.clone();
+                let label = status.name.clone();
+                let variant = IssueStatusVariant::parse(&status.category);
                 view! {
                     <DropdownItem
                         label=label
-                        selected=Signal::derive(move || value.get() == key_check)
+                        selected=Signal::derive(move || value.get() == status_id_check)
                         on_select=Callback::new({
                             let on_change = on_change.clone();
-                            let k = key_owned.clone();
-                            move |()| { on_change.run(k.clone()); set_open.set(false); }
+                            let id = status_id.clone();
+                            move |()| { on_change.run(id.clone()); set_open.set(false); }
                         })
                         icon=Arc::new(move || view! { <IssueStatusBadge status=variant size=14/> }.into_any()) as ChildrenFn
                     />

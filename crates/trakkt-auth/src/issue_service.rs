@@ -26,7 +26,7 @@ struct IssueRow {
     number: i32,
     title: String,
     description: Option<String>,
-    status: String,
+    status_id: String,
     priority: i32,
     assignee_id: Option<String>,
     creator_id: String,
@@ -44,7 +44,7 @@ impl IssueRow {
             number: self.number,
             title: self.title,
             description: self.description,
-            status: self.status,
+            status_id: self.status_id,
             priority: self.priority,
             assignee_id: self.assignee_id,
             creator_id: self.creator_id,
@@ -65,7 +65,9 @@ struct IssueDetailRow {
     number: i32,
     title: String,
     description: Option<String>,
-    status: String,
+    status_id: String,
+    status_name: String,
+    status_category: String,
     priority: i32,
     assignee_id: Option<String>,
     assignee_name: Option<String>,
@@ -86,7 +88,9 @@ impl IssueDetailRow {
             number: self.number,
             title: self.title,
             description: self.description,
-            status: self.status,
+            status_id: self.status_id,
+            status_name: self.status_name,
+            status_category: self.status_category,
             priority: self.priority,
             assignee_id: self.assignee_id,
             assignee_name: self.assignee_name,
@@ -105,7 +109,9 @@ impl IssueDetailRow {
 /// Base SELECT for issue detail queries with JOINs to teams and users.
 const ISSUE_DETAIL_SELECT: &str = "\
     SELECT i.issue_id, i.workspace_id, i.team_id, t.key AS team_key, \
-           i.number, i.title, i.description, i.status, i.priority, \
+           i.number, i.title, i.description, i.status_id, \
+           s.name AS status_name, s.category AS status_category, \
+           i.priority, \
            i.assignee_id, assignee.name AS assignee_name, \
            i.creator_id, creator.name AS creator_name, \
            CAST(i.due_date AS TEXT) AS due_date, \
@@ -113,6 +119,7 @@ const ISSUE_DETAIL_SELECT: &str = "\
            CAST(i.updated_at AS TEXT) AS updated_at \
     FROM issues i \
     JOIN teams t ON t.team_id = i.team_id \
+    JOIN statuses s ON s.status_id = i.status_id \
     LEFT JOIN users assignee ON assignee.user_id = i.assignee_id \
     JOIN users creator ON creator.user_id = i.creator_id";
 
@@ -192,16 +199,19 @@ pub async fn create_issue(
     let now = sql_compat::now(is_pg);
     let issue_id = uuid::Uuid::new_v4().to_string();
 
+    // Look up the default status for this workspace.
+    let default_status = crate::status_service::get_default_status(db, &params.workspace_id).await?;
+
     // Atomic number generation: the subquery computes the next number inside the
     // INSERT statement so the MAX read and INSERT happen atomically, preventing
     // race conditions where concurrent creates read the same MAX.
     let sql = format!(
         "INSERT INTO issues \
             (issue_id, workspace_id, team_id, number, title, description, \
-             status, priority, assignee_id, creator_id, due_date, created_at, updated_at) \
+             status_id, priority, assignee_id, creator_id, due_date, created_at, updated_at) \
          VALUES ($1, $2, $3, \
                  (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE workspace_id = $2), \
-                 $4, $5, 'backlog', $6, $7, $8, $9, {now}, {now})"
+                 $4, $5, $6, $7, $8, $9, $10, {now}, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -211,6 +221,7 @@ pub async fn create_issue(
         &params.team_id,
         &params.title,
         params.description.as_deref(),
+        &default_status.status_id,
         params.priority,
         params.assignee_id.as_deref(),
         &params.creator_id,
@@ -261,7 +272,7 @@ pub async fn create_issue(
         db,
         IssueRow,
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
-                status, priority, assignee_id, creator_id, \
+                status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
@@ -349,8 +360,8 @@ pub async fn list_issues(
     // dynamically via db_with_pool! below. Params are bound in the same
     // order as they appear in the SQL.
 
-    if filters.status.is_some() {
-        conditions.push(format!("i.status = ${param_idx}"));
+    if filters.status_id.is_some() {
+        conditions.push(format!("i.status_id = ${param_idx}"));
         param_idx += 1;
     }
 
@@ -411,7 +422,7 @@ pub async fn list_issues(
         query = query.bind(workspace_id);
 
         // Bind remaining params in order of their slot assignment.
-        if let Some(ref v) = filters.status {
+        if let Some(ref v) = filters.status_id {
             query = query.bind(v);
         }
         if let Some(v) = filters.priority {
@@ -476,8 +487,8 @@ pub async fn update_issue(
         param_idx += 1;
     }
 
-    if updates.status.is_some() {
-        set_parts.push(format!("status = ${param_idx}"));
+    if updates.status_id.is_some() {
+        set_parts.push(format!("status_id = ${param_idx}"));
         param_idx += 1;
     }
 
@@ -526,7 +537,7 @@ pub async fn update_issue(
             // Double-Option: bind the inner Option (None = NULL, Some = value)
             query = query.bind(v.as_deref());
         }
-        if let Some(ref v) = updates.status {
+        if let Some(ref v) = updates.status_id {
             query = query.bind(v);
         }
         if let Some(v) = updates.priority {
@@ -556,7 +567,7 @@ pub async fn update_issue(
         db,
         IssueRow,
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
-                status, priority, assignee_id, creator_id, \
+                status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
@@ -612,7 +623,7 @@ pub async fn delete_issue(
         db,
         IssueRow,
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
-                status, priority, assignee_id, creator_id, \
+                status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \

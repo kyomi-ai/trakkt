@@ -21,6 +21,7 @@ pub mod rate_limiter;
 pub mod redis_ops;
 pub mod security_service;
 pub mod session;
+pub mod status_service;
 pub mod sync_log_service;
 pub mod team_service;
 pub mod token_refresh;

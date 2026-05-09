@@ -14,7 +14,7 @@
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
-use trakkt_types::models::{IssueWithDetails, Label};
+use trakkt_types::models::{IssueWithDetails, Label, Status};
 
 // ── Inner storage ─────────────────────────────────────────────────────────────
 
@@ -26,6 +26,7 @@ use trakkt_types::models::{IssueWithDetails, Label};
 struct SyncStoreInner {
     issues: ArcRwSignal<Vec<IssueWithDetails>>,
     labels: ArcRwSignal<Vec<Label>>,
+    statuses: ArcRwSignal<Vec<Status>>,
     initialized: ArcRwSignal<bool>,
 }
 
@@ -58,6 +59,7 @@ impl SyncStore {
             inner: StoredValue::new(SendWrapper::new(SyncStoreInner {
                 issues: ArcRwSignal::new(Vec::new()),
                 labels: ArcRwSignal::new(Vec::new()),
+                statuses: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
             })),
         }
@@ -74,6 +76,12 @@ impl SyncStore {
     /// Reactive signal over the current label list.
     pub fn labels(&self) -> Signal<Vec<Label>> {
         let sig = self.inner.with_value(|inner| inner.labels.clone());
+        Signal::derive(move || sig.get())
+    }
+
+    /// Reactive signal over the current status list.
+    pub fn statuses(&self) -> Signal<Vec<Status>> {
+        let sig = self.inner.with_value(|inner| inner.statuses.clone());
         Signal::derive(move || sig.get())
     }
 
@@ -96,6 +104,11 @@ impl SyncStore {
     /// Replace the entire label list (called during IDB hydration).
     pub fn set_labels(&self, items: Vec<Label>) {
         self.inner.with_value(|inner| inner.labels.set(items));
+    }
+
+    /// Replace the entire status list (called during IDB hydration).
+    pub fn set_statuses(&self, items: Vec<Status>) {
+        self.inner.with_value(|inner| inner.statuses.set(items));
     }
 
     // ── Single-item upserts (live sync) ───────────────────────────────────────
@@ -126,6 +139,19 @@ impl SyncStore {
         });
     }
 
+    /// Insert or update a status by `status_id`.
+    pub fn upsert_status(&self, item: Status) {
+        self.inner.with_value(|inner| {
+            inner.statuses.update(|list| {
+                if let Some(existing) = list.iter_mut().find(|s| s.status_id == item.status_id) {
+                    *existing = item;
+                } else {
+                    list.push(item);
+                }
+            });
+        });
+    }
+
     // ── Single-item removes (delete sync) ────────────────────────────────────
 
     /// Remove an issue by `issue_id`.
@@ -142,6 +168,15 @@ impl SyncStore {
         self.inner.with_value(|inner| {
             inner.labels.update(|list| {
                 list.retain(|l| l.label_id != label_id);
+            });
+        });
+    }
+
+    /// Remove a status by `status_id`.
+    pub fn remove_status(&self, status_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.statuses.update(|list| {
+                list.retain(|s| s.status_id != status_id);
             });
         });
     }
@@ -165,6 +200,7 @@ impl SyncStore {
         self.inner.with_value(|inner| {
             inner.issues.set(Vec::new());
             inner.labels.set(Vec::new());
+            inner.statuses.set(Vec::new());
             inner.initialized.set(false);
         });
     }

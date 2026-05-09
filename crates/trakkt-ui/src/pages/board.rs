@@ -19,50 +19,8 @@ use wasm_bindgen::JsCast;
 
 use crate::components::{Avatar, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, Skeleton};
 use crate::server_fns::issues::{list_issues, update_issue};
-use trakkt_types::models::IssueWithDetails;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// All status columns in display order.
-const STATUS_COLUMNS: [StatusColumn; 5] = [
-    StatusColumn {
-        key: "backlog",
-        label: "Backlog",
-        variant: IssueStatusVariant::Backlog,
-    },
-    StatusColumn {
-        key: "todo",
-        label: "Todo",
-        variant: IssueStatusVariant::Todo,
-    },
-    StatusColumn {
-        key: "in_progress",
-        label: "In Progress",
-        variant: IssueStatusVariant::InProgress,
-    },
-    StatusColumn {
-        key: "done",
-        label: "Done",
-        variant: IssueStatusVariant::Done,
-    },
-    StatusColumn {
-        key: "cancelled",
-        label: "Cancelled",
-        variant: IssueStatusVariant::Cancelled,
-    },
-];
-
-/// Metadata for a single Kanban column.
-struct StatusColumn {
-    /// Database status value (e.g. "backlog", "in_progress").
-    key: &'static str,
-    /// Human-readable label (e.g. "In Progress").
-    label: &'static str,
-    /// Status variant for color derivation (single source of truth).
-    variant: IssueStatusVariant,
-}
+use crate::server_fns::statuses::list_statuses;
+use trakkt_types::models::{IssueWithDetails, Status};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -79,18 +37,21 @@ fn sort_column_issues(issues: &mut [IssueWithDetails]) {
     });
 }
 
-/// Group a flat list of issues into per-status vectors, sorted.
-fn group_by_status(all: &[IssueWithDetails]) -> Vec<(&'static StatusColumn, Vec<IssueWithDetails>)> {
-    STATUS_COLUMNS
+/// Group a flat list of issues into per-status columns, sorted.
+///
+/// Columns are ordered by the `statuses` list (server returns them ordered by
+/// category then position). Issues are grouped by `status_id`.
+fn group_by_status(statuses: &[Status], all: &[IssueWithDetails]) -> Vec<(Status, Vec<IssueWithDetails>)> {
+    statuses
         .iter()
-        .map(|col| {
+        .map(|status| {
             let mut col_issues: Vec<IssueWithDetails> = all
                 .iter()
-                .filter(|i| i.status == col.key)
+                .filter(|i| i.status_id == status.status_id)
                 .cloned()
                 .collect();
             sort_column_issues(&mut col_issues);
-            (col, col_issues)
+            (status.clone(), col_issues)
         })
         .collect()
 }
@@ -110,10 +71,16 @@ pub fn BoardPage() -> impl IntoView {
         move |_| async move { list_issues(None, None, None, None, None, None, None).await },
     );
 
+    // Fetch statuses once (no team filter — show all workspace statuses).
+    let statuses_resource = Resource::new(
+        || (),
+        move |_| async move { list_statuses(None).await },
+    );
+
     // ── Drag state ──────────────────────────────────────────────────────────
     // The issue_id of the card currently being dragged.
     let (dragging, set_dragging) = signal(Option::<String>::None);
-    // The status key of the column currently being dragged over.
+    // The status_id of the column currently being dragged over.
     let (drag_target, set_drag_target) = signal(Option::<String>::None);
 
     // ── Local issues for optimistic updates ─────────────────────────────────
@@ -128,9 +95,18 @@ pub fn BoardPage() -> impl IntoView {
         }
     });
 
+    // ── Resolved statuses (for grouping) ────────────────────────────────────
+    let (local_statuses, set_local_statuses) = signal(Vec::<Status>::new());
+
+    Effect::new(move || {
+        if let Some(Ok(ref list)) = statuses_resource.get() {
+            set_local_statuses.set(list.clone());
+        }
+    });
+
     // ── Drop handler ────────────────────────────────────────────────────────
-    let handle_drop = move |issue_id: String, target_status: String| {
-        // Find the issue and its current status.
+    let handle_drop = move |issue_id: String, target_status_id: String| {
+        // Find the issue and its current status_id.
         let current_issues = local_issues.get_untracked();
         let issue = current_issues.iter().find(|i| i.issue_id == issue_id);
         let issue = match issue {
@@ -139,28 +115,38 @@ pub fn BoardPage() -> impl IntoView {
         };
 
         // Same-column drop is a no-op.
-        if issue.status == target_status {
+        if issue.status_id == target_status_id {
             return;
         }
 
-        let old_status = issue.status.clone();
+        let old_status_id = issue.status_id.clone();
+        let old_status_name = issue.status_name.clone();
+        let old_status_category = issue.status_category.clone();
         let issue_number = issue.number;
+
+        // Look up the target status to update display fields optimistically.
+        let statuses = local_statuses.get_untracked();
+        let target_status = statuses.iter().find(|s| s.status_id == target_status_id);
+        let target_name = target_status.map(|s| s.name.clone()).unwrap_or_default();
+        let target_category = target_status.map(|s| s.category.clone()).unwrap_or_default();
 
         // Optimistic update: move card to new column immediately.
         set_local_issues.update(|issues| {
             if let Some(i) = issues.iter_mut().find(|i| i.issue_id == issue_id) {
-                i.status = target_status.clone();
+                i.status_id = target_status_id.clone();
+                i.status_name = target_name;
+                i.status_category = target_category;
             }
         });
 
         // Server update.
-        let target_status_for_server = target_status.clone();
+        let target_id_for_server = target_status_id.clone();
         leptos::task::spawn_local(async move {
             match update_issue(
                 issue_number,
                 None, // title
                 None, // description
-                Some(target_status_for_server),
+                Some(target_id_for_server),
                 None, // priority
                 None, // assignee_id
                 None, // due_date
@@ -176,7 +162,9 @@ pub fn BoardPage() -> impl IntoView {
                     tracing::warn!("Failed to update issue status: {e}");
                     set_local_issues.update(|issues| {
                         if let Some(i) = issues.iter_mut().find(|i| i.issue_id == issue_id) {
-                            i.status = old_status;
+                            i.status_id = old_status_id;
+                            i.status_name = old_status_name;
+                            i.status_category = old_status_category;
                         }
                     });
                 }
@@ -196,36 +184,37 @@ pub fn BoardPage() -> impl IntoView {
             <div class="flex-1 overflow-x-auto px-4 md:px-6 py-4" style="scrollbar-width: thin;">
                 <Transition fallback=move || view! { <BoardSkeleton/> }>
                     {move || {
-                        let resource_state = issues_resource.get();
-                        match resource_state {
-                            None => {
+                        let issues_state = issues_resource.get();
+                        let statuses_state = statuses_resource.get();
+                        match (issues_state, statuses_state) {
+                            (None, _) | (_, None) => {
                                 // Still loading — show skeleton.
                                 view! { <BoardSkeleton/> }.into_any()
                             }
-                            Some(Err(_)) => {
+                            (Some(Err(_)), _) | (_, Some(Err(_))) => {
                                 view! {
                                     <div class="flex items-center justify-center h-full text-muted-foreground">
                                         "Failed to load board. Please try again."
                                     </div>
                                 }.into_any()
                             }
-                            Some(Ok(_)) => {
-                                // Use local_issues for rendering (supports optimistic updates).
-                                let grouped = move || group_by_status(&local_issues.get());
+                            (Some(Ok(_)), Some(Ok(_))) => {
+                                // Use local signals for rendering (supports optimistic updates).
+                                let grouped = move || group_by_status(&local_statuses.get(), &local_issues.get());
 
                                 view! {
                                     <div class="flex gap-4 h-full">
-                                        {move || grouped().into_iter().map(|(col, issues)| {
-                                            let col_key = col.key;
-                                            let col_label = col.label;
-                                            let col_variant = col.variant;
+                                        {move || grouped().into_iter().map(|(status, issues)| {
+                                            let status_id = status.status_id.clone();
+                                            let status_name = status.name.clone();
+                                            let status_variant = IssueStatusVariant::parse(&status.category);
                                             let count = issues.len();
 
                                             view! {
                                                 <BoardColumn
-                                                    status_key=col_key
-                                                    label=col_label
-                                                    status_variant=col_variant
+                                                    status_id=status_id
+                                                    label=status_name
+                                                    status_variant=status_variant
                                                     count=count
                                                     issues=issues
                                                     dragging=dragging
@@ -258,10 +247,10 @@ pub fn BoardPage() -> impl IntoView {
 /// - Cards container: scrollable, flex-col gap-2
 #[component]
 fn BoardColumn(
-    /// Database status key (e.g. "in_progress").
-    status_key: &'static str,
+    /// The status_id for this column (used for drag-drop targeting).
+    status_id: String,
     /// Human-readable label (e.g. "In Progress").
-    label: &'static str,
+    label: String,
     /// Status variant for the SVG icon in the column header.
     status_variant: IssueStatusVariant,
     /// Number of issues in this column.
@@ -272,7 +261,7 @@ fn BoardColumn(
     dragging: ReadSignal<Option<String>>,
     /// Setter for the dragging signal.
     set_dragging: WriteSignal<Option<String>>,
-    /// Signal: which column key is the current drag target.
+    /// Signal: which status_id is the current drag target.
     drag_target: ReadSignal<Option<String>>,
     /// Setter for the drag target signal.
     set_drag_target: WriteSignal<Option<String>>,
@@ -280,14 +269,13 @@ fn BoardColumn(
     #[prop(into)]
     on_drop: Callback<(String, String)>,
 ) -> impl IntoView {
-    let status_key_owned = status_key.to_string();
-    let status_key_for_over = status_key_owned.clone();
-    let status_key_for_drop = status_key_owned.clone();
-    let status_key_for_class = status_key_owned.clone();
+    let status_id_for_over = status_id.clone();
+    let status_id_for_drop = status_id.clone();
+    let status_id_for_class = status_id.clone();
 
     // Determine if this column is the active drop target.
     let is_drop_target = move || {
-        drag_target.get().as_deref() == Some(status_key_for_class.as_str())
+        drag_target.get().as_deref() == Some(status_id_for_class.as_str())
     };
 
     let column_class = move || {
@@ -304,7 +292,7 @@ fn BoardColumn(
             class=column_class
             on:dragover=move |ev: web_sys::DragEvent| {
                 ev.prevent_default();
-                set_drag_target.set(Some(status_key_for_over.clone()));
+                set_drag_target.set(Some(status_id_for_over.clone()));
             }
             on:dragleave=move |ev: web_sys::DragEvent| {
                 let should_clear = match (ev.current_target(), ev.related_target()) {
@@ -324,14 +312,14 @@ fn BoardColumn(
                 }
             }
             on:drop={
-                let status_key_drop = status_key_for_drop.clone();
+                let status_id_drop = status_id_for_drop.clone();
                 move |ev: web_sys::DragEvent| {
                     ev.prevent_default();
                     if let Some(dt) = ev.data_transfer()
                         && let Ok(issue_id) = dt.get_data("text/plain")
                         && !issue_id.is_empty()
                     {
-                        on_drop.run((issue_id, status_key_drop.clone()));
+                        on_drop.run((issue_id, status_id_drop.clone()));
                     }
                     set_drag_target.set(None);
                 }

@@ -12,6 +12,7 @@ pub mod ownership;
 pub mod profile;
 pub mod security;
 pub mod sidebar;
+pub mod statuses;
 pub mod team;
 pub mod teams;
 pub mod workspace;

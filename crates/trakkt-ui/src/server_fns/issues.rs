@@ -45,7 +45,7 @@ pub(crate) async fn resolve_issue_id(
 /// List issues in the current workspace with optional filters.
 #[server(prefix = "/leptos-api")]
 pub async fn list_issues(
-    status: Option<String>,
+    status_id: Option<String>,
     priority: Option<i32>,
     assignee_id: Option<String>,
     label_id: Option<String>,
@@ -57,7 +57,7 @@ pub async fn list_issues(
 
     let ac = AuthenticatedContext::extract().await?;
     let filters = IssueFilters {
-        status,
+        status_id,
         priority,
         assignee_id,
         label_id,
@@ -138,7 +138,7 @@ pub async fn update_issue(
     number: i32,
     title: Option<String>,
     description: Option<String>,
-    status: Option<String>,
+    status_id: Option<String>,
     priority: Option<i32>,
     assignee_id: Option<String>,
     due_date: Option<String>,
@@ -149,7 +149,7 @@ pub async fn update_issue(
     let updates = IssueUpdate {
         title,
         description: description.map(|s| if s.is_empty() { None } else { Some(s) }),
-        status,
+        status_id,
         priority,
         assignee_id: assignee_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         due_date: due_date.map(|s| if s.is_empty() { None } else { Some(s) }),

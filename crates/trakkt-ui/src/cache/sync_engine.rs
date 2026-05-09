@@ -29,7 +29,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use trakkt_types::models::{IssueWithDetails, Label};
+use trakkt_types::models::{IssueWithDetails, Label, Status};
 use trakkt_types::sync::{SyncAction, SyncActionType, SyncResponse, entity_types};
 
 use crate::cache::db;
@@ -91,7 +91,7 @@ pub fn start_sync_engine(
                 spawn_local(async move {
                     match db::init_cache_db(&wid).await {
                         Ok(cache_db) => {
-                            for et in [entity_types::ISSUE, entity_types::LABEL] {
+                            for et in [entity_types::ISSUE, entity_types::LABEL, entity_types::STATUS] {
                                 if let Err(e) =
                                     db::delete_all_of_type(&cache_db, et, &wid).await
                                 {
@@ -169,6 +169,9 @@ pub async fn hydrate_store_from_db(
     }
     if let Ok(entries) = db::read_all(cache_db, entity_types::LABEL, workspace_id).await {
         store.set_labels(deser::<Label>(&entries, entity_types::LABEL));
+    }
+    if let Ok(entries) = db::read_all(cache_db, entity_types::STATUS, workspace_id).await {
+        store.set_statuses(deser::<Status>(&entries, entity_types::STATUS));
     }
 
     if let Ok(Some(_cursor)) = db::get_last_sync_id(cache_db, workspace_id).await {
@@ -252,6 +255,16 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                         ),
                     }
                 }
+                et if et == entity_types::STATUS => {
+                    match serde_json::from_value::<Status>(entity_data.clone()) {
+                        Ok(item) => store.upsert_status(item),
+                        Err(e) => tracing::warn!(
+                            entity_type,
+                            entity_id,
+                            "sync_action: failed to deserialize status: {e}"
+                        ),
+                    }
+                }
                 other => {
                     tracing::debug!(
                         entity_type = other,
@@ -286,6 +299,7 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
             match entity_type {
                 et if et == entity_types::ISSUE => store.remove_issue(entity_id),
                 et if et == entity_types::LABEL => store.remove_label(entity_id),
+                et if et == entity_types::STATUS => store.remove_status(entity_id),
                 other => {
                     tracing::debug!(
                         entity_type = other,

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use trakkt_auth::{comment_service, issue_service, label_service, team_service};
+use trakkt_auth::{comment_service, issue_service, label_service, status_service, team_service};
 use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate};
 
 use crate::state::AppState;
@@ -273,10 +273,9 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "status": {
+                        "status_id": {
                             "type": "string",
-                            "description": "Filter by status: backlog, todo, in_progress, done, cancelled",
-                            "enum": ["backlog", "todo", "in_progress", "done", "cancelled"]
+                            "description": "Filter by status ID (e.g. 'workspace-id::backlog'). Use list_statuses to get valid IDs."
                         },
                         "priority": {
                             "type": "integer",
@@ -372,10 +371,9 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                             "type": ["string", "null"],
                             "description": "New markdown description, or null to clear"
                         },
-                        "status": {
+                        "status_id": {
                             "type": "string",
-                            "description": "New status: backlog, todo, in_progress, done, cancelled",
-                            "enum": ["backlog", "todo", "in_progress", "done", "cancelled"]
+                            "description": "New status ID. Use list_statuses to get valid IDs."
                         },
                         "priority": {
                             "type": "integer",
@@ -476,6 +474,19 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                     },
                     "required": ["query"]
                 }
+            },
+            {
+                "name": "list_statuses",
+                "description": "List all statuses in the workspace, grouped by category (backlog, unstarted, started, completed, cancelled). Returns both global and optionally team-specific statuses.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "team_id": {
+                            "type": "string",
+                            "description": "Optional team ID to include team-specific statuses"
+                        }
+                    }
+                }
             }
         ]
     }))
@@ -534,6 +545,7 @@ async fn handle_tools_call(
         "add_comment" => "comments:write",
         "list_labels" => "labels:read",
         "create_label" => "labels:write",
+        "list_statuses" => "issues:read",
         _ => "",
     };
     if !required_scope.is_empty() && !auth.has_scope(required_scope) {
@@ -554,6 +566,7 @@ async fn handle_tools_call(
         "list_labels" => tool_list_labels(&auth, state).await,
         "create_label" => tool_create_label(&arguments, &auth, state).await,
         "search_issues" => tool_search_issues(&arguments, &auth, state).await,
+        "list_statuses" => tool_list_statuses(&arguments, &auth, state).await,
         _ => return JsonRpcResponse::error(id, -32602, format!("Unknown tool: {tool_name}")),
     };
 
@@ -606,7 +619,7 @@ async fn tool_list_issues(
     let limit = limit_raw.clamp(1, 100);
 
     let filters = IssueFilters {
-        status: args.get("status").and_then(|v| v.as_str()).map(String::from),
+        status_id: args.get("status_id").and_then(|v| v.as_str()).map(String::from),
         priority: args.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32),
         assignee_id: args.get("assignee").and_then(|v| v.as_str()).map(String::from),
         label_id: args.get("label").and_then(|v| v.as_str()).map(String::from),
@@ -692,7 +705,7 @@ async fn tool_update_issue(
         description: args.get("description").map(|v| {
             v.as_str().map(String::from)
         }),
-        status: args.get("status").and_then(|v| v.as_str()).map(String::from),
+        status_id: args.get("status_id").and_then(|v| v.as_str()).map(String::from),
         priority: args.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32),
         assignee_id: args.get("assignee").map(|v| {
             v.as_str().map(String::from)
@@ -828,4 +841,15 @@ async fn tool_search_issues(
 
     let issues = issue_service::list_issues(&state.db, &auth.workspace_id, &filters).await?;
     serde_json::to_string_pretty(&issues).map_err(trakkt_core::Error::from)
+}
+
+/// list_statuses — list all statuses in the workspace.
+async fn tool_list_statuses(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let team_id = args.get("team_id").and_then(|v| v.as_str());
+    let statuses = status_service::list_statuses(&state.db, &auth.workspace_id, team_id).await?;
+    serde_json::to_string_pretty(&statuses).map_err(trakkt_core::Error::from)
 }

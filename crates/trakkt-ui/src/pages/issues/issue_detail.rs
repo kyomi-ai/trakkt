@@ -20,11 +20,15 @@ use leptos_router::hooks::{use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, LabelBadge, Skeleton, StyledSelect,
+    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
+    DropdownItem, DropdownMenu, DropdownTrigger,
+    IssueStatusBadge, IssueStatusVariant,
+    LabelBadge, Skeleton, StyledSelect,
 };
 use crate::server_fns::comments::{create_comment, list_comments};
 use crate::server_fns::issues::{get_issue, set_issue_labels, update_issue};
 use crate::server_fns::labels::list_labels;
+use crate::server_fns::statuses::list_statuses;
 use trakkt_types::models::{Comment, IssueWithDetails};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,7 +322,7 @@ fn EditableTitle(
                 number,
                 Some(new_title),
                 None, // description
-                None, // status
+                None, // status_id
                 None, // priority
                 None, // assignee_id
                 None, // due_date
@@ -395,17 +399,21 @@ fn MetadataBar(
     on_change: Callback<()>,
 ) -> impl IntoView {
     let number = issue.number;
-    let status = issue.status.clone();
+    let current_status_id = issue.status_id.clone();
+    let current_status_category = issue.status_category.clone();
     let priority = issue.priority;
 
+    // Fetch statuses dynamically for the status dropdown.
+    let statuses_resource = LocalResource::new(move || list_statuses(None));
+
     // ── Status change handler ───────────────────────────────────────────
-    let on_status_change = move |new_status: String| {
+    let on_status_change = move |new_status_id: String| {
         leptos::task::spawn_local(async move {
             let _ = update_issue(
                 number,
                 None, // title
                 None, // description
-                Some(new_status),
+                Some(new_status_id),
                 None, // priority
                 None, // assignee_id
                 None, // due_date
@@ -423,7 +431,7 @@ fn MetadataBar(
                 number,
                 None, // title
                 None, // description
-                None, // status
+                None, // status_id
                 Some(prio),
                 None, // assignee_id
                 None, // due_date
@@ -433,24 +441,75 @@ fn MetadataBar(
         });
     };
 
+    let status_variant = IssueStatusVariant::parse(&current_status_category);
+    let (status_open, set_status_open) = signal(false);
+    let status_trigger_ref = NodeRef::<leptos::html::Div>::new();
+    let statuses = RwSignal::new(Vec::<trakkt_types::models::Status>::new());
+
+    Effect::new(move || {
+        if let Some(Ok(loaded)) = statuses_resource.get() {
+            statuses.set(loaded);
+        }
+    });
+
+    let current_status_name = {
+        let id = current_status_id.clone();
+        move || {
+            statuses.get().iter()
+                .find(|s| s.status_id == id)
+                .map(|s| s.name.clone())
+        }
+    };
+
     view! {
         <div class="flex flex-wrap items-center gap-4 mt-4">
             // ── Status ─────────────────────────────────────────────────
             <div class="flex items-center gap-2">
                 <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Status"</span>
-                <div class="w-36">
-                    <StyledSelect
-                        value=status
-                        options=vec![
-                            ("backlog", "Backlog"),
-                            ("todo", "Todo"),
-                            ("in_progress", "In Progress"),
-                            ("done", "Done"),
-                            ("cancelled", "Cancelled"),
-                        ]
-                        on_change=on_status_change
+                <div node_ref=status_trigger_ref>
+                    <DropdownTrigger
+                        label="Status"
+                        value=Signal::derive(move || current_status_name())
+                        icon=Arc::new(move || {
+                            view! { <IssueStatusBadge status=status_variant size=12/> }.into_any()
+                        }) as ChildrenFn
+                        on_click=Callback::new(move |()| set_status_open.update(|o| *o = !*o))
                     />
                 </div>
+                <DropdownMenu
+                    trigger_ref=status_trigger_ref
+                    open=Signal::derive(move || status_open.get())
+                    on_close=Callback::new(move |()| set_status_open.set(false))
+                    search_placeholder="Filter status..."
+                >
+                    {
+                        let current_sid = current_status_id.clone();
+                        move || statuses.get().into_iter().map({
+                            let current_sid = current_sid.clone();
+                            move |status| {
+                                let status_id = status.status_id.clone();
+                                let status_id_check = status.status_id.clone();
+                                let label = status.name.clone();
+                                let variant = IssueStatusVariant::parse(&status.category);
+                                view! {
+                                    <DropdownItem
+                                        label=label
+                                        selected=Signal::derive({
+                                            let id = current_sid.clone();
+                                            move || id == status_id_check
+                                        })
+                                on_select=Callback::new({
+                                    let id = status_id.clone();
+                                    move |()| {
+                                        on_status_change(id.clone());
+                                        set_status_open.set(false);
+                                    }
+                                })
+                                icon=Arc::new(move || view! { <IssueStatusBadge status=variant size=14/> }.into_any()) as ChildrenFn
+                            />
+                        }
+                    }}).collect_view()}
+                </DropdownMenu>
             </div>
 
             // ── Priority ───────────────────────────────────────────────
@@ -676,7 +735,7 @@ fn DescriptionEditor(
                 number,
                 None, // title
                 desc,
-                None, // status
+                None, // status_id
                 None, // priority
                 None, // assignee_id
                 None, // due_date
