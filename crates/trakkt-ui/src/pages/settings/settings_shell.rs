@@ -99,7 +99,7 @@ pub fn SettingsShell() -> impl IntoView {
             // Settings Header — matches React SettingsContent.jsx
             <div class="mb-8">
                 <h1 class="text-3xl font-display text-foreground">"Settings"</h1>
-                <p class="text-muted-foreground mt-2">"Manage your workspace configuration and billing settings"</p>
+                <p class="text-muted-foreground mt-2">"Manage your workspace configuration"</p>
             </div>
 
             // Settings Navigation Tabs
