@@ -243,7 +243,6 @@ pub fn IssueListPage() -> impl IntoView {
             <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
                 <h1 class="text-sm font-semibold text-foreground">"Issues"</h1>
                 <Button
-                    size=ButtonSize::Sm
                     on:click=move |_| set_show_new_issue.set(true)
                 >
                     <Icon icon=phosphor_leptos::PLUS size="14px"/>
