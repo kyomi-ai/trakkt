@@ -104,7 +104,7 @@ pub fn App() -> impl IntoView {
                     // Issue tracker
                     <Route path=path!("/issues") view=IssueListPage/>
                     <Route path=path!("/issues/:number") view=IssueDetailPage/>
-                    <Route path=path!("/board") view=BoardPage/>
+                    <Route path=path!("/board") view=|| view! { <BoardPage/> }/>
 
                     // Settings
                     <ParentRoute path=path!("/settings") view=|| view! {

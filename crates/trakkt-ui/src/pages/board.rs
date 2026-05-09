@@ -61,17 +61,33 @@ fn group_by_status(statuses: &[Status], all: &[IssueWithDetails]) -> Vec<(Status
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Kanban board page — issues arranged in status columns with drag-and-drop.
+///
+/// When `team_key` is provided, the board is scoped to a single team:
+/// only that team's issues and applicable statuses (global + team-specific)
+/// are shown. When `None`, all workspace issues and statuses are shown.
 #[component]
-pub fn BoardPage() -> impl IntoView {
+pub fn BoardPage(
+    /// Optional team key (lowercase from URL) to scope the board to a single team.
+    #[prop(optional, into)]
+    team_key: Option<String>,
+) -> impl IntoView {
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
+
+    // ── Resolve team from SyncStore ────────────────────────────────────────
+    let team_key_for_memo = team_key.clone();
+    let team = Memo::new(move |_| {
+        let key = team_key_for_memo.as_ref()?;
+        let store = sync_store?;
+        store.teams().get().into_iter().find(|t| t.key.to_lowercase() == *key)
+    });
 
     let server_issues = Resource::new(
         || (),
         move |_| async move { list_issues(None, None, None, None, None, None, None).await },
     );
 
-    let issues = Memo::new(move |_| {
+    let all_issues = Memo::new(move |_| {
         if let Some(store) = sync_store {
             let items = store.issues().get();
             if !items.is_empty() || store.initialized().get() {
@@ -83,6 +99,15 @@ pub fn BoardPage() -> impl IntoView {
             .unwrap_or_default()
     });
 
+    // Filter issues by team when a team is resolved.
+    let issues = Memo::new(move |_| {
+        let all = all_issues.get();
+        match team.get() {
+            Some(ref t) => all.into_iter().filter(|i| i.team_id == t.team_id).collect(),
+            None => all,
+        }
+    });
+
     // Statuses are workspace config — fetched once via server function.
     // They don't change frequently enough to need SyncStore.
     let statuses_resource = Resource::new(
@@ -90,10 +115,21 @@ pub fn BoardPage() -> impl IntoView {
         move |_| async move { list_statuses(None).await },
     );
 
-    let statuses = Memo::new(move |_| {
+    let all_statuses = Memo::new(move |_| {
         statuses_resource.get()
             .and_then(|r| r.ok())
             .unwrap_or_default()
+    });
+
+    // Filter statuses by team: show global (team_id=None) + team-specific.
+    let statuses = Memo::new(move |_| {
+        let all = all_statuses.get();
+        match team.get() {
+            Some(ref t) => all.into_iter().filter(|s| {
+                s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id)
+            }).collect(),
+            None => all,
+        }
     });
 
     // ── Drag state ──────────────────────────────────────────────────────────
@@ -157,7 +193,12 @@ pub fn BoardPage() -> impl IntoView {
         <div class="bg-background flex flex-col h-full">
             // ── Page header ─────────────────────────────────────────────────
             <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
-                <h1 class="text-sm font-semibold text-foreground">"Board"</h1>
+                <h1 class="text-sm font-semibold text-foreground">
+                    {move || match team.get() {
+                        Some(t) => format!("{} Board", t.name),
+                        None => "Board".to_string(),
+                    }}
+                </h1>
             </div>
 
             // ── Content area ────────────────────────────────────────────────

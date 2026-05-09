@@ -14,83 +14,59 @@
 
 use std::sync::Arc;
 
-use leptos::prelude::*;
 use leptos::children::ChildrenFn;
+use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use phosphor_leptos::Icon;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::components::{
-    Avatar, Button, ButtonVariant, EmptyState, IssueStatusBadge, IssueStatusVariant,
-    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, StyledSelect,
-    DropdownTrigger, DropdownMenu, DropdownItem,
-    INPUT_CLASS,
+    Avatar, Button, ButtonVariant, DropdownItem, DropdownMenu, DropdownTrigger, EmptyState,
+    IssueStatusBadge, IssueStatusVariant, LabelBadge, Modal, ModalSize, PriorityIndicator,
+    SearchInput, StyledSelect, INPUT_CLASS,
 };
 use crate::server_fns::issues::{create_issue, list_issues};
 use crate::server_fns::statuses::list_statuses;
-use trakkt_types::models::IssueWithDetails;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Formats a datetime string into a short date like "May 8".
-/// Expects ISO 8601 format (e.g. "2026-05-08T..."). Falls back to the
-/// first 10 characters if parsing fails.
-fn format_short_date(datetime: &str) -> String {
-    // Extract the date portion (YYYY-MM-DD).
-    let date_part = if datetime.len() >= 10 { &datetime[..10] } else { datetime };
-    let parts: Vec<&str> = date_part.split('-').collect();
-    if parts.len() == 3 {
-        let month = match parts[1] {
-            "01" => "Jan",
-            "02" => "Feb",
-            "03" => "Mar",
-            "04" => "Apr",
-            "05" => "May",
-            "06" => "Jun",
-            "07" => "Jul",
-            "08" => "Aug",
-            "09" => "Sep",
-            "10" => "Oct",
-            "11" => "Nov",
-            "12" => "Dec",
-            _ => return date_part.to_string(),
-        };
-        // Strip leading zero from the day.
-        let day = parts[2].trim_start_matches('0');
-        format!("{month} {day}")
-    } else {
-        date_part.to_string()
-    }
-}
-
-/// Returns `true` if the keyboard event target is an input, textarea, select,
-/// or contenteditable element — meaning single-key shortcuts (j/k/c) should
-/// NOT fire so they don't interfere with text editing.
-fn is_input_focused(ev: &web_sys::KeyboardEvent) -> bool {
-    use wasm_bindgen::JsCast;
-    let Some(target) = ev.target() else { return false };
-    let Some(el) = target.dyn_ref::<web_sys::HtmlElement>() else { return false };
-    let tag = el.tag_name().to_uppercase();
-    if matches!(tag.as_str(), "INPUT" | "TEXTAREA" | "SELECT") {
-        return true;
-    }
-    // Check for contenteditable (kode editor, rich text fields).
-    if el.is_content_editable() {
-        return true;
-    }
-    false
-}
+use crate::utils::date::format_short_date;
+use crate::utils::keyboard::is_input_focused;
+use trakkt_types::models::{IssueWithDetails, Team};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue List Page
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Main issue list page — displays all issues with search, filter, and create.
+/// Main issue list page — zero-arg entry point used by the router.
+///
+/// Shows all workspace issues (no team filtering). For team-scoped views,
+/// use `<IssueListForTeam team_key=.../>` instead.
 #[component]
 pub fn IssueListPage() -> impl IntoView {
+    view! { <IssueListInner/> }
+}
+
+/// Team-scoped issue list page — accepts a team key from the parent route.
+///
+/// Filters issues, statuses, and new issue creation to the resolved team.
+#[component]
+pub fn IssueListForTeam(
+    /// Team key passed by the parent route (e.g. "eng" for the Engineering
+    /// team). Compared case-insensitively against `Team.key`.
+    #[prop(into)]
+    team_key: String,
+) -> impl IntoView {
+    view! { <IssueListInner team_key=team_key/> }
+}
+
+/// Inner implementation shared by `IssueListPage` (no team) and
+/// `IssueListForTeam` (team-scoped). All filtering, title, and create-issue
+/// logic lives here.
+#[component]
+fn IssueListInner(
+    /// Optional team key. When `Some`, filters issues and statuses by team.
+    #[prop(optional, into)]
+    team_key: Option<String>,
+) -> impl IntoView {
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
     let (status_filter, set_status_filter) = signal(String::new());
@@ -100,12 +76,23 @@ pub fn IssueListPage() -> impl IntoView {
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (version, set_version) = signal(0u32);
 
+    // ── Resolve team from SyncStore ─────────────────────────────────────────
+    let team_key_stored = StoredValue::new(team_key);
+    let resolved_team: Memo<Option<Team>> = Memo::new(move |_| {
+        let key = team_key_stored.get_value()?;
+        let key_lower = key.to_lowercase();
+        let store = sync_store?;
+        store
+            .teams()
+            .get()
+            .into_iter()
+            .find(|t| t.key.to_lowercase() == key_lower)
+    });
+
     // Server function fallback — used for initial load before sync is ready.
     let server_issues = Resource::new(
         move || version.get(),
-        move |_| async move {
-            list_issues(None, None, None, None, None, None, None).await
-        },
+        move |_| async move { list_issues(None, None, None, None, None, None, None).await },
     );
 
     // Filtered issue list — reads from SyncStore when initialized, otherwise
@@ -118,24 +105,39 @@ pub fn IssueListPage() -> impl IntoView {
                 issues
             } else {
                 // Store not initialized yet — use server function result
-                server_issues.get()
+                server_issues
+                    .get()
                     .and_then(|r| r.ok())
                     .unwrap_or_default()
             }
         } else {
             // No store (SSR) — use server function
-            server_issues.get()
+            server_issues
+                .get()
                 .and_then(|r| r.ok())
                 .unwrap_or_default()
         };
+
+        // When a team_key was requested but hasn't resolved yet, return empty (loading state).
+        let team_key_present = team_key_stored.get_value().is_some();
+        if team_key_present && resolved_team.get().is_none() {
+            return vec![];
+        }
 
         // Apply client-side filters
         let search_val = search.get().to_lowercase();
         let status_val = status_filter.get();
         let priority_val = priority_filter.get();
+        let team = resolved_team.get();
 
         raw.into_iter()
             .filter(|issue| {
+                // Team filter: when on a team page, only show that team's issues.
+                if let Some(ref t) = team {
+                    if issue.team_id != t.team_id {
+                        return false;
+                    }
+                }
                 if !status_val.is_empty() && issue.status_id != status_val {
                     return false;
                 }
@@ -146,9 +148,7 @@ pub fn IssueListPage() -> impl IntoView {
                         }
                     }
                 }
-                if !search_val.is_empty()
-                    && !issue.title.to_lowercase().contains(&search_val)
-                {
+                if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
                     return false;
                 }
                 true
@@ -174,8 +174,11 @@ pub fn IssueListPage() -> impl IntoView {
     let issue_numbers = RwSignal::new(Vec::<i32>::new());
 
     // ── j/k/Enter/c keyboard listener (window-level, active on this page) ──
+    // Hoist use_navigate to component construction time (not inside closures).
+    let nav = use_navigate();
     Effect::new(move |_| {
         let Some(window) = web_sys::window() else { return };
+        let nav = nav.clone();
         let cb = Closure::<dyn Fn(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
             // Skip keyboard shortcuts when the user is typing in an input,
             // textarea, select, or contenteditable element.
@@ -212,7 +215,6 @@ pub fn IssueListPage() -> impl IntoView {
                         let numbers = issue_numbers.get_untracked();
                         if let Some(&number) = numbers.get(idx) {
                             ev.prevent_default();
-                            let nav = use_navigate();
                             nav(&format!("/issues/{number}"), Default::default());
                         }
                     }
@@ -244,7 +246,9 @@ pub fn IssueListPage() -> impl IntoView {
         <div class="bg-background flex flex-col h-full">
             // ── Page header ─────────────────────────────────────────────────
             <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
-                <h1 class="text-sm font-semibold text-foreground">"Issues"</h1>
+                <h1 class="text-sm font-semibold text-foreground">
+                    {move || resolved_team.get().map(|t| t.name.clone()).unwrap_or_else(|| "Issues".to_string())}
+                </h1>
                 <Button
                     on:click=move |_| set_show_new_issue.set(true)
                 >
@@ -261,7 +265,11 @@ pub fn IssueListPage() -> impl IntoView {
                     placeholder="Search issues..."
                     class="flex-1 max-w-sm"
                 />
-                <StatusFilterDropdown value=status_filter on_change=Callback::new(move |v: String| set_status_filter.set(v))/>
+                <StatusFilterDropdown
+                    value=status_filter
+                    on_change=Callback::new(move |v: String| set_status_filter.set(v))
+                    team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
+                />
                 <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
             </div>
 
@@ -322,6 +330,7 @@ pub fn IssueListPage() -> impl IntoView {
             show=Signal::derive(move || show_new_issue.get())
             on_close=Callback::new(move |()| set_show_new_issue.set(false))
             on_created=on_issue_created
+            team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
         />
     }
 }
@@ -439,9 +448,16 @@ fn IssueRow(
 fn StatusFilterDropdown(
     #[prop(into)] value: Signal<String>,
     on_change: Callback<String>,
+    /// When filtering by team, only show statuses that are global (team_id = None)
+    /// or belong to this team.
+    #[prop(optional, into)]
+    team_id: Option<Signal<Option<String>>>,
 ) -> impl IntoView {
     let (open, set_open) = signal(false);
     let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Use SyncStore for statuses when available (real-time), fall back to server.
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
 
     // Fetch statuses dynamically from the server.
     let statuses_resource = Resource::new(
@@ -449,12 +465,38 @@ fn StatusFilterDropdown(
         move |_| async move { list_statuses(None).await },
     );
 
-    // Resolved statuses — empty until loaded.
+    // Resolved statuses — prefer SyncStore, fall back to server resource.
+    // When team_id is provided, filter to global + team-specific statuses.
     let statuses = Memo::new(move |_| {
-        statuses_resource
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
+        let all = if let Some(store) = sync_store {
+            let s = store.statuses().get();
+            if !s.is_empty() || store.initialized().get() {
+                s
+            } else {
+                statuses_resource
+                    .get()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default()
+            }
+        } else {
+            statuses_resource
+                .get()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+        };
+
+        // Filter by team when a team_id signal is provided and has a value.
+        if let Some(team_id_signal) = team_id {
+            if let Some(ref tid) = team_id_signal.get() {
+                return all
+                    .into_iter()
+                    .filter(|s| {
+                        s.team_id.is_none() || s.team_id.as_deref() == Some(tid.as_str())
+                    })
+                    .collect();
+            }
+        }
+        all
     });
 
     // Display name for the current selection (looked up from loaded statuses).
@@ -633,6 +675,9 @@ fn NewIssueModal(
     on_close: Callback<()>,
     /// Called after an issue is successfully created.
     on_created: Callback<()>,
+    /// When on a team page, the team_id to assign to newly created issues.
+    #[prop(optional, into)]
+    team_id: Option<Signal<Option<String>>>,
 ) -> impl IntoView {
     let (title, set_title) = signal(String::new());
     let (description, set_description) = signal(String::new());
@@ -661,12 +706,13 @@ fn NewIssueModal(
         let desc_val = description.get_untracked();
         let desc = if desc_val.trim().is_empty() { None } else { Some(desc_val) };
         let prio = priority.get_untracked().parse::<i32>().unwrap_or(0);
+        let current_team_id = team_id.and_then(|s| s.get_untracked());
 
         set_submitting.set(true);
         set_error_msg.set(None);
 
         leptos::task::spawn_local(async move {
-            match create_issue(title_val, desc, prio, None, None, String::new(), None, None, None).await {
+            match create_issue(title_val, desc, prio, None, None, String::new(), None, None, current_team_id).await {
                 Ok(_) => {
                     set_submitting.set(false);
                     on_created.run(());
