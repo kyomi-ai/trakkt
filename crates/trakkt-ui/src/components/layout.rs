@@ -403,7 +403,7 @@ fn SidebarTeamsSection() -> impl IntoView {
                         let issues_href = format!("/teams/{key}/issues");
                         let board_href = format!("/teams/{key}/board");
                         view! {
-                            <SidebarTeamSubNav name=name issues_href=issues_href board_href=board_href/>
+                            <SidebarTeamSubNav team_id=team.team_id.clone() name=name issues_href=issues_href board_href=board_href/>
                         }
                     }).collect_view()}
                 </div>
@@ -541,9 +541,11 @@ fn SidebarCreateTeam(on_done: Callback<()>) -> impl IntoView {
 }
 
 /// A team's sub-navigation: clickable team name toggles expanded state,
-/// showing/hiding the Issues and Board sub-links.
+/// showing/hiding the Issues and Board sub-links. Right-click the team
+/// name to open a context menu with a "Leave team" option.
 #[component]
 fn SidebarTeamSubNav(
+    team_id: String,
     name: String,
     issues_href: String,
     board_href: String,
@@ -559,6 +561,7 @@ fn SidebarTeamSubNav(
     // Auto-expand if the current path is within this team.
     let team_active = Signal::derive(move || issues_active.get() || board_active.get());
     let (expanded, set_expanded) = signal(false);
+    let (menu_open, set_menu_open) = signal(false);
 
     // Expand when navigating into a team's pages.
     Effect::new(move |_| {
@@ -571,12 +574,47 @@ fn SidebarTeamSubNav(
         if expanded.get() { "transition-transform duration-150" } else { "transition-transform duration-150 -rotate-90" }
     };
 
+    // Close context menu on click-outside — register once, check state inside.
+    let outer_ref = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        let Some(window) = web_sys::window() else { return };
+        let outer = outer_ref.get();
+        let cb = Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |ev: web_sys::MouseEvent| {
+            if !menu_open.get_untracked() { return; }
+            if let Some(ref el) = outer {
+                if let Some(target) = ev.target() {
+                    let target_node: web_sys::Node = target.unchecked_into();
+                    if !el.contains(Some(&target_node)) {
+                        set_menu_open.set(false);
+                    }
+                }
+            }
+        });
+        let _ = window.add_event_listener_with_callback(
+            "click",
+            cb.as_ref().unchecked_ref(),
+        );
+        let cb_cleanup = send_wrapper::SendWrapper::new(cb);
+        on_cleanup(move || {
+            let Some(window) = web_sys::window() else { return };
+            let cb = cb_cleanup.take();
+            let _ = window.remove_event_listener_with_callback(
+                "click",
+                cb.as_ref().unchecked_ref(),
+            );
+        });
+    });
+
     view! {
-        <div class="mt-0.5">
-            // Team name — clickable to expand/collapse
+        <div class="mt-0.5 relative" node_ref=outer_ref>
+            // Team name — clickable to expand/collapse, right-click for context menu
             <button
                 class="w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors text-left"
                 on:click=move |_| set_expanded.update(|v| *v = !*v)
+                on:contextmenu=move |ev| {
+                    ev.prevent_default();
+                    set_menu_open.set(true);
+                }
             >
                 <Icon icon=phosphor_leptos::USERS_THREE weight=IconWeight::Light size="16px"/>
                 <span class="flex-1 truncate">{name}</span>
@@ -584,6 +622,30 @@ fn SidebarTeamSubNav(
                     <path d="M6 9l6 6 6-6"/>
                 </svg>
             </button>
+
+            // Context menu dropdown
+            <Show when=move || menu_open.get()>
+                <div class="absolute left-0 right-0 top-full mt-1 bg-popover border border-border rounded-lg shadow-lg py-1 z-50">
+                    <button
+                        class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
+                        on:click={
+                            let team_id = team_id.clone();
+                            move |_| {
+                                let team_id = team_id.clone();
+                                set_menu_open.set(false);
+                                leptos::task::spawn_local(async move {
+                                    if let Err(e) = crate::server_fns::teams::leave_team(team_id).await {
+                                        web_sys::console::warn_1(&format!("leave_team failed: {e}").into());
+                                    }
+                                });
+                            }
+                        }
+                    >
+                        "Leave team"
+                    </button>
+                </div>
+            </Show>
+
             // Indented sub-items — shown when expanded
             {move || expanded.get().then(|| {
                 let ih = issues_href.clone();
