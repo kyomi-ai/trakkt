@@ -83,20 +83,15 @@ pub fn BoardPage() -> impl IntoView {
             .unwrap_or_default()
     });
 
-    // Statuses from SyncStore, with server function fallback.
-    let server_statuses = Resource::new(
+    // Statuses are workspace config — fetched once via server function.
+    // They don't change frequently enough to need SyncStore.
+    let statuses_resource = Resource::new(
         || (),
         move |_| async move { list_statuses(None).await },
     );
 
     let statuses = Memo::new(move |_| {
-        if let Some(store) = sync_store {
-            let items = store.statuses().get();
-            if !items.is_empty() || store.initialized().get() {
-                return items;
-            }
-        }
-        server_statuses.get()
+        statuses_resource.get()
             .and_then(|r| r.ok())
             .unwrap_or_default()
     });
@@ -169,8 +164,7 @@ pub fn BoardPage() -> impl IntoView {
             <div class="flex-1 overflow-x-auto px-4 md:px-6 py-4" style="scrollbar-width: thin;">
                 {move || {
                     let s = statuses.get();
-                    let i = issues.get();
-                    if s.is_empty() && i.is_empty() && sync_store.map(|s| !s.initialized().get()).unwrap_or(true) {
+                    if s.is_empty() {
                         view! { <BoardSkeleton/> }.into_any()
                     } else {
                         let grouped = move || group_by_status(&statuses.get(), &issues.get());
