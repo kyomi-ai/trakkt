@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use leptos::prelude::*;
+use leptos::children::ChildrenFn;
 use leptos_router::hooks::use_navigate;
 use phosphor_leptos::Icon;
 use wasm_bindgen::closure::Closure;
@@ -23,6 +24,7 @@ use wasm_bindgen::JsCast;
 use crate::components::{
     Avatar, Button, ButtonVariant, EmptyState, IssueStatusBadge, IssueStatusVariant,
     LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton, StyledSelect,
+    DropdownTrigger, DropdownMenu, DropdownItem,
     INPUT_CLASS,
 };
 use crate::server_fns::issues::{create_issue, list_issues};
@@ -258,33 +260,8 @@ pub fn IssueListPage() -> impl IntoView {
                     placeholder="Search issues..."
                     class="flex-1 max-w-sm"
                 />
-                <div class="w-40">
-                    <StyledSelect
-                        value=status_filter.get_untracked()
-                        options=vec![
-                            ("", "All statuses"),
-                            ("backlog", "Backlog"),
-                            ("todo", "Todo"),
-                            ("in_progress", "In Progress"),
-                            ("done", "Done"),
-                            ("cancelled", "Cancelled"),
-                        ]
-                        on_change=move |v: String| set_status_filter.set(v)
-                    />
-                </div>
-                <div class="w-36">
-                    <StyledSelect
-                        value=priority_filter.get_untracked()
-                        options=vec![
-                            ("", "All priorities"),
-                            ("1", "Urgent"),
-                            ("2", "High"),
-                            ("3", "Medium"),
-                            ("4", "Low"),
-                        ]
-                        on_change=move |v: String| set_priority_filter.set(v)
-                    />
-                </div>
+                <StatusFilterDropdown value=status_filter on_change=Callback::new(move |v: String| set_status_filter.set(v))/>
+                <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
             </div>
 
             // ── Content area ────────────────────────────────────────────────
@@ -484,6 +461,183 @@ fn IssueListSkeleton() -> impl IntoView {
     }).collect_view();
 
     view! { <div>{rows}</div> }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter Dropdowns (DESIGN.md § Dropdowns)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[component]
+fn StatusFilterDropdown(
+    #[prop(into)] value: Signal<String>,
+    on_change: Callback<String>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    let statuses: Vec<(&str, &str, IssueStatusVariant)> = vec![
+        ("backlog", "Backlog", IssueStatusVariant::Backlog),
+        ("todo", "Todo", IssueStatusVariant::Todo),
+        ("in_progress", "In Progress", IssueStatusVariant::InProgress),
+        ("done", "Done", IssueStatusVariant::Done),
+        ("cancelled", "Cancelled", IssueStatusVariant::Cancelled),
+    ];
+
+    let display = Memo::new(move |_| {
+        let v = value.get();
+        if v.is_empty() { None } else {
+            match v.as_str() {
+                "backlog" => Some("Backlog".to_string()),
+                "todo" => Some("Todo".to_string()),
+                "in_progress" => Some("In Progress".to_string()),
+                "done" => Some("Done".to_string()),
+                "cancelled" => Some("Cancelled".to_string()),
+                _ => None,
+            }
+        }
+    });
+
+    let current_variant = Memo::new(move |_| {
+        match value.get().as_str() {
+            "backlog" => Some(IssueStatusVariant::Backlog),
+            "todo" => Some(IssueStatusVariant::Todo),
+            "in_progress" => Some(IssueStatusVariant::InProgress),
+            "done" => Some(IssueStatusVariant::Done),
+            "cancelled" => Some(IssueStatusVariant::Cancelled),
+            _ => None,
+        }
+    });
+
+    view! {
+        <div node_ref=trigger_ref>
+            <DropdownTrigger
+                label="All statuses"
+                value=Signal::derive(move || display.get())
+                icon=Arc::new(move || {
+                    current_variant.get().map(|v| {
+                        view! { <IssueStatusBadge status=v size=12/> }.into_any()
+                    }).unwrap_or_else(|| view! { <span/> }.into_any())
+                }) as ChildrenFn
+                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
+            />
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+            search_placeholder="Filter status..."
+        >
+            <DropdownItem
+                label="All statuses"
+                selected=Signal::derive(move || value.get().is_empty())
+                on_select=Callback::new({
+                    let on_change = on_change.clone();
+                    move |()| { on_change.run(String::new()); set_open.set(false); }
+                })
+            />
+            {statuses.iter().map(|(key, label, variant)| {
+                let key_owned = key.to_string();
+                let key_check = key.to_string();
+                let label = label.to_string();
+                let variant = *variant;
+                view! {
+                    <DropdownItem
+                        label=label
+                        selected=Signal::derive(move || value.get() == key_check)
+                        on_select=Callback::new({
+                            let on_change = on_change.clone();
+                            let k = key_owned.clone();
+                            move |()| { on_change.run(k.clone()); set_open.set(false); }
+                        })
+                        icon=Arc::new(move || view! { <IssueStatusBadge status=variant size=14/> }.into_any()) as ChildrenFn
+                    />
+                }
+            }).collect_view()}
+        </DropdownMenu>
+    }
+}
+
+#[component]
+fn PriorityFilterDropdown(
+    #[prop(into)] value: Signal<String>,
+    on_change: Callback<String>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    let priorities: Vec<(&str, &str, i32)> = vec![
+        ("1", "Urgent", 1),
+        ("2", "High", 2),
+        ("3", "Medium", 3),
+        ("4", "Low", 4),
+    ];
+
+    let display = Memo::new(move |_| {
+        let v = value.get();
+        if v.is_empty() { None } else {
+            match v.as_str() {
+                "1" => Some("Urgent".to_string()),
+                "2" => Some("High".to_string()),
+                "3" => Some("Medium".to_string()),
+                "4" => Some("Low".to_string()),
+                _ => None,
+            }
+        }
+    });
+
+    let current_priority = Memo::new(move |_| {
+        value.get().parse::<i32>().ok()
+    });
+
+    view! {
+        <div node_ref=trigger_ref>
+            <DropdownTrigger
+                label="All priorities"
+                value=Signal::derive(move || display.get())
+                icon=Arc::new(move || {
+                    current_priority.get().map(|p| {
+                        view! { <PriorityIndicator priority=p/> }.into_any()
+                    }).unwrap_or_else(|| view! { <span/> }.into_any())
+                }) as ChildrenFn
+                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
+            />
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+            search_placeholder="Filter priority..."
+        >
+            <DropdownItem
+                label="All priorities"
+                selected=Signal::derive(move || value.get().is_empty())
+                on_select=Callback::new({
+                    let on_change = on_change.clone();
+                    move |()| { on_change.run(String::new()); set_open.set(false); }
+                })
+            />
+            {priorities.iter().map(|(key, label, priority_val)| {
+                let key_owned = key.to_string();
+                let key_check = key.to_string();
+                let label = label.to_string();
+                let shortcut = key.to_string();
+                let priority_val = *priority_val;
+                view! {
+                    <DropdownItem
+                        label=label
+                        selected=Signal::derive(move || value.get() == key_check)
+                        on_select=Callback::new({
+                            let on_change = on_change.clone();
+                            let k = key_owned.clone();
+                            move |()| { on_change.run(k.clone()); set_open.set(false); }
+                        })
+                        icon=Arc::new(move || view! { <PriorityIndicator priority=priority_val/> }.into_any()) as ChildrenFn
+                        shortcut=shortcut
+                    />
+                }
+            }).collect_view()}
+        </DropdownMenu>
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
