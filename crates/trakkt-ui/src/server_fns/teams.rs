@@ -48,6 +48,22 @@ pub async fn get_team_by_key(key: String) -> Result<Team, ServerFnError> {
     Ok(team)
 }
 
+/// Join a team as a member. No-op if already a member.
+#[server(prefix = "/leptos-api")]
+pub async fn join_team(team_id: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    trakkt_auth::team_service::add_team_member(
+        ac.db(),
+        &team_id,
+        &ac.auth.user_id,
+        "member",
+        &ac.ws_id,
+    )
+    .await
+    .into_sfn()?;
+    Ok(())
+}
+
 // ─── Write operations ──────────────────────────────────────────────────────
 
 /// Create a new issue-tracker team in the current workspace.

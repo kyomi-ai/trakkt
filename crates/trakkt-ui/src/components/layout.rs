@@ -241,8 +241,6 @@ fn Sidebar(
 
                 <SidebarTeamsSection/>
                 <SidebarProjectsSection/>
-
-                <SidebarNavItem href="/settings" icon=phosphor_leptos::GEAR_SIX label="Settings"/>
             </nav>
 
             // User menu at bottom
@@ -370,19 +368,34 @@ fn WorkspaceSwitcher(set_user_menu_open: WriteSignal<bool>) -> impl IntoView {
 }
 
 /// Section header for "Teams" with dynamic team list from SyncStore.
+/// Teams are collapsible and the section includes create/join actions.
 #[component]
 fn SidebarTeamsSection() -> impl IntoView {
     let store = use_context::<SyncStore>();
+    let (show_create, set_show_create) = signal(false);
 
     view! {
         {move || {
             let Some(store) = store else { return view! { <span/> }.into_any() };
             let teams = store.teams().get();
-            if teams.is_empty() {
-                return view! { <span/> }.into_any();
-            }
             view! {
-                <SidebarSectionHeader label="Teams"/>
+                <div class="flex items-center justify-between px-3 pt-4 pb-1">
+                    <span class="text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
+                        "Teams"
+                    </span>
+                    <button
+                        class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors"
+                        on:click=move |_| set_show_create.update(|v| *v = !*v)
+                        title="Create or join a team"
+                    >
+                        <Icon icon=phosphor_leptos::PLUS weight=IconWeight::Bold size="12px"/>
+                    </button>
+                </div>
+
+                <Show when=move || show_create.get()>
+                    <SidebarCreateTeam on_done=Callback::new(move |()| set_show_create.set(false))/>
+                </Show>
+
                 <div class="space-y-0.5">
                     {teams.into_iter().map(|team| {
                         let key = team.key.to_lowercase();
@@ -467,7 +480,68 @@ fn SidebarSectionHeader(label: &'static str) -> impl IntoView {
     }
 }
 
-/// A team's sub-navigation: team name header + indented Issues/Board links.
+/// Inline form for creating a new team or joining an existing one from the sidebar.
+#[component]
+fn SidebarCreateTeam(on_done: Callback<()>) -> impl IntoView {
+    let (name, set_name) = signal(String::new());
+    let (error, set_error) = signal(Option::<String>::None);
+    let (submitting, set_submitting) = signal(false);
+
+    let on_submit = move |ev: web_sys::SubmitEvent| {
+        ev.prevent_default();
+        let name_val = name.get_untracked().trim().to_string();
+        if name_val.is_empty() { return; }
+
+        // Auto-derive a 3-char uppercase key from the name.
+        let key: String = name_val
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(3)
+            .collect::<String>()
+            .to_uppercase();
+
+        if key.len() < 2 {
+            set_error.set(Some("Name too short for a team key".into()));
+            return;
+        }
+
+        set_submitting.set(true);
+        set_error.set(None);
+
+        leptos::task::spawn_local(async move {
+            match crate::server_fns::teams::create_team(name_val, key, None, None).await {
+                Ok(_) => {
+                    on_done.run(());
+                }
+                Err(e) => {
+                    set_error.set(Some(format!("{e}")));
+                    set_submitting.set(false);
+                }
+            }
+        });
+    };
+
+    view! {
+        <form class="px-2 pb-2" on:submit=on_submit>
+            <input
+                type="text"
+                placeholder="New team name..."
+                class="w-full px-2 py-1.5 text-sm bg-[var(--color-sidebar-hover)] text-[var(--color-sidebar-foreground)] rounded-md border border-transparent focus:border-primary focus:outline-none placeholder:text-[var(--color-sidebar-foreground-muted)]"
+                prop:value=move || name.get()
+                on:input=move |ev| set_name.set(event_target_value(&ev))
+                prop:disabled=move || submitting.get()
+            />
+            <Show when=move || error.get().is_some()>
+                <p class="mt-1 text-[11px] text-red-400 px-1">
+                    {move || error.get().unwrap_or_default()}
+                </p>
+            </Show>
+        </form>
+    }
+}
+
+/// A team's sub-navigation: clickable team name toggles expanded state,
+/// showing/hiding the Issues and Board sub-links.
 #[component]
 fn SidebarTeamSubNav(
     name: String,
@@ -477,23 +551,50 @@ fn SidebarTeamSubNav(
     let path = leptos_router::hooks::use_location().pathname;
 
     let issues_href_match = issues_href.clone();
-    let issues_active = Signal::derive(move || path.get().starts_with(&issues_href_match));
-
     let board_href_match = board_href.clone();
+
+    let issues_active = Signal::derive(move || path.get().starts_with(&issues_href_match));
     let board_active = Signal::derive(move || path.get().starts_with(&board_href_match));
 
+    // Auto-expand if the current path is within this team.
+    let team_active = Signal::derive(move || issues_active.get() || board_active.get());
+    let (expanded, set_expanded) = signal(false);
+
+    // Expand when navigating into a team's pages.
+    Effect::new(move |_| {
+        if team_active.get() {
+            set_expanded.set(true);
+        }
+    });
+
+    let chevron_class = move || {
+        if expanded.get() { "transition-transform duration-150" } else { "transition-transform duration-150 -rotate-90" }
+    };
+
     view! {
-        <div class="mt-1">
-            // Team name header
-            <div class="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-[var(--color-sidebar-foreground)]">
+        <div class="mt-0.5">
+            // Team name — clickable to expand/collapse
+            <button
+                class="w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors text-left"
+                on:click=move |_| set_expanded.update(|v| *v = !*v)
+            >
                 <Icon icon=phosphor_leptos::USERS_THREE weight=IconWeight::Light size="16px"/>
-                <span class="truncate">{name}</span>
-            </div>
-            // Indented sub-items
-            <div class="ml-4">
-                <SidebarSubNavItem href=issues_href icon=phosphor_leptos::LIST_BULLETS label="Issues" is_active=issues_active/>
-                <SidebarSubNavItem href=board_href icon=phosphor_leptos::KANBAN label="Board" is_active=board_active/>
-            </div>
+                <span class="flex-1 truncate">{name}</span>
+                <svg class=chevron_class width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6 9l6 6 6-6"/>
+                </svg>
+            </button>
+            // Indented sub-items — shown when expanded
+            {move || expanded.get().then(|| {
+                let ih = issues_href.clone();
+                let bh = board_href.clone();
+                view! {
+                    <div class="ml-4">
+                        <SidebarSubNavItem href=ih icon=phosphor_leptos::LIST_BULLETS label="Issues" is_active=issues_active/>
+                        <SidebarSubNavItem href=bh icon=phosphor_leptos::KANBAN label="Board" is_active=board_active/>
+                    </div>
+                }
+            })}
         </div>
     }
 }
