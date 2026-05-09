@@ -14,15 +14,24 @@
 //!
 //! ## Authentication
 //!
-//! Tool calls require a Bearer token in the `Authorization` header. Tokens are
-//! created from workspace settings and stored hashed (SHA-256) in the
-//! `api_tokens` table. The token resolves to a `(workspace_id, user_id)` pair
-//! that scopes all operations.
+//! Two auth methods are supported, tried in order:
+//!
+//! 1. **JWT (OAuth 2.0)** — `Authorization: Bearer <jwt>`. The `AuthUser`
+//!    extractor validates the JWT and loads workspace context from the database.
+//!    This is the standard path for MCP clients that use OAuth 2.0 (Claude Code,
+//!    Cursor).
+//!
+//! 2. **API token (legacy)** — `Authorization: Bearer <trakkt-...>`. Raw Bearer
+//!    tokens created in workspace settings, stored hashed (SHA-256) in the
+//!    `api_tokens` table. Kept as a fallback for users with existing API tokens.
+//!
+//! In personal mode, both are bypassed — a local user context is injected.
 
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -85,10 +94,13 @@ impl JsonRpcResponse {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Bearer token auth — resolves (workspace_id, user_id) from api_tokens table
+// Resolved MCP identity — from JWT or API token
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolved identity from a valid Bearer token.
+/// Resolved identity for MCP tool calls.
+///
+/// Populated from either a JWT `AuthUser` (OAuth 2.0) or a raw Bearer API
+/// token (legacy). Personal mode injects a local context.
 struct McpAuth {
     workspace_id: String,
     user_id: String,
@@ -101,6 +113,10 @@ impl McpAuth {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy Bearer API token auth (fallback)
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Internal row type for the api_tokens lookup query.
 #[derive(sqlx::FromRow)]
 struct ApiTokenLookupRow {
@@ -109,19 +125,87 @@ struct ApiTokenLookupRow {
     scopes: Option<String>,
 }
 
-/// Validate a Bearer token from the Authorization header.
+/// Try to authenticate the request via JWT (OAuth 2.0) or legacy API token.
+/// Returns `None` if neither succeeds.
 ///
-/// Hashes the plaintext token with SHA-256 and looks it up in `api_tokens`.
-/// Returns `None` if the header is missing, malformed, or the token is
-/// invalid/expired/revoked. Falls back to resolving workspace from
-/// workspace_members if the token was created before workspace_id was added.
-async fn authenticate_bearer(
+/// JWT is tried first because it produces a richer context (workspace context,
+/// user active/verified checks). The API token path is a simple hash lookup —
+/// kept for backward compatibility with existing API tokens.
+async fn resolve_mcp_auth(
     headers: &HeaderMap,
-    db: &trakkt_core::DbPool,
+    state: &AppState,
 ) -> Option<McpAuth> {
+    // Extract the raw token from Authorization header
     let auth_header = headers.get("authorization")?.to_str().ok()?;
     let token = auth_header.strip_prefix("Bearer ")?;
 
+    // 1. Try JWT validation first (OAuth 2.0 path).
+    //    If the token is a valid JWT, resolve user + workspace from the database
+    //    using the same logic as the AuthUser extractor.
+    if let Ok(decoded) = trakkt_auth::jwt::validate_token(token, &state.config.jwt_secret) {
+        let user_id = decoded
+            .claims
+            .extra
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| decoded.claims.sub.clone());
+
+        // Verify user exists and is active
+        let user = trakkt_auth::user_service::get_user_by_id(&state.db, &user_id)
+            .await
+            .ok()??;
+
+        if !user.active {
+            return None;
+        }
+
+        // Get workspace_id from JWT claims, fall back to user's workspace context
+        let workspace_id = decoded
+            .claims
+            .extra
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                // Synchronous fallback not possible here — but we can try
+                // the database lookup below if JWT didn't include workspace_id.
+                None
+            });
+
+        let workspace_id = match workspace_id {
+            Some(ws_id) => ws_id,
+            None => {
+                // Fall back to user's first workspace
+                let ctx = trakkt_auth::user_service::get_user_workspace_context(
+                    &state.db,
+                    &user_id,
+                )
+                .await
+                .ok()??;
+                ctx.0.workspace_id
+            }
+        };
+
+        return Some(McpAuth {
+            workspace_id,
+            user_id,
+            scopes: vec![], // JWT users have full access
+        });
+    }
+
+    // 2. Legacy API token path (SHA-256 hash lookup)
+    authenticate_bearer_token(token, &state.db).await
+}
+
+/// Validate a raw Bearer token against the `api_tokens` table (legacy path).
+///
+/// Hashes the plaintext token with SHA-256 and looks it up. Returns `None`
+/// if the token is invalid/expired/revoked.
+async fn authenticate_bearer_token(
+    token: &str,
+    db: &trakkt_core::DbPool,
+) -> Option<McpAuth> {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     let token_hash = format!("{:x}", hasher.finalize());
@@ -147,15 +231,15 @@ async fn authenticate_bearer(
 
     let row = row?;
 
-    // Parse scopes from JSON array string (e.g. '["issues:read","issues:write"]')
-    let scopes: Vec<String> = row.scopes
+    // Parse scopes from JSON array string
+    let scopes: Vec<String> = row
+        .scopes
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
     // Resolve workspace_id: prefer token's workspace_id, fall back to first
-    // workspace the user belongs to (handles tokens created before the
-    // workspace_id column was added).
+    // workspace the user belongs to.
     let workspace_id = match row.workspace_id {
         Some(ws_id) => ws_id,
         None => {
@@ -170,7 +254,50 @@ async fn authenticate_bearer(
         }
     };
 
-    Some(McpAuth { workspace_id, user_id: row.user_id, scopes })
+    Some(McpAuth {
+        workspace_id,
+        user_id: row.user_id,
+        scopes,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WWW-Authenticate middleware (RFC 6750)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Response layer that adds `WWW-Authenticate` to 401 responses per RFC 6750.
+///
+/// MCP clients (and directories like Glama) use this header to discover OAuth
+/// endpoints and distinguish "online, requires auth" from "broken/offline".
+/// The `resource_metadata` parameter points to the RFC 9728 protected resource
+/// metadata endpoint, which in turn references the authorization server.
+async fn mcp_www_authenticate_layer(request: Request, next: Next) -> Response {
+    // Capture the request's host/scheme before passing ownership to `next`.
+    let base_url = {
+        let headers = request.headers();
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("https");
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("app.trakkt.dev");
+        format!("{scheme}://{host}")
+    };
+
+    let mut response = next.run(request).await;
+
+    if response.status() == StatusCode::UNAUTHORIZED {
+        let www_auth = format!(
+            r#"Bearer realm="OAuth", resource_metadata="{base_url}/.well-known/oauth-protected-resource", error="invalid_token", error_description="Missing or invalid access token""#
+        );
+        if let Ok(val) = www_auth.parse() {
+            response.headers_mut().insert("www-authenticate", val);
+        }
+    }
+
+    response
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +309,11 @@ pub fn routes() -> Router<AppState> {
         .route("/", post(handle_post))
         .route("/", get(handle_sse))
         .route("/", delete(handle_delete))
+        .layer(middleware::from_fn(mcp_www_authenticate_layer))
+        .route(
+            "/.well-known/openid-configuration",
+            get(super::oauth::mcp_openid_configuration),
+        )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -210,8 +342,8 @@ async fn handle_post(
     let mut resp_headers = HeaderMap::new();
 
     if is_initialize {
-        // Resolve workspace_id from Bearer token if present, otherwise "anonymous".
-        let workspace_id = match authenticate_bearer(&headers, &state.db).await {
+        // Resolve workspace_id from auth if present, otherwise "anonymous".
+        let workspace_id = match resolve_mcp_auth(&headers, &state).await {
             Some(auth) => auth.workspace_id,
             None => "anonymous".to_string(),
         };
@@ -526,7 +658,7 @@ async fn handle_tools_call(
             scopes: vec![],
         }
     } else {
-        match authenticate_bearer(headers, &state.db).await {
+        match resolve_mcp_auth(headers, state).await {
             Some(auth) => auth,
             None => {
                 return JsonRpcResponse::error(

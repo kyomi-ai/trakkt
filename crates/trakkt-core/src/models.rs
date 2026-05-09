@@ -130,3 +130,21 @@ pub struct ApiToken {
     pub last_used: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
+
+/// OAuth client record from the `oauth_clients` table.
+///
+/// Used for MCP dynamic client registration (RFC 7591). Clients register
+/// themselves with redirect URIs and receive a `client_id` used throughout
+/// the OAuth 2.0 authorization code flow.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct OAuthClient {
+    pub id: String,
+    pub client_id: String,
+    pub client_secret_hash: Option<String>,
+    pub name: String,
+    pub redirect_uris: serde_json::Value,
+    pub scopes: serde_json::Value,
+    pub client_type: String,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+}
