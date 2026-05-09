@@ -5,4 +5,5 @@ pub mod auth;
 pub mod board;
 pub mod issues;
 pub mod onboarding;
+pub mod projects;
 pub mod settings;
