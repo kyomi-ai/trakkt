@@ -21,7 +21,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::components::{
-    Avatar, Button, ButtonSize, ButtonVariant, EmptyState, IssueStatusBadge, IssueStatusVariant,
+    Avatar, Button, ButtonVariant, EmptyState, IssueStatusBadge, IssueStatusVariant,
     LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton, StyledSelect,
     INPUT_CLASS,
 };
