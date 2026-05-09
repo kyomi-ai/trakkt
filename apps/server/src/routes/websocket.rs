@@ -343,14 +343,35 @@ async fn handle_sync_bootstrap(
             vec![]
         });
 
-    // 3. Get the current sync watermark.
+    // 3. Fetch statuses, teams, and projects.
+    let statuses = trakkt_auth::status_service::list_statuses(db, workspace_id, None)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(user_id, workspace_id, error = %e, "list_statuses failed during bootstrap");
+            vec![]
+        });
+
+    let teams = trakkt_auth::team_service::list_teams(db, workspace_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(user_id, workspace_id, error = %e, "list_teams failed during bootstrap");
+            vec![]
+        });
+
+    let projects = trakkt_auth::project_service::list_projects(db, workspace_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(user_id, workspace_id, error = %e, "list_projects failed during bootstrap");
+            vec![]
+        });
+
+    // 4. Get the current sync watermark.
     let latest_sync_id =
         trakkt_auth::sync_log_service::get_latest_sync_id(db, workspace_id)
             .await
             .unwrap_or(0);
 
-    // 4. Stream each entity as a SyncAction with action=Insert.
-    // Serialize issues to JSON Values for stream_entities.
+    // 5. Stream each entity as a SyncAction with action=Insert.
     let issue_values: Vec<serde_json::Value> = issues
         .iter()
         .filter_map(|i| serde_json::to_value(i).ok())
@@ -363,7 +384,25 @@ async fn handle_sync_bootstrap(
         .collect();
     stream_entities(manager, user_id, workspace_id, entity_types::LABEL, "label_id", label_values).await;
 
-    // 5. Signal completion with the current sync watermark.
+    let status_values: Vec<serde_json::Value> = statuses
+        .iter()
+        .filter_map(|s| serde_json::to_value(s).ok())
+        .collect();
+    stream_entities(manager, user_id, workspace_id, entity_types::STATUS, "status_id", status_values).await;
+
+    let team_values: Vec<serde_json::Value> = teams
+        .iter()
+        .filter_map(|t| serde_json::to_value(t).ok())
+        .collect();
+    stream_entities(manager, user_id, workspace_id, entity_types::TEAM, "team_id", team_values).await;
+
+    let project_values: Vec<serde_json::Value> = projects
+        .iter()
+        .filter_map(|p| serde_json::to_value(p).ok())
+        .collect();
+    stream_entities(manager, user_id, workspace_id, entity_types::PROJECT, "project_id", project_values).await;
+
+    // 6. Signal completion with the current sync watermark.
     send_sync_response(
         manager,
         user_id,
