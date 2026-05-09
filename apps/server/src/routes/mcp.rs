@@ -412,6 +412,10 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "team_id": {
+                            "type": "string",
+                            "description": "Filter by team ID. Use list_issues without this filter first to discover team_id values from the results."
+                        },
                         "status_id": {
                             "type": "string",
                             "description": "Filter by status ID (e.g. 'workspace-id::backlog'). Use list_statuses to get valid IDs."
