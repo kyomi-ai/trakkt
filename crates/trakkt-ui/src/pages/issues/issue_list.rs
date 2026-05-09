@@ -21,15 +21,16 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::components::{
-    Avatar, Button, ButtonVariant, EmptyState,
-    IssueStatusBadge, IssueStatusVariant, LabelBadge, Modal, ModalSize, PriorityIndicator,
+    Alert, AlertVariant,
+    Button, ButtonVariant, EmptyState,
+    Modal, ModalSize,
     SearchInput, StyledSelect, INPUT_CLASS,
 };
 use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown};
+use crate::pages::issues::issue_row::IssueRow;
 use crate::server_fns::issues::{create_issue, list_issues};
-use crate::utils::date::format_short_date;
 use crate::utils::keyboard::is_input_focused;
-use trakkt_types::models::{IssueWithDetails, Team};
+use trakkt_types::models::Team;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue List Page
@@ -70,6 +71,9 @@ fn IssueListInner(
     let (status_filter, set_status_filter) = signal(String::new());
     let (priority_filter, set_priority_filter) = signal(String::new());
 
+    // ── Error state for server function failures ──────────────────────────
+    let error_msg = RwSignal::new(Option::<String>::None);
+
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (version, set_version) = signal(0u32);
@@ -88,9 +92,11 @@ fn IssueListInner(
     });
 
     // Server function fallback — used for initial load before sync is ready.
+    // When on a team-scoped page, pass the resolved team_id so the server
+    // returns only that team's issues (important for SSR initial load).
     let server_issues = Resource::new(
-        move || version.get(),
-        move |_| async move { list_issues(None, None, None, None, None, None, None).await },
+        move || (version.get(), resolved_team.get().map(|t| t.team_id.clone())),
+        move |(_, team_id)| async move { list_issues(team_id, None, None, None, None, None, None, None).await },
     );
 
     // Filtered issue list — reads from SyncStore when initialized, otherwise
@@ -103,17 +109,31 @@ fn IssueListInner(
                 issues
             } else {
                 // Store not initialized yet — use server function result
-                server_issues
-                    .get()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default()
+                match server_issues.get() {
+                    Some(Ok(items)) => {
+                        error_msg.set(None);
+                        items
+                    }
+                    Some(Err(e)) => {
+                        error_msg.set(Some(format!("Failed to load issues: {e}")));
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
             }
         } else {
             // No store (SSR) — use server function
-            server_issues
-                .get()
-                .and_then(|r| r.ok())
-                .unwrap_or_default()
+            match server_issues.get() {
+                Some(Ok(items)) => {
+                    error_msg.set(None);
+                    items
+                }
+                Some(Err(e)) => {
+                    error_msg.set(Some(format!("Failed to load issues: {e}")));
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
         };
 
         // When a team_key was requested but hasn't resolved yet, return empty (loading state).
@@ -271,6 +291,15 @@ fn IssueListInner(
                 <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
             </div>
 
+            // ── Error alert ─────────────────────────────────────────────────
+            <Show when=move || error_msg.get().is_some()>
+                <div class="mx-4 mt-4">
+                    <Alert variant=AlertVariant::Error>
+                        {move || error_msg.get().unwrap_or_default()}
+                    </Alert>
+                </div>
+            </Show>
+
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto">
                 {move || {
@@ -330,111 +359,6 @@ fn IssueListInner(
             on_created=on_issue_created
             team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
         />
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Issue Row
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A single issue row in the list.
-///
-/// DESIGN.md Issue Row Pattern:
-/// ```text
-/// [priority] [status] TRK-42  Fix login redirect loop  [bug] [auth]  May 8  @j
-/// ```
-///
-/// Row height: 36px (h-9), padding: px-3 py-[6px], gap: gap-2.5
-///
-/// Supports keyboard navigation highlighting: when `selected_index` matches
-/// `index`, the row renders with a distinct selected background.
-#[component]
-fn IssueRow(
-    issue: IssueWithDetails,
-    /// This row's index in the list.
-    index: usize,
-    /// The currently keyboard-selected index (None = no selection).
-    #[prop(into)]
-    selected_index: Signal<Option<usize>>,
-) -> impl IntoView {
-    let number = issue.number;
-    let issue_key = format!("{}-{}", issue.team_key, issue.number);
-    let issue_href = format!("/issues/{number}");
-    let status = IssueStatusVariant::parse(&issue.status_category);
-    let row_ref = NodeRef::<leptos::html::A>::new();
-
-    let is_selected = Memo::new(move |_| selected_index.get() == Some(index));
-
-    // Scroll the selected row into view when keyboard-navigated.
-    Effect::new(move || {
-        if is_selected.get() && let Some(el) = row_ref.get() {
-            let opts = web_sys::ScrollIntoViewOptions::new();
-            opts.set_block(web_sys::ScrollLogicalPosition::Nearest);
-            el.scroll_into_view_with_scroll_into_view_options(&opts);
-        }
-    });
-
-    let row_class = move || {
-        if is_selected.get() {
-            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border bg-primary/5 ring-1 ring-primary/20 focus-visible:outline-none transition-colors cursor-pointer no-underline text-inherit"
-        } else {
-            "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer no-underline text-inherit"
-        }
-    };
-
-    view! {
-        <a
-            node_ref=row_ref
-            href=issue_href
-            class=row_class
-            role="listitem"
-            tabindex="0"
-        >
-            // Priority icon (first — most important for triage scanning)
-            <PriorityIndicator priority=issue.priority/>
-
-            // Status icon
-            <IssueStatusBadge status=status/>
-
-            // Issue ID (Geist Mono)
-            <span class="font-mono text-xs text-muted-foreground shrink-0">
-                {issue_key}
-            </span>
-
-            // Title
-            <span class="text-sm font-medium text-foreground flex-1 truncate">
-                {issue.title.clone()}
-            </span>
-
-            // Labels
-            <div class="hidden sm:flex items-center gap-1 shrink-0">
-                {issue.labels.iter().map(|label| {
-                    view! {
-                        <LabelBadge
-                            name=label.name.clone()
-                            color=label.color.clone()
-                        />
-                    }
-                }).collect_view()}
-            </div>
-
-            // Date (Geist Mono)
-            <span class="font-mono text-xs text-muted-foreground shrink-0 hidden sm:inline">
-                {format_short_date(&issue.created_at)}
-            </span>
-
-            // Assignee avatar (18px)
-            {if issue.assignee_name.is_some() {
-                view! {
-                    <Avatar name=issue.assignee_name.clone().unwrap_or_default()/>
-                }.into_any()
-            } else {
-                // Empty placeholder to keep alignment
-                view! {
-                    <span class="w-[18px] h-[18px] shrink-0"></span>
-                }.into_any()
-            }}
-        </a>
     }
 }
 
