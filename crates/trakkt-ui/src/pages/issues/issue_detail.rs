@@ -169,13 +169,28 @@ pub fn IssueDetailPage() -> impl IntoView {
             .unwrap_or(0)
     });
 
-    // ── Data fetching ───────────────────────────────────────────────────
+    // ── Data source: SyncStore (real-time) with server function fallback ───
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (version, set_version) = signal(0u32);
 
-    let issue_resource = Resource::new(
+    let server_issue = Resource::new(
         move || (number.get(), version.get()),
         move |(num, _)| async move { get_issue(num).await },
     );
+
+    let issue_data = Memo::new(move |_| {
+        let num = number.get();
+        if let Some(store) = sync_store {
+            let items = store.issues().get();
+            if let Some(issue) = items.iter().find(|i| i.number == num) {
+                return Some(Ok(Some(issue.clone())));
+            }
+            if store.initialized().get() {
+                return Some(Ok(None));
+            }
+        }
+        server_issue.get()
+    });
 
     let comments_resource = Resource::new(
         move || (number.get(), version.get()),
@@ -206,46 +221,46 @@ pub fn IssueDetailPage() -> impl IntoView {
 
             // ── Content ────────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto p-4 md:p-6">
-                <Transition fallback=move || view! { <IssueDetailSkeleton/> }>
-                    {move || Suspend::new(async move {
-                        let issue_result = issue_resource.await;
-                        let comments_result = comments_resource.await;
-
-                        match issue_result {
-                            Ok(Some(ref issue)) => {
-                                let comments = comments_result.unwrap_or_default();
-                                let issue = issue.clone();
-                                let refetch = refetch;
-                                view! {
+                {move || {
+                    match issue_data.get() {
+                        Some(Ok(Some(issue))) => {
+                            let comments = comments_resource.get()
+                                .and_then(|r| r.ok())
+                                .unwrap_or_default();
+                            let refetch = refetch;
+                            let created = relative_time(&issue.created_at);
+                            let updated = relative_time(&issue.updated_at);
+                            view! {
+                                <div class="max-w-[860px] mx-auto w-full">
                                     <IssueDetailContent
-                                        issue=issue.clone()
+                                        issue=issue
                                         comments=comments
                                         on_change=Callback::new(move |()| refetch())
                                     />
-                                    // ── Footer: timestamps ─────────────────────
-                                    <div class="max-w-[860px] mx-auto w-full mt-6 pb-4">
+                                    <div class="mt-6 pb-4">
                                         <div class="flex items-center gap-4 text-xs text-muted-foreground">
-                                            <span>{format!("Created {}", relative_time(&issue.created_at))}</span>
-                                            <span>{format!("Updated {}", relative_time(&issue.updated_at))}</span>
+                                            <span>{format!("Created {created}")}</span>
+                                            <span>{format!("Updated {updated}")}</span>
                                         </div>
                                     </div>
-                                }.into_any()
-                            }
-                            Ok(None) => {
-                                view! {
-                                    <IssueNotFound number=number.get()/>
-                                }.into_any()
-                            }
-                            Err(_) => {
-                                view! {
-                                    <div class="max-w-[860px] mx-auto w-full text-center py-16">
-                                        <p class="text-muted-foreground">"Failed to load issue. Please try again."</p>
-                                    </div>
-                                }.into_any()
-                            }
+                                </div>
+                            }.into_any()
                         }
-                    })}
-                </Transition>
+                        Some(Ok(None)) => {
+                            view! { <IssueNotFound number=number.get()/> }.into_any()
+                        }
+                        Some(Err(_)) => {
+                            view! {
+                                <div class="max-w-[860px] mx-auto w-full text-center py-16">
+                                    <p class="text-muted-foreground">"Failed to load issue. Please try again."</p>
+                                </div>
+                            }.into_any()
+                        }
+                        None => {
+                            view! { <IssueDetailSkeleton/> }.into_any()
+                        }
+                    }
+                }}
             </div>
         </div>
     }

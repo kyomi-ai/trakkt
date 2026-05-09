@@ -63,58 +63,56 @@ fn group_by_status(statuses: &[Status], all: &[IssueWithDetails]) -> Vec<(Status
 /// Kanban board page — issues arranged in status columns with drag-and-drop.
 #[component]
 pub fn BoardPage() -> impl IntoView {
-    // ── Data fetching ───────────────────────────────────────────────────────
-    let (version, set_version) = signal(0u32);
+    // ── Data source: SyncStore (real-time) with server function fallback ───
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
 
-    let issues_resource = Resource::new(
-        move || version.get(),
+    let server_issues = Resource::new(
+        || (),
         move |_| async move { list_issues(None, None, None, None, None, None, None).await },
     );
 
-    // Fetch statuses once (no team filter — show all workspace statuses).
-    let statuses_resource = Resource::new(
+    let issues = Memo::new(move |_| {
+        if let Some(store) = sync_store {
+            let items = store.issues().get();
+            if !items.is_empty() || store.initialized().get() {
+                return items;
+            }
+        }
+        server_issues.get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+    });
+
+    // Statuses from SyncStore, with server function fallback.
+    let server_statuses = Resource::new(
         || (),
         move |_| async move { list_statuses(None).await },
     );
 
+    let statuses = Memo::new(move |_| {
+        if let Some(store) = sync_store {
+            let items = store.statuses().get();
+            if !items.is_empty() || store.initialized().get() {
+                return items;
+            }
+        }
+        server_statuses.get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+    });
+
     // ── Drag state ──────────────────────────────────────────────────────────
-    // The issue_id of the card currently being dragged.
     let (dragging, set_dragging) = signal(Option::<String>::None);
-    // The status_id of the column currently being dragged over.
     let (drag_target, set_drag_target) = signal(Option::<String>::None);
-
-    // ── Local issues for optimistic updates ─────────────────────────────────
-    // When the resource resolves, we copy its data into a local signal.
-    // This lets us move cards optimistically before the server responds.
-    let (local_issues, set_local_issues) = signal(Vec::<IssueWithDetails>::new());
-
-    // Sync resource data into local_issues whenever the resource resolves.
-    Effect::new(move || {
-        if let Some(Ok(ref list)) = issues_resource.get() {
-            set_local_issues.set(list.clone());
-        }
-    });
-
-    // ── Resolved statuses (for grouping) ────────────────────────────────────
-    let (local_statuses, set_local_statuses) = signal(Vec::<Status>::new());
-
-    Effect::new(move || {
-        if let Some(Ok(ref list)) = statuses_resource.get() {
-            set_local_statuses.set(list.clone());
-        }
-    });
 
     // ── Drop handler ────────────────────────────────────────────────────────
     let handle_drop = move |issue_id: String, target_status_id: String| {
-        // Find the issue and its current status_id.
-        let current_issues = local_issues.get_untracked();
-        let issue = current_issues.iter().find(|i| i.issue_id == issue_id);
-        let issue = match issue {
+        let current_issues = issues.get_untracked();
+        let issue = match current_issues.iter().find(|i| i.issue_id == issue_id) {
             Some(i) => i.clone(),
             None => return,
         };
 
-        // Same-column drop is a no-op.
         if issue.status_id == target_status_id {
             return;
         }
@@ -124,51 +122,36 @@ pub fn BoardPage() -> impl IntoView {
         let old_status_category = issue.status_category.clone();
         let issue_number = issue.number;
 
-        // Look up the target status to update display fields optimistically.
-        let statuses = local_statuses.get_untracked();
-        let target_status = statuses.iter().find(|s| s.status_id == target_status_id);
+        let current_statuses = statuses.get_untracked();
+        let target_status = current_statuses.iter().find(|s| s.status_id == target_status_id);
         let target_name = target_status.map(|s| s.name.clone()).unwrap_or_default();
         let target_category = target_status.map(|s| s.category.clone()).unwrap_or_default();
 
-        // Optimistic update: move card to new column immediately.
-        set_local_issues.update(|issues| {
-            if let Some(i) = issues.iter_mut().find(|i| i.issue_id == issue_id) {
-                i.status_id = target_status_id.clone();
-                i.status_name = target_name;
-                i.status_category = target_category;
-            }
-        });
+        // Optimistic update via SyncStore.
+        if let Some(store) = sync_store {
+            let mut updated = issue.clone();
+            updated.status_id = target_status_id.clone();
+            updated.status_name = target_name;
+            updated.status_category = target_category;
+            store.upsert_issue(updated);
+        }
 
-        // Server update.
         let target_id_for_server = target_status_id.clone();
         leptos::task::spawn_local(async move {
-            match update_issue(
+            if let Err(e) = update_issue(
                 issue_number,
-                None, // title
-                None, // description
+                None, None,
                 Some(target_id_for_server),
-                None, // priority
-                None, // assignee_id
-                None, // due_date
-                None, // project_id
-                None, // milestone_id
-            )
-            .await
-            {
-                Ok(_) => {
-                    // Bump version to refetch and get canonical server state.
-                    set_version.update(|v| *v += 1);
-                }
-                Err(e) => {
-                    // Revert optimistic update on failure.
-                    tracing::warn!("Failed to update issue status: {e}");
-                    set_local_issues.update(|issues| {
-                        if let Some(i) = issues.iter_mut().find(|i| i.issue_id == issue_id) {
-                            i.status_id = old_status_id;
-                            i.status_name = old_status_name;
-                            i.status_category = old_status_category;
-                        }
-                    });
+                None, None, None, None, None,
+            ).await {
+                tracing::warn!("Failed to update issue status: {e}");
+                // Revert optimistic update on failure.
+                if let Some(store) = sync_store {
+                    let mut reverted = issue;
+                    reverted.status_id = old_status_id;
+                    reverted.status_name = old_status_name;
+                    reverted.status_category = old_status_category;
+                    store.upsert_issue(reverted);
                 }
             }
         });
@@ -184,55 +167,39 @@ pub fn BoardPage() -> impl IntoView {
 
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-x-auto px-4 md:px-6 py-4" style="scrollbar-width: thin;">
-                <Transition fallback=move || view! { <BoardSkeleton/> }>
-                    {move || {
-                        let issues_state = issues_resource.get();
-                        let statuses_state = statuses_resource.get();
-                        match (issues_state, statuses_state) {
-                            (None, _) | (_, None) => {
-                                // Still loading — show skeleton.
-                                view! { <BoardSkeleton/> }.into_any()
-                            }
-                            (Some(Err(_)), _) | (_, Some(Err(_))) => {
-                                view! {
-                                    <div class="flex items-center justify-center h-full text-muted-foreground">
-                                        "Failed to load board. Please try again."
-                                    </div>
-                                }.into_any()
-                            }
-                            (Some(Ok(_)), Some(Ok(_))) => {
-                                // Use local signals for rendering (supports optimistic updates).
-                                let grouped = move || group_by_status(&local_statuses.get(), &local_issues.get());
-
-                                view! {
-                                    <div class="flex gap-4 h-full">
-                                        {move || grouped().into_iter().map(|(status, issues)| {
-                                            let status_id = status.status_id.clone();
-                                            let status_name = status.name.clone();
-                                            let status_variant = IssueStatusVariant::parse(&status.category);
-                                            let count = issues.len();
-
-                                            view! {
-                                                <BoardColumn
-                                                    status_id=status_id
-                                                    label=status_name
-                                                    status_variant=status_variant
-                                                    count=count
-                                                    issues=issues
-                                                    dragging=dragging
-                                                    set_dragging=set_dragging
-                                                    drag_target=drag_target
-                                                    set_drag_target=set_drag_target
-                                                    on_drop=handle_drop
-                                                />
-                                            }
-                                        }).collect_view()}
-                                    </div>
-                                }.into_any()
-                            }
-                        }
-                    }}
-                </Transition>
+                {move || {
+                    let s = statuses.get();
+                    let i = issues.get();
+                    if s.is_empty() && i.is_empty() && sync_store.map(|s| !s.initialized().get()).unwrap_or(true) {
+                        view! { <BoardSkeleton/> }.into_any()
+                    } else {
+                        let grouped = move || group_by_status(&statuses.get(), &issues.get());
+                        view! {
+                            <div class="flex gap-4 h-full">
+                                {move || grouped().into_iter().map(|(status, issues)| {
+                                    let status_id = status.status_id.clone();
+                                    let status_name = status.name.clone();
+                                    let status_variant = IssueStatusVariant::parse(&status.category);
+                                    let count = issues.len();
+                                    view! {
+                                        <BoardColumn
+                                            status_id=status_id
+                                            label=status_name
+                                            status_variant=status_variant
+                                            count=count
+                                            issues=issues
+                                            dragging=dragging
+                                            set_dragging=set_dragging
+                                            drag_target=drag_target
+                                            set_drag_target=set_drag_target
+                                            on_drop=handle_drop
+                                        />
+                                    }
+                                }).collect_view()}
+                            </div>
+                        }.into_any()
+                    }
+                }}
             </div>
         </div>
     }
