@@ -50,7 +50,7 @@ pub fn TeamsSettingsPage() -> impl IntoView {
     let create_action = Action::new(move |(name, key): &(String, String)| {
         let name = name.clone();
         let key = key.clone();
-        async move { create_team(name, key).await }
+        async move { create_team(name, key, None, None).await }
     });
 
     // React to action completion

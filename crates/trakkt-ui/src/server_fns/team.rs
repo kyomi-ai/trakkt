@@ -11,7 +11,7 @@
 
 use leptos::prelude::*;
 
-use crate::types::{OwnershipTransferData, TeamInvitation, TeamMember};
+use crate::types::{OwnershipTransferData, TeamInvitation, WorkspaceMember};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers (server-only)
@@ -73,7 +73,7 @@ async fn get_current_workspace(
 ///
 /// Mirrors `GET /api/v1/workspaces/members` in workspaces.rs.
 #[server(prefix = "/leptos-api")]
-pub async fn list_workspace_members() -> Result<Vec<TeamMember>, ServerFnError> {
+pub async fn list_workspace_members() -> Result<Vec<WorkspaceMember>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
 
     let workspace = get_current_workspace(ac.db(), &ac.ws_id).await?;
@@ -84,7 +84,7 @@ pub async fn list_workspace_members() -> Result<Vec<TeamMember>, ServerFnError> 
 
     let result = members
         .iter()
-        .map(|m| TeamMember {
+        .map(|m| WorkspaceMember {
             user_id: m.user_id.clone(),
             email: m.email.clone(),
             name: m.name.clone(),

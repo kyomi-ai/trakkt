@@ -8,7 +8,7 @@
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
-use trakkt_types::models::Team;
+use trakkt_types::models::{IssueTeamMember, Team};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
@@ -23,6 +23,8 @@ struct TeamRow {
     workspace_id: String,
     name: String,
     key: String,
+    description: Option<String>,
+    icon: Option<String>,
     created_at: String,
 }
 
@@ -33,6 +35,32 @@ impl TeamRow {
             workspace_id: self.workspace_id,
             name: self.name,
             key: self.key,
+            description: self.description,
+            icon: self.icon,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Internal row type for deserialising `team_members` JOIN query results.
+#[derive(sqlx::FromRow)]
+struct TeamMemberRow {
+    team_id: String,
+    user_id: String,
+    user_name: Option<String>,
+    user_email: String,
+    role: String,
+    created_at: String,
+}
+
+impl TeamMemberRow {
+    fn into_dto(self) -> IssueTeamMember {
+        IssueTeamMember {
+            team_id: self.team_id,
+            user_id: self.user_id,
+            user_name: self.user_name,
+            user_email: self.user_email,
+            role: self.role,
             created_at: self.created_at,
         }
     }
@@ -41,11 +69,16 @@ impl TeamRow {
 // ─── Service functions ──────────────────────────────────────────────────────
 
 /// Create a new team in a workspace.
+///
+/// If `creator_id` is provided, the creator is automatically added as a `lead` member.
 pub async fn create_team(
     db: &DbPool,
     workspace_id: &str,
     name: &str,
     key: &str,
+    description: Option<&str>,
+    icon: Option<&str>,
+    creator_id: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Team> {
     let is_pg = db.is_postgres();
@@ -53,10 +86,10 @@ pub async fn create_team(
     let team_id = uuid::Uuid::new_v4().to_string();
 
     let sql = format!(
-        "INSERT INTO teams (team_id, workspace_id, name, key, created_at) \
-         VALUES ($1, $2, $3, $4, {now})"
+        "INSERT INTO teams (team_id, workspace_id, name, key, description, icon, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, {now})"
     );
-    trakkt_core::db_execute!(db, &sql, &team_id, workspace_id, name, key)?;
+    trakkt_core::db_execute!(db, &sql, &team_id, workspace_id, name, key, description, icon)?;
 
     if let Err(e) = sync_log_service::write_sync_entry(
         db,
@@ -76,11 +109,17 @@ pub async fn create_team(
         sync_log_service::broadcast_sync_notify(ws, entity_types::TEAM, workspace_id).await;
     }
 
+    // Auto-add creator as lead member if provided.
+    if let Some(uid) = creator_id {
+        add_team_member(db, &team_id, uid, "lead", workspace_id).await?;
+    }
+
     // Re-fetch to get the DB-assigned created_at.
     let row = trakkt_core::db_fetch_one!(
         db,
         TeamRow,
-        "SELECT team_id, workspace_id, name, key, CAST(created_at AS TEXT) AS created_at \
+        "SELECT team_id, workspace_id, name, key, description, icon, \
+                CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         &team_id
     )?;
@@ -95,7 +134,8 @@ pub async fn list_teams(
     let rows: Vec<TeamRow> = trakkt_core::db_fetch_all!(
         db,
         TeamRow,
-        "SELECT team_id, workspace_id, name, key, CAST(created_at AS TEXT) AS created_at \
+        "SELECT team_id, workspace_id, name, key, description, icon, \
+                CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC",
         workspace_id
     )?;
@@ -110,7 +150,8 @@ pub async fn get_team(
     let row = trakkt_core::db_fetch_optional!(
         db,
         TeamRow,
-        "SELECT team_id, workspace_id, name, key, CAST(created_at AS TEXT) AS created_at \
+        "SELECT team_id, workspace_id, name, key, description, icon, \
+                CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
     )?;
@@ -126,7 +167,8 @@ pub async fn get_team_by_key(
     let row = trakkt_core::db_fetch_optional!(
         db,
         TeamRow,
-        "SELECT team_id, workspace_id, name, key, CAST(created_at AS TEXT) AS created_at \
+        "SELECT team_id, workspace_id, name, key, description, icon, \
+                CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 AND key = $2",
         workspace_id,
         key
@@ -144,7 +186,8 @@ pub async fn get_default_team(
     let row = trakkt_core::db_fetch_optional!(
         db,
         TeamRow,
-        "SELECT team_id, workspace_id, name, key, CAST(created_at AS TEXT) AS created_at \
+        "SELECT team_id, workspace_id, name, key, description, icon, \
+                CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1",
         workspace_id
     )?;
@@ -154,4 +197,149 @@ pub async fn get_default_team(
             "no teams found in workspace {workspace_id}"
         ))),
     }
+}
+
+// ─── Team membership ────────────────────────────────────────────────────────
+
+/// List all members of a team, with joined user details.
+pub async fn list_team_members(
+    db: &DbPool,
+    team_id: &str,
+) -> trakkt_core::Result<Vec<IssueTeamMember>> {
+    let rows: Vec<TeamMemberRow> = trakkt_core::db_fetch_all!(
+        db,
+        TeamMemberRow,
+        "SELECT tm.team_id, tm.user_id, u.name AS user_name, u.email AS user_email, \
+                tm.role, CAST(tm.created_at AS TEXT) AS created_at \
+         FROM team_members tm \
+         JOIN users u ON u.user_id = tm.user_id \
+         WHERE tm.team_id = $1 \
+         ORDER BY tm.created_at ASC",
+        team_id
+    )?;
+    Ok(rows.into_iter().map(TeamMemberRow::into_dto).collect())
+}
+
+/// Add a user to a team. No-op if the user is already a member.
+pub async fn add_team_member(
+    db: &DbPool,
+    team_id: &str,
+    user_id: &str,
+    role: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<()> {
+    let is_pg = db.is_postgres();
+    let now = sql_compat::now(is_pg);
+
+    let sql = if is_pg {
+        format!(
+            "INSERT INTO team_members (team_id, user_id, role, created_at) \
+             VALUES ($1, $2, $3, {now}) \
+             ON CONFLICT DO NOTHING"
+        )
+    } else {
+        format!(
+            "INSERT OR IGNORE INTO team_members (team_id, user_id, role, created_at) \
+             VALUES ($1, $2, $3, {now})"
+        )
+    };
+    trakkt_core::db_execute!(db, &sql, team_id, user_id, role)?;
+
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        SyncActionType::Update,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to write sync log for team member add");
+    }
+
+    Ok(())
+}
+
+/// Remove a user from a team.
+pub async fn remove_team_member(
+    db: &DbPool,
+    team_id: &str,
+    user_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<()> {
+    trakkt_core::db_execute!(
+        db,
+        "DELETE FROM team_members WHERE team_id = $1 AND user_id = $2",
+        team_id,
+        user_id
+    )?;
+
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        SyncActionType::Update,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to write sync log for team member remove");
+    }
+
+    Ok(())
+}
+
+/// Update a team member's role.
+pub async fn update_team_member_role(
+    db: &DbPool,
+    team_id: &str,
+    user_id: &str,
+    role: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<()> {
+    trakkt_core::db_execute!(
+        db,
+        "UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id = $3",
+        role,
+        team_id,
+        user_id
+    )?;
+
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        SyncActionType::Update,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to write sync log for team member role update");
+    }
+
+    Ok(())
+}
+
+/// Get all teams a user belongs to within a workspace.
+pub async fn get_user_teams(
+    db: &DbPool,
+    workspace_id: &str,
+    user_id: &str,
+) -> trakkt_core::Result<Vec<Team>> {
+    let rows: Vec<TeamRow> = trakkt_core::db_fetch_all!(
+        db,
+        TeamRow,
+        "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                CAST(t.created_at AS TEXT) AS created_at \
+         FROM teams t \
+         JOIN team_members tm ON tm.team_id = t.team_id \
+         WHERE t.workspace_id = $1 AND tm.user_id = $2 \
+         ORDER BY t.created_at ASC",
+        workspace_id,
+        user_id
+    )?;
+    Ok(rows.into_iter().map(TeamRow::into_dto).collect())
 }

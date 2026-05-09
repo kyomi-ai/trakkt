@@ -59,6 +59,9 @@ pub async fn auto_provision_personal_mode(db: &DbPool) -> Result<(), trakkt_core
     );
     db_execute!(db, &team_sql, "team-local", "workspace-local", "Default", "TRK")?;
 
+    // Add user-local as team lead of the default team
+    trakkt_auth::team_service::add_team_member(db, "team-local", "user-local", "lead", "workspace-local").await?;
+
     // Seed default statuses so issues can use status_id FK.
     trakkt_auth::status_service::seed_default_statuses(db, "workspace-local").await?;
 

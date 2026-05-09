@@ -18,6 +18,22 @@ pub struct Team {
     pub workspace_id: String,
     pub name: String,
     pub key: String,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub created_at: String,
+}
+
+/// A member of an issue-tracker team (team_members join table).
+///
+/// Distinct from workspace membership — this tracks which users belong to
+/// specific teams within a workspace, for defaults and notification routing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueTeamMember {
+    pub team_id: String,
+    pub user_id: String,
+    pub user_name: Option<String>,
+    pub user_email: String,
+    pub role: String,
     pub created_at: String,
 }
 

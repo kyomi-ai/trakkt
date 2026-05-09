@@ -41,10 +41,24 @@ pub async fn get_default_team() -> Result<Team, ServerFnError> {
 
 /// Create a new issue-tracker team in the current workspace.
 #[server(prefix = "/leptos-api")]
-pub async fn create_team(name: String, key: String) -> Result<Team, ServerFnError> {
+pub async fn create_team(
+    name: String,
+    key: String,
+    description: Option<String>,
+    icon: Option<String>,
+) -> Result<Team, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let team = trakkt_auth::team_service::create_team(ac.db(), &ac.ws_id, &name, &key, ac.ctx.ws_manager.as_ref())
-        .await
-        .into_sfn()?;
+    let team = trakkt_auth::team_service::create_team(
+        ac.db(),
+        &ac.ws_id,
+        &name,
+        &key,
+        description.as_deref(),
+        icon.as_deref(),
+        Some(&ac.auth.user_id),
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(team)
 }

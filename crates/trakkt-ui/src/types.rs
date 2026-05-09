@@ -43,8 +43,10 @@ pub struct WorkspaceSettingsData {
 /// A workspace member with user details.
 ///
 /// Mirrors the JSON shape returned by `GET /api/v1/workspaces/members`.
+/// Named `WorkspaceMember` to distinguish from `IssueTeamMember` which
+/// represents membership in an issue-tracker team.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TeamMember {
+pub struct WorkspaceMember {
     pub user_id: String,
     pub email: String,
     pub name: Option<String>,

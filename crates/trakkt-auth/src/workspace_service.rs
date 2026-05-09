@@ -519,6 +519,20 @@ pub async fn accept_invitation_for_user(
     let db_role = invitation.role.as_ref();
     create_workspace_user(pool, &invitation.workspace_id, user_id, db_role).await?;
     accept_invitation(pool, invitation_id, user_id).await?;
+
+    // Add the user to the workspace's default team.
+    if let Ok(default_team) = crate::team_service::get_default_team(pool, &invitation.workspace_id).await {
+        if let Err(e) = crate::team_service::add_team_member(
+            pool,
+            &default_team.team_id,
+            user_id,
+            "member",
+            &invitation.workspace_id,
+        ).await {
+            tracing::warn!(error = %e, "Failed to add invited user to default team");
+        }
+    }
+
     Ok(())
 }
 
