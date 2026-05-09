@@ -201,6 +201,20 @@ fn ProjectDetailContent(
                     </StatusBadge>
                 </div>
 
+                // Lead
+                {if project.lead_name.is_some() || project.lead_id.is_some() {
+                    let display = project.lead_name.clone()
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    Some(view! {
+                        <div class="flex items-center gap-2">
+                            <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Lead"</span>
+                            <span class="text-sm text-foreground">{display}</span>
+                        </div>
+                    })
+                } else {
+                    None
+                }}
+
                 // Start date
                 {project.start_date.as_deref().map(|d| {
                     let formatted = format_date(d);

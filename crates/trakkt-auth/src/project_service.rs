@@ -31,6 +31,7 @@ struct ProjectRow {
     color: Option<String>,
     status: String,
     lead_id: Option<String>,
+    lead_name: Option<String>,
     start_date: Option<String>,
     target_date: Option<String>,
     sort_order: f64,
@@ -49,6 +50,7 @@ impl ProjectRow {
             color: self.color,
             status: self.status,
             lead_id: self.lead_id,
+            lead_name: self.lead_name,
             sort_order: self.sort_order,
             start_date: self.start_date,
             target_date: self.target_date,
@@ -132,13 +134,15 @@ impl ProjectUpdateRow {
 
 /// Base SELECT for project queries.
 const PROJECT_SELECT: &str = "\
-    SELECT project_id, workspace_id, name, description, icon, color, status, \
-           lead_id, CAST(start_date AS TEXT) AS start_date, \
-           CAST(target_date AS TEXT) AS target_date, \
-           sort_order, \
-           CAST(created_at AS TEXT) AS created_at, \
-           CAST(updated_at AS TEXT) AS updated_at \
-    FROM projects";
+    SELECT p.project_id, p.workspace_id, p.name, p.description, p.icon, p.color, p.status, \
+           p.lead_id, lead.name AS lead_name, \
+           CAST(p.start_date AS TEXT) AS start_date, \
+           CAST(p.target_date AS TEXT) AS target_date, \
+           p.sort_order, \
+           CAST(p.created_at AS TEXT) AS created_at, \
+           CAST(p.updated_at AS TEXT) AS updated_at \
+    FROM projects p \
+    LEFT JOIN users lead ON lead.user_id = p.lead_id";
 
 /// Base SELECT for milestone queries.
 const MILESTONE_SELECT: &str = "\
@@ -162,7 +166,7 @@ pub async fn list_projects(
     workspace_id: &str,
 ) -> trakkt_core::Result<Vec<Project>> {
     let sql = format!(
-        "{PROJECT_SELECT} WHERE workspace_id = $1 ORDER BY sort_order ASC, created_at ASC"
+        "{PROJECT_SELECT} WHERE p.workspace_id = $1 ORDER BY p.sort_order ASC, p.created_at ASC"
     );
     let rows: Vec<ProjectRow> = trakkt_core::db_fetch_all!(
         db,
@@ -178,7 +182,7 @@ pub async fn get_project(
     db: &DbPool,
     project_id: &str,
 ) -> trakkt_core::Result<Option<Project>> {
-    let sql = format!("{PROJECT_SELECT} WHERE project_id = $1");
+    let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1");
     let row = trakkt_core::db_fetch_optional!(
         db,
         ProjectRow,
@@ -241,7 +245,7 @@ pub async fn create_project(
     }
 
     // Re-fetch to get DB-assigned timestamps.
-    let sql = format!("{PROJECT_SELECT} WHERE project_id = $1");
+    let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1");
     let row = trakkt_core::db_fetch_one!(
         db,
         ProjectRow,
@@ -371,7 +375,7 @@ pub async fn update_project(
     }
 
     // Re-fetch the updated project.
-    let sql = format!("{PROJECT_SELECT} WHERE project_id = $1");
+    let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1");
     let row = trakkt_core::db_fetch_one!(
         db,
         ProjectRow,
@@ -420,7 +424,7 @@ pub async fn delete_project(
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // Fetch workspace_id before delete for the sync log.
-    let sql = format!("{PROJECT_SELECT} WHERE project_id = $1");
+    let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1");
     let row = trakkt_core::db_fetch_optional!(
         db,
         ProjectRow,

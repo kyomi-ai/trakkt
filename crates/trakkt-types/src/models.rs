@@ -122,6 +122,7 @@ pub struct Project {
     pub color: Option<String>,
     pub status: String,
     pub lead_id: Option<String>,
+    pub lead_name: Option<String>,
     pub start_date: Option<String>,
     pub target_date: Option<String>,
     pub sort_order: f64,
