@@ -462,13 +462,17 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "create_issue",
-                "description": "Create a new issue in the workspace. The issue is assigned to the default team and starts in 'backlog' status.",
+                "description": "Create a new issue in the workspace. Specify team_id to assign to a specific team, otherwise uses the default team. Starts in 'backlog' status.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "title": {
                             "type": "string",
                             "description": "Issue title (required)"
+                        },
+                        "team_id": {
+                            "type": "string",
+                            "description": "Team ID to assign the issue to. If omitted, uses the default team."
                         },
                         "description": {
                             "type": "string",
@@ -797,7 +801,7 @@ async fn tool_get_issue(
     serde_json::to_string_pretty(&result).map_err(trakkt_core::Error::from)
 }
 
-/// create_issue — create a new issue in the default team.
+/// create_issue — create a new issue in the specified or default team.
 async fn tool_create_issue(
     args: &Value,
     auth: &McpAuth,
@@ -805,8 +809,13 @@ async fn tool_create_issue(
 ) -> trakkt_core::Result<String> {
     let title = arg_str(args, "title")?;
 
-    // Resolve the default team for the workspace.
-    let default_team = team_service::get_default_team(&state.db, &auth.workspace_id).await?;
+    let resolved_team_id = match args.get("team_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            let default_team = team_service::get_default_team(&state.db, &auth.workspace_id).await?;
+            default_team.team_id
+        }
+    };
 
     let label_ids: Vec<String> = args
         .get("labels")
@@ -820,7 +829,7 @@ async fn tool_create_issue(
 
     let params = CreateIssueParams {
         workspace_id: auth.workspace_id.clone(),
-        team_id: default_team.team_id,
+        team_id: resolved_team_id,
         creator_id: auth.user_id.clone(),
         title: title.to_string(),
         description: args.get("description").and_then(|v| v.as_str()).map(String::from),
