@@ -250,6 +250,15 @@ pub async fn create_workspace_for_user(
     );
     trakkt_core::db_execute!(pool, &ws_user_sql, &workspace_id, user_id)?;
 
+    // Create default team so issues can be created immediately
+    let team_id = format!("team-{}", uuid::Uuid::new_v4());
+    trakkt_core::db_execute!(
+        pool,
+        "INSERT INTO teams (team_id, workspace_id, name, key, created_at) \
+         VALUES ($1, $2, 'Default', 'TRK', NOW())",
+        &team_id, &workspace_id
+    )?;
+
     // Set as last workspace
     update_last_workspace(pool, user_id, &workspace_id).await?;
 
