@@ -2,7 +2,8 @@
 
 //! Reactive in-memory store for synced metadata.
 //!
-//! `SyncStore` is the single source of truth for list pages (issues, labels).
+//! `SyncStore` is the single source of truth for list pages (issues, labels,
+//! teams, projects).
 //! It is populated from IndexedDB on startup (hydration) and kept current by
 //! the sync engine as delta events arrive over WebSocket.
 //!
@@ -14,7 +15,7 @@
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
-use trakkt_types::models::{IssueWithDetails, Label, Status};
+use trakkt_types::models::{IssueWithDetails, Label, Project, Status, Team};
 
 // ── Inner storage ─────────────────────────────────────────────────────────────
 
@@ -27,6 +28,8 @@ struct SyncStoreInner {
     issues: ArcRwSignal<Vec<IssueWithDetails>>,
     labels: ArcRwSignal<Vec<Label>>,
     statuses: ArcRwSignal<Vec<Status>>,
+    teams: ArcRwSignal<Vec<Team>>,
+    projects: ArcRwSignal<Vec<Project>>,
     initialized: ArcRwSignal<bool>,
 }
 
@@ -60,6 +63,8 @@ impl SyncStore {
                 issues: ArcRwSignal::new(Vec::new()),
                 labels: ArcRwSignal::new(Vec::new()),
                 statuses: ArcRwSignal::new(Vec::new()),
+                teams: ArcRwSignal::new(Vec::new()),
+                projects: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
             })),
         }
@@ -82,6 +87,18 @@ impl SyncStore {
     /// Reactive signal over the current status list.
     pub fn statuses(&self) -> Signal<Vec<Status>> {
         let sig = self.inner.with_value(|inner| inner.statuses.clone());
+        Signal::derive(move || sig.get())
+    }
+
+    /// Reactive signal over the current team list.
+    pub fn teams(&self) -> Signal<Vec<Team>> {
+        let sig = self.inner.with_value(|inner| inner.teams.clone());
+        Signal::derive(move || sig.get())
+    }
+
+    /// Reactive signal over the current project list.
+    pub fn projects(&self) -> Signal<Vec<Project>> {
+        let sig = self.inner.with_value(|inner| inner.projects.clone());
         Signal::derive(move || sig.get())
     }
 
@@ -109,6 +126,16 @@ impl SyncStore {
     /// Replace the entire status list (called during IDB hydration).
     pub fn set_statuses(&self, items: Vec<Status>) {
         self.inner.with_value(|inner| inner.statuses.set(items));
+    }
+
+    /// Replace the entire team list (called during IDB hydration).
+    pub fn set_teams(&self, items: Vec<Team>) {
+        self.inner.with_value(|inner| inner.teams.set(items));
+    }
+
+    /// Replace the entire project list (called during IDB hydration).
+    pub fn set_projects(&self, items: Vec<Project>) {
+        self.inner.with_value(|inner| inner.projects.set(items));
     }
 
     // ── Single-item upserts (live sync) ───────────────────────────────────────
@@ -152,6 +179,32 @@ impl SyncStore {
         });
     }
 
+    /// Insert or update a team by `team_id`.
+    pub fn upsert_team(&self, item: Team) {
+        self.inner.with_value(|inner| {
+            inner.teams.update(|list| {
+                if let Some(existing) = list.iter_mut().find(|t| t.team_id == item.team_id) {
+                    *existing = item;
+                } else {
+                    list.push(item);
+                }
+            });
+        });
+    }
+
+    /// Insert or update a project by `project_id`.
+    pub fn upsert_project(&self, item: Project) {
+        self.inner.with_value(|inner| {
+            inner.projects.update(|list| {
+                if let Some(existing) = list.iter_mut().find(|p| p.project_id == item.project_id) {
+                    *existing = item;
+                } else {
+                    list.push(item);
+                }
+            });
+        });
+    }
+
     // ── Single-item removes (delete sync) ────────────────────────────────────
 
     /// Remove an issue by `issue_id`.
@@ -181,6 +234,24 @@ impl SyncStore {
         });
     }
 
+    /// Remove a team by `team_id`.
+    pub fn remove_team(&self, team_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.teams.update(|list| {
+                list.retain(|t| t.team_id != team_id);
+            });
+        });
+    }
+
+    /// Remove a project by `project_id`.
+    pub fn remove_project(&self, project_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.projects.update(|list| {
+                list.retain(|p| p.project_id != project_id);
+            });
+        });
+    }
+
     // ── State transitions ─────────────────────────────────────────────────────
 
     /// Mark the store as fully hydrated from IndexedDB.
@@ -201,6 +272,8 @@ impl SyncStore {
             inner.issues.set(Vec::new());
             inner.labels.set(Vec::new());
             inner.statuses.set(Vec::new());
+            inner.teams.set(Vec::new());
+            inner.projects.set(Vec::new());
             inner.initialized.set(false);
         });
     }
