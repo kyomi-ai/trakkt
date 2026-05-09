@@ -104,7 +104,7 @@ fn relative_time(timestamp: &str) -> String {
 ///
 /// Since kode's `Theme` is `#[non_exhaustive]`, we start from `Theme::light()`
 /// and override the fields we need.
-fn trakkt_kode_theme() -> kode_leptos::Theme {
+pub(crate) fn trakkt_kode_theme() -> kode_leptos::Theme {
     let mut t = kode_leptos::Theme::light();
     // Core colors — Trakkt warm palette
     t.bg = "#FAFAF8";

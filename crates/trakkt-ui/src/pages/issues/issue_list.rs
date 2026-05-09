@@ -611,19 +611,24 @@ fn NewIssueModal(
                     />
                 </div>
 
-                // Description
+                // Description (WYSIWYG)
                 <div class="space-y-2">
-                    <label for="issue-description" class="text-sm font-medium text-foreground">
+                    <label class="text-sm font-medium text-foreground">
                         "Description"
                     </label>
-                    <textarea
-                        id="issue-description"
-                        rows="4"
-                        placeholder="Add a description..."
-                        class=format!("{INPUT_CLASS} min-h-[100px] resize-y")
-                        prop:value=move || description.get()
-                        on:input=move |ev| set_description.set(event_target_value(&ev))
-                    />
+                    <div class="border border-border rounded-md overflow-hidden" style="min-height: 120px;">
+                        <kode_leptos::TreeWysiwygEditor
+                            content=Signal::stored(String::new())
+                            on_change=Arc::new(move |text: String| {
+                                set_description.set(text);
+                            })
+                            theme=Signal::stored({
+                                let mut theme = super::issue_detail::trakkt_kode_theme();
+                                theme.content_padding = Some("0.75rem 1rem");
+                                theme
+                            })
+                        />
+                    </div>
                 </div>
 
                 // Priority
