@@ -692,7 +692,7 @@ fn DescriptionEditor(
 
     view! {
         <div class="mt-6">
-            <h2 class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-3">"Description"</h2>
+            <h2 class="text-xs text-muted-foreground font-medium mb-3">"Description"</h2>
             <div class="border border-border rounded-md overflow-hidden" style="min-height: 200px;">
                 <TreeWysiwygEditor
                     content=initial_content
