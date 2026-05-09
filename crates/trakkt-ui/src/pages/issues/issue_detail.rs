@@ -178,7 +178,7 @@ pub fn IssueDetailPage() -> impl IntoView {
         move |(num, _)| async move { get_issue(num).await },
     );
 
-    let issue_data = Memo::new(move |_| {
+    let issue_data = Signal::derive(move || {
         let num = number.get();
         if let Some(store) = sync_store {
             let items = store.issues().get();
