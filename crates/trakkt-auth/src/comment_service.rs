@@ -106,6 +106,11 @@ pub async fn create_comment(
         }
     }
 
+    // Auto-watch: commenter watches the issue they commented on (best-effort).
+    if let Err(e) = crate::watcher_service::watch_issue(db, issue_id, user_id).await {
+        tracing::warn!(error = %e, issue_id = %issue_id, "Failed to auto-watch issue for commenter");
+    }
+
     // Re-fetch with joined user data.
     let row = trakkt_core::db_fetch_one!(
         db,

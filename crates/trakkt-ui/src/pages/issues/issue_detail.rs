@@ -29,6 +29,7 @@ use crate::server_fns::comments::{create_comment, list_comments};
 use crate::server_fns::issues::{get_issue, set_issue_labels, update_issue};
 use crate::server_fns::labels::list_labels;
 use crate::server_fns::statuses::list_statuses;
+use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
 use trakkt_types::models::{Comment, IssueWithDetails};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -679,6 +680,78 @@ fn MetadataBar(
                     </div>
                 }
             })}
+
+            // ── Watch toggle ──────────────────────────────────────────────
+            <WatchToggle number=number/>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Watch Toggle
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Eye icon button that toggles watch/unwatch state for an issue.
+#[component]
+fn WatchToggle(number: i32) -> impl IntoView {
+    let (version, set_version) = signal(0u32);
+    let watching_resource = Resource::new(
+        move || (number, version.get()),
+        move |(num, _)| async move { is_watching(num).await },
+    );
+
+    let (loading, set_loading) = signal(false);
+
+    let toggle = move |_| {
+        if loading.get_untracked() {
+            return;
+        }
+        let currently_watching = watching_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or(false);
+
+        set_loading.set(true);
+        leptos::task::spawn_local(async move {
+            let result = if currently_watching {
+                unwatch_issue(number).await
+            } else {
+                watch_issue(number).await
+            };
+            if let Err(e) = result {
+                tracing::warn!("Failed to toggle watch: {e}");
+            }
+            set_loading.set(false);
+            set_version.update(|v| *v += 1);
+        });
+    };
+
+    view! {
+        <div class="flex items-center gap-2">
+            <button
+                class="flex items-center gap-1.5 px-2 py-1 rounded text-sm text-muted-foreground hover:text-foreground hover:bg-surface-alt transition-colors"
+                on:click=toggle
+                disabled=move || loading.get()
+                title=move || {
+                    let w = watching_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                    if w { "Stop watching" } else { "Watch this issue" }
+                }
+            >
+                {move || {
+                    let w = watching_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                    if w {
+                        view! { <span class="text-foreground"><Icon icon=phosphor_leptos::EYE size="16px"/></span> }.into_any()
+                    } else {
+                        view! { <Icon icon=phosphor_leptos::EYE_SLASH size="16px"/> }.into_any()
+                    }
+                }}
+                <span class="text-xs">
+                    {move || {
+                        let w = watching_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                        if w { "Watching" } else { "Watch" }
+                    }}
+                </span>
+            </button>
         </div>
     }
 }
