@@ -36,6 +36,7 @@ use crate::pages::settings::{
     teams_settings::TeamsSettingsPage,
     workspace::WorkspacePage,
 };
+use crate::pages::views::ViewPage;
 
 /// Shell HTML page that loads the WASM bundle.
 #[component]
@@ -112,6 +113,9 @@ pub fn App() -> impl IntoView {
                     // Legacy /issues redirect — send to /my-issues
                     <Route path=path!("/issues") view=|| view! { <Redirect path="/my-issues"/> }/>
                     <Route path=path!("/issues/:number") view=IssueDetailPage/>
+
+                    // Saved views
+                    <Route path=path!("/views/:view_id") view=ViewPage/>
 
                     // Projects
                     <Route path=path!("/projects") view=ProjectListPage/>

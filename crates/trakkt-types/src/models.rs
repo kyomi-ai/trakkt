@@ -172,6 +172,22 @@ pub struct ProjectProgress {
     pub percent_done: f64,
 }
 
+/// A saved view — a named set of filters and display options.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct View {
+    pub view_id: String,
+    pub workspace_id: String,
+    pub created_by: String,
+    pub name: String,
+    pub icon: Option<String>,
+    pub filters: String,
+    pub display_options: String,
+    pub sort_order: f64,
+    pub is_shared: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// A comment on an issue, with optional author metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Comment {

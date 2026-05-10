@@ -15,7 +15,7 @@
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
-use trakkt_types::models::{IssueWithDetails, Label, Project, Status, Team};
+use trakkt_types::models::{IssueWithDetails, Label, Project, Status, Team, View};
 
 // ── Inner storage ─────────────────────────────────────────────────────────────
 
@@ -30,6 +30,7 @@ struct SyncStoreInner {
     statuses: ArcRwSignal<Vec<Status>>,
     teams: ArcRwSignal<Vec<Team>>,
     projects: ArcRwSignal<Vec<Project>>,
+    views: ArcRwSignal<Vec<View>>,
     initialized: ArcRwSignal<bool>,
 }
 
@@ -65,6 +66,7 @@ impl SyncStore {
                 statuses: ArcRwSignal::new(Vec::new()),
                 teams: ArcRwSignal::new(Vec::new()),
                 projects: ArcRwSignal::new(Vec::new()),
+                views: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
             })),
         }
@@ -102,6 +104,12 @@ impl SyncStore {
         Signal::derive(move || sig.get())
     }
 
+    /// Reactive signal over the current views list.
+    pub fn views(&self) -> Signal<Vec<View>> {
+        let sig = self.inner.with_value(|inner| inner.views.clone());
+        Signal::derive(move || sig.get())
+    }
+
     /// `true` once the store has been hydrated from IndexedDB.
     ///
     /// Pages that read from this store should show a loading state until this
@@ -136,6 +144,11 @@ impl SyncStore {
     /// Replace the entire project list (called during IDB hydration).
     pub fn set_projects(&self, items: Vec<Project>) {
         self.inner.with_value(|inner| inner.projects.set(items));
+    }
+
+    /// Replace the entire views list (called during IDB hydration).
+    pub fn set_views(&self, items: Vec<View>) {
+        self.inner.with_value(|inner| inner.views.set(items));
     }
 
     // ── Single-item upserts (live sync) ───────────────────────────────────────
@@ -205,6 +218,19 @@ impl SyncStore {
         });
     }
 
+    /// Insert or update a view by `view_id`.
+    pub fn upsert_view(&self, item: View) {
+        self.inner.with_value(|inner| {
+            inner.views.update(|list| {
+                if let Some(existing) = list.iter_mut().find(|v| v.view_id == item.view_id) {
+                    *existing = item;
+                } else {
+                    list.push(item);
+                }
+            });
+        });
+    }
+
     // ── Single-item removes (delete sync) ────────────────────────────────────
 
     /// Remove an issue by `issue_id`.
@@ -252,6 +278,15 @@ impl SyncStore {
         });
     }
 
+    /// Remove a view by `view_id`.
+    pub fn remove_view(&self, view_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.views.update(|list| {
+                list.retain(|v| v.view_id != view_id);
+            });
+        });
+    }
+
     // ── State transitions ─────────────────────────────────────────────────────
 
     /// Mark the store as fully hydrated from IndexedDB.
@@ -274,6 +309,7 @@ impl SyncStore {
             inner.statuses.set(Vec::new());
             inner.teams.set(Vec::new());
             inner.projects.set(Vec::new());
+            inner.views.set(Vec::new());
             inner.initialized.set(false);
         });
     }

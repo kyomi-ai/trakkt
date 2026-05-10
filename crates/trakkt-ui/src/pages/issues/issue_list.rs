@@ -37,6 +37,7 @@ use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown
 use crate::pages::issues::issue_row::IssueRow;
 use crate::server_fns::issues::{create_issue, list_issues};
 use crate::server_fns::statuses::list_statuses;
+use crate::server_fns::views::create_view;
 use crate::utils::keyboard::is_input_focused;
 use trakkt_types::models::Team;
 
@@ -285,6 +286,9 @@ fn IssueListInner(
         set_version.update(|v| *v += 1);
     });
 
+    // ── Save View modal state ──────────────────────────────────────────────
+    let (show_save_view, set_show_save_view) = signal(false);
+
     // ── Keyboard navigation state ──────────────────────────────────────────
     let (selected_index, set_selected_index) = signal(Option::<usize>::None);
 
@@ -426,6 +430,21 @@ fn IssueListInner(
                         team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
                     />
                     <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
+                    // "Save view" — only when at least one filter is active
+                    <Show when=move || {
+                        !search.get().is_empty()
+                            || !status_filter.get().is_empty()
+                            || !priority_filter.get().is_empty()
+                    }>
+                        <Button
+                            variant=ButtonVariant::Ghost
+                            size=ButtonSize::Sm
+                            on:click=move |_| set_show_save_view.set(true)
+                        >
+                            <Icon icon=phosphor_leptos::FLOPPY_DISK size="14px"/>
+                            "Save view"
+                        </Button>
+                    </Show>
                 </div>
             </Show>
 
@@ -521,6 +540,17 @@ fn IssueListInner(
             on_close=Callback::new(move |()| set_show_new_issue.set(false))
             on_created=on_issue_created
             team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
+        />
+
+        // ── Save View modal ────────────────────────────────────────────────
+        <SaveViewModal
+            show=Signal::derive(move || show_save_view.get())
+            on_close=Callback::new(move |()| set_show_save_view.set(false))
+            search=Signal::derive(move || search.get())
+            status_filter=Signal::derive(move || status_filter.get())
+            priority_filter=Signal::derive(move || priority_filter.get())
+            team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
+            view_mode=Signal::derive(move || view_mode.get())
         />
     }
 }
@@ -689,6 +719,164 @@ fn NewIssueModal(
                             ("4", "Low"),
                         ]
                         on_change=move |v: String| set_priority.set(v)
+                    />
+                </div>
+            </form>
+        </Modal>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Save View Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Modal form for saving the current filter set as a named view.
+#[component]
+fn SaveViewModal(
+    /// Whether the modal is visible.
+    show: Signal<bool>,
+    /// Called when the modal should close.
+    on_close: Callback<()>,
+    /// Current search filter value.
+    search: Signal<String>,
+    /// Current status filter value.
+    status_filter: Signal<String>,
+    /// Current priority filter value.
+    priority_filter: Signal<String>,
+    /// Current team_id if on a team page.
+    team_id: Signal<Option<String>>,
+    /// Current view mode (list/board).
+    view_mode: Signal<String>,
+) -> impl IntoView {
+    let (name, set_name) = signal(String::new());
+    let (submitting, set_submitting) = signal(false);
+    let (error_msg, set_error_msg) = signal(Option::<String>::None);
+
+    // Reset form state when modal opens.
+    Effect::new(move || {
+        if show.get() {
+            set_name.set(String::new());
+            set_error_msg.set(None);
+            set_submitting.set(false);
+        }
+    });
+
+    let handle_submit = move || {
+        let name_val = name.get_untracked().trim().to_string();
+        if name_val.is_empty() {
+            return;
+        }
+
+        // Build filters JSON from current filter state.
+        let mut statuses = Vec::new();
+        let status_val = status_filter.get_untracked();
+        if !status_val.is_empty() {
+            statuses.push(status_val);
+        }
+
+        let mut priorities = Vec::new();
+        let priority_val = priority_filter.get_untracked();
+        if !priority_val.is_empty() {
+            if let Ok(p) = priority_val.parse::<i32>() {
+                priorities.push(p);
+            }
+        }
+
+        let search_val = search.get_untracked();
+        let team_id_val = team_id.get_untracked().unwrap_or_default();
+
+        let labels: Vec<String> = Vec::new();
+        let filters = serde_json::json!({
+            "statuses": statuses,
+            "priorities": priorities,
+            "search": search_val,
+            "team_id": team_id_val,
+            "labels": labels,
+        });
+
+        let display_options = serde_json::json!({
+            "view_type": view_mode.get_untracked(),
+        });
+
+        let filters_str = filters.to_string();
+        let display_str = display_options.to_string();
+
+        set_submitting.set(true);
+        set_error_msg.set(None);
+
+        leptos::task::spawn_local(async move {
+            match create_view(name_val, None, filters_str, display_str, false).await {
+                Ok(_) => {
+                    set_submitting.set(false);
+                    on_close.run(());
+                }
+                Err(e) => {
+                    set_submitting.set(false);
+                    set_error_msg.set(Some(format!("Failed to save view: {e}")));
+                }
+            }
+        });
+    };
+
+    let name_empty = Memo::new(move |_| name.get().trim().is_empty());
+
+    let handle_submit_for_footer = handle_submit;
+    let modal_footer: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+        let submit = handle_submit_for_footer;
+        view! {
+            <Button
+                variant=ButtonVariant::Ghost
+                on:click=move |_| on_close.run(())
+            >
+                "Cancel"
+            </Button>
+            <Button
+                disabled=Signal::derive(move || submitting.get() || name_empty.get())
+                on:click=move |_| submit()
+            >
+                {move || if submitting.get() { "Saving..." } else { "Save View" }}
+            </Button>
+        }.into_any()
+    });
+
+    view! {
+        <Modal
+            show=show
+            on_close=on_close
+            title="Save View"
+            size=ModalSize::Sm
+            footer=modal_footer
+        >
+            <form
+                on:submit=move |ev: web_sys::SubmitEvent| {
+                    ev.prevent_default();
+                    handle_submit();
+                }
+                class="space-y-4"
+            >
+                // Error message
+                <Show when=move || error_msg.get().is_some()>
+                    <crate::components::Alert variant=crate::components::AlertVariant::Error>
+                        <crate::components::AlertDescription>
+                            {move || error_msg.get().unwrap_or_default()}
+                        </crate::components::AlertDescription>
+                    </crate::components::Alert>
+                </Show>
+
+                // View name
+                <div class="space-y-2">
+                    <label for="view-name" class="text-sm font-medium text-foreground">
+                        "Name"
+                    </label>
+                    <input
+                        id="view-name"
+                        type="text"
+                        required=true
+                        autofocus=true
+                        placeholder="e.g. High priority bugs"
+                        class=INPUT_CLASS
+                        prop:value=move || name.get()
+                        on:input=move |ev| set_name.set(event_target_value(&ev))
                     />
                 </div>
             </form>
