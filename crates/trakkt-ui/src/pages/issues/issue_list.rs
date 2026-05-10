@@ -53,7 +53,7 @@ pub fn IssueListPage() -> impl IntoView {
 #[component]
 pub fn IssueListForTeam() -> impl IntoView {
     let params = leptos_router::hooks::use_params_map();
-    let team_key = params.read().get("key").unwrap_or_default();
+    let team_key = Signal::derive(move || params.read().get("key").unwrap_or_default());
     view! { <IssueListInner team_key=team_key/> }
 }
 
@@ -62,9 +62,9 @@ pub fn IssueListForTeam() -> impl IntoView {
 /// logic lives here.
 #[component]
 fn IssueListInner(
-    /// Optional team key. When `Some`, filters issues and statuses by team.
+    /// Optional reactive team key. When `Some`, filters issues and statuses by team.
     #[prop(optional, into)]
-    team_key: Option<String>,
+    team_key: Option<Signal<String>>,
 ) -> impl IntoView {
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
@@ -79,9 +79,11 @@ fn IssueListInner(
     let (version, set_version) = signal(0u32);
 
     // ── Resolve team from SyncStore ─────────────────────────────────────────
-    let team_key_stored = StoredValue::new(team_key);
     let resolved_team: Memo<Option<Team>> = Memo::new(move |_| {
-        let key = team_key_stored.get_value()?;
+        let key = team_key?.get();
+        if key.is_empty() {
+            return None;
+        }
         let key_lower = key.to_lowercase();
         let store = sync_store?;
         store
@@ -137,7 +139,7 @@ fn IssueListInner(
         };
 
         // When a team_key was requested but hasn't resolved yet, return empty (loading state).
-        let team_key_present = team_key_stored.get_value().is_some();
+        let team_key_present = team_key.is_some_and(|s| !s.get().is_empty());
         if team_key_present && resolved_team.get().is_none() {
             return vec![];
         }
