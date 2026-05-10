@@ -634,6 +634,14 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                         }
                     }
                 }
+            },
+            {
+                "name": "list_teams",
+                "description": "List all teams in the workspace, ordered alphabetically by name.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
             }
         ]
     }))
@@ -693,6 +701,7 @@ async fn handle_tools_call(
         "list_labels" => "labels:read",
         "create_label" => "labels:write",
         "list_statuses" => "issues:read",
+        "list_teams" => "teams:read",
         _ => "",
     };
     if !required_scope.is_empty() && !auth.has_scope(required_scope) {
@@ -714,6 +723,7 @@ async fn handle_tools_call(
         "create_label" => tool_create_label(&arguments, &auth, state).await,
         "search_issues" => tool_search_issues(&arguments, &auth, state).await,
         "list_statuses" => tool_list_statuses(&arguments, &auth, state).await,
+        "list_teams" => tool_list_teams(&auth, state).await,
         _ => return JsonRpcResponse::error(id, -32602, format!("Unknown tool: {tool_name}")),
     };
 
@@ -961,6 +971,15 @@ async fn tool_list_labels(
 ) -> trakkt_core::Result<String> {
     let labels = label_service::list_labels(&state.db, &auth.workspace_id).await?;
     serde_json::to_string_pretty(&labels).map_err(trakkt_core::Error::from)
+}
+
+/// list_teams — list all teams in the workspace.
+async fn tool_list_teams(
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let teams = team_service::list_teams(&state.db, &auth.workspace_id).await?;
+    serde_json::to_string_pretty(&teams).map_err(trakkt_core::Error::from)
 }
 
 /// create_label — create a new label.

@@ -126,7 +126,7 @@ pub async fn create_team(
     Ok(row.into_dto())
 }
 
-/// List all teams in a workspace, ordered by creation date.
+/// List all teams in a workspace, ordered alphabetically by name.
 pub async fn list_teams(
     db: &DbPool,
     workspace_id: &str,
@@ -136,7 +136,7 @@ pub async fn list_teams(
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC",
+         FROM teams WHERE workspace_id = $1 ORDER BY name ASC",
         workspace_id
     )?;
     Ok(rows.into_iter().map(TeamRow::into_dto).collect())
