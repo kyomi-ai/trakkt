@@ -68,6 +68,7 @@ pub struct Issue {
     pub project_id: Option<String>,
     pub milestone_id: Option<String>,
     pub parent_issue_id: Option<String>,
+    pub sort_order: Option<f64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -95,6 +96,7 @@ pub struct IssueWithDetails {
     pub project_name: Option<String>,
     pub milestone_id: Option<String>,
     pub parent_issue_id: Option<String>,
+    pub sort_order: Option<f64>,
     pub created_at: String,
     pub updated_at: String,
     pub labels: Vec<Label>,
@@ -264,4 +266,5 @@ pub struct IssueUpdate {
     pub project_id: Option<Option<String>>,
     pub milestone_id: Option<Option<String>>,
     pub parent_issue_id: Option<Option<String>>,
+    pub sort_order: Option<Option<f64>>,
 }

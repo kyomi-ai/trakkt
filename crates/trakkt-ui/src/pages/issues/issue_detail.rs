@@ -436,6 +436,7 @@ fn EditableTitle(
                 None, // project_id
                 None, // milestone_id
                 None, // parent_issue_id
+                None, // clear_sort_order
             )
             .await;
             set_saving.set(false);
@@ -530,6 +531,7 @@ fn MetadataBar(
                 None, // project_id
                 None, // milestone_id
                 None, // parent_issue_id
+                None, // clear_sort_order
             )
             .await;
             on_change.run(());
@@ -551,6 +553,7 @@ fn MetadataBar(
                 None, // project_id
                 None, // milestone_id
                 None, // parent_issue_id
+                None, // clear_sort_order
             )
             .await;
             on_change.run(());
@@ -937,6 +940,7 @@ fn DescriptionEditor(
                 None, // project_id
                 None, // milestone_id
                 None, // parent_issue_id
+                None, // clear_sort_order
             )
             .await;
             on_save.run(());

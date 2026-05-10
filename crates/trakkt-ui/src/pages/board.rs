@@ -30,21 +30,28 @@ use wasm_bindgen::JsCast;
 
 use crate::components::{Avatar, Button, ButtonSize, ButtonVariant, Checkbox, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, SearchInput, Skeleton};
 use crate::pages::issues::filters::PriorityFilterDropdown;
-use crate::server_fns::issues::update_issue;
+use crate::server_fns::issues::{update_issue, set_issue_sort_order};
 use trakkt_types::models::{IssueWithDetails, Status};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Sort issues within a column: priority ASC (urgent=1 first, none=0 last),
-/// then created_at DESC (newest first).
+/// Sort issues within a column: issues with `sort_order` come first (ascending),
+/// then issues without `sort_order` fall back to priority ASC + created_at DESC.
 fn sort_column_issues(issues: &mut [IssueWithDetails]) {
     issues.sort_by(|a, b| {
-        // Priority 0 (none) should sort last, so map 0 → i32::MAX.
-        let pa = if a.priority == 0 { i32::MAX } else { a.priority };
-        let pb = if b.priority == 0 { i32::MAX } else { b.priority };
-        pa.cmp(&pb).then_with(|| b.created_at.cmp(&a.created_at))
+        match (a.sort_order, b.sort_order) {
+            (Some(oa), Some(ob)) => oa.partial_cmp(&ob).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                // Priority 0 (none) should sort last, so map 0 → i32::MAX.
+                let pa = if a.priority == 0 { i32::MAX } else { a.priority };
+                let pb = if b.priority == 0 { i32::MAX } else { b.priority };
+                pa.cmp(&pb).then_with(|| b.created_at.cmp(&a.created_at))
+            }
+        }
     });
 }
 
@@ -201,55 +208,110 @@ pub fn BoardContent(
     let (drag_target, set_drag_target) = signal(Option::<String>::None);
 
     // ── Drop handler ────────────────────────────────────────────────────────
-    let handle_drop = move |issue_id: String, target_status_id: String| {
+    // Accepts (issue_id, target_status_id, drop_index).
+    // - Cross-column: drop_index is None, moves issue to the bottom of the target column.
+    // - Same-column: drop_index is Some(idx), reorders using fractional indexing.
+    let handle_drop = move |issue_id: String, target_status_id: String, drop_index: Option<usize>| {
         let current_issues = issues.get_untracked();
         let issue = match current_issues.iter().find(|i| i.issue_id == issue_id) {
             Some(i) => i.clone(),
             None => return,
         };
 
-        if issue.status_id == target_status_id {
-            return;
-        }
-
-        let old_status_id = issue.status_id.clone();
-        let old_status_name = issue.status_name.clone();
-        let old_status_category = issue.status_category.clone();
         let issue_number = issue.number;
+        let is_same_column = issue.status_id == target_status_id;
 
-        let current_statuses = statuses.get_untracked();
-        let target_status = current_statuses.iter().find(|s| s.status_id == target_status_id);
-        let target_name = target_status.map(|s| s.name.clone()).unwrap_or_default();
-        let target_category = target_status.map(|s| s.category.clone()).unwrap_or_default();
+        if is_same_column {
+            // Same-column reorder via sort_order.
+            let Some(insert_idx) = drop_index else { return };
 
-        // Optimistic update via SyncStore.
-        if let Some(store) = sync_store {
-            let mut updated = issue.clone();
-            updated.status_id = target_status_id.clone();
-            updated.status_name = target_name;
-            updated.status_category = target_category;
-            store.upsert_issue(updated);
-        }
+            // Build the sorted column, excluding the dragged issue.
+            let mut col_issues: Vec<IssueWithDetails> = current_issues
+                .iter()
+                .filter(|i| i.status_id == target_status_id && i.issue_id != issue.issue_id)
+                .cloned()
+                .collect();
+            sort_column_issues(&mut col_issues);
 
-        let target_id_for_server = target_status_id.clone();
-        leptos::task::spawn_local(async move {
-            if let Err(e) = update_issue(
-                issue_number,
-                None, None,
-                Some(target_id_for_server),
-                None, None, None, None, None, None,
-            ).await {
-                tracing::warn!("Failed to update issue status: {e}");
-                // Revert optimistic update on failure.
-                if let Some(store) = sync_store {
-                    let mut reverted = issue;
-                    reverted.status_id = old_status_id;
-                    reverted.status_name = old_status_name;
-                    reverted.status_category = old_status_category;
-                    store.upsert_issue(reverted);
-                }
+            // Clamp insert_idx to valid range.
+            let insert_idx = insert_idx.min(col_issues.len());
+
+            // Compute new sort_order using fractional indexing.
+            let new_sort_order = if col_issues.is_empty() {
+                1.0
+            } else if insert_idx == 0 {
+                col_issues[0].sort_order.unwrap_or(1.0) - 1.0
+            } else if insert_idx >= col_issues.len() {
+                col_issues.last().unwrap().sort_order.unwrap_or(col_issues.len() as f64) + 1.0
+            } else {
+                let prev = col_issues[insert_idx - 1].sort_order.unwrap_or((insert_idx - 1) as f64);
+                let next = col_issues[insert_idx].sort_order.unwrap_or(insert_idx as f64);
+                (prev + next) / 2.0
+            };
+
+            // Optimistic update.
+            if let Some(store) = sync_store {
+                let mut updated = issue.clone();
+                updated.sort_order = Some(new_sort_order);
+                store.upsert_issue(updated);
             }
-        });
+
+            let old_sort_order = issue.sort_order;
+            leptos::task::spawn_local(async move {
+                if let Err(e) = set_issue_sort_order(issue_number, new_sort_order).await {
+                    tracing::warn!("Failed to set sort order: {e}");
+                    // Revert optimistic update on failure.
+                    if let Some(store) = sync_store {
+                        let mut reverted = issue;
+                        reverted.sort_order = old_sort_order;
+                        store.upsert_issue(reverted);
+                    }
+                }
+            });
+        } else {
+            // Cross-column: move issue to target status.
+            let old_status_id = issue.status_id.clone();
+            let old_status_name = issue.status_name.clone();
+            let old_status_category = issue.status_category.clone();
+
+            let current_statuses = statuses.get_untracked();
+            let target_status = current_statuses.iter().find(|s| s.status_id == target_status_id);
+            let target_name = target_status.map(|s| s.name.clone()).unwrap_or_default();
+            let target_category = target_status.map(|s| s.category.clone()).unwrap_or_default();
+
+            // Optimistic update via SyncStore.
+            if let Some(store) = sync_store {
+                let mut updated = issue.clone();
+                updated.status_id = target_status_id.clone();
+                updated.status_name = target_name;
+                updated.status_category = target_category;
+                // Clear sort_order when moving to a new column so it appears
+                // at the default position (after manually ordered items).
+                updated.sort_order = None;
+                store.upsert_issue(updated);
+            }
+
+            let target_id_for_server = target_status_id.clone();
+            leptos::task::spawn_local(async move {
+                if let Err(e) = update_issue(
+                    issue_number,
+                    None, None,
+                    Some(target_id_for_server),
+                    None, None, None, None, None, None,
+                    Some(true),
+                ).await {
+                    tracing::warn!("Failed to update issue status: {e}");
+                    // Revert optimistic update on failure.
+                    if let Some(store) = sync_store {
+                        let mut reverted = issue;
+                        reverted.status_id = old_status_id;
+                        reverted.status_name = old_status_name;
+                        reverted.status_category = old_status_category;
+                        store.upsert_issue(reverted);
+                    }
+                }
+            });
+        }
     };
 
     // ── Render ──────────────────────────────────────────────────────────────
@@ -447,12 +509,16 @@ fn BoardColumn(
     /// Setter for the drag target signal.
     set_drag_target: WriteSignal<Option<String>>,
     /// Callback when an issue is dropped on this column.
+    /// Args: (issue_id, status_id, drop_index).
     #[prop(into)]
-    on_drop: Callback<(String, String)>,
+    on_drop: Callback<(String, String, Option<usize>)>,
 ) -> impl IntoView {
     let status_id_for_over = status_id.clone();
     let status_id_for_drop = status_id.clone();
     let status_id_for_class = status_id.clone();
+
+    // ── Drop insertion index for same-column reorder ────────────────────
+    let (drop_insert_idx, set_drop_insert_idx) = signal(Option::<usize>::None);
 
     // Determine if this column is the active drop target.
     let is_drop_target = move || {
@@ -490,19 +556,22 @@ fn BoardColumn(
                 };
                 if should_clear {
                     set_drag_target.set(None);
+                    set_drop_insert_idx.set(None);
                 }
             }
             on:drop={
                 let status_id_drop = status_id_for_drop.clone();
                 move |ev: web_sys::DragEvent| {
                     ev.prevent_default();
+                    let insert_idx = drop_insert_idx.get_untracked();
                     if let Some(dt) = ev.data_transfer()
                         && let Ok(issue_id) = dt.get_data("text/plain")
                         && !issue_id.is_empty()
                     {
-                        on_drop.run((issue_id, status_id_drop.clone()));
+                        on_drop.run((issue_id, status_id_drop.clone(), insert_idx));
                     }
                     set_drag_target.set(None);
+                    set_drop_insert_idx.set(None);
                 }
             }
         >
@@ -524,13 +593,30 @@ fn BoardColumn(
                         </div>
                     }.into_any()
                 } else {
-                    issues.into_iter().map(|issue| {
+                    let total = issues.len();
+                    issues.into_iter().enumerate().map(|(idx, issue)| {
                         view! {
+                            // Drop indicator before this card
+                            <Show when=move || drop_insert_idx.get() == Some(idx)>
+                                <div class="h-0.5 bg-primary rounded-full mx-2 my-0.5"/>
+                            </Show>
                             <BoardCard
                                 issue=issue
+                                idx=idx
                                 dragging=dragging
                                 set_dragging=set_dragging
+                                set_drop_insert_idx=set_drop_insert_idx
                             />
+                            // Drop indicator after the last card
+                            {if idx == total - 1 {
+                                view! {
+                                    <Show when=move || drop_insert_idx.get() == Some(idx + 1)>
+                                        <div class="h-0.5 bg-primary rounded-full mx-2 my-0.5"/>
+                                    </Show>
+                                }.into_any()
+                            } else {
+                                ().into_any()
+                            }}
                         }
                     }).collect_view().into_any()
                 }}
@@ -564,10 +650,14 @@ fn BoardColumn(
 #[component]
 fn BoardCard(
     issue: IssueWithDetails,
+    /// Position index of this card within its column (for drop indicator).
+    idx: usize,
     /// Signal: which issue_id is currently being dragged.
     dragging: ReadSignal<Option<String>>,
     /// Setter for the dragging signal.
     set_dragging: WriteSignal<Option<String>>,
+    /// Setter for the drop insertion index in the parent column.
+    set_drop_insert_idx: WriteSignal<Option<usize>>,
 ) -> impl IntoView {
     let issue_id = issue.issue_id.clone();
     let issue_id_for_drag = issue_id.clone();
@@ -620,7 +710,20 @@ fn BoardCard(
             }
             on:dragend=move |_: web_sys::DragEvent| {
                 set_dragging.set(None);
+                set_drop_insert_idx.set(None);
                 set_did_drag.set(true);
+            }
+            on:dragover=move |ev: web_sys::DragEvent| {
+                ev.prevent_default();
+                // Compute whether cursor is in the top or bottom half of the card.
+                if let Some(target) = ev.current_target() {
+                    if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
+                        let rect = el.get_bounding_client_rect();
+                        let mid = rect.top() + rect.height() / 2.0;
+                        let insert_at = if (ev.client_y() as f64) <= mid { idx } else { idx + 1 };
+                        set_drop_insert_idx.set(Some(insert_at));
+                    }
+                }
             }
             on:click=navigate_to_issue
             on:keydown=move |ev: web_sys::KeyboardEvent| {

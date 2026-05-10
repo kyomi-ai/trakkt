@@ -921,6 +921,9 @@ async fn tool_update_issue(
         parent_issue_id: args.get("parent_issue_id").map(|v| {
             v.as_str().map(String::from)
         }),
+        sort_order: args.get("sort_order").map(|v| {
+            v.as_f64()
+        }),
     };
 
     let issue = issue_service::update_issue(

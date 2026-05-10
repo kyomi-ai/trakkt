@@ -174,6 +174,7 @@ pub async fn update_issue(
     project_id: Option<String>,
     milestone_id: Option<String>,
     parent_issue_id: Option<String>,
+    clear_sort_order: Option<bool>,
 ) -> Result<Issue, ServerFnError> {
     use trakkt_types::models::IssueUpdate;
 
@@ -188,6 +189,7 @@ pub async fn update_issue(
         project_id: project_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         milestone_id: milestone_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         parent_issue_id: parent_issue_id.map(|s| if s.is_empty() { None } else { Some(s) }),
+        sort_order: if clear_sort_order == Some(true) { Some(None) } else { None },
     };
     let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, number, &updates, ac.ctx.ws_manager.as_ref())
         .await
@@ -202,6 +204,25 @@ pub async fn delete_issue(number: i32) -> Result<(), ServerFnError> {
     trakkt_auth::issue_service::delete_issue(ac.db(), &ac.ws_id, number, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
+    Ok(())
+}
+
+/// Set the sort order for an issue (board drag-to-reorder).
+#[server(prefix = "/leptos-api")]
+pub async fn set_issue_sort_order(
+    issue_number: i32,
+    sort_order: f64,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    trakkt_auth::issue_service::set_sort_order(
+        ac.db(),
+        &ac.ws_id,
+        issue_number,
+        sort_order,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 

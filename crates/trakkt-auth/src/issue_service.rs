@@ -34,6 +34,7 @@ struct IssueRow {
     project_id: Option<String>,
     milestone_id: Option<String>,
     parent_issue_id: Option<String>,
+    sort_order: Option<f64>,
     created_at: String,
     updated_at: String,
 }
@@ -55,6 +56,7 @@ impl IssueRow {
             project_id: self.project_id,
             milestone_id: self.milestone_id,
             parent_issue_id: self.parent_issue_id,
+            sort_order: self.sort_order,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -84,6 +86,7 @@ struct IssueDetailRow {
     project_name: Option<String>,
     milestone_id: Option<String>,
     parent_issue_id: Option<String>,
+    sort_order: Option<f64>,
     created_at: String,
     updated_at: String,
 }
@@ -111,6 +114,7 @@ impl IssueDetailRow {
             project_name: self.project_name,
             milestone_id: self.milestone_id,
             parent_issue_id: self.parent_issue_id,
+            sort_order: self.sort_order,
             created_at: self.created_at,
             updated_at: self.updated_at,
             labels,
@@ -136,7 +140,7 @@ const ISSUE_DETAIL_SELECT: &str = "\
            i.creator_id, creator.name AS creator_name, \
            CAST(i.due_date AS TEXT) AS due_date, \
            i.project_id, p.name AS project_name, i.milestone_id, \
-           i.parent_issue_id, \
+           i.parent_issue_id, i.sort_order, \
            CAST(i.created_at AS TEXT) AS created_at, \
            CAST(i.updated_at AS TEXT) AS updated_at \
     FROM issues i \
@@ -329,7 +333,7 @@ pub async fn create_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
-                project_id, milestone_id, parent_issue_id, \
+                project_id, milestone_id, parent_issue_id, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE issue_id = $1",
@@ -596,6 +600,11 @@ pub async fn update_issue(
         param_idx += 1;
     }
 
+    if updates.sort_order.is_some() {
+        set_parts.push(format!("sort_order = ${param_idx}"));
+        param_idx += 1;
+    }
+
     // Always update updated_at.
     set_parts.push(format!("updated_at = {now}"));
 
@@ -669,6 +678,9 @@ pub async fn update_issue(
         if let Some(ref v) = updates.parent_issue_id {
             query = query.bind(v.as_deref());
         }
+        if let Some(ref v) = updates.sort_order {
+            query = query.bind(*v);
+        }
 
         query = query.bind(workspace_id);
         query = query.bind(number);
@@ -689,7 +701,7 @@ pub async fn update_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
-                project_id, milestone_id, parent_issue_id, \
+                project_id, milestone_id, parent_issue_id, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE workspace_id = $1 AND number = $2",
@@ -746,7 +758,7 @@ pub async fn delete_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
-                project_id, milestone_id, parent_issue_id, \
+                project_id, milestone_id, parent_issue_id, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE workspace_id = $1 AND number = $2",
@@ -855,6 +867,81 @@ pub async fn set_issue_labels(
                 &ws_id,
                 entity_types::ISSUE,
                 issue_id,
+                SyncActionType::Update,
+                serde_json::to_value(&full_issue).ok(),
+            )
+            .await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Set the sort order for an issue (used by board drag-to-reorder).
+///
+/// Updates only `sort_order` and `updated_at`. Logs to sync_log and broadcasts
+/// the updated issue over WebSocket.
+pub async fn set_sort_order(
+    db: &DbPool,
+    workspace_id: &str,
+    issue_number: i32,
+    sort_order: f64,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    let now = sql_compat::now(db.is_postgres());
+
+    let sql = format!(
+        "UPDATE issues SET sort_order = $1, updated_at = {now} \
+         WHERE workspace_id = $2 AND number = $3"
+    );
+
+    let affected: u64 = trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query(&sql)
+            .bind(sort_order)
+            .bind(workspace_id)
+            .bind(issue_number)
+            .execute(p)
+            .await
+            .map(|r| r.rows_affected())
+    })?;
+
+    if affected == 0 {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "issue #{issue_number} not found in workspace {workspace_id}"
+        )));
+    }
+
+    // Resolve issue_id for sync log + broadcast.
+    let issue_id: String = trakkt_core::db_fetch_scalar!(
+        db,
+        String,
+        "SELECT issue_id FROM issues WHERE workspace_id = $1 AND number = $2",
+        workspace_id,
+        issue_number
+    )?;
+
+    // Sync log — best-effort.
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::ISSUE,
+        &issue_id,
+        workspace_id,
+        SyncActionType::Update,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for sort_order update");
+    }
+
+    // WebSocket broadcast — fetch full entity data and send as SyncResponse.
+    if let Some(ws) = ws_manager {
+        if let Ok(Some(full_issue)) = get_issue_by_id(db, &issue_id).await {
+            sync_log_service::broadcast_sync_action(
+                ws,
+                workspace_id,
+                entity_types::ISSUE,
+                &issue_id,
                 SyncActionType::Update,
                 serde_json::to_value(&full_issue).ok(),
             )
