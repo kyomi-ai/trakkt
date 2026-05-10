@@ -6,6 +6,7 @@ pub mod auth_service;
 pub mod comment_service;
 pub mod cookies;
 pub mod email_service;
+pub mod favorite_service;
 pub mod encryption;
 pub mod google_oauth;
 pub mod issue_service;

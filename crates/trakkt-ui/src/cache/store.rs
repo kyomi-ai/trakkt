@@ -15,7 +15,7 @@
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
-use trakkt_types::models::{IssueWithDetails, Label, Project, Status, Team, View};
+use trakkt_types::models::{Favorite, IssueWithDetails, Label, Project, Status, Team, View};
 
 // ── Inner storage ─────────────────────────────────────────────────────────────
 
@@ -31,6 +31,7 @@ struct SyncStoreInner {
     teams: ArcRwSignal<Vec<Team>>,
     projects: ArcRwSignal<Vec<Project>>,
     views: ArcRwSignal<Vec<View>>,
+    favorites: ArcRwSignal<Vec<Favorite>>,
     initialized: ArcRwSignal<bool>,
 }
 
@@ -67,6 +68,7 @@ impl SyncStore {
                 teams: ArcRwSignal::new(Vec::new()),
                 projects: ArcRwSignal::new(Vec::new()),
                 views: ArcRwSignal::new(Vec::new()),
+                favorites: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
             })),
         }
@@ -110,6 +112,12 @@ impl SyncStore {
         Signal::derive(move || sig.get())
     }
 
+    /// Reactive signal over the current favorites list.
+    pub fn favorites(&self) -> Signal<Vec<Favorite>> {
+        let sig = self.inner.with_value(|inner| inner.favorites.clone());
+        Signal::derive(move || sig.get())
+    }
+
     /// `true` once the store has been hydrated from IndexedDB.
     ///
     /// Pages that read from this store should show a loading state until this
@@ -149,6 +157,11 @@ impl SyncStore {
     /// Replace the entire views list (called during IDB hydration).
     pub fn set_views(&self, items: Vec<View>) {
         self.inner.with_value(|inner| inner.views.set(items));
+    }
+
+    /// Replace the entire favorites list (called during IDB hydration).
+    pub fn set_favorites(&self, items: Vec<Favorite>) {
+        self.inner.with_value(|inner| inner.favorites.set(items));
     }
 
     // ── Single-item upserts (live sync) ───────────────────────────────────────
@@ -231,6 +244,19 @@ impl SyncStore {
         });
     }
 
+    /// Insert or update a favorite by `favorite_id`.
+    pub fn upsert_favorite(&self, item: Favorite) {
+        self.inner.with_value(|inner| {
+            inner.favorites.update(|list| {
+                if let Some(existing) = list.iter_mut().find(|f| f.favorite_id == item.favorite_id) {
+                    *existing = item;
+                } else {
+                    list.push(item);
+                }
+            });
+        });
+    }
+
     // ── Single-item removes (delete sync) ────────────────────────────────────
 
     /// Remove an issue by `issue_id`.
@@ -287,6 +313,15 @@ impl SyncStore {
         });
     }
 
+    /// Remove a favorite by `favorite_id`.
+    pub fn remove_favorite(&self, favorite_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.favorites.update(|list| {
+                list.retain(|f| f.favorite_id != favorite_id);
+            });
+        });
+    }
+
     // ── State transitions ─────────────────────────────────────────────────────
 
     /// Mark the store as fully hydrated from IndexedDB.
@@ -310,6 +345,7 @@ impl SyncStore {
             inner.teams.set(Vec::new());
             inner.projects.set(Vec::new());
             inner.views.set(Vec::new());
+            inner.favorites.set(Vec::new());
             inner.initialized.set(false);
         });
     }

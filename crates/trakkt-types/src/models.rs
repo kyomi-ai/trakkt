@@ -176,6 +176,18 @@ pub struct ProjectProgress {
     pub percent_done: f64,
 }
 
+/// A user-pinned favorite (team, project, or view) for quick sidebar access.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Favorite {
+    pub favorite_id: String,
+    pub user_id: String,
+    pub workspace_id: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub sort_order: f64,
+    pub created_at: String,
+}
+
 /// A saved view — a named set of filters and display options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct View {

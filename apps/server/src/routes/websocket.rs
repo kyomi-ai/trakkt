@@ -372,6 +372,13 @@ async fn handle_sync_bootstrap(
             vec![]
         });
 
+    let favorites = trakkt_auth::favorite_service::list_favorites(db, user_id, workspace_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(user_id, workspace_id, error = %e, "list_favorites failed during bootstrap");
+            vec![]
+        });
+
     // 4. Get the current sync watermark.
     let latest_sync_id =
         trakkt_auth::sync_log_service::get_latest_sync_id(db, workspace_id)
@@ -414,6 +421,12 @@ async fn handle_sync_bootstrap(
         .filter_map(|v| serde_json::to_value(v).ok())
         .collect();
     stream_entities(manager, user_id, workspace_id, entity_types::VIEW, "view_id", view_values).await;
+
+    let favorite_values: Vec<serde_json::Value> = favorites
+        .iter()
+        .filter_map(|f| serde_json::to_value(f).ok())
+        .collect();
+    stream_entities(manager, user_id, workspace_id, entity_types::FAVORITE, "favorite_id", favorite_values).await;
 
     // 6. Signal completion with the current sync watermark.
     send_sync_response(
