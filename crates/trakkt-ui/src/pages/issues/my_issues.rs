@@ -27,6 +27,7 @@ use wasm_bindgen::JsCast;
 use crate::components::{Alert, AlertVariant, EmptyState, SearchInput};
 use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown};
 use crate::pages::issues::issue_row::IssueRow;
+use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::issues::list_issues;
 use crate::server_fns::watchers::list_watched_issue_ids;
@@ -55,6 +56,7 @@ pub fn MyIssuesPage() -> impl IntoView {
     let (search, set_search) = signal(String::new());
     let (status_filter, set_status_filter) = signal(String::new());
     let (priority_filter, set_priority_filter) = signal(String::new());
+    let (show_archived, set_show_archived) = signal(false);
 
     // ── Error state for server function failures ──────────────────────────
     let error_msg = RwSignal::new(Option::<String>::None);
@@ -113,8 +115,13 @@ pub fn MyIssuesPage() -> impl IntoView {
         raw
     });
 
-    // ── Filter helper (closure over search/status/priority signals) ───────
+    // ── Filter helper (closure over search/status/priority/archive signals) ─
     let passes_filters = move |issue: &IssueWithDetails| -> bool {
+        // Archive filter: hide archived issues unless the toggle is on.
+        if !show_archived.get() && is_archived(issue, ARCHIVE_DAYS) {
+            return false;
+        }
+
         let search_val = search.get().to_lowercase();
         let status_val = status_filter.get();
         let priority_val = priority_filter.get();
@@ -305,6 +312,20 @@ pub fn MyIssuesPage() -> impl IntoView {
                 />
                 <StatusFilterDropdown value=status_filter on_change=Callback::new(move |v: String| set_status_filter.set(v))/>
                 <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
+                <button
+                    class=move || {
+                        if show_archived.get() {
+                            "px-2 py-1 text-xs rounded-md border border-primary bg-primary/10 text-primary transition-colors flex items-center gap-1"
+                        } else {
+                            "px-2 py-1 text-xs rounded-md border border-border text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
+                        }
+                    }
+                    on:click=move |_| set_show_archived.update(|v| *v = !*v)
+                    title="Show archived issues"
+                >
+                    <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
+                    {move || if show_archived.get() { "Hide archived" } else { "Show archived" }}
+                </button>
             </div>
 
             // ── Error alert ─────────────────────────────────────────────────
@@ -381,7 +402,8 @@ pub fn MyIssuesPage() -> impl IntoView {
                             >
                                 {if !assigned_collapsed.get() {
                                     assigned.iter().enumerate().map(|(idx, issue)| {
-                                        view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index/> }
+                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
                                     view! {}.into_any()
@@ -407,7 +429,8 @@ pub fn MyIssuesPage() -> impl IntoView {
                             >
                                 {if !created_collapsed.get() {
                                     created.iter().enumerate().map(|(idx, issue)| {
-                                        view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index/> }
+                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
                                     view! {}.into_any()
@@ -430,7 +453,8 @@ pub fn MyIssuesPage() -> impl IntoView {
                             >
                                 {if !watching_collapsed.get() {
                                     watching.iter().enumerate().map(|(idx, issue)| {
-                                        view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index/> }
+                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
                                     view! {}.into_any()

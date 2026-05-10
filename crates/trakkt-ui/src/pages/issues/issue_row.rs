@@ -39,6 +39,10 @@ pub fn IssueRow(
     /// The currently keyboard-selected index (None = no selection).
     #[prop(into)]
     selected_index: Signal<Option<usize>>,
+    /// Whether this issue is archived (completed/cancelled older than threshold).
+    /// When true, the row renders with reduced opacity.
+    #[prop(optional, default = false)]
+    archived: bool,
 ) -> impl IntoView {
     let number = issue.number;
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
@@ -58,10 +62,15 @@ pub fn IssueRow(
     });
 
     let row_class = move || {
-        if is_selected.get() {
+        let base = if is_selected.get() {
             "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border bg-primary/5 ring-1 ring-primary/20 focus-visible:outline-none transition-colors cursor-pointer no-underline text-inherit"
         } else {
             "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer no-underline text-inherit"
+        };
+        if archived {
+            format!("{base} opacity-50")
+        } else {
+            base.to_string()
         }
     };
 

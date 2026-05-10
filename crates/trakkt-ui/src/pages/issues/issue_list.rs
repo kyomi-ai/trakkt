@@ -35,6 +35,7 @@ use crate::components::{
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown};
 use crate::pages::issues::issue_row::IssueRow;
+use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::server_fns::issues::{create_issue, list_issues};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::create_view;
@@ -131,6 +132,7 @@ fn IssueListInner(
     let (search, set_search) = signal(String::new());
     let (status_filter, set_status_filter) = signal(String::new());
     let (priority_filter, set_priority_filter) = signal(String::new());
+    let (show_archived, set_show_archived) = signal(false);
 
     // ── Error state for server function failures ──────────────────────────
     let error_msg = RwSignal::new(Option::<String>::None);
@@ -215,15 +217,20 @@ fn IssueListInner(
             .collect::<Vec<_>>()
     });
 
-    // Filtered issue list for list view — applies search, status, and priority filters.
+    // Filtered issue list for list view — applies archive, search, status, and priority filters.
     let filtered_issues = Memo::new(move |_| {
         let raw = team_issues.get();
         let search_val = search.get().to_lowercase();
         let status_val = status_filter.get();
         let priority_val = priority_filter.get();
+        let archived_visible = show_archived.get();
 
         raw.into_iter()
             .filter(|issue| {
+                // Archive filter: hide archived issues unless the toggle is on.
+                if !archived_visible && is_archived(issue, ARCHIVE_DAYS) {
+                    return false;
+                }
                 if !status_val.is_empty() && issue.status_id != status_val {
                     return false;
                 }
@@ -430,6 +437,20 @@ fn IssueListInner(
                         team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
                     />
                     <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
+                    <button
+                        class=move || {
+                            if show_archived.get() {
+                                "px-2 py-1 text-xs rounded-md border border-primary bg-primary/10 text-primary transition-colors flex items-center gap-1"
+                            } else {
+                                "px-2 py-1 text-xs rounded-md border border-border text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
+                            }
+                        }
+                        on:click=move |_| set_show_archived.update(|v| *v = !*v)
+                        title="Show archived issues"
+                    >
+                        <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
+                        {move || if show_archived.get() { "Hide archived" } else { "Show archived" }}
+                    </button>
                     // "Save view" — only when at least one filter is active
                     <Show when=move || {
                         !search.get().is_empty()
@@ -519,7 +540,8 @@ fn IssueListInner(
                                     }.into_any()
                                 } else {
                                     let rows = list.iter().enumerate().map(|(idx, issue)| {
-                                        view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index/> }
+                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index archived=archived/> }
                                     }).collect_view();
                                     view! {
                                         <div role="list">
