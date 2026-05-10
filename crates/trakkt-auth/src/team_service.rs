@@ -121,6 +121,7 @@ pub async fn create_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                0 AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         &team_id
@@ -158,6 +159,7 @@ pub async fn get_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                0 AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -175,6 +177,7 @@ pub async fn get_team_by_key(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                0 AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 AND key = $2",
         workspace_id,
@@ -194,6 +197,7 @@ pub async fn get_default_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                0 AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1",
         workspace_id
@@ -340,6 +344,7 @@ pub async fn get_user_teams(
         db,
         TeamRow,
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                0 AS member_count, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
          JOIN team_members tm ON tm.team_id = t.team_id \
