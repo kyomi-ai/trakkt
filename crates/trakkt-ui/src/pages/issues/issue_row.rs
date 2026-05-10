@@ -9,6 +9,7 @@
 
 use leptos::prelude::*;
 
+use crate::cache::store::SyncStore;
 use crate::components::{
     Avatar, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator,
 };
@@ -83,9 +84,20 @@ pub fn IssueRow(
                 {issue_key}
             </span>
 
-            // Title
-            <span class="text-sm font-medium text-foreground flex-1 truncate">
-                {issue.title.clone()}
+            // Title + parent reference
+            <span class="flex-1 min-w-0 flex items-center gap-1">
+                <span class="text-sm font-medium text-foreground truncate">
+                    {issue.title.clone()}
+                </span>
+                {issue.parent_issue_id.as_ref().and_then(|parent_id| {
+                    let store = use_context::<SyncStore>()?;
+                    let parent = store.issues().get_untracked().into_iter().find(|i| i.issue_id == *parent_id)?;
+                    Some(view! {
+                        <span class="text-xs text-muted-foreground shrink-0">
+                            {format!("\u{2190} {}-{}", parent.team_key, parent.number)}
+                        </span>
+                    })
+                })}
             </span>
 
             // Labels

@@ -849,6 +849,7 @@ async fn tool_create_issue(
         label_ids,
         project_id: args.get("project_id").and_then(|v| v.as_str()).map(String::from),
         milestone_id: args.get("milestone_id").and_then(|v| v.as_str()).map(String::from),
+        parent_issue_id: args.get("parent_issue_id").and_then(|v| v.as_str()).map(String::from),
     };
 
     let issue = issue_service::create_issue(&state.db, &params, Some(&state.ws_manager)).await?;
@@ -882,6 +883,9 @@ async fn tool_update_issue(
             v.as_str().map(String::from)
         }),
         milestone_id: args.get("milestone_id").map(|v| {
+            v.as_str().map(String::from)
+        }),
+        parent_issue_id: args.get("parent_issue_id").map(|v| {
             v.as_str().map(String::from)
         }),
     };

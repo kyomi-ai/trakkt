@@ -67,6 +67,7 @@ pub struct Issue {
     pub due_date: Option<String>,
     pub project_id: Option<String>,
     pub milestone_id: Option<String>,
+    pub parent_issue_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -93,6 +94,7 @@ pub struct IssueWithDetails {
     pub project_id: Option<String>,
     pub project_name: Option<String>,
     pub milestone_id: Option<String>,
+    pub parent_issue_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub labels: Vec<Label>,
@@ -242,6 +244,7 @@ pub struct CreateIssueParams {
     pub label_ids: Vec<String>,
     pub project_id: Option<String>,
     pub milestone_id: Option<String>,
+    pub parent_issue_id: Option<String>,
 }
 
 /// Fields that can be updated on an issue.
@@ -260,4 +263,5 @@ pub struct IssueUpdate {
     pub due_date: Option<Option<String>>,
     pub project_id: Option<Option<String>>,
     pub milestone_id: Option<Option<String>>,
+    pub parent_issue_id: Option<Option<String>>,
 }

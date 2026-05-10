@@ -33,6 +33,7 @@ struct IssueRow {
     due_date: Option<String>,
     project_id: Option<String>,
     milestone_id: Option<String>,
+    parent_issue_id: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -53,6 +54,7 @@ impl IssueRow {
             due_date: self.due_date,
             project_id: self.project_id,
             milestone_id: self.milestone_id,
+            parent_issue_id: self.parent_issue_id,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -81,6 +83,7 @@ struct IssueDetailRow {
     project_id: Option<String>,
     project_name: Option<String>,
     milestone_id: Option<String>,
+    parent_issue_id: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -107,11 +110,18 @@ impl IssueDetailRow {
             project_id: self.project_id,
             project_name: self.project_name,
             milestone_id: self.milestone_id,
+            parent_issue_id: self.parent_issue_id,
             created_at: self.created_at,
             updated_at: self.updated_at,
             labels,
         }
     }
+}
+
+/// Minimal row type for verifying parent issue existence.
+#[derive(sqlx::FromRow)]
+struct ParentCheckRow {
+    issue_id: String,
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -126,6 +136,7 @@ const ISSUE_DETAIL_SELECT: &str = "\
            i.creator_id, creator.name AS creator_name, \
            CAST(i.due_date AS TEXT) AS due_date, \
            i.project_id, p.name AS project_name, i.milestone_id, \
+           i.parent_issue_id, \
            CAST(i.created_at AS TEXT) AS created_at, \
            CAST(i.updated_at AS TEXT) AS updated_at \
     FROM issues i \
@@ -216,6 +227,26 @@ pub async fn create_issue(
     // Look up the default status for this workspace.
     let default_status = crate::status_service::get_default_status(db, &params.workspace_id).await?;
 
+    // Validate parent_issue_id if provided.
+    if let Some(ref parent_id) = params.parent_issue_id {
+        // Self-reference is impossible at creation (new UUID), but validate parent exists
+        // in the same workspace.
+        let parent_exists: Option<String> = trakkt_core::db_fetch_optional!(
+            db,
+            ParentCheckRow,
+            "SELECT issue_id FROM issues WHERE issue_id = $1 AND workspace_id = $2",
+            parent_id.as_str(),
+            &params.workspace_id
+        )?
+        .map(|r| r.issue_id);
+
+        if parent_exists.is_none() {
+            return Err(trakkt_core::Error::BadRequest(
+                "Parent issue not found in this workspace".to_string(),
+            ));
+        }
+    }
+
     // Atomic number generation: the subquery computes the next number inside the
     // INSERT statement so the MAX read and INSERT happen atomically, preventing
     // race conditions where concurrent creates read the same MAX.
@@ -224,10 +255,10 @@ pub async fn create_issue(
         "INSERT INTO issues \
             (issue_id, workspace_id, team_id, number, title, description, \
              status_id, priority, assignee_id, creator_id, due_date, \
-             project_id, milestone_id, created_at, updated_at) \
+             project_id, milestone_id, parent_issue_id, created_at, updated_at) \
          VALUES ($1, $2, $3, \
                  (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE workspace_id = $2), \
-                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, {now}, {now})"
+                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, $13, {now}, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -243,7 +274,8 @@ pub async fn create_issue(
         &params.creator_id,
         params.due_date.as_deref(),
         params.project_id.as_deref(),
-        params.milestone_id.as_deref()
+        params.milestone_id.as_deref(),
+        params.parent_issue_id.as_deref()
     )?;
 
     // Attach labels.
@@ -292,7 +324,7 @@ pub async fn create_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
-                project_id, milestone_id, \
+                project_id, milestone_id, parent_issue_id, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE issue_id = $1",
@@ -554,6 +586,11 @@ pub async fn update_issue(
         param_idx += 1;
     }
 
+    if updates.parent_issue_id.is_some() {
+        set_parts.push(format!("parent_issue_id = ${param_idx}"));
+        param_idx += 1;
+    }
+
     // Always update updated_at.
     set_parts.push(format!("updated_at = {now}"));
 
@@ -566,6 +603,33 @@ pub async fn update_issue(
         "UPDATE issues SET {set_clause} \
          WHERE workspace_id = ${ws_idx} AND number = ${num_idx}"
     );
+
+    // Validate parent_issue_id — workspace isolation + prevent circular references.
+    if let Some(Some(ref proposed_parent_id)) = updates.parent_issue_id {
+        // Verify the proposed parent belongs to the same workspace.
+        let parent_exists: Option<ParentCheckRow> = trakkt_core::db_fetch_optional!(
+            db,
+            ParentCheckRow,
+            "SELECT issue_id FROM issues WHERE issue_id = $1 AND workspace_id = $2",
+            proposed_parent_id.as_str(),
+            workspace_id
+        )?;
+        if parent_exists.is_none() {
+            return Err(trakkt_core::Error::BadRequest(
+                "Parent issue not found in this workspace".to_string(),
+            ));
+        }
+
+        // Resolve the current issue's ID for circular reference check.
+        let current_issue_id: String = trakkt_core::db_fetch_scalar!(
+            db,
+            String,
+            "SELECT issue_id FROM issues WHERE workspace_id = $1 AND number = $2",
+            workspace_id,
+            number
+        )?;
+        validate_no_circular_reference(db, &current_issue_id, proposed_parent_id).await?;
+    }
 
     // Bind dynamically. Map to rows_affected() inside the closure so both
     // pool arms return the same type (u64).
@@ -597,6 +661,9 @@ pub async fn update_issue(
         if let Some(ref v) = updates.milestone_id {
             query = query.bind(v.as_deref());
         }
+        if let Some(ref v) = updates.parent_issue_id {
+            query = query.bind(v.as_deref());
+        }
 
         query = query.bind(workspace_id);
         query = query.bind(number);
@@ -617,7 +684,7 @@ pub async fn update_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
-                project_id, milestone_id, \
+                project_id, milestone_id, parent_issue_id, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE workspace_id = $1 AND number = $2",
@@ -674,7 +741,7 @@ pub async fn delete_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
-                project_id, milestone_id, \
+                project_id, milestone_id, parent_issue_id, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE workspace_id = $1 AND number = $2",
@@ -791,4 +858,90 @@ pub async fn set_issue_labels(
     }
 
     Ok(())
+}
+
+// ─── Sub-issues ────────────────────────────────────────────────────────────
+
+/// Validate that setting `proposed_parent_id` as the parent of `issue_id`
+/// would not create a circular reference.
+///
+/// Walks up the ancestor chain from the proposed parent. If `issue_id` is
+/// encountered, the assignment would create a cycle. Limits traversal to 10
+/// levels to prevent infinite loops from corrupt data.
+async fn validate_no_circular_reference(
+    db: &DbPool,
+    issue_id: &str,
+    proposed_parent_id: &str,
+) -> trakkt_core::Result<()> {
+    if issue_id == proposed_parent_id {
+        return Err(trakkt_core::Error::BadRequest(
+            "An issue cannot be its own parent".to_string(),
+        ));
+    }
+
+    let mut current_id = proposed_parent_id.to_owned();
+    for _ in 0..10 {
+        let parent: Option<Option<String>> = trakkt_core::db_with_pool!(db, |p| {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT parent_issue_id FROM issues WHERE issue_id = $1",
+            )
+            .bind(&current_id)
+            .fetch_optional(p)
+            .await
+        })?;
+
+        match parent.flatten() {
+            Some(pid) => {
+                if pid == issue_id {
+                    return Err(trakkt_core::Error::BadRequest(
+                        "Circular reference: setting this parent would create a cycle".to_string(),
+                    ));
+                }
+                current_id = pid;
+            }
+            None => return Ok(()),
+        }
+    }
+
+    Err(trakkt_core::Error::BadRequest(
+        "Issue hierarchy too deep (max 10 levels)".to_string(),
+    ))
+}
+
+/// List sub-issues (direct children) of a given parent issue.
+pub async fn list_sub_issues(
+    db: &DbPool,
+    parent_issue_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<Vec<IssueWithDetails>> {
+    let sql = format!(
+        "{ISSUE_DETAIL_SELECT} WHERE i.parent_issue_id = $1 AND i.workspace_id = $2 \
+         ORDER BY i.priority ASC, i.created_at DESC"
+    );
+
+    let rows: Vec<IssueDetailRow> = trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query_as::<_, IssueDetailRow>(&sql)
+            .bind(parent_issue_id)
+            .bind(workspace_id)
+            .fetch_all(p)
+            .await
+    })?;
+
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Batch-fetch labels for all sub-issues.
+    let issue_ids: Vec<String> = rows.iter().map(|r| r.issue_id.clone()).collect();
+    let mut labels_map = fetch_labels_for_issues(db, &issue_ids).await?;
+
+    let results = rows
+        .into_iter()
+        .map(|r| {
+            let labels = labels_map.remove(&r.issue_id).unwrap_or_default();
+            r.into_dto(labels)
+        })
+        .collect();
+
+    Ok(results)
 }
