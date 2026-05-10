@@ -127,7 +127,6 @@ pub fn StatusFilterDropdown(
             trigger_ref=trigger_ref
             open=Signal::derive(move || open.get())
             on_close=Callback::new(move |()| set_open.set(false))
-            search_placeholder="Filter status..."
         >
             <DropdownItem
                 label="All statuses"
@@ -216,7 +215,6 @@ pub fn PriorityFilterDropdown(
             trigger_ref=trigger_ref
             open=Signal::derive(move || open.get())
             on_close=Callback::new(move |()| set_open.set(false))
-            search_placeholder="Filter priority..."
         >
             <DropdownItem
                 label="All priorities"
