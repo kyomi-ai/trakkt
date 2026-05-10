@@ -365,6 +365,13 @@ async fn handle_sync_bootstrap(
             vec![]
         });
 
+    let views = trakkt_auth::view_service::list_views(db, workspace_id, user_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(user_id, workspace_id, error = %e, "list_views failed during bootstrap");
+            vec![]
+        });
+
     // 4. Get the current sync watermark.
     let latest_sync_id =
         trakkt_auth::sync_log_service::get_latest_sync_id(db, workspace_id)
@@ -401,6 +408,12 @@ async fn handle_sync_bootstrap(
         .filter_map(|p| serde_json::to_value(p).ok())
         .collect();
     stream_entities(manager, user_id, workspace_id, entity_types::PROJECT, "project_id", project_values).await;
+
+    let view_values: Vec<serde_json::Value> = views
+        .iter()
+        .filter_map(|v| serde_json::to_value(v).ok())
+        .collect();
+    stream_entities(manager, user_id, workspace_id, entity_types::VIEW, "view_id", view_values).await;
 
     // 6. Signal completion with the current sync watermark.
     send_sync_response(

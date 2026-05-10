@@ -239,6 +239,8 @@ fn Sidebar(
             <nav class="flex-1 p-3 space-y-1 overflow-y-auto">
                 <SidebarNavItem href="/my-issues" icon=phosphor_leptos::LIST_CHECKS label="My Issues"/>
 
+                <SidebarViewsSection/>
+
                 <SidebarTeamsSection/>
                 <SidebarProjectsSection/>
             </nav>
@@ -411,26 +413,28 @@ fn SidebarTeamsSection() -> impl IntoView {
     }
 }
 
-/// Section header for "Projects" with dynamic project list from SyncStore.
+/// Section for "Views" — shows saved views from SyncStore when any exist.
 #[component]
-fn SidebarProjectsSection() -> impl IntoView {
+fn SidebarViewsSection() -> impl IntoView {
     let store = use_context::<SyncStore>();
 
     view! {
         {move || {
             let Some(store) = store else { return view! { <span/> }.into_any() };
-            let projects = store.projects().get();
-            if projects.is_empty() {
+            let views = store.views().get();
+            if views.is_empty() {
                 return view! { <span/> }.into_any();
             }
+            // Limit to 10 items shown.
+            let items: Vec<_> = views.into_iter().take(10).collect();
             view! {
-                <SidebarSectionHeader label="Projects"/>
+                <SidebarSectionHeader label="Views"/>
                 <div class="space-y-0.5">
-                    {projects.into_iter().map(|project| {
-                        let href = format!("/projects/{}", project.project_id);
-                        let name = project.name.clone();
+                    {items.into_iter().map(|v| {
+                        let href = format!("/views/{}", v.view_id);
+                        let name = v.name.clone();
                         view! {
-                            <SidebarProjectItem href=href name=name/>
+                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FUNNEL/>
                         }
                     }).collect_view()}
                 </div>
@@ -439,11 +443,12 @@ fn SidebarProjectsSection() -> impl IntoView {
     }
 }
 
-/// A single project link in the sidebar with its own active-state tracking.
+/// A sidebar entity link with active-state tracking. Used for views, projects, etc.
 #[component]
-fn SidebarProjectItem(
+fn SidebarEntityItem(
     href: String,
     name: String,
+    icon: phosphor_leptos::IconData,
 ) -> impl IntoView {
     let path = leptos_router::hooks::use_location().pathname;
     let href_match = href.clone();
@@ -463,11 +468,40 @@ fn SidebarProjectItem(
     };
     view! {
         <a href=href class=class>
-            <Icon icon=phosphor_leptos::FOLDER weight=weight size="16px"/>
+            <Icon icon=icon weight=weight size="16px"/>
             <span class="truncate">{name}</span>
         </a>
     }
 }
+
+/// Section header for "Projects" with dynamic project list from SyncStore.
+#[component]
+fn SidebarProjectsSection() -> impl IntoView {
+    let store = use_context::<SyncStore>();
+
+    view! {
+        {move || {
+            let Some(store) = store else { return view! { <span/> }.into_any() };
+            let projects = store.projects().get();
+            if projects.is_empty() {
+                return view! { <span/> }.into_any();
+            }
+            view! {
+                <SidebarSectionHeader label="Projects"/>
+                <div class="space-y-0.5">
+                    {projects.into_iter().map(|project| {
+                        let href = format!("/projects/{}", project.project_id);
+                        let name = project.name.clone();
+                        view! {
+                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER/>
+                        }
+                    }).collect_view()}
+                </div>
+            }.into_any()
+        }}
+    }
+}
+
 
 /// Small, uppercase, muted section header (Linear-style).
 #[component]
