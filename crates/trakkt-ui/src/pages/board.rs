@@ -20,7 +20,8 @@ use leptos_router::hooks::use_navigate;
 use phosphor_leptos::Icon;
 use wasm_bindgen::JsCast;
 
-use crate::components::{Alert, AlertVariant, Avatar, Button, ButtonSize, ButtonVariant, Checkbox, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, Skeleton};
+use crate::components::{Alert, AlertVariant, Avatar, Button, ButtonSize, ButtonVariant, Checkbox, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, SearchInput, Skeleton};
+use crate::pages::issues::filters::PriorityFilterDropdown;
 use crate::server_fns::issues::{list_issues, update_issue};
 use crate::server_fns::statuses::list_statuses;
 use trakkt_types::models::{IssueWithDetails, Status};
@@ -238,6 +239,33 @@ pub fn BoardPage() -> impl IntoView {
         });
     }
 
+    // ── Filter state ─────────────────────────────────────────────────────────
+    let (search, set_search) = signal(String::new());
+    let (priority_filter, set_priority_filter) = signal(String::new());
+
+    // Client-side filtered issues: search + priority applied before grouping.
+    let filtered_issues = Memo::new(move |_| {
+        let raw = issues.get();
+        let search_val = search.get().to_lowercase();
+        let priority_val = priority_filter.get();
+
+        raw.into_iter()
+            .filter(|issue| {
+                if !priority_val.is_empty() {
+                    if let Ok(p) = priority_val.parse::<i32>() {
+                        if issue.priority != p {
+                            return false;
+                        }
+                    }
+                }
+                if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
+                    return false;
+                }
+                true
+            })
+            .collect::<Vec<_>>()
+    });
+
     // ── Drag state ──────────────────────────────────────────────────────────
     let (dragging, set_dragging) = signal(Option::<String>::None);
     let (drag_target, set_drag_target) = signal(Option::<String>::None);
@@ -312,6 +340,20 @@ pub fn BoardPage() -> impl IntoView {
                 />
             </div>
 
+            // ── Toolbar ─────────────────────────────────────────────────────
+            <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0">
+                <SearchInput
+                    value=Signal::derive(move || search.get())
+                    on_input=Callback::new(move |v: String| set_search.set(v))
+                    placeholder="Filter cards..."
+                    class="flex-1 max-w-sm"
+                />
+                <PriorityFilterDropdown
+                    value=priority_filter
+                    on_change=Callback::new(move |v: String| set_priority_filter.set(v))
+                />
+            </div>
+
             // ── Error alert ─────────────────────────────────────────────────
             <Show when=move || issues_error.get().is_some() || statuses_error.get().is_some()>
                 <div class="mx-4 mt-4 space-y-2">
@@ -331,7 +373,7 @@ pub fn BoardPage() -> impl IntoView {
                     if s.is_empty() {
                         view! { <BoardSkeleton/> }.into_any()
                     } else {
-                        let grouped_all = Memo::new(move |_| group_by_status(&statuses.get(), &issues.get()));
+                        let grouped_all = Memo::new(move |_| group_by_status(&statuses.get(), &filtered_issues.get()));
                         let grouped = move || {
                             let hidden = hidden_statuses.get();
                             grouped_all.get()
