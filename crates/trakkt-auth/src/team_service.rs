@@ -25,6 +25,7 @@ struct TeamRow {
     key: String,
     description: Option<String>,
     icon: Option<String>,
+    member_count: i64,
     created_at: String,
 }
 
@@ -37,6 +38,7 @@ impl TeamRow {
             key: self.key,
             description: self.description,
             icon: self.icon,
+            member_count: self.member_count,
             created_at: self.created_at,
         }
     }
@@ -119,6 +121,7 @@ pub async fn create_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                0 AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         &team_id
@@ -126,7 +129,7 @@ pub async fn create_team(
     Ok(row.into_dto())
 }
 
-/// List all teams in a workspace, ordered by creation date.
+/// List all teams in a workspace, ordered alphabetically by name.
 pub async fn list_teams(
     db: &DbPool,
     workspace_id: &str,
@@ -134,9 +137,14 @@ pub async fn list_teams(
     let rows: Vec<TeamRow> = trakkt_core::db_fetch_all!(
         db,
         TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC",
+        "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                COUNT(tm.user_id) AS member_count, \
+                CAST(t.created_at AS TEXT) AS created_at \
+         FROM teams t \
+         LEFT JOIN team_members tm ON tm.team_id = t.team_id \
+         WHERE t.workspace_id = $1 \
+         GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, t.created_at \
+         ORDER BY t.name ASC",
         workspace_id
     )?;
     Ok(rows.into_iter().map(TeamRow::into_dto).collect())
@@ -151,6 +159,7 @@ pub async fn get_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                0 AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -168,6 +177,7 @@ pub async fn get_team_by_key(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                0 AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 AND key = $2",
         workspace_id,
@@ -187,6 +197,7 @@ pub async fn get_default_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                0 AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1",
         workspace_id
@@ -333,6 +344,7 @@ pub async fn get_user_teams(
         db,
         TeamRow,
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                0 AS member_count, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
          JOIN team_members tm ON tm.team_id = t.team_id \

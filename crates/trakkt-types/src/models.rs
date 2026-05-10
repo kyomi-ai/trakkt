@@ -20,6 +20,7 @@ pub struct Team {
     pub key: String,
     pub description: Option<String>,
     pub icon: Option<String>,
+    pub member_count: i64,
     pub created_at: String,
 }
 
