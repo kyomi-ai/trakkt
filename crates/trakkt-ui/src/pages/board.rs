@@ -12,6 +12,14 @@
 //! - HTML5 drag API (dragstart, dragover, dragenter, dragleave, drop)
 //! - Optimistic UI: card moves immediately, reverts on server error
 //! - Same-column drops are no-ops
+//!
+//! ## Architecture
+//!
+//! `BoardContent` is the reusable Kanban rendering component. It accepts
+//! pre-loaded data as props and owns all board-specific state (filters,
+//! hidden columns, drag-and-drop). It is used both by `BoardPage` (the
+//! standalone route, soon to be removed) and by the unified issues page
+//! via the view toggle.
 
 use std::collections::HashSet;
 
@@ -20,10 +28,9 @@ use leptos_router::hooks::use_navigate;
 use phosphor_leptos::Icon;
 use wasm_bindgen::JsCast;
 
-use crate::components::{Alert, AlertVariant, Avatar, Button, ButtonSize, ButtonVariant, Checkbox, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, SearchInput, Skeleton};
+use crate::components::{Avatar, Button, ButtonSize, ButtonVariant, Checkbox, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, SearchInput, Skeleton};
 use crate::pages::issues::filters::PriorityFilterDropdown;
-use crate::server_fns::issues::{list_issues, update_issue};
-use crate::server_fns::statuses::list_statuses;
+use crate::server_fns::issues::update_issue;
 use trakkt_types::models::{IssueWithDetails, Status};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,107 +115,30 @@ fn default_hidden(statuses: &[Status]) -> HashSet<String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Board Page
+// Board Content — reusable Kanban rendering component
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Kanban board page — issues arranged in status columns with drag-and-drop.
+/// Reusable Kanban board content component.
 ///
-/// When mounted at `/teams/:key/board`, reads the `:key` route param to scope
-/// the board to a single team. When mounted at `/board` (no `:key` param),
-/// all workspace issues and statuses are shown.
+/// Accepts pre-loaded issues, statuses, and an optional SyncStore as props.
+/// Owns all board-specific state: filters (search + priority), hidden columns,
+/// drag-and-drop, and display options popover.
+///
+/// Used by `IssueListInner` (unified page, board view mode) and by
+/// `BoardPage` (standalone route, legacy).
 #[component]
-pub fn BoardPage() -> impl IntoView {
-    // If mounted under `/teams/:key/board`, read the team key from route params.
-    // At `/board` there is no `:key` param, so this yields None — global board.
-    let team_key = {
-        let params = leptos_router::hooks::use_params_map();
-        params.read().get("key")
-    };
-
-    // ── Data source: SyncStore (real-time) with server function fallback ───
-    let sync_store = use_context::<crate::cache::store::SyncStore>();
-
-    // ── Error state for server function failures ──────────────────────────
-    let issues_error = RwSignal::new(Option::<String>::None);
-    let statuses_error = RwSignal::new(Option::<String>::None);
-
-    // ── Resolve team from SyncStore ────────────────────────────────────────
-    let team_key_for_memo = team_key.clone();
-    let team = Memo::new(move |_| {
-        let key = team_key_for_memo.as_ref()?;
-        let store = sync_store?;
-        store.teams().get().into_iter().find(|t| t.key.to_lowercase() == *key)
-    });
-
-    let server_issues = Resource::new(
-        || (),
-        move |_| async move { list_issues(None, None, None, None, None, None, None, None).await },
-    );
-
-    let all_issues = Memo::new(move |_| {
-        if let Some(store) = sync_store {
-            let items = store.issues().get();
-            if !items.is_empty() || store.initialized().get() {
-                return items;
-            }
-        }
-        match server_issues.get() {
-            Some(Ok(items)) => {
-                issues_error.set(None);
-                items
-            }
-            Some(Err(e)) => {
-                issues_error.set(Some(format!("Failed to load issues: {e}")));
-                Vec::new()
-            }
-            None => Vec::new(),
-        }
-    });
-
-    // Filter issues by team when a team is resolved.
-    let issues = Memo::new(move |_| {
-        let all = all_issues.get();
-        match team.get() {
-            Some(ref t) => all.into_iter().filter(|i| i.team_id == t.team_id).collect(),
-            None => all,
-        }
-    });
-
-    // Statuses are workspace config — fetched once via server function.
-    // They don't change frequently enough to need SyncStore.
-    let statuses_resource = Resource::new(
-        || (),
-        move |_| async move { list_statuses(None).await },
-    );
-
-    let all_statuses = Memo::new(move |_| {
-        match statuses_resource.get() {
-            Some(Ok(items)) => {
-                statuses_error.set(None);
-                items
-            }
-            Some(Err(e)) => {
-                statuses_error.set(Some(format!("Failed to load statuses: {e}")));
-                Vec::new()
-            }
-            None => Vec::new(),
-        }
-    });
-
-    // Filter statuses by team: show global (team_id=None) + team-specific.
-    let statuses = Memo::new(move |_| {
-        let all = all_statuses.get();
-        match team.get() {
-            Some(ref t) => all.into_iter().filter(|s| {
-                s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id)
-            }).collect(),
-            None => all,
-        }
-    });
-
+pub fn BoardContent(
+    /// All issues to display, already filtered by team.
+    issues: Memo<Vec<IssueWithDetails>>,
+    /// All statuses available, already filtered by team.
+    statuses: Memo<Vec<Status>>,
+    /// SyncStore for optimistic drag-drop updates.
+    sync_store: Option<crate::cache::store::SyncStore>,
+    /// Team key for localStorage scoping. None = workspace-level.
+    #[prop(optional, into)]
+    team_key: Option<String>,
+) -> impl IntoView {
     // ── Hidden columns state ─────────────────────────────────────────────
-    // Tracks which status columns are hidden. Initialized from localStorage
-    // or defaults to hiding "cancelled" category on first visit.
     let hidden_statuses: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
     let key_for_storage = storage_key(&team_key);
 
@@ -325,21 +255,6 @@ pub fn BoardPage() -> impl IntoView {
     // ── Render ──────────────────────────────────────────────────────────────
     view! {
         <div class="bg-background flex flex-col h-full">
-            // ── Page header ─────────────────────────────────────────────────
-            <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
-                <h1 class="text-sm font-semibold text-foreground">
-                    {move || match team.get() {
-                        Some(t) => format!("{} Board", t.name),
-                        None => "Board".to_string(),
-                    }}
-                </h1>
-                <BoardDisplayOptions
-                    statuses=statuses
-                    hidden=hidden_statuses
-                    storage_key=key_for_storage.clone()
-                />
-            </div>
-
             // ── Toolbar ─────────────────────────────────────────────────────
             <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0">
                 <SearchInput
@@ -352,19 +267,12 @@ pub fn BoardPage() -> impl IntoView {
                     value=priority_filter
                     on_change=Callback::new(move |v: String| set_priority_filter.set(v))
                 />
+                <BoardDisplayOptions
+                    statuses=statuses
+                    hidden=hidden_statuses
+                    storage_key=key_for_storage.clone()
+                />
             </div>
-
-            // ── Error alert ─────────────────────────────────────────────────
-            <Show when=move || issues_error.get().is_some() || statuses_error.get().is_some()>
-                <div class="mx-4 mt-4 space-y-2">
-                    {move || issues_error.get().map(|msg| view! {
-                        <Alert variant=AlertVariant::Error>{msg}</Alert>
-                    })}
-                    {move || statuses_error.get().map(|msg| view! {
-                        <Alert variant=AlertVariant::Error>{msg}</Alert>
-                    })}
-                </div>
-            </Show>
 
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-x-auto px-4 md:px-6 py-4" style="scrollbar-width: thin;">
@@ -373,10 +281,9 @@ pub fn BoardPage() -> impl IntoView {
                     if s.is_empty() {
                         view! { <BoardSkeleton/> }.into_any()
                     } else {
-                        let grouped_all = Memo::new(move |_| group_by_status(&statuses.get(), &filtered_issues.get()));
                         let grouped = move || {
                             let hidden = hidden_statuses.get();
-                            grouped_all.get()
+                            group_by_status(&statuses.get(), &filtered_issues.get())
                                 .into_iter()
                                 .filter(|(status, _)| !hidden.contains(&status.status_id))
                                 .collect::<Vec<_>>()

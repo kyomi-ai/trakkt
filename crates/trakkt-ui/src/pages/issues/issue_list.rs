@@ -3,14 +3,20 @@
 //! Issue list page — the first thing users see after login.
 //!
 //! Layout follows DESIGN.md "Issue List Page" spec:
-//! - Page header: title + "New Issue" button
-//! - Toolbar: search + filter dropdowns
-//! - Content: issue rows, loading skeletons, or empty state
+//! - Page header: title + view toggle + "New Issue" button
+//! - Toolbar: search + filter dropdowns (list mode only)
+//! - Content: issue rows (list mode) or Kanban board (board mode)
 //!
 //! Issue Row follows DESIGN.md "Issue Row Pattern":
 //! `px-3 py-[6px] h-9 flex items-center gap-2.5 border-b border-border`
 //! hover:bg-surface-alt transition-colors cursor-pointer
 //! Order: Priority | Status | Issue ID | Title | Labels | Date | Assignee
+//!
+//! ## View toggle
+//!
+//! A segmented control in the page header allows switching between list and
+//! board views. The preference is persisted to localStorage per team (or
+//! globally for the workspace-level page).
 
 use std::sync::Arc;
 
@@ -22,15 +28,51 @@ use wasm_bindgen::JsCast;
 
 use crate::components::{
     Alert, AlertVariant,
-    Button, ButtonVariant, EmptyState,
+    Button, ButtonSize, ButtonVariant, EmptyState,
     Modal, ModalSize,
     SearchInput, StyledSelect, INPUT_CLASS,
 };
+use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown};
 use crate::pages::issues::issue_row::IssueRow;
 use crate::server_fns::issues::{create_issue, list_issues};
+use crate::server_fns::statuses::list_statuses;
 use crate::utils::keyboard::is_input_focused;
 use trakkt_types::models::Team;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// localStorage helpers for view mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read the saved view mode from localStorage.
+#[cfg(target_arch = "wasm32")]
+fn read_view_mode(key: &str) -> Option<String> {
+    let storage = web_sys::window()?.local_storage().ok()??;
+    storage.get_item(key).ok()?
+}
+
+/// Write the view mode to localStorage.
+#[cfg(target_arch = "wasm32")]
+fn write_view_mode(key: &str, mode: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(key, mode);
+    }
+}
+
+/// Build the localStorage key for the view mode.
+fn view_mode_storage_key(team_key: &Option<Signal<String>>) -> String {
+    match team_key {
+        Some(sig) => {
+            let key = sig.get_untracked();
+            if key.is_empty() {
+                "trakkt-view-mode-global".to_string()
+            } else {
+                format!("trakkt-view-mode-{key}")
+            }
+        }
+        None => "trakkt-view-mode-global".to_string(),
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue List Page
@@ -66,6 +108,24 @@ fn IssueListInner(
     #[prop(optional, into)]
     team_key: Option<Signal<String>>,
 ) -> impl IntoView {
+    // ── View mode state ────────────────────────────────────────────────────
+    let storage_key = view_mode_storage_key(&team_key);
+    let initial_mode = {
+        #[cfg(target_arch = "wasm32")]
+        { read_view_mode(&storage_key).unwrap_or_else(|| "list".to_string()) }
+        #[cfg(not(target_arch = "wasm32"))]
+        { "list".to_string() }
+    };
+    let (view_mode, set_view_mode) = signal(initial_mode);
+    let storage_key_for_effect = storage_key.clone();
+    Effect::new(move |_| {
+        let mode = view_mode.get();
+        #[cfg(target_arch = "wasm32")]
+        write_view_mode(&storage_key_for_effect, &mode);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (&storage_key_for_effect, &mode);
+    });
+
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
     let (status_filter, set_status_filter) = signal(String::new());
@@ -101,16 +161,14 @@ fn IssueListInner(
         move |(_, team_id)| async move { list_issues(team_id, None, None, None, None, None, None, None).await },
     );
 
-    // Filtered issue list — reads from SyncStore when initialized, otherwise
-    // from the server function result. Filters are applied client-side for
-    // instant reactivity (no round-trip to the server on filter change).
-    let filtered_issues = Memo::new(move |_| {
+    // ── All issues (unfiltered, scoped to team if applicable) ──────────────
+    // Shared between list and board views.
+    let team_issues = Memo::new(move |_| {
         let raw = if let Some(store) = sync_store {
             let issues = store.issues().get();
             if !issues.is_empty() || store.initialized().get() {
                 issues
             } else {
-                // Store not initialized yet — use server function result
                 match server_issues.get() {
                     Some(Ok(items)) => {
                         error_msg.set(None);
@@ -124,7 +182,6 @@ fn IssueListInner(
                 }
             }
         } else {
-            // No store (SSR) — use server function
             match server_issues.get() {
                 Some(Ok(items)) => {
                     error_msg.set(None);
@@ -144,20 +201,28 @@ fn IssueListInner(
             return vec![];
         }
 
-        // Apply client-side filters
+        // Filter by team when on a team page.
+        let team = resolved_team.get();
+        raw.into_iter()
+            .filter(|issue| {
+                if let Some(ref t) = team {
+                    issue.team_id == t.team_id
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+
+    // Filtered issue list for list view — applies search, status, and priority filters.
+    let filtered_issues = Memo::new(move |_| {
+        let raw = team_issues.get();
         let search_val = search.get().to_lowercase();
         let status_val = status_filter.get();
         let priority_val = priority_filter.get();
-        let team = resolved_team.get();
 
         raw.into_iter()
             .filter(|issue| {
-                // Team filter: when on a team page, only show that team's issues.
-                if let Some(ref t) = team {
-                    if issue.team_id != t.team_id {
-                        return false;
-                    }
-                }
                 if !status_val.is_empty() && issue.status_id != status_val {
                     return false;
                 }
@@ -174,6 +239,42 @@ fn IssueListInner(
                 true
             })
             .collect::<Vec<_>>()
+    });
+
+    // ── Statuses (for board view) ──────────────────────────────────────────
+    // Board view needs statuses for column rendering. Loaded from SyncStore
+    // with server function fallback, filtered by team.
+    let statuses_resource = Resource::new(
+        || (),
+        move |_| async move { list_statuses(None).await },
+    );
+
+    let board_statuses = Memo::new(move |_| {
+        let all = if let Some(store) = sync_store {
+            let s = store.statuses().get();
+            if !s.is_empty() || store.initialized().get() {
+                s
+            } else {
+                statuses_resource
+                    .get()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default()
+            }
+        } else {
+            statuses_resource
+                .get()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+        };
+
+        // Filter by team: global (team_id=None) + team-specific.
+        match resolved_team.get() {
+            Some(ref t) => all
+                .into_iter()
+                .filter(|s| s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
+                .collect(),
+            None => all,
+        }
     });
 
     // ── New Issue modal state ───────────────────────────────────────────────
@@ -209,6 +310,8 @@ fn IssueListInner(
             let key = ev.key();
             match key.as_str() {
                 "j" => {
+                    // Only active in list mode.
+                    if view_mode.get_untracked() != "list" { return; }
                     ev.prevent_default();
                     let count = issue_count.get_untracked();
                     if count == 0 { return; }
@@ -220,6 +323,7 @@ fn IssueListInner(
                     });
                 }
                 "k" => {
+                    if view_mode.get_untracked() != "list" { return; }
                     ev.prevent_default();
                     let count = issue_count.get_untracked();
                     if count == 0 { return; }
@@ -231,6 +335,7 @@ fn IssueListInner(
                     });
                 }
                 "Enter" => {
+                    if view_mode.get_untracked() != "list" { return; }
                     if let Some(idx) = selected_index.get_untracked() {
                         let numbers = issue_numbers.get_untracked();
                         if let Some(&number) = numbers.get(idx) {
@@ -261,6 +366,17 @@ fn IssueListInner(
         });
     });
 
+    let is_list_mode = Memo::new(move |_| view_mode.get() == "list");
+    let is_board_mode = Memo::new(move |_| view_mode.get() == "board");
+
+    // Team key as a plain String for passing to BoardContent.
+    let team_key_string = Memo::new(move |_| {
+        team_key.and_then(|s| {
+            let v = s.get();
+            if v.is_empty() { None } else { Some(v) }
+        })
+    });
+
     // ── Render ──────────────────────────────────────────────────────────────
     view! {
         <div class="bg-background flex flex-col h-full">
@@ -269,29 +385,49 @@ fn IssueListInner(
                 <h1 class="text-sm font-semibold text-foreground">
                     {move || resolved_team.get().map(|t| t.name.clone()).unwrap_or_else(|| "Issues".to_string())}
                 </h1>
-                <Button
-                    on:click=move |_| set_show_new_issue.set(true)
-                >
-                    <Icon icon=phosphor_leptos::PLUS size="14px"/>
-                    "New Issue"
-                </Button>
+                <div class="flex items-center gap-3">
+                    // View toggle (segmented control)
+                    <div class="flex items-center border border-border rounded-md overflow-hidden">
+                        {move || {
+                            let lv = if is_list_mode.get() { ButtonVariant::PillActive } else { ButtonVariant::Pill };
+                            let bv = if is_board_mode.get() { ButtonVariant::PillActive } else { ButtonVariant::Pill };
+                            view! {
+                                <Button variant=lv size=ButtonSize::Pill on:click=move |_| set_view_mode.set("list".to_string()) aria_label="List view">
+                                    <Icon icon=phosphor_leptos::LIST size="14px"/>
+                                </Button>
+                                <Button variant=bv size=ButtonSize::Pill on:click=move |_| set_view_mode.set("board".to_string()) aria_label="Board view">
+                                    <Icon icon=phosphor_leptos::KANBAN size="14px"/>
+                                </Button>
+                            }
+                        }}
+                    </div>
+
+                    <Button
+                        on:click=move |_| set_show_new_issue.set(true)
+                    >
+                        <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                        "New Issue"
+                    </Button>
+                </div>
             </div>
 
-            // ── Toolbar ─────────────────────────────────────────────────────
-            <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0">
-                <SearchInput
-                    value=Signal::derive(move || search.get())
-                    on_input=Callback::new(move |v: String| set_search.set(v))
-                    placeholder="Search issues..."
-                    class="flex-1 max-w-sm"
-                />
-                <StatusFilterDropdown
-                    value=status_filter
-                    on_change=Callback::new(move |v: String| set_status_filter.set(v))
-                    team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
-                />
-                <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
-            </div>
+            // ── Toolbar (list view only) ────────────────────────────────────
+            <Show when=move || view_mode.get() == "list">
+                <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0">
+                    <SearchInput
+                        value=Signal::derive(move || search.get())
+                        on_input=Callback::new(move |v: String| set_search.set(v))
+                        placeholder="Search issues..."
+                        class="flex-1 max-w-sm"
+                    />
+                    <StatusFilterDropdown
+                        value=status_filter
+                        on_change=Callback::new(move |v: String| set_status_filter.set(v))
+                        team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
+                    />
+                    <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
+                </div>
+            </Show>
 
             // ── Error alert ─────────────────────────────────────────────────
             <Show when=move || error_msg.get().is_some()>
@@ -303,55 +439,80 @@ fn IssueListInner(
             </Show>
 
             // ── Content area ────────────────────────────────────────────────
-            <div class="flex-1 overflow-y-auto">
-                {move || {
-                    let list = filtered_issues.get();
-
-                    // Update keyboard navigation bounds.
-                    issue_count.set(list.len());
-                    issue_numbers.set(list.iter().map(|i| i.number).collect());
-                    if let Some(idx) = selected_index.get_untracked()
-                        && idx >= list.len()
-                    {
-                        set_selected_index.set(if list.is_empty() { None } else { Some(list.len() - 1) });
-                    }
-
-                    if list.is_empty() {
-                        let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
-                            view! {
-                                <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
-                            }.into_any()
-                        });
-                        let empty_action: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
-                            view! {
-                                <Button on:click=move |_| set_show_new_issue.set(true)>
-                                    <Icon icon=phosphor_leptos::PLUS size="14px"/>
-                                    "New Issue"
-                                </Button>
-                            }.into_any()
-                        });
+            {move || {
+                if view_mode.get() == "board" {
+                    if let Some(key) = team_key_string.get() {
                         view! {
-                            <div class="p-4 md:p-6">
-                                <EmptyState
-                                    icon=empty_icon
-                                    title="No issues yet"
-                                    description="Create your first issue to get started"
-                                    action=empty_action
-                                />
-                            </div>
+                            <BoardContent
+                                issues=team_issues
+                                statuses=board_statuses
+                                sync_store=sync_store
+                                team_key=key
+                            />
                         }.into_any()
                     } else {
-                        let rows = list.iter().enumerate().map(|(idx, issue)| {
-                            view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index/> }
-                        }).collect_view();
                         view! {
-                            <div role="list">
-                                {rows}
-                            </div>
+                            <BoardContent
+                                issues=team_issues
+                                statuses=board_statuses
+                                sync_store=sync_store
+                            />
                         }.into_any()
                     }
-                }}
-            </div>
+                } else {
+                    view! {
+                        <div class="flex-1 overflow-y-auto">
+                            {move || {
+                                let list = filtered_issues.get();
+
+                                // Update keyboard navigation bounds.
+                                issue_count.set(list.len());
+                                issue_numbers.set(list.iter().map(|i| i.number).collect());
+                                if let Some(idx) = selected_index.get_untracked()
+                                    && idx >= list.len()
+                                {
+                                    set_selected_index.set(if list.is_empty() { None } else { Some(list.len() - 1) });
+                                }
+
+                                if list.is_empty() {
+                                    let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                        view! {
+                                            <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+                                        }.into_any()
+                                    });
+                                    let empty_action: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                        view! {
+                                            <Button on:click=move |_| set_show_new_issue.set(true)>
+                                                <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                                                "New Issue"
+                                            </Button>
+                                        }.into_any()
+                                    });
+                                    view! {
+                                        <div class="p-4 md:p-6">
+                                            <EmptyState
+                                                icon=empty_icon
+                                                title="No issues yet"
+                                                description="Create your first issue to get started"
+                                                action=empty_action
+                                            />
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    let rows = list.iter().enumerate().map(|(idx, issue)| {
+                                        view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index/> }
+                                    }).collect_view();
+                                    view! {
+                                        <div role="list">
+                                            {rows}
+                                        </div>
+                                    }.into_any()
+                                }
+                            }}
+                        </div>
+                    }.into_any()
+                }
+            }}
         </div>
 
         // ── New Issue modal ─────────────────────────────────────────────────

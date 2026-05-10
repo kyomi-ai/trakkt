@@ -21,7 +21,6 @@ use crate::pages::auth::{
     signup_complete::SignupCompletePage,
 };
 use crate::pages::accept_ownership::AcceptOwnershipPage;
-use crate::pages::board::BoardPage;
 use crate::pages::issues::issue_detail::IssueDetailPage;
 use crate::pages::issues::issue_list::IssueListForTeam;
 use crate::pages::issues::my_issues::MyIssuesPage;
@@ -109,7 +108,6 @@ pub fn App() -> impl IntoView {
 
                     // Team-scoped views — components read :key from route params internally
                     <Route path=path!("/teams/:key/issues") view=IssueListForTeam/>
-                    <Route path=path!("/teams/:key/board") view=BoardPage/>
 
                     // Legacy /issues redirect — send to /my-issues
                     <Route path=path!("/issues") view=|| view! { <Redirect path="/my-issues"/> }/>
@@ -118,9 +116,6 @@ pub fn App() -> impl IntoView {
                     // Projects
                     <Route path=path!("/projects") view=ProjectListPage/>
                     <Route path=path!("/projects/:id") view=ProjectDetailPage/>
-
-                    // Global board (all issues, no team filter)
-                    <Route path=path!("/board") view=|| view! { <BoardPage/> }/>
 
                     // Settings
                     <ParentRoute path=path!("/settings") view=|| view! {
