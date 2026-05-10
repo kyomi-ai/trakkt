@@ -401,9 +401,8 @@ fn SidebarTeamsSection() -> impl IntoView {
                         let key = team.key.to_lowercase();
                         let name = team.name.clone();
                         let issues_href = format!("/teams/{key}/issues");
-                        let board_href = format!("/teams/{key}/board");
                         view! {
-                            <SidebarTeamSubNav team_id=team.team_id.clone() name=name issues_href=issues_href board_href=board_href/>
+                            <SidebarTeamSubNav team_id=team.team_id.clone() name=name issues_href=issues_href/>
                         }
                     }).collect_view()}
                 </div>
@@ -541,31 +540,27 @@ fn SidebarCreateTeam(on_done: Callback<()>) -> impl IntoView {
 }
 
 /// A team's sub-navigation: clickable team name toggles expanded state,
-/// showing/hiding the Issues and Board sub-links. Right-click the team
-/// name to open a context menu with a "Leave team" option.
+/// showing/hiding the Issues sub-link. Right-click the team name to open
+/// a context menu with a "Leave team" option.
 #[component]
 fn SidebarTeamSubNav(
     team_id: String,
     name: String,
     issues_href: String,
-    board_href: String,
 ) -> impl IntoView {
     let path = leptos_router::hooks::use_location().pathname;
 
     let issues_href_match = issues_href.clone();
-    let board_href_match = board_href.clone();
 
     let issues_active = Signal::derive(move || path.get().starts_with(&issues_href_match));
-    let board_active = Signal::derive(move || path.get().starts_with(&board_href_match));
 
     // Auto-expand if the current path is within this team.
-    let team_active = Signal::derive(move || issues_active.get() || board_active.get());
     let (expanded, set_expanded) = signal(false);
     let (menu_open, set_menu_open) = signal(false);
 
     // Expand when navigating into a team's pages.
     Effect::new(move |_| {
-        if team_active.get() {
+        if issues_active.get() {
             set_expanded.set(true);
         }
     });
@@ -649,11 +644,9 @@ fn SidebarTeamSubNav(
             // Indented sub-items — shown when expanded
             {move || expanded.get().then(|| {
                 let ih = issues_href.clone();
-                let bh = board_href.clone();
                 view! {
                     <div class="ml-4">
                         <SidebarSubNavItem href=ih icon=phosphor_leptos::LIST_BULLETS label="Issues" is_active=issues_active/>
-                        <SidebarSubNavItem href=bh icon=phosphor_leptos::KANBAN label="Board" is_active=board_active/>
                     </div>
                 }
             })}

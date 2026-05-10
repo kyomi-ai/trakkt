@@ -36,7 +36,6 @@ struct PaletteAction {
 enum PaletteIcon {
     ListChecks,
     ListBullets,
-    Kanban,
     Gear,
     Plus,
     Article,
@@ -141,12 +140,11 @@ pub fn CommandPalette(
             .filter(|a| query.is_empty() || a.label.to_lowercase().contains(&query))
             .collect();
 
-        // 2. Team navigation actions (Issues + Board per team).
+        // 2. Team navigation actions (Issues per team).
         if let Some(store) = sync_store {
             let teams = store.teams().get();
             for team in &teams {
                 let issues_label = format!("Go to {} Issues", team.name);
-                let board_label = format!("Go to {} Board", team.name);
                 let key_lower = team.key.to_lowercase();
 
                 if query.is_empty() || issues_label.to_lowercase().contains(&query) {
@@ -155,14 +153,6 @@ pub fn CommandPalette(
                         description: None,
                         icon: PaletteIcon::ListBullets,
                         kind: ActionKind::Navigate(format!("/teams/{key_lower}/issues")),
-                    });
-                }
-                if query.is_empty() || board_label.to_lowercase().contains(&query) {
-                    results.push(PaletteAction {
-                        label: board_label,
-                        description: None,
-                        icon: PaletteIcon::Kanban,
-                        kind: ActionKind::Navigate(format!("/teams/{key_lower}/board")),
                     });
                 }
             }
@@ -375,9 +365,6 @@ fn palette_icon_view(icon: PaletteIcon) -> AnyView {
         }
         PaletteIcon::ListBullets => {
             view! { <Icon icon=phosphor_leptos::LIST_BULLETS size="16px"/> }.into_any()
-        }
-        PaletteIcon::Kanban => {
-            view! { <Icon icon=phosphor_leptos::KANBAN size="16px"/> }.into_any()
         }
         PaletteIcon::Gear => {
             view! { <Icon icon=phosphor_leptos::GEAR size="16px"/> }.into_any()
