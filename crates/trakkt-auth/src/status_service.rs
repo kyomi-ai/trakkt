@@ -195,6 +195,7 @@ pub async fn seed_default_statuses(
         ("backlog",      "Backlog",     "backlog",    0),
         ("todo",         "Todo",        "unstarted",  0),
         ("in_progress",  "In Progress", "started",    0),
+        ("in_review",    "In Review",   "started",    1),
         ("done",         "Done",        "completed",  0),
         ("cancelled",    "Cancelled",   "cancelled",  0),
     ];
