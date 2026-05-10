@@ -13,11 +13,14 @@
 //! - Optimistic UI: card moves immediately, reverts on server error
 //! - Same-column drops are no-ops
 
+use std::collections::HashSet;
+
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
+use phosphor_leptos::Icon;
 use wasm_bindgen::JsCast;
 
-use crate::components::{Alert, AlertVariant, Avatar, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, Skeleton};
+use crate::components::{Alert, AlertVariant, Avatar, Button, ButtonSize, ButtonVariant, Checkbox, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, Skeleton};
 use crate::server_fns::issues::{list_issues, update_issue};
 use crate::server_fns::statuses::list_statuses;
 use trakkt_types::models::{IssueWithDetails, Status};
@@ -53,6 +56,53 @@ fn group_by_status(statuses: &[Status], all: &[IssueWithDetails]) -> Vec<(Status
             sort_column_issues(&mut col_issues);
             (status.clone(), col_issues)
         })
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// localStorage helpers for column visibility
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the localStorage key for hidden columns.
+/// Team-scoped boards use `trakkt-board-hidden-{team_key}`, workspace board
+/// uses `trakkt-board-hidden-global`.
+fn storage_key(team_key: &Option<String>) -> String {
+    match team_key {
+        Some(key) => format!("trakkt-board-hidden-{key}"),
+        None => "trakkt-board-hidden-global".to_string(),
+    }
+}
+
+/// Read the set of hidden status IDs from localStorage.
+/// Returns `None` if the key doesn't exist (first visit).
+#[cfg(target_arch = "wasm32")]
+fn read_hidden_from_storage(key: &str) -> Option<HashSet<String>> {
+    let storage = web_sys::window()?.local_storage().ok()??;
+    let json = storage.get_item(key).ok()??;
+    let ids: Vec<String> = serde_json::from_str(&json).ok()?;
+    Some(ids.into_iter().collect())
+}
+
+/// Write the set of hidden status IDs to localStorage.
+#[cfg(target_arch = "wasm32")]
+fn write_hidden_to_storage(key: &str, hidden: &HashSet<String>) {
+    let Ok(json) = serde_json::to_string(&hidden.iter().collect::<Vec<_>>()) else {
+        return;
+    };
+    if let Some(storage) = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+    {
+        let _ = storage.set_item(key, &json);
+    }
+}
+
+/// Compute the default hidden set: hide all statuses with category "cancelled".
+#[cfg(target_arch = "wasm32")]
+fn default_hidden(statuses: &[Status]) -> HashSet<String> {
+    statuses
+        .iter()
+        .filter(|s| s.category == "cancelled")
+        .map(|s| s.status_id.clone())
         .collect()
 }
 
@@ -155,6 +205,39 @@ pub fn BoardPage() -> impl IntoView {
         }
     });
 
+    // ── Hidden columns state ─────────────────────────────────────────────
+    // Tracks which status columns are hidden. Initialized from localStorage
+    // or defaults to hiding "cancelled" category on first visit.
+    let hidden_statuses: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
+    let key_for_storage = storage_key(&team_key);
+
+    // Initialize hidden set once statuses are loaded.
+    {
+        let key = key_for_storage.clone();
+        let initialized = StoredValue::new(false);
+        Effect::new(move |_| {
+            let s = statuses.get();
+            if s.is_empty() || initialized.get_value() {
+                return;
+            }
+            initialized.set_value(true);
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = (&key, &s);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let initial = match read_hidden_from_storage(&key) {
+                    Some(stored) => stored,
+                    None => {
+                        let defaults = default_hidden(&s);
+                        write_hidden_to_storage(&key, &defaults);
+                        defaults
+                    }
+                };
+                hidden_statuses.set(initial);
+            }
+        });
+    }
+
     // ── Drag state ──────────────────────────────────────────────────────────
     let (dragging, set_dragging) = signal(Option::<String>::None);
     let (drag_target, set_drag_target) = signal(Option::<String>::None);
@@ -222,6 +305,11 @@ pub fn BoardPage() -> impl IntoView {
                         None => "Board".to_string(),
                     }}
                 </h1>
+                <BoardDisplayOptions
+                    statuses=statuses
+                    hidden=hidden_statuses
+                    storage_key=key_for_storage.clone()
+                />
             </div>
 
             // ── Error alert ─────────────────────────────────────────────────
@@ -243,7 +331,14 @@ pub fn BoardPage() -> impl IntoView {
                     if s.is_empty() {
                         view! { <BoardSkeleton/> }.into_any()
                     } else {
-                        let grouped = move || group_by_status(&statuses.get(), &issues.get());
+                        let grouped_all = Memo::new(move |_| group_by_status(&statuses.get(), &issues.get()));
+                        let grouped = move || {
+                            let hidden = hidden_statuses.get();
+                            grouped_all.get()
+                                .into_iter()
+                                .filter(|(status, _)| !hidden.contains(&status.status_id))
+                                .collect::<Vec<_>>()
+                        };
                         view! {
                             <div class="flex gap-4 h-full">
                                 {move || grouped().into_iter().map(|(status, issues)| {
@@ -271,6 +366,104 @@ pub fn BoardPage() -> impl IntoView {
                     }
                 }}
             </div>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Board Display Options
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Popover trigger + content for toggling column visibility.
+///
+/// Shows a "Display" button with sliders icon. When clicked, a popover lists
+/// every status with a checkbox. Toggling a checkbox hides/shows that column
+/// and persists the choice to localStorage.
+#[component]
+fn BoardDisplayOptions(
+    /// All statuses available for this board.
+    statuses: Memo<Vec<Status>>,
+    /// The set of hidden status IDs (read/write).
+    hidden: RwSignal<HashSet<String>>,
+    /// localStorage key for persistence.
+    storage_key: String,
+) -> impl IntoView {
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+    let (open, set_open) = signal(false);
+
+    let _key = StoredValue::new(storage_key);
+    let hidden_count = Memo::new(move |_| hidden.get().len());
+
+    view! {
+        <div class="flex items-center gap-2">
+            <div node_ref=trigger_ref>
+                <Button
+                    variant=ButtonVariant::Ghost
+                    size=ButtonSize::Sm
+                    on:click=move |_| set_open.update(|o| *o = !*o)
+                >
+                    <Icon icon=phosphor_leptos::SLIDERS_HORIZONTAL size="14px"/>
+                    "Display"
+                    {move || {
+                        let n = hidden_count.get();
+                        if n > 0 {
+                            view! {
+                                <span class="text-xs text-muted-foreground ml-0.5">
+                                    {format!("({n} hidden)")}
+                                </span>
+                            }.into_any()
+                        } else {
+                            ().into_any()
+                        }
+                    }}
+                </Button>
+            </div>
+
+            <crate::components::popover::Popover
+                trigger_ref=trigger_ref
+                open=Signal::derive(move || open.get())
+                on_close=Callback::new(move |()| set_open.set(false))
+                placement=crate::components::popover::Placement::BOTTOM_END
+                class="bg-popover border border-border rounded-lg shadow-lg p-3 min-w-[200px]"
+            >
+                <div class="flex flex-col gap-1">
+                    <div class="text-xs font-semibold text-muted-foreground mb-1 px-1">
+                        "Status columns"
+                    </div>
+                    {move || statuses.get().into_iter().map(|status| {
+                        let status_id = status.status_id.clone();
+                        let status_id_for_toggle = status_id.clone();
+                        let status_name = status.name.clone();
+                        let status_variant = IssueStatusVariant::parse(&status.category);
+                        let is_visible = {
+                            let sid = status_id.clone();
+                            Signal::derive(move || !hidden.get().contains(&sid))
+                        };
+                        view! {
+                            <div class="flex items-center gap-2 px-1 py-1 rounded hover:bg-accent cursor-pointer">
+                                <Checkbox
+                                    checked=is_visible
+                                    on_change=Callback::new(move |checked: bool| {
+                                        hidden.update(|set| {
+                                            if checked {
+                                                set.remove(&status_id_for_toggle);
+                                            } else {
+                                                set.insert(status_id_for_toggle.clone());
+                                            }
+                                        });
+                                        #[cfg(target_arch = "wasm32")]
+                                        _key.with_value(|k| {
+                                            write_hidden_to_storage(k, &hidden.get_untracked());
+                                        });
+                                    })
+                                />
+                                <IssueStatusBadge status=status_variant/>
+                                <span class="text-sm text-foreground">{status_name}</span>
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+            </crate::components::popover::Popover>
         </div>
     }
 }
