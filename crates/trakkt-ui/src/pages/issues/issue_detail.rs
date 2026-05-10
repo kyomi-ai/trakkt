@@ -20,10 +20,10 @@ use leptos_router::hooks::{use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
+    Alert, AlertVariant, Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
     DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
-    LabelBadge, Skeleton, StyledSelect,
+    LabelBadge, Modal, ModalSize, Skeleton, StyledSelect,
 };
 use crate::server_fns::comments::{create_comment, list_comments};
 use crate::server_fns::issues::{get_issue, set_issue_labels, update_issue};
@@ -284,8 +284,46 @@ fn IssueDetailContent(
         initial.get()
     });
 
+    // ── Sub-issues: derived from SyncStore ───────────────────────────
+    let sub_issues = Memo::new(move |_| {
+        let Some(store) = sync_store else { return vec![] };
+        let i = issue.get();
+        store.issues().get()
+            .into_iter()
+            .filter(|child| child.parent_issue_id.as_deref() == Some(i.issue_id.as_str()))
+            .collect::<Vec<_>>()
+    });
+
+    // ── New sub-issue modal state ─────────────────────────────────────
+    let (show_new_sub_issue, set_show_new_sub_issue) = signal(false);
+
+    let on_sub_issue_created = {
+        let on_change = on_change;
+        Callback::new(move |()| {
+            set_show_new_sub_issue.set(false);
+            on_change.run(());
+        })
+    };
+
     view! {
         <div class="max-w-[860px] mx-auto w-full">
+            // ── Parent breadcrumb ─────────────────────────────────────
+            {move || {
+                let i = issue.get();
+                let parent_id = i.parent_issue_id.as_ref()?;
+                let store = sync_store?;
+                let parent = store.issues().get().into_iter().find(|p| p.issue_id == *parent_id)?;
+                Some(view! {
+                    <a
+                        href=format!("/issues/{}", parent.number)
+                        class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1 mb-1"
+                    >
+                        <Icon icon=phosphor_leptos::ARROW_BEND_UP_LEFT size="12px"/>
+                        {format!("{}-{} {}", parent.team_key, parent.number, parent.title)}
+                    </a>
+                })
+            }}
+
             // ── Title ──────────────────────────────────────────────────
             {move || {
                 let i = issue.get();
@@ -310,6 +348,12 @@ fn IssueDetailContent(
                 }
             }}
 
+            // ── Sub-issues section ────────────────────────────────────
+            <SubIssuesSection
+                sub_issues=sub_issues
+                on_add=Callback::new(move |()| set_show_new_sub_issue.set(true))
+            />
+
             // ── Divider ────────────────────────────────────────────────
             <div class="border-t border-border my-6"></div>
 
@@ -333,6 +377,24 @@ fn IssueDetailContent(
                 }
             }}
         </div>
+
+        // ── New Sub-Issue modal ───────────────────────────────────────
+        {move || {
+            let i = issue.get();
+            let team_id = i.team_id.clone();
+            let parent_id = i.issue_id.clone();
+            let parent_title = format!("{}-{} {}", i.team_key, i.number, i.title);
+            view! {
+                <NewSubIssueModal
+                    show=Signal::derive(move || show_new_sub_issue.get())
+                    on_close=Callback::new(move |()| set_show_new_sub_issue.set(false))
+                    on_created=on_sub_issue_created
+                    team_id=team_id
+                    parent_issue_id=parent_id
+                    parent_title=parent_title
+                />
+            }
+        }}
     }
 }
 
@@ -372,6 +434,7 @@ fn EditableTitle(
                 None, // due_date
                 None, // project_id
                 None, // milestone_id
+                None, // parent_issue_id
             )
             .await;
             set_saving.set(false);
@@ -465,6 +528,7 @@ fn MetadataBar(
                 None, // due_date
                 None, // project_id
                 None, // milestone_id
+                None, // parent_issue_id
             )
             .await;
             on_change.run(());
@@ -485,6 +549,7 @@ fn MetadataBar(
                 None, // due_date
                 None, // project_id
                 None, // milestone_id
+                None, // parent_issue_id
             )
             .await;
             on_change.run(());
@@ -798,6 +863,7 @@ fn DescriptionEditor(
                 None, // due_date
                 None, // project_id
                 None, // milestone_id
+                None, // parent_issue_id
             )
             .await;
             on_save.run(());
@@ -819,6 +885,264 @@ fn DescriptionEditor(
                 />
             </div>
         </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-issues Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sub-issues section showing child issues with progress bar.
+///
+/// Displays: header with count + progress text, progress bar, compact issue list,
+/// and an "Add sub-issue" button.
+#[component]
+fn SubIssuesSection(
+    sub_issues: Memo<Vec<IssueWithDetails>>,
+    on_add: Callback<()>,
+) -> impl IntoView {
+    // Only render the section if there are sub-issues OR we always show it for the add button.
+    // We show it always so users can discover the "Add sub-issue" action.
+    view! {
+        <div class="mt-6">
+            {move || {
+                let items = sub_issues.get();
+                let total = items.len();
+                let completed = items.iter().filter(|i| {
+                    i.status_category == "completed" || i.status_category == "cancelled"
+                }).count();
+                let percent = if total > 0 { (completed as f64 / total as f64) * 100.0 } else { 0.0 };
+
+                view! {
+                    // ── Header ─────────────────────────────────────────
+                    <div class="flex items-center justify-between mb-2">
+                        <div class="flex items-center gap-2">
+                            <h2 class="text-xs text-muted-foreground font-medium">
+                                {if total > 0 {
+                                    format!("Sub-issues ({})", total)
+                                } else {
+                                    "Sub-issues".to_string()
+                                }}
+                            </h2>
+                            {(total > 0).then(|| view! {
+                                <span class="text-xs text-muted-foreground">
+                                    {format!("{} of {} done", completed, total)}
+                                </span>
+                            })}
+                        </div>
+                        <button
+                            class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
+                            on:click=move |_| on_add.run(())
+                            title="Add sub-issue"
+                        >
+                            <Icon icon=phosphor_leptos::PLUS size="12px"/>
+                            "Add"
+                        </button>
+                    </div>
+
+                    // ── Progress bar ──────────────────────────────────
+                    {(total > 0).then(|| view! {
+                        <div class="h-1.5 w-full bg-secondary rounded-full overflow-hidden mb-2">
+                            <div
+                                class="h-full bg-primary rounded-full transition-all duration-300"
+                                style=format!("width: {}%", percent)
+                            />
+                        </div>
+                    })}
+
+                    // ── Sub-issue rows ────────────────────────────────
+                    {(total > 0).then(|| {
+                        let rows = items.into_iter().map(|child| {
+                            let child_status = IssueStatusVariant::parse(&child.status_category);
+                            let child_key = format!("{}-{}", child.team_key, child.number);
+                            let child_href = format!("/issues/{}", child.number);
+                            let child_title = child.title.clone();
+                            let assignee_name = child.assignee_name.clone();
+                            view! {
+                                <div class="flex items-center gap-2 px-3 py-1.5 hover:bg-secondary/50 rounded-md transition-colors">
+                                    <IssueStatusBadge status=child_status size=12/>
+                                    <span class="text-xs text-muted-foreground font-mono shrink-0">{child_key}</span>
+                                    <a href=child_href class="text-sm text-foreground hover:underline truncate flex-1">
+                                        {child_title}
+                                    </a>
+                                    {assignee_name.map(|name| view! {
+                                        <Avatar name=name size=AvatarSize::Sm/>
+                                    })}
+                                </div>
+                            }
+                        }).collect_view();
+                        view! {
+                            <div class="space-y-0.5">
+                                {rows}
+                            </div>
+                        }
+                    })}
+                }
+            }}
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// New Sub-Issue Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Modal for creating a sub-issue with the parent pre-filled.
+#[component]
+fn NewSubIssueModal(
+    show: Signal<bool>,
+    on_close: Callback<()>,
+    on_created: Callback<()>,
+    team_id: String,
+    parent_issue_id: String,
+    parent_title: String,
+) -> impl IntoView {
+    let (title, set_title) = signal(String::new());
+    let (priority, set_priority) = signal("0".to_string());
+    let (submitting, set_submitting) = signal(false);
+    let (error_msg, set_error_msg) = signal(Option::<String>::None);
+
+    // Reset form when modal opens.
+    Effect::new(move || {
+        if show.get() {
+            set_title.set(String::new());
+            set_priority.set("0".to_string());
+            set_error_msg.set(None);
+            set_submitting.set(false);
+        }
+    });
+
+    let team_id_stored = Signal::stored(team_id);
+    let parent_id_stored = Signal::stored(parent_issue_id);
+
+    let handle_submit = move || {
+        let title_val = title.get_untracked();
+        if title_val.trim().is_empty() {
+            return;
+        }
+
+        let prio = priority.get_untracked().parse::<i32>().unwrap_or(0);
+        let tid = team_id_stored.get();
+        let pid = parent_id_stored.get();
+
+        set_submitting.set(true);
+        set_error_msg.set(None);
+
+        leptos::task::spawn_local(async move {
+            match crate::server_fns::issues::create_issue(
+                title_val,
+                None,   // description
+                prio,
+                None,   // assignee_id
+                None,   // due_date
+                String::new(), // label_ids
+                None,   // project_id
+                None,   // milestone_id
+                Some(pid),
+                Some(tid),
+            ).await {
+                Ok(_) => {
+                    set_submitting.set(false);
+                    on_created.run(());
+                }
+                Err(e) => {
+                    set_submitting.set(false);
+                    set_error_msg.set(Some(format!("Failed to create sub-issue: {e}")));
+                }
+            }
+        });
+    };
+
+    let title_empty = Memo::new(move |_| title.get().trim().is_empty());
+
+    let handle_submit_for_footer = handle_submit;
+    let modal_footer: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+        let submit = handle_submit_for_footer;
+        view! {
+            <Button
+                variant=ButtonVariant::Ghost
+                on:click=move |_| on_close.run(())
+            >
+                "Cancel"
+            </Button>
+            <Button
+                disabled=Signal::derive(move || submitting.get() || title_empty.get())
+                on:click=move |_| submit()
+            >
+                {move || if submitting.get() { "Creating..." } else { "Create Sub-issue" }}
+            </Button>
+        }.into_any()
+    });
+
+    let parent_title_stored = Signal::stored(parent_title);
+
+    view! {
+        <Modal
+            show=show
+            on_close=on_close
+            title="New Sub-issue"
+            size=ModalSize::Sm
+            footer=modal_footer
+        >
+            <form
+                on:submit=move |ev: web_sys::SubmitEvent| {
+                    ev.prevent_default();
+                    handle_submit();
+                }
+                class="space-y-4"
+            >
+                // Error message
+                <Show when=move || error_msg.get().is_some()>
+                    <Alert variant=AlertVariant::Error>
+                        <crate::components::AlertDescription>
+                            {move || error_msg.get().unwrap_or_default()}
+                        </crate::components::AlertDescription>
+                    </Alert>
+                </Show>
+
+                // Parent (read-only display)
+                <div class="space-y-2">
+                    <label class="text-sm font-medium text-foreground">"Parent"</label>
+                    <div class="flex items-center gap-1.5 text-sm text-muted-foreground px-3 py-2 border border-border rounded-md bg-muted/30">
+                        <Icon icon=phosphor_leptos::ARROW_BEND_UP_LEFT size="14px"/>
+                        {move || parent_title_stored.get()}
+                    </div>
+                </div>
+
+                // Title
+                <div class="space-y-2">
+                    <label for="sub-issue-title" class="text-sm font-medium text-foreground">
+                        "Title"
+                    </label>
+                    <input
+                        id="sub-issue-title"
+                        type="text"
+                        required=true
+                        autofocus=true
+                        placeholder="Sub-issue title"
+                        class=crate::components::INPUT_CLASS
+                        prop:value=move || title.get()
+                        on:input=move |ev| set_title.set(event_target_value(&ev))
+                    />
+                </div>
+
+                // Priority
+                <div class="space-y-2">
+                    <label class="text-sm font-medium text-foreground">"Priority"</label>
+                    <select
+                        class="w-full h-9 px-3 rounded-md border border-border bg-background text-sm text-foreground"
+                        prop:value=move || priority.get()
+                        on:change=move |ev| set_priority.set(event_target_value(&ev))
+                    >
+                        <option value="0">"None"</option>
+                        <option value="1">"Urgent"</option>
+                        <option value="2">"High"</option>
+                        <option value="3">"Medium"</option>
+                        <option value="4">"Low"</option>
+                    </select>
+                </div>
+            </form>
+        </Modal>
     }
 }
 

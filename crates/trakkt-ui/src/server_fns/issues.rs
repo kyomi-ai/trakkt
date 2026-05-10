@@ -82,6 +82,18 @@ pub async fn get_issue(number: i32) -> Result<Option<IssueWithDetails>, ServerFn
     Ok(issue)
 }
 
+/// List sub-issues (direct children) of a given parent issue.
+#[server(prefix = "/leptos-api")]
+pub async fn list_sub_issues(
+    parent_issue_id: String,
+) -> Result<Vec<IssueWithDetails>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let sub_issues = trakkt_auth::issue_service::list_sub_issues(ac.db(), &parent_issue_id, &ac.ws_id)
+        .await
+        .into_sfn()?;
+    Ok(sub_issues)
+}
+
 // ─── Write operations ──────────────────────────────────────────────────────
 
 /// Create a new issue in the specified team, or the default team if none given.
@@ -98,6 +110,7 @@ pub async fn create_issue(
     label_ids: String,
     project_id: Option<String>,
     milestone_id: Option<String>,
+    parent_issue_id: Option<String>,
     team_id: Option<String>,
 ) -> Result<Issue, ServerFnError> {
     use trakkt_types::models::CreateIssueParams;
@@ -117,6 +130,9 @@ pub async fn create_issue(
 
     let parsed_label_ids = parse_label_ids(&label_ids);
 
+    // Treat empty string as None (sentinel pattern for clearable fields).
+    let resolved_parent_issue_id = parent_issue_id.filter(|s| !s.is_empty());
+
     let params = CreateIssueParams {
         workspace_id: ac.ws_id.clone(),
         team_id: resolved_team_id,
@@ -129,6 +145,7 @@ pub async fn create_issue(
         label_ids: parsed_label_ids,
         project_id,
         milestone_id,
+        parent_issue_id: resolved_parent_issue_id,
     };
 
     let issue = trakkt_auth::issue_service::create_issue(ac.db(), &params, ac.ctx.ws_manager.as_ref())
@@ -156,6 +173,7 @@ pub async fn update_issue(
     due_date: Option<String>,
     project_id: Option<String>,
     milestone_id: Option<String>,
+    parent_issue_id: Option<String>,
 ) -> Result<Issue, ServerFnError> {
     use trakkt_types::models::IssueUpdate;
 
@@ -169,6 +187,7 @@ pub async fn update_issue(
         due_date: due_date.map(|s| if s.is_empty() { None } else { Some(s) }),
         project_id: project_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         milestone_id: milestone_id.map(|s| if s.is_empty() { None } else { Some(s) }),
+        parent_issue_id: parent_issue_id.map(|s| if s.is_empty() { None } else { Some(s) }),
     };
     let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, number, &updates, ac.ctx.ws_manager.as_ref())
         .await
