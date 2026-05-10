@@ -416,6 +416,10 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                             "type": "string",
                             "description": "Filter by team ID. Use list_issues without this filter first to discover team_id values from the results."
                         },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Filter by team key (e.g. 'TRA'). Alternative to team_id — resolved server-side. team_id takes precedence if both are provided."
+                        },
                         "status_id": {
                             "type": "string",
                             "description": "Filter by status ID (e.g. 'workspace-id::backlog'). Use list_statuses to get valid IDs."
@@ -462,7 +466,7 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "create_issue",
-                "description": "Create a new issue in the workspace. Specify team_id to assign to a specific team, otherwise uses the default team. Starts in 'backlog' status.",
+                "description": "Create a new issue in the workspace. Specify team_id or team_key to assign to a specific team, otherwise uses the default team. Starts in 'backlog' status.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -473,6 +477,10 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                         "team_id": {
                             "type": "string",
                             "description": "Team ID to assign the issue to. If omitted, uses the default team."
+                        },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Team key (e.g. 'TRA') as alternative to team_id. Resolved server-side. team_id takes precedence if both are provided."
                         },
                         "description": {
                             "type": "string",
@@ -631,6 +639,10 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                         "team_id": {
                             "type": "string",
                             "description": "Optional team ID to include team-specific statuses"
+                        },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Optional team key (e.g. 'TRA') as alternative to team_id. team_id takes precedence if both are provided."
                         }
                     }
                 }
@@ -766,6 +778,27 @@ fn arg_i64(args: &Value, key: &str) -> Result<i64, trakkt_core::Error> {
         .ok_or_else(|| trakkt_core::Error::BadRequest(format!("missing required parameter: {key}")))
 }
 
+/// Resolve a team_id from either `team_id` or `team_key` arguments.
+/// Returns `None` if neither is provided. `team_id` takes precedence.
+async fn resolve_team_id_from_args(
+    args: &Value,
+    db: &trakkt_core::DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Option<String>> {
+    if let Some(id) = args.get("team_id").and_then(|v| v.as_str()) {
+        return Ok(Some(id.to_string()));
+    }
+    if let Some(key) = args.get("team_key").and_then(|v| v.as_str()) {
+        let team = team_service::get_team_by_key(db, workspace_id, key)
+            .await?
+            .ok_or_else(|| trakkt_core::Error::BadRequest(
+                format!("No team found with key '{key}'"),
+            ))?;
+        return Ok(Some(team.team_id));
+    }
+    Ok(None)
+}
+
 /// list_issues — list issues with optional filters.
 async fn tool_list_issues(
     args: &Value,
@@ -785,8 +818,8 @@ async fn tool_list_issues(
         offset: None,
     };
 
-    let team_id = args.get("team_id").and_then(|v| v.as_str());
-    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, team_id, &filters).await?;
+    let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
+    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, team_id.as_deref(), &filters).await?;
     serde_json::to_string_pretty(&issues).map_err(trakkt_core::Error::from)
 }
 
@@ -819,8 +852,8 @@ async fn tool_create_issue(
 ) -> trakkt_core::Result<String> {
     let title = arg_str(args, "title")?;
 
-    let resolved_team_id = match args.get("team_id").and_then(|v| v.as_str()) {
-        Some(id) => id.to_string(),
+    let resolved_team_id = match resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await? {
+        Some(id) => id,
         None => {
             let default_team = team_service::get_default_team(&state.db, &auth.workspace_id).await?;
             default_team.team_id
@@ -1034,7 +1067,7 @@ async fn tool_list_statuses(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let team_id = args.get("team_id").and_then(|v| v.as_str());
-    let statuses = status_service::list_statuses(&state.db, &auth.workspace_id, team_id).await?;
+    let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
+    let statuses = status_service::list_statuses(&state.db, &auth.workspace_id, team_id.as_deref()).await?;
     serde_json::to_string_pretty(&statuses).map_err(trakkt_core::Error::from)
 }
