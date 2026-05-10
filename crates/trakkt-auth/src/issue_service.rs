@@ -317,6 +317,11 @@ pub async fn create_issue(
         }
     }
 
+    // Auto-watch: creator watches the issue they just created (best-effort).
+    if let Err(e) = crate::watcher_service::watch_issue(db, &issue_id, &params.creator_id).await {
+        tracing::warn!(error = %e, issue_id = %issue_id, "Failed to auto-watch issue for creator");
+    }
+
     // Re-fetch to get DB-assigned timestamps.
     let row = trakkt_core::db_fetch_one!(
         db,

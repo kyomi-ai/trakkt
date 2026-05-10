@@ -17,6 +17,7 @@ pub mod statuses;
 pub mod team;
 pub mod teams;
 pub mod views;
+pub mod watchers;
 pub mod workspace;
 
 /// State provided to server functions via Leptos context.

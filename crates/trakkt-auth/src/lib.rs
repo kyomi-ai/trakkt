@@ -30,6 +30,7 @@ pub mod token_service;
 pub mod totp;
 pub mod user_service;
 pub mod view_service;
+pub mod watcher_service;
 pub mod webauthn;
 pub mod websocket;
 pub mod workspace_service;

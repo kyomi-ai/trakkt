@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! My Issues page — shows issues assigned to the current user across all teams.
+//! My Issues page — shows issues grouped into three sections:
+//! 1. Assigned to Me — issues where the current user is the assignee
+//! 2. Created by Me — issues created by the user (excluding those already in Assigned)
+//! 3. Watching — issues the user is watching (excluding Assigned and Created)
 //!
 //! Layout follows the same patterns as `issue_list.rs`:
 //! - Page header: title (no create button — users create from team pages)
 //! - Toolbar: search + filter dropdowns
-//! - Content: issue rows, loading skeletons, or empty state
+//! - Content: collapsible sections with issue rows
 //!
 //! Issue Row follows DESIGN.md "Issue Row Pattern":
 //! `px-3 py-[6px] h-9 flex items-center gap-2.5 border-b border-border`
 //! hover:bg-surface-alt transition-colors cursor-pointer
 //! Order: Priority | Status | Issue ID (with team key) | Title | Labels | Date | Assignee
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use leptos::prelude::*;
@@ -25,13 +29,15 @@ use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown
 use crate::pages::issues::issue_row::IssueRow;
 use crate::server_fns::context::UserContext;
 use crate::server_fns::issues::list_issues;
+use crate::server_fns::watchers::list_watched_issue_ids;
 use crate::utils::keyboard::is_input_focused;
+use trakkt_types::models::IssueWithDetails;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // My Issues Page
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// My Issues page — displays issues assigned to the current user across all teams.
+/// My Issues page — displays issues in three grouped sections.
 #[component]
 pub fn MyIssuesPage() -> impl IntoView {
     // ── Get current user ────────────────────────────────────────────────────
@@ -64,23 +70,21 @@ pub fn MyIssuesPage() -> impl IntoView {
         },
     );
 
-    // Filtered issue list — reads from SyncStore when initialized, otherwise
-    // from the server function result. Filters by assignee first, then applies
-    // search/status/priority client-side for instant reactivity.
-    let filtered_issues = Memo::new(move |_| {
-        let user_id = current_user_id.get();
+    // ── Watched issue IDs from server ─────────────────────────────────────
+    // Version signal allows refetching when the page remounts or watch state changes.
+    let (watcher_version, _set_watcher_version) = signal(0u32);
+    let watched_ids_resource = Resource::new(
+        move || watcher_version.get(),
+        move |_| async move { list_watched_issue_ids().await },
+    );
 
-        // If we don't know the user yet, return empty — we'll update reactively.
-        let Some(uid) = user_id else {
-            return Vec::new();
-        };
-
+    // ── All issues (raw, unfiltered) ──────────────────────────────────────
+    let all_issues = Memo::new(move |_| {
         let raw = if let Some(store) = sync_store {
             let issues = store.issues().get();
             if !issues.is_empty() || store.initialized().get() {
                 issues
             } else {
-                // Store not initialized yet — use server function result
                 match server_issues.get() {
                     Some(Ok(items)) => {
                         error_msg.set(None);
@@ -94,7 +98,6 @@ pub fn MyIssuesPage() -> impl IntoView {
                 }
             }
         } else {
-            // No store (SSR) — use server function
             match server_issues.get() {
                 Some(Ok(items)) => {
                     error_msg.set(None);
@@ -107,35 +110,91 @@ pub fn MyIssuesPage() -> impl IntoView {
                 None => Vec::new(),
             }
         };
+        raw
+    });
 
-        // Apply client-side filters
+    // ── Filter helper (closure over search/status/priority signals) ───────
+    let passes_filters = move |issue: &IssueWithDetails| -> bool {
         let search_val = search.get().to_lowercase();
         let status_val = status_filter.get();
         let priority_val = priority_filter.get();
 
-        raw.into_iter()
-            .filter(|issue| {
-                // Primary filter: only issues assigned to the current user
-                if issue.assignee_id.as_ref() != Some(&uid) {
+        if !status_val.is_empty() && issue.status_id != status_val {
+            return false;
+        }
+        if !priority_val.is_empty() {
+            if let Ok(p) = priority_val.parse::<i32>() {
+                if issue.priority != p {
                     return false;
                 }
-                if !status_val.is_empty() && issue.status_id != status_val {
-                    return false;
-                }
-                if !priority_val.is_empty() {
-                    if let Ok(p) = priority_val.parse::<i32>() {
-                        if issue.priority != p {
-                            return false;
-                        }
-                    }
-                }
-                if !search_val.is_empty()
-                    && !issue.title.to_lowercase().contains(&search_val)
-                {
-                    return false;
-                }
-                true
+            }
+        }
+        if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
+            return false;
+        }
+        true
+    };
+
+    // ── Section: Assigned to Me ───────────────────────────────────────────
+    let assigned_issues = Memo::new(move |_| {
+        let Some(uid) = current_user_id.get() else {
+            return Vec::new();
+        };
+        all_issues
+            .get()
+            .into_iter()
+            .filter(|i| i.assignee_id.as_ref() == Some(&uid))
+            .filter(|i| passes_filters(i))
+            .collect::<Vec<_>>()
+    });
+
+    // ── Section: Created by Me (excluding already shown in Assigned) ──────
+    let created_issues = Memo::new(move |_| {
+        let Some(uid) = current_user_id.get() else {
+            return Vec::new();
+        };
+        let assigned_ids: HashSet<String> = assigned_issues
+            .get()
+            .iter()
+            .map(|i| i.issue_id.clone())
+            .collect();
+        all_issues
+            .get()
+            .into_iter()
+            .filter(|i| i.creator_id == uid && !assigned_ids.contains(&i.issue_id))
+            .filter(|i| passes_filters(i))
+            .collect::<Vec<_>>()
+    });
+
+    // ── Section: Watching (excluding Assigned and Created) ────────────────
+    let watching_issues = Memo::new(move |_| {
+        let watched = watched_ids_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        if watched.is_empty() {
+            return Vec::new();
+        }
+        let watched_set: HashSet<String> = watched.into_iter().collect();
+        let assigned_ids: HashSet<String> = assigned_issues
+            .get()
+            .iter()
+            .map(|i| i.issue_id.clone())
+            .collect();
+        let created_ids: HashSet<String> = created_issues
+            .get()
+            .iter()
+            .map(|i| i.issue_id.clone())
+            .collect();
+        all_issues
+            .get()
+            .into_iter()
+            .filter(|i| {
+                watched_set.contains(&i.issue_id)
+                    && !assigned_ids.contains(&i.issue_id)
+                    && !created_ids.contains(&i.issue_id)
             })
+            .filter(|i| passes_filters(i))
             .collect::<Vec<_>>()
     });
 
@@ -149,14 +208,11 @@ pub fn MyIssuesPage() -> impl IntoView {
     let issue_numbers = RwSignal::new(Vec::<i32>::new());
 
     // ── j/k/Enter keyboard listener (window-level, active on this page) ────
-    // Hoist use_navigate to component construction time (not inside closures).
     let nav = use_navigate();
     Effect::new(move |_| {
         let Some(window) = web_sys::window() else { return };
         let nav = nav.clone();
         let cb = Closure::<dyn Fn(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
-            // Skip keyboard shortcuts when the user is typing in an input,
-            // textarea, select, or contenteditable element.
             if is_input_focused(&ev) {
                 return;
             }
@@ -212,6 +268,25 @@ pub fn MyIssuesPage() -> impl IntoView {
         });
     });
 
+    // ── Section collapse state (persisted in localStorage) ────────────────
+    let (assigned_collapsed, set_assigned_collapsed) =
+        signal(load_collapsed_state("trakkt-myissues-assigned-collapsed"));
+    let (created_collapsed, set_created_collapsed) =
+        signal(load_collapsed_state("trakkt-myissues-created-collapsed"));
+    let (watching_collapsed, set_watching_collapsed) =
+        signal(load_collapsed_state("trakkt-myissues-watching-collapsed"));
+
+    // Persist collapse state changes to localStorage.
+    Effect::new(move || {
+        save_collapsed_state("trakkt-myissues-assigned-collapsed", assigned_collapsed.get());
+    });
+    Effect::new(move || {
+        save_collapsed_state("trakkt-myissues-created-collapsed", created_collapsed.get());
+    });
+    Effect::new(move || {
+        save_collapsed_state("trakkt-myissues-watching-collapsed", watching_collapsed.get());
+    });
+
     // ── Render ──────────────────────────────────────────────────────────────
     view! {
         <div class="bg-background flex flex-col h-full">
@@ -244,45 +319,206 @@ pub fn MyIssuesPage() -> impl IntoView {
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto">
                 {move || {
-                    let list = filtered_issues.get();
+                    let assigned = assigned_issues.get();
+                    let created = created_issues.get();
+                    let watching = watching_issues.get();
 
-                    // Update keyboard navigation bounds.
-                    issue_count.set(list.len());
-                    issue_numbers.set(list.iter().map(|i| i.number).collect());
-                    if let Some(idx) = selected_index.get_untracked()
-                        && idx >= list.len()
-                    {
-                        set_selected_index.set(if list.is_empty() { None } else { Some(list.len() - 1) });
+                    // Build a flat list of all visible issues for keyboard navigation.
+                    let mut all_visible: Vec<&IssueWithDetails> = Vec::new();
+                    if !assigned_collapsed.get() {
+                        all_visible.extend(assigned.iter());
+                    }
+                    if !created_collapsed.get() {
+                        all_visible.extend(created.iter());
+                    }
+                    if !watching_collapsed.get() {
+                        all_visible.extend(watching.iter());
                     }
 
-                    if list.is_empty() {
+                    // Update keyboard navigation bounds.
+                    issue_count.set(all_visible.len());
+                    issue_numbers.set(all_visible.iter().map(|i| i.number).collect());
+                    if let Some(idx) = selected_index.get_untracked()
+                        && idx >= all_visible.len()
+                    {
+                        set_selected_index.set(if all_visible.is_empty() { None } else { Some(all_visible.len() - 1) });
+                    }
+
+                    // If everything is empty, show empty state.
+                    let total = assigned.len() + created.len() + watching.len();
+                    if total == 0 {
                         let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
                             view! {
                                 <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
                             }.into_any()
                         });
-                        view! {
+                        return view! {
                             <div class="p-4 md:p-6">
                                 <EmptyState
                                     icon=empty_icon
-                                    title="No issues assigned to you"
-                                    description="Issues assigned to you will appear here"
+                                    title="No issues to show"
+                                    description="Issues assigned to you, created by you, or that you're watching will appear here"
                                 />
                             </div>
-                        }.into_any()
-                    } else {
-                        let rows = list.iter().enumerate().map(|(idx, issue)| {
-                            view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index/> }
-                        }).collect_view();
-                        view! {
-                            <div role="list">
-                                {rows}
-                            </div>
-                        }.into_any()
+                        }.into_any();
                     }
+
+                    // Track global index offset for keyboard selection across sections.
+                    let mut global_offset = 0usize;
+
+                    let assigned_view = if !assigned.is_empty() {
+                        let count = assigned.len();
+                        let offset = global_offset;
+                        if !assigned_collapsed.get() {
+                            global_offset += count;
+                        }
+                        Some(view! {
+                            <CollapsibleSection
+                                title="Assigned to Me"
+                                count=count
+                                collapsed=assigned_collapsed
+                                set_collapsed=set_assigned_collapsed
+                            >
+                                {if !assigned_collapsed.get() {
+                                    assigned.iter().enumerate().map(|(idx, issue)| {
+                                        view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index/> }
+                                    }).collect_view().into_any()
+                                } else {
+                                    view! {}.into_any()
+                                }}
+                            </CollapsibleSection>
+                        })
+                    } else {
+                        None
+                    };
+
+                    let created_view = if !created.is_empty() {
+                        let count = created.len();
+                        let offset = global_offset;
+                        if !created_collapsed.get() {
+                            global_offset += count;
+                        }
+                        Some(view! {
+                            <CollapsibleSection
+                                title="Created by Me"
+                                count=count
+                                collapsed=created_collapsed
+                                set_collapsed=set_created_collapsed
+                            >
+                                {if !created_collapsed.get() {
+                                    created.iter().enumerate().map(|(idx, issue)| {
+                                        view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index/> }
+                                    }).collect_view().into_any()
+                                } else {
+                                    view! {}.into_any()
+                                }}
+                            </CollapsibleSection>
+                        })
+                    } else {
+                        None
+                    };
+
+                    let watching_view = if !watching.is_empty() {
+                        let count = watching.len();
+                        let offset = global_offset;
+                        Some(view! {
+                            <CollapsibleSection
+                                title="Watching"
+                                count=count
+                                collapsed=watching_collapsed
+                                set_collapsed=set_watching_collapsed
+                            >
+                                {if !watching_collapsed.get() {
+                                    watching.iter().enumerate().map(|(idx, issue)| {
+                                        view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index/> }
+                                    }).collect_view().into_any()
+                                } else {
+                                    view! {}.into_any()
+                                }}
+                            </CollapsibleSection>
+                        })
+                    } else {
+                        None
+                    };
+
+                    view! {
+                        <div role="list">
+                            {assigned_view}
+                            {created_view}
+                            {watching_view}
+                        </div>
+                    }.into_any()
                 }}
             </div>
         </div>
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Collapsible Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A collapsible section with a header showing title, count badge, and chevron.
+#[component]
+fn CollapsibleSection(
+    title: &'static str,
+    count: usize,
+    collapsed: ReadSignal<bool>,
+    set_collapsed: WriteSignal<bool>,
+    children: Children,
+) -> impl IntoView {
+    view! {
+        <div class="border-b border-border">
+            <button
+                class="w-full px-5 py-2 flex items-center gap-2 text-sm font-medium text-foreground hover:bg-surface-alt transition-colors"
+                on:click=move |_| set_collapsed.update(|c| *c = !*c)
+            >
+                <span class="text-muted-foreground transition-transform" class:rotate-90=move || !collapsed.get()>
+                    <Icon icon=phosphor_leptos::CARET_RIGHT size="14px"/>
+                </span>
+                <span>{title}</span>
+                <span class="text-xs text-muted-foreground bg-surface-alt rounded-full px-1.5 py-0.5 min-w-[20px] text-center">
+                    {count}
+                </span>
+            </button>
+            {children()}
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// localStorage helpers for collapse state persistence
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Load a boolean collapse state from localStorage. Defaults to `false` (expanded).
+fn load_collapsed_state(key: &str) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|s| s.get_item(key).ok().flatten())
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = key;
+        false
+    }
+}
+
+/// Save a boolean collapse state to localStorage.
+fn save_collapsed_state(key: &str, collapsed: bool) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(storage) = web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+        {
+            let _ = storage.set_item(key, if collapsed { "true" } else { "false" });
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (key, collapsed);
+    }
+}
