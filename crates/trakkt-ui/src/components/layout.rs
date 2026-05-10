@@ -239,6 +239,8 @@ fn Sidebar(
             <nav class="flex-1 p-3 space-y-1 overflow-y-auto">
                 <SidebarNavItem href="/my-issues" icon=phosphor_leptos::LIST_CHECKS label="My Issues"/>
 
+                <SidebarFavoritesSection/>
+
                 <SidebarViewsSection/>
 
                 <SidebarTeamsSection/>
@@ -402,9 +404,10 @@ fn SidebarTeamsSection() -> impl IntoView {
                     {teams.into_iter().map(|team| {
                         let key = team.key.to_lowercase();
                         let name = team.name.clone();
+                        let team_id = team.team_id.clone();
                         let issues_href = format!("/teams/{key}/issues");
                         view! {
-                            <SidebarTeamSubNav team_id=team.team_id.clone() name=name issues_href=issues_href/>
+                            <SidebarTeamSubNav team_id=team_id name=name issues_href=issues_href/>
                         }
                     }).collect_view()}
                 </div>
@@ -431,10 +434,11 @@ fn SidebarViewsSection() -> impl IntoView {
                 <SidebarSectionHeader label="Views"/>
                 <div class="space-y-0.5">
                     {items.into_iter().map(|v| {
+                        let fav_id = v.view_id.clone();
                         let href = format!("/views/{}", v.view_id);
                         let name = v.name.clone();
                         view! {
-                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FUNNEL/>
+                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FUNNEL favorite_type="view" favorite_id=fav_id/>
                         }
                     }).collect_view()}
                 </div>
@@ -443,12 +447,144 @@ fn SidebarViewsSection() -> impl IntoView {
     }
 }
 
+/// Section for "Favorites" — shows user-pinned teams, projects, and views.
+///
+/// Only renders when favorites exist. Each favorite resolves its name, icon,
+/// and link from the corresponding entity in SyncStore.
+#[component]
+fn SidebarFavoritesSection() -> impl IntoView {
+    let store = use_context::<SyncStore>();
+
+    view! {
+        {move || {
+            let Some(store) = store else { return view! { <span/> }.into_any() };
+            let favorites = store.favorites().get();
+            if favorites.is_empty() {
+                return view! { <span/> }.into_any();
+            }
+            let teams = store.teams().get();
+            let projects = store.projects().get();
+            let views = store.views().get();
+            // Limit to 10 items.
+            let items: Vec<_> = favorites.into_iter().take(10).collect();
+            view! {
+                <SidebarSectionHeader label="Favorites"/>
+                <div class="space-y-0.5">
+                    {items.into_iter().filter_map(|fav| {
+                        match fav.target_type.as_str() {
+                            "team" => {
+                                let team = teams.iter().find(|t| t.team_id == fav.target_id)?;
+                                let key = team.key.to_lowercase();
+                                let href = format!("/teams/{key}/issues");
+                                let name = team.name.clone();
+                                Some(view! {
+                                    <SidebarEntityItem href=href name=name icon=phosphor_leptos::USERS_THREE/>
+                                }.into_any())
+                            }
+                            "project" => {
+                                let project = projects.iter().find(|p| p.project_id == fav.target_id)?;
+                                let href = format!("/projects/{}", project.project_id);
+                                let name = project.name.clone();
+                                Some(view! {
+                                    <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER/>
+                                }.into_any())
+                            }
+                            "view" => {
+                                let v = views.iter().find(|v| v.view_id == fav.target_id)?;
+                                let href = format!("/views/{}", v.view_id);
+                                let name = v.name.clone();
+                                Some(view! {
+                                    <SidebarEntityItem href=href name=name icon=phosphor_leptos::FUNNEL/>
+                                }.into_any())
+                            }
+                            _ => None,
+                        }
+                    }).collect_view()}
+                </div>
+            }.into_any()
+        }}
+    }
+}
+
+/// Small star button that toggles favorite state for a given target.
+///
+/// Shows a filled star when favorited, outline when not. On click, calls
+/// `add_favorite` or `remove_favorite` server function.
+#[component]
+pub fn FavoriteToggle(
+    target_type: &'static str,
+    target_id: String,
+) -> impl IntoView {
+    let store = use_context::<SyncStore>();
+    let tid = target_id.clone();
+    let is_fav = Signal::derive(move || {
+        store
+            .map(|s| {
+                s.favorites()
+                    .get()
+                    .iter()
+                    .any(|f| f.target_type == target_type && f.target_id == tid)
+            })
+            .unwrap_or(false)
+    });
+
+    let toggling = RwSignal::new(false);
+    let target_id_click = target_id.clone();
+
+    let on_click = move |ev: web_sys::MouseEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+        if toggling.get_untracked() {
+            return;
+        }
+        toggling.set(true);
+        let tt = target_type.to_string();
+        let ti = target_id_click.clone();
+        let currently_fav = is_fav.get_untracked();
+        leptos::task::spawn_local(async move {
+            if currently_fav {
+                let _ = crate::server_fns::favorites::remove_favorite(tt, ti).await;
+            } else {
+                let _ = crate::server_fns::favorites::add_favorite(tt, ti).await;
+            }
+            toggling.set(false);
+        });
+    };
+
+    let weight = Signal::derive(move || {
+        if is_fav.get() { IconWeight::Fill } else { IconWeight::Light }
+    });
+    let star_class = move || {
+        let base = "p-0.5 rounded transition-colors flex-shrink-0";
+        if is_fav.get() {
+            format!("{base} text-amber-400 hover:text-amber-300")
+        } else {
+            format!("{base} text-[var(--color-sidebar-foreground-muted)] hover:text-amber-400")
+        }
+    };
+
+    view! {
+        <button
+            class=star_class
+            on:click=on_click
+            title=move || if is_fav.get() { "Remove from favorites" } else { "Add to favorites" }
+        >
+            <Icon icon=phosphor_leptos::STAR weight=weight size="14px"/>
+        </button>
+    }
+}
+
 /// A sidebar entity link with active-state tracking. Used for views, projects, etc.
+///
+/// When `favorite_type` and `favorite_id` are provided, a star toggle button
+/// appears on hover to let users pin/unpin the item from their favorites.
 #[component]
 fn SidebarEntityItem(
     href: String,
     name: String,
     icon: phosphor_leptos::IconData,
+    #[prop(optional)] favorite_type: Option<&'static str>,
+    #[prop(optional)] favorite_id: Option<String>,
 ) -> impl IntoView {
     let path = leptos_router::hooks::use_location().pathname;
     let href_match = href.clone();
@@ -459,17 +595,27 @@ fn SidebarEntityItem(
         if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
     });
     let class = move || {
-        let base = "flex items-center gap-3 px-3 py-1.5 rounded-md text-sm transition-colors";
+        let base = "group flex items-center gap-3 px-3 py-1.5 rounded-md text-sm transition-colors";
         if is_active.get() {
             format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
         } else {
             format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)]")
         }
     };
+    let has_favorite = favorite_type.is_some() && favorite_id.is_some();
     view! {
         <a href=href class=class>
             <Icon icon=icon weight=weight size="16px"/>
-            <span class="truncate">{name}</span>
+            <span class="truncate flex-1">{name}</span>
+            {has_favorite.then(|| {
+                let ft = favorite_type.unwrap();
+                let fi = favorite_id.clone().unwrap();
+                view! {
+                    <span class="opacity-0 group-hover:opacity-100 transition-opacity">
+                        <FavoriteToggle target_type=ft target_id=fi/>
+                    </span>
+                }
+            })}
         </a>
     }
 }
@@ -490,10 +636,11 @@ fn SidebarProjectsSection() -> impl IntoView {
                 <SidebarSectionHeader label="Projects"/>
                 <div class="space-y-0.5">
                     {projects.into_iter().map(|project| {
+                        let fav_id = project.project_id.clone();
                         let href = format!("/projects/{}", project.project_id);
                         let name = project.name.clone();
                         view! {
-                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER/>
+                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type="project" favorite_id=fav_id/>
                         }
                     }).collect_view()}
                 </div>
@@ -638,7 +785,7 @@ fn SidebarTeamSubNav(
         <div class="mt-0.5 relative" node_ref=outer_ref>
             // Team name — clickable to expand/collapse, right-click for context menu
             <button
-                class="w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors text-left"
+                class="group w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors text-left"
                 on:click=move |_| set_expanded.update(|v| *v = !*v)
                 on:contextmenu=move |ev| {
                     ev.prevent_default();
@@ -647,6 +794,9 @@ fn SidebarTeamSubNav(
             >
                 <Icon icon=phosphor_leptos::USERS_THREE weight=IconWeight::Light size="16px"/>
                 <span class="flex-1 truncate">{name}</span>
+                <span class="opacity-0 group-hover:opacity-100 transition-opacity">
+                    <FavoriteToggle target_type="team" target_id=team_id.clone()/>
+                </span>
                 <svg class=chevron_class width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M6 9l6 6 6-6"/>
                 </svg>

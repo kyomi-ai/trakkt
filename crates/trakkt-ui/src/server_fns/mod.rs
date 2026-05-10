@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod comments;
 pub mod context;
+pub mod favorites;
 pub mod issues;
 pub mod labels;
 pub mod notifications;
