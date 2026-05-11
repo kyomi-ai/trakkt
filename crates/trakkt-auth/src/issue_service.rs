@@ -605,6 +605,11 @@ pub async fn update_issue(
         param_idx += 1;
     }
 
+    if updates.team_id.is_some() {
+        set_parts.push(format!("team_id = ${param_idx}"));
+        param_idx += 1;
+    }
+
     // Always update updated_at.
     set_parts.push(format!("updated_at = {now}"));
 
@@ -680,6 +685,9 @@ pub async fn update_issue(
         }
         if let Some(ref v) = updates.sort_order {
             query = query.bind(*v);
+        }
+        if let Some(ref v) = updates.team_id {
+            query = query.bind(v.as_str());
         }
 
         query = query.bind(workspace_id);

@@ -547,6 +547,14 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                         "due_date": {
                             "type": ["string", "null"],
                             "description": "Due date in ISO 8601 format, or null to clear"
+                        },
+                        "team_id": {
+                            "type": "string",
+                            "description": "Team ID to move the issue to"
+                        },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Team key (e.g. 'TRA') as alternative to team_id. Resolved server-side. team_id takes precedence if both are provided."
                         }
                     },
                     "required": ["issue_number"]
@@ -897,6 +905,8 @@ async fn tool_update_issue(
 ) -> trakkt_core::Result<String> {
     let number = arg_i64(args, "issue_number")? as i32;
 
+    let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
+
     // Build the IssueUpdate from provided fields. Absent keys mean "no change".
     // JSON null means "clear the field" (maps to Some(None) for double-Option fields).
     let updates = IssueUpdate {
@@ -924,6 +934,7 @@ async fn tool_update_issue(
         sort_order: args.get("sort_order").map(|v| {
             v.as_f64()
         }),
+        team_id,
     };
 
     let issue = issue_service::update_issue(
