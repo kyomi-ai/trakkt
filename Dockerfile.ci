@@ -49,10 +49,10 @@ RUN wget -qO /usr/local/bin/tailwindcss \
     https://github.com/tailwindlabs/tailwindcss/releases/download/v4.2.2/tailwindcss-linux-x64 \
     && chmod +x /usr/local/bin/tailwindcss
 
-# wasm-opt (binaryen) — trunk's built-in runner doesn't pass --enable-bulk-memory-opt,
-# so we install our own and run it manually after trunk
+# wasm-opt (binaryen) — installed to /opt so trunk doesn't find it on PATH
+# (trunk auto-runs wasm-opt with just -O, which fails without --enable-bulk-memory-opt)
 RUN wget -qO- https://github.com/WebAssembly/binaryen/releases/download/version_128/binaryen-version_128-x86_64-linux.tar.gz \
-    | tar -xzf - --strip-components=2 -C /usr/local/bin \
+    | tar -xzf - --strip-components=2 -C /opt \
         binaryen-version_128/bin/wasm-opt
 
 WORKDIR /build
@@ -70,7 +70,7 @@ RUN sed -i '/cargo_profile/d; /^\[tools\]/d; /^wasm_opt/d' crates/trakkt-ui/Trun
 # Build WASM frontend, then optimize with wasm-opt manually (with bulk-memory support)
 RUN cd crates/trakkt-ui && trunk build --release \
     && for f in dist/*_bg.wasm; do \
-         wasm-opt --enable-bulk-memory-opt -O -o "${f}.opt" "$f" && mv "${f}.opt" "$f"; \
+         /opt/wasm-opt --enable-bulk-memory-opt -O -o "${f}.opt" "$f" && mv "${f}.opt" "$f"; \
        done
 
 # Build server binary
