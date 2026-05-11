@@ -61,20 +61,14 @@ RUN sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCA
 # Strip cargo_profile so trunk uses the release profile
 RUN sed -i '/cargo_profile/d' crates/trakkt-ui/Trunk.toml
 
-# Pre-install wasm-opt to trunk's cache location. Trunk looks for it at
-# ~/.cache/trunk/wasm-opt-{version}/bin/wasm-opt and skips download if found.
-# We create a wrapper that adds --enable-bulk-memory-opt (which trunk doesn't pass).
-ENV TRUNK_TOOLS_WASM_OPT=version_128
-RUN mkdir -p /root/.cache/trunk/wasm-opt-version_128/bin \
-    && wget -qO- https://github.com/WebAssembly/binaryen/releases/download/version_128/binaryen-version_128-x86_64-linux.tar.gz \
-       | tar -xzf - --strip-components=2 -C /root/.cache/trunk/wasm-opt-version_128/bin \
-           binaryen-version_128/bin/wasm-opt \
-    && mv /root/.cache/trunk/wasm-opt-version_128/bin/wasm-opt /root/.cache/trunk/wasm-opt-version_128/bin/wasm-opt-real \
-    && printf '#!/bin/sh\nexec /root/.cache/trunk/wasm-opt-version_128/bin/wasm-opt-real --enable-bulk-memory-opt "$@"\n' \
-       > /root/.cache/trunk/wasm-opt-version_128/bin/wasm-opt \
-    && chmod +x /root/.cache/trunk/wasm-opt-version_128/bin/wasm-opt
-
-# Build WASM frontend
+# Build WASM frontend. Pre-install a no-op wasm-opt so trunk skips optimization
+# (trunk always runs wasm-opt in release mode, and its invocation doesn't support
+# the bulk-memory instructions newer wasm-bindgen emits — opt-level=z from rustc
+# is sufficient optimization)
+ENV TRUNK_TOOLS_WASM_OPT=skip
+RUN mkdir -p /root/.cache/trunk/wasm-opt-skip/bin \
+    && printf '#!/bin/sh\nOUT=$(echo "$1" | cut -d= -f2)\ncp "$3" "$OUT"\n' > /root/.cache/trunk/wasm-opt-skip/bin/wasm-opt \
+    && chmod +x /root/.cache/trunk/wasm-opt-skip/bin/wasm-opt
 RUN cd crates/trakkt-ui && trunk build --release
 
 # Build server binary
