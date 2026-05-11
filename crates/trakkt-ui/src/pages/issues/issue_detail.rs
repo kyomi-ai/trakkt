@@ -2,10 +2,11 @@
 
 //! Issue detail page — full view of a single issue with editing.
 //!
-//! Layout follows DESIGN.md "Issue Detail Page" spec:
+//! Layout follows Linear's two-column pattern:
 //! - Header: back button + issue number (font-mono)
-//! - Content: title (editable), metadata bar, description (kode WYSIWYG), comments
-//! - Footer: created/updated timestamps
+//! - Left column: title (editable), description (kode WYSIWYG), sub-issues, comments, timestamps
+//! - Right column (280px sidebar): status, priority, assignee, labels, due date, watch, parent, team
+//! - Responsive: sidebar stacks below main content on mobile
 //!
 //! Key interactions:
 //! - Title: click to edit, Enter/blur to save
@@ -313,77 +314,82 @@ fn IssueDetailContent(
     let issue_id_for_exclude = issue_id_for_link.clone();
 
     view! {
-        <div class="max-w-[860px] mx-auto w-full">
-            // ── Parent breadcrumb ─────────────────────────────────────
-            {move || {
-                let i = issue.get();
-                let parent_id = i.parent_issue_id.as_ref()?;
-                let store = sync_store?;
-                let parent = store.issues().get().into_iter().find(|p| p.issue_id == *parent_id)?;
-                Some(view! {
-                    <a
-                        href=format!("/issues/{}", parent.number)
-                        class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1 mb-1"
-                    >
-                        <Icon icon=phosphor_leptos::ARROW_BEND_UP_LEFT size="12px"/>
-                        {format!("{}-{} {}", parent.team_key, parent.number, parent.title)}
-                    </a>
-                })
-            }}
+        <div class="max-w-[1140px] mx-auto w-full flex flex-col md:flex-row gap-8">
+            // ── Left column: main content ─────────────────────────────
+            <div class="flex-1 min-w-0">
+                // ── Parent breadcrumb ─────────────────────────────────
+                {move || {
+                    let i = issue.get();
+                    let parent_id = i.parent_issue_id.as_ref()?;
+                    let store = sync_store?;
+                    let parent = store.issues().get().into_iter().find(|p| p.issue_id == *parent_id)?;
+                    Some(view! {
+                        <a
+                            href=format!("/issues/{}", parent.number)
+                            class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1 mb-1"
+                        >
+                            <Icon icon=phosphor_leptos::ARROW_BEND_UP_LEFT size="12px"/>
+                            {format!("{}-{} {}", parent.team_key, parent.number, parent.title)}
+                        </a>
+                    })
+                }}
 
-            // ── Title ──────────────────────────────────────────────────
-            {move || {
-                let i = issue.get();
-                view! { <EditableTitle number=number title=i.title.clone() on_save=on_change/> }
-            }}
+                // ── Title ──────────────────────────────────────────────
+                {move || {
+                    let i = issue.get();
+                    view! { <EditableTitle number=number title=i.title.clone() on_save=on_change/> }
+                }}
 
-            // ── Metadata bar ───────────────────────────────────────────
-            {move || {
-                let i = issue.get();
-                view! { <MetadataBar issue=i on_change=on_change/> }
-            }}
+                // ── Description ────────────────────────────────────────
+                {move || {
+                    let i = issue.get();
+                    view! {
+                        <DescriptionEditor
+                            number=number
+                            description=i.description.clone().unwrap_or_default()
+                            on_save=on_change
+                        />
+                    }
+                }}
 
-            // ── Description ────────────────────────────────────────────
-            {move || {
-                let i = issue.get();
-                view! {
-                    <DescriptionEditor
-                        number=number
-                        description=i.description.clone().unwrap_or_default()
-                        on_save=on_change
-                    />
-                }
-            }}
+                // ── Sub-issues section ────────────────────────────────
+                <SubIssuesSection
+                    sub_issues=sub_issues
+                    on_add=Callback::new(move |()| set_show_new_sub_issue.set(true))
+                    on_link=Callback::new(move |()| set_show_link_sub_issue.set(true))
+                />
 
-            // ── Sub-issues section ────────────────────────────────────
-            <SubIssuesSection
-                sub_issues=sub_issues
-                on_add=Callback::new(move |()| set_show_new_sub_issue.set(true))
-                on_link=Callback::new(move |()| set_show_link_sub_issue.set(true))
-            />
+                // ── Divider ────────────────────────────────────────────
+                <div class="border-t border-border my-6"></div>
 
-            // ── Divider ────────────────────────────────────────────────
-            <div class="border-t border-border my-6"></div>
+                // ── Comments ───────────────────────────────────────────
+                <CommentsSection
+                    number=number
+                    comments=comments
+                    on_comment_added=on_change
+                />
 
-            // ── Comments ───────────────────────────────────────────────
-            <CommentsSection
-                number=number
-                comments=comments
-                on_comment_added=on_change
-            />
-
-            // ── Footer: timestamps ────────────────────────────────────
-            {move || {
-                let i = issue.get();
-                view! {
-                    <div class="mt-6 pb-4">
-                        <div class="flex items-center gap-4 text-xs text-muted-foreground">
-                            <span>{format!("Created {}", relative_time(&i.created_at))}</span>
-                            <span>{format!("Updated {}", relative_time(&i.updated_at))}</span>
+                // ── Footer: timestamps ────────────────────────────────
+                {move || {
+                    let i = issue.get();
+                    view! {
+                        <div class="mt-6 pb-4">
+                            <div class="flex items-center gap-4 text-xs text-muted-foreground">
+                                <span>{format!("Created {}", relative_time(&i.created_at))}</span>
+                                <span>{format!("Updated {}", relative_time(&i.updated_at))}</span>
+                            </div>
                         </div>
-                    </div>
-                }
-            }}
+                    }
+                }}
+            </div>
+
+            // ── Right column: metadata sidebar ────────────────────────
+            <div class="w-full md:w-[280px] shrink-0">
+                {move || {
+                    let i = issue.get();
+                    view! { <MetadataSidebar issue=i on_change=on_change/> }
+                }}
+            </div>
         </div>
 
         // ── New Sub-Issue modal ───────────────────────────────────────
@@ -536,12 +542,13 @@ fn EditableTitle(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Metadata Bar
+// Metadata Sidebar
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Metadata bar showing status, priority, assignee, labels, due date, and parent issue.
+/// Metadata sidebar showing status, priority, assignee, labels, due date, watch,
+/// parent issue, and team — stacked vertically in the right column.
 #[component]
-fn MetadataBar(
+fn MetadataSidebar(
     issue: IssueWithDetails,
     on_change: Callback<()>,
 ) -> impl IntoView {
@@ -624,11 +631,13 @@ fn MetadataBar(
         }
     };
 
+    let team_key = issue.team_key.clone();
+
     view! {
-        <div class="flex flex-wrap items-center gap-4 mt-4">
+        <div class="space-y-5">
             // ── Status ─────────────────────────────────────────────────
-            <div class="flex items-center gap-2">
-                <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Status"</span>
+            <div>
+                <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Status"</div>
                 <div node_ref=status_trigger_ref>
                     <DropdownTrigger
                         label="Status"
@@ -676,26 +685,24 @@ fn MetadataBar(
             </div>
 
             // ── Priority ───────────────────────────────────────────────
-            <div class="flex items-center gap-2">
-                <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Priority"</span>
-                <div class="w-32">
-                    <StyledSelect
-                        value=priority.to_string()
-                        options=vec![
-                            ("0", "None"),
-                            ("1", "Urgent"),
-                            ("2", "High"),
-                            ("3", "Medium"),
-                            ("4", "Low"),
-                        ]
-                        on_change=on_priority_change
-                    />
-                </div>
+            <div>
+                <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Priority"</div>
+                <StyledSelect
+                    value=priority.to_string()
+                    options=vec![
+                        ("0", "None"),
+                        ("1", "Urgent"),
+                        ("2", "High"),
+                        ("3", "Medium"),
+                        ("4", "Low"),
+                    ]
+                    on_change=on_priority_change
+                />
             </div>
 
             // ── Assignee (display only — picker is future work) ────────
-            <div class="flex items-center gap-2">
-                <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Assignee"</span>
+            <div>
+                <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Assignee"</div>
                 {if let Some(ref name) = issue.assignee_name {
                     view! {
                         <div class="flex items-center gap-1.5">
@@ -719,21 +726,25 @@ fn MetadataBar(
             />
 
             // ── Due date (display only — date picker is future work) ───
-            {issue.due_date.as_ref().map(|date| {
-                view! {
-                    <div class="flex items-center gap-2">
-                        <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Due"</span>
+            <div>
+                <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Due"</div>
+                {if let Some(ref date) = issue.due_date {
+                    view! {
                         <span class="text-sm text-foreground">{date.clone()}</span>
-                    </div>
-                }
-            })}
+                    }.into_any()
+                } else {
+                    view! {
+                        <span class="text-sm text-muted-foreground">"No due date"</span>
+                    }.into_any()
+                }}
+            </div>
 
             // ── Watch toggle ──────────────────────────────────────────────
             <WatchToggle number=number/>
 
             // ── Parent issue ──────────────────────────────────────────────
-            <div class="flex items-center gap-2">
-                <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Parent"</span>
+            <div>
+                <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Parent"</div>
                 {
                     let parent_id = parent_issue_id.clone();
                     if let Some(ref pid) = parent_id {
@@ -784,6 +795,12 @@ fn MetadataBar(
                         }.into_any()
                     }
                 }
+            </div>
+
+            // ── Team ──────────────────────────────────────────────────────
+            <div>
+                <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Team"</div>
+                <span class="text-sm text-foreground">{team_key.clone()}</span>
             </div>
         </div>
 
@@ -853,7 +870,8 @@ fn WatchToggle(number: i32) -> impl IntoView {
     };
 
     view! {
-        <div class="flex items-center gap-2">
+        <div>
+            <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Watch"</div>
             <button
                 class="flex items-center gap-1.5 px-2 py-1 rounded text-sm text-muted-foreground hover:text-foreground hover:bg-surface-alt transition-colors"
                 on:click=toggle
@@ -931,9 +949,9 @@ fn LabelPicker(
     };
 
     view! {
-        <div class="flex items-center gap-2 relative">
-            <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Labels"</span>
-            <div class="flex items-center gap-1">
+        <div class="relative">
+            <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Labels"</div>
+            <div class="flex flex-wrap items-center gap-1">
                 {move || {
                     let labels = current_display.get();
                     if labels.is_empty() {
@@ -942,7 +960,7 @@ fn LabelPicker(
                         }.into_any()
                     } else {
                         view! {
-                            <div class="flex items-center gap-1">
+                            <div class="flex flex-wrap items-center gap-1">
                                 {labels.iter().map(|label| {
                                     view! {
                                         <LabelBadge
@@ -1095,7 +1113,7 @@ fn DescriptionEditor(
 
 /// Reusable modal for searching and selecting an existing issue.
 ///
-/// Used by SubIssuesSection ("Link existing") and MetadataBar ("Set parent").
+/// Used by SubIssuesSection ("Link existing") and MetadataSidebar ("Set parent").
 /// Fetches issues via `list_issues(search=...)` and excludes specified IDs
 /// to prevent self-references and cycles.
 #[component]
@@ -1483,42 +1501,49 @@ fn NewCommentForm(number: i32, on_created: Callback<()>) -> impl IntoView {
 // Loading Skeleton
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Skeleton loading state matching the issue detail layout shape.
+/// Skeleton loading state matching the two-column issue detail layout.
 #[component]
 fn IssueDetailSkeleton() -> impl IntoView {
     view! {
-        <div class="max-w-[860px] mx-auto w-full">
-            // Title
-            <Skeleton class="h-8 w-2/3 mb-4"/>
-            // Metadata bar
-            <div class="flex flex-wrap gap-4 mt-4">
-                <Skeleton class="h-11 w-36"/>
-                <Skeleton class="h-11 w-32"/>
-                <Skeleton class="h-5 w-24"/>
-                <Skeleton class="h-5 w-20"/>
-            </div>
-            // Description
-            <div class="mt-6">
-                <Skeleton class="h-4 w-20 mb-3"/>
-                <Skeleton class="h-48 w-full rounded-md"/>
-            </div>
-            // Divider
-            <div class="border-t border-border my-6"></div>
-            // Comments heading
-            <Skeleton class="h-5 w-28 mb-4"/>
-            // Comment placeholders
-            <div class="space-y-4">
-                {(0..2).map(|_| {
-                    view! {
-                        <div class="flex gap-3">
-                            <Skeleton class="w-7 h-7 rounded-full shrink-0"/>
-                            <div class="flex-1">
-                                <div class="flex gap-2 mb-1">
-                                    <Skeleton class="h-4 w-20"/>
-                                    <Skeleton class="h-3 w-12"/>
+        <div class="max-w-[1140px] mx-auto w-full flex flex-col md:flex-row gap-8">
+            // ── Left column ───────────────────────────────────────────
+            <div class="flex-1 min-w-0">
+                // Title
+                <Skeleton class="h-8 w-2/3 mb-4"/>
+                // Description
+                <div class="mt-6">
+                    <Skeleton class="h-4 w-20 mb-3"/>
+                    <Skeleton class="h-48 w-full rounded-md"/>
+                </div>
+                // Divider
+                <div class="border-t border-border my-6"></div>
+                // Comments heading
+                <Skeleton class="h-5 w-28 mb-4"/>
+                // Comment placeholders
+                <div class="space-y-4">
+                    {(0..2).map(|_| {
+                        view! {
+                            <div class="flex gap-3">
+                                <Skeleton class="w-7 h-7 rounded-full shrink-0"/>
+                                <div class="flex-1">
+                                    <div class="flex gap-2 mb-1">
+                                        <Skeleton class="h-4 w-20"/>
+                                        <Skeleton class="h-3 w-12"/>
+                                    </div>
+                                    <Skeleton class="h-12 w-full"/>
                                 </div>
-                                <Skeleton class="h-12 w-full"/>
                             </div>
+                        }
+                    }).collect_view()}
+                </div>
+            </div>
+            // ── Right column (metadata sidebar) ───────────────────────
+            <div class="w-full md:w-[280px] shrink-0 space-y-5">
+                {(0..8).map(|_| {
+                    view! {
+                        <div>
+                            <Skeleton class="h-3 w-16 mb-1.5"/>
+                            <Skeleton class="h-8 w-full"/>
                         </div>
                     }
                 }).collect_view()}
