@@ -29,8 +29,8 @@ use crate::server_fns::statuses::list_statuses;
 /// and statuses belonging to that team.
 #[component]
 pub fn StatusFilterDropdown(
-    #[prop(into)] value: Signal<String>,
-    on_change: Callback<String>,
+    #[prop(into)] value: Signal<Vec<String>>,
+    on_change: Callback<Vec<String>>,
     /// When filtering by team, only show statuses that are global (team_id = None)
     /// or belong to this team.
     #[prop(optional, into)]
@@ -82,31 +82,37 @@ pub fn StatusFilterDropdown(
         all
     });
 
-    // Display name for the current selection (looked up from loaded statuses).
+    // Display name for the current selection (multi-select).
+    // 0 selected → None (shows "All statuses" default label)
+    // 1 selected → look up name from loaded statuses
+    // 2+ selected → "Status (N)"
     let display = Memo::new(move |_| {
         let v = value.get();
-        if v.is_empty() {
-            None
-        } else {
-            statuses
-                .get()
-                .iter()
-                .find(|s| s.status_id == v)
-                .map(|s| s.name.clone())
+        match v.len() {
+            0 => None,
+            1 => {
+                let id = &v[0];
+                statuses
+                    .get()
+                    .iter()
+                    .find(|s| &s.status_id == id)
+                    .map(|s| s.name.clone())
+            }
+            n => Some(format!("Status ({n})")),
         }
     });
 
-    // Icon variant for the current selection.
+    // Icon variant — only show when exactly 1 status is selected.
     let current_variant = Memo::new(move |_| {
         let v = value.get();
-        if v.is_empty() {
-            None
-        } else {
+        if v.len() == 1 {
             statuses
                 .get()
                 .iter()
-                .find(|s| s.status_id == v)
+                .find(|s| s.status_id == v[0])
                 .map(|s| IssueStatusVariant::parse(&s.category))
+        } else {
+            None
         }
     });
 
@@ -133,7 +139,7 @@ pub fn StatusFilterDropdown(
                 selected=Signal::derive(move || value.get().is_empty())
                 on_select=Callback::new({
                     let on_change = on_change.clone();
-                    move |()| { on_change.run(String::new()); set_open.set(false); }
+                    move |()| { on_change.run(Vec::new()); }
                 })
             />
             {move || statuses.get().into_iter().map(|status| {
@@ -144,11 +150,19 @@ pub fn StatusFilterDropdown(
                 view! {
                     <DropdownItem
                         label=label
-                        selected=Signal::derive(move || value.get() == status_id_check)
+                        selected=Signal::derive(move || value.get().contains(&status_id_check))
                         on_select=Callback::new({
                             let on_change = on_change.clone();
                             let id = status_id.clone();
-                            move |()| { on_change.run(id.clone()); set_open.set(false); }
+                            move |()| {
+                                let mut current = value.get_untracked();
+                                if let Some(pos) = current.iter().position(|s| s == &id) {
+                                    current.remove(pos);
+                                } else {
+                                    current.push(id.clone());
+                                }
+                                on_change.run(current);
+                            }
                         })
                         icon=Arc::new(move || view! { <IssueStatusBadge status=variant size=14/> }.into_any()) as ChildrenFn
                     />
@@ -168,8 +182,8 @@ pub fn StatusFilterDropdown(
 /// with their corresponding icons.
 #[component]
 pub fn PriorityFilterDropdown(
-    #[prop(into)] value: Signal<String>,
-    on_change: Callback<String>,
+    #[prop(into)] value: Signal<Vec<String>>,
+    on_change: Callback<Vec<String>>,
 ) -> impl IntoView {
     let (open, set_open) = signal(false);
     let trigger_ref = NodeRef::<leptos::html::Div>::new();
@@ -181,21 +195,33 @@ pub fn PriorityFilterDropdown(
         ("4", "Low", 4),
     ];
 
+    // Display name for the current selection (multi-select).
+    // 0 selected → None (shows "All priorities" default label)
+    // 1 selected → look up name ("Urgent", "High", etc.)
+    // 2+ selected → "Priority (N)"
     let display = Memo::new(move |_| {
         let v = value.get();
-        if v.is_empty() { None } else {
-            match v.as_str() {
+        match v.len() {
+            0 => None,
+            1 => match v[0].as_str() {
                 "1" => Some("Urgent".to_string()),
                 "2" => Some("High".to_string()),
                 "3" => Some("Medium".to_string()),
                 "4" => Some("Low".to_string()),
                 _ => None,
-            }
+            },
+            n => Some(format!("Priority ({n})")),
         }
     });
 
+    // Icon — only show when exactly 1 priority is selected.
     let current_priority = Memo::new(move |_| {
-        value.get().parse::<i32>().ok()
+        let v = value.get();
+        if v.len() == 1 {
+            v[0].parse::<i32>().ok()
+        } else {
+            None
+        }
     });
 
     view! {
@@ -221,7 +247,7 @@ pub fn PriorityFilterDropdown(
                 selected=Signal::derive(move || value.get().is_empty())
                 on_select=Callback::new({
                     let on_change = on_change.clone();
-                    move |()| { on_change.run(String::new()); set_open.set(false); }
+                    move |()| { on_change.run(Vec::new()); }
                 })
             />
             {priorities.iter().map(|(key, label, priority_val)| {
@@ -233,11 +259,19 @@ pub fn PriorityFilterDropdown(
                 view! {
                     <DropdownItem
                         label=label
-                        selected=Signal::derive(move || value.get() == key_check)
+                        selected=Signal::derive(move || value.get().contains(&key_check))
                         on_select=Callback::new({
                             let on_change = on_change.clone();
                             let k = key_owned.clone();
-                            move |()| { on_change.run(k.clone()); set_open.set(false); }
+                            move |()| {
+                                let mut current = value.get_untracked();
+                                if let Some(pos) = current.iter().position(|s| s == &k) {
+                                    current.remove(pos);
+                                } else {
+                                    current.push(k.clone());
+                                }
+                                on_change.run(current);
+                            }
                         })
                         icon=Arc::new(move || view! { <PriorityIndicator priority=priority_val/> }.into_any()) as ChildrenFn
                         shortcut=shortcut

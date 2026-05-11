@@ -130,8 +130,8 @@ fn IssueListInner(
 
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
-    let (status_filter, set_status_filter) = signal(String::new());
-    let (priority_filter, set_priority_filter) = signal(String::new());
+    let (status_filter, set_status_filter) = signal(Vec::<String>::new());
+    let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
     let (show_archived, set_show_archived) = signal(false);
 
     // ── Error state for server function failures ──────────────────────────
@@ -231,14 +231,13 @@ fn IssueListInner(
                 if !archived_visible && is_archived(issue, ARCHIVE_DAYS) {
                     return false;
                 }
-                if !status_val.is_empty() && issue.status_id != status_val {
+                if !status_val.is_empty() && !status_val.contains(&issue.status_id) {
                     return false;
                 }
                 if !priority_val.is_empty() {
-                    if let Ok(p) = priority_val.parse::<i32>() {
-                        if issue.priority != p {
-                            return false;
-                        }
+                    let p_str = issue.priority.to_string();
+                    if !priority_val.contains(&p_str) {
+                        return false;
                     }
                 }
                 if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
@@ -433,10 +432,10 @@ fn IssueListInner(
                     />
                     <StatusFilterDropdown
                         value=status_filter
-                        on_change=Callback::new(move |v: String| set_status_filter.set(v))
+                        on_change=Callback::new(move |v: Vec<String>| set_status_filter.set(v))
                         team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
                     />
-                    <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
+                    <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))/>
                     <button
                         class=move || {
                             if show_archived.get() {
@@ -760,10 +759,10 @@ pub(crate) fn SaveViewModal(
     on_close: Callback<()>,
     /// Current search filter value.
     search: Signal<String>,
-    /// Current status filter value.
-    status_filter: Signal<String>,
-    /// Current priority filter value.
-    priority_filter: Signal<String>,
+    /// Current status filter values (multi-select).
+    status_filter: Signal<Vec<String>>,
+    /// Current priority filter values (multi-select).
+    priority_filter: Signal<Vec<String>>,
     /// Current team_id if on a team page.
     team_id: Signal<Option<String>>,
     /// Current view mode (list/board).
@@ -789,19 +788,9 @@ pub(crate) fn SaveViewModal(
         }
 
         // Build filters JSON from current filter state.
-        let mut statuses = Vec::new();
-        let status_val = status_filter.get_untracked();
-        if !status_val.is_empty() {
-            statuses.push(status_val);
-        }
-
-        let mut priorities = Vec::new();
-        let priority_val = priority_filter.get_untracked();
-        if !priority_val.is_empty() {
-            if let Ok(p) = priority_val.parse::<i32>() {
-                priorities.push(p);
-            }
-        }
+        let statuses: Vec<String> = status_filter.get_untracked();
+        let priority_strings = priority_filter.get_untracked();
+        let priorities: Vec<i32> = priority_strings.iter().filter_map(|s| s.parse::<i32>().ok()).collect();
 
         let search_val = search.get_untracked();
         let team_id_val = team_id.get_untracked().unwrap_or_default();
