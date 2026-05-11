@@ -39,10 +39,10 @@ RUN wget -qO- https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk
     | tar -xzf - -C /usr/local/bin \
     && chmod +x /usr/local/bin/trunk
 
-# wasm-bindgen-cli 0.2.120 (musl binary from GitHub releases)
-RUN wget -qO- https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.120/wasm-bindgen-0.2.120-x86_64-unknown-linux-musl.tar.gz \
+# wasm-bindgen-cli (must match the version in Cargo.lock)
+RUN wget -qO- https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.121/wasm-bindgen-0.2.121-x86_64-unknown-linux-musl.tar.gz \
     | tar -xzf - --strip-components=1 -C /usr/local/bin \
-        wasm-bindgen-0.2.120-x86_64-unknown-linux-musl/wasm-bindgen
+        wasm-bindgen-0.2.121-x86_64-unknown-linux-musl/wasm-bindgen
 
 # tailwindcss v4.2.2
 RUN wget -qO /usr/local/bin/tailwindcss \
@@ -57,8 +57,10 @@ COPY . .
 # Strip local dev patches from Cargo.toml (path overrides not available in Docker)
 RUN sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
 
-# Strip cargo_profile from Trunk.toml so trunk uses the default release profile
-RUN sed -i '/cargo_profile/d' crates/trakkt-ui/Trunk.toml
+# Strip cargo_profile so trunk uses the release profile, and disable wasm-opt
+# (trunk's bundled wasm-opt doesn't support bulk-memory instructions from newer wasm-bindgen)
+RUN sed -i '/cargo_profile/d' crates/trakkt-ui/Trunk.toml \
+    && sed -i '/^\[build\]/a wasm_opt = "Off"' crates/trakkt-ui/Trunk.toml
 
 # Build WASM frontend (trunk build --release)
 RUN cd crates/trakkt-ui && trunk build --release
