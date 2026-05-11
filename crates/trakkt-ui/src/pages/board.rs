@@ -317,6 +317,7 @@ pub fn BoardContent(
                     Some(target_id_for_server),
                     None, None, None, None, None, None,
                     Some(true),
+                    None,
                 ).await {
                     tracing::warn!("Failed to update issue status: {e}");
                     // Revert optimistic update on failure.

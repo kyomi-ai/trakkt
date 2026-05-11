@@ -584,7 +584,7 @@ fn IssueListInner(
 /// Fields: title (required), description (textarea), priority (select).
 /// Uses the `create_issue` server function via spawn_local.
 #[component]
-fn NewIssueModal(
+pub(crate) fn NewIssueModal(
     /// Whether the modal is visible.
     show: Signal<bool>,
     /// Called when the modal should close (cancel, escape, backdrop click).
@@ -594,6 +594,12 @@ fn NewIssueModal(
     /// When on a team page, the team_id to assign to newly created issues.
     #[prop(optional, into)]
     team_id: Option<Signal<Option<String>>>,
+    /// When creating a sub-issue, the parent issue ID to attach.
+    #[prop(optional, into)]
+    parent_issue_id: Option<Signal<Option<String>>>,
+    /// When creating a sub-issue, the parent's display title (e.g. "TEAM-42 Fix bug").
+    #[prop(optional, into)]
+    parent_title: Option<Signal<Option<String>>>,
 ) -> impl IntoView {
     let (title, set_title) = signal(String::new());
     let (description, set_description) = signal(String::new());
@@ -623,12 +629,13 @@ fn NewIssueModal(
         let desc = if desc_val.trim().is_empty() { None } else { Some(desc_val) };
         let prio = priority.get_untracked().parse::<i32>().unwrap_or(0);
         let current_team_id = team_id.and_then(|s| s.get_untracked());
+        let current_parent_id = parent_issue_id.and_then(|s| s.get_untracked());
 
         set_submitting.set(true);
         set_error_msg.set(None);
 
         leptos::task::spawn_local(async move {
-            match create_issue(title_val, desc, prio, None, None, String::new(), None, None, None, current_team_id).await {
+            match create_issue(title_val, desc, prio, None, None, String::new(), None, None, current_parent_id, current_team_id).await {
                 Ok(_) => {
                     set_submitting.set(false);
                     on_created.run(());
@@ -658,16 +665,30 @@ fn NewIssueModal(
                 disabled=Signal::derive(move || submitting.get() || title_empty.get())
                 on:click=move |_| submit()
             >
-                {move || if submitting.get() { "Creating..." } else { "Create Issue" }}
+                {move || if submitting.get() {
+                    "Creating..."
+                } else if parent_issue_id.is_some_and(|s| s.get().is_some()) {
+                    "Create Sub-issue"
+                } else {
+                    "Create Issue"
+                }}
             </Button>
         }.into_any()
+    });
+
+    let modal_title = Signal::derive(move || {
+        if parent_issue_id.is_some_and(|s| s.get().is_some()) {
+            "New Sub-issue".to_string()
+        } else {
+            "New Issue".to_string()
+        }
     });
 
     view! {
         <Modal
             show=show
             on_close=on_close
-            title="New Issue"
+            title=modal_title
             size=ModalSize::Lg
             footer=modal_footer
         >
@@ -686,6 +707,17 @@ fn NewIssueModal(
                         </crate::components::AlertDescription>
                     </crate::components::Alert>
                 </Show>
+
+                // Parent indicator (shown when creating a sub-issue)
+                {move || parent_title.and_then(|s| s.get()).map(|title| {
+                    view! {
+                        <div class="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
+                            <Icon icon=phosphor_leptos::ARROW_BEND_DOWN_RIGHT size="12px"/>
+                            <span>"Sub-issue of "</span>
+                            <span class="font-medium text-foreground">{title}</span>
+                        </div>
+                    }
+                })}
 
                 // Title
                 <div class="space-y-2">
