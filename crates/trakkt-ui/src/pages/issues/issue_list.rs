@@ -451,21 +451,20 @@ fn IssueListInner(
                         <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
                         {move || if show_archived.get() { "Hide archived" } else { "Show archived" }}
                     </button>
-                    // "Save view" — only when at least one filter is active
-                    <Show when=move || {
-                        !search.get().is_empty()
-                            || !status_filter.get().is_empty()
-                            || !priority_filter.get().is_empty()
-                    }>
-                        <Button
-                            variant=ButtonVariant::Ghost
-                            size=ButtonSize::Sm
-                            on:click=move |_| set_show_save_view.set(true)
-                        >
-                            <Icon icon=phosphor_leptos::FLOPPY_DISK size="14px"/>
-                            "Save view"
-                        </Button>
-                    </Show>
+                    // "Save view" — always visible, disabled when no filters active
+                    <Button
+                        variant=ButtonVariant::Ghost
+                        size=ButtonSize::Sm
+                        disabled=Signal::derive(move || {
+                            search.get().is_empty()
+                                && status_filter.get().is_empty()
+                                && priority_filter.get().is_empty()
+                        })
+                        on:click=move |_| set_show_save_view.set(true)
+                    >
+                        <Icon icon=phosphor_leptos::FLOPPY_DISK size="14px"/>
+                        "Save view"
+                    </Button>
                 </div>
             </Show>
 
@@ -754,7 +753,7 @@ fn NewIssueModal(
 
 /// Modal form for saving the current filter set as a named view.
 #[component]
-fn SaveViewModal(
+pub(crate) fn SaveViewModal(
     /// Whether the modal is visible.
     show: Signal<bool>,
     /// Called when the modal should close.
