@@ -415,6 +415,7 @@ fn IssueDetailContent(
                             None, None, None, None, None, None, None, None,
                             Some(parent_id),
                             None,
+                            None,
                         ).await;
                         on_change.run(());
                     });
@@ -471,6 +472,7 @@ fn EditableTitle(
                 None, // milestone_id
                 None, // parent_issue_id
                 None, // clear_sort_order
+                None, // clear_parent
             )
             .await;
             set_saving.set(false);
@@ -572,6 +574,7 @@ fn MetadataBar(
                 None, // milestone_id
                 None, // parent_issue_id
                 None, // clear_sort_order
+                None, // clear_parent
             )
             .await;
             on_change.run(());
@@ -594,6 +597,7 @@ fn MetadataBar(
                 None, // milestone_id
                 None, // parent_issue_id
                 None, // clear_sort_order
+                None, // clear_parent
             )
             .await;
             on_change.run(());
@@ -754,10 +758,10 @@ fn MetadataBar(
                                                 let _ = update_issue(
                                                     number,
                                                     None, None, None, None, None, None, None, None,
-                                                    Some(String::new()),
                                                     None,
+                                                    None,
+                                                    Some(true),
                                                 ).await;
-                                                on_change.run(());
                                             });
                                         }
                                     >
@@ -796,8 +800,8 @@ fn MetadataBar(
                         None, None, None, None, None, None, None, None,
                         Some(parent_id),
                         None,
+                        None,
                     ).await;
-                    on_change.run(());
                 });
             })
             exclude_ids=Signal::derive({
@@ -1060,6 +1064,7 @@ fn DescriptionEditor(
                 None, // milestone_id
                 None, // parent_issue_id
                 None, // clear_sort_order
+                None, // clear_parent
             )
             .await;
             on_save.run(());
