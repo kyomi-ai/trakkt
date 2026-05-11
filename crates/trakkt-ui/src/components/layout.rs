@@ -685,6 +685,13 @@ fn SidebarCreateTeam(on_done: Callback<()>) -> impl IntoView {
     let (name, set_name) = signal(String::new());
     let (error, set_error) = signal(Option::<String>::None);
     let (submitting, set_submitting) = signal(false);
+    let input_ref = NodeRef::<leptos::html::Input>::new();
+
+    Effect::new(move || {
+        if let Some(input) = input_ref.get() {
+            let _ = input.focus();
+        }
+    });
 
     let on_submit = move |ev: web_sys::SubmitEvent| {
         ev.prevent_default();
@@ -723,6 +730,7 @@ fn SidebarCreateTeam(on_done: Callback<()>) -> impl IntoView {
     view! {
         <form class="px-2 pb-2" on:submit=on_submit>
             <input
+                node_ref=input_ref
                 type="text"
                 placeholder="New team name..."
                 class="w-full px-2 py-1.5 text-sm bg-[var(--color-sidebar-hover)] text-[var(--color-sidebar-foreground)] rounded-md border border-transparent focus:border-primary focus:outline-none placeholder:text-[var(--color-sidebar-foreground-muted)]"
