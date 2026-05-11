@@ -19,6 +19,3 @@ command_arguments = [
     "--output", "style/output.css",
 ]
 
-[tools]
-wasm_opt = "version_128"
-
