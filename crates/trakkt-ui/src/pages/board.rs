@@ -179,7 +179,7 @@ pub fn BoardContent(
 
     // ── Filter state ─────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
-    let (priority_filter, set_priority_filter) = signal(String::new());
+    let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
     let (show_archived, set_show_archived) = signal(false);
 
     // Client-side filtered issues: archive + search + priority applied before grouping.
@@ -196,10 +196,9 @@ pub fn BoardContent(
                     return false;
                 }
                 if !priority_val.is_empty() {
-                    if let Ok(p) = priority_val.parse::<i32>() {
-                        if issue.priority != p {
-                            return false;
-                        }
+                    let p_str = issue.priority.to_string();
+                    if !priority_val.contains(&p_str) {
+                        return false;
                     }
                 }
                 if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
@@ -346,7 +345,7 @@ pub fn BoardContent(
                 />
                 <PriorityFilterDropdown
                     value=priority_filter
-                    on_change=Callback::new(move |v: String| set_priority_filter.set(v))
+                    on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))
                 />
                 <button
                     class=move || {

@@ -55,8 +55,8 @@ pub fn MyIssuesPage() -> impl IntoView {
 
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
-    let (status_filter, set_status_filter) = signal(String::new());
-    let (priority_filter, set_priority_filter) = signal(String::new());
+    let (status_filter, set_status_filter) = signal(Vec::<String>::new());
+    let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
     let (show_archived, set_show_archived) = signal(false);
     let (show_save_view, set_show_save_view) = signal(false);
 
@@ -128,14 +128,13 @@ pub fn MyIssuesPage() -> impl IntoView {
         let status_val = status_filter.get();
         let priority_val = priority_filter.get();
 
-        if !status_val.is_empty() && issue.status_id != status_val {
+        if !status_val.is_empty() && !status_val.contains(&issue.status_id) {
             return false;
         }
         if !priority_val.is_empty() {
-            if let Ok(p) = priority_val.parse::<i32>() {
-                if issue.priority != p {
-                    return false;
-                }
+            let p_str = issue.priority.to_string();
+            if !priority_val.contains(&p_str) {
+                return false;
             }
         }
         if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
@@ -312,8 +311,8 @@ pub fn MyIssuesPage() -> impl IntoView {
                     placeholder="Search issues..."
                     class="flex-1 max-w-sm"
                 />
-                <StatusFilterDropdown value=status_filter on_change=Callback::new(move |v: String| set_status_filter.set(v))/>
-                <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: String| set_priority_filter.set(v))/>
+                <StatusFilterDropdown value=status_filter on_change=Callback::new(move |v: Vec<String>| set_status_filter.set(v))/>
+                <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))/>
                 <button
                     class=move || {
                         if show_archived.get() {
