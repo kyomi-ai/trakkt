@@ -383,12 +383,12 @@ fn SidebarTeamsSection() -> impl IntoView {
             let Some(store) = store else { return view! { <span/> }.into_any() };
             let teams = store.teams().get();
             view! {
-                <div class="flex items-center justify-between px-3 pt-4 pb-1">
+                <div class="group flex items-center justify-between px-3 pt-4 pb-1">
                     <span class="text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
                         "Teams"
                     </span>
                     <button
-                        class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors"
+                        class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors opacity-0 group-hover:opacity-100"
                         on:click=move |_| set_show_create.update(|v| *v = !*v)
                         title="Create or join a team"
                     >
@@ -594,29 +594,39 @@ fn SidebarEntityItem(
     let weight = Signal::derive(move || {
         if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
     });
-    let class = move || {
-        let base = "group flex items-center gap-3 px-3 py-1.5 rounded-md text-sm transition-colors";
+    let wrapper_class = move || {
+        let base = "group flex items-center rounded-md transition-colors";
         if is_active.get() {
-            format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
+            format!("{base} bg-[var(--color-sidebar-active)]")
         } else {
-            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)]")
+            format!("{base} hover:bg-[var(--color-sidebar-hover)]")
+        }
+    };
+    let link_class = move || {
+        let base = "flex-1 min-w-0 flex items-center gap-3 px-3 py-1.5 text-sm";
+        if is_active.get() {
+            format!("{base} text-[var(--color-sidebar-foreground)] font-medium")
+        } else {
+            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)]")
         }
     };
     let has_favorite = favorite_type.is_some() && favorite_id.is_some();
     view! {
-        <a href=href class=class>
-            <Icon icon=icon weight=weight size="16px"/>
-            <span class="truncate flex-1">{name}</span>
+        <div class=wrapper_class>
+            <a href=href class=link_class>
+                <Icon icon=icon weight=weight size="16px"/>
+                <span class="truncate">{name}</span>
+            </a>
             {has_favorite.then(|| {
                 let ft = favorite_type.unwrap();
                 let fi = favorite_id.clone().unwrap();
                 view! {
-                    <span class="opacity-0 group-hover:opacity-100 transition-opacity">
+                    <div class="flex items-center gap-1 pr-2 opacity-0 group-hover:opacity-100 transition-opacity">
                         <FavoriteToggle target_type=ft target_id=fi/>
-                    </span>
+                    </div>
                 }
             })}
-        </a>
+        </div>
     }
 }
 
@@ -783,24 +793,35 @@ fn SidebarTeamSubNav(
 
     view! {
         <div class="mt-0.5 relative" node_ref=outer_ref>
-            // Team name — clickable to expand/collapse, right-click for context menu
-            <button
-                class="group w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors text-left"
-                on:click=move |_| set_expanded.update(|v| *v = !*v)
-                on:contextmenu=move |ev| {
-                    ev.prevent_default();
-                    set_menu_open.set(true);
-                }
-            >
-                <Icon icon=phosphor_leptos::USERS_THREE weight=IconWeight::Light size="16px"/>
-                <span class="flex-1 truncate">{name}</span>
-                <span class="opacity-0 group-hover:opacity-100 transition-opacity">
+            // Row wrapper — owns group hover for the entire row
+            <div class="group flex items-center rounded-md hover:bg-[var(--color-sidebar-hover)] transition-colors">
+                // Left zone: expand/collapse + right-click context menu
+                <button
+                    class="flex-1 min-w-0 flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-[var(--color-sidebar-foreground)] text-left"
+                    on:click=move |_| set_expanded.update(|v| *v = !*v)
+                    on:contextmenu=move |ev| {
+                        ev.prevent_default();
+                        set_menu_open.set(true);
+                    }
+                >
+                    <Icon icon=phosphor_leptos::USERS_THREE weight=IconWeight::Light size="16px"/>
+                    <span class="flex-1 truncate">{name}</span>
+                    <svg class=chevron_class width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M6 9l6 6 6-6"/>
+                    </svg>
+                </button>
+                // Right zone: actions (hover-reveal)
+                <div class="flex items-center gap-1 pr-2 opacity-0 group-hover:opacity-100 transition-opacity">
                     <FavoriteToggle target_type="team" target_id=team_id.clone()/>
-                </span>
-                <svg class=chevron_class width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M6 9l6 6 6-6"/>
-                </svg>
-            </button>
+                    <button
+                        class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors"
+                        on:click=move |_| set_menu_open.set(true)
+                        title="More actions"
+                    >
+                        <Icon icon=phosphor_leptos::DOTS_THREE weight=IconWeight::Bold size="14px"/>
+                    </button>
+                </div>
+            </div>
 
             // Context menu dropdown
             <Show when=move || menu_open.get()>
