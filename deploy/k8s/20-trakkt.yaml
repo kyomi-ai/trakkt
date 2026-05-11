@@ -30,8 +30,8 @@ spec:
       serviceAccountName: default
       containers:
         - name: trakkt
-          image: localhost/trakkt:latest
-          imagePullPolicy: Never
+          image: ghcr.io/kyomi-ai/trakkt:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8003

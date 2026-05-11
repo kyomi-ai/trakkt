@@ -118,5 +118,6 @@ opt-level = "s"
 # The Dockerfile strips everything between BEGIN_LOCAL_DEV_PATCHES and
 # END_LOCAL_DEV_PATCHES before `cargo build`, so prod always uses crates.io.
 # BEGIN_LOCAL_DEV_PATCHES
-# [patch.crates-io]
+[patch.crates-io]
+kode-leptos = { path = "../kode/kode-leptos" }
 # END_LOCAL_DEV_PATCHES

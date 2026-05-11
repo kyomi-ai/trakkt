@@ -1,0 +1,133 @@
+# =============================================================================
+# Trakkt — Release Workflow
+# =============================================================================
+# Triggered by version tags (v*). Builds a linux/amd64 Docker image via
+# Dockerfile.ci, pushes to GHCR, dispatches a deploy to trakkt-cloud,
+# and creates a GitHub Release.
+#
+# Usage:
+#   git tag v2026.05.11.1
+#   git push --tags
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GHCR_REGISTRY: ghcr.io/kyomi-ai
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Extract version from tag
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Docker: build and push image via Dockerfile.ci
+  # ---------------------------------------------------------------------------
+  docker:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ci
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.GHCR_REGISTRY }}/trakkt:${{ needs.prepare.outputs.version }}
+            ${{ env.GHCR_REGISTRY }}/trakkt:latest
+          cache-from: type=gha,scope=docker
+          cache-to: type=gha,mode=max,scope=docker
+
+  # ---------------------------------------------------------------------------
+  # Deploy: notify trakkt-cloud to deploy from GHCR
+  # ---------------------------------------------------------------------------
+  deploy-notify:
+    needs: [prepare, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.ARC_APP_ID }}
+          private-key: ${{ secrets.ARC_APP_PRIVATE_KEY }}
+          owner: kyomi-ai
+          repositories: trakkt-cloud
+
+      - name: Dispatch deploy to trakkt-cloud
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: kyomi-ai/trakkt-cloud
+          event-type: public-repo-updated
+          client-payload: >-
+            {
+              "version": "${{ github.ref_name }}",
+              "sha": "${{ github.sha }}"
+            }
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [prepare, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            ### Docker
+            ```bash
+            docker pull ghcr.io/kyomi-ai/trakkt:${{ needs.prepare.outputs.version }}
+            ```
+
+            Then run:
+            ```bash
+            docker run -p 8003:8003 \
+              -e DATABASE_URL=postgres://user:pass@host/trakkt \
+              -e JWT_SECRET_KEY=your-secret-key \
+              -e ENCRYPTION_KEY=your-encryption-key \
+              ghcr.io/kyomi-ai/trakkt:${{ needs.prepare.outputs.version }}
+            ```
+
+            ### Self-hosting
+
+            Trakkt is a single binary with the frontend embedded. The Docker
+            image exposes port **8003** and requires the following environment
+            variables:
+
+            | Variable | Description |
+            |---|---|
+            | `DATABASE_URL` | PostgreSQL connection string |
+            | `JWT_SECRET_KEY` | Secret key for JWT token signing |
+            | `ENCRYPTION_KEY` | Secret key for data encryption |

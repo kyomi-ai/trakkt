@@ -1,0 +1,103 @@
+# =============================================================================
+# Trakkt — CI (Pull Request Checks)
+# =============================================================================
+# Runs on every PR to main, including new pushes to existing PRs.
+# Two jobs:
+#   1. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
+#   2. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
+# =============================================================================
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Slow check: cargo clippy (compiles + lints the entire workspace)
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Verify sccache can reach GHA cache
+        run: |
+          echo 'fn main(){}' > /tmp/sccache_test.rs
+          if sccache $(rustc --print sysroot)/bin/rustc /tmp/sccache_test.rs --crate-type bin -o /tmp/sccache_test_out; then
+            echo "SCCACHE_AVAILABLE=true" >> $GITHUB_ENV
+            sccache --show-stats 2>&1 | head -5
+          else
+            echo "::warning::sccache GHA cache probe failed (see above), building without cache"
+            echo "SCCACHE_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+          rm -f /tmp/sccache_test.rs /tmp/sccache_test_out
+
+      - name: Strip local dev patches (path overrides not available in CI)
+        run: sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
+
+      - name: Ensure trakkt-ui/dist/ exists for ServeDir
+        run: mkdir -p crates/trakkt-ui/dist
+
+      - name: Install tailwindcss
+        run: |
+          curl -sLO https://github.com/tailwindlabs/tailwindcss/releases/download/v4.2.2/tailwindcss-linux-x64
+          chmod +x tailwindcss-linux-x64
+          sudo mv tailwindcss-linux-x64 /usr/local/bin/tailwindcss
+
+      - name: Build Tailwind CSS
+        working-directory: crates/trakkt-ui
+        run: tailwindcss --input style/main.css --output style/output.css
+
+      - name: cargo clippy (workspace)
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: cargo clippy --locked --workspace -- -D warnings
+
+      - name: cargo clippy (trakkt-ui, wasm32)
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: cargo clippy --locked -p trakkt-ui --target wasm32-unknown-unknown --features hydrate -- -D warnings
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  # ---------------------------------------------------------------------------
+  # Security: Trivy filesystem vulnerability scan
+  # ---------------------------------------------------------------------------
+  trivy-scan:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+          ignore-unfixed: true
+          format: 'table'
