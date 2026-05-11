@@ -12,6 +12,7 @@ use phosphor_leptos::{Icon, IconWeight};
 
 use crate::cache::store::SyncStore;
 use crate::components::{CommandPalette, Spinner};
+use crate::components::popover::{Popover, Placement};
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
 
 /// Main authenticated layout with sidebar and content area.
@@ -221,6 +222,7 @@ fn Sidebar(
     user_menu_open: ReadSignal<bool>,
     set_user_menu_open: WriteSignal<bool>,
 ) -> impl IntoView {
+    let user_menu_trigger_ref = NodeRef::<leptos::html::Div>::new();
 
     view! {
         <div class="w-[220px] bg-[var(--color-sidebar)] border-r border-[var(--color-sidebar-border)] text-[var(--color-sidebar-foreground)] flex flex-col h-full">
@@ -248,7 +250,7 @@ fn Sidebar(
             </nav>
 
             // User menu at bottom
-            <div class="border-t border-[var(--color-sidebar-border)] p-3 relative">
+            <div class="border-t border-[var(--color-sidebar-border)] p-3">
                 <Suspense fallback=|| view! {
                     <div class="px-3 py-2 text-sm text-[var(--color-sidebar-foreground-muted)]">"Loading..."</div>
                 }>
@@ -259,51 +261,58 @@ fn Sidebar(
                             let avatar_char = user.name.as_ref().and_then(|n| n.chars().next()).unwrap_or('?').to_uppercase().to_string();
                             let ws_name = user.workspace_name.clone().unwrap_or_default();
                             view! {
-                                <button
-                                    class="w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm hover:bg-[var(--color-sidebar-hover)] transition-colors text-left"
-                                    on:click=move |_| set_user_menu_open.update(|v| *v = !*v)
-                                >
-                                    // Avatar
-                                    <div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-xs font-semibold flex-shrink-0">
-                                        {avatar_char.clone()}
-                                    </div>
-                                    <div class="flex-1 min-w-0">
-                                        <div class="text-[var(--color-sidebar-foreground)] font-medium truncate text-sm">
-                                            {display_name.clone()}
+                                <div node_ref=user_menu_trigger_ref>
+                                    <button
+                                        class="w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm hover:bg-[var(--color-sidebar-hover)] transition-colors text-left"
+                                        on:click=move |_| set_user_menu_open.update(|v| *v = !*v)
+                                    >
+                                        // Avatar
+                                        <div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-xs font-semibold flex-shrink-0">
+                                            {avatar_char.clone()}
                                         </div>
-                                        <div class="text-[var(--color-sidebar-foreground-muted)] text-xs truncate">
-                                            {ws_name.clone()}
+                                        <div class="flex-1 min-w-0">
+                                            <div class="text-[var(--color-sidebar-foreground)] font-medium truncate text-sm">
+                                                {display_name.clone()}
+                                            </div>
+                                            <div class="text-[var(--color-sidebar-foreground-muted)] text-xs truncate">
+                                                {ws_name.clone()}
+                                            </div>
                                         </div>
-                                    </div>
-                                    // Chevron
-                                    <svg class="w-4 h-4 text-[var(--color-sidebar-foreground-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
-                                    </svg>
-                                </button>
+                                        // Chevron
+                                        <svg class="w-4 h-4 text-[var(--color-sidebar-foreground-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                                        </svg>
+                                    </button>
+                                </div>
 
-                                // Dropdown menu
-                                <Show when=move || user_menu_open.get()>
-                                    <div class="absolute bottom-full left-3 right-3 mb-1 bg-popover border border-border rounded-lg shadow-lg py-1 z-50">
-                                        // Workspace switcher (includes separator only when shown)
-                                        <WorkspaceSwitcher set_user_menu_open=set_user_menu_open/>
-                                        <a href="/settings/profile" class="block px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors">
-                                            "Settings"
-                                        </a>
-                                        <button
-                                            class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
-                                            on:click=move |_| {
-                                                set_user_menu_open.set(false);
-                                                leptos::task::spawn_local(async move {
-                                                    let _ = crate::server_fns::security::logout().await;
-                                                    let _ = web_sys::window()
-                                                        .and_then(|w| w.location().set_href("/login").ok());
-                                                });
-                                            }
-                                        >
-                                            "Sign Out"
-                                        </button>
-                                    </div>
-                                </Show>
+                                // Dropdown menu — portalled via Popover for click-outside, Escape, and viewport-aware positioning
+                                <Popover
+                                    trigger_ref=user_menu_trigger_ref
+                                    open=Signal::derive(move || user_menu_open.get())
+                                    on_close=Callback::new(move |()| set_user_menu_open.set(false))
+                                    placement=Placement::TOP_START
+                                    match_width=true
+                                    class="bg-popover border border-border rounded-lg shadow-lg py-1"
+                                >
+                                    // Workspace switcher (includes separator only when shown)
+                                    <WorkspaceSwitcher set_user_menu_open=set_user_menu_open/>
+                                    <a href="/settings/profile" class="block px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors">
+                                        "Settings"
+                                    </a>
+                                    <button
+                                        class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
+                                        on:click=move |_| {
+                                            set_user_menu_open.set(false);
+                                            leptos::task::spawn_local(async move {
+                                                let _ = crate::server_fns::security::logout().await;
+                                                let _ = web_sys::window()
+                                                    .and_then(|w| w.location().set_href("/login").ok());
+                                            });
+                                        }
+                                    >
+                                        "Sign Out"
+                                    </button>
+                                </Popover>
                             }.into_any()
                             },
                             Err(_) => view! {
