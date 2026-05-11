@@ -190,6 +190,7 @@ pub async fn update_issue(
         milestone_id: milestone_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         parent_issue_id: parent_issue_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         sort_order: if clear_sort_order == Some(true) { Some(None) } else { None },
+        team_id: None,
     };
     let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, number, &updates, ac.ctx.ws_manager.as_ref())
         .await

@@ -279,4 +279,5 @@ pub struct IssueUpdate {
     pub milestone_id: Option<Option<String>>,
     pub parent_issue_id: Option<Option<String>>,
     pub sort_order: Option<Option<f64>>,
+    pub team_id: Option<String>,
 }
