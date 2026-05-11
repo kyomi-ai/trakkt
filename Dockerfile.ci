@@ -60,9 +60,8 @@ RUN sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCA
 # Strip cargo_profile so trunk uses the release profile
 RUN sed -i '/cargo_profile/d' crates/trakkt-ui/Trunk.toml
 
-# Build WASM frontend (disable wasm-opt — its bundled version doesn't support
-# bulk-memory instructions emitted by newer wasm-bindgen)
-RUN cd crates/trakkt-ui && TRUNK_TOOLS_WASM_OPT=Off trunk build --release
+# Build WASM frontend
+RUN cd crates/trakkt-ui && trunk build --release
 
 # Build server binary
 RUN cargo build --release --bin trakkt
