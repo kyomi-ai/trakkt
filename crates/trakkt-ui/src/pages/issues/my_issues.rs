@@ -24,8 +24,9 @@ use phosphor_leptos::Icon;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
-use crate::components::{Alert, AlertVariant, EmptyState, SearchInput};
+use crate::components::{Alert, AlertVariant, Button, ButtonSize, ButtonVariant, EmptyState, SearchInput};
 use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown};
+use crate::pages::issues::issue_list::SaveViewModal;
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::server_fns::context::UserContext;
@@ -57,6 +58,7 @@ pub fn MyIssuesPage() -> impl IntoView {
     let (status_filter, set_status_filter) = signal(String::new());
     let (priority_filter, set_priority_filter) = signal(String::new());
     let (show_archived, set_show_archived) = signal(false);
+    let (show_save_view, set_show_save_view) = signal(false);
 
     // ── Error state for server function failures ──────────────────────────
     let error_msg = RwSignal::new(Option::<String>::None);
@@ -326,6 +328,20 @@ pub fn MyIssuesPage() -> impl IntoView {
                     <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
                     {move || if show_archived.get() { "Hide archived" } else { "Show archived" }}
                 </button>
+                // "Save view" — always visible, disabled when no filters active
+                <Button
+                    variant=ButtonVariant::Ghost
+                    size=ButtonSize::Sm
+                    disabled=Signal::derive(move || {
+                        search.get().is_empty()
+                            && status_filter.get().is_empty()
+                            && priority_filter.get().is_empty()
+                    })
+                    on:click=move |_| set_show_save_view.set(true)
+                >
+                    <Icon icon=phosphor_leptos::FLOPPY_DISK size="14px"/>
+                    "Save view"
+                </Button>
             </div>
 
             // ── Error alert ─────────────────────────────────────────────────
@@ -475,6 +491,15 @@ pub fn MyIssuesPage() -> impl IntoView {
                 }}
             </div>
         </div>
+        <SaveViewModal
+            show=Signal::derive(move || show_save_view.get())
+            on_close=Callback::new(move |()| set_show_save_view.set(false))
+            search=Signal::derive(move || search.get())
+            status_filter=Signal::derive(move || status_filter.get())
+            priority_filter=Signal::derive(move || priority_filter.get())
+            team_id=Signal::stored(None::<String>)
+            view_mode=Signal::stored("list".to_string())
+        />
     }
 }
 
