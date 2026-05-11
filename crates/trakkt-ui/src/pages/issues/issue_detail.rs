@@ -1395,10 +1395,18 @@ fn CommentItem(comment: Comment) -> impl IntoView {
                     <span class="text-sm font-medium text-foreground">{author}</span>
                     <span class="text-xs text-muted-foreground">{timestamp}</span>
                 </div>
-                <div class="mt-1 text-sm text-foreground">
-                    // Render markdown body as plain text for v1 (not editable).
-                    // A full markdown renderer can be added later.
-                    <p class="whitespace-pre-wrap">{comment.body.clone()}</p>
+                <div class="mt-1 text-sm text-foreground" style="pointer-events: none;">
+                    <kode_leptos::TreeWysiwygEditor
+                        content=Signal::stored(comment.body.clone())
+                        show_toolbar=false
+                        theme=Signal::stored({
+                            let mut theme = trakkt_kode_theme();
+                            theme.content_padding = Some("0");
+                            theme.container_padding = Some("0");
+                            theme.bg = "transparent";
+                            theme
+                        })
+                    />
                 </div>
             </div>
         </div>
