@@ -128,11 +128,14 @@ pub async fn create_view(
         sql_compat::bool_false(is_pg)
     };
 
+    let filters_cast = sql_compat::cast_to_json(is_pg, "$6");
+    let display_cast = sql_compat::cast_to_json(is_pg, "$7");
+
     let sql = format!(
         "INSERT INTO views \
             (view_id, workspace_id, created_by, name, icon, filters, display_options, \
              sort_order, is_shared, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, {shared_val}, {now}, {now})"
+         VALUES ($1, $2, $3, $4, $5, {filters_cast}, {display_cast}, 0, {shared_val}, {now}, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -216,11 +219,13 @@ pub async fn update_view(
         param_idx += 1;
     }
     if filters.is_some() {
-        set_parts.push(format!("filters = ${param_idx}"));
+        let cast = sql_compat::cast_to_json(is_pg, &format!("${param_idx}"));
+        set_parts.push(format!("filters = {cast}"));
         param_idx += 1;
     }
     if display_options.is_some() {
-        set_parts.push(format!("display_options = ${param_idx}"));
+        let cast = sql_compat::cast_to_json(is_pg, &format!("${param_idx}"));
+        set_parts.push(format!("display_options = {cast}"));
         param_idx += 1;
     }
     if let Some(shared) = is_shared {
