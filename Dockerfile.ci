@@ -57,13 +57,12 @@ COPY . .
 # Strip local dev patches from Cargo.toml (path overrides not available in Docker)
 RUN sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
 
-# Strip cargo_profile so trunk uses the release profile, and disable wasm-opt
-# (trunk's bundled wasm-opt doesn't support bulk-memory instructions from newer wasm-bindgen)
-RUN sed -i '/cargo_profile/d' crates/trakkt-ui/Trunk.toml \
-    && sed -i '/^\[build\]/a wasm_opt = "Off"' crates/trakkt-ui/Trunk.toml
+# Strip cargo_profile so trunk uses the release profile
+RUN sed -i '/cargo_profile/d' crates/trakkt-ui/Trunk.toml
 
-# Build WASM frontend (trunk build --release)
-RUN cd crates/trakkt-ui && trunk build --release
+# Build WASM frontend (skip wasm-opt — its bundled version doesn't support
+# bulk-memory instructions from newer wasm-bindgen)
+RUN cd crates/trakkt-ui && trunk build --release --skip-wasm-opt
 
 # Build server binary
 RUN cargo build --release --bin trakkt
