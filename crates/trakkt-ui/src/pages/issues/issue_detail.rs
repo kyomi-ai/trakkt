@@ -20,13 +20,14 @@ use leptos_router::hooks::{use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Alert, AlertVariant, Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
+    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
     DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
-    LabelBadge, Modal, ModalSize, Skeleton, StyledSelect,
+    LabelBadge, Modal, ModalSize, SearchInput, Skeleton, StyledSelect,
 };
+use crate::pages::issues::issue_list::NewIssueModal;
 use crate::server_fns::comments::{create_comment, list_comments};
-use crate::server_fns::issues::{get_issue, set_issue_labels, update_issue};
+use crate::server_fns::issues::{get_issue, list_issues, set_issue_labels, update_issue};
 use crate::server_fns::labels::list_labels;
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
@@ -297,6 +298,7 @@ fn IssueDetailContent(
 
     // ── New sub-issue modal state ─────────────────────────────────────
     let (show_new_sub_issue, set_show_new_sub_issue) = signal(false);
+    let (show_link_sub_issue, set_show_link_sub_issue) = signal(false);
 
     let on_sub_issue_created = {
         let on_change = on_change;
@@ -305,6 +307,10 @@ fn IssueDetailContent(
             on_change.run(());
         })
     };
+
+    // Clone fields needed in link-sub-issue closures
+    let issue_id_for_link = issue.get_untracked().issue_id.clone();
+    let issue_id_for_exclude = issue_id_for_link.clone();
 
     view! {
         <div class="max-w-[860px] mx-auto w-full">
@@ -353,6 +359,7 @@ fn IssueDetailContent(
             <SubIssuesSection
                 sub_issues=sub_issues
                 on_add=Callback::new(move |()| set_show_new_sub_issue.set(true))
+                on_link=Callback::new(move |()| set_show_link_sub_issue.set(true))
             />
 
             // ── Divider ────────────────────────────────────────────────
@@ -380,22 +387,49 @@ fn IssueDetailContent(
         </div>
 
         // ── New Sub-Issue modal ───────────────────────────────────────
-        {move || {
-            let i = issue.get();
-            let team_id = i.team_id.clone();
-            let parent_id = i.issue_id.clone();
-            let parent_title = format!("{}-{} {}", i.team_key, i.number, i.title);
-            view! {
-                <NewSubIssueModal
-                    show=Signal::derive(move || show_new_sub_issue.get())
-                    on_close=Callback::new(move |()| set_show_new_sub_issue.set(false))
-                    on_created=on_sub_issue_created
-                    team_id=team_id
-                    parent_issue_id=parent_id
-                    parent_title=parent_title
-                />
-            }
-        }}
+        <NewIssueModal
+            show=Signal::derive(move || show_new_sub_issue.get())
+            on_close=Callback::new(move |()| set_show_new_sub_issue.set(false))
+            on_created=on_sub_issue_created
+            team_id=Signal::derive(move || Some(issue.get().team_id.clone()))
+            parent_issue_id=Signal::derive(move || Some(issue.get().issue_id.clone()))
+            parent_title=Signal::derive(move || {
+                let i = issue.get();
+                Some(format!("{}-{} {}", i.team_key, i.number, i.title))
+            })
+        />
+
+        // ── Link existing sub-issue modal ────────────────────────────────
+        <IssuePickerModal
+            show=Signal::derive(move || show_link_sub_issue.get())
+            on_close=Callback::new(move |()| set_show_link_sub_issue.set(false))
+            on_select=Callback::new({
+                let parent_id = issue_id_for_link.clone();
+                move |selected: IssueWithDetails| {
+                    let child_number = selected.number;
+                    let parent_id = parent_id.clone();
+                    set_show_link_sub_issue.set(false);
+                    leptos::task::spawn_local(async move {
+                        let _ = update_issue(
+                            child_number,
+                            None, None, None, None, None, None, None, None,
+                            Some(parent_id),
+                            None,
+                        ).await;
+                        on_change.run(());
+                    });
+                }
+            })
+            exclude_ids=Signal::derive({
+                let issue_id = issue_id_for_exclude.clone();
+                move || {
+                    let mut ids = vec![issue_id.clone()];
+                    ids.extend(sub_issues.get().iter().map(|i| i.issue_id.clone()));
+                    ids
+                }
+            })
+            title="Link existing issue"
+        />
     }
 }
 
@@ -503,7 +537,7 @@ fn EditableTitle(
 // Metadata Bar
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Metadata bar showing status, priority, assignee, labels, and due date.
+/// Metadata bar showing status, priority, assignee, labels, due date, and parent issue.
 #[component]
 fn MetadataBar(
     issue: IssueWithDetails,
@@ -513,6 +547,12 @@ fn MetadataBar(
     let current_status_id = issue.status_id.clone();
     let current_status_category = issue.status_category.clone();
     let priority = issue.priority;
+
+    // ── Parent issue state ─────────────────────────────────────────────
+    let (show_parent_picker, set_show_parent_picker) = signal(false);
+    let issue_id_for_parent_exclude = issue.issue_id.clone();
+    let parent_issue_id = issue.parent_issue_id.clone();
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
 
     // Fetch statuses dynamically for the status dropdown.
     let statuses_resource = LocalResource::new(move || list_statuses(None));
@@ -686,7 +726,86 @@ fn MetadataBar(
 
             // ── Watch toggle ──────────────────────────────────────────────
             <WatchToggle number=number/>
+
+            // ── Parent issue ──────────────────────────────────────────────
+            <div class="flex items-center gap-2">
+                <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Parent"</span>
+                {
+                    let parent_id = parent_issue_id.clone();
+                    if let Some(ref pid) = parent_id {
+                        let parent = sync_store.and_then(|store| {
+                            store.issues().get().into_iter().find(|i| i.issue_id == *pid)
+                        });
+                        if let Some(p) = parent {
+                            let parent_key = format!("{}-{}", p.team_key, p.number);
+                            let parent_href = format!("/issues/{}", p.number);
+                            let parent_title = p.title.clone();
+                            view! {
+                                <div class="flex items-center gap-1.5 min-w-0">
+                                    <a href=parent_href class="text-sm text-foreground hover:underline truncate flex items-center gap-1">
+                                        <span class="font-mono text-xs text-muted-foreground">{parent_key}</span>
+                                        {parent_title}
+                                    </a>
+                                    <button
+                                        class="text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                                        title="Remove parent"
+                                        on:click=move |_| {
+                                            leptos::task::spawn_local(async move {
+                                                let _ = update_issue(
+                                                    number,
+                                                    None, None, None, None, None, None, None, None,
+                                                    Some(String::new()),
+                                                    None,
+                                                ).await;
+                                                on_change.run(());
+                                            });
+                                        }
+                                    >
+                                        <Icon icon=phosphor_leptos::X size="12px"/>
+                                    </button>
+                                </div>
+                            }.into_any()
+                        } else {
+                            // Parent exists but not in SyncStore (e.g. different team not loaded yet)
+                            view! { <span class="text-sm text-muted-foreground italic">"Unknown"</span> }.into_any()
+                        }
+                    } else {
+                        view! {
+                            <button
+                                class="text-sm text-muted-foreground hover:text-foreground transition-colors"
+                                on:click=move |_| set_show_parent_picker.set(true)
+                            >
+                                "Set parent..."
+                            </button>
+                        }.into_any()
+                    }
+                }
+            </div>
         </div>
+
+        // ── Parent issue picker modal ────────────────────────────────────
+        <IssuePickerModal
+            show=Signal::derive(move || show_parent_picker.get())
+            on_close=Callback::new(move |()| set_show_parent_picker.set(false))
+            on_select=Callback::new(move |selected: IssueWithDetails| {
+                let parent_id = selected.issue_id.clone();
+                set_show_parent_picker.set(false);
+                leptos::task::spawn_local(async move {
+                    let _ = update_issue(
+                        number,
+                        None, None, None, None, None, None, None, None,
+                        Some(parent_id),
+                        None,
+                    ).await;
+                    on_change.run(());
+                });
+            })
+            exclude_ids=Signal::derive({
+                let issue_id = issue_id_for_parent_exclude;
+                move || vec![issue_id.clone()]
+            })
+            title="Set parent issue"
+        />
     }
 }
 
@@ -966,17 +1085,136 @@ fn DescriptionEditor(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Issue Picker Modal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reusable modal for searching and selecting an existing issue.
+///
+/// Used by SubIssuesSection ("Link existing") and MetadataBar ("Set parent").
+/// Fetches issues via `list_issues(search=...)` and excludes specified IDs
+/// to prevent self-references and cycles.
+#[component]
+fn IssuePickerModal(
+    /// Whether the modal is visible.
+    show: Signal<bool>,
+    /// Called when the modal should close.
+    on_close: Callback<()>,
+    /// Called when an issue is selected.
+    on_select: Callback<IssueWithDetails>,
+    /// Issue IDs to exclude from results (e.g. self + existing children).
+    exclude_ids: Signal<Vec<String>>,
+    /// Title for the modal header.
+    title: &'static str,
+) -> impl IntoView {
+    let (search, set_search) = signal(String::new());
+
+    // Reset search when modal opens
+    Effect::new(move || {
+        if show.get() {
+            set_search.set(String::new());
+        }
+    });
+
+    // Fetch issues matching the search query
+    let search_results = Resource::new(
+        move || search.get(),
+        move |query| async move {
+            let q = if query.trim().is_empty() { None } else { Some(query) };
+            list_issues(None, None, None, None, None, q, Some(20), None).await
+        },
+    );
+
+    view! {
+        <Modal
+            show=show
+            on_close=on_close
+            title=title
+            size=ModalSize::Md
+        >
+            // Search input
+            <div class="mb-3">
+                <SearchInput
+                    value=Signal::derive(move || search.get())
+                    on_input=Callback::new(move |val: String| set_search.set(val))
+                    placeholder="Search issues..."
+                />
+            </div>
+
+            // Results list
+            <div class="max-h-[300px] overflow-y-auto -mx-1">
+                <Suspense fallback=|| view! {
+                    <div class="py-4 text-center text-sm text-muted-foreground">"Searching..."</div>
+                }>
+                    {move || search_results.get().map(|result| {
+                        match result {
+                            Ok(issues) => {
+                                let excluded = exclude_ids.get();
+                                let filtered: Vec<_> = issues
+                                    .into_iter()
+                                    .filter(|i| !excluded.contains(&i.issue_id))
+                                    .collect();
+
+                                if filtered.is_empty() {
+                                    view! {
+                                        <div class="py-4 text-center text-sm text-muted-foreground">
+                                            "No matching issues found."
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <div class="space-y-0.5">
+                                            {filtered.into_iter().map(|issue| {
+                                                let issue_for_click = issue.clone();
+                                                let status_variant = IssueStatusVariant::parse(&issue.status_category);
+                                                let issue_key = format!("{}-{}", issue.team_key, issue.number);
+                                                let issue_title = issue.title.clone();
+                                                view! {
+                                                    <button
+                                                        class="w-full text-left flex items-center gap-2 px-3 py-2 rounded-md hover:bg-secondary/50 transition-colors"
+                                                        on:click={
+                                                            let issue_for_click = issue_for_click.clone();
+                                                            move |_| {
+                                                                on_select.run(issue_for_click.clone());
+                                                                on_close.run(());
+                                                            }
+                                                        }
+                                                    >
+                                                        <IssueStatusBadge status=status_variant size=14/>
+                                                        <span class="text-xs text-muted-foreground font-mono shrink-0">{issue_key}</span>
+                                                        <span class="text-sm text-foreground truncate">{issue_title}</span>
+                                                    </button>
+                                                }
+                                            }).collect_view()}
+                                        </div>
+                                    }.into_any()
+                                }
+                            }
+                            Err(_) => view! {
+                                <div class="py-4 text-center text-sm text-destructive-foreground">
+                                    "Failed to search issues."
+                                </div>
+                            }.into_any(),
+                        }
+                    })}
+                </Suspense>
+            </div>
+        </Modal>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Sub-issues Section
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Sub-issues section showing child issues with progress bar.
 ///
 /// Displays: header with count + progress text, progress bar, compact issue list,
-/// and an "Add sub-issue" button.
+/// and "Link" / "Add" buttons.
 #[component]
 fn SubIssuesSection(
     sub_issues: Memo<Vec<IssueWithDetails>>,
     on_add: Callback<()>,
+    on_link: Callback<()>,
 ) -> impl IntoView {
     // Only render the section if there are sub-issues OR we always show it for the add button.
     // We show it always so users can discover the "Add sub-issue" action.
@@ -1007,14 +1245,24 @@ fn SubIssuesSection(
                                 </span>
                             })}
                         </div>
-                        <button
-                            class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
-                            on:click=move |_| on_add.run(())
-                            title="Add sub-issue"
-                        >
-                            <Icon icon=phosphor_leptos::PLUS size="12px"/>
-                            "Add"
-                        </button>
+                        <div class="flex items-center gap-2">
+                            <button
+                                class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
+                                on:click=move |_| on_link.run(())
+                                title="Link existing issue"
+                            >
+                                <Icon icon=phosphor_leptos::LINK size="12px"/>
+                                "Link"
+                            </button>
+                            <button
+                                class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
+                                on:click=move |_| on_add.run(())
+                                title="Add sub-issue"
+                            >
+                                <Icon icon=phosphor_leptos::PLUS size="12px"/>
+                                "Add"
+                            </button>
+                        </div>
                     </div>
 
                     // ── Progress bar ──────────────────────────────────
@@ -1057,169 +1305,6 @@ fn SubIssuesSection(
                 }
             }}
         </div>
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// New Sub-Issue Modal
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Modal for creating a sub-issue with the parent pre-filled.
-#[component]
-fn NewSubIssueModal(
-    show: Signal<bool>,
-    on_close: Callback<()>,
-    on_created: Callback<()>,
-    team_id: String,
-    parent_issue_id: String,
-    parent_title: String,
-) -> impl IntoView {
-    let (title, set_title) = signal(String::new());
-    let (priority, set_priority) = signal("0".to_string());
-    let (submitting, set_submitting) = signal(false);
-    let (error_msg, set_error_msg) = signal(Option::<String>::None);
-
-    // Reset form when modal opens.
-    Effect::new(move || {
-        if show.get() {
-            set_title.set(String::new());
-            set_priority.set("0".to_string());
-            set_error_msg.set(None);
-            set_submitting.set(false);
-        }
-    });
-
-    let team_id_stored = Signal::stored(team_id);
-    let parent_id_stored = Signal::stored(parent_issue_id);
-
-    let handle_submit = move || {
-        let title_val = title.get_untracked();
-        if title_val.trim().is_empty() {
-            return;
-        }
-
-        let prio = priority.get_untracked().parse::<i32>().unwrap_or(0);
-        let tid = team_id_stored.get();
-        let pid = parent_id_stored.get();
-
-        set_submitting.set(true);
-        set_error_msg.set(None);
-
-        leptos::task::spawn_local(async move {
-            match crate::server_fns::issues::create_issue(
-                title_val,
-                None,   // description
-                prio,
-                None,   // assignee_id
-                None,   // due_date
-                String::new(), // label_ids
-                None,   // project_id
-                None,   // milestone_id
-                Some(pid),
-                Some(tid),
-            ).await {
-                Ok(_) => {
-                    set_submitting.set(false);
-                    on_created.run(());
-                }
-                Err(e) => {
-                    set_submitting.set(false);
-                    set_error_msg.set(Some(format!("Failed to create sub-issue: {e}")));
-                }
-            }
-        });
-    };
-
-    let title_empty = Memo::new(move |_| title.get().trim().is_empty());
-
-    let handle_submit_for_footer = handle_submit;
-    let modal_footer: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
-        let submit = handle_submit_for_footer;
-        view! {
-            <Button
-                variant=ButtonVariant::Ghost
-                on:click=move |_| on_close.run(())
-            >
-                "Cancel"
-            </Button>
-            <Button
-                disabled=Signal::derive(move || submitting.get() || title_empty.get())
-                on:click=move |_| submit()
-            >
-                {move || if submitting.get() { "Creating..." } else { "Create Sub-issue" }}
-            </Button>
-        }.into_any()
-    });
-
-    let parent_title_stored = Signal::stored(parent_title);
-
-    view! {
-        <Modal
-            show=show
-            on_close=on_close
-            title="New Sub-issue"
-            size=ModalSize::Sm
-            footer=modal_footer
-        >
-            <form
-                on:submit=move |ev: web_sys::SubmitEvent| {
-                    ev.prevent_default();
-                    handle_submit();
-                }
-                class="space-y-4"
-            >
-                // Error message
-                <Show when=move || error_msg.get().is_some()>
-                    <Alert variant=AlertVariant::Error>
-                        <crate::components::AlertDescription>
-                            {move || error_msg.get().unwrap_or_default()}
-                        </crate::components::AlertDescription>
-                    </Alert>
-                </Show>
-
-                // Parent (read-only display)
-                <div class="space-y-2">
-                    <label class="text-sm font-medium text-foreground">"Parent"</label>
-                    <div class="flex items-center gap-1.5 text-sm text-muted-foreground px-3 py-2 border border-border rounded-md bg-muted/30">
-                        <Icon icon=phosphor_leptos::ARROW_BEND_UP_LEFT size="14px"/>
-                        {move || parent_title_stored.get()}
-                    </div>
-                </div>
-
-                // Title
-                <div class="space-y-2">
-                    <label for="sub-issue-title" class="text-sm font-medium text-foreground">
-                        "Title"
-                    </label>
-                    <input
-                        id="sub-issue-title"
-                        type="text"
-                        required=true
-                        autofocus=true
-                        placeholder="Sub-issue title"
-                        class=crate::components::INPUT_CLASS
-                        prop:value=move || title.get()
-                        on:input=move |ev| set_title.set(event_target_value(&ev))
-                    />
-                </div>
-
-                // Priority
-                <div class="space-y-2">
-                    <label class="text-sm font-medium text-foreground">"Priority"</label>
-                    <select
-                        class="w-full h-9 px-3 rounded-md border border-border bg-background text-sm text-foreground"
-                        prop:value=move || priority.get()
-                        on:change=move |ev| set_priority.set(event_target_value(&ev))
-                    >
-                        <option value="0">"None"</option>
-                        <option value="1">"Urgent"</option>
-                        <option value="2">"High"</option>
-                        <option value="3">"Medium"</option>
-                        <option value="4">"Low"</option>
-                    </select>
-                </div>
-            </form>
-        </Modal>
     }
 }
 
