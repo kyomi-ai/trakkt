@@ -106,11 +106,6 @@ pub async fn create_team(
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team create");
     }
 
-    // WebSocket broadcast — best-effort.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::TEAM, workspace_id).await;
-    }
-
     // Auto-add creator as lead member if provided.
     if let Some(uid) = creator_id {
         add_team_member(db, &team_id, uid, "lead", workspace_id).await?;
@@ -126,7 +121,22 @@ pub async fn create_team(
          FROM teams WHERE team_id = $1",
         &team_id
     )?;
-    Ok(row.into_dto())
+    let team = row.into_dto();
+
+    // WebSocket broadcast — send full entity data so clients update immediately.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::TEAM,
+            &team_id,
+            SyncActionType::Insert,
+            serde_json::to_value(&team).ok(),
+        )
+        .await;
+    }
+
+    Ok(team)
 }
 
 /// List all teams in a workspace, ordered alphabetically by name.
