@@ -24,17 +24,17 @@ use trakkt_types::models::View;
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-struct ViewFilters {
+pub struct ViewFilters {
     #[serde(default)]
-    statuses: Vec<String>,
+    pub statuses: Vec<String>,
     #[serde(default)]
-    priorities: Vec<i32>,
+    pub priorities: Vec<i32>,
     #[serde(default)]
-    labels: Vec<String>,
+    pub labels: Vec<String>,
     #[serde(default)]
-    search: String,
+    pub search: String,
     #[serde(default)]
-    team_id: String,
+    pub team_id: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

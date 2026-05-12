@@ -36,6 +36,7 @@ use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown};
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
+use crate::pages::views::ViewFilters;
 use crate::server_fns::issues::{create_issue, list_issues};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::create_view;
@@ -134,6 +135,10 @@ fn IssueListInner(
     let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
     let (show_archived, set_show_archived) = signal(false);
 
+    // ── Active tab state (team-scoped pages only) ─────────────────────────
+    // Values: "all", "active", "backlog", "view:{view_id}"
+    let (active_tab, set_active_tab) = signal("all".to_string());
+
     // ── Error state for server function failures ──────────────────────────
     let error_msg = RwSignal::new(Option::<String>::None);
 
@@ -154,6 +159,27 @@ fn IssueListInner(
             .get()
             .into_iter()
             .find(|t| t.key.to_lowercase() == key_lower)
+    });
+
+    // ── Team-scoped views (custom tabs) ──────────────────────────────────
+    let team_views = Memo::new(move |_| {
+        let team = resolved_team.get();
+        let Some(store) = sync_store else { return Vec::new() };
+        let Some(ref t) = team else { return Vec::new() };
+        let mut views: Vec<trakkt_types::models::View> = store
+            .views()
+            .get()
+            .into_iter()
+            .filter(|v| v.team_id.as_deref() == Some(t.team_id.as_str()))
+            .collect();
+        views.sort_by_key(|v| v.position);
+        views
+    });
+
+    // Reset active tab when navigating between teams.
+    Effect::new(move |_| {
+        let _ = resolved_team.get();
+        set_active_tab.set("all".to_string());
     });
 
     // Server function fallback — used for initial load before sync is ready.
@@ -433,6 +459,126 @@ fn IssueListInner(
                     </Button>
                 </div>
             </div>
+
+            // ── Tab bar (team-scoped pages only) ───────────────────────────
+            {move || {
+                if team_key.is_none() {
+                    return None;
+                }
+
+                let on_all = move |_: web_sys::MouseEvent| {
+                    set_active_tab.set("all".to_string());
+                    set_search.set(String::new());
+                    set_status_filter.set(Vec::new());
+                    set_priority_filter.set(Vec::new());
+                };
+
+                let on_active = move |_: web_sys::MouseEvent| {
+                    set_active_tab.set("active".to_string());
+                    set_search.set(String::new());
+                    set_priority_filter.set(Vec::new());
+                    let team = resolved_team.get();
+                    let status_ids: Vec<String> = if let (Some(store), Some(t)) = (sync_store, &team) {
+                        store
+                            .statuses()
+                            .get()
+                            .into_iter()
+                            .filter(|s| {
+                                s.category == "started"
+                                    && (s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
+                            })
+                            .map(|s| s.status_id)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    set_status_filter.set(status_ids);
+                };
+
+                let on_backlog = move |_: web_sys::MouseEvent| {
+                    set_active_tab.set("backlog".to_string());
+                    set_search.set(String::new());
+                    set_priority_filter.set(Vec::new());
+                    let team = resolved_team.get();
+                    let status_ids: Vec<String> = if let (Some(store), Some(t)) = (sync_store, &team) {
+                        store
+                            .statuses()
+                            .get()
+                            .into_iter()
+                            .filter(|s| {
+                                (s.category == "backlog" || s.category == "unstarted")
+                                    && (s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
+                            })
+                            .map(|s| s.status_id)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    set_status_filter.set(status_ids);
+                };
+
+                Some(view! {
+                    <div class="px-5 py-1.5 flex items-center gap-1 bg-background shrink-0 overflow-x-auto">
+                        // Default tabs
+                        {move || {
+                            let tab = active_tab.get();
+                            let all_v = if tab == "all" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
+                            let active_v = if tab == "active" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
+                            let backlog_v = if tab == "backlog" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
+                            view! {
+                                <Button variant=all_v size=ButtonSize::Pill on:click=on_all>"All Issues"</Button>
+                                <Button variant=active_v size=ButtonSize::Pill on:click=on_active>"Active"</Button>
+                                <Button variant=backlog_v size=ButtonSize::Pill on:click=on_backlog>"Backlog"</Button>
+                            }
+                        }}
+
+                        // Custom view tabs
+                        {move || {
+                            let views = team_views.get();
+                            let current_tab = active_tab.get();
+                            views.into_iter().map(|v| {
+                                let tab_id = format!("view:{}", v.view_id);
+                                let variant = if current_tab == tab_id { ButtonVariant::PillActive } else { ButtonVariant::Pill };
+                                let filters_json = v.filters.clone();
+                                let name = v.name.clone();
+                                let tab_id_click = tab_id;
+
+                                let on_view_click = move |_: web_sys::MouseEvent| {
+                                    set_active_tab.set(tab_id_click.clone());
+                                    match serde_json::from_str::<ViewFilters>(&filters_json) {
+                                        Ok(filters) => {
+                                            set_search.set(filters.search);
+                                            set_status_filter.set(filters.statuses);
+                                            set_priority_filter.set(
+                                                filters.priorities.iter().map(|p| p.to_string()).collect()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Failed to parse view filters: {e}");
+                                        }
+                                    }
+                                };
+
+                                view! {
+                                    <Button variant=variant size=ButtonSize::Pill on:click=on_view_click>
+                                        {name}
+                                    </Button>
+                                }
+                            }).collect_view()
+                        }}
+
+                        // + button to save a new view
+                        <Button
+                            variant=ButtonVariant::GhostMuted
+                            size=ButtonSize::IconXs
+                            on:click=move |_| set_show_save_view.set(true)
+                            aria_label="Save current filters as a view"
+                        >
+                            <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                        </Button>
+                    </div>
+                })
+            }}
 
             // ── Toolbar (list view only) ────────────────────────────────────
             <Show when=move || view_mode.get() == "list">
