@@ -1142,6 +1142,8 @@ fn DescriptionEditor(
                 <TreeWysiwygEditor
                     content=initial_content
                     on_change=on_change
+                    show_fixed_toolbar=false
+                    show_floating_toolbar=true
                     theme=theme_signal
                 />
             </div>
@@ -1459,7 +1461,7 @@ fn CommentItem(comment: Comment) -> impl IntoView {
                 <div class="mt-1 text-sm text-foreground" style="pointer-events: none;">
                     <kode_leptos::TreeWysiwygEditor
                         content=Signal::stored(comment.body.clone())
-                        show_toolbar=false
+                        show_fixed_toolbar=false
                         theme=Signal::stored({
                             let mut theme = trakkt_kode_theme();
                             theme.content_padding = Some("0");
@@ -1525,6 +1527,8 @@ fn NewCommentForm(team_key: String, number: i32, on_created: Callback<()>) -> im
                 <TreeWysiwygEditor
                     content=content.read_only()
                     on_change=on_change
+                    show_fixed_toolbar=false
+                    show_floating_toolbar=true
                     theme=theme_signal
                 />
             </div>

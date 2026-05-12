@@ -2116,14 +2116,14 @@ dependencies = [
 
 [[package]]
 name = "kode-core"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "ropey",
 ]
 
 [[package]]
 name = "kode-doc"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "arborium-markdown",
  "arborium-tree-sitter",
@@ -2132,7 +2132,7 @@ dependencies = [
 
 [[package]]
 name = "kode-leptos"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "arborium",
  "arborium-theme",
@@ -2152,7 +2152,7 @@ dependencies = [
 
 [[package]]
 name = "kode-markdown"
-version = "0.2.8"
+version = "0.3.0"
 dependencies = [
  "arborium-markdown",
  "arborium-tree-sitter",
