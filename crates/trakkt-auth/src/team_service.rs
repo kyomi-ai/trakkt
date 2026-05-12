@@ -235,6 +235,38 @@ pub async fn get_default_team(
     }
 }
 
+/// Get the default team for a user in a workspace, with three-tier resolution:
+///
+/// 1. User's personal `default_team_id` — if set and the team exists in this workspace
+/// 2. Workspace-level `default_team_id` — if set and the team exists
+/// 3. First-created team in the workspace (existing fallback)
+pub async fn get_user_default_team(
+    db: &DbPool,
+    user_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<Team> {
+    // Tier 1: user's personal default
+    if let Some(user) = crate::user_service::get_user_by_id(db, user_id).await?
+        && let Some(ref tid) = user.default_team_id
+        && let Some(team) = get_team(db, tid).await?
+        && team.workspace_id == workspace_id
+    {
+        return Ok(team);
+    }
+
+    // Tier 2: workspace default
+    if let Some(ref tid) =
+        crate::workspace_service::get_workspace_default_team_id(db, workspace_id).await?
+        && let Some(team) = get_team(db, tid).await?
+        && team.workspace_id == workspace_id
+    {
+        return Ok(team);
+    }
+
+    // Tier 3: first-created team (existing fallback)
+    get_default_team(db, workspace_id).await
+}
+
 /// Update a team's name and/or key.
 ///
 /// Only provided fields are changed (COALESCE pattern). The DB UNIQUE
@@ -327,6 +359,205 @@ pub async fn update_team(
     }
 
     Ok(team)
+}
+
+/// Delete a team and optionally reassign its issues to another team.
+///
+/// Steps:
+/// 1. Verify the team exists and belongs to this workspace
+/// 2. Prevent deletion of the last team in a workspace
+/// 3. Reassign issues to target team (with new team-scoped numbers) if requested
+/// 4. Delete favorites referencing this team
+/// 5. Clear `default_team_id` on users who had this team as default
+/// 6. Optionally set a new workspace default team
+/// 7. Write sync log + delete the team (cascades team_members, labels, statuses)
+/// 8. Broadcast delete via WebSocket
+pub async fn delete_team(
+    db: &DbPool,
+    team_id: &str,
+    workspace_id: &str,
+    reassign_to_team_id: Option<&str>,
+    new_workspace_default_id: Option<&str>,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    // 1. Verify team exists and belongs to workspace
+    let team = get_team(db, team_id).await?.ok_or_else(|| {
+        trakkt_core::Error::NotFound(format!("team {team_id} not found"))
+    })?;
+    if team.workspace_id != workspace_id {
+        return Err(trakkt_core::Error::BadRequest(
+            "Team does not belong to this workspace".into(),
+        ));
+    }
+
+    // 2. Count teams — refuse to delete the last one
+    let team_count: i64 = trakkt_core::db_fetch_scalar!(
+        db,
+        i64,
+        "SELECT COUNT(*) FROM teams WHERE workspace_id = $1",
+        workspace_id
+    )?;
+    if team_count <= 1 {
+        return Err(trakkt_core::Error::BadRequest(
+            "Cannot delete the only team in a workspace".into(),
+        ));
+    }
+
+    // 3. Check for issues and reassign if needed
+    let issue_count: i64 = trakkt_core::db_fetch_scalar!(
+        db,
+        i64,
+        "SELECT COUNT(*) FROM issues WHERE team_id = $1",
+        team_id
+    )?;
+
+    if issue_count > 0 && reassign_to_team_id.is_none() {
+        return Err(trakkt_core::Error::BadRequest(format!(
+            "Team has {issue_count} issues. Provide a target team to reassign them to."
+        )));
+    }
+
+    if let Some(target_team_id) = reassign_to_team_id {
+        // Verify target team exists in this workspace
+        let target = get_team(db, target_team_id).await?.ok_or_else(|| {
+            trakkt_core::Error::NotFound(format!(
+                "reassign target team {target_team_id} not found"
+            ))
+        })?;
+        if target.workspace_id != workspace_id {
+            return Err(trakkt_core::Error::BadRequest(
+                "Target team does not belong to this workspace".into(),
+            ));
+        }
+
+        // Fetch issue IDs belonging to the team being deleted.
+        #[derive(sqlx::FromRow)]
+        struct IssueIdRow {
+            issue_id: String,
+        }
+        let issue_rows: Vec<IssueIdRow> = trakkt_core::db_fetch_all!(
+            db,
+            IssueIdRow,
+            "SELECT issue_id FROM issues WHERE team_id = $1 ORDER BY number ASC",
+            team_id
+        )?;
+
+        // Find the default (backlog) status in the workspace for reassigned issues.
+        // Team-scoped statuses will be cascaded when the team is deleted, so we
+        // must move issues to a workspace-scoped status to avoid FK violations.
+        #[derive(sqlx::FromRow)]
+        struct StatusIdRow {
+            status_id: String,
+        }
+        let default_status = trakkt_core::db_fetch_optional!(
+            db,
+            StatusIdRow,
+            "SELECT status_id FROM statuses \
+             WHERE workspace_id = $1 AND team_id IS NULL AND category = 'backlog' \
+             ORDER BY position ASC LIMIT 1",
+            workspace_id
+        )?
+        .ok_or_else(|| {
+            trakkt_core::Error::Internal("no workspace-scoped backlog status found".into())
+        })?;
+
+        // Reassign each issue one at a time so team-scoped numbers are sequential.
+        let is_pg = db.is_postgres();
+        let now = sql_compat::now(is_pg);
+        for row in &issue_rows {
+            let sql = format!(
+                "UPDATE issues SET team_id = $1, \
+                 number = (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = $1), \
+                 status_id = $3, \
+                 updated_at = {now} \
+                 WHERE issue_id = $2"
+            );
+            trakkt_core::db_execute!(db, &sql, target_team_id, &row.issue_id, &default_status.status_id)?;
+
+            // Sync log for each moved issue — best-effort.
+            if let Err(e) = sync_log_service::write_sync_entry(
+                db,
+                entity_types::ISSUE,
+                &row.issue_id,
+                workspace_id,
+                SyncActionType::Update,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, issue_id = %row.issue_id, "Failed to write sync log for issue reassignment");
+            }
+
+            // Broadcast issue update
+            if let Some(ws) = ws_manager {
+                sync_log_service::broadcast_sync_action(
+                    ws,
+                    workspace_id,
+                    entity_types::ISSUE,
+                    &row.issue_id,
+                    SyncActionType::Update,
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
+    // 4. Delete favorites referencing this team
+    trakkt_core::db_execute!(
+        db,
+        "DELETE FROM favorites WHERE target_type = 'team' AND target_id = $1",
+        team_id
+    )?;
+
+    // 5. Clear default_team_id on any users who had this team as default
+    trakkt_core::db_execute!(
+        db,
+        "UPDATE users SET default_team_id = NULL WHERE default_team_id = $1",
+        team_id
+    )?;
+
+    // 6. Optionally set a new workspace default team
+    if let Some(new_default_id) = new_workspace_default_id {
+        crate::workspace_service::set_workspace_default_team(db, workspace_id, new_default_id)
+            .await?;
+    }
+
+    // 7. Sync log for team delete — best-effort.
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        SyncActionType::Delete,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team delete");
+    }
+
+    // Delete the team (cascades team_members, team-scoped labels, team-scoped statuses)
+    trakkt_core::db_execute!(
+        db,
+        "DELETE FROM teams WHERE team_id = $1",
+        team_id
+    )?;
+
+    // 8. Broadcast delete via WebSocket
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::TEAM,
+            team_id,
+            SyncActionType::Delete,
+            None,
+        )
+        .await;
+    }
+
+    Ok(())
 }
 
 // ─── Team membership ────────────────────────────────────────────────────────

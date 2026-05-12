@@ -216,6 +216,50 @@ pub async fn update_workspace_settings(
     Ok(result.rows_affected() > 0)
 }
 
+/// Set the workspace-level default team.
+///
+/// Validates that the team belongs to this workspace before writing.
+pub async fn set_workspace_default_team(
+    pool: &DbPool,
+    workspace_id: &str,
+    team_id: &str,
+) -> trakkt_core::Result<bool> {
+    let team = crate::team_service::get_team(pool, team_id)
+        .await?
+        .ok_or_else(|| trakkt_core::Error::NotFound(format!("team {team_id} not found")))?;
+    if team.workspace_id != workspace_id {
+        return Err(trakkt_core::Error::BadRequest(
+            "Team does not belong to this workspace".into(),
+        ));
+    }
+
+    let is_pg = pool.is_postgres();
+    let now = sql_compat::now(is_pg);
+    let sql = format!(
+        "UPDATE workspaces SET default_team_id = $1, updated_at = {now} WHERE workspace_id = $2"
+    );
+    let result = trakkt_core::db_execute!(pool, &sql, team_id, workspace_id)?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Get the workspace-level default team ID, if set.
+pub async fn get_workspace_default_team_id(
+    pool: &DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Option<String>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        default_team_id: Option<String>,
+    }
+    let row = trakkt_core::db_fetch_optional!(
+        pool,
+        Row,
+        "SELECT default_team_id FROM workspaces WHERE workspace_id = $1",
+        workspace_id
+    )?;
+    Ok(row.and_then(|r| r.default_team_id))
+}
+
 /// Get a workspace with all fields (SELECT *).
 ///
 /// This is functionally identical to `user_service::get_workspace` but lives

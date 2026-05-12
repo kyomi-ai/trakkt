@@ -84,6 +84,21 @@ pub async fn update_last_workspace(
     Ok(result.rows_affected() > 0)
 }
 
+/// Update the user's default_team_id.
+pub async fn update_default_team(
+    pool: &DbPool,
+    user_id: &str,
+    team_id: Option<&str>,
+) -> trakkt_core::Result<bool> {
+    let is_pg = pool.is_postgres();
+    let now = sql_compat::now(is_pg);
+    let sql = format!(
+        "UPDATE users SET default_team_id = $1, updated_at = {now} WHERE user_id = $2"
+    );
+    let result = trakkt_core::db_execute!(pool, &sql, team_id, user_id)?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Mark a user as email-verified.
 pub async fn mark_user_verified(pool: &DbPool, email: &str) -> trakkt_core::Result<bool> {
     let is_pg = pool.is_postgres();
