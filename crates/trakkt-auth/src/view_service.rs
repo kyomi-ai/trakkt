@@ -24,12 +24,14 @@ use crate::websocket::WebSocketManager;
 struct ViewRow {
     view_id: String,
     workspace_id: String,
+    team_id: Option<String>,
     created_by: String,
     name: String,
     icon: Option<String>,
     filters: String,
     display_options: String,
     sort_order: f64,
+    position: i32,
     is_shared: bool,
     created_at: String,
     updated_at: String,
@@ -40,12 +42,14 @@ impl ViewRow {
         View {
             view_id: self.view_id,
             workspace_id: self.workspace_id,
+            team_id: self.team_id,
             created_by: self.created_by,
             name: self.name,
             icon: self.icon,
             filters: self.filters,
             display_options: self.display_options,
             sort_order: self.sort_order,
+            position: self.position,
             is_shared: self.is_shared,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -57,10 +61,10 @@ impl ViewRow {
 
 /// Base SELECT for view queries.
 const VIEW_SELECT: &str = "\
-    SELECT view_id, workspace_id, created_by, name, icon, \
+    SELECT view_id, workspace_id, team_id, created_by, name, icon, \
            CAST(filters AS TEXT) AS filters, \
            CAST(display_options AS TEXT) AS display_options, \
-           sort_order, is_shared, \
+           sort_order, position, is_shared, \
            CAST(created_at AS TEXT) AS created_at, \
            CAST(updated_at AS TEXT) AS updated_at \
     FROM views";
@@ -69,26 +73,56 @@ const VIEW_SELECT: &str = "\
 
 /// List views visible to a user: their own views plus shared views in the workspace.
 ///
-/// Ordered by sort_order then creation date.
+/// When `team_id` is `Some`, only views belonging to that team are returned.
+/// When `None`, all views for the workspace are returned (no team filter).
+///
+/// Ordered by position, then sort_order, then creation date.
 pub async fn list_views(
     db: &DbPool,
     workspace_id: &str,
     user_id: &str,
+    team_id: Option<&str>,
 ) -> trakkt_core::Result<Vec<View>> {
     let is_pg = db.is_postgres();
     let bt = sql_compat::bool_true(is_pg);
 
-    let sql = format!(
-        "{VIEW_SELECT} WHERE workspace_id = $1 AND (created_by = $2 OR is_shared = {bt}) \
-         ORDER BY sort_order ASC, created_at ASC"
-    );
-    let rows: Vec<ViewRow> = trakkt_core::db_fetch_all!(
-        db,
-        ViewRow,
-        &sql,
-        workspace_id,
-        user_id
-    )?;
+    let (sql, has_team) = if team_id.is_some() {
+        (
+            format!(
+                "{VIEW_SELECT} WHERE workspace_id = $1 AND (created_by = $2 OR is_shared = {bt}) \
+                 AND team_id = $3 \
+                 ORDER BY position ASC, sort_order ASC, created_at ASC"
+            ),
+            true,
+        )
+    } else {
+        (
+            format!(
+                "{VIEW_SELECT} WHERE workspace_id = $1 AND (created_by = $2 OR is_shared = {bt}) \
+                 ORDER BY position ASC, sort_order ASC, created_at ASC"
+            ),
+            false,
+        )
+    };
+
+    let rows: Vec<ViewRow> = if has_team {
+        trakkt_core::db_fetch_all!(
+            db,
+            ViewRow,
+            &sql,
+            workspace_id,
+            user_id,
+            team_id.unwrap()
+        )?
+    } else {
+        trakkt_core::db_fetch_all!(
+            db,
+            ViewRow,
+            &sql,
+            workspace_id,
+            user_id
+        )?
+    };
     Ok(rows.into_iter().map(ViewRow::into_dto).collect())
 }
 
@@ -108,6 +142,9 @@ pub async fn get_view(
 }
 
 /// Create a new saved view in a workspace.
+///
+/// `team_id` scopes the view to a specific team. `position` controls the
+/// ordering of views in the sidebar.
 pub async fn create_view(
     db: &DbPool,
     workspace_id: &str,
@@ -117,6 +154,8 @@ pub async fn create_view(
     filters: &str,
     display_options: &str,
     is_shared: bool,
+    team_id: Option<&str>,
+    position: i32,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<View> {
     let is_pg = db.is_postgres();
@@ -130,12 +169,17 @@ pub async fn create_view(
 
     let filters_cast = sql_compat::cast_to_json(is_pg, "$6");
     let display_cast = sql_compat::cast_to_json(is_pg, "$7");
+    let position_cast = if is_pg {
+        "CAST($8 AS INTEGER)"
+    } else {
+        "$8"
+    };
 
     let sql = format!(
         "INSERT INTO views \
             (view_id, workspace_id, created_by, name, icon, filters, display_options, \
-             sort_order, is_shared, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, {filters_cast}, {display_cast}, 0, {shared_val}, {now}, {now})"
+             sort_order, is_shared, team_id, position, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, {filters_cast}, {display_cast}, 0, {shared_val}, $9, {position_cast}, {now}, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -146,7 +190,9 @@ pub async fn create_view(
         name,
         icon,
         filters,
-        display_options
+        display_options,
+        position,
+        team_id
     )?;
 
     // Sync log — best-effort.
@@ -192,6 +238,11 @@ pub async fn create_view(
 /// Update a view.
 ///
 /// Only fields that are `Some` are changed. `updated_at` is always set.
+///
+/// `team_id` uses a double-Option: the outer `Option` controls whether the
+/// field should be updated at all, while the inner `Option` allows setting
+/// the column to `NULL` (making the view workspace-scoped rather than
+/// team-scoped).
 pub async fn update_view(
     db: &DbPool,
     view_id: &str,
@@ -201,6 +252,8 @@ pub async fn update_view(
     display_options: Option<&str>,
     is_shared: Option<bool>,
     sort_order: Option<f64>,
+    team_id: Option<Option<&str>>,
+    position: Option<i32>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<View> {
     let is_pg = db.is_postgres();
@@ -240,6 +293,18 @@ pub async fn update_view(
         set_parts.push(format!("sort_order = ${param_idx}"));
         param_idx += 1;
     }
+    if team_id.is_some() {
+        set_parts.push(format!("team_id = ${param_idx}"));
+        param_idx += 1;
+    }
+    if position.is_some() {
+        if is_pg {
+            set_parts.push(format!("position = CAST(${param_idx} AS INTEGER)"));
+        } else {
+            set_parts.push(format!("position = ${param_idx}"));
+        }
+        param_idx += 1;
+    }
 
     // Always update updated_at.
     set_parts.push(format!("updated_at = {now}"));
@@ -266,6 +331,13 @@ pub async fn update_view(
             query = query.bind(v);
         }
         if let Some(v) = sort_order {
+            query = query.bind(v);
+        }
+        if let Some(v) = team_id {
+            // v is Option<&str> — bind as nullable string.
+            query = query.bind(v);
+        }
+        if let Some(v) = position {
             query = query.bind(v);
         }
 

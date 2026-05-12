@@ -245,8 +245,6 @@ fn Sidebar(
 
                 <SidebarFavoritesSection/>
 
-                <SidebarViewsSection/>
-
                 <SidebarTeamsSection/>
                 <SidebarProjectsSection/>
             </nav>
@@ -428,37 +426,6 @@ fn SidebarTeamsSection() -> impl IntoView {
     }
 }
 
-/// Section for "Views" — shows saved views from SyncStore when any exist.
-#[component]
-fn SidebarViewsSection() -> impl IntoView {
-    let store = use_context::<SyncStore>();
-
-    view! {
-        {move || {
-            let Some(store) = store else { return view! { <span/> }.into_any() };
-            let views = store.views().get();
-            if views.is_empty() {
-                return view! { <span/> }.into_any();
-            }
-            // Limit to 10 items shown.
-            let items: Vec<_> = views.into_iter().take(10).collect();
-            view! {
-                <SidebarSectionHeader label="Views"/>
-                <div class="space-y-0.5">
-                    {items.into_iter().map(|v| {
-                        let fav_id = v.view_id.clone();
-                        let href = format!("/views/{}", v.view_id);
-                        let name = v.name.clone();
-                        view! {
-                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FUNNEL favorite_type="view" favorite_id=fav_id/>
-                        }
-                    }).collect_view()}
-                </div>
-            }.into_any()
-        }}
-    }
-}
-
 /// Section for "Favorites" — shows user-pinned teams, projects, and views.
 ///
 /// Only renders when favorites exist. Each favorite resolves its name, icon,
@@ -476,7 +443,6 @@ fn SidebarFavoritesSection() -> impl IntoView {
             }
             let teams = store.teams().get();
             let projects = store.projects().get();
-            let views = store.views().get();
             // Limit to 10 items.
             let items: Vec<_> = favorites.into_iter().take(10).collect();
             view! {
@@ -501,14 +467,10 @@ fn SidebarFavoritesSection() -> impl IntoView {
                                     <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER/>
                                 }.into_any())
                             }
-                            "view" => {
-                                let v = views.iter().find(|v| v.view_id == fav.target_id)?;
-                                let href = format!("/views/{}", v.view_id);
-                                let name = v.name.clone();
-                                Some(view! {
-                                    <SidebarEntityItem href=href name=name icon=phosphor_leptos::FUNNEL/>
-                                }.into_any())
-                            }
+                            // View favorites are skipped for now — the view model
+                            // doesn't include the team key needed to build the URL
+                            // to the team issues page where the view tab lives.
+                            "view" => None,
                             _ => None,
                         }
                     }).collect_view()}
