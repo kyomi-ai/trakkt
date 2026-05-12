@@ -70,6 +70,7 @@ pub async fn list_issues(
         search,
         limit,
         offset,
+        ..Default::default()
     };
     let issues = trakkt_auth::issue_service::list_issues(ac.db(), &ac.ws_id, team_id.as_deref(), &filters)
         .await

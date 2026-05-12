@@ -434,6 +434,22 @@ pub async fn list_issues(
         param_idx += 1;
     }
 
+    if let Some(ref cats) = filters.status_categories {
+        if !cats.is_empty() {
+            let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(cats.len(), param_idx);
+            conditions.push(format!("s.category IN {in_clause}"));
+            param_idx = next_idx;
+        }
+    }
+
+    if let Some(ref cats) = filters.exclude_status_categories {
+        if !cats.is_empty() {
+            let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(cats.len(), param_idx);
+            conditions.push(format!("s.category NOT IN {in_clause}"));
+            param_idx = next_idx;
+        }
+    }
+
     if filters.priority.is_some() {
         // CAST for Postgres compatibility per CODING_STANDARDS.md.
         if is_pg {
@@ -496,6 +512,16 @@ pub async fn list_issues(
         }
         if let Some(ref v) = filters.status_id {
             query = query.bind(v);
+        }
+        if let Some(ref cats) = filters.status_categories {
+            for cat in cats {
+                query = query.bind(cat);
+            }
+        }
+        if let Some(ref cats) = filters.exclude_status_categories {
+            for cat in cats {
+                query = query.bind(cat);
+            }
         }
         if let Some(v) = filters.priority {
             query = query.bind(v);

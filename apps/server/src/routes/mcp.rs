@@ -408,7 +408,7 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
         "tools": [
             {
                 "name": "list_issues",
-                "description": "List issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first).",
+                "description": "List issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -423,6 +423,14 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                         "status_id": {
                             "type": "string",
                             "description": "Filter by status ID (e.g. 'workspace-id::backlog'). Use list_statuses to get valid IDs."
+                        },
+                        "status_category": {
+                            "type": "string",
+                            "description": "Comma-separated status categories to include: backlog, unstarted, started, completed, cancelled. Example: 'backlog,unstarted' returns issues in either category."
+                        },
+                        "include_closed": {
+                            "type": "boolean",
+                            "description": "If true, include completed and cancelled issues. Default is false — these are excluded unless status_id or status_category is set."
                         },
                         "priority": {
                             "type": "integer",
@@ -649,7 +657,7 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "search_issues",
-                "description": "Search for issues by text query. Matches against issue titles. Returns results ordered by priority (urgent first), then by creation date (newest first). Optionally filter by team.",
+                "description": "Search for issues by text query. Matches against issue titles. Returns results ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -660,6 +668,10 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                         "team_key": {
                             "type": "string",
                             "description": "Optional team key (e.g. 'TRA') to scope search to a specific team."
+                        },
+                        "include_closed": {
+                            "type": "boolean",
+                            "description": "If true, include completed and cancelled issues in results. Default is false."
                         },
                         "limit": {
                             "type": "integer",
@@ -881,8 +893,23 @@ async fn tool_list_issues(
     let limit_raw = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
     let limit = limit_raw.clamp(1, 100);
 
+    let status_id = args.get("status_id").and_then(|v| v.as_str()).map(String::from);
+    let status_categories: Option<Vec<String>> = args
+        .get("status_category")
+        .and_then(|v| v.as_str())
+        .map(|s| s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect());
+    let include_closed = args.get("include_closed").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let exclude_status_categories = if status_id.is_none() && status_categories.is_none() && !include_closed {
+        Some(vec!["completed".to_string(), "cancelled".to_string()])
+    } else {
+        None
+    };
+
     let filters = IssueFilters {
-        status_id: args.get("status_id").and_then(|v| v.as_str()).map(String::from),
+        status_id,
+        status_categories,
+        exclude_status_categories,
         priority: args.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32),
         assignee_id: args.get("assignee").and_then(|v| v.as_str()).map(String::from),
         label_id: args.get("label").and_then(|v| v.as_str()).map(String::from),
@@ -1154,11 +1181,19 @@ async fn tool_search_issues(
     let query = arg_str(args, "query")?;
     let limit_raw = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
     let limit = limit_raw.clamp(1, 100);
+    let include_closed = args.get("include_closed").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
 
+    let exclude_status_categories = if !include_closed {
+        Some(vec!["completed".to_string(), "cancelled".to_string()])
+    } else {
+        None
+    };
+
     let filters = IssueFilters {
         search: Some(query.to_string()),
+        exclude_status_categories,
         limit: Some(limit),
         ..Default::default()
     };
