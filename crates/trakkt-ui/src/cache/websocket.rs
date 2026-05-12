@@ -288,7 +288,6 @@ fn do_connect(
                 connection_state,
                 user_id.to_owned(),
                 workspace_id.to_owned(),
-                token.to_owned(),
             );
             return;
         }
@@ -308,7 +307,6 @@ fn do_connect(
                 connection_state,
                 user_id.to_owned(),
                 workspace_id.to_owned(),
-                token.to_owned(),
             );
             return;
         }
@@ -373,7 +371,6 @@ fn do_connect(
     let onclose_conn = connection_state.clone();
     let uid_close = user_id.to_owned();
     let wid_close = workspace_id.to_owned();
-    let tok_close = token.to_owned();
     let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
         let code = event.code();
         let reason = event.reason();
@@ -390,7 +387,6 @@ fn do_connect(
                 onclose_conn.clone(),
                 uid_close.clone(),
                 wid_close.clone(),
-                tok_close.clone(),
             );
         }
     });
@@ -406,13 +402,15 @@ fn do_connect(
 
 /// Schedule a reconnect with exponential backoff.
 ///
+/// Fetches a fresh JWT token before each reconnect attempt so expired
+/// tokens don't cause an infinite 4001 reconnect loop.
+///
 /// Delay formula: `min(1000 * 2^attempt, 30000)`.
 fn schedule_reconnect(
     state: Rc<RefCell<WsState>>,
     connection_state: ArcRwSignal<ConnectionState>,
     user_id: String,
     workspace_id: String,
-    token: String,
 ) {
     let (intentional, attempts) = {
         let s = state.borrow();
@@ -444,13 +442,23 @@ fn schedule_reconnect(
     let reconnect_state = state.clone();
     let reconnect_conn = connection_state.clone();
     let timeout = gloo_timers::callback::Timeout::new(delay_ms, move || {
-        do_connect(
-            reconnect_state,
-            reconnect_conn,
-            &user_id,
-            &workspace_id,
-            &token,
-        );
+        let rs = reconnect_state.clone();
+        let rc = reconnect_conn.clone();
+        let uid = user_id.clone();
+        let wid = workspace_id.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let token = match crate::server_fns::auth::get_ws_token().await {
+                Ok(t) if !t.is_empty() => t,
+                _ => {
+                    web_sys::console::warn_1(
+                        &"[trakkt-sync] Failed to fetch fresh WS token, retrying".into(),
+                    );
+                    schedule_reconnect(rs, rc, uid, wid);
+                    return;
+                }
+            };
+            do_connect(rs, rc, &uid, &wid, &token);
+        });
     });
 
     state.borrow_mut().reconnect_timeout = Some(SendWrapper::new(timeout));
