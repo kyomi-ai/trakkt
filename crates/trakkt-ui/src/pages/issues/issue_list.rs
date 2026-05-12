@@ -383,6 +383,20 @@ fn IssueListInner(
         statuses
     });
 
+    // ── Board-filtered statuses ──────────────────────────────────────────
+    // When a view tab sets status_filter, only show matching board columns.
+    let board_filtered_statuses = Memo::new(move |_| {
+        let all = board_statuses.get();
+        let status_val = status_filter.get();
+        if status_val.is_empty() {
+            all
+        } else {
+            all.into_iter()
+                .filter(|s| status_val.contains(&s.status_id))
+                .collect()
+        }
+    });
+
     // ── New Issue modal state ───────────────────────────────────────────────
     let (show_new_issue, set_show_new_issue) = signal(false);
 
@@ -816,7 +830,7 @@ fn IssueListInner(
                         view! {
                             <BoardContent
                                 issues=team_issues
-                                statuses=board_statuses
+                                statuses=board_filtered_statuses
                                 sync_store=sync_store
                                 team_key=key
                             />
@@ -825,7 +839,7 @@ fn IssueListInner(
                         view! {
                             <BoardContent
                                 issues=team_issues
-                                statuses=board_statuses
+                                statuses=board_filtered_statuses
                                 sync_store=sync_store
                             />
                         }.into_any()
