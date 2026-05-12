@@ -60,3 +60,6 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 - Primary accent: teal #0D9488 (NOT amber).
 - All interactive elements need `transition-colors` with `duration-200`.
 - All interactive elements need `focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring`.
+
+## CI / Security Scanning
+- Test fixtures must not contain strings matching real secret patterns (e.g. `xoxb-`, `xoxp-`, `AKIA`). Trivy's secret scanner cannot distinguish `#[cfg(test)]` from production code. Use obviously-fake prefixes like `slack-bot-`, `test-key-` instead.
