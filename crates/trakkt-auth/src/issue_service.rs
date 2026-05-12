@@ -403,6 +403,41 @@ pub async fn get_issue(
     }
 }
 
+/// Find the team key for an issue given only its number (no team context).
+/// Used as a backward-compatibility fallback when MCP clients send `issue_number`
+/// without `team_key` due to stale cached tool schemas.
+pub async fn find_team_key_by_issue_number(
+    db: &DbPool,
+    workspace_id: &str,
+    number: i32,
+) -> trakkt_core::Result<Option<String>> {
+    #[derive(sqlx::FromRow)]
+    struct TeamKeyRow {
+        key: String,
+    }
+    let rows = trakkt_core::db_fetch_all!(
+        db,
+        TeamKeyRow,
+        "SELECT t.key FROM issues i JOIN teams t ON i.team_id = t.team_id \
+         WHERE i.workspace_id = $1 AND i.number = $2",
+        workspace_id,
+        number
+    )?;
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(rows.into_iter().next().map(|r| r.key)),
+        _ => {
+            let keys: Vec<String> = rows.into_iter().map(|r| r.key).collect();
+            Err(trakkt_core::Error::BadRequest(format!(
+                "Issue number {number} exists in multiple teams ({teams}). \
+                 Specify team_key or use issue_identifier (e.g. '{first}-{number}').",
+                teams = keys.join(", "),
+                first = keys[0],
+            )))
+        }
+    }
+}
+
 /// List issues in a workspace with optional filters.
 ///
 /// Supports filtering by status, priority, assignee, label, and text search.

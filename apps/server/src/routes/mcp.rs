@@ -823,32 +823,43 @@ fn parse_issue_identifier(identifier: &str) -> Option<(String, i32)> {
 
 /// Resolve `team_key` and `number` from either an `issue_identifier` parameter
 /// (e.g. "TRA-35") or explicit `team_key` + `issue_number` parameters.
-fn resolve_issue_key_and_number(args: &Value) -> Result<(String, i32), trakkt_core::Error> {
+///
+/// As a backward-compatibility fallback for clients with stale tool schemas that
+/// only send `issue_number` without `team_key`, queries the DB to find which
+/// team owns the issue. Fails if the number is ambiguous across teams.
+async fn resolve_issue_key_and_number(
+    args: &Value,
+    db: &trakkt_core::DbPool,
+    workspace_id: &str,
+) -> Result<(String, i32), trakkt_core::Error> {
     if let Some(identifier) = args.get("issue_identifier").and_then(|v| v.as_str()) {
-        parse_issue_identifier(identifier).ok_or_else(|| {
+        return parse_issue_identifier(identifier).ok_or_else(|| {
             trakkt_core::Error::BadRequest(
                 "Invalid issue identifier format. Expected 'TRA-35'".to_string(),
             )
-        })
-    } else {
-        let team_key = args
-            .get("team_key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                trakkt_core::Error::BadRequest(
-                    "Either issue_identifier or team_key+issue_number required".to_string(),
-                )
-            })?;
-        let number = args
-            .get("issue_number")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| {
-                trakkt_core::Error::BadRequest(
-                    "Either issue_identifier or team_key+issue_number required".to_string(),
-                )
-            })? as i32;
-        Ok((team_key.to_string(), number))
+        });
     }
+
+    let number = args
+        .get("issue_number")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| {
+            trakkt_core::Error::BadRequest(
+                "Either issue_identifier or team_key+issue_number required".to_string(),
+            )
+        })? as i32;
+
+    if let Some(key) = args.get("team_key").and_then(|v| v.as_str()) {
+        return Ok((key.to_string(), number));
+    }
+
+    // Fallback: resolve team from issue_number alone (stale-schema compat).
+    let team_key = issue_service::find_team_key_by_issue_number(db, workspace_id, number)
+        .await?
+        .ok_or_else(|| {
+            trakkt_core::Error::NotFound(format!("No issue with number {number} found"))
+        })?;
+    Ok((team_key, number))
 }
 
 /// Resolve a team_id from either `team_id` or `team_key` arguments.
@@ -902,7 +913,7 @@ async fn tool_get_issue(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let (team_key, number) = resolve_issue_key_and_number(args)?;
+    let (team_key, number) = resolve_issue_key_and_number(args, &state.db, &auth.workspace_id).await?;
 
     let issue = issue_service::get_issue(&state.db, &auth.workspace_id, &team_key, number)
         .await?
@@ -989,7 +1000,7 @@ async fn tool_update_issue(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let (team_key, number) = resolve_issue_key_and_number(args)?;
+    let (team_key, number) = resolve_issue_key_and_number(args, &state.db, &auth.workspace_id).await?;
 
     // Resolve "move to team" separately from the identifying team_key.
     let move_team_id = resolve_move_team_id(args, &state.db, &auth.workspace_id).await?;
@@ -1064,7 +1075,7 @@ async fn tool_delete_issue(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let (team_key, number) = resolve_issue_key_and_number(args)?;
+    let (team_key, number) = resolve_issue_key_and_number(args, &state.db, &auth.workspace_id).await?;
 
     issue_service::delete_issue(
         &state.db,
@@ -1084,7 +1095,7 @@ async fn tool_add_comment(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let (team_key, number) = resolve_issue_key_and_number(args)?;
+    let (team_key, number) = resolve_issue_key_and_number(args, &state.db, &auth.workspace_id).await?;
     let body = arg_str(args, "body")?;
 
     // Resolve issue_id from team-scoped identifier.
