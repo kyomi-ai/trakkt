@@ -24,12 +24,14 @@ use crate::websocket::WebSocketManager;
 struct ViewRow {
     view_id: String,
     workspace_id: String,
+    team_id: Option<String>,
     created_by: String,
     name: String,
     icon: Option<String>,
     filters: String,
     display_options: String,
     sort_order: f64,
+    position: i32,
     is_shared: bool,
     created_at: String,
     updated_at: String,
@@ -40,12 +42,14 @@ impl ViewRow {
         View {
             view_id: self.view_id,
             workspace_id: self.workspace_id,
+            team_id: self.team_id,
             created_by: self.created_by,
             name: self.name,
             icon: self.icon,
             filters: self.filters,
             display_options: self.display_options,
             sort_order: self.sort_order,
+            position: self.position,
             is_shared: self.is_shared,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -57,10 +61,10 @@ impl ViewRow {
 
 /// Base SELECT for view queries.
 const VIEW_SELECT: &str = "\
-    SELECT view_id, workspace_id, created_by, name, icon, \
+    SELECT view_id, workspace_id, team_id, created_by, name, icon, \
            CAST(filters AS TEXT) AS filters, \
            CAST(display_options AS TEXT) AS display_options, \
-           sort_order, is_shared, \
+           sort_order, position, is_shared, \
            CAST(created_at AS TEXT) AS created_at, \
            CAST(updated_at AS TEXT) AS updated_at \
     FROM views";
