@@ -17,6 +17,7 @@ pub struct User {
     pub active: bool,
     pub last_login: Option<DateTime<Utc>>,
     pub last_workspace_id: Option<String>,
+    pub default_team_id: Option<String>,
     pub oauth_data: Option<String>,
     pub extra_metadata: Option<serde_json::Value>,
     pub terms_accepted_at: Option<DateTime<Utc>>,
@@ -59,6 +60,7 @@ pub struct Workspace {
     pub status: WorkspaceStatus,
     pub user_limit: Option<i32>,
     pub settings: Option<serde_json::Value>,
+    pub default_team_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -102,6 +102,62 @@ pub async fn update_team(
     Ok(())
 }
 
+/// Delete a team, optionally reassigning its issues to another team.
+#[server(prefix = "/leptos-api")]
+pub async fn delete_team(
+    team_id: String,
+    reassign_to_team_id: Option<String>,
+    new_workspace_default_id: Option<String>,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    trakkt_auth::team_service::delete_team(
+        ac.db(),
+        &team_id,
+        &ac.ws_id,
+        reassign_to_team_id.as_deref(),
+        new_workspace_default_id.as_deref(),
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(())
+}
+
+/// Set the current user's personal default team.
+#[server(prefix = "/leptos-api")]
+pub async fn set_my_default_team(team_id: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let team = trakkt_auth::team_service::get_team(ac.db(), &team_id)
+        .await
+        .into_sfn()?
+        .ok_or_else(|| ServerFnError::new("Team not found"))?;
+    if team.workspace_id != ac.ws_id {
+        return Err(ServerFnError::new("Team does not belong to this workspace"));
+    }
+    trakkt_auth::user_service::update_default_team(
+        ac.db(),
+        &ac.auth.user_id,
+        Some(&team_id),
+    )
+    .await
+    .into_sfn()?;
+    Ok(())
+}
+
+/// Set the workspace-level default team.
+#[server(prefix = "/leptos-api")]
+pub async fn set_workspace_default_team(team_id: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    trakkt_auth::workspace_service::set_workspace_default_team(
+        ac.db(),
+        &ac.ws_id,
+        &team_id,
+    )
+    .await
+    .into_sfn()?;
+    Ok(())
+}
+
 /// Create a new issue-tracker team in the current workspace.
 #[server(prefix = "/leptos-api")]
 pub async fn create_team(
