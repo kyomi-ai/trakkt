@@ -40,7 +40,7 @@ use crate::server_fns::issues::{create_issue, list_issues};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::create_view;
 use crate::utils::keyboard::is_input_focused;
-use trakkt_types::models::Team;
+use trakkt_types::models::{Status, Team};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // localStorage helpers for view mode
@@ -274,14 +274,27 @@ fn IssueListInner(
                 .unwrap_or_default()
         };
 
-        // Filter by team: global (team_id=None) + team-specific.
-        match resolved_team.get() {
+        let mut statuses: Vec<Status> = match resolved_team.get() {
             Some(ref t) => all
                 .into_iter()
                 .filter(|s| s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
                 .collect(),
             None => all,
-        }
+        };
+        statuses.sort_by(|a, b| {
+            let cat_rank = |c: &str| match c {
+                "backlog" => 0,
+                "unstarted" => 1,
+                "started" => 2,
+                "completed" => 3,
+                "cancelled" => 4,
+                _ => 5,
+            };
+            cat_rank(&a.category)
+                .cmp(&cat_rank(&b.category))
+                .then(a.position.cmp(&b.position))
+        });
+        statuses
     });
 
     // ── New Issue modal state ───────────────────────────────────────────────

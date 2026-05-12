@@ -58,8 +58,8 @@ fn sort_column_issues(issues: &mut [IssueWithDetails]) {
 
 /// Group a flat list of issues into per-status columns, sorted.
 ///
-/// Columns are ordered by the `statuses` list (server returns them ordered by
-/// category then position). Issues are grouped by `status_id`.
+/// Columns are ordered by the `statuses` list (caller sorts by category then
+/// position before passing). Issues are grouped by `status_id`.
 fn group_by_status(statuses: &[Status], all: &[IssueWithDetails]) -> Vec<(Status, Vec<IssueWithDetails>)> {
     statuses
         .iter()
