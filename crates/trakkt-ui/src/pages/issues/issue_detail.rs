@@ -107,33 +107,50 @@ fn relative_time(timestamp: &str) -> String {
 // Shared kode theme builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a kode `Theme` matching Trakkt's design system (warm light palette).
+/// Build a kode `Theme` matching Trakkt's design system for light or dark mode.
 ///
 /// Since kode's `Theme` is `#[non_exhaustive]`, we start from `Theme::light()`
-/// and override the fields we need.
-pub(crate) fn trakkt_kode_theme() -> kode_leptos::Theme {
-    let mut t = kode_leptos::Theme::light();
-    // Core colors — Trakkt warm palette
-    t.bg = "#FAFAF8";
-    t.fg = "#1C1917";
-    t.fg_bright = "#1C1917";
-    t.fg_dim = "#9C9790";
-    t.cursor = "#1C1917";
-    t.selection = "rgba(13, 148, 136, 0.15)";
-    t.current_line = "rgba(0, 0, 0, 0.03)";
-    t.gutter_fg = "#9C9790";
-    t.gutter_border = "#E8E5DE";
-    t.border = "#E8E5DE";
-    t.accent = "#0D9488";
-    t.bg_highlight = "#F5F3EF";
-    t.bg_hover = "#E8E5DE";
+/// or `Theme::dark()` and override fields with CSS variable references so they
+/// resolve to the correct values in both modes.
+pub(crate) fn trakkt_kode_theme(dark: bool) -> kode_leptos::Theme {
+    let mut t = if dark {
+        kode_leptos::Theme::dark()
+    } else {
+        kode_leptos::Theme::light()
+    };
+    // Core colors — CSS variable references resolve via Trakkt's design tokens
+    t.bg = "var(--color-card)";
+    t.fg = "var(--color-foreground)";
+    t.fg_bright = "var(--color-foreground)";
+    t.fg_dim = "var(--color-muted-foreground)";
+    t.cursor = "var(--color-foreground)";
+    t.selection = if dark {
+        "rgba(13, 148, 136, 0.25)"
+    } else {
+        "rgba(13, 148, 136, 0.15)"
+    };
+    t.current_line = if dark {
+        "rgba(255, 255, 255, 0.04)"
+    } else {
+        "rgba(0, 0, 0, 0.03)"
+    };
+    t.gutter_fg = "var(--color-muted-foreground)";
+    t.gutter_border = "var(--color-border)";
+    t.border = "var(--color-border)";
+    t.accent = "var(--color-primary)";
+    t.bg_highlight = "var(--color-surface-alt)";
+    t.bg_hover = "var(--color-border)";
     t.marker_error = "#DC2626";
     t.marker_warning = "#CA8A04";
     t.marker_info = "#2563EB";
-    t.marker_hint = "#9C9790";
-    t.code_fg = "#0D9488";
-    t.link = "#0D9488";
-    t.syntax = kode_leptos::SyntaxTheme::GithubLight;
+    t.marker_hint = "var(--color-muted-foreground)";
+    t.code_fg = "var(--color-primary)";
+    t.link = "var(--color-primary)";
+    t.syntax = if dark {
+        kode_leptos::SyntaxTheme::OneDark
+    } else {
+        kode_leptos::SyntaxTheme::GithubLight
+    };
     // Typography — DESIGN.md fonts
     t.content_font_family = Some("'DM Sans', sans-serif");
     t.heading_font_family = Some("'Instrument Serif', serif");
@@ -142,13 +159,13 @@ pub(crate) fn trakkt_kode_theme() -> kode_leptos::Theme {
     // Content layout
     t.content_max_width = Some("100%");
     t.container_padding = Some("0");
-    // Toolbar styling to match Trakkt
-    t.toolbar_bg = Some("#FAFAF8");
-    t.toolbar_border_color = Some("#E8E5DE");
+    // Toolbar styling — CSS variable references for automatic light/dark
+    t.toolbar_bg = Some("var(--color-background)");
+    t.toolbar_border_color = Some("var(--color-border)");
     t.toolbar_button_border_radius = Some("6px");
-    t.toolbar_button_hover_bg = Some("#F5F3EF");
-    t.toolbar_button_selected_bg = Some("#0D9488");
-    t.toolbar_button_selected_color = Some("#FFFFFF");
+    t.toolbar_button_hover_bg = Some("var(--color-surface-alt)");
+    t.toolbar_button_selected_bg = Some("var(--color-primary)");
+    t.toolbar_button_selected_color = Some("var(--color-primary-foreground)");
     // Heading styling
     t.heading_font_weight = Some("600");
     t.h1_border_width = Some("0");
@@ -1132,9 +1149,15 @@ fn DescriptionEditor(
         });
     });
 
-    let mut theme = trakkt_kode_theme();
-    theme.content_padding = Some("1rem 1.25rem");
-    let theme_signal = Signal::stored(theme);
+    let theme_state = crate::components::theme::use_theme();
+    let theme_signal = Signal::derive(move || {
+        let dark = theme_state
+            .map(|s| s.effective.get() == "dark")
+            .unwrap_or(false);
+        let mut theme = trakkt_kode_theme(dark);
+        theme.content_padding = Some("1rem 1.25rem");
+        theme
+    });
 
     view! {
         <div class="mt-6">
@@ -1449,6 +1472,8 @@ fn CommentItem(comment: Comment) -> impl IntoView {
         .unwrap_or_else(|| "Unknown".to_string());
     let timestamp = relative_time(&comment.created_at);
 
+    let theme_state = crate::components::theme::use_theme();
+
     view! {
         <div class="flex gap-3">
             <Avatar name=author.clone() size=AvatarSize::Md/>
@@ -1461,8 +1486,11 @@ fn CommentItem(comment: Comment) -> impl IntoView {
                     <kode_leptos::TreeWysiwygEditor
                         content=Signal::stored(comment.body.clone())
                         show_toolbar=false
-                        theme=Signal::stored({
-                            let mut theme = trakkt_kode_theme();
+                        theme=Signal::derive(move || {
+                            let dark = theme_state
+                                .map(|s| s.effective.get() == "dark")
+                                .unwrap_or(false);
+                            let mut theme = trakkt_kode_theme(dark);
                             theme.content_padding = Some("0");
                             theme.container_padding = Some("0");
                             theme.bg = "transparent";
@@ -1516,9 +1544,15 @@ fn NewCommentForm(team_key: String, number: i32, on_created: Callback<()>) -> im
         content.set(text);
     });
 
-    let mut theme = trakkt_kode_theme();
-    theme.content_padding = Some("0.75rem 1rem");
-    let theme_signal = Signal::stored(theme);
+    let theme_state = crate::components::theme::use_theme();
+    let theme_signal = Signal::derive(move || {
+        let dark = theme_state
+            .map(|s| s.effective.get() == "dark")
+            .unwrap_or(false);
+        let mut theme = trakkt_kode_theme(dark);
+        theme.content_padding = Some("0.75rem 1rem");
+        theme
+    });
 
     view! {
         <div class="mt-6">

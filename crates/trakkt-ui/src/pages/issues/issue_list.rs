@@ -948,6 +948,8 @@ pub(crate) fn NewIssueModal(
     #[prop(optional, into)]
     parent_title: Option<Signal<Option<String>>>,
 ) -> impl IntoView {
+    let theme_state = crate::components::theme::use_theme();
+
     let (title, set_title) = signal(String::new());
     let (description, set_description) = signal(String::new());
     let (priority, set_priority) = signal("0".to_string());
@@ -1094,8 +1096,11 @@ pub(crate) fn NewIssueModal(
                             on_change=Arc::new(move |text: String| {
                                 set_description.set(text);
                             })
-                            theme=Signal::stored({
-                                let mut theme = super::issue_detail::trakkt_kode_theme();
+                            theme=Signal::derive(move || {
+                                let dark = theme_state
+                                    .map(|s| s.effective.get() == "dark")
+                                    .unwrap_or(false);
+                                let mut theme = super::issue_detail::trakkt_kode_theme(dark);
                                 theme.content_padding = Some("0.75rem 1rem");
                                 theme
                             })
