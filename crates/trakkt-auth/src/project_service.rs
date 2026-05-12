@@ -192,17 +192,22 @@ pub async fn get_project(
     Ok(row.map(ProjectRow::into_dto))
 }
 
+/// Parameters for creating a new project.
+pub struct CreateProjectParams<'a> {
+    pub workspace_id: &'a str,
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub icon: Option<&'a str>,
+    pub color: Option<&'a str>,
+    pub lead_id: Option<&'a str>,
+    pub start_date: Option<&'a str>,
+    pub target_date: Option<&'a str>,
+}
+
 /// Create a new project in a workspace.
 pub async fn create_project(
     db: &DbPool,
-    workspace_id: &str,
-    name: &str,
-    description: Option<&str>,
-    icon: Option<&str>,
-    color: Option<&str>,
-    lead_id: Option<&str>,
-    start_date: Option<&str>,
-    target_date: Option<&str>,
+    params: &CreateProjectParams<'_>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Project> {
     let is_pg = db.is_postgres();
@@ -220,14 +225,14 @@ pub async fn create_project(
         db,
         &sql,
         &project_id,
-        workspace_id,
-        name,
-        description,
-        icon,
-        color,
-        lead_id,
-        start_date,
-        target_date
+        params.workspace_id,
+        params.name,
+        params.description,
+        params.icon,
+        params.color,
+        params.lead_id,
+        params.start_date,
+        params.target_date
     )?;
 
     // Sync log — best-effort.
@@ -235,7 +240,7 @@ pub async fn create_project(
         db,
         entity_types::PROJECT,
         &project_id,
-        workspace_id,
+        params.workspace_id,
         SyncActionType::Insert,
         None,
     )
@@ -258,7 +263,7 @@ pub async fn create_project(
     if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
             ws,
-            workspace_id,
+            params.workspace_id,
             entity_types::PROJECT,
             &project_id,
             SyncActionType::Insert,
@@ -270,20 +275,30 @@ pub async fn create_project(
     Ok(project)
 }
 
+/// Parameters for updating a project.
+///
+/// Only fields that are `Some` are changed. `updated_at` is always set.
+/// For clearable fields (`lead_id`, `start_date`, `target_date`), the outer
+/// `Option` controls whether the field is updated; the inner `Option` allows
+/// setting the column to `NULL`.
+pub struct UpdateProjectParams<'a> {
+    pub project_id: &'a str,
+    pub name: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub icon: Option<&'a str>,
+    pub color: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub lead_id: Option<Option<&'a str>>,
+    pub start_date: Option<Option<&'a str>>,
+    pub target_date: Option<Option<&'a str>>,
+}
+
 /// Update a project.
 ///
 /// Only fields that are `Some` are changed. `updated_at` is always set.
 pub async fn update_project(
     db: &DbPool,
-    project_id: &str,
-    name: Option<&str>,
-    description: Option<&str>,
-    icon: Option<&str>,
-    color: Option<&str>,
-    status: Option<&str>,
-    lead_id: Option<Option<&str>>,
-    start_date: Option<Option<&str>>,
-    target_date: Option<Option<&str>>,
+    params: &UpdateProjectParams<'_>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Project> {
     let is_pg = db.is_postgres();
@@ -293,35 +308,35 @@ pub async fn update_project(
     let mut set_parts: Vec<String> = Vec::new();
     let mut param_idx: usize = 1;
 
-    if name.is_some() {
+    if params.name.is_some() {
         set_parts.push(format!("name = ${param_idx}"));
         param_idx += 1;
     }
-    if description.is_some() {
+    if params.description.is_some() {
         set_parts.push(format!("description = ${param_idx}"));
         param_idx += 1;
     }
-    if icon.is_some() {
+    if params.icon.is_some() {
         set_parts.push(format!("icon = ${param_idx}"));
         param_idx += 1;
     }
-    if color.is_some() {
+    if params.color.is_some() {
         set_parts.push(format!("color = ${param_idx}"));
         param_idx += 1;
     }
-    if status.is_some() {
+    if params.status.is_some() {
         set_parts.push(format!("status = ${param_idx}"));
         param_idx += 1;
     }
-    if lead_id.is_some() {
+    if params.lead_id.is_some() {
         set_parts.push(format!("lead_id = ${param_idx}"));
         param_idx += 1;
     }
-    if start_date.is_some() {
+    if params.start_date.is_some() {
         set_parts.push(format!("start_date = ${param_idx}"));
         param_idx += 1;
     }
-    if target_date.is_some() {
+    if params.target_date.is_some() {
         set_parts.push(format!("target_date = ${param_idx}"));
         param_idx += 1;
     }
@@ -338,39 +353,39 @@ pub async fn update_project(
     let affected: u64 = trakkt_core::db_with_pool!(db, |p| {
         let mut query = sqlx::query(&sql);
 
-        if let Some(v) = name {
+        if let Some(v) = params.name {
             query = query.bind(v);
         }
-        if let Some(v) = description {
+        if let Some(v) = params.description {
             query = query.bind(v);
         }
-        if let Some(v) = icon {
+        if let Some(v) = params.icon {
             query = query.bind(v);
         }
-        if let Some(v) = color {
+        if let Some(v) = params.color {
             query = query.bind(v);
         }
-        if let Some(v) = status {
+        if let Some(v) = params.status {
             query = query.bind(v);
         }
-        if let Some(v) = lead_id {
+        if let Some(v) = params.lead_id {
             query = query.bind(v);
         }
-        if let Some(v) = start_date {
+        if let Some(v) = params.start_date {
             query = query.bind(v);
         }
-        if let Some(v) = target_date {
+        if let Some(v) = params.target_date {
             query = query.bind(v);
         }
 
-        query = query.bind(project_id);
+        query = query.bind(params.project_id);
 
         query.execute(p).await.map(|r| r.rows_affected())
     })?;
 
     if affected == 0 {
         return Err(trakkt_core::Error::NotFound(format!(
-            "project {project_id} not found"
+            "project {} not found", params.project_id
         )));
     }
 
@@ -380,7 +395,7 @@ pub async fn update_project(
         db,
         ProjectRow,
         &sql,
-        project_id
+        params.project_id
     )?;
     let project = row.into_dto();
 
@@ -388,14 +403,14 @@ pub async fn update_project(
     if let Err(e) = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT,
-        project_id,
+        params.project_id,
         &project.workspace_id,
         SyncActionType::Update,
         None,
     )
     .await
     {
-        tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for project update");
+        tracing::warn!(error = %e, project_id = %params.project_id, "Failed to write sync log entry for project update");
     }
 
     // WebSocket broadcast — send full entity data as SyncResponse.
@@ -404,7 +419,7 @@ pub async fn update_project(
             ws,
             &project.workspace_id,
             entity_types::PROJECT,
-            project_id,
+            params.project_id,
             SyncActionType::Update,
             serde_json::to_value(&project).ok(),
         )

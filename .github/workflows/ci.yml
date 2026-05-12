@@ -56,6 +56,9 @@ jobs:
       - name: Strip local dev patches (path overrides not available in CI)
         run: sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
 
+      - name: Regenerate lockfile after stripping local patches
+        run: cargo update --workspace
+
       - name: Ensure trakkt-ui/dist/ exists for ServeDir
         run: mkdir -p crates/trakkt-ui/dist
 

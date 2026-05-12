@@ -167,7 +167,7 @@ async fn resolve_mcp_auth(
             .get("workspace_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .or_else(|| {
+            .or({
                 // Synchronous fallback not possible here — but we can try
                 // the database lookup below if JWT didn't include workspace_id.
                 None
@@ -329,10 +329,10 @@ async fn handle_post(
 
     // Authenticate all requests except `initialize` (which triggers the OAuth flow).
     // In personal mode, bypass auth entirely.
-    if !is_initialize && request.method != "notifications/initialized" && !state.config.is_personal() {
-        if resolve_mcp_auth(&headers, &state).await.is_none() {
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
+    if !is_initialize && request.method != "notifications/initialized" && !state.config.is_personal()
+        && resolve_mcp_auth(&headers, &state).await.is_none()
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let response = match request.method.as_str() {
@@ -812,20 +812,11 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, trakkt_core::Error
         .ok_or_else(|| trakkt_core::Error::BadRequest(format!("missing required parameter: {key}")))
 }
 
-/// Helper to extract a required integer argument.
-fn arg_i64(args: &Value, key: &str) -> Result<i64, trakkt_core::Error> {
-    args.get(key)
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| trakkt_core::Error::BadRequest(format!("missing required parameter: {key}")))
-}
-
 /// Parse an issue identifier like "TRA-35" into (team_key, number).
 fn parse_issue_identifier(identifier: &str) -> Option<(String, i32)> {
     let parts: Vec<&str> = identifier.splitn(2, '-').collect();
-    if parts.len() == 2 {
-        if let Ok(number) = parts[1].parse::<i32>() {
-            return Some((parts[0].to_string(), number));
-        }
+    if parts.len() == 2 && let Ok(number) = parts[1].parse::<i32>() {
+        return Some((parts[0].to_string(), number));
     }
     None
 }

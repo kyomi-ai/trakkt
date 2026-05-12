@@ -113,12 +113,14 @@ pub async fn create_team(
     let ac = AuthenticatedContext::extract().await?;
     let team = trakkt_auth::team_service::create_team(
         ac.db(),
-        &ac.ws_id,
-        &name,
-        &key,
-        description.as_deref(),
-        icon.as_deref(),
-        Some(&ac.auth.user_id),
+        &trakkt_auth::team_service::CreateTeamParams {
+            workspace_id: &ac.ws_id,
+            name: &name,
+            key: &key,
+            description: description.as_deref(),
+            icon: icon.as_deref(),
+            creator_id: Some(&ac.auth.user_id),
+        },
         ac.ctx.ws_manager.as_ref(),
     )
     .await

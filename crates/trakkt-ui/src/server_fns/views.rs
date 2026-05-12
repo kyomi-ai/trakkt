@@ -4,6 +4,10 @@
 //!
 //! Thin wrappers around `trakkt_auth::view_service` — extract auth,
 //! call service, return. No business logic lives here.
+//!
+//! Leptos server functions receive each field as a separate parameter
+//! (no struct grouping), so many-argument signatures are unavoidable.
+//! The workspace-root `clippy.toml` raises the threshold to 14.
 
 use leptos::prelude::*;
 use trakkt_types::models::View;
@@ -47,15 +51,17 @@ pub async fn create_view(
     let ac = AuthenticatedContext::extract().await?;
     let view = trakkt_auth::view_service::create_view(
         ac.db(),
-        &ac.ws_id,
-        &ac.auth.user_id,
-        &name,
-        icon.as_deref(),
-        &filters,
-        &display_options,
-        is_shared,
-        team_id.as_deref(),
-        position,
+        &trakkt_auth::view_service::CreateViewParams {
+            workspace_id: &ac.ws_id,
+            user_id: &ac.auth.user_id,
+            name: &name,
+            icon: icon.as_deref(),
+            filters: &filters,
+            display_options: &display_options,
+            is_shared,
+            team_id: team_id.as_deref(),
+            position,
+        },
         ac.ctx.ws_manager.as_ref(),
     )
     .await
@@ -80,15 +86,17 @@ pub async fn update_view(
 
     let view = trakkt_auth::view_service::update_view(
         ac.db(),
-        &view_id,
-        name.as_deref(),
-        icon.as_deref(),
-        filters.as_deref(),
-        display_options.as_deref(),
-        is_shared,
-        sort_order,
-        None, // team_id changes not needed in MVP
-        position,
+        &trakkt_auth::view_service::UpdateViewParams {
+            view_id: &view_id,
+            name: name.as_deref(),
+            icon: icon.as_deref(),
+            filters: filters.as_deref(),
+            display_options: display_options.as_deref(),
+            is_shared,
+            sort_order,
+            team_id: None, // team_id changes not needed in MVP
+            position,
+        },
         ac.ctx.ws_manager.as_ref(),
     )
     .await

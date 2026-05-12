@@ -169,7 +169,7 @@ pub fn IssueStatusBadge(
     let color_class = status.icon_color_class();
 
     let wrapper_class = if show_label {
-        format!("inline-flex items-center gap-1.5 text-sm text-muted-foreground")
+        "inline-flex items-center gap-1.5 text-sm text-muted-foreground".to_string()
     } else {
         String::new()
     };

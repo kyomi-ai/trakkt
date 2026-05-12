@@ -251,11 +251,9 @@ fn do_connect(
             tracing::info!("connect(): already connecting, skipping");
             return;
         }
-        if let Some(ref ws) = s.ws {
-            if ws.ready_state() == WebSocket::OPEN {
-                tracing::info!("connect(): already OPEN, skipping");
-                return;
-            }
+        if let Some(ref ws) = s.ws && ws.ready_state() == WebSocket::OPEN {
+            tracing::info!("connect(): already OPEN, skipping");
+            return;
         }
     }
 

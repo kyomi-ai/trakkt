@@ -158,10 +158,9 @@ pub async fn remove_favorite(
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // Fetch the favorite_id before deleting so we can broadcast the correct entity_id.
-    let sql = format!(
-        "SELECT favorite_id FROM favorites \
+    let sql = "SELECT favorite_id FROM favorites \
          WHERE user_id = $1 AND workspace_id = $2 AND target_type = $3 AND target_id = $4"
-    );
+        .to_string();
 
     #[derive(sqlx::FromRow)]
     struct IdRow {

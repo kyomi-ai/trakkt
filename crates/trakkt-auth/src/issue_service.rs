@@ -308,18 +308,18 @@ pub async fn create_issue(
     }
 
     // WebSocket broadcast — fetch full entity data and send as SyncResponse.
-    if let Some(ws) = ws_manager {
-        if let Ok(Some(full_issue)) = get_issue_by_id(db, &issue_id).await {
-            sync_log_service::broadcast_sync_action(
-                ws,
-                &params.workspace_id,
-                entity_types::ISSUE,
-                &issue_id,
-                SyncActionType::Insert,
-                serde_json::to_value(&full_issue).ok(),
-            )
-            .await;
-        }
+    if let Some(ws) = ws_manager
+        && let Ok(Some(full_issue)) = get_issue_by_id(db, &issue_id).await
+    {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            &params.workspace_id,
+            entity_types::ISSUE,
+            &issue_id,
+            SyncActionType::Insert,
+            serde_json::to_value(&full_issue).ok(),
+        )
+        .await;
     }
 
     // Auto-watch: creator watches the issue they just created (best-effort).
@@ -638,8 +638,9 @@ pub async fn update_issue(
             "number = (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = ${}", param_idx - 1
         ));
         // Close the subquery paren.
-        let last = set_parts.last_mut().unwrap();
-        last.push(')');
+        if let Some(last) = set_parts.last_mut() {
+            last.push(')');
+        }
     }
 
     // Always update updated_at.
@@ -752,18 +753,18 @@ pub async fn update_issue(
     }
 
     // WebSocket broadcast — fetch full entity data and send as SyncResponse.
-    if let Some(ws) = ws_manager {
-        if let Ok(Some(full_issue)) = get_issue_by_id(db, &issue.issue_id).await {
-            sync_log_service::broadcast_sync_action(
-                ws,
-                workspace_id,
-                entity_types::ISSUE,
-                &issue.issue_id,
-                SyncActionType::Update,
-                serde_json::to_value(&full_issue).ok(),
-            )
-            .await;
-        }
+    if let Some(ws) = ws_manager
+        && let Ok(Some(full_issue)) = get_issue_by_id(db, &issue.issue_id).await
+    {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::ISSUE,
+            &issue.issue_id,
+            SyncActionType::Update,
+            serde_json::to_value(&full_issue).ok(),
+        )
+        .await;
     }
 
     Ok(issue)
@@ -893,18 +894,18 @@ pub async fn set_issue_labels(
     }
 
     // WebSocket broadcast — fetch full entity data with updated labels.
-    if let Some(ws) = ws_manager {
-        if let Ok(Some(full_issue)) = get_issue_by_id(db, issue_id).await {
-            sync_log_service::broadcast_sync_action(
-                ws,
-                &ws_id,
-                entity_types::ISSUE,
-                issue_id,
-                SyncActionType::Update,
-                serde_json::to_value(&full_issue).ok(),
-            )
-            .await;
-        }
+    if let Some(ws) = ws_manager
+        && let Ok(Some(full_issue)) = get_issue_by_id(db, issue_id).await
+    {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            &ws_id,
+            entity_types::ISSUE,
+            issue_id,
+            SyncActionType::Update,
+            serde_json::to_value(&full_issue).ok(),
+        )
+        .await;
     }
 
     Ok(())
@@ -972,18 +973,18 @@ pub async fn set_sort_order(
     }
 
     // WebSocket broadcast — fetch full entity data and send as SyncResponse.
-    if let Some(ws) = ws_manager {
-        if let Ok(Some(full_issue)) = get_issue_by_id(db, &issue_id).await {
-            sync_log_service::broadcast_sync_action(
-                ws,
-                workspace_id,
-                entity_types::ISSUE,
-                &issue_id,
-                SyncActionType::Update,
-                serde_json::to_value(&full_issue).ok(),
-            )
-            .await;
-        }
+    if let Some(ws) = ws_manager
+        && let Ok(Some(full_issue)) = get_issue_by_id(db, &issue_id).await
+    {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::ISSUE,
+            &issue_id,
+            SyncActionType::Update,
+            serde_json::to_value(&full_issue).ok(),
+        )
+        .await;
     }
 
     Ok(())

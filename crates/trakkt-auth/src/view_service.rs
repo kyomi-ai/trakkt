@@ -112,7 +112,7 @@ pub async fn list_views(
             &sql,
             workspace_id,
             user_id,
-            team_id.unwrap()
+            team_id.unwrap_or_default()
         )?
     } else {
         trakkt_core::db_fetch_all!(
@@ -141,27 +141,32 @@ pub async fn get_view(
     Ok(row.map(ViewRow::into_dto))
 }
 
+/// Parameters for creating a new saved view.
+pub struct CreateViewParams<'a> {
+    pub workspace_id: &'a str,
+    pub user_id: &'a str,
+    pub name: &'a str,
+    pub icon: Option<&'a str>,
+    pub filters: &'a str,
+    pub display_options: &'a str,
+    pub is_shared: bool,
+    pub team_id: Option<&'a str>,
+    pub position: i32,
+}
+
 /// Create a new saved view in a workspace.
 ///
-/// `team_id` scopes the view to a specific team. `position` controls the
-/// ordering of views in the sidebar.
+/// `params.team_id` scopes the view to a specific team. `params.position`
+/// controls the ordering of views in the sidebar.
 pub async fn create_view(
     db: &DbPool,
-    workspace_id: &str,
-    user_id: &str,
-    name: &str,
-    icon: Option<&str>,
-    filters: &str,
-    display_options: &str,
-    is_shared: bool,
-    team_id: Option<&str>,
-    position: i32,
+    params: &CreateViewParams<'_>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<View> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
     let view_id = uuid::Uuid::new_v4().to_string();
-    let shared_val = if is_shared {
+    let shared_val = if params.is_shared {
         sql_compat::bool_true(is_pg)
     } else {
         sql_compat::bool_false(is_pg)
@@ -185,14 +190,14 @@ pub async fn create_view(
         db,
         &sql,
         &view_id,
-        workspace_id,
-        user_id,
-        name,
-        icon,
-        filters,
-        display_options,
-        position,
-        team_id
+        params.workspace_id,
+        params.user_id,
+        params.name,
+        params.icon,
+        params.filters,
+        params.display_options,
+        params.position,
+        params.team_id
     )?;
 
     // Sync log — best-effort.
@@ -200,7 +205,7 @@ pub async fn create_view(
         db,
         entity_types::VIEW,
         &view_id,
-        workspace_id,
+        params.workspace_id,
         SyncActionType::Insert,
         None,
     )
@@ -223,7 +228,7 @@ pub async fn create_view(
     if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
             ws,
-            workspace_id,
+            params.workspace_id,
             entity_types::VIEW,
             &view_id,
             SyncActionType::Insert,
@@ -235,7 +240,7 @@ pub async fn create_view(
     Ok(view)
 }
 
-/// Update a view.
+/// Parameters for updating a view.
 ///
 /// Only fields that are `Some` are changed. `updated_at` is always set.
 ///
@@ -243,17 +248,24 @@ pub async fn create_view(
 /// field should be updated at all, while the inner `Option` allows setting
 /// the column to `NULL` (making the view workspace-scoped rather than
 /// team-scoped).
+pub struct UpdateViewParams<'a> {
+    pub view_id: &'a str,
+    pub name: Option<&'a str>,
+    pub icon: Option<&'a str>,
+    pub filters: Option<&'a str>,
+    pub display_options: Option<&'a str>,
+    pub is_shared: Option<bool>,
+    pub sort_order: Option<f64>,
+    pub team_id: Option<Option<&'a str>>,
+    pub position: Option<i32>,
+}
+
+/// Update a view.
+///
+/// Only fields that are `Some` are changed. `updated_at` is always set.
 pub async fn update_view(
     db: &DbPool,
-    view_id: &str,
-    name: Option<&str>,
-    icon: Option<&str>,
-    filters: Option<&str>,
-    display_options: Option<&str>,
-    is_shared: Option<bool>,
-    sort_order: Option<f64>,
-    team_id: Option<Option<&str>>,
-    position: Option<i32>,
+    params: &UpdateViewParams<'_>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<View> {
     let is_pg = db.is_postgres();
@@ -263,25 +275,25 @@ pub async fn update_view(
     let mut set_parts: Vec<String> = Vec::new();
     let mut param_idx: usize = 1;
 
-    if name.is_some() {
+    if params.name.is_some() {
         set_parts.push(format!("name = ${param_idx}"));
         param_idx += 1;
     }
-    if icon.is_some() {
+    if params.icon.is_some() {
         set_parts.push(format!("icon = ${param_idx}"));
         param_idx += 1;
     }
-    if filters.is_some() {
+    if params.filters.is_some() {
         let cast = sql_compat::cast_to_json(is_pg, &format!("${param_idx}"));
         set_parts.push(format!("filters = {cast}"));
         param_idx += 1;
     }
-    if display_options.is_some() {
+    if params.display_options.is_some() {
         let cast = sql_compat::cast_to_json(is_pg, &format!("${param_idx}"));
         set_parts.push(format!("display_options = {cast}"));
         param_idx += 1;
     }
-    if let Some(shared) = is_shared {
+    if let Some(shared) = params.is_shared {
         let shared_val = if shared {
             sql_compat::bool_true(is_pg)
         } else {
@@ -289,15 +301,15 @@ pub async fn update_view(
         };
         set_parts.push(format!("is_shared = {shared_val}"));
     }
-    if sort_order.is_some() {
+    if params.sort_order.is_some() {
         set_parts.push(format!("sort_order = ${param_idx}"));
         param_idx += 1;
     }
-    if team_id.is_some() {
+    if params.team_id.is_some() {
         set_parts.push(format!("team_id = ${param_idx}"));
         param_idx += 1;
     }
-    if position.is_some() {
+    if params.position.is_some() {
         if is_pg {
             set_parts.push(format!("position = CAST(${param_idx} AS INTEGER)"));
         } else {
@@ -318,37 +330,37 @@ pub async fn update_view(
     let affected: u64 = trakkt_core::db_with_pool!(db, |p| {
         let mut query = sqlx::query(&sql);
 
-        if let Some(v) = name {
+        if let Some(v) = params.name {
             query = query.bind(v);
         }
-        if let Some(v) = icon {
+        if let Some(v) = params.icon {
             query = query.bind(v);
         }
-        if let Some(v) = filters {
+        if let Some(v) = params.filters {
             query = query.bind(v);
         }
-        if let Some(v) = display_options {
+        if let Some(v) = params.display_options {
             query = query.bind(v);
         }
-        if let Some(v) = sort_order {
+        if let Some(v) = params.sort_order {
             query = query.bind(v);
         }
-        if let Some(v) = team_id {
+        if let Some(v) = params.team_id {
             // v is Option<&str> — bind as nullable string.
             query = query.bind(v);
         }
-        if let Some(v) = position {
+        if let Some(v) = params.position {
             query = query.bind(v);
         }
 
-        query = query.bind(view_id);
+        query = query.bind(params.view_id);
 
         query.execute(p).await.map(|r| r.rows_affected())
     })?;
 
     if affected == 0 {
         return Err(trakkt_core::Error::NotFound(format!(
-            "view {view_id} not found"
+            "view {} not found", params.view_id
         )));
     }
 
@@ -358,7 +370,7 @@ pub async fn update_view(
         db,
         ViewRow,
         &sql,
-        view_id
+        params.view_id
     )?;
     let view = row.into_dto();
 
@@ -366,14 +378,14 @@ pub async fn update_view(
     if let Err(e) = sync_log_service::write_sync_entry(
         db,
         entity_types::VIEW,
-        view_id,
+        params.view_id,
         &view.workspace_id,
         SyncActionType::Update,
         None,
     )
     .await
     {
-        tracing::warn!(error = %e, view_id = %view_id, "Failed to write sync log entry for view update");
+        tracing::warn!(error = %e, view_id = %params.view_id, "Failed to write sync log entry for view update");
     }
 
     // WebSocket broadcast — send full entity data as SyncResponse.
@@ -382,7 +394,7 @@ pub async fn update_view(
             ws,
             &view.workspace_id,
             entity_types::VIEW,
-            view_id,
+            params.view_id,
             SyncActionType::Update,
             serde_json::to_value(&view).ok(),
         )

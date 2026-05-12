@@ -69,15 +69,15 @@ pub fn StatusFilterDropdown(
         };
 
         // Filter by team when a team_id signal is provided and has a value.
-        if let Some(team_id_signal) = team_id {
-            if let Some(ref tid) = team_id_signal.get() {
-                return all
-                    .into_iter()
-                    .filter(|s| {
-                        s.team_id.is_none() || s.team_id.as_deref() == Some(tid.as_str())
-                    })
-                    .collect();
-            }
+        if let Some(team_id_signal) = team_id
+            && let Some(ref tid) = team_id_signal.get()
+        {
+            return all
+                .into_iter()
+                .filter(|s| {
+                    s.team_id.is_none() || s.team_id.as_deref() == Some(tid.as_str())
+                })
+                .collect();
         }
         all
     });
@@ -137,10 +137,7 @@ pub fn StatusFilterDropdown(
             <DropdownItem
                 label="All statuses"
                 selected=Signal::derive(move || value.get().is_empty())
-                on_select=Callback::new({
-                    let on_change = on_change.clone();
-                    move |()| { on_change.run(Vec::new()); }
-                })
+                on_select=Callback::new(move |()| { on_change.run(Vec::new()); })
             />
             {move || statuses.get().into_iter().map(|status| {
                 let status_id = status.status_id.clone();
@@ -152,7 +149,6 @@ pub fn StatusFilterDropdown(
                         label=label
                         selected=Signal::derive(move || value.get().contains(&status_id_check))
                         on_select=Callback::new({
-                            let on_change = on_change.clone();
                             let id = status_id.clone();
                             move |()| {
                                 let mut current = value.get_untracked();
@@ -245,10 +241,7 @@ pub fn PriorityFilterDropdown(
             <DropdownItem
                 label="All priorities"
                 selected=Signal::derive(move || value.get().is_empty())
-                on_select=Callback::new({
-                    let on_change = on_change.clone();
-                    move |()| { on_change.run(Vec::new()); }
-                })
+                on_select=Callback::new(move |()| { on_change.run(Vec::new()); })
             />
             {priorities.iter().map(|(key, label, priority_val)| {
                 let key_owned = key.to_string();
@@ -261,7 +254,6 @@ pub fn PriorityFilterDropdown(
                         label=label
                         selected=Signal::derive(move || value.get().contains(&key_check))
                         on_select=Callback::new({
-                            let on_change = on_change.clone();
                             let k = key_owned.clone();
                             move |()| {
                                 let mut current = value.get_untracked();

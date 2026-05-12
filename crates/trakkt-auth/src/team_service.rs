@@ -70,23 +70,28 @@ impl TeamMemberRow {
 
 // ─── Service functions ──────────────────────────────────────────────────────
 
+/// Parameters for creating a new team.
+pub struct CreateTeamParams<'a> {
+    pub workspace_id: &'a str,
+    pub name: &'a str,
+    pub key: &'a str,
+    pub description: Option<&'a str>,
+    pub icon: Option<&'a str>,
+    pub creator_id: Option<&'a str>,
+}
+
 /// Create a new team in a workspace.
 ///
-/// If `creator_id` is provided, the creator is automatically added as a `lead` member.
+/// If `params.creator_id` is provided, the creator is automatically added as a `lead` member.
 pub async fn create_team(
     db: &DbPool,
-    workspace_id: &str,
-    name: &str,
-    key: &str,
-    description: Option<&str>,
-    icon: Option<&str>,
-    creator_id: Option<&str>,
+    params: &CreateTeamParams<'_>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Team> {
     // Validate key format: 2-5 uppercase alphanumeric characters (no hyphens).
-    if key.len() < 2
-        || key.len() > 5
-        || !key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    if params.key.len() < 2
+        || params.key.len() > 5
+        || !params.key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
     {
         return Err(trakkt_core::Error::BadRequest(
             "Team key must be 2-5 uppercase alphanumeric characters".into(),
@@ -101,13 +106,13 @@ pub async fn create_team(
         "INSERT INTO teams (team_id, workspace_id, name, key, description, icon, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, {now})"
     );
-    trakkt_core::db_execute!(db, &sql, &team_id, workspace_id, name, key, description, icon)?;
+    trakkt_core::db_execute!(db, &sql, &team_id, params.workspace_id, params.name, params.key, params.description, params.icon)?;
 
     if let Err(e) = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
         &team_id,
-        workspace_id,
+        params.workspace_id,
         SyncActionType::Insert,
         None,
     )
@@ -117,8 +122,8 @@ pub async fn create_team(
     }
 
     // Auto-add creator as lead member if provided.
-    if let Some(uid) = creator_id {
-        add_team_member(db, &team_id, uid, "lead", workspace_id).await?;
+    if let Some(uid) = params.creator_id {
+        add_team_member(db, &team_id, uid, "lead", params.workspace_id).await?;
     }
 
     // Re-fetch to get the DB-assigned created_at.
@@ -137,7 +142,7 @@ pub async fn create_team(
     if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
             ws,
-            workspace_id,
+            params.workspace_id,
             entity_types::TEAM,
             &team_id,
             SyncActionType::Insert,
@@ -242,15 +247,14 @@ pub async fn update_team(
     key: Option<String>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Team> {
-    if let Some(ref k) = key {
-        if k.len() < 2
+    if let Some(ref k) = key
+        && (k.len() < 2
             || k.len() > 5
-            || !k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        {
-            return Err(trakkt_core::Error::BadRequest(
-                "Team key must be 2-5 uppercase alphanumeric characters".into(),
-            ));
-        }
+            || !k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
+    {
+        return Err(trakkt_core::Error::BadRequest(
+            "Team key must be 2-5 uppercase alphanumeric characters".into(),
+        ));
     }
 
     let result = trakkt_core::db_execute!(
