@@ -1092,6 +1092,8 @@ pub(crate) fn NewIssueModal(
                             on_change=Arc::new(move |text: String| {
                                 set_description.set(text);
                             })
+                            show_fixed_toolbar=false
+                            show_floating_toolbar=true
                             theme=Signal::stored({
                                 let mut theme = super::issue_detail::trakkt_kode_theme();
                                 theme.content_padding = Some("0.75rem 1rem");
