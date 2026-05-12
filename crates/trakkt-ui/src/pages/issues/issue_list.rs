@@ -22,13 +22,13 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
-use phosphor_leptos::Icon;
+use phosphor_leptos::{Icon, IconWeight};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::components::{
     Alert, AlertVariant,
-    Button, ButtonSize, ButtonVariant, EmptyState,
+    Button, ButtonSize, ButtonVariant, ConfirmDialog, EmptyState,
     Modal, ModalSize,
     SearchInput, StyledSelect, INPUT_CLASS,
 };
@@ -39,7 +39,7 @@ use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::pages::views::ViewFilters;
 use crate::server_fns::issues::{create_issue, list_issues};
 use crate::server_fns::statuses::list_statuses;
-use crate::server_fns::views::create_view;
+use crate::server_fns::views::{create_view, delete_view, update_view};
 use crate::utils::keyboard::is_input_focused;
 use trakkt_types::models::{Status, Team};
 
@@ -142,6 +142,12 @@ fn IssueListInner(
     // ── Error state for server function failures ──────────────────────────
     let error_msg = RwSignal::new(Option::<String>::None);
 
+    // ── Context menu / rename / delete state for custom view tabs ────────
+    let (context_menu_view_id, set_context_menu_view_id) = signal(Option::<String>::None);
+    let (renaming_view_id, set_renaming_view_id) = signal(Option::<String>::None);
+    let (rename_value, set_rename_value) = signal(String::new());
+    let (confirm_delete_view_id, set_confirm_delete_view_id) = signal(Option::<String>::None);
+
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (version, set_version) = signal(0u32);
@@ -176,10 +182,64 @@ fn IssueListInner(
         views
     });
 
+    // ── Rename submit handler for custom view tabs ────────────────────────
+    let handle_tab_rename_submit = move || {
+        let name = rename_value.get_untracked().trim().to_string();
+        let view_id = renaming_view_id.get_untracked();
+        set_renaming_view_id.set(None);
+        if name.is_empty() {
+            return;
+        }
+        let Some(vid) = view_id else { return };
+        leptos::task::spawn_local(async move {
+            match update_view(vid, Some(name), None, None, None, None, None, None).await {
+                Ok(_) => error_msg.set(None),
+                Err(e) => error_msg.set(Some(format!("Failed to rename view: {e}"))),
+            }
+        });
+    };
+
+    // ── Delete handler for custom view tabs ─────────────────────────────
+    let handle_tab_delete = move || {
+        let Some(vid) = confirm_delete_view_id.get_untracked() else { return };
+        set_confirm_delete_view_id.set(None);
+        // If the deleted view was the active tab, reset to "All Issues".
+        let current_tab = active_tab.get_untracked();
+        if current_tab == format!("view:{vid}") {
+            set_active_tab.set("all".to_string());
+            set_search.set(String::new());
+            set_status_filter.set(Vec::new());
+            set_priority_filter.set(Vec::new());
+        }
+        leptos::task::spawn_local(async move {
+            match delete_view(vid).await {
+                Ok(_) => error_msg.set(None),
+                Err(e) => error_msg.set(Some(format!("Failed to delete view: {e}"))),
+            }
+        });
+    };
+
     // Reset active tab when navigating between teams.
     Effect::new(move |_| {
         let _ = resolved_team.get();
         set_active_tab.set("all".to_string());
+    });
+
+    // Close context menu on click outside.
+    Effect::new(move |_| {
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
+        let cb = Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |_: web_sys::MouseEvent| {
+            if context_menu_view_id.get_untracked().is_some() {
+                set_context_menu_view_id.set(None);
+            }
+        });
+        let _ = document.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref());
+        let cb_cleanup = send_wrapper::SendWrapper::new(cb);
+        on_cleanup(move || {
+            let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
+            let cb = cb_cleanup.take();
+            let _ = document.remove_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref());
+        });
     });
 
     // Server function fallback — used for initial load before sync is ready.
@@ -518,7 +578,7 @@ fn IssueListInner(
                 };
 
                 Some(view! {
-                    <div class="px-5 py-1.5 flex items-center gap-1 bg-background shrink-0 overflow-x-auto">
+                    <div class="px-5 py-1.5 flex items-center gap-1 bg-background shrink-0 flex-wrap">
                         // Default tabs
                         {move || {
                             let tab = active_tab.get();
@@ -536,14 +596,23 @@ fn IssueListInner(
                         {move || {
                             let views = team_views.get();
                             let current_tab = active_tab.get();
+                            let open_menu_id = context_menu_view_id.get();
+                            let current_renaming = renaming_view_id.get();
                             views.into_iter().map(|v| {
+                                let view_id = v.view_id.clone();
                                 let tab_id = format!("view:{}", v.view_id);
-                                let variant = if current_tab == tab_id { ButtonVariant::PillActive } else { ButtonVariant::Pill };
+                                let is_active = current_tab == tab_id;
+                                let is_renaming = current_renaming.as_deref() == Some(v.view_id.as_str());
+                                let is_menu_open = open_menu_id.as_deref() == Some(v.view_id.as_str());
                                 let filters_json = v.filters.clone();
                                 let name = v.name.clone();
                                 let tab_id_click = tab_id;
 
                                 let on_view_click = move |_: web_sys::MouseEvent| {
+                                    if renaming_view_id.get_untracked().is_some() {
+                                        return;
+                                    }
+                                    set_context_menu_view_id.set(None);
                                     set_active_tab.set(tab_id_click.clone());
                                     match serde_json::from_str::<ViewFilters>(&filters_json) {
                                         Ok(filters) => {
@@ -559,10 +628,117 @@ fn IssueListInner(
                                     }
                                 };
 
-                                view! {
-                                    <Button variant=variant size=ButtonSize::Pill on:click=on_view_click>
-                                        {name}
-                                    </Button>
+                                let vid_ctx = view_id.clone();
+                                let on_contextmenu = move |ev: web_sys::MouseEvent| {
+                                    ev.prevent_default();
+                                    set_context_menu_view_id.set(Some(vid_ctx.clone()));
+                                };
+
+                                if is_renaming {
+                                    // Inline rename input replacing the tab text
+                                    let handle_submit = handle_tab_rename_submit;
+                                    view! {
+                                        <div class="relative flex items-center">
+                                            <form
+                                                class="flex items-center"
+                                                on:submit=move |ev: web_sys::SubmitEvent| {
+                                                    ev.prevent_default();
+                                                    handle_submit();
+                                                }
+                                            >
+                                                <input
+                                                    type="text"
+                                                    autofocus=true
+                                                    class="w-36 h-7 px-2 py-0.5 text-[13px] rounded-md border border-border bg-background text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                                    prop:value=move || rename_value.get()
+                                                    on:input=move |ev| set_rename_value.set(event_target_value(&ev))
+                                                    on:blur=move |_| handle_submit()
+                                                />
+                                            </form>
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    // Normal tab: name + "..." button on hover + optional dropdown
+                                    let active_class = if is_active {
+                                        "inline-flex items-center gap-1 group relative px-3 py-1 text-[13px] font-medium rounded-md transition-colors bg-secondary text-foreground"
+                                    } else {
+                                        "inline-flex items-center gap-1 group relative px-3 py-1 text-[13px] font-medium rounded-md transition-colors text-muted-foreground hover:text-foreground hover:bg-secondary/50"
+                                    };
+
+                                    let vid_dots = view_id.clone();
+                                    let vid_rename = view_id.clone();
+                                    let name_for_rename = name.clone();
+                                    let vid_delete = view_id.clone();
+
+                                    view! {
+                                        <div
+                                            class=active_class
+                                            role="tab"
+                                            tabindex=0
+                                            on:click=on_view_click
+                                            on:contextmenu=on_contextmenu
+                                        >
+                                            {name}
+                                            // "..." button — visible on hover or when menu is open
+                                            <button
+                                                class=move || {
+                                                    if is_menu_open {
+                                                        "p-0.5 rounded text-muted-foreground hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                                    } else {
+                                                        "p-0.5 rounded text-muted-foreground hover:text-foreground transition-colors opacity-0 group-hover:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                                    }
+                                                }
+                                                on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
+                                                on:click=move |ev: web_sys::MouseEvent| {
+                                                    ev.stop_propagation();
+                                                    if context_menu_view_id.get_untracked().as_deref() == Some(vid_dots.as_str()) {
+                                                        set_context_menu_view_id.set(None);
+                                                    } else {
+                                                        set_context_menu_view_id.set(Some(vid_dots.clone()));
+                                                    }
+                                                }
+                                                title="View actions"
+                                            >
+                                                <Icon icon=phosphor_leptos::DOTS_THREE weight=IconWeight::Bold size="14px"/>
+                                            </button>
+
+                                            // Context menu dropdown
+                                            {if is_menu_open {
+                                                let vid_rename = vid_rename.clone();
+                                                let name_for_rename = name_for_rename.clone();
+                                                let vid_delete = vid_delete.clone();
+                                                Some(view! {
+                                                    <div class="absolute left-0 top-full mt-1 w-40 bg-popover border border-border rounded-lg shadow-lg py-1 z-50">
+                                                        <button
+                                                            class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                                            on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
+                                                            on:click=move |ev: web_sys::MouseEvent| {
+                                                                ev.stop_propagation();
+                                                                set_context_menu_view_id.set(None);
+                                                                set_rename_value.set(name_for_rename.clone());
+                                                                set_renaming_view_id.set(Some(vid_rename.clone()));
+                                                            }
+                                                        >
+                                                            "Rename"
+                                                        </button>
+                                                        <button
+                                                            class="w-full text-left px-4 py-2 text-sm text-destructive hover:bg-secondary transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                                            on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
+                                                            on:click=move |ev: web_sys::MouseEvent| {
+                                                                ev.stop_propagation();
+                                                                set_context_menu_view_id.set(None);
+                                                                set_confirm_delete_view_id.set(Some(vid_delete.clone()));
+                                                            }
+                                                        >
+                                                            "Delete"
+                                                        </button>
+                                                    </div>
+                                                })
+                                            } else {
+                                                None
+                                            }}
+                                        </div>
+                                    }.into_any()
                                 }
                             }).collect_view()
                         }}
@@ -730,6 +906,18 @@ fn IssueListInner(
             priority_filter=Signal::derive(move || priority_filter.get())
             team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
             view_mode=Signal::derive(move || view_mode.get())
+        />
+
+        // ── Delete View confirmation dialog ────────────────────────────────
+        <ConfirmDialog
+            open=Signal::derive(move || confirm_delete_view_id.get().is_some())
+            title="Delete view?"
+            message="This saved view will be permanently deleted."
+            confirm_text="Delete"
+            on_confirm=Callback::new(move |()| {
+                handle_tab_delete();
+            })
+            on_cancel=Callback::new(move |()| set_confirm_delete_view_id.set(None))
         />
     }
 }
