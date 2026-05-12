@@ -238,6 +238,8 @@ pub struct Notification {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IssueFilters {
     pub status_id: Option<String>,
+    pub status_categories: Option<Vec<String>>,
+    pub exclude_status_categories: Option<Vec<String>>,
     pub priority: Option<i32>,
     pub assignee_id: Option<String>,
     pub label_id: Option<String>,
