@@ -212,8 +212,8 @@ pub fn MyIssuesPage() -> impl IntoView {
     // Track the current issue count so keyboard handlers know the bounds.
     let issue_count = RwSignal::new(0usize);
 
-    // Track issue numbers so Enter can navigate to the selected issue.
-    let issue_numbers = RwSignal::new(Vec::<i32>::new());
+    // Track issue identifiers (e.g. "TRA-42") so Enter can navigate to the selected issue.
+    let issue_identifiers = RwSignal::new(Vec::<String>::new());
 
     // ── j/k/Enter keyboard listener (window-level, active on this page) ────
     let nav = use_navigate();
@@ -251,10 +251,10 @@ pub fn MyIssuesPage() -> impl IntoView {
                 }
                 "Enter" => {
                     if let Some(idx) = selected_index.get_untracked() {
-                        let numbers = issue_numbers.get_untracked();
-                        if let Some(&number) = numbers.get(idx) {
+                        let ids = issue_identifiers.get_untracked();
+                        if let Some(identifier) = ids.get(idx) {
                             ev.prevent_default();
-                            nav(&format!("/issues/{number}"), Default::default());
+                            nav(&format!("/issues/{identifier}"), Default::default());
                         }
                     }
                 }
@@ -373,7 +373,7 @@ pub fn MyIssuesPage() -> impl IntoView {
 
                     // Update keyboard navigation bounds.
                     issue_count.set(all_visible.len());
-                    issue_numbers.set(all_visible.iter().map(|i| i.number).collect());
+                    issue_identifiers.set(all_visible.iter().map(|i| format!("{}-{}", i.team_key, i.number)).collect());
                     if let Some(idx) = selected_index.get_untracked()
                         && idx >= all_visible.len()
                     {

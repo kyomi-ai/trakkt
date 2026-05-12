@@ -46,8 +46,8 @@ enum PaletteIcon {
 enum ActionKind {
     /// Navigate to a fixed route.
     Navigate(String),
-    /// Navigate to an issue by number.
-    NavigateIssue(i32),
+    /// Navigate to an issue by identifier (e.g. "TRA-42").
+    NavigateIssue(String),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -181,7 +181,7 @@ pub fn CommandPalette(
                 label: issue.title,
                 description: Some(format!("{}-{}", issue.team_key, issue.number)),
                 icon: PaletteIcon::Article,
-                kind: ActionKind::NavigateIssue(issue.number),
+                kind: ActionKind::NavigateIssue(format!("{}-{}", issue.team_key, issue.number)),
             }));
         }
 
@@ -197,8 +197,8 @@ pub fn CommandPalette(
             ActionKind::Navigate(path) => {
                 nav(path, Default::default());
             }
-            ActionKind::NavigateIssue(number) => {
-                nav(&format!("/issues/{number}"), Default::default());
+            ActionKind::NavigateIssue(identifier) => {
+                nav(&format!("/issues/{identifier}"), Default::default());
             }
         }
         on_close.run(());

@@ -14,11 +14,11 @@ use super::{AuthenticatedContext, IntoServerFnError};
 
 // ─── Read operations ───────────────────────────────────────────────────────
 
-/// List all comments for an issue, identified by its workspace-scoped number.
+/// List all comments for an issue, identified by its team key + number (e.g. "ENG-42").
 #[server(prefix = "/leptos-api")]
-pub async fn list_comments(issue_number: i32) -> Result<Vec<Comment>, ServerFnError> {
+pub async fn list_comments(team_key: String, issue_number: i32) -> Result<Vec<Comment>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let issue_id = super::issues::resolve_issue_id(ac.db(), &ac.ws_id, issue_number).await?;
+    let issue_id = super::issues::resolve_issue_id(ac.db(), &ac.ws_id, &team_key, issue_number).await?;
     let comments = trakkt_auth::comment_service::list_comments(ac.db(), &issue_id)
         .await
         .into_sfn()?;
@@ -30,12 +30,13 @@ pub async fn list_comments(issue_number: i32) -> Result<Vec<Comment>, ServerFnEr
 /// Create a new comment on an issue.
 #[server(prefix = "/leptos-api")]
 pub async fn create_comment(
+    team_key: String,
     issue_number: i32,
     body: String,
     parent_id: Option<String>,
 ) -> Result<Comment, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let issue_id = super::issues::resolve_issue_id(ac.db(), &ac.ws_id, issue_number).await?;
+    let issue_id = super::issues::resolve_issue_id(ac.db(), &ac.ws_id, &team_key, issue_number).await?;
     let comment = trakkt_auth::comment_service::create_comment(
         ac.db(),
         &issue_id,

@@ -44,9 +44,8 @@ pub fn IssueRow(
     #[prop(optional, default = false)]
     archived: bool,
 ) -> impl IntoView {
-    let number = issue.number;
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
-    let issue_href = format!("/issues/{number}");
+    let issue_href = format!("/issues/{issue_key}");
     let status = IssueStatusVariant::parse(&issue.status_category);
     let row_ref = NodeRef::<leptos::html::A>::new();
 

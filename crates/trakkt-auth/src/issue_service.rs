@@ -3,7 +3,7 @@
 //! Issue service — CRUD operations for the `issues` table.
 //!
 //! Issues are the core entity in Trakkt. Each issue belongs to a team within
-//! a workspace and has a workspace-scoped auto-incrementing number. The service
+//! a workspace and has a team-scoped auto-incrementing number. The service
 //! supports dynamic filtering, label assignment, and full CRUD with sync log
 //! integration.
 
@@ -217,7 +217,7 @@ async fn fetch_labels_for_issues(
 
 /// Create a new issue in a team.
 ///
-/// The issue `number` is auto-incremented per workspace. Labels are attached
+/// The issue `number` is auto-incremented per team. Labels are attached
 /// via the `issue_labels` junction table.
 pub async fn create_issue(
     db: &DbPool,
@@ -254,6 +254,7 @@ pub async fn create_issue(
     // Atomic number generation: the subquery computes the next number inside the
     // INSERT statement so the MAX read and INSERT happen atomically, preventing
     // race conditions where concurrent creates read the same MAX.
+    // Numbers are scoped per-team (e.g. ENG-1, ENG-2, DES-1, DES-2).
     let due_date_cast = if is_pg { "CAST($10 AS TIMESTAMPTZ)" } else { "$10" };
     let sql = format!(
         "INSERT INTO issues \
@@ -261,7 +262,7 @@ pub async fn create_issue(
              status_id, priority, assignee_id, creator_id, due_date, \
              project_id, milestone_id, parent_issue_id, created_at, updated_at) \
          VALUES ($1, $2, $3, \
-                 (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE workspace_id = $2), \
+                 (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = $3), \
                  $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, $13, {now}, {now})"
     );
     trakkt_core::db_execute!(
@@ -370,20 +371,22 @@ pub async fn get_issue_by_id(
     }
 }
 
-/// Get a single issue by workspace-scoped number, with full details.
+/// Get a single issue by team key + number (e.g. "ENG-42"), with full details.
 pub async fn get_issue(
     db: &DbPool,
     workspace_id: &str,
+    team_key: &str,
     number: i32,
 ) -> trakkt_core::Result<Option<IssueWithDetails>> {
     let sql = format!(
-        "{ISSUE_DETAIL_SELECT} WHERE i.workspace_id = $1 AND i.number = $2"
+        "{ISSUE_DETAIL_SELECT} WHERE i.workspace_id = $1 AND t.key = $2 AND i.number = $3"
     );
     let row = trakkt_core::db_fetch_optional!(
         db,
         IssueDetailRow,
         &sql,
         workspace_id,
+        team_key,
         number
     )?;
 
@@ -529,18 +532,40 @@ pub async fn list_issues(
     Ok(results)
 }
 
-/// Update an issue by workspace-scoped number.
+/// Update an issue by team key + number (e.g. "ENG-42").
 ///
 /// Only fields present in `updates` are changed. `updated_at` is always set.
+/// When `team_id` changes, the issue is renumbered in the target team.
 pub async fn update_issue(
     db: &DbPool,
     workspace_id: &str,
+    team_key: &str,
     number: i32,
     updates: &IssueUpdate,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Issue> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
+
+    // Resolve the issue_id first — needed for parent validation, renumbering,
+    // and re-fetch. This also validates the issue exists.
+    let issue_id: String = trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query_scalar::<_, String>(
+            "SELECT i.issue_id FROM issues i \
+             JOIN teams t ON t.team_id = i.team_id \
+             WHERE i.workspace_id = $1 AND t.key = $2 AND i.number = $3"
+        )
+        .bind(workspace_id)
+        .bind(team_key)
+        .bind(number)
+        .fetch_optional(p)
+        .await
+    })?
+    .ok_or_else(|| {
+        trakkt_core::Error::NotFound(format!(
+            "issue {team_key}-{number} not found in workspace {workspace_id}"
+        ))
+    })?;
 
     // Dynamic SET clause — params are numbered sequentially starting at $1.
     let mut set_parts: Vec<String> = Vec::new();
@@ -605,22 +630,26 @@ pub async fn update_issue(
         param_idx += 1;
     }
 
+    // When team_id changes, assign a new number in the target team atomically.
     if updates.team_id.is_some() {
         set_parts.push(format!("team_id = ${param_idx}"));
         param_idx += 1;
+        set_parts.push(format!(
+            "number = (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = ${}", param_idx - 1
+        ));
+        // Close the subquery paren.
+        let last = set_parts.last_mut().unwrap();
+        last.push(')');
     }
 
     // Always update updated_at.
     set_parts.push(format!("updated_at = {now}"));
 
-    let ws_idx = param_idx;
-    param_idx += 1;
-    let num_idx = param_idx;
+    let id_idx = param_idx;
 
     let set_clause = set_parts.join(", ");
     let sql = format!(
-        "UPDATE issues SET {set_clause} \
-         WHERE workspace_id = ${ws_idx} AND number = ${num_idx}"
+        "UPDATE issues SET {set_clause} WHERE issue_id = ${id_idx}"
     );
 
     // Validate parent_issue_id — workspace isolation + prevent circular references.
@@ -639,15 +668,7 @@ pub async fn update_issue(
             ));
         }
 
-        // Resolve the current issue's ID for circular reference check.
-        let current_issue_id: String = trakkt_core::db_fetch_scalar!(
-            db,
-            String,
-            "SELECT issue_id FROM issues WHERE workspace_id = $1 AND number = $2",
-            workspace_id,
-            number
-        )?;
-        validate_no_circular_reference(db, &current_issue_id, proposed_parent_id).await?;
+        validate_no_circular_reference(db, &issue_id, proposed_parent_id).await?;
     }
 
     // Bind dynamically. Map to rows_affected() inside the closure so both
@@ -690,19 +711,18 @@ pub async fn update_issue(
             query = query.bind(v.as_str());
         }
 
-        query = query.bind(workspace_id);
-        query = query.bind(number);
+        query = query.bind(&issue_id);
 
         query.execute(p).await.map(|r| r.rows_affected())
     })?;
 
     if affected == 0 {
         return Err(trakkt_core::Error::NotFound(format!(
-            "issue #{number} not found in workspace {workspace_id}"
+            "issue {team_key}-{number} not found in workspace {workspace_id}"
         )));
     }
 
-    // Re-fetch the updated issue.
+    // Re-fetch the updated issue by UUID (number may have changed on team reassignment).
     let row = trakkt_core::db_fetch_one!(
         db,
         IssueRow,
@@ -712,9 +732,8 @@ pub async fn update_issue(
                 project_id, milestone_id, parent_issue_id, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
-         FROM issues WHERE workspace_id = $1 AND number = $2",
-        workspace_id,
-        number
+         FROM issues WHERE issue_id = $1",
+        &issue_id
     )?;
     let issue = row.into_dto();
 
@@ -750,33 +769,39 @@ pub async fn update_issue(
     Ok(issue)
 }
 
-/// Delete an issue by workspace-scoped number.
+/// Delete an issue by team key + number (e.g. "ENG-42").
 ///
 /// Cascading deletes remove associated issue_labels, comments, and watchers.
 pub async fn delete_issue(
     db: &DbPool,
     workspace_id: &str,
+    team_key: &str,
     number: i32,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // Fetch the issue_id first for the sync log entry.
-    let issue_row = trakkt_core::db_fetch_optional!(
-        db,
-        IssueRow,
-        "SELECT issue_id, workspace_id, team_id, number, title, description, \
-                status_id, priority, assignee_id, creator_id, \
-                CAST(due_date AS TEXT) AS due_date, \
-                project_id, milestone_id, parent_issue_id, sort_order, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM issues WHERE workspace_id = $1 AND number = $2",
-        workspace_id,
-        number
-    )?;
+    let issue_row: Option<IssueRow> = trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query_as::<_, IssueRow>(
+            "SELECT i.issue_id, i.workspace_id, i.team_id, i.number, i.title, i.description, \
+                    i.status_id, i.priority, i.assignee_id, i.creator_id, \
+                    CAST(i.due_date AS TEXT) AS due_date, \
+                    i.project_id, i.milestone_id, i.parent_issue_id, i.sort_order, \
+                    CAST(i.created_at AS TEXT) AS created_at, \
+                    CAST(i.updated_at AS TEXT) AS updated_at \
+             FROM issues i \
+             JOIN teams t ON t.team_id = i.team_id \
+             WHERE i.workspace_id = $1 AND t.key = $2 AND i.number = $3"
+        )
+        .bind(workspace_id)
+        .bind(team_key)
+        .bind(number)
+        .fetch_optional(p)
+        .await
+    })?;
 
     let issue_row = issue_row.ok_or_else(|| {
         trakkt_core::Error::NotFound(format!(
-            "issue #{number} not found in workspace {workspace_id}"
+            "issue {team_key}-{number} not found in workspace {workspace_id}"
         ))
     })?;
 
@@ -892,41 +917,45 @@ pub async fn set_issue_labels(
 pub async fn set_sort_order(
     db: &DbPool,
     workspace_id: &str,
+    team_key: &str,
     issue_number: i32,
     sort_order: f64,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let now = sql_compat::now(db.is_postgres());
 
-    let sql = format!(
-        "UPDATE issues SET sort_order = $1, updated_at = {now} \
-         WHERE workspace_id = $2 AND number = $3"
-    );
-
-    let affected: u64 = trakkt_core::db_with_pool!(db, |p| {
-        sqlx::query(&sql)
-            .bind(sort_order)
-            .bind(workspace_id)
-            .bind(issue_number)
-            .execute(p)
-            .await
-            .map(|r| r.rows_affected())
+    // Resolve issue_id first — needed for the UPDATE and sync log/broadcast.
+    let issue_id: String = trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query_scalar::<_, String>(
+            "SELECT i.issue_id FROM issues i \
+             JOIN teams t ON t.team_id = i.team_id \
+             WHERE i.workspace_id = $1 AND t.key = $2 AND i.number = $3"
+        )
+        .bind(workspace_id)
+        .bind(team_key)
+        .bind(issue_number)
+        .fetch_optional(p)
+        .await
+    })?
+    .ok_or_else(|| {
+        trakkt_core::Error::NotFound(format!(
+            "issue {team_key}-{issue_number} not found in workspace {workspace_id}"
+        ))
     })?;
 
-    if affected == 0 {
-        return Err(trakkt_core::Error::NotFound(format!(
-            "issue #{issue_number} not found in workspace {workspace_id}"
-        )));
-    }
+    // UPDATE using the resolved issue_id directly — no subquery needed.
+    let sql = format!(
+        "UPDATE issues SET sort_order = $1, updated_at = {now} WHERE issue_id = $2"
+    );
 
-    // Resolve issue_id for sync log + broadcast.
-    let issue_id: String = trakkt_core::db_fetch_scalar!(
-        db,
-        String,
-        "SELECT issue_id FROM issues WHERE workspace_id = $1 AND number = $2",
-        workspace_id,
-        issue_number
-    )?;
+    trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query(&sql)
+            .bind(sort_order)
+            .bind(&issue_id)
+            .execute(p)
+            .await
+            .map(|_| ())
+    })?;
 
     // Sync log — best-effort.
     if let Err(e) = sync_log_service::write_sync_entry(
