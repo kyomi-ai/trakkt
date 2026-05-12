@@ -522,9 +522,7 @@ fn IssueListInner(
 
             // ── Tab bar (team-scoped pages only) ───────────────────────────
             {move || {
-                if team_key.is_none() {
-                    return None;
-                }
+                team_key?;
 
                 let on_all = move |_: web_sys::MouseEvent| {
                     set_active_tab.set("all".to_string());

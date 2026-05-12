@@ -584,16 +584,14 @@ fn SidebarEntityItem(
             format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)]")
         }
     };
-    let has_favorite = favorite_type.is_some() && favorite_id.is_some();
     view! {
         <div class=wrapper_class>
             <a href=href class=link_class>
                 <Icon icon=icon weight=weight size="16px"/>
                 <span class="truncate">{name}</span>
             </a>
-            {has_favorite.then(|| {
-                let ft = favorite_type.unwrap();
-                let fi = favorite_id.clone().unwrap();
+            {favorite_type.zip(favorite_id.as_ref()).map(|(ft, fi)| {
+                let fi = fi.clone();
                 view! {
                     <div class="flex items-center gap-1 pr-2 opacity-0 group-hover:opacity-100 transition-opacity">
                         <FavoriteToggle target_type=ft target_id=fi/>
@@ -757,12 +755,12 @@ fn SidebarTeamSubNav(
         let outer = outer_ref.get();
         let cb = Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |ev: web_sys::MouseEvent| {
             if !menu_open.get_untracked() { return; }
-            if let Some(ref el) = outer {
-                if let Some(target) = ev.target() {
-                    let target_node: web_sys::Node = target.unchecked_into();
-                    if !el.contains(Some(&target_node)) {
-                        set_menu_open.set(false);
-                    }
+            if let Some(ref el) = outer
+                && let Some(target) = ev.target()
+            {
+                let target_node: web_sys::Node = target.unchecked_into();
+                if !el.contains(Some(&target_node)) {
+                    set_menu_open.set(false);
                 }
             }
         });

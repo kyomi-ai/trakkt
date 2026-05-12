@@ -313,7 +313,6 @@ fn IssueDetailContent(
     let (show_link_sub_issue, set_show_link_sub_issue) = signal(false);
 
     let on_sub_issue_created = {
-        let on_change = on_change;
         Callback::new(move |()| {
             set_show_new_sub_issue.set(false);
             on_change.run(());
@@ -666,7 +665,7 @@ fn MetadataSidebar(
                 <div node_ref=status_trigger_ref>
                     <DropdownTrigger
                         label="Status"
-                        value=Signal::derive(move || current_status_name())
+                        value=Signal::derive(current_status_name)
                         icon=Arc::new(move || {
                             view! { <IssueStatusBadge status=status_variant size=12/> }.into_any()
                         }) as ChildrenFn

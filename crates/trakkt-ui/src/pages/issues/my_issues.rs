@@ -84,7 +84,7 @@ pub fn MyIssuesPage() -> impl IntoView {
 
     // ── All issues (raw, unfiltered) ──────────────────────────────────────
     let all_issues = Memo::new(move |_| {
-        let raw = if let Some(store) = sync_store {
+        if let Some(store) = sync_store {
             let issues = store.issues().get();
             if !issues.is_empty() || store.initialized().get() {
                 issues
@@ -113,8 +113,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                 }
                 None => Vec::new(),
             }
-        };
-        raw
+        }
     });
 
     // ── Filter helper (closure over search/status/priority/archive signals) ─
@@ -421,7 +420,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                                         view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
-                                    view! {}.into_any()
+                                    ().into_any()
                                 }}
                             </CollapsibleSection>
                         })
@@ -448,7 +447,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                                         view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
-                                    view! {}.into_any()
+                                    ().into_any()
                                 }}
                             </CollapsibleSection>
                         })
@@ -472,7 +471,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                                         view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
-                                    view! {}.into_any()
+                                    ().into_any()
                                 }}
                             </CollapsibleSection>
                         })

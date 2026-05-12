@@ -4,6 +4,10 @@
 //!
 //! Thin wrappers around `trakkt_auth::issue_service` — extract auth,
 //! call service, return. No business logic lives here.
+//!
+//! Leptos server functions receive each field as a separate parameter
+//! (no struct grouping), so many-argument signatures are unavoidable.
+//! The workspace-root `clippy.toml` raises the threshold to 14.
 
 use leptos::prelude::*;
 use trakkt_types::models::{Issue, IssueWithDetails};

@@ -118,15 +118,20 @@ pub async fn get_default_status(
     }
 }
 
+/// Parameters for creating a new status.
+pub struct CreateStatusParams<'a> {
+    pub workspace_id: &'a str,
+    pub team_id: Option<&'a str>,
+    pub name: &'a str,
+    pub category: &'a str,
+    pub position: i32,
+    pub color: Option<&'a str>,
+}
+
 /// Create a new status in a workspace.
 pub async fn create_status(
     db: &DbPool,
-    workspace_id: &str,
-    team_id: Option<&str>,
-    name: &str,
-    category: &str,
-    position: i32,
-    color: Option<&str>,
+    params: &CreateStatusParams<'_>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Status> {
     let is_pg = db.is_postgres();
@@ -141,12 +146,12 @@ pub async fn create_status(
         db,
         &sql,
         &status_id,
-        workspace_id,
-        team_id,
-        name,
-        category,
-        position,
-        color
+        params.workspace_id,
+        params.team_id,
+        params.name,
+        params.category,
+        params.position,
+        params.color
     )?;
 
     // Sync log — best-effort.
@@ -154,7 +159,7 @@ pub async fn create_status(
         db,
         entity_types::STATUS,
         &status_id,
-        workspace_id,
+        params.workspace_id,
         SyncActionType::Insert,
         None,
     )
@@ -165,7 +170,7 @@ pub async fn create_status(
 
     // WebSocket broadcast — best-effort.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::STATUS, workspace_id).await;
+        sync_log_service::broadcast_sync_notify(ws, entity_types::STATUS, params.workspace_id).await;
     }
 
     // Re-fetch to get the DB-assigned created_at.

@@ -261,7 +261,7 @@ pub fn BoardContent(
             } else if insert_idx == 0 {
                 col_issues[0].sort_order.unwrap_or(1.0) - 1.0
             } else if insert_idx >= col_issues.len() {
-                col_issues.last().unwrap().sort_order.unwrap_or(col_issues.len() as f64) + 1.0
+                col_issues.last().expect("col_issues is non-empty at this branch").sort_order.unwrap_or(col_issues.len() as f64) + 1.0
             } else {
                 let prev = col_issues[insert_idx - 1].sort_order.unwrap_or((insert_idx - 1) as f64);
                 let next = col_issues[insert_idx].sort_order.unwrap_or(insert_idx as f64);
@@ -744,9 +744,7 @@ fn BoardCard(
 
     let card_class = move || {
         let base = "bg-card border border-border rounded-md p-4 shadow-sm hover:shadow-md transition-shadow cursor-grab focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
-        if is_dragging() {
-            format!("{base} opacity-50")
-        } else if archived {
+        if is_dragging() || archived {
             format!("{base} opacity-50")
         } else {
             base.to_string()
@@ -790,13 +788,13 @@ fn BoardCard(
             on:dragover=move |ev: web_sys::DragEvent| {
                 ev.prevent_default();
                 // Compute whether cursor is in the top or bottom half of the card.
-                if let Some(target) = ev.current_target() {
-                    if let Ok(el) = target.dyn_into::<web_sys::HtmlElement>() {
-                        let rect = el.get_bounding_client_rect();
-                        let mid = rect.top() + rect.height() / 2.0;
-                        let insert_at = if (ev.client_y() as f64) <= mid { idx } else { idx + 1 };
-                        set_drop_insert_idx.set(Some(insert_at));
-                    }
+                if let Some(target) = ev.current_target()
+                    && let Ok(el) = target.dyn_into::<web_sys::HtmlElement>()
+                {
+                    let rect = el.get_bounding_client_rect();
+                    let mid = rect.top() + rect.height() / 2.0;
+                    let insert_at = if (ev.client_y() as f64) <= mid { idx } else { idx + 1 };
+                    set_drop_insert_idx.set(Some(insert_at));
                 }
             }
             on:click=navigate_to_issue

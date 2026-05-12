@@ -4,6 +4,10 @@
 //!
 //! Thin wrappers around `trakkt_auth::project_service` — extract auth,
 //! call service, return. No business logic lives here.
+//!
+//! Leptos server functions receive each field as a separate parameter
+//! (no struct grouping), so many-argument signatures are unavoidable.
+//! The workspace-root `clippy.toml` raises the threshold to 14.
 
 use leptos::prelude::*;
 use trakkt_types::models::{Project, ProjectMember, ProjectMilestone};
@@ -33,10 +37,10 @@ pub async fn get_project(project_id: String) -> Result<Option<Project>, ServerFn
         .into_sfn()?;
 
     // Verify the project belongs to this workspace.
-    if let Some(ref p) = project {
-        if p.workspace_id != ac.ws_id {
-            return Ok(None);
-        }
+    if let Some(ref p) = project
+        && p.workspace_id != ac.ws_id
+    {
+        return Ok(None);
     }
 
     Ok(project)
@@ -58,14 +62,16 @@ pub async fn create_project(
     let ac = AuthenticatedContext::extract().await?;
     let project = trakkt_auth::project_service::create_project(
         ac.db(),
-        &ac.ws_id,
-        &name,
-        description.as_deref(),
-        icon.as_deref(),
-        color.as_deref(),
-        lead_id.as_deref(),
-        start_date.as_deref(),
-        target_date.as_deref(),
+        &trakkt_auth::project_service::CreateProjectParams {
+            workspace_id: &ac.ws_id,
+            name: &name,
+            description: description.as_deref(),
+            icon: icon.as_deref(),
+            color: color.as_deref(),
+            lead_id: lead_id.as_deref(),
+            start_date: start_date.as_deref(),
+            target_date: target_date.as_deref(),
+        },
         ac.ctx.ws_manager.as_ref(),
     )
     .await
@@ -96,15 +102,17 @@ pub async fn update_project(
 
     let project = trakkt_auth::project_service::update_project(
         ac.db(),
-        &project_id,
-        name.as_deref(),
-        description.as_deref(),
-        icon.as_deref(),
-        color.as_deref(),
-        status.as_deref(),
-        lead_id.as_ref().map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
-        start_date.as_ref().map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
-        target_date.as_ref().map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
+        &trakkt_auth::project_service::UpdateProjectParams {
+            project_id: &project_id,
+            name: name.as_deref(),
+            description: description.as_deref(),
+            icon: icon.as_deref(),
+            color: color.as_deref(),
+            status: status.as_deref(),
+            lead_id: lead_id.as_ref().map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
+            start_date: start_date.as_ref().map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
+            target_date: target_date.as_ref().map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
+        },
         ac.ctx.ws_manager.as_ref(),
     )
     .await
