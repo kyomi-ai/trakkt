@@ -83,6 +83,16 @@ pub async fn create_team(
     creator_id: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Team> {
+    // Validate key format: 2-5 uppercase alphanumeric characters (no hyphens).
+    if key.len() < 2
+        || key.len() > 5
+        || !key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return Err(trakkt_core::Error::BadRequest(
+            "Team key must be 2-5 uppercase alphanumeric characters".into(),
+        ));
+    }
+
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
     let team_id = uuid::Uuid::new_v4().to_string();

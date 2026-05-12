@@ -164,28 +164,38 @@ pub(crate) fn trakkt_kode_theme() -> kode_leptos::Theme {
 #[component]
 pub fn IssueDetailPage() -> impl IntoView {
     let params = use_params_map();
-    let number = Memo::new(move |_| {
-        params
-            .get()
-            .get("number")
-            .and_then(|n| n.parse::<i32>().ok())
-            .unwrap_or(0)
+
+    // Parse `:identifier` param as `TEAM-123` format.
+    // Split on the first `-` — team keys are alphanumeric (no hyphens).
+    let identifier = Memo::new(move |_| {
+        let raw = params.get().get("identifier").unwrap_or_default();
+        let parts: Vec<&str> = raw.splitn(2, '-').collect();
+        if parts.len() == 2 {
+            let tk = parts[0].to_string();
+            let num = parts[1].parse::<i32>().unwrap_or(0);
+            (tk, num)
+        } else {
+            (String::new(), 0)
+        }
     });
+    let team_key = Memo::new(move |_| identifier.get().0);
+    let number = Memo::new(move |_| identifier.get().1);
 
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (version, set_version) = signal(0u32);
 
     let server_issue = Resource::new(
-        move || (number.get(), version.get()),
-        move |(num, _)| async move { get_issue(num).await },
+        move || (team_key.get(), number.get(), version.get()),
+        move |(tk, num, _)| async move { get_issue(tk, num).await },
     );
 
     let issue_data = Signal::derive(move || {
+        let tk = team_key.get();
         let num = number.get();
         if let Some(store) = sync_store {
             let items = store.issues().get();
-            if let Some(issue) = items.iter().find(|i| i.number == num) {
+            if let Some(issue) = items.iter().find(|i| i.team_key == tk && i.number == num) {
                 return Some(Ok(Some(issue.clone())));
             }
             if store.initialized().get() {
@@ -196,8 +206,8 @@ pub fn IssueDetailPage() -> impl IntoView {
     });
 
     let comments_resource = Resource::new(
-        move || (number.get(), version.get()),
-        move |(num, _)| async move { list_comments(num).await },
+        move || (team_key.get(), number.get(), version.get()),
+        move |(tk, num, _)| async move { list_comments(tk, num).await },
     );
 
     let refetch = move || set_version.update(|v| *v += 1);
@@ -218,7 +228,7 @@ pub fn IssueDetailPage() -> impl IntoView {
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>
                 </Button>
                 <span class="font-mono text-sm text-muted-foreground">
-                    {move || format!("#{}", number.get())}
+                    {move || format!("{}-{}", team_key.get(), number.get())}
                 </span>
             </div>
 
@@ -240,7 +250,7 @@ pub fn IssueDetailPage() -> impl IntoView {
                             }.into_any()
                         }
                         Some(Ok(None)) => {
-                            view! { <IssueNotFound number=number.get()/> }.into_any()
+                            view! { <IssueNotFound identifier=format!("{}-{}", team_key.get(), number.get())/> }.into_any()
                         }
                         Some(Err(_)) => {
                             view! {
@@ -274,13 +284,14 @@ fn IssueDetailContent(
     on_change: Callback<()>,
 ) -> impl IntoView {
     let number = initial_issue.number;
+    let issue_team_key_for_lookup = initial_issue.team_key.clone();
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let initial = RwSignal::new(initial_issue);
 
     let issue = Signal::derive(move || {
         if let Some(store) = sync_store {
             let items = store.issues().get();
-            if let Some(found) = items.iter().find(|i| i.number == number) {
+            if let Some(found) = items.iter().find(|i| i.team_key == issue_team_key_for_lookup && i.number == number) {
                 return found.clone();
             }
         }
@@ -325,7 +336,7 @@ fn IssueDetailContent(
                     let parent = store.issues().get().into_iter().find(|p| p.issue_id == *parent_id)?;
                     Some(view! {
                         <a
-                            href=format!("/issues/{}", parent.number)
+                            href=format!("/issues/{}-{}", parent.team_key, parent.number)
                             class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1 mb-1"
                         >
                             <Icon icon=phosphor_leptos::ARROW_BEND_UP_LEFT size="12px"/>
@@ -337,7 +348,7 @@ fn IssueDetailContent(
                 // ── Title ──────────────────────────────────────────────
                 {move || {
                     let i = issue.get();
-                    view! { <EditableTitle number=number title=i.title.clone() on_save=on_change/> }
+                    view! { <EditableTitle team_key=i.team_key.clone() number=number title=i.title.clone() on_save=on_change/> }
                 }}
 
                 // ── Description ────────────────────────────────────────
@@ -345,6 +356,7 @@ fn IssueDetailContent(
                     let i = issue.get();
                     view! {
                         <DescriptionEditor
+                            team_key=i.team_key.clone()
                             number=number
                             description=i.description.clone().unwrap_or_default()
                             on_save=on_change
@@ -364,6 +376,7 @@ fn IssueDetailContent(
 
                 // ── Comments ───────────────────────────────────────────
                 <CommentsSection
+                    team_key=initial.get_untracked().team_key.clone()
                     number=number
                     comments=comments
                     on_comment_added=on_change
@@ -412,11 +425,13 @@ fn IssueDetailContent(
             on_select=Callback::new({
                 let parent_id = issue_id_for_link.clone();
                 move |selected: IssueWithDetails| {
+                    let child_team_key = selected.team_key.clone();
                     let child_number = selected.number;
                     let parent_id = parent_id.clone();
                     set_show_link_sub_issue.set(false);
                     leptos::task::spawn_local(async move {
                         let _ = update_issue(
+                            child_team_key,
                             child_number,
                             None, None, None, None, None, None, None, None,
                             Some(parent_id),
@@ -447,6 +462,7 @@ fn IssueDetailContent(
 /// Inline-editable title — click to edit, Enter or blur to save.
 #[component]
 fn EditableTitle(
+    team_key: String,
     number: i32,
     title: String,
     on_save: Callback<()>,
@@ -456,6 +472,7 @@ fn EditableTitle(
     let (saving, set_saving) = signal(false);
     let original_title = title.clone();
     let input_ref = NodeRef::<leptos::html::Input>::new();
+    let stored_team_key = StoredValue::new(team_key);
 
     let save_title = move || {
         let new_title = current_title.get_untracked();
@@ -465,8 +482,10 @@ fn EditableTitle(
         set_editing.set(false);
         set_saving.set(true);
 
+        let tk = stored_team_key.get_value();
         leptos::task::spawn_local(async move {
             let _ = update_issue(
+                tk,
                 number,
                 Some(new_title),
                 None, // description
@@ -553,6 +572,7 @@ fn MetadataSidebar(
     on_change: Callback<()>,
 ) -> impl IntoView {
     let number = issue.number;
+    let issue_team_key = issue.team_key.clone();
     let current_status_id = issue.status_id.clone();
     let current_status_category = issue.status_category.clone();
     let priority = issue.priority;
@@ -567,9 +587,12 @@ fn MetadataSidebar(
     let statuses_resource = LocalResource::new(move || list_statuses(None));
 
     // ── Status change handler ───────────────────────────────────────────
+    let stored_tk = StoredValue::new(issue_team_key.clone());
     let on_status_change = move |new_status_id: String| {
+        let tk = stored_tk.get_value();
         leptos::task::spawn_local(async move {
             let _ = update_issue(
+                tk,
                 number,
                 None, // title
                 None, // description
@@ -591,8 +614,10 @@ fn MetadataSidebar(
     // ── Priority change handler ─────────────────────────────────────────
     let on_priority_change = move |new_priority: String| {
         let prio = new_priority.parse::<i32>().unwrap_or(0);
+        let tk = stored_tk.get_value();
         leptos::task::spawn_local(async move {
             let _ = update_issue(
+                tk,
                 number,
                 None, // title
                 None, // description
@@ -719,6 +744,7 @@ fn MetadataSidebar(
 
             // ── Labels ─────────────────────────────────────────────────
             <LabelPicker
+                team_key=issue_team_key.clone()
                 number=number
                 team_id=issue.team_id.clone()
                 current_labels=issue.labels.clone()
@@ -740,7 +766,7 @@ fn MetadataSidebar(
             </div>
 
             // ── Watch toggle ──────────────────────────────────────────────
-            <WatchToggle number=number/>
+            <WatchToggle team_key=issue_team_key.clone() number=number/>
 
             // ── Parent issue ──────────────────────────────────────────────
             <div>
@@ -753,8 +779,9 @@ fn MetadataSidebar(
                         });
                         if let Some(p) = parent {
                             let parent_key = format!("{}-{}", p.team_key, p.number);
-                            let parent_href = format!("/issues/{}", p.number);
+                            let parent_href = format!("/issues/{}-{}", p.team_key, p.number);
                             let parent_title = p.title.clone();
+                            let tk_for_remove = issue_team_key.clone();
                             view! {
                                 <div class="flex items-center gap-1.5 min-w-0">
                                     <a href=parent_href class="text-sm text-foreground hover:underline truncate flex items-center gap-1">
@@ -765,8 +792,10 @@ fn MetadataSidebar(
                                         class="text-muted-foreground hover:text-foreground transition-colors shrink-0"
                                         title="Remove parent"
                                         on:click=move |_| {
+                                            let tk = tk_for_remove.clone();
                                             leptos::task::spawn_local(async move {
                                                 let _ = update_issue(
+                                                    tk,
                                                     number,
                                                     None, None, None, None, None, None, None, None,
                                                     None,
@@ -808,18 +837,23 @@ fn MetadataSidebar(
         <IssuePickerModal
             show=Signal::derive(move || show_parent_picker.get())
             on_close=Callback::new(move |()| set_show_parent_picker.set(false))
-            on_select=Callback::new(move |selected: IssueWithDetails| {
-                let parent_id = selected.issue_id.clone();
-                set_show_parent_picker.set(false);
-                leptos::task::spawn_local(async move {
-                    let _ = update_issue(
-                        number,
-                        None, None, None, None, None, None, None, None,
-                        Some(parent_id),
-                        None,
-                        None,
-                    ).await;
-                });
+            on_select=Callback::new({
+                let tk = issue_team_key.clone();
+                move |selected: IssueWithDetails| {
+                    let parent_id = selected.issue_id.clone();
+                    let tk = tk.clone();
+                    set_show_parent_picker.set(false);
+                    leptos::task::spawn_local(async move {
+                        let _ = update_issue(
+                            tk,
+                            number,
+                            None, None, None, None, None, None, None, None,
+                            Some(parent_id),
+                            None,
+                            None,
+                        ).await;
+                    });
+                }
             })
             exclude_ids=Signal::derive({
                 let issue_id = issue_id_for_parent_exclude;
@@ -836,11 +870,12 @@ fn MetadataSidebar(
 
 /// Eye icon button that toggles watch/unwatch state for an issue.
 #[component]
-fn WatchToggle(number: i32) -> impl IntoView {
+fn WatchToggle(team_key: String, number: i32) -> impl IntoView {
+    let tk = team_key.clone();
     let (version, set_version) = signal(0u32);
     let watching_resource = Resource::new(
-        move || (number, version.get()),
-        move |(num, _)| async move { is_watching(num).await },
+        move || (tk.clone(), number, version.get()),
+        move |(tk, num, _)| async move { is_watching(tk, num).await },
     );
 
     let (loading, set_loading) = signal(false);
@@ -855,11 +890,12 @@ fn WatchToggle(number: i32) -> impl IntoView {
             .unwrap_or(false);
 
         set_loading.set(true);
+        let tk = team_key.clone();
         leptos::task::spawn_local(async move {
             let result = if currently_watching {
-                unwatch_issue(number).await
+                unwatch_issue(tk, number).await
             } else {
-                watch_issue(number).await
+                watch_issue(tk, number).await
             };
             if let Err(e) = result {
                 tracing::warn!("Failed to toggle watch: {e}");
@@ -910,6 +946,7 @@ fn WatchToggle(number: i32) -> impl IntoView {
 
 #[component]
 fn LabelPicker(
+    team_key: String,
     number: i32,
     /// The team_id of the issue, used to scope the label list.
     team_id: String,
@@ -921,6 +958,7 @@ fn LabelPicker(
         current_labels.iter().map(|l| l.label_id.clone()).collect::<Vec<_>>()
     );
     let current_display = RwSignal::new(current_labels);
+    let stored_tk = StoredValue::new(team_key);
 
     let team_id_for_fetch = Some(team_id);
     let all_labels = LocalResource::new(move || {
@@ -941,9 +979,10 @@ fn LabelPicker(
         current_ids.set(ids.clone());
         current_display.set(display);
 
+        let tk = stored_tk.get_value();
         let label_ids_str = ids.join(",");
         leptos::task::spawn_local(async move {
-            let _ = set_issue_labels(number, label_ids_str).await;
+            let _ = set_issue_labels(tk, number, label_ids_str).await;
             on_change.run(());
         });
     };
@@ -1042,6 +1081,7 @@ fn LabelPicker(
 /// the counter has not changed (i.e., no newer edits arrived).
 #[component]
 fn DescriptionEditor(
+    team_key: String,
     number: i32,
     description: String,
     on_save: Callback<()>,
@@ -1054,11 +1094,13 @@ fn DescriptionEditor(
     let latest_text = RwSignal::new(String::new());
     let edit_version = RwSignal::new(0u32);
 
+    let tk = team_key.clone();
     let on_change: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text: String| {
         latest_text.set(text);
         edit_version.update(|v| *v += 1);
         let snapshot = edit_version.get_untracked();
 
+        let tk = tk.clone();
         leptos::task::spawn_local(async move {
             gloo_timers::future::TimeoutFuture::new(500).await;
             if edit_version.get_untracked() != snapshot {
@@ -1071,6 +1113,7 @@ fn DescriptionEditor(
                 Some(current_text)
             };
             let _ = update_issue(
+                tk,
                 number,
                 None, // title
                 desc,
@@ -1303,7 +1346,7 @@ fn SubIssuesSection(
                         let rows = items.into_iter().map(|child| {
                             let child_status = IssueStatusVariant::parse(&child.status_category);
                             let child_key = format!("{}-{}", child.team_key, child.number);
-                            let child_href = format!("/issues/{}", child.number);
+                            let child_href = format!("/issues/{}-{}", child.team_key, child.number);
                             let child_title = child.title.clone();
                             let assignee_name = child.assignee_name.clone();
                             view! {
@@ -1338,6 +1381,7 @@ fn SubIssuesSection(
 /// Comments section with threaded display and new comment form.
 #[component]
 fn CommentsSection(
+    team_key: String,
     number: i32,
     comments: Vec<Comment>,
     on_comment_added: Callback<()>,
@@ -1391,7 +1435,7 @@ fn CommentsSection(
             </div>
 
             // ── New comment form ───────────────────────────────────────
-            <NewCommentForm number=number on_created=on_comment_added/>
+            <NewCommentForm team_key=team_key.clone() number=number on_created=on_comment_added/>
         </div>
     }
 }
@@ -1437,7 +1481,7 @@ fn CommentItem(comment: Comment) -> impl IntoView {
 
 /// Form for adding a new comment with kode WYSIWYG editor.
 #[component]
-fn NewCommentForm(number: i32, on_created: Callback<()>) -> impl IntoView {
+fn NewCommentForm(team_key: String, number: i32, on_created: Callback<()>) -> impl IntoView {
     use kode_leptos::TreeWysiwygEditor;
 
     let content = RwSignal::new(String::new());
@@ -1452,8 +1496,9 @@ fn NewCommentForm(number: i32, on_created: Callback<()>) -> impl IntoView {
         }
 
         set_submitting.set(true);
+        let tk = team_key.clone();
         leptos::task::spawn_local(async move {
-            match create_comment(number, body, None).await {
+            match create_comment(tk, number, body, None).await {
                 Ok(_) => {
                     content.set(String::new());
                     set_submitting.set(false);
@@ -1556,13 +1601,13 @@ fn IssueDetailSkeleton() -> impl IntoView {
 // Not Found State
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Displayed when the issue number does not resolve to an issue.
+/// Displayed when the issue identifier does not resolve to an issue.
 #[component]
-fn IssueNotFound(number: i32) -> impl IntoView {
+fn IssueNotFound(identifier: String) -> impl IntoView {
     view! {
         <div class="max-w-[860px] mx-auto w-full text-center py-16">
             <h2 class="text-xl font-semibold text-foreground mb-2">
-                {format!("Issue #{number} not found")}
+                {format!("Issue {identifier} not found")}
             </h2>
             <p class="text-muted-foreground mb-6">
                 "This issue may have been deleted or you don\u{2019}t have access."

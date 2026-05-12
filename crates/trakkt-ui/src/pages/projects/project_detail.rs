@@ -291,9 +291,8 @@ fn ProjectDetailContent(
 /// Order: Priority | Status | Issue ID (team-key + number) | Title | Labels | Date
 #[component]
 fn ProjectIssueRow(issue: IssueWithDetails) -> impl IntoView {
-    let number = issue.number;
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
-    let issue_href = format!("/issues/{number}");
+    let issue_href = format!("/issues/{issue_key}");
     let status = IssueStatusVariant::parse(&issue.status_category);
 
     view! {

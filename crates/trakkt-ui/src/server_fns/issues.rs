@@ -22,21 +22,22 @@ fn parse_label_ids(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Resolve a workspace-scoped issue number to its `issue_id`.
+/// Resolve a team-scoped issue identifier (team_key + number) to its `issue_id`.
 ///
-/// Used by server functions that need to convert from the user-facing number
-/// (e.g. "#42") to the internal UUID used by service functions.
+/// Used by server functions that need to convert from the user-facing identifier
+/// (e.g. "ENG-42") to the internal UUID used by service functions.
 #[cfg(feature = "ssr")]
 pub(crate) async fn resolve_issue_id(
     db: &trakkt_core::DbPool,
     workspace_id: &str,
+    team_key: &str,
     number: i32,
 ) -> Result<String, ServerFnError> {
     use super::IntoServerFnError;
-    let issue = trakkt_auth::issue_service::get_issue(db, workspace_id, number)
+    let issue = trakkt_auth::issue_service::get_issue(db, workspace_id, team_key, number)
         .await
         .into_sfn()?
-        .ok_or_else(|| ServerFnError::new(format!("Issue #{number} not found")))?;
+        .ok_or_else(|| ServerFnError::new(format!("Issue {team_key}-{number} not found")))?;
     Ok(issue.issue_id)
 }
 
@@ -72,11 +73,11 @@ pub async fn list_issues(
     Ok(issues)
 }
 
-/// Get a single issue by its workspace-scoped number.
+/// Get a single issue by its team key + number (e.g. "ENG-42").
 #[server(prefix = "/leptos-api")]
-pub async fn get_issue(number: i32) -> Result<Option<IssueWithDetails>, ServerFnError> {
+pub async fn get_issue(team_key: String, number: i32) -> Result<Option<IssueWithDetails>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let issue = trakkt_auth::issue_service::get_issue(ac.db(), &ac.ws_id, number)
+    let issue = trakkt_auth::issue_service::get_issue(ac.db(), &ac.ws_id, &team_key, number)
         .await
         .into_sfn()?;
     Ok(issue)
@@ -164,6 +165,7 @@ pub async fn create_issue(
 /// This avoids `Option<Option<T>>` which cannot round-trip through Leptos form encoding.
 #[server(prefix = "/leptos-api")]
 pub async fn update_issue(
+    team_key: String,
     number: i32,
     title: Option<String>,
     description: Option<String>,
@@ -197,17 +199,17 @@ pub async fn update_issue(
         sort_order: if clear_sort_order == Some(true) { Some(None) } else { None },
         team_id: None,
     };
-    let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, number, &updates, ac.ctx.ws_manager.as_ref())
+    let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, &team_key, number, &updates, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(issue)
 }
 
-/// Delete an issue by its workspace-scoped number.
+/// Delete an issue by its team key + number (e.g. "ENG-42").
 #[server(prefix = "/leptos-api")]
-pub async fn delete_issue(number: i32) -> Result<(), ServerFnError> {
+pub async fn delete_issue(team_key: String, number: i32) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    trakkt_auth::issue_service::delete_issue(ac.db(), &ac.ws_id, number, ac.ctx.ws_manager.as_ref())
+    trakkt_auth::issue_service::delete_issue(ac.db(), &ac.ws_id, &team_key, number, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(())
@@ -216,6 +218,7 @@ pub async fn delete_issue(number: i32) -> Result<(), ServerFnError> {
 /// Set the sort order for an issue (board drag-to-reorder).
 #[server(prefix = "/leptos-api")]
 pub async fn set_issue_sort_order(
+    team_key: String,
     issue_number: i32,
     sort_order: f64,
 ) -> Result<(), ServerFnError> {
@@ -223,6 +226,7 @@ pub async fn set_issue_sort_order(
     trakkt_auth::issue_service::set_sort_order(
         ac.db(),
         &ac.ws_id,
+        &team_key,
         issue_number,
         sort_order,
         ac.ctx.ws_manager.as_ref(),
@@ -237,13 +241,14 @@ pub async fn set_issue_sort_order(
 /// `label_ids` is a comma-separated string of label UUIDs.
 #[server(prefix = "/leptos-api")]
 pub async fn set_issue_labels(
+    team_key: String,
     number: i32,
     label_ids: String,
 ) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
 
-    // Resolve the workspace-scoped number to an issue_id.
-    let issue_id = resolve_issue_id(ac.db(), &ac.ws_id, number).await?;
+    // Resolve the team-scoped identifier to an issue_id.
+    let issue_id = resolve_issue_id(ac.db(), &ac.ws_id, &team_key, number).await?;
 
     let parsed_label_ids = parse_label_ids(&label_ids);
 

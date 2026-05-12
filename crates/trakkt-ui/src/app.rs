@@ -112,7 +112,7 @@ pub fn App() -> impl IntoView {
 
                     // Legacy /issues redirect — send to /my-issues
                     <Route path=path!("/issues") view=|| view! { <Redirect path="/my-issues"/> }/>
-                    <Route path=path!("/issues/:number") view=IssueDetailPage/>
+                    <Route path=path!("/issues/:identifier") view=IssueDetailPage/>
 
                     // Saved views
                     <Route path=path!("/views/:view_id") view=ViewPage/>

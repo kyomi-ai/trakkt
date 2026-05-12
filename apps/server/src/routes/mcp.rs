@@ -452,16 +452,23 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "get_issue",
-                "description": "Get a single issue by its workspace-scoped number, including full details (description, labels, assignee, creator) and all comments.",
+                "description": "Get a single issue by its team-scoped identifier (e.g. 'TRA-35'), including full details (description, labels, assignee, creator) and all comments.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "issue_identifier": {
+                            "type": "string",
+                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
+                        },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
+                        },
                         "issue_number": {
                             "type": "integer",
-                            "description": "The workspace-scoped issue number (e.g. 42 for TRK-42)"
+                            "description": "Issue number within the team. Required if issue_identifier is not provided."
                         }
-                    },
-                    "required": ["issue_number"]
+                    }
                 }
             },
             {
@@ -514,9 +521,17 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "issue_identifier": {
+                            "type": "string",
+                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
+                        },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided. Also used as the target team when moving an issue (use move_to_team_id or move_to_team_key instead)."
+                        },
                         "issue_number": {
                             "type": "integer",
-                            "description": "The workspace-scoped issue number to update"
+                            "description": "Issue number within the team. Required if issue_identifier is not provided."
                         },
                         "title": {
                             "type": "string",
@@ -548,16 +563,15 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                             "type": ["string", "null"],
                             "description": "Due date in ISO 8601 format, or null to clear"
                         },
-                        "team_id": {
+                        "move_to_team_id": {
                             "type": "string",
-                            "description": "Team ID to move the issue to"
+                            "description": "Team ID to move the issue to (reassigns team and renumbers)"
                         },
-                        "team_key": {
+                        "move_to_team_key": {
                             "type": "string",
-                            "description": "Team key (e.g. 'TRA') as alternative to team_id. Resolved server-side. team_id takes precedence if both are provided."
+                            "description": "Team key to move the issue to (e.g. 'ENG'). Alternative to move_to_team_id."
                         }
-                    },
-                    "required": ["issue_number"]
+                    }
                 }
             },
             {
@@ -566,16 +580,24 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "issue_identifier": {
+                            "type": "string",
+                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
+                        },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
+                        },
                         "issue_number": {
                             "type": "integer",
-                            "description": "The workspace-scoped issue number to comment on"
+                            "description": "Issue number within the team. Required if issue_identifier is not provided."
                         },
                         "body": {
                             "type": "string",
                             "description": "Markdown body of the comment"
                         }
                     },
-                    "required": ["issue_number", "body"]
+                    "required": ["body"]
                 }
             },
             {
@@ -606,27 +628,38 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "delete_issue",
-                "description": "Delete an issue by its workspace-scoped number. This permanently removes the issue and all associated comments and labels.",
+                "description": "Delete an issue by its team-scoped identifier (e.g. 'TRA-35'). This permanently removes the issue and all associated comments and labels.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "issue_identifier": {
+                            "type": "string",
+                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
+                        },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
+                        },
                         "issue_number": {
                             "type": "integer",
-                            "description": "The workspace-scoped issue number to delete"
+                            "description": "Issue number within the team. Required if issue_identifier is not provided."
                         }
-                    },
-                    "required": ["issue_number"]
+                    }
                 }
             },
             {
                 "name": "search_issues",
-                "description": "Search for issues by text query. Matches against issue titles. Returns results ordered by priority (urgent first), then by creation date (newest first).",
+                "description": "Search for issues by text query. Matches against issue titles. Returns results ordered by priority (urgent first), then by creation date (newest first). Optionally filter by team.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
                             "description": "Search text to match against issue titles"
+                        },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Optional team key (e.g. 'TRA') to scope search to a specific team."
                         },
                         "limit": {
                             "type": "integer",
@@ -786,6 +819,47 @@ fn arg_i64(args: &Value, key: &str) -> Result<i64, trakkt_core::Error> {
         .ok_or_else(|| trakkt_core::Error::BadRequest(format!("missing required parameter: {key}")))
 }
 
+/// Parse an issue identifier like "TRA-35" into (team_key, number).
+fn parse_issue_identifier(identifier: &str) -> Option<(String, i32)> {
+    let parts: Vec<&str> = identifier.splitn(2, '-').collect();
+    if parts.len() == 2 {
+        if let Ok(number) = parts[1].parse::<i32>() {
+            return Some((parts[0].to_string(), number));
+        }
+    }
+    None
+}
+
+/// Resolve `team_key` and `number` from either an `issue_identifier` parameter
+/// (e.g. "TRA-35") or explicit `team_key` + `issue_number` parameters.
+fn resolve_issue_key_and_number(args: &Value) -> Result<(String, i32), trakkt_core::Error> {
+    if let Some(identifier) = args.get("issue_identifier").and_then(|v| v.as_str()) {
+        parse_issue_identifier(identifier).ok_or_else(|| {
+            trakkt_core::Error::BadRequest(
+                "Invalid issue identifier format. Expected 'TRA-35'".to_string(),
+            )
+        })
+    } else {
+        let team_key = args
+            .get("team_key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                trakkt_core::Error::BadRequest(
+                    "Either issue_identifier or team_key+issue_number required".to_string(),
+                )
+            })?;
+        let number = args
+            .get("issue_number")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                trakkt_core::Error::BadRequest(
+                    "Either issue_identifier or team_key+issue_number required".to_string(),
+                )
+            })? as i32;
+        Ok((team_key.to_string(), number))
+    }
+}
+
 /// Resolve a team_id from either `team_id` or `team_key` arguments.
 /// Returns `None` if neither is provided. `team_id` takes precedence.
 async fn resolve_team_id_from_args(
@@ -837,11 +911,11 @@ async fn tool_get_issue(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let number = arg_i64(args, "issue_number")? as i32;
+    let (team_key, number) = resolve_issue_key_and_number(args)?;
 
-    let issue = issue_service::get_issue(&state.db, &auth.workspace_id, number)
+    let issue = issue_service::get_issue(&state.db, &auth.workspace_id, &team_key, number)
         .await?
-        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue #{number} not found")))?;
+        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue {team_key}-{number} not found")))?;
 
     let comments = comment_service::list_comments(&state.db, &issue.issue_id).await?;
 
@@ -897,15 +971,37 @@ async fn tool_create_issue(
     serde_json::to_string_pretty(&issue).map_err(trakkt_core::Error::from)
 }
 
+/// Resolve a target team_id for "move to team" from `move_to_team_id` or
+/// `move_to_team_key` arguments. Returns `None` if neither is provided.
+async fn resolve_move_team_id(
+    args: &Value,
+    db: &trakkt_core::DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Option<String>> {
+    if let Some(id) = args.get("move_to_team_id").and_then(|v| v.as_str()) {
+        return Ok(Some(id.to_string()));
+    }
+    if let Some(key) = args.get("move_to_team_key").and_then(|v| v.as_str()) {
+        let team = team_service::get_team_by_key(db, workspace_id, key)
+            .await?
+            .ok_or_else(|| trakkt_core::Error::BadRequest(
+                format!("No team found with key '{key}'"),
+            ))?;
+        return Ok(Some(team.team_id));
+    }
+    Ok(None)
+}
+
 /// update_issue — update fields on an existing issue.
 async fn tool_update_issue(
     args: &Value,
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let number = arg_i64(args, "issue_number")? as i32;
+    let (team_key, number) = resolve_issue_key_and_number(args)?;
 
-    let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
+    // Resolve "move to team" separately from the identifying team_key.
+    let move_team_id = resolve_move_team_id(args, &state.db, &auth.workspace_id).await?;
 
     // Build the IssueUpdate from provided fields. Absent keys mean "no change".
     // JSON null means "clear the field" (maps to Some(None) for double-Option fields).
@@ -934,12 +1030,13 @@ async fn tool_update_issue(
         sort_order: args.get("sort_order").map(|v| {
             v.as_f64()
         }),
-        team_id,
+        team_id: move_team_id,
     };
 
     let issue = issue_service::update_issue(
         &state.db,
         &auth.workspace_id,
+        &team_key,
         number,
         &updates,
         Some(&state.ws_manager),
@@ -962,9 +1059,10 @@ async fn tool_update_issue(
     }
 
     // Re-fetch with full details after label update.
-    let updated = issue_service::get_issue(&state.db, &auth.workspace_id, number)
+    // Use get_issue_by_id since the team/number may have changed on team reassignment.
+    let updated = issue_service::get_issue_by_id(&state.db, &issue.issue_id)
         .await?
-        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue #{number} not found")))?;
+        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue {team_key}-{number} not found")))?;
 
     serde_json::to_string_pretty(&updated).map_err(trakkt_core::Error::from)
 }
@@ -975,17 +1073,18 @@ async fn tool_delete_issue(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let number = arg_i64(args, "issue_number")? as i32;
+    let (team_key, number) = resolve_issue_key_and_number(args)?;
 
     issue_service::delete_issue(
         &state.db,
         &auth.workspace_id,
+        &team_key,
         number,
         Some(&state.ws_manager),
     )
     .await?;
 
-    Ok(format!("Issue #{number} deleted"))
+    Ok(format!("Issue {team_key}-{number} deleted"))
 }
 
 /// add_comment — add a comment to an issue.
@@ -994,13 +1093,13 @@ async fn tool_add_comment(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let number = arg_i64(args, "issue_number")? as i32;
+    let (team_key, number) = resolve_issue_key_and_number(args)?;
     let body = arg_str(args, "body")?;
 
-    // Resolve issue_id from workspace-scoped number.
-    let issue = issue_service::get_issue(&state.db, &auth.workspace_id, number)
+    // Resolve issue_id from team-scoped identifier.
+    let issue = issue_service::get_issue(&state.db, &auth.workspace_id, &team_key, number)
         .await?
-        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue #{number} not found")))?;
+        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue {team_key}-{number} not found")))?;
 
     let comment = comment_service::create_comment(
         &state.db,
@@ -1065,13 +1164,15 @@ async fn tool_search_issues(
     let limit_raw = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
     let limit = limit_raw.clamp(1, 100);
 
+    let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
+
     let filters = IssueFilters {
         search: Some(query.to_string()),
         limit: Some(limit),
         ..Default::default()
     };
 
-    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, None, &filters).await?;
+    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, team_id.as_deref(), &filters).await?;
     serde_json::to_string_pretty(&issues).map_err(trakkt_core::Error::from)
 }
 

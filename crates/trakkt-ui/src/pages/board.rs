@@ -237,6 +237,7 @@ pub fn BoardContent(
         };
 
         let issue_number = issue.number;
+        let issue_team_key = issue.team_key.clone();
         let is_same_column = issue.status_id == target_status_id;
 
         if is_same_column {
@@ -275,8 +276,9 @@ pub fn BoardContent(
             }
 
             let old_sort_order = issue.sort_order;
+            let tk = issue_team_key.clone();
             leptos::task::spawn_local(async move {
-                if let Err(e) = set_issue_sort_order(issue_number, new_sort_order).await {
+                if let Err(e) = set_issue_sort_order(tk, issue_number, new_sort_order).await {
                     tracing::warn!("Failed to set sort order: {e}");
                     // Revert optimistic update on failure.
                     if let Some(store) = sync_store {
@@ -312,6 +314,7 @@ pub fn BoardContent(
             let target_id_for_server = target_status_id.clone();
             leptos::task::spawn_local(async move {
                 if let Err(e) = update_issue(
+                    issue_team_key,
                     issue_number,
                     None, None,
                     Some(target_id_for_server),
@@ -729,7 +732,6 @@ fn BoardCard(
     let issue_id_for_drag = issue_id.clone();
     let issue_id_for_opacity = issue_id.clone();
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
-    let number = issue.number;
     let title = issue.title.clone();
     let labels = issue.labels.clone();
     let priority = issue.priority;
@@ -751,13 +753,17 @@ fn BoardCard(
         }
     };
 
+    let issue_href = format!("/issues/{issue_key}");
+    let issue_href_for_click = issue_href.clone();
+    let issue_href_for_keydown = issue_href.clone();
+
     let navigate_to_issue = move |_: web_sys::MouseEvent| {
         if did_drag.get_untracked() {
             set_did_drag.set(false);
             return;
         }
         let nav = use_navigate();
-        nav(&format!("/issues/{number}"), Default::default());
+        nav(&issue_href_for_click, Default::default());
     };
 
     view! {
@@ -797,7 +803,7 @@ fn BoardCard(
             on:keydown=move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Enter" {
                     let nav = use_navigate();
-                    nav(&format!("/issues/{number}"), Default::default());
+                    nav(&issue_href_for_keydown, Default::default());
                 }
             }
         >
