@@ -114,10 +114,8 @@ pub fn Layout() -> impl IntoView {
             let uid_reconnect = user_id.clone();
             let wid_reconnect = workspace_id.clone();
             leptos::task::spawn_local(async move {
-                if let Ok(token) = crate::server_fns::auth::get_ws_token().await {
-                    if !token.is_empty() {
-                        ws_for_reconnect.reconnect(&uid_reconnect, &wid_reconnect, &token);
-                    }
+                if let Ok(token) = crate::server_fns::auth::get_ws_token().await && !token.is_empty() {
+                    ws_for_reconnect.reconnect(&uid_reconnect, &wid_reconnect, &token);
                 }
             });
         });
