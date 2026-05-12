@@ -434,20 +434,20 @@ pub async fn list_issues(
         param_idx += 1;
     }
 
-    if let Some(ref cats) = filters.status_categories {
-        if !cats.is_empty() {
-            let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(cats.len(), param_idx);
-            conditions.push(format!("s.category IN {in_clause}"));
-            param_idx = next_idx;
-        }
+    if let Some(ref cats) = filters.status_categories
+        && !cats.is_empty()
+    {
+        let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(cats.len(), param_idx);
+        conditions.push(format!("s.category IN {in_clause}"));
+        param_idx = next_idx;
     }
 
-    if let Some(ref cats) = filters.exclude_status_categories {
-        if !cats.is_empty() {
-            let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(cats.len(), param_idx);
-            conditions.push(format!("s.category NOT IN {in_clause}"));
-            param_idx = next_idx;
-        }
+    if let Some(ref cats) = filters.exclude_status_categories
+        && !cats.is_empty()
+    {
+        let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(cats.len(), param_idx);
+        conditions.push(format!("s.category NOT IN {in_clause}"));
+        param_idx = next_idx;
     }
 
     if filters.priority.is_some() {
