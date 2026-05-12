@@ -10,8 +10,10 @@ use wasm_bindgen::JsCast;
 
 use phosphor_leptos::{Icon, IconWeight};
 
+use std::sync::Arc;
+
 use crate::cache::store::SyncStore;
-use crate::components::{CommandPalette, Spinner};
+use crate::components::{Button, ButtonVariant, CommandPalette, Modal, ModalSize, Spinner, INPUT_CLASS};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
 
@@ -411,12 +413,13 @@ fn SidebarTeamsSection() -> impl IntoView {
 
                 <div class="space-y-0.5">
                     {teams.into_iter().map(|team| {
-                        let key = team.key.to_lowercase();
+                        let key_lower = team.key.to_lowercase();
                         let name = team.name.clone();
                         let team_id = team.team_id.clone();
-                        let issues_href = format!("/teams/{key}/issues");
+                        let team_key = team.key.clone();
+                        let issues_href = format!("/teams/{key_lower}/issues");
                         view! {
-                            <SidebarTeamSubNav team_id=team_id name=name issues_href=issues_href/>
+                            <SidebarTeamSubNav team_id=team_id name=name team_key=team_key issues_href=issues_href/>
                         }
                     }).collect_view()}
                 </div>
@@ -749,11 +752,12 @@ fn SidebarCreateTeam(on_done: Callback<()>) -> impl IntoView {
 
 /// A team's sub-navigation: clickable team name toggles expanded state,
 /// showing/hiding the Issues sub-link. Right-click the team name to open
-/// a context menu with a "Leave team" option.
+/// a context menu with "Rename" and "Leave team" options.
 #[component]
 fn SidebarTeamSubNav(
     team_id: String,
     name: String,
+    team_key: String,
     issues_href: String,
 ) -> impl IntoView {
     let path = leptos_router::hooks::use_location().pathname;
@@ -765,6 +769,13 @@ fn SidebarTeamSubNav(
     // Auto-expand if the current path is within this team.
     let (expanded, set_expanded) = signal(false);
     let (menu_open, set_menu_open) = signal(false);
+
+    // Rename modal state
+    let (show_rename, set_show_rename) = signal(false);
+    let (rename_name, set_rename_name) = signal(name.clone());
+    let (rename_key, set_rename_key) = signal(team_key.clone());
+    let (rename_error, set_rename_error) = signal(Option::<String>::None);
+    let (rename_submitting, set_rename_submitting) = signal(false);
 
     // Expand when navigating into a team's pages.
     Effect::new(move |_| {
@@ -808,6 +819,12 @@ fn SidebarTeamSubNav(
         });
     });
 
+    let display_name = name.clone();
+    let name_for_menu = name;
+    let team_id_for_menu = team_id.clone();
+    let team_key_for_menu = team_key;
+    let team_id_for_rename = team_id.clone();
+
     view! {
         <div class="mt-0.5 relative" node_ref=outer_ref>
             // Row wrapper — owns group hover for the entire row
@@ -823,7 +840,7 @@ fn SidebarTeamSubNav(
                 >
                     <Icon icon=phosphor_leptos::CARET_DOWN weight=IconWeight::Bold size="12px" attr:class=chevron_class/>
                     <Icon icon=phosphor_leptos::USERS_THREE weight=IconWeight::Light size="16px"/>
-                    <span class="flex-1 truncate">{name}</span>
+                    <span class="flex-1 truncate">{display_name}</span>
                 </button>
                 // Right zone: actions (hover-reveal)
                 <div class="flex items-center gap-1 pr-2 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -844,7 +861,23 @@ fn SidebarTeamSubNav(
                     <button
                         class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
                         on:click={
-                            let team_id = team_id.clone();
+                            let name = name_for_menu.clone();
+                            let team_key = team_key_for_menu.clone();
+                            move |_| {
+                                set_menu_open.set(false);
+                                set_rename_name.set(name.clone());
+                                set_rename_key.set(team_key.clone());
+                                set_rename_error.set(None);
+                                set_show_rename.set(true);
+                            }
+                        }
+                    >
+                        "Rename..."
+                    </button>
+                    <button
+                        class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
+                        on:click={
+                            let team_id = team_id_for_menu.clone();
                             move |_| {
                                 let team_id = team_id.clone();
                                 set_menu_open.set(false);
@@ -870,6 +903,95 @@ fn SidebarTeamSubNav(
                     </div>
                 }
             })}
+
+            // Rename team modal
+            {
+                let on_close_rename = Callback::new(move |()| set_show_rename.set(false));
+                let team_id_for_footer = team_id_for_rename.clone();
+                let modal_footer: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                    let team_id = team_id_for_footer.clone();
+                    let handle_save = move |_| {
+                        let n = rename_name.get_untracked();
+                        let k = rename_key.get_untracked();
+                        if n.trim().is_empty() {
+                            set_rename_error.set(Some("Team name cannot be empty".into()));
+                            return;
+                        }
+                        if k.len() < 2 || k.len() > 5 || !k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+                            set_rename_error.set(Some("Key must be 2-5 uppercase alphanumeric characters".into()));
+                            return;
+                        }
+                        set_rename_submitting.set(true);
+                        set_rename_error.set(None);
+                        let team_id = team_id.clone();
+                        leptos::task::spawn_local(async move {
+                            match crate::server_fns::teams::update_team(team_id, Some(n), Some(k)).await {
+                                Ok(()) => {
+                                    set_show_rename.set(false);
+                                }
+                                Err(e) => {
+                                    set_rename_error.set(Some(format!("{e}")));
+                                }
+                            }
+                            set_rename_submitting.set(false);
+                        });
+                    };
+                    view! {
+                        <Button
+                            variant=ButtonVariant::Ghost
+                            disabled=Signal::derive(move || rename_submitting.get())
+                            on:click=move |_| set_show_rename.set(false)
+                        >
+                            "Cancel"
+                        </Button>
+                        <Button
+                            disabled=Signal::derive(move || rename_submitting.get())
+                            on:click=handle_save
+                        >
+                            {move || if rename_submitting.get() { "Saving..." } else { "Save" }}
+                        </Button>
+                    }.into_any()
+                });
+
+                view! {
+                    <Modal
+                        show=Signal::derive(move || show_rename.get())
+                        on_close=on_close_rename
+                        title="Rename team"
+                        size=ModalSize::Sm
+                        footer=modal_footer
+                    >
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-sm font-medium text-foreground mb-2">"Team name"</label>
+                                <input
+                                    type="text"
+                                    class=INPUT_CLASS
+                                    prop:value=move || rename_name.get()
+                                    on:input=move |ev| set_rename_name.set(event_target_value(&ev))
+                                    prop:disabled=move || rename_submitting.get()
+                                />
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-foreground mb-2">"Team key"</label>
+                                <input
+                                    type="text"
+                                    class=INPUT_CLASS
+                                    maxlength="5"
+                                    prop:value=move || rename_key.get()
+                                    on:input=move |ev| set_rename_key.set(event_target_value(&ev).to_uppercase())
+                                    prop:disabled=move || rename_submitting.get()
+                                />
+                            </div>
+                            <Show when=move || rename_error.get().is_some()>
+                                <p class="text-sm text-red-400">
+                                    {move || rename_error.get().unwrap_or_default()}
+                                </p>
+                            </Show>
+                        </div>
+                    </Modal>
+                }
+            }
         </div>
     }
 }

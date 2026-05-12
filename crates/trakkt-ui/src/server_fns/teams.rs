@@ -81,6 +81,27 @@ pub async fn leave_team(team_id: String) -> Result<(), ServerFnError> {
 
 // ─── Write operations ──────────────────────────────────────────────────────
 
+/// Update an issue-tracker team's name and/or key.
+#[server(prefix = "/leptos-api")]
+pub async fn update_team(
+    team_id: String,
+    name: Option<String>,
+    key: Option<String>,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    trakkt_auth::team_service::update_team(
+        ac.db(),
+        &team_id,
+        &ac.ws_id,
+        name,
+        key,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(())
+}
+
 /// Create a new issue-tracker team in the current workspace.
 #[server(prefix = "/leptos-api")]
 pub async fn create_team(
