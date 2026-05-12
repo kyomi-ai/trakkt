@@ -15,12 +15,19 @@ use super::{AuthenticatedContext, IntoServerFnError};
 // ─── Read operations ───────────────────────────────────────────────────────
 
 /// List all views visible to the current user (own + shared) in the workspace.
+///
+/// When `team_id` is provided, only views scoped to that team are returned.
 #[server(prefix = "/leptos-api")]
-pub async fn list_views() -> Result<Vec<View>, ServerFnError> {
+pub async fn list_views(team_id: Option<String>) -> Result<Vec<View>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let views = trakkt_auth::view_service::list_views(ac.db(), &ac.ws_id, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    let views = trakkt_auth::view_service::list_views(
+        ac.db(),
+        &ac.ws_id,
+        &ac.auth.user_id,
+        team_id.as_deref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(views)
 }
 
@@ -34,6 +41,8 @@ pub async fn create_view(
     filters: String,
     display_options: String,
     is_shared: bool,
+    team_id: Option<String>,
+    position: i32,
 ) -> Result<View, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let view = trakkt_auth::view_service::create_view(
@@ -45,6 +54,8 @@ pub async fn create_view(
         &filters,
         &display_options,
         is_shared,
+        team_id.as_deref(),
+        position,
         ac.ctx.ws_manager.as_ref(),
     )
     .await
@@ -62,6 +73,7 @@ pub async fn update_view(
     display_options: Option<String>,
     is_shared: Option<bool>,
     sort_order: Option<f64>,
+    position: Option<i32>,
 ) -> Result<View, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     verify_view_ownership(ac.db(), &ac.ws_id, &ac.auth.user_id, &view_id).await?;
@@ -75,6 +87,8 @@ pub async fn update_view(
         display_options.as_deref(),
         is_shared,
         sort_order,
+        None, // team_id changes not needed in MVP
+        position,
         ac.ctx.ws_manager.as_ref(),
     )
     .await

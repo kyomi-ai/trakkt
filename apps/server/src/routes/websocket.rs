@@ -365,7 +365,7 @@ async fn handle_sync_bootstrap(
             vec![]
         });
 
-    let views = trakkt_auth::view_service::list_views(db, workspace_id, user_id)
+    let views = trakkt_auth::view_service::list_views(db, workspace_id, user_id, None)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(user_id, workspace_id, error = %e, "list_views failed during bootstrap");

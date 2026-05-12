@@ -860,7 +860,8 @@ pub(crate) fn SaveViewModal(
         set_error_msg.set(None);
 
         leptos::task::spawn_local(async move {
-            match create_view(name_val, None, filters_str, display_str, false).await {
+            let view_team_id = if team_id_val.is_empty() { None } else { Some(team_id_val.clone()) };
+            match create_view(name_val, None, filters_str, display_str, false, view_team_id, 0).await {
                 Ok(_) => {
                     set_submitting.set(false);
                     on_close.run(());

@@ -52,7 +52,7 @@ pub fn ViewPage() -> impl IntoView {
     let sync_store = use_context::<SyncStore>();
 
     // Server function fallback for views.
-    let server_views = Resource::new(|| (), move |_| async move { list_views().await });
+    let server_views = Resource::new(|| (), move |_| async move { list_views(None).await });
 
     // Resolve the current view from SyncStore or fallback.
     let current_view: Memo<Option<View>> = Memo::new(move |_| {
@@ -186,7 +186,7 @@ pub fn ViewPage() -> impl IntoView {
         set_rename_submitting.set(true);
         let vid = view.view_id.clone();
         leptos::task::spawn_local(async move {
-            match update_view(vid, Some(name), None, None, None, None, None).await {
+            match update_view(vid, Some(name), None, None, None, None, None, None).await {
                 Ok(_) => error_msg.set(None),
                 Err(e) => error_msg.set(Some(format!("Failed to rename: {e}"))),
             }
