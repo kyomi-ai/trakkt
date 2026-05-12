@@ -27,11 +27,14 @@ pub async fn list_teams() -> Result<Vec<Team>, ServerFnError> {
     Ok(teams)
 }
 
-/// Get the default (first-created) team in the current workspace.
+/// Get the default team for the current user in the current workspace.
+///
+/// Uses three-tier resolution: user's personal default, workspace default,
+/// then first-created team as fallback.
 #[server(prefix = "/leptos-api")]
 pub async fn get_default_team() -> Result<Team, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let team = trakkt_auth::team_service::get_default_team(ac.db(), &ac.ws_id)
+    let team = trakkt_auth::team_service::get_user_default_team(ac.db(), &ac.auth.user_id, &ac.ws_id)
         .await
         .into_sfn()?;
     Ok(team)
