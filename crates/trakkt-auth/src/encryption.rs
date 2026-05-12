@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn roundtrip_slack_bot_token() {
         let key = test_key();
-        let token = "xoxb-1234567890-abcdefghijklmnop";
+        let token = "slack-bot-1234567890-abcdefghijklmnop";
         let encrypted = encrypt_slack_token(token, &key).unwrap();
         let decrypted = decrypt_slack_token(&encrypted, &key).unwrap();
         assert_eq!(decrypted, token);
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn roundtrip_slack_user_token() {
         let key = test_key();
-        let token = "xoxp-9876543210-zyxwvutsrqponml";
+        let token = "slack-user-9876543210-zyxwvutsrqponml";
         let encrypted = encrypt_slack_token(token, &key).unwrap();
         let decrypted = decrypt_slack_token(&encrypted, &key).unwrap();
         assert_eq!(decrypted, token);
@@ -298,17 +298,15 @@ mod tests {
         let mut key_b = test_key();
         key_b[0] ^= 0xFF;
 
-        let encrypted = encrypt_slack_token("xoxb-secret", &key_a).unwrap();
+        let encrypted = encrypt_slack_token("slack-bot-secret", &key_a).unwrap();
         let result = decrypt_slack_token(&encrypted, &key_b);
         assert!(result.is_err());
     }
 
     #[test]
     fn slack_token_interoperable_with_raw_encrypt() {
-        // Verify that encrypt_slack_token produces output that decrypt() can read,
-        // and vice versa — they use the same AES-256-GCM format.
         let key = test_key();
-        let token = "xoxb-interop-test";
+        let token = "slack-bot-interop-test";
 
         let from_slack_fn = encrypt_slack_token(token, &key).unwrap();
         assert_eq!(decrypt(&from_slack_fn, &key).unwrap(), token);
