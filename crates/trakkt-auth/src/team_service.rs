@@ -220,6 +220,101 @@ pub async fn get_default_team(
     }
 }
 
+/// Update a team's name and/or key.
+///
+/// Only provided fields are changed (COALESCE pattern). The DB UNIQUE
+/// constraint on `(workspace_id, key)` rejects duplicate keys automatically.
+pub async fn update_team(
+    db: &DbPool,
+    team_id: &str,
+    workspace_id: &str,
+    name: Option<String>,
+    key: Option<String>,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<Team> {
+    if let Some(ref k) = key {
+        if k.len() < 2
+            || k.len() > 5
+            || !k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        {
+            return Err(trakkt_core::Error::BadRequest(
+                "Team key must be 2-5 uppercase alphanumeric characters".into(),
+            ));
+        }
+    }
+
+    let result = trakkt_core::db_execute!(
+        db,
+        "UPDATE teams SET name = COALESCE($1, name), key = COALESCE($2, key) \
+         WHERE team_id = $3 AND workspace_id = $4",
+        name,
+        key,
+        team_id,
+        workspace_id
+    )
+    .map_err(|e| {
+        // Catch UNIQUE constraint violations and return a user-friendly error.
+        // Postgres: code "23505", SQLite: code "2067" or message contains "UNIQUE constraint".
+        if let sqlx::Error::Database(ref db_err) = e {
+            let is_unique = db_err
+                .code()
+                .map(|c| c == "23505" || c == "2067")
+                .unwrap_or(false)
+                || db_err.message().contains("UNIQUE constraint");
+            if is_unique {
+                return trakkt_core::Error::Conflict(
+                    "A team with that key already exists".into(),
+                );
+            }
+        }
+        trakkt_core::Error::from(e)
+    })?;
+
+    if result.rows_affected() == 0 {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "team {team_id} not found"
+        )));
+    }
+
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        SyncActionType::Update,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team update");
+    }
+
+    let row = trakkt_core::db_fetch_one!(
+        db,
+        TeamRow,
+        "SELECT team_id, workspace_id, name, key, description, icon, \
+                CAST(0 AS BIGINT) AS member_count, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM teams WHERE team_id = $1",
+        team_id
+    )?;
+    let team = row.into_dto();
+
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::TEAM,
+            team_id,
+            SyncActionType::Update,
+            serde_json::to_value(&team).ok(),
+        )
+        .await;
+    }
+
+    Ok(team)
+}
+
 // ─── Team membership ────────────────────────────────────────────────────────
 
 /// List all members of a team, with joined user details.
