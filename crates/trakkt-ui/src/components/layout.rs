@@ -821,11 +821,9 @@ fn SidebarTeamSubNav(
                         set_menu_open.set(true);
                     }
                 >
+                    <Icon icon=phosphor_leptos::CARET_DOWN weight=IconWeight::Bold size="12px" attr:class=chevron_class/>
                     <Icon icon=phosphor_leptos::USERS_THREE weight=IconWeight::Light size="16px"/>
                     <span class="flex-1 truncate">{name}</span>
-                    <svg class=chevron_class width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M6 9l6 6 6-6"/>
-                    </svg>
                 </button>
                 // Right zone: actions (hover-reveal)
                 <div class="flex items-center gap-1 pr-2 opacity-0 group-hover:opacity-100 transition-opacity">
