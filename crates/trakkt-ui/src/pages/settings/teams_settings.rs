@@ -38,7 +38,7 @@ fn is_valid_key(key: &str) -> bool {
 #[component]
 pub fn TeamsSettingsPage() -> impl IntoView {
     let (version, set_version) = signal(0u32);
-    let teams = Resource::new(move || version.get(), |_| list_teams());
+    let teams = Resource::new(move || version.get(), |_| list_all_teams());
     let default_team = Resource::new(move || version.get(), |_| get_default_team());
 
     // Create team form state

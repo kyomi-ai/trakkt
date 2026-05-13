@@ -154,10 +154,61 @@ pub async fn create_team(
     Ok(team)
 }
 
-/// List all teams in a workspace, ordered alphabetically by name.
+/// List teams in a workspace, ordered alphabetically by name.
+///
+/// When `user_id` is `Some`, only teams the user belongs to are returned
+/// (INNER JOIN on `team_members`). When `None`, all teams are returned
+/// (for admin/internal use).
 pub async fn list_teams(
     db: &DbPool,
     workspace_id: &str,
+    user_id: Option<&str>,
+) -> trakkt_core::Result<Vec<Team>> {
+    match user_id {
+        Some(uid) => {
+            let rows: Vec<TeamRow> = trakkt_core::db_fetch_all!(
+                db,
+                TeamRow,
+                "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                        COUNT(tm2.user_id) AS member_count, \
+                        CAST(t.created_at AS TEXT) AS created_at \
+                 FROM teams t \
+                 INNER JOIN team_members tm ON tm.team_id = t.team_id AND tm.user_id = $2 \
+                 LEFT JOIN team_members tm2 ON tm2.team_id = t.team_id \
+                 WHERE t.workspace_id = $1 \
+                 GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, t.created_at \
+                 ORDER BY t.name ASC",
+                workspace_id,
+                uid
+            )?;
+            Ok(rows.into_iter().map(TeamRow::into_dto).collect())
+        }
+        None => {
+            let rows: Vec<TeamRow> = trakkt_core::db_fetch_all!(
+                db,
+                TeamRow,
+                "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                        COUNT(tm.user_id) AS member_count, \
+                        CAST(t.created_at AS TEXT) AS created_at \
+                 FROM teams t \
+                 LEFT JOIN team_members tm ON tm.team_id = t.team_id \
+                 WHERE t.workspace_id = $1 \
+                 GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, t.created_at \
+                 ORDER BY t.name ASC",
+                workspace_id
+            )?;
+            Ok(rows.into_iter().map(TeamRow::into_dto).collect())
+        }
+    }
+}
+
+/// List teams in a workspace that the user is NOT a member of.
+///
+/// Used for the "join team" flow — shows teams available to join.
+pub async fn list_joinable_teams(
+    db: &DbPool,
+    workspace_id: &str,
+    user_id: &str,
 ) -> trakkt_core::Result<Vec<Team>> {
     let rows: Vec<TeamRow> = trakkt_core::db_fetch_all!(
         db,
@@ -168,9 +219,11 @@ pub async fn list_teams(
          FROM teams t \
          LEFT JOIN team_members tm ON tm.team_id = t.team_id \
          WHERE t.workspace_id = $1 \
+           AND t.team_id NOT IN (SELECT tm2.team_id FROM team_members tm2 WHERE tm2.user_id = $2) \
          GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, t.created_at \
          ORDER BY t.name ASC",
-        workspace_id
+        workspace_id,
+        user_id
     )?;
     Ok(rows.into_iter().map(TeamRow::into_dto).collect())
 }
