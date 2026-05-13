@@ -489,8 +489,7 @@ fn IssueDetailContent(
                             child_number,
                             None, None, None, None, None, None, None, None,
                             Some(parent_id),
-                            None,
-                            None,
+                            None, None, None, None,
                         ).await;
                     });
                 }
@@ -551,6 +550,8 @@ fn EditableTitle(
                 None, // parent_issue_id
                 None, // clear_sort_order
                 None, // clear_parent
+                None, // clear_project
+                None, // clear_milestone
             )
             .await;
             set_saving.set(false);
@@ -660,6 +661,8 @@ fn MetadataSidebar(
                 None, // parent_issue_id
                 None, // clear_sort_order
                 None, // clear_parent
+                None, // clear_project
+                None, // clear_milestone
             )
             .await;
             on_change.run(());
@@ -684,6 +687,8 @@ fn MetadataSidebar(
                 None, // parent_issue_id
                 None, // clear_sort_order
                 None, // clear_parent
+                None, // clear_project
+                None, // clear_milestone
             )
             .await;
             on_change.run(());
@@ -693,13 +698,16 @@ fn MetadataSidebar(
     // ── Project change handler ─────────────────────────────────────────
     let on_project_change = move |project_id: String| {
         let tk = stored_tk.get_value();
+        let is_clear = project_id.is_empty();
         leptos::task::spawn_local(async move {
             let _ = update_issue(
                 tk, number,
                 None, None, None, None, None, None,
-                Some(project_id),
-                Some(String::new()),
+                if is_clear { None } else { Some(project_id) },
+                None,
                 None, None, None,
+                if is_clear { Some(true) } else { None },
+                Some(true),
             ).await;
             on_change.run(());
         });
@@ -708,13 +716,15 @@ fn MetadataSidebar(
     // ── Milestone change handler ───────────────────────────────────────
     let on_milestone_change = move |milestone_id: String| {
         let tk = stored_tk.get_value();
+        let is_clear = milestone_id.is_empty();
         leptos::task::spawn_local(async move {
             let _ = update_issue(
                 tk, number,
                 None, None, None, None, None, None,
                 None,
-                Some(milestone_id),
-                None, None, None,
+                if is_clear { None } else { Some(milestone_id) },
+                None, None, None, None,
+                if is_clear { Some(true) } else { None },
             ).await;
             on_change.run(());
         });
@@ -749,8 +759,10 @@ fn MetadataSidebar(
     let current_milestone_id = issue.milestone_id.clone();
     let (project_open, set_project_open) = signal(false);
     let project_trigger_ref = NodeRef::<leptos::html::Div>::new();
+    let (project_search, set_project_search) = signal(String::new());
     let (milestone_open, set_milestone_open) = signal(false);
     let milestone_trigger_ref = NodeRef::<leptos::html::Div>::new();
+    let (milestone_search, set_milestone_search) = signal(String::new());
 
     let milestones = RwSignal::new(Vec::<trakkt_types::models::ProjectMilestone>::new());
     let milestone_pid = current_project_id.clone();
@@ -930,13 +942,18 @@ fn MetadataSidebar(
                 <DropdownMenu
                     trigger_ref=project_trigger_ref
                     open=Signal::derive(move || project_open.get())
-                    on_close=Callback::new(move |()| set_project_open.set(false))
+                    on_close=Callback::new(move |()| { set_project_open.set(false); set_project_search.set(String::new()); })
                     search_placeholder="Filter projects..."
+                    on_search=Callback::new(move |text: String| set_project_search.set(text))
                 >
                     {
                         let current_pid = current_project_id.clone();
                         move || {
-                            let projects = sync_store.map(|store| store.projects().get()).unwrap_or_default();
+                            let search = project_search.get().to_lowercase();
+                            let projects: Vec<_> = sync_store.map(|store| store.projects().get()).unwrap_or_default()
+                                .into_iter()
+                                .filter(|p| search.is_empty() || p.name.to_lowercase().contains(&search))
+                                .collect();
                             let none_item = {
                                 view! {
                                     <DropdownItem
@@ -1047,13 +1064,18 @@ fn MetadataSidebar(
                             <DropdownMenu
                                 trigger_ref=milestone_trigger_ref
                                 open=Signal::derive(move || milestone_open.get())
-                                on_close=Callback::new(move |()| set_milestone_open.set(false))
+                                on_close=Callback::new(move |()| { set_milestone_open.set(false); set_milestone_search.set(String::new()); })
                                 search_placeholder="Filter milestones..."
+                                on_search=Callback::new(move |text: String| set_milestone_search.set(text))
                             >
                                 {
                                     let current_mid = current_mid.clone();
                                     move || {
-                                        let ms_list = milestones.get();
+                                        let search = milestone_search.get().to_lowercase();
+                                        let ms_list: Vec<_> = milestones.get()
+                                            .into_iter()
+                                            .filter(|m| search.is_empty() || m.name.to_lowercase().contains(&search))
+                                            .collect();
                                         let none_item = {
                                             view! {
                                                 <DropdownItem
@@ -1158,6 +1180,7 @@ fn MetadataSidebar(
                                                     None,
                                                     None,
                                                     Some(true),
+                                                    None, None,
                                                 ).await;
                                             });
                                         }
@@ -1206,8 +1229,7 @@ fn MetadataSidebar(
                             number,
                             None, None, None, None, None, None, None, None,
                             Some(parent_id),
-                            None,
-                            None,
+                            None, None, None, None,
                         ).await;
                     });
                 }
@@ -1482,6 +1504,8 @@ fn DescriptionEditor(
                 None, // parent_issue_id
                 None, // clear_sort_order
                 None, // clear_parent
+                None, // clear_project
+                None, // clear_milestone
             )
             .await;
         });
