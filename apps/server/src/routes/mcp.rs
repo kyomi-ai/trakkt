@@ -702,7 +702,7 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "list_teams",
-                "description": "List all teams in the workspace, ordered alphabetically by name.",
+                "description": "List teams the authenticated user belongs to, ordered alphabetically by name.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
@@ -1205,12 +1205,12 @@ async fn tool_list_labels(
     serde_json::to_string_pretty(&labels).map_err(trakkt_core::Error::from)
 }
 
-/// list_teams — list all teams in the workspace.
+/// list_teams — list teams the authenticated user belongs to.
 async fn tool_list_teams(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let teams = team_service::list_teams(&state.db, &auth.workspace_id).await?;
+    let teams = team_service::list_teams(&state.db, &auth.workspace_id, Some(&auth.user_id)).await?;
     serde_json::to_string_pretty(&teams).map_err(trakkt_core::Error::from)
 }
 

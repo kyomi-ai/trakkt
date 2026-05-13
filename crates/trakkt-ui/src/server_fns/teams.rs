@@ -17,11 +17,31 @@ use super::{AuthenticatedContext, IntoServerFnError};
 
 // ─── Read operations ───────────────────────────────────────────────────────
 
-/// List all issue-tracker teams in the current workspace.
+/// List issue-tracker teams the current user belongs to.
 #[server(prefix = "/leptos-api")]
 pub async fn list_teams() -> Result<Vec<Team>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let teams = trakkt_auth::team_service::list_teams(ac.db(), &ac.ws_id)
+    let teams = trakkt_auth::team_service::list_teams(ac.db(), &ac.ws_id, Some(&ac.auth.user_id))
+        .await
+        .into_sfn()?;
+    Ok(teams)
+}
+
+/// List all issue-tracker teams in the workspace (for admin settings).
+#[server(prefix = "/leptos-api")]
+pub async fn list_all_teams() -> Result<Vec<Team>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let teams = trakkt_auth::team_service::list_teams(ac.db(), &ac.ws_id, None)
+        .await
+        .into_sfn()?;
+    Ok(teams)
+}
+
+/// List issue-tracker teams the current user can join (not yet a member of).
+#[server(prefix = "/leptos-api")]
+pub async fn list_joinable_teams() -> Result<Vec<Team>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let teams = trakkt_auth::team_service::list_joinable_teams(ac.db(), &ac.ws_id, &ac.auth.user_id)
         .await
         .into_sfn()?;
     Ok(teams)

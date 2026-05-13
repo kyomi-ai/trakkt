@@ -351,7 +351,7 @@ async fn handle_sync_bootstrap(
             vec![]
         });
 
-    let teams = trakkt_auth::team_service::list_teams(db, workspace_id)
+    let teams = trakkt_auth::team_service::list_teams(db, workspace_id, Some(user_id))
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(user_id, workspace_id, error = %e, "list_teams failed during bootstrap");
