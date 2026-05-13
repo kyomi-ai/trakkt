@@ -61,44 +61,30 @@ fn classify_time_group(created_at: &str) -> TimeGroup {
         None => return TimeGroup::Older,
     };
 
+    let ts_ms = ts.timestamp_millis() as f64;
+
     let now = js_sys::Date::new_0();
-    let now_year = now.get_full_year() as i32;
-    let now_month = now.get_month() as u32;
-    let now_date = now.get_date() as u32;
     let now_day = now.get_day() as i32;
 
-    let ts_year = ts.format("%Y").to_string().parse::<i32>().unwrap_or(0);
-    let ts_month = ts.format("%-m").to_string().parse::<u32>().unwrap_or(1) - 1;
-    let ts_date = ts.format("%-d").to_string().parse::<u32>().unwrap_or(1);
+    let today_start = js_sys::Date::new_0();
+    today_start.set_hours(0);
+    today_start.set_minutes(0);
+    today_start.set_seconds(0);
+    today_start.set_milliseconds(0);
+    let today_start_ms = today_start.get_time();
 
-    if ts_year == now_year && ts_month == now_month && ts_date == now_date {
+    if ts_ms >= today_start_ms {
         return TimeGroup::Today;
     }
 
-    if now_date > 1 && ts_year == now_year && ts_month == now_month && ts_date == now_date - 1 {
+    let yesterday_start_ms = today_start_ms - 86_400_000.0;
+    if ts_ms >= yesterday_start_ms {
         return TimeGroup::Yesterday;
-    }
-    if now_date == 1 {
-        let yesterday_ms = now.get_time() - 86_400_000.0;
-        let yesterday = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(yesterday_ms));
-        let y_year = yesterday.get_full_year() as i32;
-        let y_month = yesterday.get_month() as u32;
-        let y_date = yesterday.get_date() as u32;
-        if ts_year == y_year && ts_month == y_month && ts_date == y_date {
-            return TimeGroup::Yesterday;
-        }
     }
 
     let monday_offset = if now_day == 0 { 6 } else { now_day - 1 };
-    let week_start_ms = now.get_time() - (monday_offset as f64 * 86_400_000.0);
-    let week_start = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(week_start_ms));
-    week_start.set_hours(0);
-    week_start.set_minutes(0);
-    week_start.set_seconds(0);
-    week_start.set_milliseconds(0);
-
-    let ts_ms = ts.timestamp_millis() as f64;
-    if ts_ms >= week_start.get_time() {
+    let week_start_ms = today_start_ms - (monday_offset as f64 * 86_400_000.0);
+    if ts_ms >= week_start_ms {
         return TimeGroup::ThisWeek;
     }
 
