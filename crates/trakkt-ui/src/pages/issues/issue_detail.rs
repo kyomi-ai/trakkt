@@ -1212,10 +1212,11 @@ fn DescriptionEditor(
     let theme_signal = Signal::derive(move || {
         let mut theme = trakkt_kode_theme();
         theme.content_padding = Some("0");
-        if let Some(ts) = theme_state {
-            if ts.effective.get() == "dark" {
-                theme.syntax = kode_leptos::SyntaxTheme::OneDark;
-            }
+        theme.bg = "var(--color-background)";
+        if let Some(ts) = theme_state
+            && ts.effective.get() == "dark"
+        {
+            theme.syntax = kode_leptos::SyntaxTheme::OneDark;
         }
         theme
     });
@@ -1551,10 +1552,10 @@ fn CommentItem(comment: Comment) -> impl IntoView {
                                 theme.content_padding = Some("0");
                                 theme.container_padding = Some("0");
                                 theme.bg = "transparent";
-                                if let Some(ts) = theme_state {
-                                    if ts.effective.get() == "dark" {
-                                        theme.syntax = kode_leptos::SyntaxTheme::OneDark;
-                                    }
+                                if let Some(ts) = theme_state
+                                    && ts.effective.get() == "dark"
+                                {
+                                    theme.syntax = kode_leptos::SyntaxTheme::OneDark;
                                 }
                                 theme
                             })
@@ -1611,10 +1612,10 @@ fn NewCommentForm(team_key: String, number: i32, on_created: Callback<()>) -> im
     let theme_signal = Signal::derive(move || {
         let mut theme = trakkt_kode_theme();
         theme.content_padding = Some("0.75rem 1rem");
-        if let Some(ts) = theme_state {
-            if ts.effective.get() == "dark" {
-                theme.syntax = kode_leptos::SyntaxTheme::OneDark;
-            }
+        if let Some(ts) = theme_state
+            && ts.effective.get() == "dark"
+        {
+            theme.syntax = kode_leptos::SyntaxTheme::OneDark;
         }
         theme
     });
