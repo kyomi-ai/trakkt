@@ -882,6 +882,7 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
   --kode-ol-marker-color: var(--color-muted-foreground);
   --kode-ol-marker-font-family: 'Geist Mono', ui-monospace, monospace;
   --kode-ol-marker-font-variant-numeric: tabular-nums;
+  --kode-list-padding-left: 2.5em;
 
   /* Blockquote — teal rule + italic Instrument Serif */
   --kode-blockquote-border-width: 3px;
