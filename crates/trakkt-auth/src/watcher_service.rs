@@ -88,3 +88,21 @@ pub async fn is_watching(
     )?;
     Ok(count > 0)
 }
+
+/// List all user IDs watching a given issue.
+pub async fn list_watchers_of_issue(
+    db: &DbPool,
+    issue_id: &str,
+) -> trakkt_core::Result<Vec<String>> {
+    #[derive(sqlx::FromRow)]
+    struct UserIdRow {
+        user_id: String,
+    }
+    let rows: Vec<UserIdRow> = trakkt_core::db_fetch_all!(
+        db,
+        UserIdRow,
+        "SELECT user_id FROM issue_watchers WHERE issue_id = $1",
+        issue_id
+    )?;
+    Ok(rows.into_iter().map(|r| r.user_id).collect())
+}

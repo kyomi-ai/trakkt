@@ -82,14 +82,17 @@ pub async fn create_comment(
     );
     trakkt_core::db_execute!(db, &sql, &comment_id, issue_id, user_id, body, parent_id)?;
 
+    // Resolve workspace once — needed for sync log, broadcast, and notifications.
+    let resolved_workspace_id = get_workspace_for_issue(db, issue_id).await;
+
     // Sync log + broadcast — best-effort.
-    match get_workspace_for_issue(db, issue_id).await {
+    match &resolved_workspace_id {
         Ok(workspace_id) => {
             if let Err(e) = sync_log_service::write_sync_entry(
                 db,
                 entity_types::COMMENT,
                 &comment_id,
-                &workspace_id,
+                workspace_id,
                 SyncActionType::Insert,
                 None,
             )
@@ -98,7 +101,7 @@ pub async fn create_comment(
                 tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment create");
             }
             if let Some(ws) = ws_manager {
-                sync_log_service::broadcast_sync_notify(ws, entity_types::COMMENT, &workspace_id).await;
+                sync_log_service::broadcast_sync_notify(ws, entity_types::COMMENT, workspace_id).await;
             }
         }
         Err(e) => {
@@ -109,6 +112,28 @@ pub async fn create_comment(
     // Auto-watch: commenter watches the issue they commented on (best-effort).
     if let Err(e) = crate::watcher_service::watch_issue(db, issue_id, user_id).await {
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to auto-watch issue for commenter");
+    }
+
+    // Notify watchers about the new comment (best-effort).
+    if let Ok(ws_id) = &resolved_workspace_id {
+        match crate::watcher_service::list_watchers_of_issue(db, issue_id).await {
+            Ok(watchers) => {
+                for watcher_id in &watchers {
+                    if *watcher_id == user_id {
+                        continue;
+                    }
+                    if let Err(e) = crate::notification_service::create_notification(
+                        db, ws_id, watcher_id, issue_id,
+                        crate::notification_service::TYPE_COMMENTED, ws_manager,
+                    ).await {
+                        tracing::warn!(error = %e, "Failed to create comment notification");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, issue_id = %issue_id, "Failed to list watchers for comment notification");
+            }
+        }
     }
 
     // Re-fetch with joined user data.

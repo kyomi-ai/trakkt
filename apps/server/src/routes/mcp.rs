@@ -1120,6 +1120,7 @@ async fn tool_update_issue(
         &team_key,
         number,
         &updates,
+        Some(&auth.user_id),
         Some(&state.ws_manager),
     )
     .await?;

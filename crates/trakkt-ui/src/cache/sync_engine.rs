@@ -29,7 +29,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use trakkt_types::models::{Favorite, IssueWithDetails, Label, Project, Status, Team, View};
+use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
 use trakkt_types::sync::{SyncAction, SyncActionType, SyncResponse, entity_types};
 
 use crate::cache::db;
@@ -91,7 +91,7 @@ pub fn start_sync_engine(
                 spawn_local(async move {
                     match db::init_cache_db(&wid).await {
                         Ok(cache_db) => {
-                            for et in [entity_types::ISSUE, entity_types::LABEL, entity_types::STATUS, entity_types::TEAM, entity_types::PROJECT, entity_types::VIEW, entity_types::FAVORITE] {
+                            for et in [entity_types::ISSUE, entity_types::LABEL, entity_types::STATUS, entity_types::TEAM, entity_types::PROJECT, entity_types::VIEW, entity_types::FAVORITE, entity_types::NOTIFICATION] {
                                 if let Err(e) =
                                     db::delete_all_of_type(&cache_db, et, &wid).await
                                 {
@@ -184,6 +184,9 @@ pub async fn hydrate_store_from_db(
     }
     if let Ok(entries) = db::read_all(cache_db, entity_types::FAVORITE, workspace_id).await {
         store.set_favorites(deser::<Favorite>(&entries, entity_types::FAVORITE));
+    }
+    if let Ok(entries) = db::read_all(cache_db, entity_types::NOTIFICATION, workspace_id).await {
+        store.set_notifications(deser::<Notification>(&entries, entity_types::NOTIFICATION));
     }
 
     if let Ok(Some(_cursor)) = db::get_last_sync_id(cache_db, workspace_id).await {
@@ -317,6 +320,16 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                         ),
                     }
                 }
+                et if et == entity_types::NOTIFICATION => {
+                    match serde_json::from_value::<Notification>(entity_data.clone()) {
+                        Ok(item) => store.upsert_notification(item),
+                        Err(e) => tracing::warn!(
+                            entity_type,
+                            entity_id,
+                            "sync_action: failed to deserialize notification: {e}"
+                        ),
+                    }
+                }
                 other => {
                     tracing::debug!(
                         entity_type = other,
@@ -356,6 +369,7 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                 et if et == entity_types::PROJECT => store.remove_project(entity_id),
                 et if et == entity_types::VIEW => store.remove_view(entity_id),
                 et if et == entity_types::FAVORITE => store.remove_favorite(entity_id),
+                et if et == entity_types::NOTIFICATION => store.remove_notification(entity_id),
                 other => {
                     tracing::debug!(
                         entity_type = other,

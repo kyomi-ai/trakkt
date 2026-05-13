@@ -204,7 +204,7 @@ pub async fn update_issue(
         sort_order: if clear_sort_order == Some(true) { Some(None) } else { None },
         team_id: None,
     };
-    let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, &team_key, number, &updates, ac.ctx.ws_manager.as_ref())
+    let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, &team_key, number, &updates, Some(&ac.auth.user_id), ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
     Ok(issue)

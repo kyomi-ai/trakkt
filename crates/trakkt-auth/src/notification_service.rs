@@ -16,6 +16,11 @@ use crate::websocket::WebSocketManager;
 
 const DEFAULT_NOTIFICATION_LIMIT: i64 = 50;
 
+pub const TYPE_COMMENTED: &str = "commented";
+pub const TYPE_STATUS_CHANGED: &str = "status_changed";
+pub const TYPE_ASSIGNED: &str = "assigned";
+pub const TYPE_PRIORITY_CHANGED: &str = "priority_changed";
+
 // ─── Row type ────────────────────────────────────────────────────────────────
 
 /// Internal row type for deserialising notification queries.
@@ -82,22 +87,45 @@ pub async fn create_notification(
         notification_type
     )?;
 
+    // Re-fetch with joined issue data for the sync payload.
+    let notification = trakkt_core::db_fetch_optional!(
+        db,
+        NotificationRow,
+        "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
+                n.type AS notification_type, n.read, \
+                i.title AS issue_title, i.number AS issue_number, \
+                CAST(n.created_at AS TEXT) AS created_at \
+         FROM notifications n \
+         LEFT JOIN issues i ON i.issue_id = n.issue_id \
+         WHERE n.notification_id = $1",
+        &notification_id
+    )?;
+    let notification_data = notification.map(|r| r.into_dto());
+
     if let Err(e) = sync_log_service::write_sync_entry(
         db,
         entity_types::NOTIFICATION,
         &notification_id,
         workspace_id,
         SyncActionType::Insert,
-        None,
+        notification_data.as_ref().and_then(|n| serde_json::to_value(n).ok()),
     )
     .await
     {
         tracing::warn!(error = %e, notification_id = %notification_id, "Failed to write sync log entry for notification create");
     }
 
-    // WebSocket broadcast — best-effort.
+    // WebSocket broadcast with full entity data.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::NOTIFICATION, workspace_id).await;
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::NOTIFICATION,
+            &notification_id,
+            SyncActionType::Insert,
+            notification_data.and_then(|n| serde_json::to_value(&n).ok()),
+        )
+        .await;
     }
 
     Ok(())

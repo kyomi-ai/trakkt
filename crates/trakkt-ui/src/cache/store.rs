@@ -15,7 +15,7 @@
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
-use trakkt_types::models::{Favorite, IssueWithDetails, Label, Project, Status, Team, View};
+use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
 
 // ── Inner storage ─────────────────────────────────────────────────────────────
 
@@ -32,6 +32,7 @@ struct SyncStoreInner {
     projects: ArcRwSignal<Vec<Project>>,
     views: ArcRwSignal<Vec<View>>,
     favorites: ArcRwSignal<Vec<Favorite>>,
+    notifications: ArcRwSignal<Vec<Notification>>,
     initialized: ArcRwSignal<bool>,
 }
 
@@ -69,6 +70,7 @@ impl SyncStore {
                 projects: ArcRwSignal::new(Vec::new()),
                 views: ArcRwSignal::new(Vec::new()),
                 favorites: ArcRwSignal::new(Vec::new()),
+                notifications: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
             })),
         }
@@ -118,6 +120,12 @@ impl SyncStore {
         Signal::derive(move || sig.get())
     }
 
+    /// Reactive signal over the current notifications list.
+    pub fn notifications(&self) -> Signal<Vec<Notification>> {
+        let sig = self.inner.with_value(|inner| inner.notifications.clone());
+        Signal::derive(move || sig.get())
+    }
+
     /// `true` once the store has been hydrated from IndexedDB.
     ///
     /// Pages that read from this store should show a loading state until this
@@ -162,6 +170,11 @@ impl SyncStore {
     /// Replace the entire favorites list (called during IDB hydration).
     pub fn set_favorites(&self, items: Vec<Favorite>) {
         self.inner.with_value(|inner| inner.favorites.set(items));
+    }
+
+    /// Replace the entire notifications list (called during IDB hydration).
+    pub fn set_notifications(&self, items: Vec<Notification>) {
+        self.inner.with_value(|inner| inner.notifications.set(items));
     }
 
     // ── Single-item upserts (live sync) ───────────────────────────────────────
@@ -257,6 +270,19 @@ impl SyncStore {
         });
     }
 
+    /// Insert or update a notification by `notification_id`.
+    pub fn upsert_notification(&self, item: Notification) {
+        self.inner.with_value(|inner| {
+            inner.notifications.update(|list| {
+                if let Some(existing) = list.iter_mut().find(|n| n.notification_id == item.notification_id) {
+                    *existing = item;
+                } else {
+                    list.push(item);
+                }
+            });
+        });
+    }
+
     // ── Single-item removes (delete sync) ────────────────────────────────────
 
     /// Remove an issue by `issue_id`.
@@ -322,6 +348,15 @@ impl SyncStore {
         });
     }
 
+    /// Remove a notification by `notification_id`.
+    pub fn remove_notification(&self, notification_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.notifications.update(|list| {
+                list.retain(|n| n.notification_id != notification_id);
+            });
+        });
+    }
+
     // ── State transitions ─────────────────────────────────────────────────────
 
     /// Mark the store as fully hydrated from IndexedDB.
@@ -346,6 +381,7 @@ impl SyncStore {
             inner.projects.set(Vec::new());
             inner.views.set(Vec::new());
             inner.favorites.set(Vec::new());
+            inner.notifications.set(Vec::new());
             inner.initialized.set(false);
         });
     }

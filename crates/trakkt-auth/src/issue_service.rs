@@ -568,6 +568,7 @@ pub async fn update_issue(
     team_key: &str,
     number: i32,
     updates: &IssueUpdate,
+    actor_user_id: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Issue> {
     let is_pg = db.is_postgres();
@@ -791,6 +792,50 @@ pub async fn update_issue(
             serde_json::to_value(&full_issue).ok(),
         )
         .await;
+    }
+
+    // ── Notification triggers (best-effort) ─────────────────────────────
+    if let Some(actor_id) = actor_user_id {
+        // Assignee auto-watch: when assigned, auto-add as watcher.
+        if let Some(Some(ref assignee_id)) = updates.assignee_id {
+            if let Err(e) = crate::watcher_service::watch_issue(db, &issue_id, assignee_id).await {
+                tracing::warn!(error = %e, issue_id = %issue_id, "Failed to auto-watch issue for assignee");
+            }
+        }
+
+        // Determine which notification types to send.
+        let mut types_to_notify = Vec::new();
+        if updates.status_id.is_some() {
+            types_to_notify.push(crate::notification_service::TYPE_STATUS_CHANGED);
+        }
+        if matches!(updates.assignee_id, Some(Some(_))) {
+            types_to_notify.push(crate::notification_service::TYPE_ASSIGNED);
+        }
+        if updates.priority.is_some() {
+            types_to_notify.push(crate::notification_service::TYPE_PRIORITY_CHANGED);
+        }
+
+        if !types_to_notify.is_empty() {
+            match crate::watcher_service::list_watchers_of_issue(db, &issue_id).await {
+                Ok(watchers) => {
+                    for notification_type in types_to_notify {
+                        for watcher_id in &watchers {
+                            if watcher_id == actor_id {
+                                continue;
+                            }
+                            if let Err(e) = crate::notification_service::create_notification(
+                                db, workspace_id, watcher_id, &issue_id, notification_type, ws_manager,
+                            ).await {
+                                tracing::warn!(error = %e, "Failed to create notification");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, issue_id = %issue_id, "Failed to list watchers for notifications");
+                }
+            }
+        }
     }
 
     Ok(issue)
