@@ -361,7 +361,6 @@ pub fn LoginPage(
                     Ok(LoginResult::Success { .. }) => {
                         #[cfg(target_arch = "wasm32")]
                         {
-                            let auth_version = expect_context::<RwSignal<u64>>();
                             auth_version.update(|v| *v += 1);
                             let dest = redirect_url();
                             if dest.starts_with("/api/") {
@@ -454,7 +453,6 @@ pub fn LoginPage(
                     Ok(SignupResult::AccountCreated { redirect }) => {
                         #[cfg(target_arch = "wasm32")]
                         {
-                            let auth_version = expect_context::<RwSignal<u64>>();
                             auth_version.update(|v| *v += 1);
                             navigate.get_value()(&redirect, Default::default());
                         }
