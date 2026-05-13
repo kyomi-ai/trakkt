@@ -25,7 +25,10 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::components::{Alert, AlertVariant, Button, ButtonSize, ButtonVariant, EmptyState, SearchInput};
-use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown};
+use crate::pages::issues::filters::{
+    sort_issues, PriorityFilterDropdown, SortDirection, SortDropdown, SortField,
+    StatusFilterDropdown,
+};
 use crate::pages::issues::issue_list::SaveViewModal;
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
@@ -59,6 +62,10 @@ pub fn MyIssuesPage() -> impl IntoView {
     let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
     let (show_archived, set_show_archived) = signal(false);
     let (show_save_view, set_show_save_view) = signal(false);
+
+    // ── Sort state (default: updated date, newest first for My Issues) ────
+    let (sort_field, set_sort_field) = signal(SortField::UpdatedDate);
+    let (sort_direction, set_sort_direction) = signal(SortDirection::Desc);
 
     // ── Error state for server function failures ──────────────────────────
     let error_msg = RwSignal::new(Option::<String>::None);
@@ -147,12 +154,14 @@ pub fn MyIssuesPage() -> impl IntoView {
         let Some(uid) = current_user_id.get() else {
             return Vec::new();
         };
-        all_issues
+        let mut issues: Vec<_> = all_issues
             .get()
             .into_iter()
             .filter(|i| i.assignee_id.as_ref() == Some(&uid))
             .filter(|i| passes_filters(i))
-            .collect::<Vec<_>>()
+            .collect();
+        sort_issues(&mut issues, sort_field.get(), sort_direction.get());
+        issues
     });
 
     // ── Section: Created by Me (excluding already shown in Assigned) ──────
@@ -165,12 +174,14 @@ pub fn MyIssuesPage() -> impl IntoView {
             .iter()
             .map(|i| i.issue_id.clone())
             .collect();
-        all_issues
+        let mut issues: Vec<_> = all_issues
             .get()
             .into_iter()
             .filter(|i| i.creator_id == uid && !assigned_ids.contains(&i.issue_id))
             .filter(|i| passes_filters(i))
-            .collect::<Vec<_>>()
+            .collect();
+        sort_issues(&mut issues, sort_field.get(), sort_direction.get());
+        issues
     });
 
     // ── Section: Watching (excluding Assigned and Created) ────────────────
@@ -193,7 +204,7 @@ pub fn MyIssuesPage() -> impl IntoView {
             .iter()
             .map(|i| i.issue_id.clone())
             .collect();
-        all_issues
+        let mut issues: Vec<_> = all_issues
             .get()
             .into_iter()
             .filter(|i| {
@@ -202,7 +213,9 @@ pub fn MyIssuesPage() -> impl IntoView {
                     && !created_ids.contains(&i.issue_id)
             })
             .filter(|i| passes_filters(i))
-            .collect::<Vec<_>>()
+            .collect();
+        sort_issues(&mut issues, sort_field.get(), sort_direction.get());
+        issues
     });
 
     // ── Keyboard navigation state ──────────────────────────────────────────
@@ -312,6 +325,14 @@ pub fn MyIssuesPage() -> impl IntoView {
                 />
                 <StatusFilterDropdown value=status_filter on_change=Callback::new(move |v: Vec<String>| set_status_filter.set(v))/>
                 <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))/>
+                <SortDropdown
+                    field=Signal::derive(move || sort_field.get())
+                    direction=Signal::derive(move || sort_direction.get())
+                    on_change=Callback::new(move |(f, d): (SortField, SortDirection)| {
+                        set_sort_field.set(f);
+                        set_sort_direction.set(d);
+                    })
+                />
                 <button
                     class=move || {
                         if show_archived.get() {
@@ -497,6 +518,8 @@ pub fn MyIssuesPage() -> impl IntoView {
             priority_filter=Signal::derive(move || priority_filter.get())
             team_id=Signal::stored(None::<String>)
             view_mode=Signal::stored("list".to_string())
+            sort_field=Signal::derive(move || sort_field.get())
+            sort_direction=Signal::derive(move || sort_direction.get())
         />
     }
 }
