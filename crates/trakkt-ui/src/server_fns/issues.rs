@@ -168,6 +168,9 @@ pub async fn create_issue(
 /// - `Some("value")` = set to new value
 ///
 /// This avoids `Option<Option<T>>` which cannot round-trip through Leptos form encoding.
+///
+/// `clear_fields` is a comma-separated list of relation fields to set to NULL:
+/// `"sort_order"`, `"parent"`, `"project"`, `"milestone"` (any combination).
 #[server(prefix = "/leptos-api")]
 pub async fn update_issue(
     team_key: String,
@@ -181,14 +184,17 @@ pub async fn update_issue(
     project_id: Option<String>,
     milestone_id: Option<String>,
     parent_issue_id: Option<String>,
-    clear_sort_order: Option<bool>,
-    clear_parent: Option<bool>,
-    clear_project: Option<bool>,
-    clear_milestone: Option<bool>,
+    clear_fields: Option<String>,
 ) -> Result<Issue, ServerFnError> {
     use trakkt_types::models::IssueUpdate;
 
     let ac = AuthenticatedContext::extract().await?;
+
+    let clears: Vec<&str> = clear_fields
+        .as_deref()
+        .map(|s| s.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+
     let updates = IssueUpdate {
         title,
         description: description.map(|s| if s.is_empty() { None } else { Some(s) }),
@@ -196,22 +202,22 @@ pub async fn update_issue(
         priority,
         assignee_id: assignee_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         due_date: due_date.map(|s| if s.is_empty() { None } else { Some(s) }),
-        project_id: if clear_project == Some(true) {
+        project_id: if clears.contains(&"project") {
             Some(None)
         } else {
             project_id.map(|s| if s.is_empty() { None } else { Some(s) })
         },
-        milestone_id: if clear_milestone == Some(true) {
+        milestone_id: if clears.contains(&"milestone") {
             Some(None)
         } else {
             milestone_id.map(|s| if s.is_empty() { None } else { Some(s) })
         },
-        parent_issue_id: if clear_parent == Some(true) {
+        parent_issue_id: if clears.contains(&"parent") {
             Some(None)
         } else {
             parent_issue_id.map(|s| if s.is_empty() { None } else { Some(s) })
         },
-        sort_order: if clear_sort_order == Some(true) { Some(None) } else { None },
+        sort_order: if clears.contains(&"sort_order") { Some(None) } else { None },
         team_id: None,
     };
     let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, &team_key, number, &updates, Some(&ac.auth.user_id), ac.ctx.ws_manager.as_ref())

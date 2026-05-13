@@ -319,8 +319,7 @@ pub fn BoardContent(
                     None, None,
                     Some(target_id_for_server),
                     None, None, None, None, None, None,
-                    Some(true),
-                    None, None, None,
+                    Some("sort_order".to_string()),
                 ).await {
                     tracing::warn!("Failed to update issue status: {e}");
                     // Revert optimistic update on failure.

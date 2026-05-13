@@ -421,7 +421,7 @@ fn IssueDetailContent(
                             child_number,
                             None, None, None, None, None, None, None, None,
                             Some(parent_id),
-                            None, None, None, None,
+                            None,
                         ).await;
                     });
                 }
@@ -472,18 +472,8 @@ fn EditableTitle(
                 tk,
                 number,
                 Some(new_title),
-                None, // description
-                None, // status_id
-                None, // priority
-                None, // assignee_id
-                None, // due_date
-                None, // project_id
-                None, // milestone_id
-                None, // parent_issue_id
-                None, // clear_sort_order
-                None, // clear_parent
-                None, // clear_project
-                None, // clear_milestone
+                None, None, None, None, None, None, None, None,
+                None,
             )
             .await;
             set_saving.set(false);
@@ -582,19 +572,10 @@ fn MetadataSidebar(
             let _ = update_issue(
                 tk,
                 number,
-                None, // title
-                None, // description
+                None, None,
                 Some(new_status_id),
-                None, // priority
-                None, // assignee_id
-                None, // due_date
-                None, // project_id
-                None, // milestone_id
-                None, // parent_issue_id
-                None, // clear_sort_order
-                None, // clear_parent
-                None, // clear_project
-                None, // clear_milestone
+                None, None, None, None, None, None,
+                None,
             )
             .await;
             on_change.run(());
@@ -608,19 +589,10 @@ fn MetadataSidebar(
             let _ = update_issue(
                 tk,
                 number,
-                None, // title
-                None, // description
-                None, // status_id
+                None, None, None,
                 Some(prio),
-                None, // assignee_id
-                None, // due_date
-                None, // project_id
-                None, // milestone_id
-                None, // parent_issue_id
-                None, // clear_sort_order
-                None, // clear_parent
-                None, // clear_project
-                None, // clear_milestone
+                None, None, None, None, None,
+                None,
             )
             .await;
             on_change.run(());
@@ -636,10 +608,8 @@ fn MetadataSidebar(
                 tk, number,
                 None, None, None, None, None, None,
                 if is_clear { None } else { Some(project_id) },
-                None,
-                None, None, None,
-                if is_clear { Some(true) } else { None },
-                Some(true),
+                None, None,
+                Some(if is_clear { "project,milestone".to_string() } else { "milestone".to_string() }),
             ).await;
             on_change.run(());
         });
@@ -655,8 +625,8 @@ fn MetadataSidebar(
                 None, None, None, None, None, None,
                 None,
                 if is_clear { None } else { Some(milestone_id) },
-                None, None, None, None,
-                if is_clear { Some(true) } else { None },
+                None,
+                if is_clear { Some("milestone".to_string()) } else { None },
             ).await;
             on_change.run(());
         });
@@ -1110,9 +1080,7 @@ fn MetadataSidebar(
                                                     number,
                                                     None, None, None, None, None, None, None, None,
                                                     None,
-                                                    None,
-                                                    Some(true),
-                                                    None, None,
+                                                    Some("parent".to_string()),
                                                 ).await;
                                             });
                                         }
@@ -1161,7 +1129,7 @@ fn MetadataSidebar(
                             number,
                             None, None, None, None, None, None, None, None,
                             Some(parent_id),
-                            None, None, None, None,
+                            None,
                         ).await;
                     });
                 }
@@ -1425,19 +1393,10 @@ fn DescriptionEditor(
             let _ = update_issue(
                 tk,
                 number,
-                None, // title
+                None,
                 desc,
-                None, // status_id
-                None, // priority
-                None, // assignee_id
-                None, // due_date
-                None, // project_id
-                None, // milestone_id
-                None, // parent_issue_id
-                None, // clear_sort_order
-                None, // clear_parent
-                None, // clear_project
-                None, // clear_milestone
+                None, None, None, None, None, None, None,
+                None,
             )
             .await;
         });
