@@ -25,6 +25,7 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 
 ### Error Handling
 - Never silently discard errors with `let _ =`. At minimum, log with `tracing::warn!`.
+- Never use `unwrap_or_default()` on deserialization (JSON parse, filter decode, etc.) — use `match` and log the error with `tracing::warn!`.
 - Service errors propagate as `trakkt_core::Error` variants.
 - Server function errors convert via `IntoServerFnError` trait.
 
@@ -40,6 +41,9 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 - Use Leptos components (`<Button>`, `<Modal>`), never raw HTML elements for styled components.
 - Styles live in the component definition, not in the caller.
 - Pass `variant`, `size`, and optional `class` props — don't inline Tailwind in callers.
+
+### Layout
+- Never put `overflow-x-auto` on containers that have absolutely-positioned dropdown children — the overflow clipping hides the dropdown. Use `flex-wrap` or move the dropdown to a portal.
 
 ### SSR / Hydration
 - Never use `Resource::new()` inside `#[cfg(target_arch = "wasm32")]` blocks (desyncs hydration IDs).
