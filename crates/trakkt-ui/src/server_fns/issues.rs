@@ -183,6 +183,8 @@ pub async fn update_issue(
     parent_issue_id: Option<String>,
     clear_sort_order: Option<bool>,
     clear_parent: Option<bool>,
+    clear_project: Option<bool>,
+    clear_milestone: Option<bool>,
 ) -> Result<Issue, ServerFnError> {
     use trakkt_types::models::IssueUpdate;
 
@@ -194,8 +196,16 @@ pub async fn update_issue(
         priority,
         assignee_id: assignee_id.map(|s| if s.is_empty() { None } else { Some(s) }),
         due_date: due_date.map(|s| if s.is_empty() { None } else { Some(s) }),
-        project_id: project_id.map(|s| if s.is_empty() { None } else { Some(s) }),
-        milestone_id: milestone_id.map(|s| if s.is_empty() { None } else { Some(s) }),
+        project_id: if clear_project == Some(true) {
+            Some(None)
+        } else {
+            project_id.map(|s| if s.is_empty() { None } else { Some(s) })
+        },
+        milestone_id: if clear_milestone == Some(true) {
+            Some(None)
+        } else {
+            milestone_id.map(|s| if s.is_empty() { None } else { Some(s) })
+        },
         parent_issue_id: if clear_parent == Some(true) {
             Some(None)
         } else {
