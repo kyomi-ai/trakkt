@@ -43,6 +43,11 @@ fn classify_time_group(created_at: &str) -> TimeGroup {
         .parse::<chrono::DateTime<chrono::Utc>>()
         .ok()
         .or_else(|| {
+            chrono::DateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S%.f%#z")
+                .ok()
+                .map(|dt| dt.to_utc())
+        })
+        .or_else(|| {
             NaiveDateTime::parse_from_str(created_at, "%Y-%m-%dT%H:%M:%S%.f")
                 .ok()
                 .or_else(|| {
