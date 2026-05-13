@@ -564,7 +564,7 @@ fn EditableTitle(
                 view! {
                     <h1
                         class="font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors"
-                        style="font-size: 48px; font-weight: 400; line-height: 1.1; letter-spacing: -0.01em;"
+                        style="font-size: 36px; font-weight: 400; line-height: 1.1; letter-spacing: -0.01em;"
                         on:click=move |_| {
                             set_editing.set(true);
                         }
@@ -582,7 +582,7 @@ fn EditableTitle(
                         node_ref=input_ref
                         type="text"
                         class="font-display text-foreground bg-transparent border-b-2 border-primary outline-none w-full py-1"
-                        style="font-size: 48px; font-weight: 400; line-height: 1.1; letter-spacing: -0.01em;"
+                        style="font-size: 36px; font-weight: 400; line-height: 1.1; letter-spacing: -0.01em;"
                         prop:value=move || current_title.get()
                         on:input=move |ev| set_current_title.set(event_target_value(&ev))
                         on:blur=move |_| save_title()
