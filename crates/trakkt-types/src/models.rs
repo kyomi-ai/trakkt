@@ -231,6 +231,8 @@ pub struct Notification {
     pub read: bool,
     pub issue_title: Option<String>,
     pub issue_number: Option<i32>,
+    pub actor_id: Option<String>,
+    pub actor_name: Option<String>,
     pub created_at: String,
 }
 

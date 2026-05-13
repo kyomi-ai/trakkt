@@ -124,7 +124,7 @@ pub async fn create_comment(
                     }
                     if let Err(e) = crate::notification_service::create_notification(
                         db, ws_id, watcher_id, issue_id,
-                        crate::notification_service::TYPE_COMMENTED, ws_manager,
+                        crate::notification_service::TYPE_COMMENTED, Some(user_id), ws_manager,
                     ).await {
                         tracing::warn!(error = %e, "Failed to create comment notification");
                     }

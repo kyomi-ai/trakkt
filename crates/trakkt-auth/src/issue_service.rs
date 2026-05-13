@@ -824,7 +824,7 @@ pub async fn update_issue(
                                 continue;
                             }
                             if let Err(e) = crate::notification_service::create_notification(
-                                db, workspace_id, watcher_id, &issue_id, notification_type, ws_manager,
+                                db, workspace_id, watcher_id, &issue_id, notification_type, Some(actor_id), ws_manager,
                             ).await {
                                 tracing::warn!(error = %e, "Failed to create notification");
                             }

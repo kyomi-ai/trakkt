@@ -239,6 +239,7 @@ fn Sidebar(
 
             // Navigation
             <nav class="flex-1 p-3 space-y-1 overflow-y-auto">
+                <SidebarInboxNavItem/>
                 <SidebarNavItem href="/my-issues" icon=phosphor_leptos::LIST_CHECKS label="My Issues"/>
 
                 <SidebarFavoritesSection/>
@@ -977,6 +978,52 @@ fn SidebarSubNavItem(
         <a href=href class=class>
             <Icon icon=icon weight=weight size="14px"/>
             {label}
+        </a>
+    }
+}
+
+#[component]
+fn SidebarInboxNavItem() -> impl IntoView {
+    let path = leptos_router::hooks::use_location().pathname;
+    let is_active = Memo::new(move |_| {
+        let p = path.get();
+        p == "/inbox" || p.starts_with("/inbox/")
+    });
+    let weight = Memo::new(move |_| {
+        if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
+    });
+    let class = move || {
+        let base = "flex items-center gap-3 px-3 py-3 rounded-md text-sm transition-colors";
+        if is_active.get() {
+            format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
+        } else {
+            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)]")
+        }
+    };
+
+    let sync_store = use_context::<SyncStore>();
+    let unread_count = Signal::derive(move || {
+        sync_store
+            .map(|store| store.notifications().get().iter().filter(|n| !n.read).count())
+            .unwrap_or(0)
+    });
+
+    view! {
+        <a href="/inbox" class=class>
+            <Icon icon=phosphor_leptos::TRAY weight=weight size="18px"/>
+            "Inbox"
+            {move || {
+                let count = unread_count.get();
+                if count > 0 {
+                    Some(view! {
+                        <span class="ml-auto text-xs font-medium text-primary-foreground bg-primary rounded-full px-1.5 py-0.5 min-w-[1.25rem] text-center">
+                            {count}
+                        </span>
+                    })
+                } else {
+                    None
+                }
+            }}
         </a>
     }
 }
