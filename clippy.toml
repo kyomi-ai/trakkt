@@ -1,0 +1,4 @@
+# Leptos `#[server]` macro requires flat parameter lists — this is a genuine
+# framework constraint, not bad code. The default threshold of 7 is too
+# restrictive for server functions that pass through entity fields.
+too-many-arguments-threshold = 14

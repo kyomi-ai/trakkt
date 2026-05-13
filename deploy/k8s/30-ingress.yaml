@@ -1,0 +1,14 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: trakkt
+  namespace: trakkt
+spec:
+  entryPoints:
+    - web
+  routes:
+    - kind: Rule
+      match: Host(`trakkt.app`)
+      services:
+        - name: trakkt
+          port: 80

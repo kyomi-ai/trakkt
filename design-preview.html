@@ -1,0 +1,1254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trakkt Design System Preview</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Instrument+Serif:ital@0;1&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --accent: #0D9488;
+    --accent-hover: #0F766E;
+    --accent-light: #CCFBF1;
+    --warm-dark: #2C241E;
+    --warm-dark-deep: #1C1917;
+    --bg: #FAFAF8;
+    --surface: #FFFFFF;
+    --surface-alt: #F5F3EF;
+    --border: #E8E5DE;
+    --border-strong: #D4D0C8;
+    --text: #1C1917;
+    --text-secondary: #6B6660;
+    --text-muted: #9C9790;
+    --success: #15803D;
+    --warning: #CA8A04;
+    --error: #DC2626;
+    --info: #2563EB;
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 12px;
+    font-size: 15px;
+  }
+
+  .dark {
+    --bg: #12100F;
+    --surface: #1A1816;
+    --surface-alt: #24201E;
+    --border: #2E2925;
+    --border-strong: #3B3530;
+    --text: #F5F3EF;
+    --text-secondary: #A8A29E;
+    --text-muted: #78716C;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'DM Sans', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }
+
+  .container { max-width: 1200px; margin: 0 auto; padding: 48px 32px; }
+
+  .hero {
+    text-align: center;
+    margin-bottom: 64px;
+    padding-bottom: 48px;
+    border-bottom: 1px solid var(--border);
+  }
+  .hero h1 {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-weight: 400;
+    font-size: 48px;
+    letter-spacing: -0.01em;
+    line-height: 1.1;
+    margin-bottom: 12px;
+  }
+  .hero h1 em { color: var(--accent); font-style: italic; }
+  .hero p { font-size: 18px; color: var(--text-secondary); max-width: 55ch; margin: 0 auto; }
+
+  .theme-toggle {
+    position: fixed; top: 12px; right: 12px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-md); padding: 6px 14px;
+    font-family: 'DM Sans', sans-serif; font-size: 12px; font-weight: 500;
+    color: var(--text-secondary); cursor: pointer; z-index: 100;
+    transition: all 0.15s ease;
+  }
+  .theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+
+  .section { margin-bottom: 56px; }
+  .section-title {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-weight: 400; font-size: 28px; margin-bottom: 6px;
+    letter-spacing: -0.01em;
+  }
+  .section-desc { color: var(--text-secondary); font-size: 13px; margin-bottom: 24px; }
+
+  /* Typography */
+  .type-specimen { display: flex; flex-direction: column; gap: 0; }
+  .type-row {
+    display: flex; align-items: baseline; gap: 20px;
+    padding: 14px 0; border-bottom: 1px solid var(--border);
+  }
+  .type-label {
+    font-family: 'Geist Mono', monospace; font-size: 10px;
+    color: var(--text-muted); width: 100px; flex-shrink: 0;
+    text-transform: uppercase; letter-spacing: 0.08em;
+  }
+  .type-display { font-family: 'Instrument Serif', Georgia, serif; font-weight: 400; font-size: 36px; line-height: 1.1; letter-spacing: -0.01em; }
+  .type-heading { font-family: 'Instrument Serif', Georgia, serif; font-weight: 400; font-size: 24px; line-height: 1.1; letter-spacing: -0.01em; }
+  .type-body { font-size: 15px; max-width: 55ch; }
+  .type-label-text { font-size: 13px; font-weight: 500; }
+  .type-data { font-family: 'Geist Mono', monospace; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .type-code { font-family: 'Geist Mono', monospace; font-size: 12px; background: var(--surface-alt); padding: 2px 6px; border-radius: 3px; }
+
+  /* Color Palette */
+  .palette { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
+  .swatch { border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border); }
+  .swatch-color { height: 64px; }
+  .swatch-info { padding: 10px; background: var(--surface); }
+  .swatch-name { font-size: 12px; font-weight: 600; margin-bottom: 1px; }
+  .swatch-hex { font-family: 'Geist Mono', monospace; font-size: 11px; color: var(--text-muted); }
+
+  /* Label colors demo */
+  .label-colors { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 20px; }
+  .label-pill {
+    font-size: 11px; font-weight: 500;
+    padding: 1px 8px; border-radius: 12px;
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+
+  /* Buttons */
+  .button-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    gap: 5px; white-space: nowrap;
+    border-radius: var(--radius-md);
+    font-family: 'DM Sans', sans-serif; font-size: 13px; font-weight: 600;
+    padding: 7px 14px; cursor: pointer;
+    transition: all 0.15s ease; border: none; text-decoration: none;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-secondary { background: var(--surface-alt); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { border-color: var(--border-strong); }
+  .btn-ghost { background: transparent; color: var(--text-secondary); }
+  .btn-ghost:hover { background: var(--surface-alt); color: var(--text); }
+  .btn-destructive { background: var(--error); color: #fff; }
+  .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  .btn-outline:hover { background: var(--surface-alt); }
+  .btn-sm { font-size: 12px; padding: 5px 10px; }
+
+  /* SVG Icons */
+  .icon { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+
+  /* Status Icons */
+  .status-icon { width: 14px; height: 14px; flex-shrink: 0; }
+  .status-icon svg { width: 14px; height: 14px; }
+
+  /* Priority Icons — bar chart style like Linear */
+  .priority-icon { width: 14px; height: 14px; flex-shrink: 0; display: flex; align-items: flex-end; gap: 1px; }
+  .priority-bar { width: 3px; border-radius: 0.5px; background: var(--text-muted); opacity: 0.25; }
+  .priority-bar.filled { opacity: 1; }
+  .priority-bar.urgent { background: #DC2626; opacity: 1; }
+
+  /* Issue List — Linear-density */
+  .issue-list {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden; background: var(--surface);
+  }
+  .issue-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 12px; height: 36px;
+    border-bottom: 1px solid var(--border);
+    transition: background-color 0.1s ease;
+    cursor: default; font-size: 13px;
+  }
+  .issue-row:hover { background: var(--surface-alt); }
+  .issue-row:last-child { border-bottom: none; }
+  .issue-id {
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px; color: var(--text-muted);
+    width: 52px; flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .issue-title { font-size: 13px; font-weight: 500; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .issue-labels { display: flex; gap: 4px; flex-shrink: 0; }
+  .issue-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .avatar-sm {
+    width: 18px; height: 18px; border-radius: 50%;
+    background: var(--surface-alt); border: 1px solid var(--border);
+    color: var(--text-muted); font-size: 9px; font-weight: 600;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .issue-date {
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px; color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Kanban */
+  .kanban-grid { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 4px; }
+  .kanban-column { min-width: 260px; max-width: 300px; flex-shrink: 0; }
+  .kanban-header {
+    font-size: 12px; font-weight: 600; color: var(--text-secondary);
+    padding: 6px 0; margin-bottom: 6px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .kanban-count {
+    font-family: 'Geist Mono', monospace; font-size: 10px; color: var(--text-muted);
+    background: var(--surface-alt); padding: 0 5px; border-radius: 8px;
+  }
+  .kanban-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-md); padding: 10px 12px;
+    margin-bottom: 6px; box-shadow: 0 1px 2px rgba(28,25,23,0.04);
+    transition: box-shadow 0.15s ease; font-size: 13px;
+  }
+  .kanban-card:hover { box-shadow: 0 2px 8px rgba(28,25,23,0.08); }
+  .kanban-card-id {
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px; color: var(--text-muted); margin-bottom: 3px;
+  }
+  .kanban-card-title { font-size: 13px; font-weight: 500; margin-bottom: 8px; line-height: 1.35; }
+  .kanban-card-footer { display: flex; align-items: center; justify-content: space-between; }
+
+  /* Linear-style Dropdown */
+  .dropdown-demo { position: relative; display: inline-block; }
+  .dropdown-menu {
+    width: 220px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: 0 4px 16px rgba(28,25,23,0.12), 0 1px 3px rgba(28,25,23,0.06);
+    overflow: hidden;
+  }
+  .dropdown-search {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .dropdown-search input {
+    width: 100%; border: none; background: transparent;
+    font-family: 'DM Sans', sans-serif; font-size: 12px;
+    color: var(--text); outline: none;
+  }
+  .dropdown-search input::placeholder { color: var(--text-muted); }
+  .dropdown-section-label {
+    font-size: 10px; font-weight: 500; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--text-muted);
+    padding: 8px 10px 4px;
+  }
+  .dropdown-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 10px; font-size: 13px; color: var(--text);
+    cursor: pointer; transition: background 0.1s ease;
+    border-radius: 3px; margin: 1px 4px;
+  }
+  .dropdown-item:hover { background: var(--surface-alt); }
+  .dropdown-item.selected { background: var(--accent-light); color: var(--accent); }
+  .dropdown-item .check { width: 14px; color: var(--accent); font-size: 12px; flex-shrink: 0; }
+  .dropdown-item .item-icon { width: 14px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .dropdown-kbd {
+    margin-left: auto; font-family: 'Geist Mono', monospace;
+    font-size: 10px; color: var(--text-muted);
+  }
+  .dropdown-divider { height: 1px; background: var(--border); margin: 4px 0; }
+  .dropdown-footer {
+    padding: 6px 10px; border-top: 1px solid var(--border);
+    display: flex; gap: 12px;
+  }
+  .dropdown-footer-hint {
+    font-size: 10px; color: var(--text-muted);
+    display: flex; align-items: center; gap: 4px;
+  }
+  .dropdown-footer-hint kbd {
+    font-family: 'Geist Mono', monospace; font-size: 10px;
+    background: var(--surface-alt); padding: 1px 4px; border-radius: 3px;
+    border: 1px solid var(--border);
+  }
+
+  /* App Layout Mock */
+  .app-mock {
+    border: 1px solid var(--border); border-radius: var(--radius-lg);
+    overflow: hidden; display: flex; height: 520px; background: var(--bg);
+  }
+  .mock-sidebar {
+    width: 220px; flex-shrink: 0;
+    background: var(--warm-dark-deep);
+    padding: 14px 8px; color: #F5F3EF;
+    display: flex; flex-direction: column;
+  }
+  .mock-sidebar-logo {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px; font-weight: 700;
+    padding: 0 8px 16px; color: #F5F3EF;
+  }
+  .mock-sidebar-logo span { color: var(--accent); }
+  .mock-sidebar-section {
+    font-size: 10px; font-weight: 500; text-transform: uppercase;
+    letter-spacing: 0.08em; color: #78716C; padding: 14px 8px 4px;
+  }
+  .mock-nav-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px; border-radius: 4px;
+    font-size: 13px; color: #A8A29E;
+    transition: all 0.1s ease; cursor: pointer;
+  }
+  .mock-nav-item:hover { color: #F5F3EF; background: rgba(255,255,255,0.05); }
+  .mock-nav-item.active { color: #F5F3EF; background: var(--warm-dark); }
+  .mock-nav-icon { width: 16px; text-align: center; font-size: 13px; }
+  .mock-content { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
+  .mock-header {
+    padding: 14px 20px; display: flex; align-items: center; justify-content: space-between;
+  }
+  .mock-page-title {
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 600; font-size: 14px;
+  }
+  .mock-toolbar {
+    padding: 0 20px 10px; display: flex; gap: 6px; align-items: center;
+  }
+  .mock-search {
+    flex: 1; padding: 5px 10px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); font-family: 'DM Sans', sans-serif;
+    font-size: 12px; color: var(--text-muted);
+  }
+  .mock-filter {
+    padding: 4px 10px;
+    background: transparent; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); font-size: 12px; color: var(--text-secondary);
+    cursor: pointer; transition: all 0.1s ease;
+  }
+  .mock-filter:hover { border-color: var(--border-strong); color: var(--text); }
+  .mock-filter.active { background: var(--surface-alt); color: var(--text); }
+  .mock-view-toggle {
+    display: flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden;
+  }
+  .mock-view-btn {
+    padding: 4px 8px; font-size: 11px; color: var(--text-muted);
+    background: transparent; cursor: pointer; border: none;
+    transition: all 0.1s ease;
+  }
+  .mock-view-btn.active { background: var(--surface-alt); color: var(--text); }
+  .mock-view-btn + .mock-view-btn { border-left: 1px solid var(--border); }
+
+  /* Speed cards */
+  .speed-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .speed-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-md); padding: 16px;
+  }
+  .speed-card h4 { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  .speed-card p { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+
+  /* Alerts */
+  .alert {
+    padding: 8px 12px; border-radius: var(--radius-sm);
+    font-size: 12px; border: 1px solid; margin-bottom: 8px;
+  }
+
+  /* Spacing */
+  .spacing-demo { display: flex; gap: 8px; align-items: flex-end; }
+  .spacing-block { background: var(--accent-light); border: 1px solid var(--accent); border-radius: 1px; }
+  .spacing-label { font-family: 'Geist Mono', monospace; font-size: 9px; color: var(--text-muted); text-align: center; margin-top: 4px; }
+
+  /* Dropdowns grid */
+  .dropdown-grid { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+
+  /* Collapsed dropdown triggers */
+  .dropdown-trigger {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 4px 8px; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); background: transparent;
+    font-family: 'DM Sans', sans-serif; font-size: 12px;
+    color: var(--text-secondary); cursor: pointer;
+    transition: all 0.1s ease;
+  }
+  .dropdown-trigger:hover { border-color: var(--border-strong); color: var(--text); }
+  .dropdown-trigger.has-value { color: var(--text); }
+  .dropdown-trigger .trigger-icon { width: 14px; display: flex; align-items: center; justify-content: center; }
+  .dropdown-trigger .chevron { font-size: 8px; color: var(--text-muted); margin-left: 2px; }
+  .dropdown-triggers-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 20px; }
+
+  /* Logo section */
+  .logo-sizes { display: flex; gap: 28px; align-items: flex-end; flex-wrap: wrap; }
+  .logo-size-item { text-align: center; }
+  .logo-size-item .size-label {
+    font-family: 'Geist Mono', monospace; font-size: 9px;
+    color: var(--text-muted); margin-top: 6px;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .logo-size-item svg { display: block; margin: 0 auto; }
+  .bg-row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .bg-card {
+    padding: 24px 40px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border);
+  }
+  .wordmark-row { display: flex; gap: 32px; flex-wrap: wrap; align-items: center; }
+  .wordmark { display: flex; align-items: center; gap: 8px; }
+  .wordmark-text { font-family: 'DM Sans', sans-serif; font-weight: 700; letter-spacing: -0.02em; }
+  .animated-box {
+    padding: 24px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 6px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .logo-context-grid {
+    display: grid; grid-template-columns: auto 1fr; gap: 24px; align-items: start;
+  }
+  .mini-sidebar {
+    width: 200px; background: var(--warm-dark-deep);
+    border-radius: 6px; padding: 12px 8px; color: #F5F3EF;
+  }
+  .mini-sidebar-logo { display: flex; align-items: center; gap: 8px; padding: 0 8px 12px; }
+  .mini-sidebar-logo-text { font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 13px; color: #F5F3EF; }
+  .mini-nav-item {
+    display: flex; align-items: center; gap: 7px;
+    padding: 4px 8px; border-radius: 4px;
+    font-size: 12px; color: #A8A29E;
+  }
+  .mini-nav-item.active { color: #F5F3EF; background: var(--warm-dark); }
+  .mini-auth-mock {
+    display: flex; border-radius: 8px; overflow: hidden;
+    border: 1px solid var(--border); height: 320px;
+  }
+  .mini-auth-brand {
+    width: 300px; background: var(--warm-dark-deep);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 32px;
+  }
+  .mini-auth-tagline {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-size: 16px; color: #A8A29E; margin-top: 12px;
+    text-align: center; font-style: italic;
+  }
+  .mini-auth-form {
+    flex: 1; padding: 32px;
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .mini-auth-form h3 {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-size: 22px; margin-bottom: 16px;
+  }
+  .mini-auth-input {
+    width: 100%; padding: 6px 10px; margin-bottom: 10px;
+    border: 1px solid var(--border); border-radius: 4px;
+    font-family: 'DM Sans', sans-serif; font-size: 12px;
+    background: var(--surface); color: var(--text);
+  }
+  .mini-auth-btn {
+    width: 100%; padding: 7px; margin-top: 6px;
+    background: var(--accent); color: #fff; border: none;
+    border-radius: 6px; font-family: 'DM Sans', sans-serif;
+    font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  .tab-mock {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-bottom: none; border-radius: 6px 6px 0 0;
+    padding: 6px 14px 6px 10px; font-size: 11px; color: var(--text-secondary);
+  }
+  .tab-mock-bar {
+    background: var(--surface-alt); border: 1px solid var(--border);
+    border-radius: 0 0 6px 6px; padding: 6px 10px;
+    font-family: 'Geist Mono', monospace; font-size: 10px; color: var(--text-muted);
+    display: flex; align-items: center; gap: 6px;
+  }
+
+  @media (max-width: 768px) {
+    .speed-grid { grid-template-columns: 1fr; }
+    .app-mock { flex-direction: column; height: auto; }
+    .mock-sidebar { width: 100%; height: auto; padding: 8px; }
+    .dropdown-grid { flex-direction: column; }
+    .logo-context-grid { grid-template-columns: 1fr; }
+    .mini-auth-mock { flex-direction: column; height: auto; }
+    .mini-auth-brand { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<button class="theme-toggle" onclick="document.documentElement.classList.toggle('dark'); this.textContent = document.documentElement.classList.contains('dark') ? 'Light Mode' : 'Dark Mode'">Dark Mode</button>
+
+<div class="container">
+
+<div class="hero">
+  <div style="margin-bottom: 16px;">
+    <svg viewBox="0 0 180 180" width="56" height="56"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+  </div>
+  <h1>Trakkt <em>Design System</em></h1>
+  <p>Faster than anything else. Icons for system state, color for user taxonomy.</p>
+</div>
+
+<!-- Logo -->
+<div class="section">
+  <h2 class="section-title">Logo</h2>
+  <p class="section-desc">Two mirrored brackets forming a track in negative space. Geometric, symmetric, reads at 16px.</p>
+
+  <div style="margin-bottom: 28px;">
+    <div style="font-size: 11px; font-weight: 600; margin-bottom: 10px; color: var(--text-secondary);">SCALE</div>
+    <div class="logo-sizes">
+      <div class="logo-size-item">
+        <svg viewBox="0 0 180 180" width="16" height="16"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+        <div class="size-label">16px<br>favicon</div>
+      </div>
+      <div class="logo-size-item">
+        <svg viewBox="0 0 180 180" width="24" height="24"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+        <div class="size-label">24px<br>sidebar</div>
+      </div>
+      <div class="logo-size-item">
+        <svg viewBox="0 0 180 180" width="32" height="32"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+        <div class="size-label">32px<br>nav</div>
+      </div>
+      <div class="logo-size-item">
+        <svg viewBox="0 0 180 180" width="48" height="48"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+        <div class="size-label">48px<br>header</div>
+      </div>
+      <div class="logo-size-item">
+        <svg viewBox="0 0 180 180" width="64" height="64"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+        <div class="size-label">64px<br>marketing</div>
+      </div>
+      <div class="logo-size-item">
+        <svg viewBox="0 0 180 180" width="128" height="128"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+        <div class="size-label">128px<br>app icon</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-bottom: 28px;">
+    <div style="font-size: 11px; font-weight: 600; margin-bottom: 10px; color: var(--text-secondary);">ON BACKGROUNDS</div>
+    <div class="bg-row">
+      <div class="bg-card" style="background: #FFFFFF;">
+        <svg viewBox="0 0 180 180" width="48" height="48"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+      </div>
+      <div class="bg-card" style="background: #FAFAF8;">
+        <svg viewBox="0 0 180 180" width="48" height="48"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+      </div>
+      <div class="bg-card" style="background: #1C1917; border-color: #2E2925;">
+        <svg viewBox="0 0 180 180" width="48" height="48"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#FFFFFF"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#FFFFFF"/></svg>
+      </div>
+      <div class="bg-card" style="background: #12100F; border-color: #2E2925;">
+        <svg viewBox="0 0 180 180" width="48" height="48"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+      </div>
+      <div class="bg-card" style="background: #0D9488; border-color: #0F766E;">
+        <svg viewBox="0 0 180 180" width="48" height="48"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#FFFFFF"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#FFFFFF"/></svg>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-bottom: 28px;">
+    <div style="font-size: 11px; font-weight: 600; margin-bottom: 10px; color: var(--text-secondary);">WORDMARK LOCKUPS</div>
+    <div class="wordmark-row">
+      <div class="wordmark">
+        <svg viewBox="0 0 180 180" width="24" height="24"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+        <span class="wordmark-text" style="font-size: 18px; color: var(--text);">Trakkt</span>
+      </div>
+      <div class="wordmark">
+        <svg viewBox="0 0 180 180" width="18" height="18"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+        <span class="wordmark-text" style="font-size: 14px; color: var(--text);">Trakkt</span>
+      </div>
+      <div class="wordmark" style="background: var(--warm-dark-deep); padding: 10px 16px; border-radius: 6px;">
+        <svg viewBox="0 0 180 180" width="18" height="18"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#F5F3EF"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#F5F3EF"/></svg>
+        <span class="wordmark-text" style="font-size: 14px; color: #F5F3EF;">Trakkt</span>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-bottom: 28px;">
+    <div style="font-size: 11px; font-weight: 600; margin-bottom: 10px; color: var(--text-secondary);">ANIMATED (loading / splash only)</div>
+    <div class="animated-box">
+      <svg viewBox="0 0 180 180" width="64" height="64">
+        <path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488">
+          <animateTransform attributeName="transform" type="translate" values="0 0; 12 0; 0 0; -8 0; 0 0" keyTimes="0; 0.3; 0.5; 0.8; 1" dur="2.8s" repeatCount="indefinite" calcMode="spline" keySplines="0.4 0 0.2 1; 0.4 0 0.2 1; 0.4 0 0.2 1; 0.4 0 0.2 1"/>
+        </path>
+        <path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488">
+          <animateTransform attributeName="transform" type="translate" values="0 0; -12 0; 0 0; 8 0; 0 0" keyTimes="0; 0.3; 0.5; 0.8; 1" dur="2.8s" repeatCount="indefinite" calcMode="spline" keySplines="0.4 0 0.2 1; 0.4 0 0.2 1; 0.4 0 0.2 1; 0.4 0 0.2 1"/>
+        </path>
+      </svg>
+    </div>
+  </div>
+
+  <!-- In context -->
+  <div>
+    <div style="font-size: 11px; font-weight: 600; margin-bottom: 10px; color: var(--text-secondary);">IN CONTEXT</div>
+    <div class="logo-context-grid">
+      <div>
+        <div class="mini-sidebar">
+          <div class="mini-sidebar-logo">
+            <svg viewBox="0 0 180 180" width="18" height="18"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#F5F3EF"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#F5F3EF"/></svg>
+            <span class="mini-sidebar-logo-text">Trakkt</span>
+          </div>
+          <div class="mini-nav-item active"><span style="width: 14px; text-align: center;">&#9632;</span> Issues</div>
+          <div class="mini-nav-item"><span style="width: 14px; text-align: center;">&#9633;</span> Board</div>
+          <div class="mini-nav-item"><span style="width: 14px; text-align: center;">&#9678;</span> Labels</div>
+          <div class="mini-nav-item"><span style="width: 14px; text-align: center;">&#9881;</span> Settings</div>
+        </div>
+      </div>
+      <div>
+        <div style="margin-bottom: 20px;">
+          <div class="tab-mock">
+            <svg viewBox="0 0 180 180" width="12" height="12"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#0D9488"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#0D9488"/></svg>
+            Issues - Trakkt
+          </div>
+          <div class="tab-mock-bar">
+            <svg viewBox="0 0 180 180" width="10" height="10"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#9C9790"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#9C9790"/></svg>
+            trakkt.app/issues
+          </div>
+        </div>
+        <div class="mini-auth-mock">
+          <div class="mini-auth-brand">
+            <svg viewBox="0 0 180 180" width="44" height="44"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#FFFFFF"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#FFFFFF"/></svg>
+            <div style="font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 20px; color: #F5F3EF; margin-top: 10px;">Trakkt</div>
+            <div class="mini-auth-tagline">Track your work,<br>ship with confidence</div>
+          </div>
+          <div class="mini-auth-form">
+            <h3>Sign in</h3>
+            <input class="mini-auth-input" type="email" placeholder="Email">
+            <input class="mini-auth-input" type="password" placeholder="Password">
+            <button class="mini-auth-btn">Sign in</button>
+            <div style="text-align: center; margin-top: 12px; font-size: 11px; color: var(--text-muted);">
+              Don't have an account? <span style="color: var(--accent);">Sign up</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- DESIGN PRINCIPLE: Icons vs Color -->
+<div class="section">
+  <h2 class="section-title">Icons for System, Color for Users</h2>
+  <p class="section-desc">Status and priority are communicated through icon shape, not color. Color is reserved for labels and teams -- things the user creates.</p>
+
+  <div style="display: flex; gap: 48px; flex-wrap: wrap; margin-bottom: 32px;">
+    <!-- Status Icons -->
+    <div>
+      <div style="font-size: 12px; font-weight: 600; margin-bottom: 12px; color: var(--text-secondary);">STATUS (icon shape)</div>
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <svg class="status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-muted);">
+            <circle cx="8" cy="8" r="6" stroke-width="1.5" stroke-dasharray="2.5 2.5"/>
+          </svg>
+          Backlog
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <svg class="status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-secondary);">
+            <circle cx="8" cy="8" r="6" stroke-width="1.5"/>
+          </svg>
+          Todo
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <svg class="status-icon" viewBox="0 0 16 16" fill="none" style="color: var(--accent);">
+            <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M8 2a6 6 0 0 1 0 12" fill="currentColor"/>
+          </svg>
+          In Progress
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <svg class="status-icon" viewBox="0 0 16 16" fill="none" style="color: var(--accent);">
+            <circle cx="8" cy="8" r="6" fill="currentColor"/>
+            <path d="M5.5 8l2 2 3-3.5" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Done
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <svg class="status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-muted);">
+            <circle cx="8" cy="8" r="6" stroke-width="1.5"/>
+            <path d="M6 6l4 4M10 6l-4 4" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          Cancelled
+        </div>
+      </div>
+    </div>
+
+    <!-- Priority Icons -->
+    <div>
+      <div style="font-size: 12px; font-weight: 600; margin-bottom: 12px; color: var(--text-secondary);">PRIORITY (3 bars + urgent)</div>
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <svg class="priority-icon" viewBox="0 0 16 16" width="14" height="14" fill="none"><rect x="1" y="1" width="14" height="14" rx="2" fill="#DC2626"/><rect x="7" y="4" width="2" height="6" rx="1" fill="white"/><rect x="7" y="11.5" width="2" height="2" rx="1" fill="white"/></svg>
+          <span style="color: #DC2626; font-weight: 500;">Urgent</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <div class="priority-icon"><div class="priority-bar filled" style="height: 5px;"></div><div class="priority-bar filled" style="height: 9px;"></div><div class="priority-bar filled" style="height: 13px;"></div></div>
+          High
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <div class="priority-icon"><div class="priority-bar filled" style="height: 5px;"></div><div class="priority-bar filled" style="height: 9px;"></div><div class="priority-bar" style="height: 13px;"></div></div>
+          Medium
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <div class="priority-icon"><div class="priority-bar filled" style="height: 5px;"></div><div class="priority-bar" style="height: 9px;"></div><div class="priority-bar" style="height: 13px;"></div></div>
+          Low
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px;">
+          <svg class="priority-icon" viewBox="0 0 16 16" width="14" height="14" fill="none"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor" style="color: var(--text-muted);"/></svg>
+          <span style="color: var(--text-muted);">None</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Labels = color -->
+    <div>
+      <div style="font-size: 12px; font-weight: 600; margin-bottom: 12px; color: var(--text-secondary);">LABELS (user-assigned color)</div>
+      <div style="display: flex; flex-direction: column; gap: 6px;">
+        <div class="label-colors">
+          <span class="label-pill" style="background: #FEF2F2; color: #DC2626;">bug</span>
+          <span class="label-pill" style="background: #EFF6FF; color: #2563EB;">feature</span>
+          <span class="label-pill" style="background: #CCFBF1; color: #0D9488;">ui</span>
+          <span class="label-pill" style="background: #FEFCE8; color: #CA8A04;">design</span>
+          <span class="label-pill" style="background: #F5F3EF; color: #6B6660;">tech-debt</span>
+          <span class="label-pill" style="background: #FDF2F8; color: #DB2777;">security</span>
+          <span class="label-pill" style="background: #F0FDF4; color: #15803D;">docs</span>
+          <span class="label-pill" style="background: #FFF7ED; color: #EA580C;">perf</span>
+        </div>
+        <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Users pick from a preset palette. Color lives here, not on system states.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Typography -->
+<div class="section">
+  <h2 class="section-title">Typography</h2>
+  <p class="section-desc">Instrument Serif for display. DM Sans for everything else. Geist Mono for data and code.</p>
+  <div class="type-specimen">
+    <div class="type-row">
+      <div class="type-label">Display / 36px</div>
+      <div class="type-display">Track your work, ship faster</div>
+    </div>
+    <div class="type-row">
+      <div class="type-label">Heading / 24px</div>
+      <div class="type-heading">Issues assigned to you</div>
+    </div>
+    <div class="type-row">
+      <div class="type-label">Body / 15px</div>
+      <div class="type-body">Trakkt ships as a single binary. No Docker Compose, no external deps. Auth, workspaces, and an MCP server built in.</div>
+    </div>
+    <div class="type-row">
+      <div class="type-label">Label / 13px</div>
+      <div class="type-label-text">Priority &middot; Assignee &middot; Status &middot; Labels &middot; Due date</div>
+    </div>
+    <div class="type-row">
+      <div class="type-label">Data / 13px</div>
+      <div class="type-data">TRK-142 &middot; 2026-05-08 &middot; 3 comments &middot; 12:34:56</div>
+    </div>
+    <div class="type-row">
+      <div class="type-label">Code / 12px</div>
+      <div class="type-code">cargo run --release -- serve --port 3000</div>
+    </div>
+  </div>
+</div>
+
+<!-- Color Palette -->
+<div class="section">
+  <h2 class="section-title">Color Palette</h2>
+  <p class="section-desc">Teal accent on warm grays. Color is restrained -- earned, not spent.</p>
+  <div class="palette">
+    <div class="swatch">
+      <div class="swatch-color" style="background: #0D9488;"></div>
+      <div class="swatch-info"><div class="swatch-name">Accent</div><div class="swatch-hex">#0D9488</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #0F766E;"></div>
+      <div class="swatch-info"><div class="swatch-name">Accent Hover</div><div class="swatch-hex">#0F766E</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #CCFBF1;"></div>
+      <div class="swatch-info"><div class="swatch-name">Accent Light</div><div class="swatch-hex">#CCFBF1</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #FAFAF8;"></div>
+      <div class="swatch-info"><div class="swatch-name">Background</div><div class="swatch-hex">#FAFAF8</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #FFFFFF; border-bottom: 1px solid #E8E5DE;"></div>
+      <div class="swatch-info"><div class="swatch-name">Surface</div><div class="swatch-hex">#FFFFFF</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #F5F3EF;"></div>
+      <div class="swatch-info"><div class="swatch-name">Surface Alt</div><div class="swatch-hex">#F5F3EF</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #1C1917;"></div>
+      <div class="swatch-info"><div class="swatch-name">Text</div><div class="swatch-hex">#1C1917</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #6B6660;"></div>
+      <div class="swatch-info"><div class="swatch-name">Text Secondary</div><div class="swatch-hex">#6B6660</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #9C9790;"></div>
+      <div class="swatch-info"><div class="swatch-name">Text Muted</div><div class="swatch-hex">#9C9790</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #E8E5DE;"></div>
+      <div class="swatch-info"><div class="swatch-name">Border</div><div class="swatch-hex">#E8E5DE</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #1C1917;"></div>
+      <div class="swatch-info"><div class="swatch-name">Sidebar</div><div class="swatch-hex">#1C1917</div></div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #2C241E;"></div>
+      <div class="swatch-info"><div class="swatch-name">Sidebar Active</div><div class="swatch-hex">#2C241E</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- Speed Principles -->
+<div class="section">
+  <h2 class="section-title">Speed as Design</h2>
+  <p class="section-desc">"Faster than anything else." Every design decision serves perceived performance.</p>
+  <div class="speed-grid">
+    <div class="speed-card">
+      <h4>Optimistic UI</h4>
+      <p>Show the result before the server confirms. Status changes, issue creation, comment posting update immediately. Roll back on error.</p>
+    </div>
+    <div class="speed-card">
+      <h4>Non-Blocking Animations</h4>
+      <p>Content appears immediately. Transitions layer on top. Max 200ms for state changes. No entrance animations that gate content.</p>
+    </div>
+    <div class="speed-card">
+      <h4>Keyboard-First</h4>
+      <p>Every action reachable by keyboard. j/k, single-key shortcuts, Cmd+K palette. The mouse is optional.</p>
+    </div>
+    <div class="speed-card">
+      <h4>No Spinners Under 100ms</h4>
+      <p>Brief loading indicators only appear after 100ms delay. Most operations feel instant.</p>
+    </div>
+    <div class="speed-card">
+      <h4>Content Before Chrome</h4>
+      <p>Issue data renders before sidebar animations complete. Data first, nav second, decorative last.</p>
+    </div>
+    <div class="speed-card">
+      <h4>Zero Layout Shift</h4>
+      <p>Reserve space for async content. Sidebar state persists. No content jumping after load.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Buttons -->
+<div class="section">
+  <h2 class="section-title">Buttons</h2>
+  <p class="section-desc">Compact. DM Sans 13px weight 600. 6px radius.</p>
+  <div class="button-row">
+    <button class="btn btn-primary">New Issue</button>
+    <button class="btn btn-secondary">Filter</button>
+    <button class="btn btn-outline">Export</button>
+    <button class="btn btn-ghost">Cancel</button>
+    <button class="btn btn-destructive">Delete</button>
+  </div>
+  <div class="button-row">
+    <button class="btn btn-primary btn-sm">Save</button>
+    <button class="btn btn-secondary btn-sm">Discard</button>
+    <button class="btn btn-ghost btn-sm">Skip</button>
+  </div>
+</div>
+
+<!-- Linear-style Dropdowns -->
+<div class="section">
+  <h2 class="section-title">Dropdowns</h2>
+  <p class="section-desc">Compact triggers show current value with icon. Click to expand a searchable, keyboard-navigable menu.</p>
+
+  <div style="margin-bottom: 24px;">
+    <div style="font-size: 12px; font-weight: 600; margin-bottom: 10px; color: var(--text-secondary);">COLLAPSED TRIGGERS</div>
+    <div class="dropdown-triggers-row">
+      <button class="dropdown-trigger has-value">
+        <span class="trigger-icon">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" style="color: var(--accent);">
+            <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M8 2a6 6 0 0 1 0 12" fill="currentColor"/>
+          </svg>
+        </span>
+        In Progress
+        <span class="chevron">&#9662;</span>
+      </button>
+      <button class="dropdown-trigger has-value">
+        <span class="trigger-icon">
+          <span class="priority-icon" style="width: 12px; height: 12px;">
+            <span class="priority-bar filled" style="height: 4px; width: 2px;"></span>
+            <span class="priority-bar filled" style="height: 7px; width: 2px;"></span>
+            <span class="priority-bar filled" style="height: 10px; width: 2px;"></span>
+          </span>
+        </span>
+        High
+        <span class="chevron">&#9662;</span>
+      </button>
+      <button class="dropdown-trigger">
+        Assignee
+        <span class="chevron">&#9662;</span>
+      </button>
+      <button class="dropdown-trigger has-value">
+        <span class="trigger-icon"><span style="width: 6px; height: 6px; border-radius: 50%; background: #DC2626; display: block;"></span></span>
+        bug
+        <span class="chevron">&#9662;</span>
+      </button>
+      <button class="dropdown-trigger">
+        Due date
+        <span class="chevron">&#9662;</span>
+      </button>
+    </div>
+    <div style="font-size: 11px; color: var(--text-muted);">Triggers with a value show the icon + label. Empty triggers show the field name. Chevron indicates expandable.</div>
+  </div>
+
+  <div style="font-size: 12px; font-weight: 600; margin-bottom: 10px; color: var(--text-secondary);">EXPANDED MENUS</div>
+  <div class="dropdown-grid">
+    <!-- Status dropdown -->
+    <div class="dropdown-menu">
+      <div class="dropdown-search"><input type="text" placeholder="Change status..."></div>
+      <div style="padding: 4px 0;">
+        <div class="dropdown-item">
+          <span class="item-icon">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-muted);">
+              <circle cx="8" cy="8" r="6" stroke-width="1.5" stroke-dasharray="2.5 2.5"/>
+            </svg>
+          </span>
+          Backlog
+        </div>
+        <div class="dropdown-item">
+          <span class="item-icon">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-secondary);">
+              <circle cx="8" cy="8" r="6" stroke-width="1.5"/>
+            </svg>
+          </span>
+          Todo
+        </div>
+        <div class="dropdown-item selected">
+          <span class="item-icon">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" style="color: var(--accent);">
+              <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
+              <path d="M8 2a6 6 0 0 1 0 12" fill="currentColor"/>
+            </svg>
+          </span>
+          In Progress
+          <span class="check">&#10003;</span>
+        </div>
+        <div class="dropdown-item">
+          <span class="item-icon">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" style="color: var(--accent);">
+              <circle cx="8" cy="8" r="6" fill="currentColor"/>
+              <path d="M5.5 8l2 2 3-3.5" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          Done
+        </div>
+        <div class="dropdown-item">
+          <span class="item-icon">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-muted);">
+              <circle cx="8" cy="8" r="6" stroke-width="1.5"/>
+              <path d="M6 6l4 4M10 6l-4 4" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </span>
+          Cancelled
+        </div>
+      </div>
+      <div class="dropdown-footer">
+        <span class="dropdown-footer-hint"><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
+        <span class="dropdown-footer-hint"><kbd>&crarr;</kbd> select</span>
+        <span class="dropdown-footer-hint"><kbd>esc</kbd> close</span>
+      </div>
+    </div>
+
+    <!-- Priority dropdown -->
+    <div class="dropdown-menu">
+      <div class="dropdown-search"><input type="text" placeholder="Set priority..."></div>
+      <div style="padding: 4px 0;">
+        <div class="dropdown-item">
+          <span class="item-icon">
+            <svg class="priority-icon" viewBox="0 0 16 16" width="12" height="12" fill="none"><rect x="1" y="1" width="14" height="14" rx="2" fill="#DC2626"/><rect x="7" y="4" width="2" height="6" rx="1" fill="white"/><rect x="7" y="11.5" width="2" height="2" rx="1" fill="white"/></svg>
+          </span>
+          <span style="color: #DC2626;">Urgent</span>
+          <span class="dropdown-kbd">1</span>
+        </div>
+        <div class="dropdown-item selected">
+          <span class="item-icon">
+            <span class="priority-icon" style="width: 12px; height: 12px;"><span class="priority-bar filled" style="height: 4px; width: 2px;"></span><span class="priority-bar filled" style="height: 7px; width: 2px;"></span><span class="priority-bar filled" style="height: 10px; width: 2px;"></span></span>
+          </span>
+          High
+          <span class="check">&#10003;</span>
+          <span class="dropdown-kbd">2</span>
+        </div>
+        <div class="dropdown-item">
+          <span class="item-icon">
+            <span class="priority-icon" style="width: 12px; height: 12px;"><span class="priority-bar filled" style="height: 4px; width: 2px;"></span><span class="priority-bar filled" style="height: 7px; width: 2px;"></span><span class="priority-bar" style="height: 10px; width: 2px;"></span></span>
+          </span>
+          Medium
+          <span class="dropdown-kbd">3</span>
+        </div>
+        <div class="dropdown-item">
+          <span class="item-icon">
+            <span class="priority-icon" style="width: 12px; height: 12px;"><span class="priority-bar filled" style="height: 4px; width: 2px;"></span><span class="priority-bar" style="height: 7px; width: 2px;"></span><span class="priority-bar" style="height: 10px; width: 2px;"></span></span>
+          </span>
+          Low
+          <span class="dropdown-kbd">4</span>
+        </div>
+        <div class="dropdown-divider"></div>
+        <div class="dropdown-item">
+          <span class="item-icon">
+            <svg viewBox="0 0 16 16" width="12" height="12" fill="none"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor" style="color: var(--text-muted);"/></svg>
+          </span>
+          <span style="color: var(--text-muted);">No priority</span>
+          <span class="dropdown-kbd">0</span>
+        </div>
+      </div>
+      <div class="dropdown-footer">
+        <span class="dropdown-footer-hint"><kbd>1</kbd>-<kbd>4</kbd> quick set</span>
+        <span class="dropdown-footer-hint"><kbd>esc</kbd> close</span>
+      </div>
+    </div>
+
+    <!-- Label dropdown -->
+    <div class="dropdown-menu">
+      <div class="dropdown-search"><input type="text" placeholder="Add label..."></div>
+      <div style="padding: 4px 0;">
+        <div class="dropdown-item selected">
+          <span class="item-icon"><span style="width: 8px; height: 8px; border-radius: 50%; background: #DC2626; display: block;"></span></span>
+          bug
+          <span class="check">&#10003;</span>
+        </div>
+        <div class="dropdown-item">
+          <span class="item-icon"><span style="width: 8px; height: 8px; border-radius: 50%; background: #2563EB; display: block;"></span></span>
+          feature
+        </div>
+        <div class="dropdown-item selected">
+          <span class="item-icon"><span style="width: 8px; height: 8px; border-radius: 50%; background: #0D9488; display: block;"></span></span>
+          ui
+          <span class="check">&#10003;</span>
+        </div>
+        <div class="dropdown-item">
+          <span class="item-icon"><span style="width: 8px; height: 8px; border-radius: 50%; background: #CA8A04; display: block;"></span></span>
+          design
+        </div>
+        <div class="dropdown-item">
+          <span class="item-icon"><span style="width: 8px; height: 8px; border-radius: 50%; background: #DB2777; display: block;"></span></span>
+          security
+        </div>
+        <div class="dropdown-divider"></div>
+        <div class="dropdown-item" style="color: var(--text-muted);">
+          <span class="item-icon" style="font-size: 14px;">+</span>
+          Create new label
+        </div>
+      </div>
+      <div class="dropdown-footer">
+        <span class="dropdown-footer-hint"><kbd>l</kbd> open from issue</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Issue List — Dense -->
+<div class="section">
+  <h2 class="section-title">Issue List</h2>
+  <p class="section-desc">36px rows. Priority first, then status, ID, title, labels. Linear-density.</p>
+  <div class="issue-list">
+    <div class="issue-row">
+      <svg class="priority-icon" viewBox="0 0 16 16" width="14" height="14" fill="none"><rect x="1" y="1" width="14" height="14" rx="2" fill="#DC2626"/><rect x="7" y="4" width="2" height="6" rx="1" fill="white"/><rect x="7" y="11.5" width="2" height="2" rx="1" fill="white"/></svg>
+      <svg class="status-icon" viewBox="0 0 16 16" fill="none" style="color: var(--accent);">
+        <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M8 2a6 6 0 0 1 0 12" fill="currentColor"/>
+      </svg>
+      <div class="issue-id">TRK-42</div>
+      <div class="issue-title">Fix login redirect loop</div>
+      <div class="issue-labels">
+        <span class="label-pill" style="background: #FEF2F2; color: #DC2626;">bug</span>
+        <span class="label-pill" style="background: #CCFBF1; color: #0D9488;">auth</span>
+      </div>
+      <div class="issue-meta">
+        <div class="issue-date">May 8</div>
+        <div class="avatar-sm">J</div>
+      </div>
+    </div>
+    <div class="issue-row">
+      <div class="priority-icon"><div class="priority-bar filled" style="height: 5px;"></div><div class="priority-bar filled" style="height: 9px;"></div><div class="priority-bar filled" style="height: 13px;"></div></div>
+      <svg class="status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-secondary);">
+        <circle cx="8" cy="8" r="6" stroke-width="1.5"/>
+      </svg>
+      <div class="issue-id">TRK-41</div>
+      <div class="issue-title">Add keyboard shortcuts for bulk actions</div>
+      <div class="issue-labels">
+        <span class="label-pill" style="background: #EFF6FF; color: #2563EB;">feature</span>
+      </div>
+      <div class="issue-meta">
+        <div class="issue-date">May 7</div>
+        <div class="avatar-sm">M</div>
+      </div>
+    </div>
+    <div class="issue-row">
+      <div class="priority-icon"><div class="priority-bar filled" style="height: 5px;"></div><div class="priority-bar filled" style="height: 9px;"></div><div class="priority-bar" style="height: 13px;"></div></div>
+      <svg class="status-icon" viewBox="0 0 16 16" fill="none" style="color: var(--accent);">
+        <circle cx="8" cy="8" r="6" fill="currentColor"/>
+        <path d="M5.5 8l2 2 3-3.5" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div class="issue-id">TRK-40</div>
+      <div class="issue-title">Implement workspace invitation flow</div>
+      <div class="issue-labels"></div>
+      <div class="issue-meta">
+        <div class="issue-date">May 5</div>
+        <div class="avatar-sm">A</div>
+      </div>
+    </div>
+    <div class="issue-row">
+      <div class="priority-icon"><div class="priority-bar filled" style="height: 5px;"></div><div class="priority-bar" style="height: 9px;"></div><div class="priority-bar" style="height: 13px;"></div></div>
+      <svg class="status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-muted);">
+        <circle cx="8" cy="8" r="6" stroke-width="1.5" stroke-dasharray="2.5 2.5"/>
+      </svg>
+      <div class="issue-id">TRK-39</div>
+      <div class="issue-title">Design system migration from Kyomi palette</div>
+      <div class="issue-labels">
+        <span class="label-pill" style="background: #FEFCE8; color: #CA8A04;">design</span>
+      </div>
+      <div class="issue-meta">
+        <div class="issue-date">May 4</div>
+        <div class="avatar-sm">J</div>
+      </div>
+    </div>
+    <div class="issue-row">
+      <svg class="priority-icon" viewBox="0 0 16 16" width="14" height="14" fill="none"><rect x="3" y="7" width="10" height="2" rx="1" fill="currentColor" style="color: var(--text-muted);"/></svg>
+      <svg class="status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-muted);">
+        <circle cx="8" cy="8" r="6" stroke-width="1.5"/>
+        <path d="M6 6l4 4M10 6l-4 4" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <div class="issue-id">TRK-37</div>
+      <div class="issue-title" style="color: var(--text-muted); text-decoration: line-through;">Remove legacy React frontend stubs</div>
+      <div class="issue-labels">
+        <span class="label-pill" style="background: #F5F3EF; color: #6B6660;">cleanup</span>
+      </div>
+      <div class="issue-meta">
+        <div class="issue-date">May 2</div>
+        <div class="avatar-sm">J</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- App Layout Mock -->
+<div class="section">
+  <h2 class="section-title">App Layout</h2>
+  <p class="section-desc">Dense. Warm sidebar, continuous surface. Icons communicate state, labels carry color.</p>
+  <div class="app-mock">
+    <div class="mock-sidebar">
+      <div class="mock-sidebar-logo" style="display: flex; align-items: center; gap: 8px;">
+        <svg viewBox="0 0 180 180" width="18" height="18"><path d="M 18 18 L 78 18 L 78 44 L 52 44 L 52 136 L 78 136 L 78 162 L 18 162 Z" fill="#F5F3EF"/><path d="M 162 18 L 102 18 L 102 44 L 128 44 L 128 136 L 102 136 L 102 162 L 162 162 Z" fill="#F5F3EF"/></svg>
+        <span style="font-weight: 700; font-size: 14px;">Trakkt</span>
+      </div>
+      <div class="mock-sidebar-section">Workspace</div>
+      <div class="mock-nav-item active"><span class="mock-nav-icon">&#9632;</span> Issues</div>
+      <div class="mock-nav-item"><span class="mock-nav-icon">&#9633;</span> Board</div>
+      <div class="mock-nav-item"><span class="mock-nav-icon">&#9678;</span> Labels</div>
+      <div class="mock-sidebar-section">Account</div>
+      <div class="mock-nav-item"><span class="mock-nav-icon">&#9881;</span> Settings</div>
+      <div class="mock-nav-item"><span class="mock-nav-icon">&#9775;</span> Team</div>
+      <div style="flex: 1;"></div>
+      <div style="padding: 8px; border-top: 1px solid rgba(255,255,255,0.08); margin-top: 8px;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <div class="avatar-sm" style="background: var(--accent); color: #fff; border: none;">J</div>
+          <div style="font-size: 12px; color: #A8A29E;">jason</div>
+        </div>
+      </div>
+    </div>
+    <div class="mock-content">
+      <div class="mock-header">
+        <div class="mock-page-title">Issues</div>
+        <div style="display: flex; gap: 6px; align-items: center;">
+          <div class="mock-view-toggle">
+            <button class="mock-view-btn active">List</button>
+            <button class="mock-view-btn">Board</button>
+          </div>
+          <button class="btn btn-primary btn-sm">+ New Issue</button>
+        </div>
+      </div>
+      <div class="mock-toolbar">
+        <div class="mock-search">Search issues...</div>
+        <div class="mock-filter active">Status</div>
+        <div class="mock-filter">Priority</div>
+        <div class="mock-filter">Label</div>
+        <div class="mock-filter">Assignee</div>
+      </div>
+      <div style="padding: 0 20px;">
+        <div class="issue-list" style="border: none; border-radius: 0;">
+          <div class="issue-row">
+            <svg class="priority-icon" viewBox="0 0 16 16" width="14" height="14" fill="none"><rect x="1" y="1" width="14" height="14" rx="2" fill="#DC2626"/><rect x="7" y="4" width="2" height="6" rx="1" fill="white"/><rect x="7" y="11.5" width="2" height="2" rx="1" fill="white"/></svg>
+            <svg class="status-icon" viewBox="0 0 16 16" fill="none" style="color: var(--accent);"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/><path d="M8 2a6 6 0 0 1 0 12" fill="currentColor"/></svg>
+            <div class="issue-id">TRK-42</div>
+            <div class="issue-title">Fix login redirect loop</div>
+            <div class="issue-labels"><span class="label-pill" style="background: #FEF2F2; color: #DC2626;">bug</span></div>
+            <div class="issue-meta">
+              <div class="issue-date">May 8</div>
+              <div class="avatar-sm">J</div>
+            </div>
+          </div>
+          <div class="issue-row">
+            <div class="priority-icon"><div class="priority-bar filled" style="height: 5px;"></div><div class="priority-bar filled" style="height: 9px;"></div><div class="priority-bar filled" style="height: 13px;"></div></div>
+            <svg class="status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-secondary);"><circle cx="8" cy="8" r="6" stroke-width="1.5"/></svg>
+            <div class="issue-id">TRK-41</div>
+            <div class="issue-title">Add keyboard shortcuts for bulk actions</div>
+            <div class="issue-labels"><span class="label-pill" style="background: #EFF6FF; color: #2563EB;">feature</span></div>
+            <div class="issue-meta">
+              <div class="issue-date">May 7</div>
+              <div class="avatar-sm">M</div>
+            </div>
+          </div>
+          <div class="issue-row">
+            <div class="priority-icon"><div class="priority-bar filled" style="height: 5px;"></div><div class="priority-bar filled" style="height: 9px;"></div><div class="priority-bar" style="height: 13px;"></div></div>
+            <svg class="status-icon" viewBox="0 0 16 16" fill="none" style="color: var(--accent);"><circle cx="8" cy="8" r="6" fill="currentColor"/><path d="M5.5 8l2 2 3-3.5" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <div class="issue-id">TRK-40</div>
+            <div class="issue-title">Implement workspace invitation flow</div>
+            <div class="issue-labels"></div>
+            <div class="issue-meta">
+              <div class="issue-date">May 5</div>
+              <div class="avatar-sm">A</div>
+            </div>
+          </div>
+          <div class="issue-row">
+            <div class="priority-icon"><div class="priority-bar filled" style="height: 5px;"></div><div class="priority-bar" style="height: 9px;"></div><div class="priority-bar" style="height: 13px;"></div></div>
+            <svg class="status-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" style="color: var(--text-muted);"><circle cx="8" cy="8" r="6" stroke-width="1.5" stroke-dasharray="2.5 2.5"/></svg>
+            <div class="issue-id">TRK-39</div>
+            <div class="issue-title">Design system migration from Kyomi palette</div>
+            <div class="issue-labels"><span class="label-pill" style="background: #FEFCE8; color: #CA8A04;">design</span></div>
+            <div class="issue-meta">
+              <div class="issue-date">May 4</div>
+              <div class="avatar-sm">J</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Spacing -->
+<div class="section">
+  <h2 class="section-title">Spacing</h2>
+  <p class="section-desc">4px base unit. Comfortable density.</p>
+  <div class="spacing-demo">
+    <div style="text-align: center;"><div class="spacing-block" style="width: 16px; height: 2px;"></div><div class="spacing-label">2xs<br>2px</div></div>
+    <div style="text-align: center;"><div class="spacing-block" style="width: 16px; height: 4px;"></div><div class="spacing-label">xs<br>4px</div></div>
+    <div style="text-align: center;"><div class="spacing-block" style="width: 16px; height: 8px;"></div><div class="spacing-label">sm<br>8px</div></div>
+    <div style="text-align: center;"><div class="spacing-block" style="width: 16px; height: 16px;"></div><div class="spacing-label">md<br>16px</div></div>
+    <div style="text-align: center;"><div class="spacing-block" style="width: 16px; height: 24px;"></div><div class="spacing-label">lg<br>24px</div></div>
+    <div style="text-align: center;"><div class="spacing-block" style="width: 16px; height: 32px;"></div><div class="spacing-label">xl<br>32px</div></div>
+    <div style="text-align: center;"><div class="spacing-block" style="width: 16px; height: 48px;"></div><div class="spacing-label">2xl<br>48px</div></div>
+    <div style="text-align: center;"><div class="spacing-block" style="width: 16px; height: 64px;"></div><div class="spacing-label">3xl<br>64px</div></div>
+  </div>
+</div>
+
+<!-- Alerts -->
+<div class="section">
+  <h2 class="section-title">Alerts</h2>
+  <p class="section-desc">Semantic feedback. These are system-level, not user-assigned color.</p>
+  <div>
+    <div class="alert" style="background: #F0FDF4; border-color: #BBF7D0; color: #15803D;">Issue TRK-40 has been marked as done.</div>
+    <div class="alert" style="background: #FEFCE8; border-color: #FDE68A; color: #CA8A04;">This issue has been inactive for 14 days.</div>
+    <div class="alert" style="background: #FEF2F2; border-color: #FECDD3; color: #DC2626;">Failed to save changes. Check your connection.</div>
+    <div class="alert" style="background: #EFF6FF; border-color: #BFDBFE; color: #2563EB;">2 new issues assigned to you.</div>
+  </div>
+</div>
+
+</div>
+</body>
+</html>

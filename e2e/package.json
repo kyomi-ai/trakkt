@@ -1,0 +1,24 @@
+{
+  "name": "trakkt-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "npx playwright test",
+    "test:ui": "npx playwright test --ui",
+    "test:headed": "npx playwright test --headed",
+    "test:debug": "npx playwright test --debug",
+    "test:auth": "npx playwright test tests/auth/",
+    "test:settings": "npx playwright test tests/settings/",
+    "test:team": "npx playwright test tests/team/",
+    "test:mcp": "npx playwright test tests/mcp/",
+    "test:modes": "npx playwright test tests/modes/",
+    "report": "npx playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "otplib": "^12.0.1"
+  },
+  "dependencies": {
+    "argon2": "^0.44.0"
+  }
+}
