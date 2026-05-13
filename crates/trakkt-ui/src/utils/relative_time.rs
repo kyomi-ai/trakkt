@@ -15,6 +15,11 @@ pub fn relative_time(timestamp: &str) -> String {
         .parse::<chrono::DateTime<chrono::Utc>>()
         .ok()
         .or_else(|| {
+            chrono::DateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f%#z")
+                .ok()
+                .map(|dt| dt.to_utc())
+        })
+        .or_else(|| {
             NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.f")
                 .ok()
                 .or_else(|| NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S").ok())

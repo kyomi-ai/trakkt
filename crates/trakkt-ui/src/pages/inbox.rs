@@ -112,17 +112,6 @@ fn notification_event_text(notification: &Notification) -> String {
     }
 }
 
-fn build_issue_href(notification: &Notification, sync_store: Option<SyncStore>) -> Option<String> {
-    let issue_id = &notification.issue_id;
-    sync_store.and_then(|store| {
-        let issues = store.issues().get_untracked();
-        issues
-            .iter()
-            .find(|i| i.issue_id == *issue_id)
-            .map(|issue| format!("/issues/{}-{}", issue.team_key, issue.number))
-    })
-}
-
 #[component]
 pub fn InboxPage() -> impl IntoView {
     let (unread_only, set_unread_only) = signal(false);
@@ -299,20 +288,19 @@ fn NotificationRow(
     let event_text = notification_event_text(&notification);
     let issue_title = notification.issue_title.clone().unwrap_or_default();
     let timestamp = relative_time(&notification.created_at);
-    let href = build_issue_href(&notification, sync_store);
 
-    let issue_label = {
-        let issue_id = notification.issue_id.clone();
+    let issue_id_for_lookup = notification.issue_id.clone();
+    let issue_id_for_label = notification.issue_id.clone();
+
+    let issue_label = Signal::derive(move || {
         sync_store.and_then(|store| {
-            let issues = store.issues().get_untracked();
-            issues
+            store.issues().get()
                 .iter()
-                .find(|i| i.issue_id == issue_id)
+                .find(|i| i.issue_id == issue_id_for_label)
                 .map(|issue| format!("{}-{}", issue.team_key, issue.number))
         })
-    };
+    });
 
-    let has_href = href.is_some();
     let on_click = move |_: web_sys::MouseEvent| {
         if is_unread {
             let nid = notification_id.clone();
@@ -326,20 +314,20 @@ fn NotificationRow(
                 on_read.run(());
             });
         }
-        if let Some(ref h) = href {
-            nav(h.as_str(), Default::default());
+        let href = sync_store.and_then(|store| {
+            store.issues().get_untracked()
+                .iter()
+                .find(|i| i.issue_id == issue_id_for_lookup)
+                .map(|issue| format!("/issues/{}-{}", issue.team_key, issue.number))
+        });
+        if let Some(h) = href {
+            nav(&h, Default::default());
         }
-    };
-
-    let cursor = if has_href {
-        "cursor-pointer"
-    } else {
-        "cursor-default"
     };
 
     view! {
         <div
-            class=format!("flex items-start gap-3 px-6 py-3 hover:bg-accent transition-colors {cursor}")
+            class="flex items-start gap-3 px-6 py-3 hover:bg-accent transition-colors cursor-pointer"
             on:click=on_click
         >
             <div class="flex-shrink-0 pt-1.5">
@@ -355,7 +343,7 @@ fn NotificationRow(
                     <span class=if is_unread { "text-sm font-medium text-foreground" } else { "text-sm text-muted-foreground" }>
                         {event_text}
                     </span>
-                    {issue_label.map(|label| view! {
+                    {move || issue_label.get().map(|label| view! {
                         <span class="text-xs text-muted-foreground font-mono">{label}</span>
                     })}
                 </div>
