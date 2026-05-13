@@ -563,7 +563,7 @@ fn EditableTitle(
                 let t = title_for_display.clone();
                 view! {
                     <h1
-                        class="text-2xl font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors"
+                        class="text-3xl font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors"
                         on:click=move |_| {
                             set_editing.set(true);
                         }
@@ -580,7 +580,7 @@ fn EditableTitle(
                     <input
                         node_ref=input_ref
                         type="text"
-                        class="text-2xl font-display text-foreground bg-transparent border-b-2 border-primary outline-none w-full py-1"
+                        class="text-3xl font-display text-foreground bg-transparent border-b-2 border-primary outline-none w-full py-1"
                         prop:value=move || current_title.get()
                         on:input=move |ev| set_current_title.set(event_target_value(&ev))
                         on:blur=move |_| save_title()
@@ -1172,22 +1172,17 @@ fn DescriptionEditor(
         });
     });
 
-    let mut theme = trakkt_kode_theme();
-    theme.content_padding = Some("1rem 1.25rem");
-    let theme_signal = Signal::stored(theme);
+    let theme_signal = Signal::stored(trakkt_kode_theme());
 
     view! {
-        <div class="mt-6">
-            <h2 class="text-xs text-muted-foreground font-medium mb-3">"Description"</h2>
-            <div class="border border-border rounded-md overflow-hidden" style="min-height: 200px;">
-                <TreeWysiwygEditor
-                    content=initial_content
-                    on_change=on_change
-                    show_fixed_toolbar=false
-                    show_floating_toolbar=true
-                    theme=theme_signal
-                />
-            </div>
+        <div class="mt-2" style="min-height: 120px;">
+            <TreeWysiwygEditor
+                content=initial_content
+                on_change=on_change
+                show_fixed_toolbar=false
+                show_floating_toolbar=true
+                theme=theme_signal
+            />
         </div>
     }
 }
