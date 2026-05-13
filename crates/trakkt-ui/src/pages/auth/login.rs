@@ -297,6 +297,8 @@ pub fn LoginPage(
                 Ok(LoginResult::Success { .. }) => {
                     #[cfg(target_arch = "wasm32")]
                     {
+                        let auth_version = expect_context::<RwSignal<u64>>();
+                        auth_version.update(|v| *v += 1);
                         let dest = redirect_url();
                         if dest.starts_with("/api/") {
                             if let Some(window) = web_sys::window() {
@@ -358,6 +360,8 @@ pub fn LoginPage(
                     Ok(LoginResult::Success { .. }) => {
                         #[cfg(target_arch = "wasm32")]
                         {
+                            let auth_version = expect_context::<RwSignal<u64>>();
+                            auth_version.update(|v| *v += 1);
                             let dest = redirect_url();
                             if dest.starts_with("/api/") {
                                 if let Some(window) = web_sys::window() {
@@ -447,9 +451,12 @@ pub fn LoginPage(
 
                 match result {
                     Ok(SignupResult::AccountCreated { redirect }) => {
-                        // SPA navigation — keeps WASM in memory
                         #[cfg(target_arch = "wasm32")]
-                        navigate.get_value()(&redirect, Default::default());
+                        {
+                            let auth_version = expect_context::<RwSignal<u64>>();
+                            auth_version.update(|v| *v += 1);
+                            navigate.get_value()(&redirect, Default::default());
+                        }
                         let _ = &redirect; // Suppress unused warning on SSR
                     }
                     Ok(SignupResult::VerificationRequired { message }) => {
