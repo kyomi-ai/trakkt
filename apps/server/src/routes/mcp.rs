@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use trakkt_auth::{comment_service, issue_service, label_service, status_service, team_service};
+use trakkt_auth::{comment_service, issue_service, label_service, relation_service, status_service, team_service};
 use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate};
 
 use crate::state::AppState;
@@ -707,6 +707,64 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                     "type": "object",
                     "properties": {}
                 }
+            },
+            {
+                "name": "add_relation",
+                "description": "Add a relation between two issues. Currently supports 'blocks' relation type (directional: source blocks target).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source_issue": {
+                            "type": "string",
+                            "description": "Source issue identifier in 'TRA-35' format (the issue that blocks)"
+                        },
+                        "target_issue": {
+                            "type": "string",
+                            "description": "Target issue identifier in 'TRA-35' format (the issue that is blocked)"
+                        },
+                        "relation_type": {
+                            "type": "string",
+                            "description": "Relation type. Currently only 'blocks' is supported.",
+                            "enum": ["blocks"]
+                        }
+                    },
+                    "required": ["source_issue", "target_issue", "relation_type"]
+                }
+            },
+            {
+                "name": "remove_relation",
+                "description": "Remove a relation between two issues by its relation ID.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "relation_id": {
+                            "type": "string",
+                            "description": "The relation ID to remove"
+                        }
+                    },
+                    "required": ["relation_id"]
+                }
+            },
+            {
+                "name": "list_issue_relations",
+                "description": "List all relations for an issue (both directions — blocks and blocked-by).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "issue_identifier": {
+                            "type": "string",
+                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
+                        },
+                        "team_key": {
+                            "type": "string",
+                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
+                        },
+                        "issue_number": {
+                            "type": "integer",
+                            "description": "Issue number within the team. Required if issue_identifier is not provided."
+                        }
+                    }
+                }
             }
         ]
     }))
@@ -767,6 +825,8 @@ async fn handle_tools_call(
         "create_label" => "labels:write",
         "list_statuses" => "issues:read",
         "list_teams" => "teams:read",
+        "add_relation" | "remove_relation" => "issues:write",
+        "list_issue_relations" => "issues:read",
         _ => "",
     };
     if !required_scope.is_empty() && !auth.has_scope(required_scope) {
@@ -789,6 +849,9 @@ async fn handle_tools_call(
         "search_issues" => tool_search_issues(&arguments, &auth, state).await,
         "list_statuses" => tool_list_statuses(&arguments, &auth, state).await,
         "list_teams" => tool_list_teams(&auth, state).await,
+        "add_relation" => tool_add_relation(&arguments, &auth, state).await,
+        "remove_relation" => tool_remove_relation(&arguments, &auth, state).await,
+        "list_issue_relations" => tool_list_issue_relations(&arguments, &auth, state).await,
         _ => return JsonRpcResponse::error(id, -32602, format!("Unknown tool: {tool_name}")),
     };
 
@@ -1211,4 +1274,93 @@ async fn tool_list_statuses(
     let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
     let statuses = status_service::list_statuses(&state.db, &auth.workspace_id, team_id.as_deref()).await?;
     serde_json::to_string_pretty(&statuses).map_err(trakkt_core::Error::from)
+}
+
+/// add_relation — create a relation between two issues.
+async fn tool_add_relation(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let source = arg_str(args, "source_issue")?;
+    let target = arg_str(args, "target_issue")?;
+    let relation_type = arg_str(args, "relation_type")?;
+
+    // Resolve source issue identifier to issue_id.
+    let (source_key, source_num) = parse_issue_identifier(source)
+        .ok_or_else(|| trakkt_core::Error::BadRequest(
+            "Invalid source_issue format. Expected 'TRA-35'".to_string(),
+        ))?;
+    let source_issue = issue_service::get_issue(
+        &state.db, &auth.workspace_id, &source_key, source_num,
+    ).await?
+        .ok_or_else(|| trakkt_core::Error::NotFound(
+            format!("Source issue {source} not found"),
+        ))?;
+
+    // Resolve target issue identifier to issue_id.
+    let (target_key, target_num) = parse_issue_identifier(target)
+        .ok_or_else(|| trakkt_core::Error::BadRequest(
+            "Invalid target_issue format. Expected 'TRA-35'".to_string(),
+        ))?;
+    let target_issue = issue_service::get_issue(
+        &state.db, &auth.workspace_id, &target_key, target_num,
+    ).await?
+        .ok_or_else(|| trakkt_core::Error::NotFound(
+            format!("Target issue {target} not found"),
+        ))?;
+
+    let relation = relation_service::create_relation(
+        &state.db,
+        &auth.workspace_id,
+        &source_issue.issue_id,
+        &target_issue.issue_id,
+        relation_type,
+        Some(&auth.user_id),
+        Some(&state.ws_manager),
+    ).await?;
+
+    serde_json::to_string_pretty(&relation).map_err(trakkt_core::Error::from)
+}
+
+/// remove_relation — delete a relation by its ID.
+async fn tool_remove_relation(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let relation_id = arg_str(args, "relation_id")?;
+
+    relation_service::delete_relation(
+        &state.db,
+        relation_id,
+        &auth.workspace_id,
+        Some(&state.ws_manager),
+    ).await?;
+
+    Ok("Relation removed successfully".to_string())
+}
+
+/// list_issue_relations — list all relations for an issue (both directions).
+async fn tool_list_issue_relations(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let (team_key, number) = resolve_issue_key_and_number(args)?;
+
+    let issue = issue_service::get_issue(
+        &state.db, &auth.workspace_id, &team_key, number,
+    ).await?
+        .ok_or_else(|| trakkt_core::Error::NotFound(
+            format!("Issue {team_key}-{number} not found"),
+        ))?;
+
+    let relations = relation_service::list_relations_for_issue(
+        &state.db,
+        &issue.issue_id,
+        &auth.workspace_id,
+    ).await?;
+
+    serde_json::to_string_pretty(&relations).map_err(trakkt_core::Error::from)
 }

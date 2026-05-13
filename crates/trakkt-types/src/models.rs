@@ -285,3 +285,28 @@ pub struct IssueUpdate {
     pub sort_order: Option<Option<f64>>,
     pub team_id: Option<String>,
 }
+
+/// A relation between two issues (e.g. "blocks").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueRelation {
+    pub relation_id: String,
+    pub workspace_id: String,
+    pub source_issue_id: String,
+    pub target_issue_id: String,
+    pub relation_type: String,
+    pub created_by: Option<String>,
+    pub created_at: String,
+}
+
+/// A relation with joined issue details for display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueRelationWithDetails {
+    pub relation_id: String,
+    pub relation_type: String,
+    pub issue_id: String,
+    pub team_key: String,
+    pub number: i32,
+    pub title: String,
+    pub status_category: String,
+    pub direction: String,
+}

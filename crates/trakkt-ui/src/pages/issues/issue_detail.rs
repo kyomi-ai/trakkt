@@ -30,6 +30,7 @@ use crate::pages::issues::issue_list::NewIssueModal;
 use crate::server_fns::comments::{create_comment, list_comments};
 use crate::server_fns::issues::{get_issue, list_issues, set_issue_labels, update_issue};
 use crate::server_fns::labels::list_labels;
+use crate::server_fns::relations::{add_relation, list_issue_relations, remove_relation};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
 use trakkt_types::models::{Comment, IssueWithDetails};
@@ -406,6 +407,12 @@ fn IssueDetailContent(
                     sub_issues=sub_issues
                     on_add=Callback::new(move |()| set_show_new_sub_issue.set(true))
                     on_link=Callback::new(move |()| set_show_link_sub_issue.set(true))
+                />
+
+                // ── Relations section ─────────────────────────────────
+                <RelationsSection
+                    team_key=initial_team_key.clone()
+                    number=number
                 />
 
                 // ── Divider ────────────────────────────────────────────
@@ -1454,6 +1461,212 @@ fn SubIssuesSection(
                     })}
                 }
             }}
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Relations Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Relations section showing blocking/blocked-by relationships with other issues.
+///
+/// Displays each relation with a direction indicator, linked issue identifier,
+/// title, and a remove button. Includes an inline form for adding new relations.
+#[component]
+fn RelationsSection(
+    team_key: String,
+    number: i32,
+) -> impl IntoView {
+    let issue_identifier = format!("{team_key}-{number}");
+    let tk = team_key.clone();
+    let (version, set_version) = signal(0u32);
+    let relations_resource = Resource::new(
+        move || (tk.clone(), number, version.get()),
+        move |(tk, num, _)| async move { list_issue_relations(tk, num).await },
+    );
+
+    // ── "Add relation" form state ─────────────────────────────────────
+    let (show_add_form, set_show_add_form) = signal(false);
+    let (add_direction, set_add_direction) = signal("blocks".to_string());
+    let (add_identifier, set_add_identifier) = signal(String::new());
+    let (adding, set_adding) = signal(false);
+    let (add_error, set_add_error) = signal(Option::<String>::None);
+
+    let stored_issue_identifier = StoredValue::new(issue_identifier);
+    let handle_add = Callback::new(move |()| {
+        let target_id_raw = add_identifier.get_untracked().trim().to_uppercase();
+        if target_id_raw.is_empty() || adding.get_untracked() {
+            return;
+        }
+        set_adding.set(true);
+        set_add_error.set(None);
+
+        let direction = add_direction.get_untracked();
+        let current = stored_issue_identifier.get_value();
+
+        // direction == "blocks"  => current blocks target => source=current, target=target, type="blocks"
+        // direction == "blocked_by" => current is blocked by target => source=target, target=current, type="blocks"
+        let (source, target) = if direction == "blocks" {
+            (current, target_id_raw)
+        } else {
+            (target_id_raw, current)
+        };
+
+        leptos::task::spawn_local(async move {
+            match add_relation(source, target, "blocks".to_string()).await {
+                Ok(_) => {
+                    set_add_identifier.set(String::new());
+                    set_show_add_form.set(false);
+                    set_adding.set(false);
+                    set_version.update(|v| *v += 1);
+                }
+                Err(e) => {
+                    set_add_error.set(Some(format!("{e}")));
+                    set_adding.set(false);
+                }
+            }
+        });
+    });
+
+    view! {
+        <div class="mt-6">
+            <Suspense fallback=|| ()>
+                {move || {
+                    let relations = relations_resource.get()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                    let total = relations.len();
+
+                    view! {
+                        // ── Header ─────────────────────────────────────────
+                        <div class="flex items-center justify-between mb-2">
+                            <h2 class="text-xs text-muted-foreground font-medium">
+                                {if total > 0 {
+                                    format!("Relations ({})", total)
+                                } else {
+                                    "Relations".to_string()
+                                }}
+                            </h2>
+                            <button
+                                class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
+                                on:click=move |_| {
+                                    set_show_add_form.update(|v| *v = !*v);
+                                    set_add_error.set(None);
+                                }
+                                title="Add relation"
+                            >
+                                <Icon icon=phosphor_leptos::PLUS size="12px"/>
+                                "Add"
+                            </button>
+                        </div>
+
+                        // ── Relation rows ─────────────────────────────────
+                        {(total > 0).then(|| {
+                            let rows = relations.into_iter().map(|rel| {
+                                let rel_id = rel.relation_id.clone();
+                                let rel_key = format!("{}-{}", rel.team_key, rel.number);
+                                let rel_href = format!("/issues/{}-{}", rel.team_key, rel.number);
+                                let rel_title = rel.title.clone();
+                                let direction = rel.direction.clone();
+                                let status_variant = IssueStatusVariant::parse(&rel.status_category);
+
+                                view! {
+                                    <div class="group flex items-center gap-2 px-3 py-1.5 hover:bg-secondary/50 rounded-md transition-colors">
+                                        // Direction label
+                                        {if direction == "blocked_by" {
+                                            view! {
+                                                <span class="text-xs font-medium shrink-0 w-[72px] text-destructive">
+                                                    "Blocked by"
+                                                </span>
+                                            }.into_any()
+                                        } else {
+                                            view! {
+                                                <span class="text-xs font-medium shrink-0 w-[72px] text-success-foreground">
+                                                    "Blocks"
+                                                </span>
+                                            }.into_any()
+                                        }}
+                                        // Status icon
+                                        <IssueStatusBadge status=status_variant size=12/>
+                                        // Issue identifier
+                                        <span class="text-xs text-muted-foreground font-mono shrink-0">{rel_key}</span>
+                                        // Title link
+                                        <a href=rel_href class="text-sm text-foreground hover:underline truncate flex-1">
+                                            {rel_title}
+                                        </a>
+                                        // Remove button (appears on hover)
+                                        <button
+                                            class="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-foreground transition-all shrink-0"
+                                            title="Remove relation"
+                                            on:click=move |_| {
+                                                let rid = rel_id.clone();
+                                                leptos::task::spawn_local(async move {
+                                                    if let Err(e) = remove_relation(rid).await {
+                                                        tracing::warn!("Failed to remove relation: {e}");
+                                                    }
+                                                    set_version.update(|v| *v += 1);
+                                                });
+                                            }
+                                        >
+                                            <Icon icon=phosphor_leptos::X size="12px"/>
+                                        </button>
+                                    </div>
+                                }
+                            }).collect_view();
+                            view! {
+                                <div class="space-y-0.5">
+                                    {rows}
+                                </div>
+                            }
+                        })}
+
+                        // ── Add relation inline form ──────────────────────
+                        <Show when=move || show_add_form.get()>
+                            <div class="mt-2 p-3 border border-border rounded-md space-y-2">
+                                <div class="flex items-center gap-2">
+                                    // Direction select
+                                    <select
+                                        class="text-xs bg-background border border-border rounded px-2 py-1.5 text-foreground"
+                                        on:change=move |ev| set_add_direction.set(event_target_value(&ev))
+                                        prop:value=move || add_direction.get()
+                                    >
+                                        <option value="blocks">"Blocks"</option>
+                                        <option value="blocked_by">"Blocked by"</option>
+                                    </select>
+                                    // Identifier input
+                                    <input
+                                        type="text"
+                                        class="flex-1 text-sm bg-background border border-border rounded px-2 py-1 text-foreground placeholder:text-muted-foreground font-mono"
+                                        placeholder="e.g. TRA-12"
+                                        prop:value=move || add_identifier.get()
+                                        on:input=move |ev| set_add_identifier.set(event_target_value(&ev))
+                                        on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                            if ev.key() == "Enter" {
+                                                handle_add.run(());
+                                            } else if ev.key() == "Escape" {
+                                                set_show_add_form.set(false);
+                                            }
+                                        }
+                                    />
+                                    // Submit button
+                                    <Button
+                                        size=ButtonSize::Sm
+                                        disabled=Signal::derive(move || adding.get() || add_identifier.get().trim().is_empty())
+                                        on:click=move |_| handle_add.run(())
+                                    >
+                                        {move || if adding.get() { "Adding..." } else { "Add" }}
+                                    </Button>
+                                </div>
+                                // Error message
+                                {move || add_error.get().map(|err| view! {
+                                    <p class="text-xs text-destructive">{err}</p>
+                                })}
+                            </div>
+                        </Show>
+                    }
+                }}
+            </Suspense>
         </div>
     }
 }
