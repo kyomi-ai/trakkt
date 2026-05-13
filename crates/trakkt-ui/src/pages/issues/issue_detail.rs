@@ -346,16 +346,32 @@ fn IssueDetailContent(
     // No-op callback for components that need on_change but don't need parent notification
     let noop = Callback::new(|()| {});
 
+    // ── Fine-grained memos: only re-render when the specific field changes ──
+    let title = Memo::new(move |_| issue.get().title.clone());
+    let parent_issue_id = Memo::new(move |_| issue.get().parent_issue_id.clone());
+    let timestamps = Memo::new(move |_| {
+        let i = issue.get();
+        (i.created_at.clone(), i.updated_at.clone())
+    });
+    // Sidebar-relevant fields only — excludes title/description so those
+    // edits don't cause the sidebar to flicker.
+    let sidebar_key = Memo::new(move |_| {
+        let i = issue.get();
+        (i.status_id.clone(), i.status_category.clone(), i.priority,
+         i.assignee_id.clone(), i.assignee_name.clone(),
+         i.due_date.clone(), i.parent_issue_id.clone(),
+         i.labels.clone())
+    });
+
     view! {
         <div class="max-w-[1140px] mx-auto w-full flex flex-col md:flex-row gap-8">
             // ── Left column: main content ─────────────────────────────
             <div class="flex-1 min-w-0">
                 // ── Parent breadcrumb ─────────────────────────────────
                 {move || {
-                    let i = issue.get();
-                    let parent_id = i.parent_issue_id.as_ref()?;
+                    let pid = parent_issue_id.get()?;
                     let store = sync_store?;
-                    let parent = store.issues().get().into_iter().find(|p| p.issue_id == *parent_id)?;
+                    let parent = store.issues().get().into_iter().find(|p| p.issue_id == pid)?;
                     Some(view! {
                         <a
                             href=format!("/issues/{}-{}", parent.team_key, parent.number)
@@ -368,10 +384,13 @@ fn IssueDetailContent(
                 }}
 
                 // ── Title ──────────────────────────────────────────────
-                {move || {
-                    let i = issue.get();
-                    view! { <EditableTitle team_key=i.team_key.clone() number=number title=i.title.clone() on_save=noop/> }
-                }}
+                {
+                    let tk = initial_team_key.clone();
+                    move || {
+                        let t = title.get();
+                        view! { <EditableTitle team_key=tk.clone() number=number title=t on_save=noop/> }
+                    }
+                }
 
                 // ── Description ────────────────────────────────────────
                 <DescriptionEditor
@@ -407,12 +426,12 @@ fn IssueDetailContent(
 
                 // ── Footer: timestamps ────────────────────────────────
                 {move || {
-                    let i = issue.get();
+                    let (created, updated) = timestamps.get();
                     view! {
                         <div class="mt-6 pb-4">
                             <div class="flex items-center gap-4 text-xs text-muted-foreground">
-                                <span>{format!("Created {}", relative_time(&i.created_at))}</span>
-                                <span>{format!("Updated {}", relative_time(&i.updated_at))}</span>
+                                <span>{format!("Created {}", relative_time(&created))}</span>
+                                <span>{format!("Updated {}", relative_time(&updated))}</span>
                             </div>
                         </div>
                     }
@@ -422,7 +441,8 @@ fn IssueDetailContent(
             // ── Right column: metadata sidebar ────────────────────────
             <div class="w-full md:w-[280px] shrink-0">
                 {move || {
-                    let i = issue.get();
+                    sidebar_key.get();
+                    let i = issue.get_untracked();
                     view! { <MetadataSidebar issue=i on_change=noop/> }
                 }}
             </div>
