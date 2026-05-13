@@ -13,7 +13,7 @@ use phosphor_leptos::{Icon, IconWeight};
 use std::sync::Arc;
 
 use crate::cache::store::SyncStore;
-use crate::components::{Button, ButtonVariant, CommandPalette, Modal, ModalSize, Spinner, INPUT_CLASS};
+use crate::components::{Button, ButtonVariant, CommandPalette, ConfirmDialog, Modal, ModalSize, SearchInput, Spinner, INPUT_CLASS};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
 
@@ -405,7 +405,7 @@ fn SidebarTeamsSection() -> impl IntoView {
                 </div>
 
                 <Show when=move || show_create.get()>
-                    <SidebarCreateTeam on_done=Callback::new(move |()| set_show_create.set(false))/>
+                    <SidebarCreateOrJoinTeam on_done=Callback::new(move |()| set_show_create.set(false))/>
                 </Show>
 
                 <div class="space-y-0.5">
@@ -641,13 +641,20 @@ fn SidebarSectionHeader(label: &'static str) -> impl IntoView {
     }
 }
 
-/// Inline form for creating a new team or joining an existing one from the sidebar.
+/// Modal for creating a new team or joining an existing one.
 #[component]
-fn SidebarCreateTeam(on_done: Callback<()>) -> impl IntoView {
+fn SidebarCreateOrJoinTeam(on_done: Callback<()>) -> impl IntoView {
+    let store = use_context::<SyncStore>();
+
     let (name, set_name) = signal(String::new());
     let (error, set_error) = signal(Option::<String>::None);
     let (submitting, set_submitting) = signal(false);
     let input_ref = NodeRef::<leptos::html::Input>::new();
+
+    let (search, set_search) = signal(String::new());
+    let (joining, set_joining) = signal(Option::<String>::None);
+
+    let joinable_teams = LocalResource::new(crate::server_fns::teams::list_joinable_teams);
 
     Effect::new(move || {
         if let Some(input) = input_ref.get() {
@@ -660,7 +667,6 @@ fn SidebarCreateTeam(on_done: Callback<()>) -> impl IntoView {
         let name_val = name.get_untracked().trim().to_string();
         if name_val.is_empty() { return; }
 
-        // Auto-derive a 3-char uppercase key from the name.
         let key: String = name_val
             .chars()
             .filter(|c| c.is_alphanumeric())
@@ -689,23 +695,140 @@ fn SidebarCreateTeam(on_done: Callback<()>) -> impl IntoView {
         });
     };
 
+    let on_close = Callback::new(move |()| on_done.run(()));
+
+    let modal_body: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+        view! {
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-foreground mb-2">"Create new team"</label>
+                    <form class="flex gap-2" on:submit=on_submit>
+                        <input
+                            node_ref=input_ref
+                            type="text"
+                            placeholder="Team name..."
+                            class=INPUT_CLASS
+                            prop:value=move || name.get()
+                            on:input=move |ev| set_name.set(event_target_value(&ev))
+                            prop:disabled=move || submitting.get()
+                        />
+                        <Button
+                            disabled=Signal::derive(move || submitting.get() || name.get().trim().is_empty())
+                        >
+                            {move || if submitting.get() { "Creating..." } else { "Create" }}
+                        </Button>
+                    </form>
+                    <Show when=move || error.get().is_some()>
+                        <p class="mt-1 text-sm text-red-400">
+                            {move || error.get().unwrap_or_default()}
+                        </p>
+                    </Show>
+                </div>
+
+                <div class="flex items-center gap-3">
+                    <div class="flex-1 h-px bg-border"/>
+                    <span class="text-xs text-muted-foreground">"or"</span>
+                    <div class="flex-1 h-px bg-border"/>
+                </div>
+
+                <div>
+                    <label class="block text-sm font-medium text-foreground mb-2">"Join existing team"</label>
+                    <SearchInput
+                        value=Signal::derive(move || search.get())
+                        on_input=Callback::new(move |v: String| set_search.set(v))
+                        placeholder="Search teams..."
+                    />
+                    <div class="mt-2 max-h-48 overflow-y-auto rounded-md border border-border">
+                        <Suspense fallback=|| view! {
+                            <div class="px-4 py-3 text-sm text-muted-foreground">"Loading teams..."</div>
+                        }>
+                            {move || joinable_teams.get().map(|result| {
+                                match result {
+                                    Ok(ref teams) => {
+                                        let query = search.get().to_lowercase();
+                                        let filtered: Vec<_> = teams.iter()
+                                            .filter(|t| query.is_empty() || t.name.to_lowercase().contains(&query))
+                                            .cloned()
+                                            .collect();
+                                        if filtered.is_empty() {
+                                            view! {
+                                                <div class="px-4 py-3 text-sm text-muted-foreground">
+                                                    "No teams available to join"
+                                                </div>
+                                            }.into_any()
+                                        } else {
+                                            filtered.into_iter().map(|team| {
+                                                let team_id = team.team_id.clone();
+                                                let team_name = team.name.clone();
+                                                let member_count = team.member_count;
+                                                let is_joining = Signal::derive(move || {
+                                                    joining.get().as_deref() == Some(team_id.as_str())
+                                                });
+                                                let team_for_upsert = team.clone();
+                                                let tid = team.team_id.clone();
+                                                view! {
+                                                    <button
+                                                        class="w-full flex items-center justify-between px-4 py-2.5 text-sm text-foreground hover:bg-secondary transition-colors disabled:opacity-50"
+                                                        disabled=move || joining.get().is_some()
+                                                        on:click=move |_| {
+                                                            let tid = tid.clone();
+                                                            let team_for_upsert = team_for_upsert.clone();
+                                                            set_joining.set(Some(tid.clone()));
+                                                            leptos::task::spawn_local(async move {
+                                                                match crate::server_fns::teams::join_team(tid).await {
+                                                                    Ok(()) => {
+                                                                        if let Some(store) = store {
+                                                                            store.upsert_team(team_for_upsert);
+                                                                        }
+                                                                        on_done.run(());
+                                                                    }
+                                                                    Err(e) => {
+                                                                        web_sys::console::warn_1(&format!("join_team failed: {e}").into());
+                                                                        set_joining.set(None);
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                    >
+                                                        <span class="truncate">{team_name}</span>
+                                                        <span class="text-xs text-muted-foreground flex-shrink-0 ml-2">
+                                                            {move || if is_joining.get() {
+                                                                "Joining...".to_string()
+                                                            } else {
+                                                                let n = member_count;
+                                                                if n == 1 { "1 member".to_string() } else { format!("{n} members") }
+                                                            }}
+                                                        </span>
+                                                    </button>
+                                                }
+                                            }).collect_view().into_any()
+                                        }
+                                    }
+                                    Err(ref e) => {
+                                        view! {
+                                            <div class="px-4 py-3 text-sm text-red-400">
+                                                {format!("Failed to load teams: {e}")}
+                                            </div>
+                                        }.into_any()
+                                    }
+                                }
+                            })}
+                        </Suspense>
+                    </div>
+                </div>
+            </div>
+        }.into_any()
+    });
+
     view! {
-        <form class="px-2 pb-2" on:submit=on_submit>
-            <input
-                node_ref=input_ref
-                type="text"
-                placeholder="New team name..."
-                class="w-full px-2 py-1.5 text-sm bg-[var(--color-sidebar-hover)] text-[var(--color-sidebar-foreground)] rounded-md border border-transparent focus:border-primary focus:outline-none placeholder:text-[var(--color-sidebar-foreground-muted)]"
-                prop:value=move || name.get()
-                on:input=move |ev| set_name.set(event_target_value(&ev))
-                prop:disabled=move || submitting.get()
-            />
-            <Show when=move || error.get().is_some()>
-                <p class="mt-1 text-[11px] text-red-400 px-1">
-                    {move || error.get().unwrap_or_default()}
-                </p>
-            </Show>
-        </form>
+        <Modal
+            show=Signal::derive(move || true)
+            on_close=on_close
+            title="Add Team"
+            size=ModalSize::Sm
+        >
+            {modal_body()}
+        </Modal>
     }
 }
 
@@ -729,12 +852,17 @@ fn SidebarTeamSubNav(
     let (expanded, set_expanded) = signal(false);
     let (menu_open, set_menu_open) = signal(false);
 
+    let store = use_context::<SyncStore>();
+    let nav = leptos_router::hooks::use_navigate();
+
     // Rename modal state
     let (show_rename, set_show_rename) = signal(false);
     let (rename_name, set_rename_name) = signal(name.clone());
     let (rename_key, set_rename_key) = signal(team_key.clone());
     let (rename_error, set_rename_error) = signal(Option::<String>::None);
     let (rename_submitting, set_rename_submitting) = signal(false);
+
+    let (show_leave_confirm, set_show_leave_confirm) = signal(false);
 
     // Expand when navigating into a team's pages.
     Effect::new(move |_| {
@@ -779,10 +907,15 @@ fn SidebarTeamSubNav(
     });
 
     let display_name = name.clone();
+    let leave_confirm_message = format!(
+        "Are you sure you want to leave {}? You'll no longer see this team's issues.",
+        name,
+    );
+    let team_prefix = format!("/teams/{}/", issues_href.split('/').nth(2).unwrap_or(""));
     let name_for_menu = name;
-    let team_id_for_menu = team_id.clone();
     let team_key_for_menu = team_key;
     let team_id_for_rename = team_id.clone();
+    let team_id_for_leave = team_id.clone();
 
     view! {
         <div class="mt-0.5 relative" node_ref=outer_ref>
@@ -835,17 +968,9 @@ fn SidebarTeamSubNav(
                     </button>
                     <button
                         class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
-                        on:click={
-                            let team_id = team_id_for_menu.clone();
-                            move |_| {
-                                let team_id = team_id.clone();
-                                set_menu_open.set(false);
-                                leptos::task::spawn_local(async move {
-                                    if let Err(e) = crate::server_fns::teams::leave_team(team_id).await {
-                                        web_sys::console::warn_1(&format!("leave_team failed: {e}").into());
-                                    }
-                                });
-                            }
+                        on:click=move |_| {
+                            set_menu_open.set(false);
+                            set_show_leave_confirm.set(true);
                         }
                     >
                         "Leave team"
@@ -949,6 +1074,40 @@ fn SidebarTeamSubNav(
                             </Show>
                         </div>
                     </Modal>
+                }
+            }
+
+            {
+                let team_id = team_id_for_leave.clone();
+                view! {
+                    <ConfirmDialog
+                        open=Signal::derive(move || show_leave_confirm.get())
+                        title="Leave team?"
+                        message=leave_confirm_message
+                        confirm_text="Leave"
+                        on_confirm=Callback::new(move |()| {
+                            set_show_leave_confirm.set(false);
+                            let team_id = team_id.clone();
+                            let is_viewing_this_team = path.get_untracked().starts_with(&team_prefix);
+                            let nav = nav.clone();
+                            leptos::task::spawn_local(async move {
+                                match crate::server_fns::teams::leave_team(team_id.clone()).await {
+                                    Ok(()) => {
+                                        if let Some(store) = store {
+                                            store.remove_team(&team_id);
+                                        }
+                                        if is_viewing_this_team {
+                                            nav("/my-issues", Default::default());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        web_sys::console::warn_1(&format!("leave_team failed: {e}").into());
+                                    }
+                                }
+                            });
+                        })
+                        on_cancel=Callback::new(move |()| set_show_leave_confirm.set(false))
+                    />
                 }
             }
         </div>
