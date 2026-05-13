@@ -183,11 +183,10 @@ pub fn IssueDetailPage() -> impl IntoView {
 
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
-    let (version, set_version) = signal(0u32);
 
     let server_issue = Resource::new(
-        move || (team_key.get(), number.get(), version.get()),
-        move |(tk, num, _)| async move { get_issue(tk, num).await },
+        move || (team_key.get(), number.get()),
+        move |(tk, num)| async move { get_issue(tk, num).await },
     );
 
     let issue_data = Signal::derive(move || {
@@ -205,12 +204,25 @@ pub fn IssueDetailPage() -> impl IntoView {
         server_issue.get()
     });
 
-    let comments_resource = Resource::new(
-        move || (team_key.get(), number.get(), version.get()),
-        move |(tk, num, _)| async move { list_comments(tk, num).await },
-    );
+    // Only tracks load-state transitions (Loading → Loaded, etc.),
+    // not SyncStore data changes. Prevents IssueDetailContent from being
+    // recreated on every WebSocket update.
+    #[derive(Clone, PartialEq)]
+    enum PageState {
+        Loading,
+        Loaded(String, i32),
+        NotFound,
+        Error,
+    }
 
-    let refetch = move || set_version.update(|v| *v += 1);
+    let page_state = Memo::new(move |_| {
+        match issue_data.get() {
+            Some(Ok(Some(ref issue))) => PageState::Loaded(issue.team_key.clone(), issue.number),
+            Some(Ok(None)) => PageState::NotFound,
+            Some(Err(_)) => PageState::Error,
+            None => PageState::Loading,
+        }
+    });
 
     view! {
         <div class="bg-background flex flex-col h-full">
@@ -235,31 +247,29 @@ pub fn IssueDetailPage() -> impl IntoView {
             // ── Content ────────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto p-4 md:p-6">
                 {move || {
-                    match issue_data.get() {
-                        Some(Ok(Some(issue))) => {
-                            let comments = comments_resource.get()
-                                .and_then(|r| r.ok())
-                                .unwrap_or_default();
-                            let refetch = refetch;
+                    match page_state.get() {
+                        PageState::Loaded(_, _) => {
+                            let issue = match issue_data.get_untracked() {
+                                Some(Ok(Some(i))) => i,
+                                _ => return view! { <IssueDetailSkeleton/> }.into_any(),
+                            };
                             view! {
                                 <IssueDetailContent
                                     initial_issue=issue
-                                    comments=comments
-                                    on_change=Callback::new(move |()| refetch())
                                 />
                             }.into_any()
                         }
-                        Some(Ok(None)) => {
+                        PageState::NotFound => {
                             view! { <IssueNotFound identifier=format!("{}-{}", team_key.get(), number.get())/> }.into_any()
                         }
-                        Some(Err(_)) => {
+                        PageState::Error => {
                             view! {
                                 <div class="max-w-[860px] mx-auto w-full text-center py-16">
                                     <p class="text-muted-foreground">"Failed to load issue. Please try again."</p>
                                 </div>
                             }.into_any()
                         }
-                        None => {
+                        PageState::Loading => {
                             view! { <IssueDetailSkeleton/> }.into_any()
                         }
                     }
@@ -277,14 +287,16 @@ pub fn IssueDetailPage() -> impl IntoView {
 ///
 /// Reads from SyncStore reactively so external changes (MCP, other clients)
 /// update the UI in realtime without a page refresh.
+/// Owns its own comments resource so comment refetches don't trigger
+/// parent re-renders (which would destroy the description editor).
 #[component]
 fn IssueDetailContent(
     initial_issue: IssueWithDetails,
-    comments: Vec<Comment>,
-    on_change: Callback<()>,
 ) -> impl IntoView {
     let number = initial_issue.number;
     let issue_team_key_for_lookup = initial_issue.team_key.clone();
+    let initial_team_key = initial_issue.team_key.clone();
+    let initial_description = initial_issue.description.clone().unwrap_or_default();
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let initial = RwSignal::new(initial_issue);
 
@@ -297,6 +309,15 @@ fn IssueDetailContent(
         }
         initial.get()
     });
+
+    // ── Comments: fetched locally, refetched via version bump ────────
+    let comments_tk = initial_team_key.clone();
+    let (comment_version, set_comment_version) = signal(0u32);
+    let comments_resource = Resource::new(
+        move || (comments_tk.clone(), number, comment_version.get()),
+        move |(tk, num, _)| async move { list_comments(tk, num).await },
+    );
+    let refetch_comments = Callback::new(move |()| set_comment_version.update(|v| *v += 1));
 
     // ── Sub-issues: derived from SyncStore ───────────────────────────
     let sub_issues = Memo::new(move |_| {
@@ -315,13 +336,15 @@ fn IssueDetailContent(
     let on_sub_issue_created = {
         Callback::new(move |()| {
             set_show_new_sub_issue.set(false);
-            on_change.run(());
         })
     };
 
     // Clone fields needed in link-sub-issue closures
     let issue_id_for_link = issue.get_untracked().issue_id.clone();
     let issue_id_for_exclude = issue_id_for_link.clone();
+
+    // No-op callback for components that need on_change but don't need parent notification
+    let noop = Callback::new(|()| {});
 
     view! {
         <div class="max-w-[1140px] mx-auto w-full flex flex-col md:flex-row gap-8">
@@ -347,21 +370,15 @@ fn IssueDetailContent(
                 // ── Title ──────────────────────────────────────────────
                 {move || {
                     let i = issue.get();
-                    view! { <EditableTitle team_key=i.team_key.clone() number=number title=i.title.clone() on_save=on_change/> }
+                    view! { <EditableTitle team_key=i.team_key.clone() number=number title=i.title.clone() on_save=noop/> }
                 }}
 
                 // ── Description ────────────────────────────────────────
-                {move || {
-                    let i = issue.get();
-                    view! {
-                        <DescriptionEditor
-                            team_key=i.team_key.clone()
-                            number=number
-                            description=i.description.clone().unwrap_or_default()
-                            on_save=on_change
-                        />
-                    }
-                }}
+                <DescriptionEditor
+                    team_key=initial_team_key.clone()
+                    number=number
+                    description=initial_description.clone()
+                />
 
                 // ── Sub-issues section ────────────────────────────────
                 <SubIssuesSection
@@ -374,12 +391,19 @@ fn IssueDetailContent(
                 <div class="border-t border-border my-6"></div>
 
                 // ── Comments ───────────────────────────────────────────
-                <CommentsSection
-                    team_key=initial.get_untracked().team_key.clone()
-                    number=number
-                    comments=comments
-                    on_comment_added=on_change
-                />
+                {move || {
+                    let comments = comments_resource.get()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                    view! {
+                        <CommentsSection
+                            team_key=initial.get_untracked().team_key.clone()
+                            number=number
+                            comments=comments
+                            on_comment_added=refetch_comments
+                        />
+                    }
+                }}
 
                 // ── Footer: timestamps ────────────────────────────────
                 {move || {
@@ -399,7 +423,7 @@ fn IssueDetailContent(
             <div class="w-full md:w-[280px] shrink-0">
                 {move || {
                     let i = issue.get();
-                    view! { <MetadataSidebar issue=i on_change=on_change/> }
+                    view! { <MetadataSidebar issue=i on_change=noop/> }
                 }}
             </div>
         </div>
@@ -437,7 +461,6 @@ fn IssueDetailContent(
                             None,
                             None,
                         ).await;
-                        on_change.run(());
                     });
                 }
             })
@@ -1083,7 +1106,6 @@ fn DescriptionEditor(
     team_key: String,
     number: i32,
     description: String,
-    on_save: Callback<()>,
 ) -> impl IntoView {
     use kode_leptos::TreeWysiwygEditor;
 
@@ -1127,7 +1149,6 @@ fn DescriptionEditor(
                 None, // clear_parent
             )
             .await;
-            on_save.run(());
         });
     });
 
