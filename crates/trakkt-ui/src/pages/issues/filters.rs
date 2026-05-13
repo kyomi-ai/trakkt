@@ -103,7 +103,7 @@ impl SortDirection {
     }
 
     /// Parse from string. Returns `None` for unrecognized input.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "asc" => Some(Self::Asc),
             "desc" => Some(Self::Desc),
@@ -152,7 +152,7 @@ pub fn sort_issues(issues: &mut [IssueWithDetails], field: SortField, direction:
             SortField::DueDate => {
                 let ad = a.due_date.as_deref().unwrap_or("\u{ffff}");
                 let bd = b.due_date.as_deref().unwrap_or("\u{ffff}");
-                ad.cmp(&bd)
+                ad.cmp(bd)
             }
         };
         match direction {

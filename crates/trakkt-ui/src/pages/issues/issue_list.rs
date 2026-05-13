@@ -667,7 +667,7 @@ fn IssueListInner(
                                             );
                                             set_sort_direction.set(
                                                 filters.sort_direction.as_deref()
-                                                    .and_then(SortDirection::from_str)
+                                                    .and_then(SortDirection::parse)
                                                     .unwrap_or(SortDirection::Asc)
                                             );
                                         }
