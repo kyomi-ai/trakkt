@@ -30,6 +30,7 @@ use crate::pages::issues::issue_list::NewIssueModal;
 use crate::server_fns::comments::{create_comment, list_comments};
 use crate::server_fns::issues::{get_issue, list_issues, set_issue_labels, update_issue};
 use crate::server_fns::labels::list_labels;
+use crate::server_fns::projects::list_milestones;
 use crate::server_fns::relations::{add_relation, list_issue_relations, remove_relation};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
@@ -363,7 +364,8 @@ fn IssueDetailContent(
         (i.status_id.clone(), i.status_category.clone(), i.priority,
          i.assignee_id.clone(), i.assignee_name.clone(),
          i.due_date.clone(), i.parent_issue_id.clone(),
-         i.labels.clone())
+         i.labels.clone(),
+         i.project_id.clone(), i.project_name.clone(), i.milestone_id.clone())
     });
 
     view! {
@@ -688,6 +690,36 @@ fn MetadataSidebar(
         });
     };
 
+    // ── Project change handler ─────────────────────────────────────────
+    let on_project_change = move |project_id: String| {
+        let tk = stored_tk.get_value();
+        leptos::task::spawn_local(async move {
+            let _ = update_issue(
+                tk, number,
+                None, None, None, None, None, None,
+                Some(project_id),
+                Some(String::new()),
+                None, None, None,
+            ).await;
+            on_change.run(());
+        });
+    };
+
+    // ── Milestone change handler ───────────────────────────────────────
+    let on_milestone_change = move |milestone_id: String| {
+        let tk = stored_tk.get_value();
+        leptos::task::spawn_local(async move {
+            let _ = update_issue(
+                tk, number,
+                None, None, None, None, None, None,
+                None,
+                Some(milestone_id),
+                None, None, None,
+            ).await;
+            on_change.run(());
+        });
+    };
+
     let status_variant = IssueStatusVariant::parse(&current_status_category);
     let (status_open, set_status_open) = signal(false);
     let (priority_open, set_priority_open) = signal(false);
@@ -711,6 +743,31 @@ fn MetadataSidebar(
     };
 
     let team_key = issue.team_key.clone();
+
+    let current_project_id = issue.project_id.clone();
+    let current_project_name = issue.project_name.clone();
+    let current_milestone_id = issue.milestone_id.clone();
+    let (project_open, set_project_open) = signal(false);
+    let project_trigger_ref = NodeRef::<leptos::html::Div>::new();
+    let (milestone_open, set_milestone_open) = signal(false);
+    let milestone_trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    let milestones = RwSignal::new(Vec::<trakkt_types::models::ProjectMilestone>::new());
+    let milestone_pid = current_project_id.clone();
+    if let Some(ref pid) = milestone_pid {
+        let pid = pid.clone();
+        let milestones_resource = LocalResource::new(move || {
+            let pid = pid.clone();
+            async move { list_milestones(pid).await }
+        });
+        Effect::new(move || {
+            if let Some(Ok(loaded)) = milestones_resource.get() {
+                milestones.set(loaded);
+            }
+        });
+    }
+
+    let current_project_id_for_ms = current_project_id.clone();
 
     view! {
         <div class="space-y-5">
@@ -835,6 +892,221 @@ fn MetadataSidebar(
                 current_labels=issue.labels.clone()
                 on_change=on_change
             />
+
+            // ── Project ───────────────────────────────────────────────
+            <div>
+                <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Project"</div>
+                <div class="flex items-center gap-1">
+                    <div node_ref=project_trigger_ref class="flex-1 min-w-0">
+                        <DropdownTrigger
+                            label="Set project..."
+                            value=Signal::derive({
+                                let name = current_project_name.clone();
+                                move || name.clone()
+                            })
+                            icon=Arc::new(move || {
+                                view! { <Icon icon=phosphor_leptos::FOLDER_SIMPLE size="14px"/> }.into_any()
+                            }) as ChildrenFn
+                            on_click=Callback::new(move |()| set_project_open.update(|o| *o = !*o))
+                        />
+                    </div>
+                    {
+                        let has_project = current_project_id.is_some();
+                        if has_project {
+                            Some(view! {
+                                <button
+                                    class="text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                                    title="Remove project"
+                                    on:click=move |_| on_project_change(String::new())
+                                >
+                                    <Icon icon=phosphor_leptos::X size="12px"/>
+                                </button>
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                </div>
+                <DropdownMenu
+                    trigger_ref=project_trigger_ref
+                    open=Signal::derive(move || project_open.get())
+                    on_close=Callback::new(move |()| set_project_open.set(false))
+                    search_placeholder="Filter projects..."
+                >
+                    {
+                        let current_pid = current_project_id.clone();
+                        move || {
+                            let projects = sync_store.map(|store| store.projects().get()).unwrap_or_default();
+                            let none_item = {
+                                view! {
+                                    <DropdownItem
+                                        label="None".to_string()
+                                        selected=Signal::derive({
+                                            let pid = current_pid.clone();
+                                            move || pid.is_none()
+                                        })
+                                        on_select=Callback::new(move |()| {
+                                            on_project_change(String::new());
+                                            set_project_open.set(false);
+                                        })
+                                    />
+                                }
+                            };
+                            let project_items = projects.into_iter().map({
+                                let current_pid = current_pid.clone();
+                                move |project| {
+                                    let project_id = project.project_id.clone();
+                                    let project_id_check = project.project_id.clone();
+                                    let label = project.name.clone();
+                                    let color = project.color.clone();
+                                    let icon: ChildrenFn = if let Some(c) = color {
+                                        Arc::new(move || {
+                                            let c = c.clone();
+                                            view! {
+                                                <span
+                                                    class="inline-block w-2.5 h-2.5 rounded-full shrink-0"
+                                                    style=format!("background-color: {c}")
+                                                />
+                                            }.into_any()
+                                        }) as ChildrenFn
+                                    } else {
+                                        Arc::new(move || {
+                                            view! { <Icon icon=phosphor_leptos::FOLDER_SIMPLE size="14px"/> }.into_any()
+                                        }) as ChildrenFn
+                                    };
+                                    view! {
+                                        <DropdownItem
+                                            label=label
+                                            selected=Signal::derive({
+                                                let pid = current_pid.clone();
+                                                let check = project_id_check.clone();
+                                                move || pid.as_deref() == Some(check.as_str())
+                                            })
+                                            on_select=Callback::new({
+                                                let id = project_id.clone();
+                                                move |()| {
+                                                    on_project_change(id.clone());
+                                                    set_project_open.set(false);
+                                                }
+                                            })
+                                            icon=icon
+                                        />
+                                    }
+                                }
+                            }).collect_view();
+                            view! { {none_item} {project_items} }
+                        }
+                    }
+                </DropdownMenu>
+            </div>
+
+            // ── Milestone (only when project is set) ──────────────────
+            {
+                let has_project = current_project_id_for_ms.is_some();
+                let current_mid = current_milestone_id.clone();
+                if has_project {
+                    Some(view! {
+                        <div>
+                            <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Milestone"</div>
+                            <div class="flex items-center gap-1">
+                                <div node_ref=milestone_trigger_ref class="flex-1 min-w-0">
+                                    <DropdownTrigger
+                                        label="Set milestone..."
+                                        value=Signal::derive({
+                                            let mid = current_mid.clone();
+                                            move || {
+                                                let mid = mid.as_deref()?;
+                                                milestones.get().iter()
+                                                    .find(|m| m.milestone_id == mid)
+                                                    .map(|m| m.name.clone())
+                                            }
+                                        })
+                                        icon=Arc::new(move || {
+                                            view! { <Icon icon=phosphor_leptos::FLAG size="14px"/> }.into_any()
+                                        }) as ChildrenFn
+                                        on_click=Callback::new(move |()| set_milestone_open.update(|o| *o = !*o))
+                                    />
+                                </div>
+                                {
+                                    let has_milestone = current_mid.is_some();
+                                    if has_milestone {
+                                        Some(view! {
+                                            <button
+                                                class="text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                                                title="Remove milestone"
+                                                on:click=move |_| on_milestone_change(String::new())
+                                            >
+                                                <Icon icon=phosphor_leptos::X size="12px"/>
+                                            </button>
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                }
+                            </div>
+                            <DropdownMenu
+                                trigger_ref=milestone_trigger_ref
+                                open=Signal::derive(move || milestone_open.get())
+                                on_close=Callback::new(move |()| set_milestone_open.set(false))
+                                search_placeholder="Filter milestones..."
+                            >
+                                {
+                                    let current_mid = current_mid.clone();
+                                    move || {
+                                        let ms_list = milestones.get();
+                                        let none_item = {
+                                            view! {
+                                                <DropdownItem
+                                                    label="None".to_string()
+                                                    selected=Signal::derive({
+                                                        let mid = current_mid.clone();
+                                                        move || mid.is_none()
+                                                    })
+                                                    on_select=Callback::new(move |()| {
+                                                        on_milestone_change(String::new());
+                                                        set_milestone_open.set(false);
+                                                    })
+                                                />
+                                            }
+                                        };
+                                        let milestone_items = ms_list.into_iter().map({
+                                            let current_mid = current_mid.clone();
+                                            move |ms| {
+                                                let ms_id = ms.milestone_id.clone();
+                                                let ms_id_check = ms.milestone_id.clone();
+                                                let label = match ms.target_date {
+                                                    Some(ref d) => format!("{} ({})", ms.name, d),
+                                                    None => ms.name.clone(),
+                                                };
+                                                view! {
+                                                    <DropdownItem
+                                                        label=label
+                                                        selected=Signal::derive({
+                                                            let mid = current_mid.clone();
+                                                            let check = ms_id_check.clone();
+                                                            move || mid.as_deref() == Some(check.as_str())
+                                                        })
+                                                        on_select=Callback::new({
+                                                            let id = ms_id.clone();
+                                                            move |()| {
+                                                                on_milestone_change(id.clone());
+                                                                set_milestone_open.set(false);
+                                                            }
+                                                        })
+                                                    />
+                                                }
+                                            }
+                                        }).collect_view();
+                                        view! { {none_item} {milestone_items} }
+                                    }
+                                }
+                            </DropdownMenu>
+                        </div>
+                    })
+                } else {
+                    None
+                }
+            }
 
             // ── Due date (display only — date picker is future work) ───
             <div>
