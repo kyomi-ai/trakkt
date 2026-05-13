@@ -189,8 +189,9 @@ pub async fn hydrate_store_from_db(
         store.set_notifications(deser::<Notification>(&entries, entity_types::NOTIFICATION));
     }
 
-    if let Ok(Some(_cursor)) = db::get_last_sync_id(cache_db, workspace_id).await {
-        store.set_initialized(true);
+    store.set_initialized(true);
+    if let Ok(Some(cursor)) = db::get_last_sync_id(cache_db, workspace_id).await {
+        tracing::debug!(cursor, "hydrated from IDB with cursor — will delta-sync");
     }
 }
 

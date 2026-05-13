@@ -91,6 +91,10 @@ pub fn Layout() -> impl IntoView {
                     }
                     Err(e) => {
                         web_sys::console::warn_1(&format!("Failed to open IDB: {e}").into());
+                        // Mark initialized even on IDB failure — an empty store is
+                        // valid state (the sync engine bootstrap will populate it).
+                        // Without this, the sidebar stays in skeleton state forever.
+                        sync_store.set_initialized(true);
                     }
                 }
             });
@@ -389,6 +393,24 @@ fn SidebarTeamsSection() -> impl IntoView {
     view! {
         {move || {
             let Some(store) = store else { return view! { <span/> }.into_any() };
+
+            // Show skeleton placeholders while the sync store is hydrating.
+            // This prevents the sidebar from showing an empty teams list
+            // after client-side login navigation (before bootstrap completes).
+            if !store.initialized().get() {
+                return view! {
+                    <div class="px-3 pt-4 pb-1">
+                        <span class="text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
+                            "Teams"
+                        </span>
+                    </div>
+                    <div class="space-y-1 px-2">
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse"/>
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse w-3/4"/>
+                    </div>
+                }.into_any();
+            }
+
             let teams = store.teams().get();
             view! {
                 <div class="group flex items-center justify-between px-3 pt-4 pb-1">
@@ -436,6 +458,24 @@ fn SidebarFavoritesSection() -> impl IntoView {
     view! {
         {move || {
             let Some(store) = store else { return view! { <span/> }.into_any() };
+
+            // Show skeleton placeholders while the sync store is hydrating.
+            // Without this, the favorites section disappears entirely after
+            // client-side login until bootstrap completes.
+            if !store.initialized().get() {
+                return view! {
+                    <div class="px-3 pt-4 pb-1">
+                        <span class="text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
+                            "Favorites"
+                        </span>
+                    </div>
+                    <div class="space-y-1 px-2">
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse"/>
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse w-3/4"/>
+                    </div>
+                }.into_any();
+            }
+
             let favorites = store.favorites().get();
             if favorites.is_empty() {
                 return view! { <span/> }.into_any();
@@ -609,6 +649,16 @@ fn SidebarProjectsSection() -> impl IntoView {
     view! {
         {move || {
             let Some(store) = store else { return view! { <span/> }.into_any() };
+
+            // Show skeleton placeholders while the sync store is hydrating.
+            if !store.initialized().get() {
+                return view! {
+                    <div class="space-y-1 px-2 pt-4">
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse"/>
+                    </div>
+                }.into_any();
+            }
+
             let projects = store.projects().get();
             if projects.is_empty() {
                 return view! { <span/> }.into_any();
