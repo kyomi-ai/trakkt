@@ -10,7 +10,7 @@
 //!
 //! Key interactions:
 //! - Title: click to edit, Enter/blur to save
-//! - Status/Priority: StyledSelect dropdowns with immediate save
+//! - Status/Priority: DropdownMenu pickers with immediate save
 //! - Description: kode WYSIWYG editor with debounced auto-save
 //! - Comments: threaded display with new comment form
 
@@ -24,7 +24,7 @@ use crate::components::{
     Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
     DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
-    LabelBadge, Modal, ModalSize, SearchInput, Skeleton, StyledSelect,
+    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton,
 };
 use crate::pages::issues::issue_list::NewIssueModal;
 use crate::server_fns::comments::{create_comment, list_comments};
@@ -563,7 +563,8 @@ fn EditableTitle(
                 let t = title_for_display.clone();
                 view! {
                     <h1
-                        class="text-3xl font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors"
+                        class="font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors"
+                        style="font-size: 2em; font-weight: 600; line-height: 1.3;"
                         on:click=move |_| {
                             set_editing.set(true);
                         }
@@ -580,7 +581,8 @@ fn EditableTitle(
                     <input
                         node_ref=input_ref
                         type="text"
-                        class="text-3xl font-display text-foreground bg-transparent border-b-2 border-primary outline-none w-full py-1"
+                        class="font-display text-foreground bg-transparent border-b-2 border-primary outline-none w-full py-1"
+                        style="font-size: 2em; font-weight: 600; line-height: 1.3;"
                         prop:value=move || current_title.get()
                         on:input=move |ev| set_current_title.set(event_target_value(&ev))
                         on:blur=move |_| save_title()
@@ -654,8 +656,7 @@ fn MetadataSidebar(
     };
 
     // ── Priority change handler ─────────────────────────────────────────
-    let on_priority_change = move |new_priority: String| {
-        let prio = new_priority.parse::<i32>().unwrap_or(0);
+    let on_priority_change = move |prio: i32| {
         let tk = stored_tk.get_value();
         leptos::task::spawn_local(async move {
             let _ = update_issue(
@@ -680,7 +681,9 @@ fn MetadataSidebar(
 
     let status_variant = IssueStatusVariant::parse(&current_status_category);
     let (status_open, set_status_open) = signal(false);
+    let (priority_open, set_priority_open) = signal(false);
     let status_trigger_ref = NodeRef::<leptos::html::Div>::new();
+    let priority_trigger_ref = NodeRef::<leptos::html::Div>::new();
     let statuses = RwSignal::new(Vec::<trakkt_types::models::Status>::new());
 
     Effect::new(move || {
@@ -754,17 +757,48 @@ fn MetadataSidebar(
             // ── Priority ───────────────────────────────────────────────
             <div>
                 <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Priority"</div>
-                <StyledSelect
-                    value=priority.to_string()
-                    options=vec![
-                        ("0", "None"),
-                        ("1", "Urgent"),
-                        ("2", "High"),
-                        ("3", "Medium"),
-                        ("4", "Low"),
-                    ]
-                    on_change=on_priority_change
-                />
+                <div node_ref=priority_trigger_ref>
+                    <DropdownTrigger
+                        label="Priority"
+                        value=Signal::derive(move || {
+                            Some(match priority {
+                                1 => "Urgent",
+                                2 => "High",
+                                3 => "Medium",
+                                4 => "Low",
+                                _ => "None",
+                            }.to_string())
+                        })
+                        icon=Arc::new(move || {
+                            view! { <PriorityIndicator priority=priority size=14/> }.into_any()
+                        }) as ChildrenFn
+                        on_click=Callback::new(move |()| set_priority_open.update(|o| *o = !*o))
+                    />
+                </div>
+                <DropdownMenu
+                    trigger_ref=priority_trigger_ref
+                    open=Signal::derive(move || priority_open.get())
+                    on_close=Callback::new(move |()| set_priority_open.set(false))
+                >
+                    {move || {
+                        [(1, "Urgent"), (2, "High"), (3, "Medium"), (4, "Low"), (0, "None")]
+                            .into_iter()
+                            .map(|(prio, label)| {
+                                view! {
+                                    <DropdownItem
+                                        label=label.to_string()
+                                        selected=Signal::derive(move || priority == prio)
+                                        on_select=Callback::new(move |()| {
+                                            on_priority_change(prio);
+                                            set_priority_open.set(false);
+                                        })
+                                        icon=Arc::new(move || view! { <PriorityIndicator priority=prio size=14/> }.into_any()) as ChildrenFn
+                                    />
+                                }
+                            })
+                            .collect_view()
+                    }}
+                </DropdownMenu>
             </div>
 
             // ── Assignee (display only — picker is future work) ────────
@@ -1172,7 +1206,9 @@ fn DescriptionEditor(
         });
     });
 
-    let theme_signal = Signal::stored(trakkt_kode_theme());
+    let mut theme = trakkt_kode_theme();
+    theme.content_padding = Some("0");
+    let theme_signal = Signal::stored(theme);
 
     view! {
         <div class="mt-2" style="min-height: 120px;">
