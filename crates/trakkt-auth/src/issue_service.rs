@@ -797,10 +797,10 @@ pub async fn update_issue(
     // ── Notification triggers (best-effort) ─────────────────────────────
     if let Some(actor_id) = actor_user_id {
         // Assignee auto-watch: when assigned, auto-add as watcher.
-        if let Some(Some(ref assignee_id)) = updates.assignee_id {
-            if let Err(e) = crate::watcher_service::watch_issue(db, &issue_id, assignee_id).await {
-                tracing::warn!(error = %e, issue_id = %issue_id, "Failed to auto-watch issue for assignee");
-            }
+        if let Some(Some(ref assignee_id)) = updates.assignee_id
+            && let Err(e) = crate::watcher_service::watch_issue(db, &issue_id, assignee_id).await
+        {
+            tracing::warn!(error = %e, issue_id = %issue_id, "Failed to auto-watch issue for assignee");
         }
 
         // Determine which notification types to send.
