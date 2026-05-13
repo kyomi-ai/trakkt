@@ -21,6 +21,7 @@ use crate::pages::auth::{
     signup_complete::SignupCompletePage,
 };
 use crate::pages::accept_ownership::AcceptOwnershipPage;
+use crate::pages::inbox::InboxPage;
 use crate::pages::issues::issue_detail::IssueDetailPage;
 use crate::pages::issues::issue_list::IssueListForTeam;
 use crate::pages::issues::my_issues::MyIssuesPage;
@@ -102,6 +103,9 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/") view=|| view! { <Redirect path="/my-issues"/> }/>
                     <Route path=path!("/onboarding") view=OnboardingPage/>
                     <Route path=path!("/accept-ownership/:transfer_id") view=AcceptOwnershipPage/>
+
+                    // Inbox — notification feed
+                    <Route path=path!("/inbox") view=InboxPage/>
 
                     // My Issues — cross-team view of issues assigned to the current user
                     <Route path=path!("/my-issues") view=MyIssuesPage/>

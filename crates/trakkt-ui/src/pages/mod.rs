@@ -3,6 +3,7 @@
 pub mod accept_ownership;
 pub mod auth;
 pub mod board;
+pub mod inbox;
 pub mod issues;
 pub mod onboarding;
 pub mod projects;
