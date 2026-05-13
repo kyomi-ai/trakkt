@@ -1113,10 +1113,10 @@ pub(crate) fn NewIssueModal(
                                 Signal::derive(move || {
                                     let mut theme = super::issue_detail::trakkt_kode_theme();
                                     theme.content_padding = Some("0.75rem 1rem");
-                                    if let Some(ts) = theme_state {
-                                        if ts.effective.get() == "dark" {
-                                            theme.syntax = kode_leptos::SyntaxTheme::OneDark;
-                                        }
+                                    if let Some(ts) = theme_state
+                                        && ts.effective.get() == "dark"
+                                    {
+                                        theme.syntax = kode_leptos::SyntaxTheme::OneDark;
                                     }
                                     theme
                                 })
