@@ -37,6 +37,8 @@ struct NotificationRow {
     read: bool,
     issue_title: Option<String>,
     issue_number: Option<i32>,
+    actor_id: Option<String>,
+    actor_name: Option<String>,
     created_at: String,
 }
 
@@ -51,6 +53,8 @@ impl NotificationRow {
             read: self.read,
             issue_title: self.issue_title,
             issue_number: self.issue_number,
+            actor_id: self.actor_id,
+            actor_name: self.actor_name,
             created_at: self.created_at,
         }
     }
@@ -65,6 +69,7 @@ pub async fn create_notification(
     user_id: &str,
     issue_id: &str,
     notification_type: &str,
+    actor_id: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let is_pg = db.is_postgres();
@@ -73,8 +78,8 @@ pub async fn create_notification(
 
     let sql = format!(
         "INSERT INTO notifications \
-            (notification_id, workspace_id, user_id, issue_id, type, read, created_at) \
-         VALUES ($1, $2, $3, $4, $5, {bf}, {now})",
+            (notification_id, workspace_id, user_id, issue_id, type, actor_id, read, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, {bf}, {now})",
         bf = sql_compat::bool_false(is_pg),
     );
     trakkt_core::db_execute!(
@@ -84,19 +89,22 @@ pub async fn create_notification(
         workspace_id,
         user_id,
         issue_id,
-        notification_type
+        notification_type,
+        actor_id
     )?;
 
-    // Re-fetch with joined issue data for the sync payload.
     let notification = trakkt_core::db_fetch_optional!(
         db,
         NotificationRow,
         "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
                 n.type AS notification_type, n.read, \
                 i.title AS issue_title, i.number AS issue_number, \
+                n.actor_id, \
+                u_actor.name AS actor_name, \
                 CAST(n.created_at AS TEXT) AS created_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
+         LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id \
          WHERE n.notification_id = $1",
         &notification_id
     )?;
@@ -153,9 +161,12 @@ pub async fn list_notifications(
         "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
                 n.type AS notification_type, n.read, \
                 i.title AS issue_title, i.number AS issue_number, \
+                n.actor_id, \
+                u_actor.name AS actor_name, \
                 CAST(n.created_at AS TEXT) AS created_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
+         LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id \
          WHERE n.user_id = $1 {unread_filter} \
          ORDER BY n.created_at DESC \
          LIMIT {DEFAULT_NOTIFICATION_LIMIT}"
