@@ -33,7 +33,10 @@ use crate::components::{
     SearchInput, StyledSelect, INPUT_CLASS,
 };
 use crate::pages::board::BoardContent;
-use crate::pages::issues::filters::{PriorityFilterDropdown, StatusFilterDropdown};
+use crate::pages::issues::filters::{
+    parse_sort_field, sort_field_to_str, sort_issues, PriorityFilterDropdown, SortDirection,
+    SortDropdown, SortField, StatusFilterDropdown,
+};
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::pages::views::ViewFilters;
@@ -135,6 +138,10 @@ fn IssueListInner(
     let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
     let (show_archived, set_show_archived) = signal(false);
 
+    // ── Sort state ─────────────────────────────────────────────────────────
+    let (sort_field, set_sort_field) = signal(SortField::Priority);
+    let (sort_direction, set_sort_direction) = signal(SortDirection::Asc);
+
     // ── Active tab state (team-scoped pages only) ─────────────────────────
     // Values: "all", "active", "backlog", "view:{view_id}"
     let (active_tab, set_active_tab) = signal("all".to_string());
@@ -210,6 +217,8 @@ fn IssueListInner(
             set_search.set(String::new());
             set_status_filter.set(Vec::new());
             set_priority_filter.set(Vec::new());
+            set_sort_field.set(SortField::Priority);
+            set_sort_direction.set(SortDirection::Asc);
         }
         leptos::task::spawn_local(async move {
             match delete_view(vid).await {
@@ -219,10 +228,12 @@ fn IssueListInner(
         });
     };
 
-    // Reset active tab when navigating between teams.
+    // Reset active tab and sort when navigating between teams.
     Effect::new(move |_| {
         let _ = resolved_team.get();
         set_active_tab.set("all".to_string());
+        set_sort_field.set(SortField::Priority);
+        set_sort_direction.set(SortDirection::Asc);
     });
 
     // Close context menu on click outside.
@@ -332,6 +343,15 @@ fn IssueListInner(
                 true
             })
             .collect::<Vec<_>>()
+    });
+
+    // Sorted issue list — applies the selected sort field and direction on
+    // top of the filtered results. All rendering reads from `sorted_issues`
+    // instead of `filtered_issues`.
+    let sorted_issues = Memo::new(move |_| {
+        let mut issues = filtered_issues.get();
+        sort_issues(&mut issues, sort_field.get(), sort_direction.get());
+        issues
     });
 
     // ── Statuses (for board view) ──────────────────────────────────────────
@@ -543,12 +563,16 @@ fn IssueListInner(
                     set_search.set(String::new());
                     set_status_filter.set(Vec::new());
                     set_priority_filter.set(Vec::new());
+                    set_sort_field.set(SortField::Priority);
+                    set_sort_direction.set(SortDirection::Asc);
                 };
 
                 let on_active = move |_: web_sys::MouseEvent| {
                     set_active_tab.set("active".to_string());
                     set_search.set(String::new());
                     set_priority_filter.set(Vec::new());
+                    set_sort_field.set(SortField::Priority);
+                    set_sort_direction.set(SortDirection::Asc);
                     let team = resolved_team.get();
                     let status_ids: Vec<String> = if let (Some(store), Some(t)) = (sync_store, &team) {
                         store
@@ -571,6 +595,8 @@ fn IssueListInner(
                     set_active_tab.set("backlog".to_string());
                     set_search.set(String::new());
                     set_priority_filter.set(Vec::new());
+                    set_sort_field.set(SortField::Priority);
+                    set_sort_direction.set(SortDirection::Asc);
                     let team = resolved_team.get();
                     let status_ids: Vec<String> = if let (Some(store), Some(t)) = (sync_store, &team) {
                         store
@@ -632,6 +658,17 @@ fn IssueListInner(
                                             set_status_filter.set(filters.statuses);
                                             set_priority_filter.set(
                                                 filters.priorities.iter().map(|p| p.to_string()).collect()
+                                            );
+                                            // Restore sort from saved view (or reset to defaults).
+                                            set_sort_field.set(
+                                                filters.sort_field.as_deref()
+                                                    .and_then(parse_sort_field)
+                                                    .unwrap_or(SortField::Priority)
+                                            );
+                                            set_sort_direction.set(
+                                                filters.sort_direction.as_deref()
+                                                    .and_then(SortDirection::from_str)
+                                                    .unwrap_or(SortDirection::Asc)
                                             );
                                         }
                                         Err(e) => {
@@ -783,6 +820,14 @@ fn IssueListInner(
                         team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
                     />
                     <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))/>
+                    <SortDropdown
+                        field=Signal::derive(move || sort_field.get())
+                        direction=Signal::derive(move || sort_direction.get())
+                        on_change=Callback::new(move |(f, d): (SortField, SortDirection)| {
+                            set_sort_field.set(f);
+                            set_sort_direction.set(d);
+                        })
+                    />
                     <button
                         class=move || {
                             if show_archived.get() {
@@ -848,7 +893,7 @@ fn IssueListInner(
                     view! {
                         <div class="flex-1 overflow-y-auto">
                             {move || {
-                                let list = filtered_issues.get();
+                                let list = sorted_issues.get();
 
                                 // Update keyboard navigation bounds.
                                 issue_count.set(list.len());
@@ -918,6 +963,8 @@ fn IssueListInner(
             priority_filter=Signal::derive(move || priority_filter.get())
             team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
             view_mode=Signal::derive(move || view_mode.get())
+            sort_field=Signal::derive(move || sort_field.get())
+            sort_direction=Signal::derive(move || sort_direction.get())
         />
 
         // ── Delete View confirmation dialog ────────────────────────────────
@@ -1168,6 +1215,12 @@ pub(crate) fn SaveViewModal(
     team_id: Signal<Option<String>>,
     /// Current view mode (list/board).
     view_mode: Signal<String>,
+    /// Current sort field.
+    #[prop(optional, into)]
+    sort_field: Option<Signal<SortField>>,
+    /// Current sort direction.
+    #[prop(optional, into)]
+    sort_direction: Option<Signal<SortDirection>>,
 ) -> impl IntoView {
     let (name, set_name) = signal(String::new());
     let (submitting, set_submitting) = signal(false);
@@ -1197,12 +1250,16 @@ pub(crate) fn SaveViewModal(
         let team_id_val = team_id.get_untracked().unwrap_or_default();
 
         let labels: Vec<String> = Vec::new();
+        let sf_str = sort_field.map(|s| sort_field_to_str(s.get_untracked()).to_string());
+        let sd_str = sort_direction.map(|s| s.get_untracked().as_str().to_string());
         let filters = serde_json::json!({
             "statuses": statuses,
             "priorities": priorities,
             "search": search_val,
             "team_id": team_id_val,
             "labels": labels,
+            "sort_field": sf_str,
+            "sort_direction": sd_str,
         });
 
         let display_options = serde_json::json!({

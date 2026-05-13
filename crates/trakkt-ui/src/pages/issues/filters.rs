@@ -17,6 +17,175 @@ use crate::components::{
     PriorityIndicator,
 };
 use crate::server_fns::statuses::list_statuses;
+use trakkt_types::models::IssueWithDetails;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sort enums and helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Field to sort the issue list by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortField {
+    Priority,
+    Status,
+    CreatedDate,
+    UpdatedDate,
+    Assignee,
+    DueDate,
+}
+
+impl SortField {
+    /// Human-readable label for the dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Priority => "Priority",
+            Self::Status => "Status",
+            Self::CreatedDate => "Created date",
+            Self::UpdatedDate => "Updated date",
+            Self::Assignee => "Assignee",
+            Self::DueDate => "Due date",
+        }
+    }
+
+    /// The natural default direction for this sort field.
+    pub fn default_direction(self) -> SortDirection {
+        match self {
+            Self::Priority => SortDirection::Asc,
+            Self::Status => SortDirection::Asc,
+            Self::CreatedDate => SortDirection::Desc,
+            Self::UpdatedDate => SortDirection::Desc,
+            Self::Assignee => SortDirection::Asc,
+            Self::DueDate => SortDirection::Asc,
+        }
+    }
+
+    /// All variants in display order.
+    pub const ALL: [SortField; 6] = [
+        Self::Priority,
+        Self::Status,
+        Self::CreatedDate,
+        Self::UpdatedDate,
+        Self::Assignee,
+        Self::DueDate,
+    ];
+}
+
+/// Sort direction — ascending or descending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    /// Toggle between ascending and descending.
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+
+    /// Arrow character for UI display.
+    pub fn arrow(self) -> &'static str {
+        match self {
+            Self::Asc => "\u{2191}",  // ↑
+            Self::Desc => "\u{2193}", // ↓
+        }
+    }
+
+    /// Serialize to string for view persistence.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    /// Parse from string. Returns `None` for unrecognized input.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "asc" => Some(Self::Asc),
+            "desc" => Some(Self::Desc),
+            _ => None,
+        }
+    }
+}
+
+/// Sort a slice of issues in-place by the given field and direction.
+///
+/// Shared by `issue_list.rs` and `my_issues.rs` to avoid duplicating sort
+/// logic (per CODING_STANDARDS.md "No duplicated helper functions across
+/// modules").
+pub fn sort_issues(issues: &mut [IssueWithDetails], field: SortField, direction: SortDirection) {
+    if field == SortField::Assignee {
+        issues.sort_by_cached_key(|i| {
+            i.assignee_name.as_deref().unwrap_or("\u{ffff}").to_lowercase()
+        });
+        if direction == SortDirection::Desc {
+            issues.reverse();
+        }
+        return;
+    }
+
+    issues.sort_by(|a, b| {
+        let cmp = match field {
+            SortField::Priority => {
+                let pa = if a.priority == 0 { 99 } else { a.priority };
+                let pb = if b.priority == 0 { 99 } else { b.priority };
+                pa.cmp(&pb)
+            }
+            SortField::Status => {
+                let cat_order = |cat: &str| match cat {
+                    "backlog" => 0,
+                    "unstarted" => 1,
+                    "started" => 2,
+                    "completed" => 3,
+                    "cancelled" => 4,
+                    _ => 5,
+                };
+                cat_order(&a.status_category).cmp(&cat_order(&b.status_category))
+            }
+            SortField::CreatedDate => a.created_at.cmp(&b.created_at),
+            SortField::UpdatedDate => a.updated_at.cmp(&b.updated_at),
+            SortField::Assignee => unreachable!(),
+            SortField::DueDate => {
+                let ad = a.due_date.as_deref().unwrap_or("\u{ffff}");
+                let bd = b.due_date.as_deref().unwrap_or("\u{ffff}");
+                ad.cmp(&bd)
+            }
+        };
+        match direction {
+            SortDirection::Asc => cmp,
+            SortDirection::Desc => cmp.reverse(),
+        }
+    });
+}
+
+/// Parse a sort field name back to the enum. Returns `None` for unknown input.
+pub fn parse_sort_field(s: &str) -> Option<SortField> {
+    match s {
+        "priority" => Some(SortField::Priority),
+        "status" => Some(SortField::Status),
+        "created_date" => Some(SortField::CreatedDate),
+        "updated_date" => Some(SortField::UpdatedDate),
+        "assignee" => Some(SortField::Assignee),
+        "due_date" => Some(SortField::DueDate),
+        _ => None,
+    }
+}
+
+/// Serialize a sort field to a stable string for view persistence.
+pub fn sort_field_to_str(field: SortField) -> &'static str {
+    match field {
+        SortField::Priority => "priority",
+        SortField::Status => "status",
+        SortField::CreatedDate => "created_date",
+        SortField::UpdatedDate => "updated_date",
+        SortField::Assignee => "assignee",
+        SortField::DueDate => "due_date",
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Status Filter Dropdown
@@ -267,6 +436,74 @@ pub fn PriorityFilterDropdown(
                         })
                         icon=Arc::new(move || view! { <PriorityIndicator priority=priority_val/> }.into_any()) as ChildrenFn
                         shortcut=shortcut
+                    />
+                }
+            }).collect_view()}
+        </DropdownMenu>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sort Dropdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dropdown for selecting sort field and direction.
+///
+/// Clicking the currently active sort field toggles the direction (asc/desc).
+/// Clicking a different field selects it with its default direction.
+/// The active field shows a checkmark; the trigger shows the field name + an
+/// arrow indicating current direction.
+#[component]
+pub fn SortDropdown(
+    /// Current sort field.
+    #[prop(into)]
+    field: Signal<SortField>,
+    /// Current sort direction.
+    #[prop(into)]
+    direction: Signal<SortDirection>,
+    /// Called when the user changes sort field or direction.
+    on_change: Callback<(SortField, SortDirection)>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Display: "Priority ↑" etc.
+    let display = Memo::new(move |_| {
+        let f = field.get();
+        let d = direction.get();
+        Some(format!("{} {}", f.label(), d.arrow()))
+    });
+
+    view! {
+        <div node_ref=trigger_ref>
+            <DropdownTrigger
+                label="Sort"
+                value=Signal::derive(move || display.get())
+                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
+            />
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+        >
+            {SortField::ALL.iter().map(|sort_field| {
+                let sf = *sort_field;
+                let label = sf.label().to_string();
+                view! {
+                    <DropdownItem
+                        label=label
+                        selected=Signal::derive(move || field.get() == sf)
+                        on_select=Callback::new(move |()| {
+                            if field.get_untracked() == sf {
+                                // Same field: toggle direction.
+                                on_change.run((sf, direction.get_untracked().toggle()));
+                            } else {
+                                // Different field: use its default direction.
+                                on_change.run((sf, sf.default_direction()));
+                            }
+                            set_open.set(false);
+                        })
                     />
                 }
             }).collect_view()}

@@ -20,4 +20,10 @@ pub struct ViewFilters {
     pub search: String,
     #[serde(default)]
     pub team_id: String,
+    /// Persisted sort field (e.g. "priority", "status", "created_date").
+    #[serde(default)]
+    pub sort_field: Option<String>,
+    /// Persisted sort direction ("asc" or "desc").
+    #[serde(default)]
+    pub sort_direction: Option<String>,
 }
