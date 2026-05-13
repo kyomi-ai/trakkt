@@ -1212,6 +1212,7 @@ fn DescriptionEditor(
     let theme_signal = Signal::derive(move || {
         let mut theme = trakkt_kode_theme();
         theme.content_padding = Some("0");
+        theme.bg = "var(--color-background)";
         if let Some(ts) = theme_state
             && ts.effective.get() == "dark"
         {
