@@ -7,6 +7,7 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 ### Database Queries
 - Use `db_fetch_all!`, `db_fetch_one!`, `db_fetch_optional!`, `db_execute!`, `db_fetch_scalar!` macros for ALL database queries. Never use raw sqlx pool access.
 - Always match on `DbPool::Postgres` and `DbPool::Sqlite` variants — never assume one backend.
+- Always create SQLite migrations alongside Postgres migrations. Same schema changes, adapted for SQLite syntax (e.g. no ON DELETE CASCADE).
 - Use `sql_compat` helpers (`now()`, `bool_true()`, `ilike()`, etc.) for dialect-dependent SQL fragments.
 - Generate UUIDs as `Uuid::new_v4().to_string()` for all entity IDs.
 
@@ -14,6 +15,7 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 - All service functions are free functions with `db: &DbPool` as the first argument.
 - Service functions return `trakkt_core::Result<T>`, never `ServerFnError`.
 - Every write operation must append to `sync_log` after the main write.
+- When changing a service function signature, grep for ALL call sites (server functions, websocket bootstrap, tests, other services).
 
 ### Server Functions (Leptos)
 - Server functions are thin wrappers: extract auth, extract context, call service, return.
