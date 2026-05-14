@@ -8,4 +8,5 @@ pub mod issues;
 pub mod onboarding;
 pub mod projects;
 pub mod settings;
+pub mod teams;
 pub mod views;
