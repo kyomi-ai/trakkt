@@ -4,14 +4,15 @@
 //!
 //! Layout follows Linear's two-column pattern:
 //! - Header: back button + issue number (font-mono)
-//! - Left column: title (editable), description (kode WYSIWYG), sub-issues, comments, timestamps
-//! - Right column (280px sidebar): status, priority, assignee, labels, due date, watch, parent, team
+//! - Left column: title (editable), description (kode WYSIWYG), relations (unified), comments, timestamps
+//! - Right column (280px sidebar): status, priority, assignee, labels, due date, watch, team
 //! - Responsive: sidebar stacks below main content on mobile
 //!
 //! Key interactions:
 //! - Title: click to edit, Enter/blur to save
 //! - Status/Priority: DropdownMenu pickers with immediate save
 //! - Description: kode WYSIWYG editor with debounced auto-save
+//! - Relations: unified section showing parent, children, blocks, blocked-by
 //! - Comments: threaded display with new comment form
 
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use crate::components::{
     Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
     DatePicker, DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
-    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton,
+    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton, StyledSelect,
 };
 use crate::pages::issues::issue_list::NewIssueModal;
 use crate::server_fns::comments::create_comment;
@@ -261,37 +262,6 @@ fn IssueDetailContent(
         }).unwrap_or_default()
     });
 
-    // ── Sub-issues: fetched via server function ────────────────────
-    let sub_issue_issue_id = initial.get_untracked().issue_id.clone();
-    let (sub_issue_version, set_sub_issue_version) = signal(0u32);
-    let sub_issues_resource = Resource::new(
-        move || (sub_issue_issue_id.clone(), sub_issue_version.get()),
-        move |(pid, _)| async move {
-            crate::server_fns::issues::list_sub_issues(pid).await
-        },
-    );
-    let sub_issues = Memo::new(move |_| {
-        sub_issues_resource
-            .get()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-    });
-
-    // ── New sub-issue modal state ─────────────────────────────────────
-    let (show_new_sub_issue, set_show_new_sub_issue) = signal(false);
-    let (show_link_sub_issue, set_show_link_sub_issue) = signal(false);
-
-    let on_sub_issue_created = {
-        Callback::new(move |()| {
-            set_show_new_sub_issue.set(false);
-            set_sub_issue_version.update(|v| *v += 1);
-        })
-    };
-
-    // Clone fields needed in link-sub-issue closures
-    let issue_id_for_link = issue.get_untracked().issue_id.clone();
-    let issue_id_for_exclude = issue_id_for_link.clone();
-
     // No-op callback for components that need on_change but don't need parent notification
     let noop = Callback::new(|()| {});
 
@@ -308,7 +278,7 @@ fn IssueDetailContent(
         let i = issue.get();
         (i.status_id.clone(), i.status_category.clone(), i.priority,
          i.assignee_id.clone(), i.assignee_name.clone(),
-         i.due_date.clone(), i.parent_identifier.clone(), i.parent_title.clone(),
+         i.due_date.clone(),
          i.labels.clone(),
          i.project_id.clone(), i.project_name.clone(), i.milestone_id.clone())
     });
@@ -354,17 +324,12 @@ fn IssueDetailContent(
                     description=initial_description.clone()
                 />
 
-                // ── Sub-issues section ────────────────────────────────
-                <SubIssuesSection
-                    sub_issues=sub_issues
-                    on_add=Callback::new(move |()| set_show_new_sub_issue.set(true))
-                    on_link=Callback::new(move |()| set_show_link_sub_issue.set(true))
-                />
-
-                // ── Relations section ─────────────────────────────────
+                // ── Relations section (unified: parent, children, blocks, blocked-by) ──
                 <RelationsSection
                     team_key=initial_team_key.clone()
                     number=number
+                    issue_id=initial.get_untracked().issue_id.clone()
+                    team_id=initial.get_untracked().team_id.clone()
                 />
 
                 // ── Divider ────────────────────────────────────────────
@@ -406,52 +371,6 @@ fn IssueDetailContent(
             </div>
         </div>
 
-        // ── New Sub-Issue modal ───────────────────────────────────────
-        <NewIssueModal
-            show=Signal::derive(move || show_new_sub_issue.get())
-            on_close=Callback::new(move |()| set_show_new_sub_issue.set(false))
-            on_created=on_sub_issue_created
-            team_id=Signal::derive(move || Some(issue.get().team_id.clone()))
-            parent_issue_id=Signal::derive(move || Some(issue.get().issue_id.clone()))
-            parent_title=Signal::derive(move || {
-                let i = issue.get();
-                Some(format!("{}-{} {}", i.team_key, i.number, i.title))
-            })
-        />
-
-        // ── Link existing sub-issue modal ────────────────────────────────
-        <IssuePickerModal
-            show=Signal::derive(move || show_link_sub_issue.get())
-            on_close=Callback::new(move |()| set_show_link_sub_issue.set(false))
-            on_select=Callback::new({
-                let parent_id = issue_id_for_link.clone();
-                move |selected: IssueWithDetails| {
-                    let child_team_key = selected.team_key.clone();
-                    let child_number = selected.number;
-                    let parent_id = parent_id.clone();
-                    set_show_link_sub_issue.set(false);
-                    leptos::task::spawn_local(async move {
-                        let _ = update_issue(
-                            child_team_key,
-                            child_number,
-                            None, None, None, None, None, None, None, None,
-                            Some(parent_id),
-                            None,
-                        ).await;
-                        set_sub_issue_version.update(|v| *v += 1);
-                    });
-                }
-            })
-            exclude_ids=Signal::derive({
-                let issue_id = issue_id_for_exclude.clone();
-                move || {
-                    let mut ids = vec![issue_id.clone()];
-                    ids.extend(sub_issues.get().iter().map(|i| i.issue_id.clone()));
-                    ids
-                }
-            })
-            title="Link existing issue"
-        />
     }
 }
 
@@ -559,7 +478,7 @@ fn EditableTitle(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Metadata sidebar showing status, priority, assignee, labels, due date, watch,
-/// parent issue, and team — stacked vertically in the right column.
+/// and team — stacked vertically in the right column.
 #[component]
 fn MetadataSidebar(
     issue: IssueWithDetails,
@@ -571,11 +490,6 @@ fn MetadataSidebar(
     let current_status_category = issue.status_category.clone();
     let priority = issue.priority;
 
-    // ── Parent issue state ─────────────────────────────────────────────
-    let (show_parent_picker, set_show_parent_picker) = signal(false);
-    let issue_id_for_parent_exclude = issue.issue_id.clone();
-    let parent_identifier = issue.parent_identifier.clone();
-    let parent_title = issue.parent_title.clone();
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
     // Fetch statuses dynamically for the status dropdown.
@@ -1184,90 +1098,12 @@ fn MetadataSidebar(
             // ── Watch toggle ──────────────────────────────────────────────
             <WatchToggle team_key=issue_team_key.clone() number=number/>
 
-            // ── Parent issue ──────────────────────────────────────────────
-            <div>
-                <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Parent"</div>
-                {
-                    let pid = parent_identifier.clone();
-                    let ptitle = parent_title.clone();
-                    if let Some(ref parent_key) = pid {
-                        let parent_href = format!("/issues/{parent_key}");
-                        let parent_key_display = parent_key.clone();
-                        let ptitle_display = ptitle.clone();
-                        let tk_for_remove = issue_team_key.clone();
-                        view! {
-                            <div class="flex items-center gap-1.5 min-w-0">
-                                <a href=parent_href class="text-sm text-foreground hover:underline truncate flex items-center gap-1">
-                                    <span class="font-mono text-xs text-muted-foreground">{parent_key_display}</span>
-                                    {ptitle_display.map(|t| view! { <span class="truncate">{t}</span> })}
-                                </a>
-                                <button
-                                    class="text-muted-foreground hover:text-foreground transition-colors shrink-0"
-                                    title="Remove parent"
-                                    on:click=move |_| {
-                                        let tk = tk_for_remove.clone();
-                                        leptos::task::spawn_local(async move {
-                                            let _ = update_issue(
-                                                tk,
-                                                number,
-                                                None, None, None, None, None, None, None, None,
-                                                None,
-                                                Some("parent".to_string()),
-                                            ).await;
-                                        });
-                                    }
-                                >
-                                    <Icon icon=phosphor_leptos::X size="12px"/>
-                                </button>
-                            </div>
-                        }.into_any()
-                    } else {
-                        view! {
-                            <button
-                                class="text-sm text-muted-foreground hover:text-foreground transition-colors"
-                                on:click=move |_| set_show_parent_picker.set(true)
-                            >
-                                "Set parent..."
-                            </button>
-                        }.into_any()
-                    }
-                }
-            </div>
-
             // ── Team ──────────────────────────────────────────────────────
             <div>
                 <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Team"</div>
                 <span class="text-sm text-foreground">{team_key.clone()}</span>
             </div>
         </div>
-
-        // ── Parent issue picker modal ────────────────────────────────────
-        <IssuePickerModal
-            show=Signal::derive(move || show_parent_picker.get())
-            on_close=Callback::new(move |()| set_show_parent_picker.set(false))
-            on_select=Callback::new({
-                let tk = issue_team_key.clone();
-                move |selected: IssueWithDetails| {
-                    let parent_id = selected.issue_id.clone();
-                    let tk = tk.clone();
-                    set_show_parent_picker.set(false);
-                    leptos::task::spawn_local(async move {
-                        let _ = update_issue(
-                            tk,
-                            number,
-                            None, None, None, None, None, None, None, None,
-                            Some(parent_id),
-                            None,
-                        ).await;
-                    });
-                }
-            })
-            exclude_ids=Signal::derive({
-                let issue_id = issue_id_for_parent_exclude;
-                move || vec![issue_id.clone()]
-            })
-            title="Set parent issue"
-        />
     }
 }
 
@@ -1556,242 +1392,29 @@ fn DescriptionEditor(
     }
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Issue Picker Modal
+// Relations Section (unified: parent, children, blocks, blocked-by)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Reusable modal for searching and selecting an existing issue.
+/// Unified relations section showing ALL relation types in one list.
 ///
-/// Used by SubIssuesSection ("Link existing") and MetadataSidebar ("Set parent").
-/// Fetches issues via `list_issues(search=...)` and excludes specified IDs
-/// to prevent self-references and cycles.
-#[component]
-fn IssuePickerModal(
-    /// Whether the modal is visible.
-    show: Signal<bool>,
-    /// Called when the modal should close.
-    on_close: Callback<()>,
-    /// Called when an issue is selected.
-    on_select: Callback<IssueWithDetails>,
-    /// Issue IDs to exclude from results (e.g. self + existing children).
-    exclude_ids: Signal<Vec<String>>,
-    /// Title for the modal header.
-    title: &'static str,
-) -> impl IntoView {
-    let (search, set_search) = signal(String::new());
-
-    // Reset search when modal opens
-    Effect::new(move || {
-        if show.get() {
-            set_search.set(String::new());
-        }
-    });
-
-    // Fetch issues matching the search query
-    let search_results = Resource::new(
-        move || search.get(),
-        move |query| async move {
-            let q = if query.trim().is_empty() { None } else { Some(query) };
-            list_issues(None, None, None, None, None, q, Some(20), None).await
-        },
-    );
-
-    view! {
-        <Modal
-            show=show
-            on_close=on_close
-            title=title
-            size=ModalSize::Md
-        >
-            // Search input
-            <div class="mb-3">
-                <SearchInput
-                    value=Signal::derive(move || search.get())
-                    on_input=Callback::new(move |val: String| set_search.set(val))
-                    placeholder="Search issues..."
-                />
-            </div>
-
-            // Results list
-            <div class="max-h-[300px] overflow-y-auto -mx-1">
-                <Suspense fallback=|| view! {
-                    <div class="py-4 text-center text-sm text-muted-foreground">"Searching..."</div>
-                }>
-                    {move || search_results.get().map(|result| {
-                        match result {
-                            Ok(issues) => {
-                                let excluded = exclude_ids.get();
-                                let filtered: Vec<_> = issues
-                                    .into_iter()
-                                    .filter(|i| !excluded.contains(&i.issue_id))
-                                    .collect();
-
-                                if filtered.is_empty() {
-                                    view! {
-                                        <div class="py-4 text-center text-sm text-muted-foreground">
-                                            "No matching issues found."
-                                        </div>
-                                    }.into_any()
-                                } else {
-                                    view! {
-                                        <div class="space-y-0.5">
-                                            {filtered.into_iter().map(|issue| {
-                                                let issue_for_click = issue.clone();
-                                                let status_variant = IssueStatusVariant::parse(&issue.status_category);
-                                                let issue_key = format!("{}-{}", issue.team_key, issue.number);
-                                                let issue_title = issue.title.clone();
-                                                view! {
-                                                    <button
-                                                        class="w-full text-left flex items-center gap-2 px-3 py-2 rounded-md hover:bg-secondary/50 transition-colors"
-                                                        on:click={
-                                                            let issue_for_click = issue_for_click.clone();
-                                                            move |_| {
-                                                                on_select.run(issue_for_click.clone());
-                                                                on_close.run(());
-                                                            }
-                                                        }
-                                                    >
-                                                        <IssueStatusBadge status=status_variant size=14/>
-                                                        <span class="text-xs text-muted-foreground font-mono shrink-0">{issue_key}</span>
-                                                        <span class="text-sm text-foreground truncate">{issue_title}</span>
-                                                    </button>
-                                                }
-                                            }).collect_view()}
-                                        </div>
-                                    }.into_any()
-                                }
-                            }
-                            Err(_) => view! {
-                                <div class="py-4 text-center text-sm text-destructive-foreground">
-                                    "Failed to search issues."
-                                </div>
-                            }.into_any(),
-                        }
-                    })}
-                </Suspense>
-            </div>
-        </Modal>
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Sub-issues Section
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Sub-issues section showing child issues with progress bar.
+/// Consolidates the old Parent sidebar section, SubIssuesSection, and
+/// RelationsSection into a single component. Displays parent, blocked-by,
+/// blocks, and child relations grouped in that order.
 ///
-/// Displays: header with count + progress text, progress bar, compact issue list,
-/// and "Link" / "Add" buttons.
-#[component]
-fn SubIssuesSection(
-    sub_issues: Memo<Vec<IssueWithDetails>>,
-    on_add: Callback<()>,
-    on_link: Callback<()>,
-) -> impl IntoView {
-    // Only render the section if there are sub-issues OR we always show it for the add button.
-    // We show it always so users can discover the "Add sub-issue" action.
-    view! {
-        <div class="mt-6">
-            {move || {
-                let items = sub_issues.get();
-                let total = items.len();
-                let completed = items.iter().filter(|i| {
-                    i.status_category == "completed" || i.status_category == "cancelled"
-                }).count();
-                let percent = if total > 0 { (completed as f64 / total as f64) * 100.0 } else { 0.0 };
-
-                view! {
-                    // ── Header ─────────────────────────────────────────
-                    <div class="flex items-center justify-between mb-2">
-                        <div class="flex items-center gap-2">
-                            <h2 class="text-xs text-muted-foreground font-medium">
-                                {if total > 0 {
-                                    format!("Sub-issues ({})", total)
-                                } else {
-                                    "Sub-issues".to_string()
-                                }}
-                            </h2>
-                            {(total > 0).then(|| view! {
-                                <span class="text-xs text-muted-foreground">
-                                    {format!("{} of {} done", completed, total)}
-                                </span>
-                            })}
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <button
-                                class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
-                                on:click=move |_| on_link.run(())
-                                title="Link existing issue"
-                            >
-                                <Icon icon=phosphor_leptos::LINK size="12px"/>
-                                "Link"
-                            </button>
-                            <button
-                                class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
-                                on:click=move |_| on_add.run(())
-                                title="Add sub-issue"
-                            >
-                                <Icon icon=phosphor_leptos::PLUS size="12px"/>
-                                "Add"
-                            </button>
-                        </div>
-                    </div>
-
-                    // ── Progress bar ──────────────────────────────────
-                    {(total > 0).then(|| view! {
-                        <div class="h-1.5 w-full bg-secondary rounded-full overflow-hidden mb-2">
-                            <div
-                                class="h-full bg-primary rounded-full transition-all duration-300"
-                                style=format!("width: {}%", percent)
-                            />
-                        </div>
-                    })}
-
-                    // ── Sub-issue rows ────────────────────────────────
-                    {(total > 0).then(|| {
-                        let rows = items.into_iter().map(|child| {
-                            let child_status = IssueStatusVariant::parse(&child.status_category);
-                            let child_key = format!("{}-{}", child.team_key, child.number);
-                            let child_href = format!("/issues/{}-{}", child.team_key, child.number);
-                            let child_title = child.title.clone();
-                            let assignee_name = child.assignee_name.clone();
-                            view! {
-                                <div class="flex items-center gap-2 px-3 py-1.5 hover:bg-secondary/50 rounded-md transition-colors">
-                                    <IssueStatusBadge status=child_status size=12/>
-                                    <span class="text-xs text-muted-foreground font-mono shrink-0">{child_key}</span>
-                                    <a href=child_href class="text-sm text-foreground hover:underline truncate flex-1">
-                                        {child_title}
-                                    </a>
-                                    {assignee_name.map(|name| view! {
-                                        <Avatar name=name size=AvatarSize::Sm/>
-                                    })}
-                                </div>
-                            }
-                        }).collect_view();
-                        view! {
-                            <div class="space-y-0.5">
-                                {rows}
-                            </div>
-                        }
-                    })}
-                }
-            }}
-        </div>
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Relations Section
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Relations section showing blocking/blocked-by relationships with other issues.
-///
-/// Displays each relation with a direction indicator, linked issue identifier,
-/// title, and a remove button. Includes an inline form for adding new relations.
+/// Provides:
+/// - "+ Add relation" button that opens a modal with a relation-type selector and issue picker
+/// - "+ New sub-issue" button that opens the NewIssueModal with parent_issue_id set
+/// - Per-row remove button (hover-reveal)
 #[component]
 fn RelationsSection(
     team_key: String,
     number: i32,
+    /// The current issue's ID (used as parent_issue_id when creating sub-issues).
+    issue_id: String,
+    /// The current issue's team_id (used to scope the NewIssueModal team).
+    team_id: String,
 ) -> impl IntoView {
     let issue_identifier = format!("{team_key}-{number}");
     let tk = team_key.clone();
@@ -1801,56 +1424,92 @@ fn RelationsSection(
         move |(tk, num, _)| async move { list_issue_relations(tk, num).await },
     );
 
-    // ── "Add relation" form state ─────────────────────────────────────
-    let (show_add_form, set_show_add_form) = signal(false);
-    let (add_direction, set_add_direction) = signal("blocks".to_string());
-    let (add_identifier, set_add_identifier) = signal(String::new());
-    let (adding, set_adding) = signal(false);
-    let (add_error, set_add_error) = signal(Option::<String>::None);
+    // ── "Add relation" modal state ───────────────────────────────────
+    let (show_add_modal, set_show_add_modal) = signal(false);
+    let (add_relation_type, set_add_relation_type) = signal("child_of".to_string());
+
+    // ── "New sub-issue" modal state ──────────────────────────────────
+    let (show_new_sub_issue, set_show_new_sub_issue) = signal(false);
 
     let stored_issue_identifier = StoredValue::new(issue_identifier);
-    let handle_add = Callback::new(move |()| {
-        let target_id_raw = add_identifier.get_untracked().trim().to_uppercase();
-        if target_id_raw.is_empty() || adding.get_untracked() {
-            return;
-        }
-        set_adding.set(true);
-        set_add_error.set(None);
+    let stored_issue_id = StoredValue::new(issue_id);
+    let stored_team_id = StoredValue::new(team_id);
+    let stored_team_key = StoredValue::new(team_key.clone());
 
-        let direction = add_direction.get_untracked();
+    // Handler for when a relation is added via the picker modal
+    let on_relation_selected = Callback::new(move |selected: IssueWithDetails| {
+        let rel_type = add_relation_type.get_untracked();
         let current = stored_issue_identifier.get_value();
+        let selected_ident = format!("{}-{}", selected.team_key, selected.number);
 
-        // direction == "blocks"  => current blocks target => source=current, target=target, type="blocks"
-        // direction == "blocked_by" => current is blocked by target => source=target, target=current, type="blocks"
-        let (source, target) = if direction == "blocks" {
-            (current, target_id_raw)
-        } else {
-            (target_id_raw, current)
+        // Determine source, target, and relation_type for the API call
+        let (source, target, api_type) = match rel_type.as_str() {
+            "parent" => (selected_ident, current, "parent".to_string()),
+            "child_of" => (current, selected_ident, "parent".to_string()),
+            "blocks" => (current, selected_ident, "blocks".to_string()),
+            "blocked_by" => (selected_ident, current, "blocks".to_string()),
+            _ => return,
         };
 
+        set_show_add_modal.set(false);
         leptos::task::spawn_local(async move {
-            match add_relation(source, target, "blocks".to_string()).await {
+            match add_relation(source, target, api_type).await {
                 Ok(_) => {
-                    set_add_identifier.set(String::new());
-                    set_show_add_form.set(false);
-                    set_adding.set(false);
                     set_version.update(|v| *v += 1);
                 }
                 Err(e) => {
-                    set_add_error.set(Some(format!("{e}")));
-                    set_adding.set(false);
+                    tracing::warn!("Failed to add relation: {e}");
                 }
             }
         });
     });
 
+    // Handler for when a new sub-issue is created
+    let on_sub_issue_created = Callback::new(move |()| {
+        set_show_new_sub_issue.set(false);
+        set_version.update(|v| *v += 1);
+    });
+
+    // Modal title depends on relation type
+    let modal_title = Memo::new(move |_| {
+        match add_relation_type.get().as_str() {
+            "parent" => "Set parent issue".to_string(),
+            "child_of" => "Add child issue".to_string(),
+            "blocks" => "Add issue this blocks".to_string(),
+            "blocked_by" => "Add issue that blocks this".to_string(),
+            _ => "Add relation".to_string(),
+        }
+    });
+
+    // Sort relations into display order: parent, blocked_by, blocks, child_of
+    fn direction_order(direction: &str) -> u8 {
+        match direction {
+            "parent" => 0,
+            "blocked_by" => 1,
+            "blocks" => 2,
+            "child_of" => 3,
+            _ => 4,
+        }
+    }
+
+    fn direction_label(direction: &str) -> &'static str {
+        match direction {
+            "parent" => "Parent",
+            "blocked_by" => "Blocked by",
+            "blocks" => "Blocks",
+            "child_of" => "Child",
+            _ => "Related",
+        }
+    }
+
     view! {
         <div class="mt-6">
             <Suspense fallback=|| ()>
                 {move || {
-                    let relations = relations_resource.get()
+                    let mut relations = relations_resource.get()
                         .and_then(|r| r.ok())
                         .unwrap_or_default();
+                    relations.sort_by_key(|r| direction_order(&r.direction));
                     let total = relations.len();
 
                     view! {
@@ -1863,64 +1522,64 @@ fn RelationsSection(
                                     "Relations".to_string()
                                 }}
                             </h2>
-                            <button
-                                class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
-                                on:click=move |_| {
-                                    set_show_add_form.update(|v| *v = !*v);
-                                    set_add_error.set(None);
-                                }
-                                title="Add relation"
-                            >
-                                <Icon icon=phosphor_leptos::PLUS size="12px"/>
-                                "Add"
-                            </button>
+                            <div class="flex items-center gap-2">
+                                <button
+                                    class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
+                                    on:click=move |_| set_show_add_modal.set(true)
+                                    title="Add relation"
+                                >
+                                    <Icon icon=phosphor_leptos::PLUS size="12px"/>
+                                    "Add relation"
+                                </button>
+                                <button
+                                    class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
+                                    on:click=move |_| set_show_new_sub_issue.set(true)
+                                    title="Create new sub-issue"
+                                >
+                                    <Icon icon=phosphor_leptos::PLUS size="12px"/>
+                                    "New sub-issue"
+                                </button>
+                            </div>
                         </div>
 
                         // ── Relation rows ─────────────────────────────────
-                        {(total > 0).then(|| {
+                        {if total > 0 {
                             let rows = relations.into_iter().map(|rel| {
                                 let rel_id = rel.relation_id.clone();
                                 let rel_key = format!("{}-{}", rel.team_key, rel.number);
                                 let rel_href = format!("/issues/{}-{}", rel.team_key, rel.number);
                                 let rel_title = rel.title.clone();
                                 let direction = rel.direction.clone();
+                                let label = direction_label(&direction);
                                 let status_variant = IssueStatusVariant::parse(&rel.status_category);
 
                                 view! {
                                     <div class="group flex items-center gap-2 px-3 py-1.5 hover:bg-secondary/50 rounded-md transition-colors">
-                                        // Direction label
-                                        {if direction == "blocked_by" {
-                                            view! {
-                                                <span class="text-xs font-medium shrink-0 w-[72px] text-destructive">
-                                                    "Blocked by"
-                                                </span>
-                                            }.into_any()
-                                        } else {
-                                            view! {
-                                                <span class="text-xs font-medium shrink-0 w-[72px] text-success-foreground">
-                                                    "Blocks"
-                                                </span>
-                                            }.into_any()
-                                        }}
+                                        // Type label
+                                        <span class="text-xs text-muted-foreground font-medium shrink-0 w-[90px]">
+                                            {label}
+                                        </span>
                                         // Status icon
                                         <IssueStatusBadge status=status_variant size=12/>
                                         // Issue identifier
-                                        <span class="text-xs text-muted-foreground font-mono shrink-0">{rel_key}</span>
+                                        <a href=rel_href.clone() class="text-xs text-muted-foreground font-mono shrink-0 hover:underline">
+                                            {rel_key}
+                                        </a>
                                         // Title link
                                         <a href=rel_href class="text-sm text-foreground hover:underline truncate flex-1">
                                             {rel_title}
                                         </a>
                                         // Remove button (appears on hover)
                                         <button
-                                            class="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-foreground transition-all shrink-0"
+                                            class="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-foreground transition-all shrink-0 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded"
                                             title="Remove relation"
                                             on:click=move |_| {
                                                 let rid = rel_id.clone();
                                                 leptos::task::spawn_local(async move {
-                                                    if let Err(e) = remove_relation(rid).await {
-                                                        tracing::warn!("Failed to remove relation: {e}");
+                                                    match remove_relation(rid).await {
+                                                        Ok(_) => set_version.update(|v| *v += 1),
+                                                        Err(e) => tracing::warn!("Failed to remove relation: {e}"),
                                                     }
-                                                    set_version.update(|v| *v += 1);
                                                 });
                                             }
                                         >
@@ -1933,54 +1592,145 @@ fn RelationsSection(
                                 <div class="space-y-0.5">
                                     {rows}
                                 </div>
-                            }
-                        })}
-
-                        // ── Add relation inline form ──────────────────────
-                        <Show when=move || show_add_form.get()>
-                            <div class="mt-2 p-3 border border-border rounded-md space-y-2">
-                                <div class="flex items-center gap-2">
-                                    // Direction select
-                                    <select
-                                        class="text-xs bg-background border border-border rounded px-2 py-1.5 text-foreground"
-                                        on:change=move |ev| set_add_direction.set(event_target_value(&ev))
-                                        prop:value=move || add_direction.get()
-                                    >
-                                        <option value="blocks">"Blocks"</option>
-                                        <option value="blocked_by">"Blocked by"</option>
-                                    </select>
-                                    // Identifier input
-                                    <input
-                                        type="text"
-                                        class="flex-1 text-sm bg-background border border-border rounded px-2 py-1 text-foreground placeholder:text-muted-foreground font-mono"
-                                        placeholder="e.g. TRA-12"
-                                        prop:value=move || add_identifier.get()
-                                        on:input=move |ev| set_add_identifier.set(event_target_value(&ev))
-                                        on:keydown=move |ev: web_sys::KeyboardEvent| {
-                                            if ev.key() == "Enter" {
-                                                handle_add.run(());
-                                            } else if ev.key() == "Escape" {
-                                                set_show_add_form.set(false);
-                                            }
-                                        }
-                                    />
-                                    // Submit button
-                                    <Button
-                                        size=ButtonSize::Sm
-                                        disabled=Signal::derive(move || adding.get() || add_identifier.get().trim().is_empty())
-                                        on:click=move |_| handle_add.run(())
-                                    >
-                                        {move || if adding.get() { "Adding..." } else { "Add" }}
-                                    </Button>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <div class="text-sm text-muted-foreground py-2">
+                                    "No relations"
                                 </div>
-                                // Error message
-                                {move || add_error.get().map(|err| view! {
-                                    <p class="text-xs text-destructive">{err}</p>
-                                })}
-                            </div>
-                        </Show>
+                            }.into_any()
+                        }}
                     }
                 }}
+            </Suspense>
+        </div>
+
+        // ── Add relation picker modal ────────────────────────────────────
+        <Modal
+            show=Signal::derive(move || show_add_modal.get())
+            on_close=Callback::new(move |()| set_show_add_modal.set(false))
+            title=modal_title
+            size=ModalSize::Md
+        >
+            // Relation type selector
+            <div class="mb-3">
+                <StyledSelect
+                    value=add_relation_type.get_untracked()
+                    options=vec![
+                        ("child_of", "Child"),
+                        ("parent", "Parent"),
+                        ("blocks", "Blocks"),
+                        ("blocked_by", "Blocked by"),
+                    ]
+                    on_change=move |val| set_add_relation_type.set(val)
+                />
+            </div>
+            // Inline issue picker (search + results)
+            <AddRelationPicker
+                on_select=on_relation_selected
+                exclude_ids=Signal::derive({
+                    let issue_id = stored_issue_id.get_value();
+                    move || vec![issue_id.clone()]
+                })
+            />
+        </Modal>
+
+        // ── New Sub-Issue modal ──────────────────────────────────────────
+        <NewIssueModal
+            show=Signal::derive(move || show_new_sub_issue.get())
+            on_close=Callback::new(move |()| set_show_new_sub_issue.set(false))
+            on_created=on_sub_issue_created
+            team_id=Signal::derive(move || Some(stored_team_id.get_value()))
+            parent_issue_id=Signal::derive(move || Some(stored_issue_id.get_value()))
+            parent_title=Signal::derive(move || {
+                let tk = stored_team_key.get_value();
+                Some(format!("{tk}-{number}"))
+            })
+        />
+    }
+}
+
+/// Inline issue search + results list used inside the Add Relation modal.
+///
+/// Separated into its own component so the search Resource lives inside the
+/// modal lifecycle and resets properly on each open.
+#[component]
+fn AddRelationPicker(
+    on_select: Callback<IssueWithDetails>,
+    exclude_ids: Signal<Vec<String>>,
+) -> impl IntoView {
+    let (search, set_search) = signal(String::new());
+
+    let search_results = Resource::new(
+        move || search.get(),
+        move |query| async move {
+            let q = if query.trim().is_empty() { None } else { Some(query) };
+            list_issues(None, None, None, None, None, q, Some(20), None).await
+        },
+    );
+
+    view! {
+        <div class="mb-3">
+            <SearchInput
+                value=Signal::derive(move || search.get())
+                on_input=Callback::new(move |val: String| set_search.set(val))
+                placeholder="Search issues..."
+            />
+        </div>
+        <div class="max-h-[300px] overflow-y-auto -mx-1">
+            <Suspense fallback=|| view! {
+                <div class="py-4 text-center text-sm text-muted-foreground">"Searching..."</div>
+            }>
+                {move || search_results.get().map(|result| {
+                    match result {
+                        Ok(issues) => {
+                            let excluded = exclude_ids.get();
+                            let filtered: Vec<_> = issues
+                                .into_iter()
+                                .filter(|i| !excluded.contains(&i.issue_id))
+                                .collect();
+
+                            if filtered.is_empty() {
+                                view! {
+                                    <div class="py-4 text-center text-sm text-muted-foreground">
+                                        "No matching issues found."
+                                    </div>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <div class="space-y-0.5">
+                                        {filtered.into_iter().map(|issue| {
+                                            let issue_for_click = issue.clone();
+                                            let status_variant = IssueStatusVariant::parse(&issue.status_category);
+                                            let issue_key = format!("{}-{}", issue.team_key, issue.number);
+                                            let issue_title = issue.title.clone();
+                                            view! {
+                                                <button
+                                                    class="w-full text-left flex items-center gap-2 px-3 py-2 rounded-md hover:bg-secondary/50 transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                                    on:click={
+                                                        let issue_for_click = issue_for_click.clone();
+                                                        move |_| {
+                                                            on_select.run(issue_for_click.clone());
+                                                        }
+                                                    }
+                                                >
+                                                    <IssueStatusBadge status=status_variant size=14/>
+                                                    <span class="text-xs text-muted-foreground font-mono shrink-0">{issue_key}</span>
+                                                    <span class="text-sm text-foreground truncate">{issue_title}</span>
+                                                </button>
+                                            }
+                                        }).collect_view()}
+                                    </div>
+                                }.into_any()
+                            }
+                        }
+                        Err(_) => view! {
+                            <div class="py-4 text-center text-sm text-destructive-foreground">
+                                "Failed to search issues."
+                            </div>
+                        }.into_any(),
+                    }
+                })}
             </Suspense>
         </div>
     }
