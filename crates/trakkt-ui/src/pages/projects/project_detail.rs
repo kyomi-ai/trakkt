@@ -18,16 +18,17 @@ use crate::components::{
     Button, ButtonSize, ButtonVariant, ConfirmDialog, DatePicker, EmptyState,
     IssueStatusBadge, IssueStatusVariant, INPUT_CLASS,
     PriorityIndicator, LabelBadge,
-    StatusBadge,
+    StatusBadge, ToggleButton,
 };
 use crate::server_fns::projects::{
     get_project, get_project_progress, list_milestones,
     create_milestone, update_milestone, delete_milestone,
+    list_project_updates, create_project_update,
 };
 use crate::server_fns::issues::list_issues;
 use crate::utils::date::{format_date, format_short_date};
 use crate::utils::project::{status_label, status_variant};
-use trakkt_types::models::{IssueWithDetails, Project, ProjectMilestone, ProjectProgress};
+use trakkt_types::models::{IssueWithDetails, Project, ProjectMilestone, ProjectProgress, ProjectUpdate};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Project Detail Page
@@ -69,6 +70,11 @@ pub fn ProjectDetailPage() -> impl IntoView {
     let server_milestones = Resource::new(
         move || project_id.get(),
         move |id| async move { list_milestones(id).await },
+    );
+
+    let server_updates = Resource::new(
+        move || project_id.get(),
+        move |id| async move { list_project_updates(id).await },
     );
 
     // Resolve the project from SyncStore or server function.
@@ -164,6 +170,14 @@ pub fn ProjectDetailPage() -> impl IntoView {
                                 }
                                 None => Vec::new(),
                             };
+                            let updates = match server_updates.get() {
+                                Some(Ok(v)) => v,
+                                Some(Err(e)) => {
+                                    leptos::logging::warn!("Failed to load project updates: {e}");
+                                    Vec::new()
+                                }
+                                None => Vec::new(),
+                            };
                             view! {
                                 <ProjectDetailContent
                                     project=project
@@ -171,6 +185,8 @@ pub fn ProjectDetailPage() -> impl IntoView {
                                     progress=progress
                                     milestones=milestones
                                     server_milestones=server_milestones
+                                    updates=updates
+                                    server_updates=server_updates
                                 />
                             }.into_any()
                         }
@@ -210,6 +226,8 @@ fn ProjectDetailContent(
     progress: Option<ProjectProgress>,
     milestones: Vec<ProjectMilestone>,
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
+    updates: Vec<ProjectUpdate>,
+    server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
 ) -> impl IntoView {
 
     let variant = status_variant(&project.status);
@@ -290,6 +308,13 @@ fn ProjectDetailContent(
                 milestones=milestones
                 issues=issues.clone()
                 server_milestones=server_milestones
+            />
+
+            // ── Health Updates ───────────────────────────────────────────
+            <HealthUpdateSection
+                project_id=project.project_id.clone()
+                updates=updates
+                server_updates=server_updates
             />
 
             // ── Divider ───────────────────────────────────────────────────
@@ -490,6 +515,217 @@ fn MilestoneSection(
             on_confirm=on_confirm_delete
             on_cancel=on_cancel_delete
         />
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Health Update Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the CSS class for the health status dot.
+fn health_dot_class(health: &str) -> &'static str {
+    match health {
+        "on_track" => "bg-primary",
+        "at_risk" => "bg-[var(--color-warning-foreground)]",
+        "off_track" => "bg-[var(--color-destructive)]",
+        _ => "bg-muted-foreground",
+    }
+}
+
+/// Returns the human-readable label for a health status value.
+fn health_label(health: &str) -> &'static str {
+    match health {
+        "on_track" => "On Track",
+        "at_risk" => "At Risk",
+        "off_track" => "Off Track",
+        _ => "Unknown",
+    }
+}
+
+/// Health update timeline section — lists project status updates with an
+/// inline form for posting new ones.
+///
+/// Each update card shows a colored health dot, label, formatted date,
+/// and optional body text. Cards are stacked newest-first.
+#[component]
+fn HealthUpdateSection(
+    project_id: String,
+    updates: Vec<ProjectUpdate>,
+    server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
+) -> impl IntoView {
+    let posting_update: RwSignal<bool> = RwSignal::new(false);
+    let post_health: RwSignal<String> = RwSignal::new("on_track".to_string());
+    let post_body: RwSignal<String> = RwSignal::new(String::new());
+
+    let pid = StoredValue::new(project_id.clone());
+    let do_post = move || {
+        let health_val = post_health.get_untracked();
+        let body_val = post_body.get_untracked();
+        let body_param = if body_val.trim().is_empty() {
+            None
+        } else {
+            Some(body_val)
+        };
+
+        let pid_c = pid.get_value();
+        leptos::task::spawn_local(async move {
+            match create_project_update(pid_c, health_val, body_param).await {
+                Ok(_) => {
+                    posting_update.set(false);
+                    post_health.set("on_track".to_string());
+                    post_body.set(String::new());
+                }
+                Err(e) => {
+                    leptos::logging::warn!("Failed to create project update: {e}");
+                }
+            }
+            server_updates.refetch();
+        });
+    };
+
+    let has_updates = !updates.is_empty();
+
+    view! {
+        <div class="mt-6">
+            <h3 class="text-sm font-medium text-foreground mb-3">"Updates"</h3>
+
+            // ── Update cards ──────────────────────────────────────────────
+            {if has_updates {
+                Some(view! {
+                    <div class="flex flex-col gap-2">
+                        {updates.iter().map(|update| {
+                            let dot_class = format!(
+                                "w-2 h-2 rounded-full shrink-0 {}",
+                                health_dot_class(&update.health)
+                            );
+                            let label = health_label(&update.health);
+                            let date = format_date(&update.created_at);
+                            let body = update.body.clone();
+
+                            view! {
+                                <div class="border border-border rounded-md p-3">
+                                    <div class="flex items-center gap-2">
+                                        <span class=dot_class></span>
+                                        <span class="text-sm font-medium text-foreground">{label}</span>
+                                        <span class="text-muted-foreground">{"\u{2014}"}</span>
+                                        <span class="font-mono text-xs text-muted-foreground">{date}</span>
+                                    </div>
+                                    {body.filter(|b| !b.trim().is_empty()).map(|b| {
+                                        view! {
+                                            <p class="text-sm text-foreground mt-1">{b}</p>
+                                        }
+                                    })}
+                                </div>
+                            }
+                        }).collect_view()}
+                    </div>
+                })
+            } else {
+                None
+            }}
+
+            // ── Post update form / button ─────────────────────────────────
+            <Show
+                when=move || posting_update.get()
+                fallback=move || {
+                    view! {
+                        <div class={if has_updates { "mt-2" } else { "" }}>
+                            <Button
+                                variant=ButtonVariant::GhostMuted
+                                size=ButtonSize::Sm
+                                on:click=move |_| posting_update.set(true)
+                            >
+                                <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                                "Post update"
+                            </Button>
+                        </div>
+                    }
+                }
+            >
+                <PostUpdateForm
+                    posting_update=posting_update
+                    post_health=post_health
+                    post_body=post_body
+                    on_post=Callback::new(move |()| do_post())
+                />
+            </Show>
+        </div>
+    }
+}
+
+/// Inline form for posting a new health update — health pill selector,
+/// body textarea, and Post/Cancel action buttons.
+#[component]
+fn PostUpdateForm(
+    posting_update: RwSignal<bool>,
+    post_health: RwSignal<String>,
+    post_body: RwSignal<String>,
+    on_post: Callback<()>,
+) -> impl IntoView {
+    let cancel = move || {
+        posting_update.set(false);
+        post_health.set("on_track".to_string());
+        post_body.set(String::new());
+    };
+
+    view! {
+        <div class="mt-2 border border-border rounded-md p-3">
+            // ── Health selector (pill buttons) ──────────────────────────
+            <div class="flex items-center gap-1 mb-3">
+                {["on_track", "at_risk", "off_track"].into_iter().map(|value| {
+                    let label = health_label(value);
+                    let dot_class = format!(
+                        "w-2 h-2 rounded-full shrink-0 {}",
+                        health_dot_class(value)
+                    );
+                    let value_owned = value.to_string();
+                    let value_for_click = value.to_string();
+
+                    view! {
+                        <ToggleButton
+                            variant=Signal::derive(move || {
+                                if post_health.get() == value_owned {
+                                    ButtonVariant::PillActive
+                                } else {
+                                    ButtonVariant::Pill
+                                }
+                            })
+                            size=ButtonSize::Pill
+                            on:click=move |_| post_health.set(value_for_click.clone())
+                        >
+                            <span class=dot_class.clone()></span>
+                            {label}
+                        </ToggleButton>
+                    }
+                }).collect_view()}
+            </div>
+
+            // ── Body textarea ───────────────────────────────────────────
+            <textarea
+                class=format!("{INPUT_CLASS} !h-auto min-h-[80px] w-full resize-y")
+                placeholder="What\u{2019}s the latest?"
+                prop:value=move || post_body.get()
+                on:input=move |ev| post_body.set(event_target_value(&ev))
+            ></textarea>
+
+            // ── Action buttons ──────────────────────────────────────────
+            <div class="flex items-center gap-2 mt-2">
+                <Button
+                    variant=ButtonVariant::Secondary
+                    size=ButtonSize::Sm
+                    on:click=move |_| on_post.run(())
+                >
+                    "Post"
+                </Button>
+                <Button
+                    variant=ButtonVariant::GhostMuted
+                    size=ButtonSize::Sm
+                    on:click=move |_| cancel()
+                >
+                    "Cancel"
+                </Button>
+            </div>
+        </div>
     }
 }
 
