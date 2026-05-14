@@ -255,14 +255,20 @@ fn IssueDetailContent(
     );
     let refetch_comments = Callback::new(move |()| set_comment_version.update(|v| *v += 1));
 
-    // ── Sub-issues: derived from SyncStore ───────────────────────────
+    // ── Sub-issues: fetched via server function ────────────────────
+    let sub_issue_issue_id = initial.get_untracked().issue_id.clone();
+    let (sub_issue_version, set_sub_issue_version) = signal(0u32);
+    let sub_issues_resource = Resource::new(
+        move || (sub_issue_issue_id.clone(), sub_issue_version.get()),
+        move |(pid, _)| async move {
+            crate::server_fns::issues::list_sub_issues(pid).await
+        },
+    );
     let sub_issues = Memo::new(move |_| {
-        let Some(store) = sync_store else { return vec![] };
-        let i = issue.get();
-        store.issues().get()
-            .into_iter()
-            .filter(|child| child.parent_issue_id.as_deref() == Some(i.issue_id.as_str()))
-            .collect::<Vec<_>>()
+        sub_issues_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
     });
 
     // ── New sub-issue modal state ─────────────────────────────────────
@@ -272,6 +278,7 @@ fn IssueDetailContent(
     let on_sub_issue_created = {
         Callback::new(move |()| {
             set_show_new_sub_issue.set(false);
+            set_sub_issue_version.update(|v| *v += 1);
         })
     };
 
@@ -284,7 +291,7 @@ fn IssueDetailContent(
 
     // ── Fine-grained memos: only re-render when the specific field changes ──
     let title = Memo::new(move |_| issue.get().title.clone());
-    let parent_issue_id = Memo::new(move |_| issue.get().parent_issue_id.clone());
+    let parent_identifier = Memo::new(move |_| issue.get().parent_identifier.clone());
     let timestamps = Memo::new(move |_| {
         let i = issue.get();
         (i.created_at.clone(), i.updated_at.clone())
@@ -295,7 +302,7 @@ fn IssueDetailContent(
         let i = issue.get();
         (i.status_id.clone(), i.status_category.clone(), i.priority,
          i.assignee_id.clone(), i.assignee_name.clone(),
-         i.due_date.clone(), i.parent_issue_id.clone(),
+         i.due_date.clone(), i.parent_identifier.clone(), i.parent_title.clone(),
          i.labels.clone(),
          i.project_id.clone(), i.project_name.clone(), i.milestone_id.clone())
     });
@@ -306,16 +313,21 @@ fn IssueDetailContent(
             <div class="flex-1 min-w-0">
                 // ── Parent breadcrumb ─────────────────────────────────
                 {move || {
-                    let pid = parent_issue_id.get()?;
-                    let store = sync_store?;
-                    let parent = store.issues().get().into_iter().find(|p| p.issue_id == pid)?;
+                    let pid = parent_identifier.get()?;
+                    let ptitle = issue.get().parent_title.clone();
+                    let href = format!("/issues/{pid}");
+                    let label = if let Some(t) = ptitle {
+                        format!("{pid} {t}")
+                    } else {
+                        pid
+                    };
                     Some(view! {
                         <a
-                            href=format!("/issues/{}-{}", parent.team_key, parent.number)
+                            href=href
                             class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1 mb-1"
                         >
                             <Icon icon=phosphor_leptos::ARROW_BEND_UP_LEFT size="12px"/>
-                            {format!("{}-{} {}", parent.team_key, parent.number, parent.title)}
+                            {label}
                         </a>
                     })
                 }}
@@ -423,6 +435,7 @@ fn IssueDetailContent(
                             Some(parent_id),
                             None,
                         ).await;
+                        set_sub_issue_version.update(|v| *v += 1);
                     });
                 }
             })
@@ -558,7 +571,8 @@ fn MetadataSidebar(
     // ── Parent issue state ─────────────────────────────────────────────
     let (show_parent_picker, set_show_parent_picker) = signal(false);
     let issue_id_for_parent_exclude = issue.issue_id.clone();
-    let parent_issue_id = issue.parent_issue_id.clone();
+    let parent_identifier = issue.parent_identifier.clone();
+    let parent_title = issue.parent_title.clone();
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
     // Fetch statuses dynamically for the status dropdown.
@@ -1053,46 +1067,39 @@ fn MetadataSidebar(
             <div>
                 <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Parent"</div>
                 {
-                    let parent_id = parent_issue_id.clone();
-                    if let Some(ref pid) = parent_id {
-                        let parent = sync_store.and_then(|store| {
-                            store.issues().get().into_iter().find(|i| i.issue_id == *pid)
-                        });
-                        if let Some(p) = parent {
-                            let parent_key = format!("{}-{}", p.team_key, p.number);
-                            let parent_href = format!("/issues/{}-{}", p.team_key, p.number);
-                            let parent_title = p.title.clone();
-                            let tk_for_remove = issue_team_key.clone();
-                            view! {
-                                <div class="flex items-center gap-1.5 min-w-0">
-                                    <a href=parent_href class="text-sm text-foreground hover:underline truncate flex items-center gap-1">
-                                        <span class="font-mono text-xs text-muted-foreground">{parent_key}</span>
-                                        {parent_title}
-                                    </a>
-                                    <button
-                                        class="text-muted-foreground hover:text-foreground transition-colors shrink-0"
-                                        title="Remove parent"
-                                        on:click=move |_| {
-                                            let tk = tk_for_remove.clone();
-                                            leptos::task::spawn_local(async move {
-                                                let _ = update_issue(
-                                                    tk,
-                                                    number,
-                                                    None, None, None, None, None, None, None, None,
-                                                    None,
-                                                    Some("parent".to_string()),
-                                                ).await;
-                                            });
-                                        }
-                                    >
-                                        <Icon icon=phosphor_leptos::X size="12px"/>
-                                    </button>
-                                </div>
-                            }.into_any()
-                        } else {
-                            // Parent exists but not in SyncStore (e.g. different team not loaded yet)
-                            view! { <span class="text-sm text-muted-foreground italic">"Unknown"</span> }.into_any()
-                        }
+                    let pid = parent_identifier.clone();
+                    let ptitle = parent_title.clone();
+                    if let Some(ref parent_key) = pid {
+                        let parent_href = format!("/issues/{parent_key}");
+                        let parent_key_display = parent_key.clone();
+                        let ptitle_display = ptitle.clone();
+                        let tk_for_remove = issue_team_key.clone();
+                        view! {
+                            <div class="flex items-center gap-1.5 min-w-0">
+                                <a href=parent_href class="text-sm text-foreground hover:underline truncate flex items-center gap-1">
+                                    <span class="font-mono text-xs text-muted-foreground">{parent_key_display}</span>
+                                    {ptitle_display.map(|t| view! { <span class="truncate">{t}</span> })}
+                                </a>
+                                <button
+                                    class="text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                                    title="Remove parent"
+                                    on:click=move |_| {
+                                        let tk = tk_for_remove.clone();
+                                        leptos::task::spawn_local(async move {
+                                            let _ = update_issue(
+                                                tk,
+                                                number,
+                                                None, None, None, None, None, None, None, None,
+                                                None,
+                                                Some("parent".to_string()),
+                                            ).await;
+                                        });
+                                    }
+                                >
+                                    <Icon icon=phosphor_leptos::X size="12px"/>
+                                </button>
+                            </div>
+                        }.into_any()
                     } else {
                         view! {
                             <button
