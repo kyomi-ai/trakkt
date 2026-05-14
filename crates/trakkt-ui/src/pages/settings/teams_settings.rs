@@ -11,8 +11,9 @@ use leptos::prelude::*;
 use crate::components::{
     Alert, AlertDescription, AlertVariant, Badge, BadgeVariant, Button, ButtonSize, ButtonVariant,
     Card, CardContent, CardDescription, CardHeader, CardTitle, ConfirmDialog, EmptyState, Skeleton,
-    INPUT_CLASS,
+    TeamIcon, TeamIconPicker, INPUT_CLASS,
 };
+use crate::components::popover::{Placement, Popover};
 use crate::server_fns::teams::*;
 use trakkt_types::models::Team;
 
@@ -212,8 +213,15 @@ pub fn TeamsSettingsPage() -> impl IntoView {
                                             let can_delete = team_count > 1;
                                             let team_for_delete = team.clone();
                                             let team_for_default = team.clone();
+                                            let team_for_icon = team.clone();
                                             view! {
                                                 <div class="flex items-center gap-3 py-2.5 px-1 border-b border-border last:border-b-0 hover:bg-muted/50 transition-colors rounded-sm">
+                                                    <TeamIconTrigger
+                                                        team=team_for_icon
+                                                        on_saved=Callback::new(move |()| {
+                                                            set_version.update(|v| *v += 1);
+                                                        })
+                                                    />
                                                     <span class="font-mono text-xs bg-muted px-2 py-0.5 rounded text-foreground flex-shrink-0">
                                                         {team.key.clone()}
                                                     </span>
@@ -366,5 +374,76 @@ pub fn TeamsSettingsPage() -> impl IntoView {
                 on_cancel=on_cancel_delete
             />
         </div>
+    }
+}
+
+// ─── Team icon trigger + popover ─────────────────────────────────────────
+
+/// Clickable team icon that opens a popover with the `TeamIconPicker`.
+///
+/// Self-contained: manages its own open state, trigger ref, and server
+/// function calls. Fires `on_saved` after the server confirms the change
+/// so the parent can refresh the team list.
+#[component]
+fn TeamIconTrigger(
+    team: Team,
+    on_saved: Callback<()>,
+) -> impl IntoView {
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+    let picker_open = RwSignal::new(false);
+
+    let team_for_picker = StoredValue::new(team.clone());
+    let team_id = team.team_id.clone();
+
+    let on_change = {
+        let team_id = team_id.clone();
+        Callback::new(move |(icon_type, icon_name, icon_color): (Option<String>, Option<String>, Option<String>)| {
+            let team_id = team_id.clone();
+            let on_saved = on_saved;
+            let is_clear = icon_type.is_none();
+            leptos::task::spawn_local(async move {
+                let result = if is_clear {
+                    clear_team_icon(team_id).await
+                } else {
+                    update_team_icon(team_id, icon_type, icon_name, icon_color).await
+                };
+                match result {
+                    Ok(_) => on_saved.run(()),
+                    Err(e) => tracing::warn!("Failed to update team icon: {e}"),
+                }
+            });
+        })
+    };
+
+    let on_close = Callback::new(move |()| {
+        picker_open.set(false);
+    });
+
+    view! {
+        <div
+            node_ref=trigger_ref
+            class="cursor-pointer flex-shrink-0 transition-opacity duration-200 hover:opacity-80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-md"
+            role="button"
+            tabindex="0"
+            aria-label="Change team icon"
+            on:click=move |_| picker_open.update(|v| *v = !*v)
+            on:keydown=move |e: web_sys::KeyboardEvent| {
+                if e.key() == "Enter" || e.key() == " " {
+                    e.prevent_default();
+                    picker_open.update(|v| *v = !*v);
+                }
+            }
+        >
+            <TeamIcon team=team.clone() size="28px"/>
+        </div>
+        <Popover
+            trigger_ref=trigger_ref
+            open=Signal::from(picker_open)
+            on_close=on_close
+            placement=Placement::BOTTOM_START
+            class="bg-card border border-border rounded-lg shadow-lg p-4 w-[300px]"
+        >
+            <TeamIconPicker team=team_for_picker.get_value() on_change=on_change/>
+        </Popover>
     }
 }

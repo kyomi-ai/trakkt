@@ -13,7 +13,7 @@ use phosphor_leptos::{Icon, IconWeight};
 use std::sync::Arc;
 
 use crate::cache::store::SyncStore;
-use crate::components::{Button, CommandPalette, ConfirmDialog, Modal, ModalSize, SearchInput, Spinner, INPUT_CLASS};
+use crate::components::{Button, CommandPalette, ConfirmDialog, Modal, ModalSize, SearchInput, Spinner, TeamIcon, INPUT_CLASS};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
 
@@ -432,13 +432,9 @@ fn SidebarTeamsSection() -> impl IntoView {
 
                 <div class="space-y-0.5">
                     {teams.into_iter().map(|team| {
-                        let key_lower = team.key.to_lowercase();
-                        let name = team.name.clone();
-                        let team_id = team.team_id.clone();
-                        let team_key = team.key.clone();
-                        let issues_href = format!("/teams/{key_lower}/issues");
+                        let issues_href = format!("/teams/{}/issues", team.key.to_lowercase());
                         view! {
-                            <SidebarTeamSubNav team_id=team_id name=name team_key=team_key issues_href=issues_href/>
+                            <SidebarTeamSubNav team=team issues_href=issues_href/>
                         }
                     }).collect_view()}
                 </div>
@@ -887,11 +883,13 @@ fn SidebarCreateOrJoinTeam(on_done: Callback<()>) -> impl IntoView {
 /// the dots menu to open a context menu with "Settings" and "Leave team".
 #[component]
 fn SidebarTeamSubNav(
-    team_id: String,
-    name: String,
-    team_key: String,
+    team: trakkt_types::models::Team,
     issues_href: String,
 ) -> impl IntoView {
+    let team_id = team.team_id.clone();
+    let name = team.name.clone();
+    let team_key = team.key.clone();
+
     let path = leptos_router::hooks::use_location().pathname;
 
     let issues_href_match = issues_href.clone();
@@ -976,7 +974,7 @@ fn SidebarTeamSubNav(
                     }
                 >
                     <Icon icon=phosphor_leptos::CARET_DOWN weight=IconWeight::Bold size="12px" attr:class=chevron_class/>
-                    <Icon icon=phosphor_leptos::USERS_THREE weight=IconWeight::Light size="16px"/>
+                    <TeamIcon team=team size="16px"/>
                     <span class="flex-1 truncate">{display_name}</span>
                 </button>
                 // Right zone: actions (hover-reveal)

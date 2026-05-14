@@ -181,6 +181,46 @@ pub async fn set_workspace_default_team(team_id: String) -> Result<(), ServerFnE
     Ok(())
 }
 
+/// Update a team's icon to a preset icon (or clear it by passing all None).
+#[server(prefix = "/leptos-api")]
+pub async fn update_team_icon(
+    team_id: String,
+    icon_type: Option<String>,
+    icon_name: Option<String>,
+    icon_color: Option<String>,
+) -> Result<Team, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let team = trakkt_auth::team_service::update_team_icon(
+        ac.db(),
+        &team_id,
+        &ac.ws_id,
+        icon_type.as_deref(),
+        icon_name.as_deref(),
+        icon_color.as_deref(),
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(team)
+}
+
+/// Clear a team's icon entirely (removes both preset and custom icons).
+#[server(prefix = "/leptos-api")]
+pub async fn clear_team_icon(
+    team_id: String,
+) -> Result<Team, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let team = trakkt_auth::team_service::delete_team_icon(
+        ac.db(),
+        &team_id,
+        &ac.ws_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(team)
+}
+
 /// Create a new issue-tracker team in the current workspace.
 #[server(prefix = "/leptos-api")]
 pub async fn create_team(

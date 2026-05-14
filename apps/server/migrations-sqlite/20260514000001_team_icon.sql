@@ -1,0 +1,5 @@
+ALTER TABLE teams ADD COLUMN icon_type TEXT;
+ALTER TABLE teams ADD COLUMN icon_name TEXT;
+ALTER TABLE teams ADD COLUMN icon_color TEXT;
+ALTER TABLE teams ADD COLUMN icon_data BLOB;
+ALTER TABLE teams ADD COLUMN icon_mime TEXT;
