@@ -1481,23 +1481,25 @@ fn RelationsSection(
         }
     });
 
-    // Sort relations into display order: parent, blocked_by, blocks, child_of
+    // Sort relations into display order: Parent, Blocked by, Blocks, Child
+    // Note: `direction` describes the CURRENT issue's role, but labels describe
+    // the OTHER issue. "parent" means current IS the parent → other is "Child".
     fn direction_order(direction: &str) -> u8 {
         match direction {
-            "parent" => 0,
+            "child_of" => 0,
             "blocked_by" => 1,
             "blocks" => 2,
-            "child_of" => 3,
+            "parent" => 3,
             _ => 4,
         }
     }
 
     fn direction_label(direction: &str) -> &'static str {
         match direction {
-            "parent" => "Parent",
+            "child_of" => "Parent",
             "blocked_by" => "Blocked by",
             "blocks" => "Blocks",
-            "child_of" => "Child",
+            "parent" => "Child",
             _ => "Related",
         }
     }
