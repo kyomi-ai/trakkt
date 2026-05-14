@@ -40,7 +40,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use trakkt_auth::{comment_service, issue_service, label_service, project_service, relation_service, status_service, team_service};
-use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate};
 
 use crate::state::AppState;
 
@@ -414,579 +413,367 @@ fn handle_initialize(id: Option<Value>, _params: Option<Value>) -> JsonRpcRespon
 }
 
 fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
-    JsonRpcResponse::success(id, json!({
-        "tools": [
-            {
-                "name": "list_issues",
-                "description": "List issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "team_id": {
-                            "type": "string",
-                            "description": "Filter by team ID. Use list_issues without this filter first to discover team_id values from the results."
-                        },
-                        "team_key": {
-                            "type": "string",
-                            "description": "Filter by team key (e.g. 'TRA'). Alternative to team_id — resolved server-side. team_id takes precedence if both are provided."
-                        },
-                        "status_id": {
-                            "type": "string",
-                            "description": "Filter by status ID (e.g. 'workspace-id::backlog'). Use list_statuses to get valid IDs."
-                        },
-                        "status_category": {
-                            "type": "string",
-                            "description": "Comma-separated status categories to include: backlog, unstarted, started, completed, cancelled. Example: 'backlog,unstarted' returns issues in either category."
-                        },
-                        "include_closed": {
-                            "type": "boolean",
-                            "description": "If true, include completed and cancelled issues. Default is false — these are excluded unless status_id or status_category is set."
-                        },
-                        "priority": {
-                            "type": "integer",
-                            "description": "Filter by priority: 0=none, 1=urgent, 2=high, 3=medium, 4=low",
-                            "enum": [0, 1, 2, 3, 4]
-                        },
-                        "assignee": {
-                            "type": "string",
-                            "description": "Filter by assignee user ID"
-                        },
-                        "label": {
-                            "type": "string",
-                            "description": "Filter by label ID(s). Comma-separated for multiple (OR logic) — returns issues with any of the specified labels."
-                        },
-                        "search": {
-                            "type": "string",
-                            "description": "Search text to match against issue titles"
-                        },
-                        "include_archived": {
-                            "type": "boolean",
-                            "description": "If true, include archived issues (issues auto-archived after being in completed/cancelled state past the team's archive threshold). Default is false."
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of issues to return (default: 50, max: 100)",
-                            "minimum": 1,
-                            "maximum": 100
-                        }
-                    }
+    // Build the tool list from two sources:
+    // 1. Registry-driven tools (issues) — generated from shared API operation metadata.
+    // 2. Hand-written tools (comments, labels, teams, etc.) — not yet migrated.
+    let mut tools = Vec::new();
+
+    // Registry-driven tools (issues)
+    for op in crate::api::all_operations() {
+        let schema = (op.json_schema)();
+        let schema_value = match serde_json::to_value(&schema) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(tool = %op.name, error = %e, "failed to serialize tool schema");
+                continue;
+            }
+        };
+        tools.push(json!({
+            "name": op.name,
+            "description": op.description,
+            "inputSchema": schema_value,
+        }));
+    }
+
+    // Hand-written tools (not yet migrated)
+    tools.push(json!({
+        "name": "add_comment",
+        "description": "Add a comment to an issue. Comments support markdown formatting.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "issue_identifier": {
+                    "type": "string",
+                    "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
+                },
+                "team_key": {
+                    "type": "string",
+                    "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
+                },
+                "issue_number": {
+                    "type": "integer",
+                    "description": "Issue number within the team. Required if issue_identifier is not provided."
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Markdown body of the comment"
                 }
             },
-            {
-                "name": "get_issue",
-                "description": "Get a single issue by its team-scoped identifier (e.g. 'TRA-35'), including full details (description, labels, assignee, creator) and all comments.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "issue_identifier": {
-                            "type": "string",
-                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
-                        },
-                        "team_key": {
-                            "type": "string",
-                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
-                        },
-                        "issue_number": {
-                            "type": "integer",
-                            "description": "Issue number within the team. Required if issue_identifier is not provided."
-                        }
-                    }
+            "required": ["body"]
+        }
+    }));
+    tools.push(json!({
+        "name": "list_labels",
+        "description": "List all labels in the workspace, ordered alphabetically by name.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    }));
+    tools.push(json!({
+        "name": "create_label",
+        "description": "Create a new label in the workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Label name (must be unique within the workspace)"
+                },
+                "color": {
+                    "type": "string",
+                    "description": "Hex color code (e.g. '#FF5733' or 'FF5733')"
                 }
             },
-            {
-                "name": "create_issue",
-                "description": "Create a new issue in the workspace. Specify team_id or team_key to assign to a specific team, otherwise uses the default team. Starts in 'backlog' status.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "title": {
-                            "type": "string",
-                            "description": "Issue title (required)"
-                        },
-                        "team_id": {
-                            "type": "string",
-                            "description": "Team ID to assign the issue to. If omitted, uses the default team."
-                        },
-                        "team_key": {
-                            "type": "string",
-                            "description": "Team key (e.g. 'TRA') as alternative to team_id. Resolved server-side. team_id takes precedence if both are provided."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Markdown description of the issue"
-                        },
-                        "priority": {
-                            "type": "integer",
-                            "description": "Priority level: 0=none (default), 1=urgent, 2=high, 3=medium, 4=low",
-                            "enum": [0, 1, 2, 3, 4]
-                        },
-                        "labels": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Array of label IDs to attach to the issue"
-                        },
-                        "assignee": {
-                            "type": "string",
-                            "description": "User ID to assign the issue to"
-                        },
-                        "due_date": {
-                            "type": "string",
-                            "description": "Due date in ISO 8601 format (YYYY-MM-DD)"
-                        }
-                    },
-                    "required": ["title"]
-                }
-            },
-            {
-                "name": "update_issue",
-                "description": "Update an existing issue. Only provided fields are changed; omitted fields remain unchanged. Set a field to null to clear it.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "issue_identifier": {
-                            "type": "string",
-                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
-                        },
-                        "team_key": {
-                            "type": "string",
-                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided. Also used as the target team when moving an issue (use move_to_team_id or move_to_team_key instead)."
-                        },
-                        "issue_number": {
-                            "type": "integer",
-                            "description": "Issue number within the team. Required if issue_identifier is not provided."
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "New title for the issue"
-                        },
-                        "description": {
-                            "type": ["string", "null"],
-                            "description": "New markdown description, or null to clear"
-                        },
-                        "status_id": {
-                            "type": "string",
-                            "description": "New status ID. Use list_statuses to get valid IDs."
-                        },
-                        "priority": {
-                            "type": "integer",
-                            "description": "New priority: 0=none, 1=urgent, 2=high, 3=medium, 4=low",
-                            "enum": [0, 1, 2, 3, 4]
-                        },
-                        "assignee": {
-                            "type": ["string", "null"],
-                            "description": "User ID to assign, or null to unassign"
-                        },
-                        "labels": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Replace all labels with this list of label IDs"
-                        },
-                        "due_date": {
-                            "type": ["string", "null"],
-                            "description": "Due date in ISO 8601 format, or null to clear"
-                        },
-                        "move_to_team_id": {
-                            "type": "string",
-                            "description": "Team ID to move the issue to (reassigns team and renumbers)"
-                        },
-                        "move_to_team_key": {
-                            "type": "string",
-                            "description": "Team key to move the issue to (e.g. 'ENG'). Alternative to move_to_team_id."
-                        }
-                    }
-                }
-            },
-            {
-                "name": "add_comment",
-                "description": "Add a comment to an issue. Comments support markdown formatting.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "issue_identifier": {
-                            "type": "string",
-                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
-                        },
-                        "team_key": {
-                            "type": "string",
-                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
-                        },
-                        "issue_number": {
-                            "type": "integer",
-                            "description": "Issue number within the team. Required if issue_identifier is not provided."
-                        },
-                        "body": {
-                            "type": "string",
-                            "description": "Markdown body of the comment"
-                        }
-                    },
-                    "required": ["body"]
-                }
-            },
-            {
-                "name": "list_labels",
-                "description": "List all labels in the workspace, ordered alphabetically by name.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "create_label",
-                "description": "Create a new label in the workspace.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Label name (must be unique within the workspace)"
-                        },
-                        "color": {
-                            "type": "string",
-                            "description": "Hex color code (e.g. '#FF5733' or 'FF5733')"
-                        }
-                    },
-                    "required": ["name", "color"]
-                }
-            },
-            {
-                "name": "delete_issue",
-                "description": "Delete an issue by its team-scoped identifier (e.g. 'TRA-35'). This permanently removes the issue and all associated comments and labels.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "issue_identifier": {
-                            "type": "string",
-                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
-                        },
-                        "team_key": {
-                            "type": "string",
-                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
-                        },
-                        "issue_number": {
-                            "type": "integer",
-                            "description": "Issue number within the team. Required if issue_identifier is not provided."
-                        }
-                    }
-                }
-            },
-            {
-                "name": "search_issues",
-                "description": "Search for issues by text query. Matches against issue titles. Returns results ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search text to match against issue titles"
-                        },
-                        "team_key": {
-                            "type": "string",
-                            "description": "Optional team key (e.g. 'TRA') to scope search to a specific team."
-                        },
-                        "include_closed": {
-                            "type": "boolean",
-                            "description": "If true, include completed and cancelled issues in results. Default is false."
-                        },
-                        "include_archived": {
-                            "type": "boolean",
-                            "description": "If true, include archived issues (issues auto-archived after being in completed/cancelled state past the team's archive threshold). Default is false."
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return (default: 20, max: 100)",
-                            "minimum": 1,
-                            "maximum": 100
-                        }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "list_statuses",
-                "description": "List all statuses in the workspace, grouped by category (backlog, unstarted, started, completed, cancelled). Returns both global and optionally team-specific statuses.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "team_id": {
-                            "type": "string",
-                            "description": "Optional team ID to include team-specific statuses"
-                        },
-                        "team_key": {
-                            "type": "string",
-                            "description": "Optional team key (e.g. 'TRA') as alternative to team_id. team_id takes precedence if both are provided."
-                        }
-                    }
-                }
-            },
-            {
-                "name": "list_teams",
-                "description": "List teams the authenticated user belongs to, ordered alphabetically by name.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "add_relation",
-                "description": "Add a relation between two issues. Supports 'blocks' (source blocks target) and 'parent' (source is parent of target) relation types.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "source_issue": {
-                            "type": "string",
-                            "description": "Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue."
-                        },
-                        "target_issue": {
-                            "type": "string",
-                            "description": "Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue."
-                        },
-                        "relation_type": {
-                            "type": "string",
-                            "description": "Relation type: 'blocks' or 'parent'.",
-                            "enum": ["blocks", "parent"]
-                        }
-                    },
-                    "required": ["source_issue", "target_issue", "relation_type"]
-                }
-            },
-            {
-                "name": "remove_relation",
-                "description": "Remove a relation between two issues by its relation ID.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "relation_id": {
-                            "type": "string",
-                            "description": "The relation ID to remove"
-                        }
-                    },
-                    "required": ["relation_id"]
-                }
-            },
-            {
-                "name": "list_issue_relations",
-                "description": "List all relations for an issue (both directions — blocks and blocked-by).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "issue_identifier": {
-                            "type": "string",
-                            "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
-                        },
-                        "team_key": {
-                            "type": "string",
-                            "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
-                        },
-                        "issue_number": {
-                            "type": "integer",
-                            "description": "Issue number within the team. Required if issue_identifier is not provided."
-                        }
-                    }
-                }
-            },
-            // ─── Project / Milestone tools ─────────────────────────
-            {
-                "name": "list_projects",
-                "description": "List all projects in the workspace.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "get_project",
-                "description": "Get a single project by its ID, including milestones.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {
-                            "type": "string",
-                            "description": "The project ID"
-                        }
-                    },
-                    "required": ["project_id"]
-                }
-            },
-            {
-                "name": "create_project",
-                "description": "Create a new project in the workspace.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Project name (required)"
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Markdown description of the project"
-                        },
-                        "icon": {
-                            "type": "string",
-                            "description": "Icon identifier for the project"
-                        },
-                        "color": {
-                            "type": "string",
-                            "description": "Hex color code (e.g. '#0D9488')"
-                        },
-                        "lead_id": {
-                            "type": "string",
-                            "description": "User ID to set as project lead"
-                        },
-                        "start_date": {
-                            "type": "string",
-                            "description": "Start date in ISO 8601 format (YYYY-MM-DD)"
-                        },
-                        "target_date": {
-                            "type": "string",
-                            "description": "Target completion date in ISO 8601 format (YYYY-MM-DD)"
-                        }
-                    },
-                    "required": ["name"]
-                }
-            },
-            {
-                "name": "update_project",
-                "description": "Update fields on an existing project. Only provided fields are changed.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {
-                            "type": "string",
-                            "description": "The project ID (required)"
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "New project name"
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "New markdown description"
-                        },
-                        "icon": {
-                            "type": "string",
-                            "description": "New icon identifier"
-                        },
-                        "color": {
-                            "type": "string",
-                            "description": "New hex color code"
-                        },
-                        "status": {
-                            "type": "string",
-                            "description": "New project status (e.g. 'planned', 'in_progress', 'paused', 'completed', 'cancelled')"
-                        },
-                        "lead_id": {
-                            "type": ["string", "null"],
-                            "description": "User ID to set as project lead, or null to clear"
-                        },
-                        "start_date": {
-                            "type": ["string", "null"],
-                            "description": "Start date in ISO 8601 format, or null to clear"
-                        },
-                        "target_date": {
-                            "type": ["string", "null"],
-                            "description": "Target date in ISO 8601 format, or null to clear"
-                        }
-                    },
-                    "required": ["project_id"]
-                }
-            },
-            {
-                "name": "delete_project",
-                "description": "Permanently delete a project and its milestones.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {
-                            "type": "string",
-                            "description": "The project ID to delete"
-                        }
-                    },
-                    "required": ["project_id"]
-                }
-            },
-            {
-                "name": "list_milestones",
-                "description": "List all milestones in a project.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {
-                            "type": "string",
-                            "description": "The project ID to list milestones for"
-                        }
-                    },
-                    "required": ["project_id"]
-                }
-            },
-            {
-                "name": "create_milestone",
-                "description": "Create a new milestone in a project.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {
-                            "type": "string",
-                            "description": "The project ID to create the milestone in"
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Milestone name (required)"
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Markdown description of the milestone"
-                        },
-                        "target_date": {
-                            "type": "string",
-                            "description": "Target date in ISO 8601 format (YYYY-MM-DD)"
-                        }
-                    },
-                    "required": ["project_id", "name"]
-                }
-            },
-            {
-                "name": "update_milestone",
-                "description": "Update fields on an existing milestone.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "milestone_id": {
-                            "type": "string",
-                            "description": "The milestone ID (required)"
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "New milestone name"
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "New markdown description"
-                        },
-                        "target_date": {
-                            "type": ["string", "null"],
-                            "description": "Target date in ISO 8601 format, or null to clear"
-                        }
-                    },
-                    "required": ["milestone_id"]
-                }
-            },
-            {
-                "name": "delete_milestone",
-                "description": "Delete a milestone. Issues linked to this milestone will be unlinked.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "milestone_id": {
-                            "type": "string",
-                            "description": "The milestone ID to delete"
-                        }
-                    },
-                    "required": ["milestone_id"]
+            "required": ["name", "color"]
+        }
+    }));
+    tools.push(json!({
+        "name": "list_statuses",
+        "description": "List all statuses in the workspace, grouped by category (backlog, unstarted, started, completed, cancelled). Returns both global and optionally team-specific statuses.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "team_id": {
+                    "type": "string",
+                    "description": "Optional team ID to include team-specific statuses"
+                },
+                "team_key": {
+                    "type": "string",
+                    "description": "Optional team key (e.g. 'TRA') as alternative to team_id. team_id takes precedence if both are provided."
                 }
             }
-        ]
-    }))
+        }
+    }));
+    tools.push(json!({
+        "name": "list_teams",
+        "description": "List teams the authenticated user belongs to, ordered alphabetically by name.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    }));
+    tools.push(json!({
+        "name": "add_relation",
+        "description": "Add a relation between two issues. Supports 'blocks' (source blocks target) and 'parent' (source is parent of target) relation types.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_issue": {
+                    "type": "string",
+                    "description": "Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue."
+                },
+                "target_issue": {
+                    "type": "string",
+                    "description": "Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue."
+                },
+                "relation_type": {
+                    "type": "string",
+                    "description": "Relation type: 'blocks' or 'parent'.",
+                    "enum": ["blocks", "parent"]
+                }
+            },
+            "required": ["source_issue", "target_issue", "relation_type"]
+        }
+    }));
+    tools.push(json!({
+        "name": "remove_relation",
+        "description": "Remove a relation between two issues by its relation ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "relation_id": {
+                    "type": "string",
+                    "description": "The relation ID to remove"
+                }
+            },
+            "required": ["relation_id"]
+        }
+    }));
+    tools.push(json!({
+        "name": "list_issue_relations",
+        "description": "List all relations for an issue (both directions — blocks and blocked-by).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "issue_identifier": {
+                    "type": "string",
+                    "description": "Issue identifier in 'TRA-35' format (team key + number). Preferred over separate team_key/issue_number."
+                },
+                "team_key": {
+                    "type": "string",
+                    "description": "Team key (e.g. 'TRA'). Required if issue_identifier is not provided."
+                },
+                "issue_number": {
+                    "type": "integer",
+                    "description": "Issue number within the team. Required if issue_identifier is not provided."
+                }
+            }
+        }
+    }));
+    // ─── Project / Milestone tools ─────────────────────────
+    tools.push(json!({
+        "name": "list_projects",
+        "description": "List all projects in the workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    }));
+    tools.push(json!({
+        "name": "get_project",
+        "description": "Get a single project by its ID, including milestones.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "The project ID"
+                }
+            },
+            "required": ["project_id"]
+        }
+    }));
+    tools.push(json!({
+        "name": "create_project",
+        "description": "Create a new project in the workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Project name (required)"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Markdown description of the project"
+                },
+                "icon": {
+                    "type": "string",
+                    "description": "Icon identifier for the project"
+                },
+                "color": {
+                    "type": "string",
+                    "description": "Hex color code (e.g. '#0D9488')"
+                },
+                "lead_id": {
+                    "type": "string",
+                    "description": "User ID to set as project lead"
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date in ISO 8601 format (YYYY-MM-DD)"
+                },
+                "target_date": {
+                    "type": "string",
+                    "description": "Target completion date in ISO 8601 format (YYYY-MM-DD)"
+                }
+            },
+            "required": ["name"]
+        }
+    }));
+    tools.push(json!({
+        "name": "update_project",
+        "description": "Update fields on an existing project. Only provided fields are changed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "The project ID (required)"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "New project name"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "New markdown description"
+                },
+                "icon": {
+                    "type": "string",
+                    "description": "New icon identifier"
+                },
+                "color": {
+                    "type": "string",
+                    "description": "New hex color code"
+                },
+                "status": {
+                    "type": "string",
+                    "description": "New project status (e.g. 'planned', 'in_progress', 'paused', 'completed', 'cancelled')"
+                },
+                "lead_id": {
+                    "type": ["string", "null"],
+                    "description": "User ID to set as project lead, or null to clear"
+                },
+                "start_date": {
+                    "type": ["string", "null"],
+                    "description": "Start date in ISO 8601 format, or null to clear"
+                },
+                "target_date": {
+                    "type": ["string", "null"],
+                    "description": "Target date in ISO 8601 format, or null to clear"
+                }
+            },
+            "required": ["project_id"]
+        }
+    }));
+    tools.push(json!({
+        "name": "delete_project",
+        "description": "Permanently delete a project and its milestones.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "The project ID to delete"
+                }
+            },
+            "required": ["project_id"]
+        }
+    }));
+    tools.push(json!({
+        "name": "list_milestones",
+        "description": "List all milestones in a project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "The project ID to list milestones for"
+                }
+            },
+            "required": ["project_id"]
+        }
+    }));
+    tools.push(json!({
+        "name": "create_milestone",
+        "description": "Create a new milestone in a project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "The project ID to create the milestone in"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Milestone name (required)"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Markdown description of the milestone"
+                },
+                "target_date": {
+                    "type": "string",
+                    "description": "Target date in ISO 8601 format (YYYY-MM-DD)"
+                }
+            },
+            "required": ["project_id", "name"]
+        }
+    }));
+    tools.push(json!({
+        "name": "update_milestone",
+        "description": "Update fields on an existing milestone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "milestone_id": {
+                    "type": "string",
+                    "description": "The milestone ID (required)"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "New milestone name"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "New markdown description"
+                },
+                "target_date": {
+                    "type": ["string", "null"],
+                    "description": "Target date in ISO 8601 format, or null to clear"
+                }
+            },
+            "required": ["milestone_id"]
+        }
+    }));
+    tools.push(json!({
+        "name": "delete_milestone",
+        "description": "Delete a milestone. Issues linked to this milestone will be unlinked.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "milestone_id": {
+                    "type": "string",
+                    "description": "The milestone ID to delete"
+                }
+            },
+            "required": ["milestone_id"]
+        }
+    }));
+
+    JsonRpcResponse::success(id, json!({ "tools": tools }))
 }
 
 fn handle_resources_list(id: Option<Value>) -> JsonRpcResponse {
@@ -1035,21 +822,24 @@ async fn handle_tools_call(
         }
     };
 
-    // Scope enforcement: map each tool to its required scope.
-    let required_scope = match tool_name {
-        "list_issues" | "get_issue" | "search_issues" => "issues:read",
-        "create_issue" | "update_issue" | "delete_issue" => "issues:write",
-        "add_comment" => "comments:write",
-        "list_labels" => "labels:read",
-        "create_label" => "labels:write",
-        "list_statuses" => "issues:read",
-        "list_teams" => "teams:read",
-        "add_relation" | "remove_relation" => "issues:write",
-        "list_issue_relations" => "issues:read",
-        "list_projects" | "get_project" | "list_milestones" => "projects:read",
-        "create_project" | "update_project" | "delete_project"
-        | "create_milestone" | "update_milestone" | "delete_milestone" => "projects:write",
-        _ => "",
+    // Scope enforcement: registry-driven tools carry their scope in metadata;
+    // hand-written tools use the static match table below.
+    let required_scope = if let Some(scope) = registry_tool_scope(tool_name) {
+        scope
+    } else {
+        match tool_name {
+            "add_comment" => "comments:write",
+            "list_labels" => "labels:read",
+            "create_label" => "labels:write",
+            "list_statuses" => "issues:read",
+            "list_teams" => "teams:read",
+            "add_relation" | "remove_relation" => "issues:write",
+            "list_issue_relations" => "issues:read",
+            "list_projects" | "get_project" | "list_milestones" => "projects:read",
+            "create_project" | "update_project" | "delete_project"
+            | "create_milestone" | "update_milestone" | "delete_milestone" => "projects:write",
+            _ => "",
+        }
     };
     if !required_scope.is_empty() && !auth.has_scope(required_scope) {
         return JsonRpcResponse::error(
@@ -1059,31 +849,31 @@ async fn handle_tools_call(
         );
     }
 
-    let result = match tool_name {
-        "list_issues" => tool_list_issues(&arguments, &auth, state).await,
-        "get_issue" => tool_get_issue(&arguments, &auth, state).await,
-        "create_issue" => tool_create_issue(&arguments, &auth, state).await,
-        "update_issue" => tool_update_issue(&arguments, &auth, state).await,
-        "delete_issue" => tool_delete_issue(&arguments, &auth, state).await,
-        "add_comment" => tool_add_comment(&arguments, &auth, state).await,
-        "list_labels" => tool_list_labels(&auth, state).await,
-        "create_label" => tool_create_label(&arguments, &auth, state).await,
-        "search_issues" => tool_search_issues(&arguments, &auth, state).await,
-        "list_statuses" => tool_list_statuses(&arguments, &auth, state).await,
-        "list_teams" => tool_list_teams(&auth, state).await,
-        "add_relation" => tool_add_relation(&arguments, &auth, state).await,
-        "remove_relation" => tool_remove_relation(&arguments, &auth, state).await,
-        "list_issue_relations" => tool_list_issue_relations(&arguments, &auth, state).await,
-        "list_projects" => tool_list_projects(&auth, state).await,
-        "get_project" => tool_get_project(&arguments, &auth, state).await,
-        "create_project" => tool_create_project(&arguments, &auth, state).await,
-        "update_project" => tool_update_project(&arguments, &auth, state).await,
-        "delete_project" => tool_delete_project(&arguments, &auth, state).await,
-        "list_milestones" => tool_list_milestones(&arguments, &auth, state).await,
-        "create_milestone" => tool_create_milestone(&arguments, &auth, state).await,
-        "update_milestone" => tool_update_milestone(&arguments, &auth, state).await,
-        "delete_milestone" => tool_delete_milestone(&arguments, &auth, state).await,
-        _ => return JsonRpcResponse::error(id, -32602, format!("Unknown tool: {tool_name}")),
+    // Dispatch: registry-driven tools (issues) use the shared handler;
+    // hand-written tools (not yet migrated) use their own functions.
+    let result = if is_registry_tool(tool_name) {
+        dispatch_registry_tool(tool_name, arguments, &auth, state).await
+    } else {
+        match tool_name {
+            "add_comment" => tool_add_comment(&arguments, &auth, state).await,
+            "list_labels" => tool_list_labels(&auth, state).await,
+            "create_label" => tool_create_label(&arguments, &auth, state).await,
+            "list_statuses" => tool_list_statuses(&arguments, &auth, state).await,
+            "list_teams" => tool_list_teams(&auth, state).await,
+            "add_relation" => tool_add_relation(&arguments, &auth, state).await,
+            "remove_relation" => tool_remove_relation(&arguments, &auth, state).await,
+            "list_issue_relations" => tool_list_issue_relations(&arguments, &auth, state).await,
+            "list_projects" => tool_list_projects(&auth, state).await,
+            "get_project" => tool_get_project(&arguments, &auth, state).await,
+            "create_project" => tool_create_project(&arguments, &auth, state).await,
+            "update_project" => tool_update_project(&arguments, &auth, state).await,
+            "delete_project" => tool_delete_project(&arguments, &auth, state).await,
+            "list_milestones" => tool_list_milestones(&arguments, &auth, state).await,
+            "create_milestone" => tool_create_milestone(&arguments, &auth, state).await,
+            "update_milestone" => tool_update_milestone(&arguments, &auth, state).await,
+            "delete_milestone" => tool_delete_milestone(&arguments, &auth, state).await,
+            _ => return JsonRpcResponse::error(id, -32602, format!("Unknown tool: {tool_name}")),
+        }
     };
 
     match result {
@@ -1108,7 +898,63 @@ async fn handle_tools_call(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tool implementations
+// Registry-driven tool dispatch
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Check whether a tool name is served by the shared API operation registry.
+fn is_registry_tool(name: &str) -> bool {
+    crate::api::all_operations().iter().any(|op| op.name == name)
+}
+
+/// Look up the required scope for a registry-driven tool.
+///
+/// Returns `None` if the tool is not in the registry (hand-written tools
+/// resolve their scope via the static match table in `handle_tools_call`).
+fn registry_tool_scope(name: &str) -> Option<&'static str> {
+    crate::api::all_operations()
+        .into_iter()
+        .find(|op| op.name == name)
+        .map(|op| op.scope)
+}
+
+/// Dispatch a registry-driven tool call through the shared API handler.
+///
+/// Builds an [`ApiCtx`] from the MCP auth context, calls the handler, and
+/// serializes the result to a pretty-printed JSON string (matching the
+/// format the old `tool_*` functions used).
+async fn dispatch_registry_tool(
+    name: &str,
+    arguments: serde_json::Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let ops = crate::api::all_operations();
+    let op = ops
+        .into_iter()
+        .find(|o| o.name == name)
+        .ok_or_else(|| trakkt_core::Error::BadRequest(format!("Unknown registry tool: {name}")))?;
+
+    let ctx = crate::api::ApiCtx::from_bearer(
+        auth.workspace_id.clone(),
+        auth.user_id.clone(),
+        &state.db,
+        &state.ws_manager,
+    );
+
+    let result = (op.handler)(ctx, arguments).await.map_err(|e| match e {
+        crate::api::ApiError::NotFound(msg) => trakkt_core::Error::NotFound(msg),
+        crate::api::ApiError::BadRequest(msg) => trakkt_core::Error::BadRequest(msg),
+        crate::api::ApiError::Unauthorized(msg) => trakkt_core::Error::Forbidden(msg),
+        crate::api::ApiError::Forbidden(msg) => trakkt_core::Error::Forbidden(msg),
+        crate::api::ApiError::Conflict(msg) => trakkt_core::Error::Conflict(msg),
+        crate::api::ApiError::Internal(msg) => trakkt_core::Error::Internal(msg),
+    })?;
+
+    serde_json::to_string_pretty(&result).map_err(trakkt_core::Error::from)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool implementations (hand-written, not yet migrated)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Helper to extract a required string argument.
@@ -1178,268 +1024,6 @@ async fn resolve_team_id_from_args(
     Ok(None)
 }
 
-/// list_issues — list issues with optional filters.
-async fn tool_list_issues(
-    args: &Value,
-    auth: &McpAuth,
-    state: &AppState,
-) -> trakkt_core::Result<String> {
-    let limit_raw = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
-    let limit = limit_raw.clamp(1, 100);
-
-    let status_id = args.get("status_id").and_then(|v| v.as_str()).map(String::from);
-    let status_categories: Option<Vec<String>> = args
-        .get("status_category")
-        .and_then(|v| v.as_str())
-        .map(|s| s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect());
-    let include_closed = args.get("include_closed").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    let exclude_status_categories = if status_id.is_none() && status_categories.is_none() && !include_closed {
-        Some(vec!["completed".to_string(), "cancelled".to_string()])
-    } else {
-        None
-    };
-
-    let filters = IssueFilters {
-        status_id,
-        status_categories,
-        exclude_status_categories,
-        priority: args.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32),
-        assignee_id: args.get("assignee").and_then(|v| v.as_str()).map(String::from),
-        creator_id: None,
-        label_ids: args.get("label").and_then(|v| v.as_str()).map(|s| {
-            s.split(',').map(|id| id.trim().to_string()).filter(|id| !id.is_empty()).collect()
-        }),
-        search: args.get("search").and_then(|v| v.as_str()).map(String::from),
-        limit: Some(limit),
-        offset: None,
-        include_archived: args.get("include_archived").and_then(|v| v.as_bool()),
-        only_archived: None,
-    };
-
-    let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
-    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, team_id.as_deref(), &filters).await?;
-    serde_json::to_string_pretty(&issues).map_err(trakkt_core::Error::from)
-}
-
-/// get_issue — get a single issue with details and comments.
-async fn tool_get_issue(
-    args: &Value,
-    auth: &McpAuth,
-    state: &AppState,
-) -> trakkt_core::Result<String> {
-    let (team_key, number) = resolve_issue_key_and_number(args)?;
-
-    let issue = issue_service::get_issue(&state.db, &auth.workspace_id, &team_key, number)
-        .await?
-        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue {team_key}-{number} not found")))?;
-
-    let comments = comment_service::list_comments(&state.db, &issue.issue_id).await?;
-
-    let result = json!({
-        "issue": issue,
-        "comments": comments
-    });
-    serde_json::to_string_pretty(&result).map_err(trakkt_core::Error::from)
-}
-
-/// create_issue — create a new issue in the specified or default team.
-async fn tool_create_issue(
-    args: &Value,
-    auth: &McpAuth,
-    state: &AppState,
-) -> trakkt_core::Result<String> {
-    let title = arg_str(args, "title")?;
-
-    let resolved_team_id = match resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await? {
-        Some(id) => id,
-        None => {
-            let default_team = team_service::get_default_team(&state.db, &auth.workspace_id).await?;
-            default_team.team_id
-        }
-    };
-
-    let label_ids: Vec<String> = args
-        .get("labels")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let parent_issue_id = args.get("parent_issue_id").and_then(|v| v.as_str()).map(String::from);
-
-    let params = CreateIssueParams {
-        workspace_id: auth.workspace_id.clone(),
-        team_id: resolved_team_id,
-        creator_id: auth.user_id.clone(),
-        title: title.to_string(),
-        description: args.get("description").and_then(|v| v.as_str()).map(String::from),
-        priority: args.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-        assignee_id: args.get("assignee").and_then(|v| v.as_str()).map(String::from),
-        due_date: args.get("due_date").and_then(|v| v.as_str()).map(String::from),
-        label_ids,
-        project_id: args.get("project_id").and_then(|v| v.as_str()).map(String::from),
-        milestone_id: args.get("milestone_id").and_then(|v| v.as_str()).map(String::from),
-    };
-
-    let issue = issue_service::create_issue(&state.db, &params, Some(&state.ws_manager)).await?;
-
-    // If a parent was specified, create the parent relation after issue creation.
-    if let Some(ref parent_id) = parent_issue_id {
-        relation_service::set_parent(
-            &state.db,
-            &auth.workspace_id,
-            &issue.issue_id,
-            parent_id,
-            Some(&auth.user_id),
-            Some(&state.ws_manager),
-        )
-        .await?;
-    }
-
-    serde_json::to_string_pretty(&issue).map_err(trakkt_core::Error::from)
-}
-
-/// Resolve a target team_id for "move to team" from `move_to_team_id` or
-/// `move_to_team_key` arguments. Returns `None` if neither is provided.
-async fn resolve_move_team_id(
-    args: &Value,
-    db: &trakkt_core::DbPool,
-    workspace_id: &str,
-) -> trakkt_core::Result<Option<String>> {
-    if let Some(id) = args.get("move_to_team_id").and_then(|v| v.as_str()) {
-        return Ok(Some(id.to_string()));
-    }
-    if let Some(key) = args.get("move_to_team_key").and_then(|v| v.as_str()) {
-        let team = team_service::get_team_by_key(db, workspace_id, key)
-            .await?
-            .ok_or_else(|| trakkt_core::Error::BadRequest(
-                format!("No team found with key '{key}'"),
-            ))?;
-        return Ok(Some(team.team_id));
-    }
-    Ok(None)
-}
-
-/// update_issue — update fields on an existing issue.
-async fn tool_update_issue(
-    args: &Value,
-    auth: &McpAuth,
-    state: &AppState,
-) -> trakkt_core::Result<String> {
-    let (team_key, number) = resolve_issue_key_and_number(args)?;
-
-    // Resolve "move to team" separately from the identifying team_key.
-    let move_team_id = resolve_move_team_id(args, &state.db, &auth.workspace_id).await?;
-
-    // Build the IssueUpdate from provided fields. Absent keys mean "no change".
-    // JSON null means "clear the field" (maps to Some(None) for double-Option fields).
-    let updates = IssueUpdate {
-        title: args.get("title").and_then(|v| v.as_str()).map(String::from),
-        description: args.get("description").map(|v| {
-            v.as_str().map(String::from)
-        }),
-        status_id: args.get("status_id").and_then(|v| v.as_str()).map(String::from),
-        priority: args.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32),
-        assignee_id: args.get("assignee").map(|v| {
-            v.as_str().map(String::from)
-        }),
-        due_date: args.get("due_date").map(|v| {
-            v.as_str().map(String::from)
-        }),
-        project_id: args.get("project_id").map(|v| {
-            v.as_str().map(String::from)
-        }),
-        milestone_id: args.get("milestone_id").map(|v| {
-            v.as_str().map(String::from)
-        }),
-        sort_order: args.get("sort_order").map(|v| {
-            v.as_f64()
-        }),
-        team_id: move_team_id,
-    };
-
-    let issue = issue_service::update_issue(
-        &state.db,
-        &auth.workspace_id,
-        &team_key,
-        number,
-        &updates,
-        Some(&auth.user_id),
-        Some(&state.ws_manager),
-    )
-    .await?;
-
-    // Handle parent_issue_id changes via relation_service.
-    if let Some(parent_val) = args.get("parent_issue_id") {
-        if parent_val.is_null() || parent_val.as_str().is_some_and(|s| s.is_empty()) {
-            relation_service::clear_parent(
-                &state.db,
-                &auth.workspace_id,
-                &issue.issue_id,
-                Some(&state.ws_manager),
-            )
-            .await?;
-        } else if let Some(parent_id) = parent_val.as_str() {
-            relation_service::set_parent(
-                &state.db,
-                &auth.workspace_id,
-                &issue.issue_id,
-                parent_id,
-                Some(&auth.user_id),
-                Some(&state.ws_manager),
-            )
-            .await?;
-        }
-    }
-
-    // If labels were provided, replace them on the issue.
-    if let Some(label_values) = args.get("labels").and_then(|v| v.as_array()) {
-        let label_ids: Vec<String> = label_values
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        issue_service::set_issue_labels(
-            &state.db,
-            &issue.issue_id,
-            &label_ids,
-            Some(&state.ws_manager),
-        )
-        .await?;
-    }
-
-    // Re-fetch with full details after label update.
-    // Use get_issue_by_id since the team/number may have changed on team reassignment.
-    let updated = issue_service::get_issue_by_id(&state.db, &issue.issue_id)
-        .await?
-        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue {team_key}-{number} not found")))?;
-
-    serde_json::to_string_pretty(&updated).map_err(trakkt_core::Error::from)
-}
-
-/// delete_issue — permanently delete an issue.
-async fn tool_delete_issue(
-    args: &Value,
-    auth: &McpAuth,
-    state: &AppState,
-) -> trakkt_core::Result<String> {
-    let (team_key, number) = resolve_issue_key_and_number(args)?;
-
-    issue_service::delete_issue(
-        &state.db,
-        &auth.workspace_id,
-        &team_key,
-        number,
-        Some(&state.ws_manager),
-    )
-    .await?;
-
-    Ok(format!("Issue {team_key}-{number} deleted"))
-}
-
 /// add_comment — add a comment to an issue.
 async fn tool_add_comment(
     args: &Value,
@@ -1505,38 +1089,6 @@ async fn tool_create_label(
     .await?;
 
     serde_json::to_string_pretty(&label).map_err(trakkt_core::Error::from)
-}
-
-/// search_issues — search issues by title text.
-async fn tool_search_issues(
-    args: &Value,
-    auth: &McpAuth,
-    state: &AppState,
-) -> trakkt_core::Result<String> {
-    let query = arg_str(args, "query")?;
-    let limit_raw = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-    let limit = limit_raw.clamp(1, 100);
-    let include_closed = args.get("include_closed").and_then(|v| v.as_bool()).unwrap_or(false);
-    let include_archived = args.get("include_archived").and_then(|v| v.as_bool());
-
-    let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
-
-    let exclude_status_categories = if !include_closed {
-        Some(vec!["completed".to_string(), "cancelled".to_string()])
-    } else {
-        None
-    };
-
-    let filters = IssueFilters {
-        search: Some(query.to_string()),
-        exclude_status_categories,
-        include_archived,
-        limit: Some(limit),
-        ..Default::default()
-    };
-
-    let issues = issue_service::list_issues(&state.db, &auth.workspace_id, team_id.as_deref(), &filters).await?;
-    serde_json::to_string_pretty(&issues).map_err(trakkt_core::Error::from)
 }
 
 /// list_statuses — list all statuses in the workspace.
