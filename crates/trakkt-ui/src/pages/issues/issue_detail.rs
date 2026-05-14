@@ -610,7 +610,8 @@ fn MetadataSidebar(
 
     // ── Assignee change handler ────────────────────────────────────────
     let on_assignee_change = move |user_id: String, display_name: Option<String>| {
-        set_current_assignee_id.set(if user_id.is_empty() { None } else { Some(user_id.clone()) });
+        let is_clear = user_id.is_empty();
+        set_current_assignee_id.set(if is_clear { None } else { Some(user_id.clone()) });
         set_current_assignee_name.set(display_name);
         let tk = stored_tk.get_value();
         leptos::task::spawn_local(async move {
@@ -618,9 +619,9 @@ fn MetadataSidebar(
                 tk,
                 number,
                 None, None, None, None,
-                Some(user_id),
+                if is_clear { None } else { Some(user_id) },
                 None, None, None, None,
-                None,
+                if is_clear { Some("assignee".to_string()) } else { None },
             )
             .await;
             on_change.run(());
