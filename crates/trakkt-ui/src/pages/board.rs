@@ -29,7 +29,7 @@ use phosphor_leptos::Icon;
 use wasm_bindgen::JsCast;
 
 use crate::components::{Avatar, Button, ButtonSize, ButtonVariant, Checkbox, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, SearchInput, Skeleton};
-use crate::pages::issues::filters::PriorityFilterDropdown;
+use crate::pages::issues::filters::{LabelFilterDropdown, PriorityFilterDropdown, ProjectFilterDropdown};
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::server_fns::issues::{update_issue, set_issue_sort_order};
 use trakkt_types::models::{IssueWithDetails, Status};
@@ -180,13 +180,18 @@ pub fn BoardContent(
     // ── Filter state ─────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
     let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
+    let (label_filter, set_label_filter) = signal(Vec::<String>::new());
+    let (project_filter, set_project_filter) = signal(Vec::<String>::new());
     let (show_archived, set_show_archived) = signal(false);
 
-    // Client-side filtered issues: archive + search + priority applied before grouping.
+    // Client-side filtered issues: archive + search + priority + label + project
+    // applied before grouping.
     let filtered_issues = Memo::new(move |_| {
         let raw = issues.get();
         let search_val = search.get().to_lowercase();
         let priority_val = priority_filter.get();
+        let label_val = label_filter.get();
+        let project_val = project_filter.get();
         let archived_visible = show_archived.get();
 
         raw.into_iter()
@@ -199,6 +204,20 @@ pub fn BoardContent(
                     let p_str = issue.priority.to_string();
                     if !priority_val.contains(&p_str) {
                         return false;
+                    }
+                }
+                // Label filter: OR within labels — issue matches if it has ANY of the selected labels.
+                if !label_val.is_empty() {
+                    let has_match = issue.labels.iter().any(|l| label_val.contains(&l.label_id));
+                    if !has_match {
+                        return false;
+                    }
+                }
+                // Project filter: OR within projects — issue matches if its project_id is any of the selected.
+                if !project_val.is_empty() {
+                    match &issue.project_id {
+                        Some(pid) if project_val.contains(pid) => {}
+                        _ => return false,
                     }
                 }
                 if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
@@ -339,7 +358,7 @@ pub fn BoardContent(
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Toolbar ─────────────────────────────────────────────────────
-            <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0">
+            <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0 flex-wrap">
                 <SearchInput
                     value=Signal::derive(move || search.get())
                     on_input=Callback::new(move |v: String| set_search.set(v))
@@ -350,6 +369,26 @@ pub fn BoardContent(
                     value=priority_filter
                     on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))
                 />
+                <LabelFilterDropdown
+                    value=label_filter
+                    on_change=Callback::new(move |v: Vec<String>| set_label_filter.set(v))
+                    team_id={
+                        // Derive team_id from team_key + SyncStore for label scoping.
+                        let team_key_for_labels = team_key.clone();
+                        Signal::derive(move || {
+                            let key = team_key_for_labels.as_deref()?;
+                            let key_lower = key.to_lowercase();
+                            let store = sync_store?;
+                            store
+                                .teams()
+                                .get()
+                                .into_iter()
+                                .find(|t| t.key.to_lowercase() == key_lower)
+                                .map(|t| t.team_id)
+                        })
+                    }
+                />
+                <ProjectFilterDropdown value=project_filter on_change=Callback::new(move |v: Vec<String>| set_project_filter.set(v))/>
                 <button
                     class=move || {
                         if show_archived.get() {

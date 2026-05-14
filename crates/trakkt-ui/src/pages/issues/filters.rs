@@ -16,6 +16,8 @@ use crate::components::{
     DropdownItem, DropdownMenu, DropdownTrigger, IssueStatusBadge, IssueStatusVariant,
     PriorityIndicator,
 };
+use crate::server_fns::labels::list_labels;
+use crate::server_fns::projects::list_projects;
 use crate::server_fns::statuses::list_statuses;
 use trakkt_types::models::IssueWithDetails;
 
@@ -503,6 +505,278 @@ pub fn SortDropdown(
                                 on_change.run((sf, sf.default_direction()));
                             }
                             set_open.set(false);
+                        })
+                    />
+                }
+            }).collect_view()}
+        </DropdownMenu>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Label Filter Dropdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dropdown filter for issue labels.
+///
+/// Reads labels from SyncStore (real-time) with a server function fallback.
+/// When `team_id` is provided, filters to show only workspace-scoped labels
+/// (team_id = None) and labels belonging to that team.
+#[component]
+pub fn LabelFilterDropdown(
+    #[prop(into)] value: Signal<Vec<String>>,
+    on_change: Callback<Vec<String>>,
+    /// When filtering by team, only show labels that are workspace-scoped
+    /// (team_id = None) or belong to this team.
+    #[prop(optional, into)]
+    team_id: Option<Signal<Option<String>>>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Use SyncStore for labels when available (real-time), fall back to server.
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+
+    // Fetch labels dynamically from the server.
+    let labels_resource = Resource::new(
+        || (),
+        move |_| async move { list_labels(None).await },
+    );
+
+    // Resolved labels — prefer SyncStore, fall back to server resource.
+    // When team_id is provided, filter to workspace-scoped + team-specific labels.
+    let labels = Memo::new(move |_| {
+        let all = if let Some(store) = sync_store {
+            let l = store.labels().get();
+            if !l.is_empty() || store.initialized().get() {
+                l
+            } else {
+                labels_resource
+                    .get()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default()
+            }
+        } else {
+            labels_resource
+                .get()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+        };
+
+        // Filter by team when a team_id signal is provided and has a value.
+        if let Some(team_id_signal) = team_id
+            && let Some(ref tid) = team_id_signal.get()
+        {
+            return all
+                .into_iter()
+                .filter(|l| {
+                    l.team_id.is_none() || l.team_id.as_deref() == Some(tid.as_str())
+                })
+                .collect();
+        }
+        all
+    });
+
+    // Display name for the current selection (multi-select).
+    // 0 selected -> None (shows "All labels" default label)
+    // 1 selected -> look up name from loaded labels
+    // 2+ selected -> "Label (N)"
+    let display = Memo::new(move |_| {
+        let v = value.get();
+        match v.len() {
+            0 => None,
+            1 => {
+                let id = &v[0];
+                labels
+                    .get()
+                    .iter()
+                    .find(|l| &l.label_id == id)
+                    .map(|l| l.name.clone())
+            }
+            n => Some(format!("Label ({n})")),
+        }
+    });
+
+    // Icon — show a colored dot when exactly 1 label is selected.
+    let current_label_color = Memo::new(move |_| {
+        let v = value.get();
+        if v.len() == 1 {
+            labels
+                .get()
+                .iter()
+                .find(|l| l.label_id == v[0])
+                .map(|l| l.color.clone())
+        } else {
+            None
+        }
+    });
+
+    view! {
+        <div node_ref=trigger_ref>
+            <DropdownTrigger
+                label="All labels"
+                value=Signal::derive(move || display.get())
+                icon=Arc::new(move || {
+                    current_label_color.get().map(|color| {
+                        view! {
+                            <span
+                                class="inline-block w-2.5 h-2.5 rounded-full shrink-0"
+                                style=format!("background-color: {color}")
+                            />
+                        }.into_any()
+                    }).unwrap_or_else(|| view! { <span/> }.into_any())
+                }) as ChildrenFn
+                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
+            />
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+        >
+            <DropdownItem
+                label="All labels"
+                selected=Signal::derive(move || value.get().is_empty())
+                on_select=Callback::new(move |()| { on_change.run(Vec::new()); })
+            />
+            {move || labels.get().into_iter().map(|label| {
+                let label_id = label.label_id.clone();
+                let label_id_check = label.label_id.clone();
+                let label_name = label.name.clone();
+                let label_color = label.color.clone();
+                view! {
+                    <DropdownItem
+                        label=label_name
+                        selected=Signal::derive(move || value.get().contains(&label_id_check))
+                        on_select=Callback::new({
+                            let id = label_id.clone();
+                            move |()| {
+                                let mut current = value.get_untracked();
+                                if let Some(pos) = current.iter().position(|s| s == &id) {
+                                    current.remove(pos);
+                                } else {
+                                    current.push(id.clone());
+                                }
+                                on_change.run(current);
+                            }
+                        })
+                        icon=Arc::new(move || {
+                            view! {
+                                <span
+                                    class="inline-block w-2.5 h-2.5 rounded-full shrink-0"
+                                    style=format!("background-color: {}", label_color)
+                                />
+                            }.into_any()
+                        }) as ChildrenFn
+                    />
+                }
+            }).collect_view()}
+        </DropdownMenu>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Project Filter Dropdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dropdown filter for projects.
+///
+/// Reads projects from SyncStore (real-time) with a server function fallback.
+/// Multi-select: issues are matched by `project_id`.
+#[component]
+pub fn ProjectFilterDropdown(
+    #[prop(into)] value: Signal<Vec<String>>,
+    on_change: Callback<Vec<String>>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Use SyncStore for projects when available (real-time), fall back to server.
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+
+    // Fetch projects dynamically from the server.
+    let projects_resource = Resource::new(
+        || (),
+        move |_| async move { list_projects().await },
+    );
+
+    // Resolved projects — prefer SyncStore, fall back to server resource.
+    let projects = Memo::new(move |_| {
+        if let Some(store) = sync_store {
+            let p = store.projects().get();
+            if !p.is_empty() || store.initialized().get() {
+                p
+            } else {
+                projects_resource
+                    .get()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default()
+            }
+        } else {
+            projects_resource
+                .get()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+        }
+    });
+
+    // Display name for the current selection (multi-select).
+    // 0 selected -> None (shows "All projects" default label)
+    // 1 selected -> look up name from loaded projects
+    // 2+ selected -> "Project (N)"
+    let display = Memo::new(move |_| {
+        let v = value.get();
+        match v.len() {
+            0 => None,
+            1 => {
+                let id = &v[0];
+                projects
+                    .get()
+                    .iter()
+                    .find(|p| &p.project_id == id)
+                    .map(|p| p.name.clone())
+            }
+            n => Some(format!("Project ({n})")),
+        }
+    });
+
+    view! {
+        <div node_ref=trigger_ref>
+            <DropdownTrigger
+                label="All projects"
+                value=Signal::derive(move || display.get())
+                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
+            />
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+        >
+            <DropdownItem
+                label="All projects"
+                selected=Signal::derive(move || value.get().is_empty())
+                on_select=Callback::new(move |()| { on_change.run(Vec::new()); })
+            />
+            {move || projects.get().into_iter().map(|project| {
+                let project_id = project.project_id.clone();
+                let project_id_check = project.project_id.clone();
+                let project_name = project.name.clone();
+                view! {
+                    <DropdownItem
+                        label=project_name
+                        selected=Signal::derive(move || value.get().contains(&project_id_check))
+                        on_select=Callback::new({
+                            let id = project_id.clone();
+                            move |()| {
+                                let mut current = value.get_untracked();
+                                if let Some(pos) = current.iter().position(|s| s == &id) {
+                                    current.remove(pos);
+                                } else {
+                                    current.push(id.clone());
+                                }
+                                on_change.run(current);
+                            }
                         })
                     />
                 }

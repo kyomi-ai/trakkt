@@ -34,8 +34,8 @@ use crate::components::{
 };
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{
-    parse_sort_field, sort_field_to_str, sort_issues, PriorityFilterDropdown, SortDirection,
-    SortDropdown, SortField, StatusFilterDropdown,
+    parse_sort_field, sort_field_to_str, sort_issues, LabelFilterDropdown, PriorityFilterDropdown,
+    ProjectFilterDropdown, SortDirection, SortDropdown, SortField, StatusFilterDropdown,
 };
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
@@ -136,6 +136,8 @@ fn IssueListInner(
     let (search, set_search) = signal(String::new());
     let (status_filter, set_status_filter) = signal(Vec::<String>::new());
     let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
+    let (label_filter, set_label_filter) = signal(Vec::<String>::new());
+    let (project_filter, set_project_filter) = signal(Vec::<String>::new());
     let (show_archived, set_show_archived) = signal(false);
 
     // ── Sort state ─────────────────────────────────────────────────────────
@@ -217,6 +219,8 @@ fn IssueListInner(
             set_search.set(String::new());
             set_status_filter.set(Vec::new());
             set_priority_filter.set(Vec::new());
+            set_label_filter.set(Vec::new());
+            set_project_filter.set(Vec::new());
             set_sort_field.set(SortField::Priority);
             set_sort_direction.set(SortDirection::Asc);
         }
@@ -314,12 +318,15 @@ fn IssueListInner(
             .collect::<Vec<_>>()
     });
 
-    // Filtered issue list for list view — applies archive, search, status, and priority filters.
+    // Filtered issue list for list view — applies archive, search, status, priority,
+    // label, and project filters.
     let filtered_issues = Memo::new(move |_| {
         let raw = team_issues.get();
         let search_val = search.get().to_lowercase();
         let status_val = status_filter.get();
         let priority_val = priority_filter.get();
+        let label_val = label_filter.get();
+        let project_val = project_filter.get();
         let archived_visible = show_archived.get();
 
         raw.into_iter()
@@ -335,6 +342,20 @@ fn IssueListInner(
                     let p_str = issue.priority.to_string();
                     if !priority_val.contains(&p_str) {
                         return false;
+                    }
+                }
+                // Label filter: OR within labels — issue matches if it has ANY of the selected labels.
+                if !label_val.is_empty() {
+                    let has_match = issue.labels.iter().any(|l| label_val.contains(&l.label_id));
+                    if !has_match {
+                        return false;
+                    }
+                }
+                // Project filter: OR within projects — issue matches if its project_id is any of the selected.
+                if !project_val.is_empty() {
+                    match &issue.project_id {
+                        Some(pid) if project_val.contains(pid) => {}
+                        _ => return false,
                     }
                 }
                 if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
@@ -563,6 +584,8 @@ fn IssueListInner(
                     set_search.set(String::new());
                     set_status_filter.set(Vec::new());
                     set_priority_filter.set(Vec::new());
+                    set_label_filter.set(Vec::new());
+                    set_project_filter.set(Vec::new());
                     set_sort_field.set(SortField::Priority);
                     set_sort_direction.set(SortDirection::Asc);
                 };
@@ -571,6 +594,8 @@ fn IssueListInner(
                     set_active_tab.set("active".to_string());
                     set_search.set(String::new());
                     set_priority_filter.set(Vec::new());
+                    set_label_filter.set(Vec::new());
+                    set_project_filter.set(Vec::new());
                     set_sort_field.set(SortField::Priority);
                     set_sort_direction.set(SortDirection::Asc);
                     let team = resolved_team.get();
@@ -595,6 +620,8 @@ fn IssueListInner(
                     set_active_tab.set("backlog".to_string());
                     set_search.set(String::new());
                     set_priority_filter.set(Vec::new());
+                    set_label_filter.set(Vec::new());
+                    set_project_filter.set(Vec::new());
                     set_sort_field.set(SortField::Priority);
                     set_sort_direction.set(SortDirection::Asc);
                     let team = resolved_team.get();
@@ -659,6 +686,8 @@ fn IssueListInner(
                                             set_priority_filter.set(
                                                 filters.priorities.iter().map(|p| p.to_string()).collect()
                                             );
+                                            set_label_filter.set(filters.labels);
+                                            set_project_filter.set(filters.project_ids);
                                             // Restore sort from saved view (or reset to defaults).
                                             set_sort_field.set(
                                                 filters.sort_field.as_deref()
@@ -820,6 +849,12 @@ fn IssueListInner(
                         team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
                     />
                     <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))/>
+                    <LabelFilterDropdown
+                        value=label_filter
+                        on_change=Callback::new(move |v: Vec<String>| set_label_filter.set(v))
+                        team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
+                    />
+                    <ProjectFilterDropdown value=project_filter on_change=Callback::new(move |v: Vec<String>| set_project_filter.set(v))/>
                     <SortDropdown
                         field=Signal::derive(move || sort_field.get())
                         direction=Signal::derive(move || sort_direction.get())
@@ -850,6 +885,8 @@ fn IssueListInner(
                             search.get().is_empty()
                                 && status_filter.get().is_empty()
                                 && priority_filter.get().is_empty()
+                                && label_filter.get().is_empty()
+                                && project_filter.get().is_empty()
                         })
                         on:click=move |_| set_show_save_view.set(true)
                     >
@@ -961,6 +998,8 @@ fn IssueListInner(
             search=Signal::derive(move || search.get())
             status_filter=Signal::derive(move || status_filter.get())
             priority_filter=Signal::derive(move || priority_filter.get())
+            label_filter=Signal::derive(move || label_filter.get())
+            project_filter=Signal::derive(move || project_filter.get())
             team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
             view_mode=Signal::derive(move || view_mode.get())
             sort_field=Signal::derive(move || sort_field.get())
@@ -1211,6 +1250,12 @@ pub(crate) fn SaveViewModal(
     status_filter: Signal<Vec<String>>,
     /// Current priority filter values (multi-select).
     priority_filter: Signal<Vec<String>>,
+    /// Current label filter values (multi-select).
+    #[prop(optional, into)]
+    label_filter: Option<Signal<Vec<String>>>,
+    /// Current project filter values (multi-select).
+    #[prop(optional, into)]
+    project_filter: Option<Signal<Vec<String>>>,
     /// Current team_id if on a team page.
     team_id: Signal<Option<String>>,
     /// Current view mode (list/board).
@@ -1249,7 +1294,8 @@ pub(crate) fn SaveViewModal(
         let search_val = search.get_untracked();
         let team_id_val = team_id.get_untracked().unwrap_or_default();
 
-        let labels: Vec<String> = Vec::new();
+        let labels: Vec<String> = label_filter.map(|s| s.get_untracked()).unwrap_or_default();
+        let project_ids: Vec<String> = project_filter.map(|s| s.get_untracked()).unwrap_or_default();
         let sf_str = sort_field.map(|s| sort_field_to_str(s.get_untracked()).to_string());
         let sd_str = sort_direction.map(|s| s.get_untracked().as_str().to_string());
         let filters = serde_json::json!({
@@ -1258,6 +1304,7 @@ pub(crate) fn SaveViewModal(
             "search": search_val,
             "team_id": team_id_val,
             "labels": labels,
+            "project_ids": project_ids,
             "sort_field": sf_str,
             "sort_direction": sd_str,
         });
