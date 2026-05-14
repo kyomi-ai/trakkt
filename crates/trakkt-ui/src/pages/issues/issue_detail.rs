@@ -1928,7 +1928,7 @@ fn NewCommentForm(team_key: String, number: i32) -> impl IntoView {
 
     view! {
         <div class="mt-6">
-            <div class="border border-border rounded-md overflow-hidden" style="min-height: 120px;">
+            <div class="border border-border rounded-md overflow-hidden bg-card">
                 <TreeWysiwygEditor
                     content=content.read_only()
                     on_change=on_change
