@@ -211,8 +211,9 @@ pub struct ListStatusesApiParams {
 /// Parameters for adding a relation between two issues.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct AddRelationApiParams {
-    /// Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue
-    pub source_issue: String,
+    /// Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue.
+    /// Optional so REST can inject it from the path parameter.
+    pub source_issue: Option<String>,
     /// Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue
     pub target_issue: String,
     /// Relation type: 'blocks' or 'parent'
@@ -279,8 +280,8 @@ pub struct CreateProjectApiParams {
 /// - Field set to a value = update the field (`Some(Some(value))`)
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct UpdateProjectApiParams {
-    /// The project ID (required)
-    pub project_id: String,
+    /// The project ID. Optional so REST can inject it from the path parameter.
+    pub project_id: Option<String>,
     /// New project name
     pub name: Option<String>,
     /// New markdown description
@@ -320,8 +321,8 @@ pub struct ListMilestonesApiParams {
 /// Parameters for creating a new milestone.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct CreateMilestoneApiParams {
-    /// The project ID to create the milestone in
-    pub project_id: String,
+    /// The project ID to create the milestone in. Optional so REST can inject from path.
+    pub project_id: Option<String>,
     /// Milestone name (required)
     pub name: String,
     /// Markdown description of the milestone
@@ -338,8 +339,8 @@ pub struct CreateMilestoneApiParams {
 /// - Field set to a value = update the field (`Some(Some(value))`)
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct UpdateMilestoneApiParams {
-    /// The milestone ID (required)
-    pub milestone_id: String,
+    /// The milestone ID. Optional so REST can inject from path.
+    pub milestone_id: Option<String>,
     /// New milestone name
     pub name: Option<String>,
     /// New markdown description

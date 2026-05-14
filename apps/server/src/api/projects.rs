@@ -101,10 +101,13 @@ pub async fn update_project(
     ctx: &ApiCtx<'_>,
     params: UpdateProjectApiParams,
 ) -> ApiResult<serde_json::Value> {
-    verify_project_ownership(ctx, &params.project_id).await?;
+    let project_id = params.project_id.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("project_id is required".to_string())
+    })?;
+    verify_project_ownership(ctx, project_id).await?;
 
     let update_params = project_service::UpdateProjectParams {
-        project_id: &params.project_id,
+        project_id,
         name: params.name.as_deref(),
         description: params.description.as_deref(),
         icon: params.icon.as_deref(),

@@ -30,16 +30,20 @@ pub async fn add_relation(
     ctx: &ApiCtx<'_>,
     params: AddRelationApiParams,
 ) -> ApiResult<serde_json::Value> {
+    let source_identifier = params.source_issue.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("source_issue is required".to_string())
+    })?;
+
     // Resolve source issue identifier to issue_id.
     let (source_key, source_num) =
-        parse_issue_identifier(&params.source_issue).ok_or_else(|| {
+        parse_issue_identifier(source_identifier).ok_or_else(|| {
             ApiError::BadRequest("Invalid source_issue format. Expected 'TRA-35'".to_string())
         })?;
     let source_issue =
         issue_service::get_issue(ctx.db, &ctx.workspace_id, &source_key, source_num)
             .await?
             .ok_or_else(|| {
-                ApiError::NotFound(format!("Source issue {} not found", params.source_issue))
+                ApiError::NotFound(format!("Source issue {source_identifier} not found"))
             })?;
 
     // Resolve target issue identifier to issue_id.

@@ -72,11 +72,14 @@ pub async fn create_milestone(
     ctx: &ApiCtx<'_>,
     params: CreateMilestoneApiParams,
 ) -> ApiResult<serde_json::Value> {
-    verify_project_ownership(ctx, &params.project_id).await?;
+    let project_id = params.project_id.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("project_id is required".to_string())
+    })?;
+    verify_project_ownership(ctx, project_id).await?;
 
     let milestone = project_service::create_milestone(
         ctx.db,
-        &params.project_id,
+        project_id,
         &params.name,
         params.description.as_deref(),
         params.target_date.as_deref(),
@@ -100,13 +103,16 @@ pub async fn update_milestone(
     ctx: &ApiCtx<'_>,
     params: UpdateMilestoneApiParams,
 ) -> ApiResult<serde_json::Value> {
+    let milestone_id = params.milestone_id.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("milestone_id is required".to_string())
+    })?;
     // Verify the milestone's project belongs to this workspace.
-    let project_id = resolve_milestone_project_id(ctx, &params.milestone_id).await?;
+    let project_id = resolve_milestone_project_id(ctx, milestone_id).await?;
     verify_project_ownership(ctx, &project_id).await?;
 
     let milestone = project_service::update_milestone(
         ctx.db,
-        &params.milestone_id,
+        milestone_id,
         params.name.as_deref(),
         params.description.as_deref(),
         params.target_date.as_ref().map(|opt| opt.as_deref()),

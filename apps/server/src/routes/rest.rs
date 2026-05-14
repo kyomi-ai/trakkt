@@ -19,13 +19,13 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::api::{issues, ApiCtx, ApiError};
+use crate::api::{comments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
 use crate::state::AppState;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -333,6 +333,241 @@ async fn delete_issue_handler(
     Ok(Json(result))
 }
 
+// ─── Comments ────────────────────────────────────────────────────────────────
+
+async fn add_comment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(mut params): Json<trakkt_types::api::AddCommentApiParams>,
+) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "comments:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    params.issue_identifier = Some(identifier);
+    let result = comments::add_comment(&ctx, params).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+// ─── Labels ──────────────────────────────────────────────────────────────────
+
+async fn list_labels_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "labels:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let result = labels::list_labels(&ctx, trakkt_types::api::ListLabelsApiParams {}).await?;
+    Ok(Json(result))
+}
+
+async fn create_label_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(params): Json<trakkt_types::api::CreateLabelApiParams>,
+) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "labels:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let result = labels::create_label(&ctx, params).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+// ─── Teams ───────────────────────────────────────────────────────────────────
+
+async fn list_teams_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "teams:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let result = teams::list_teams(&ctx, trakkt_types::api::ListTeamsApiParams {}).await?;
+    Ok(Json(result))
+}
+
+// ─── Statuses ────────────────────────────────────────────────────────────────
+
+async fn list_statuses_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<trakkt_types::api::ListStatusesApiParams>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "issues:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let result = statuses::list_statuses(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+// ─── Relations ───────────────────────────────────────────────────────────────
+
+async fn add_relation_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(mut params): Json<trakkt_types::api::AddRelationApiParams>,
+) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "issues:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    params.source_issue = Some(identifier);
+    let result = relations::add_relation(&ctx, params).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+async fn list_relations_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "issues:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let params = trakkt_types::api::ListRelationsApiParams {
+        issue_identifier: Some(identifier),
+        team_key: None,
+        issue_number: None,
+    };
+    let result = relations::list_relations(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+async fn remove_relation_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "issues:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let params = trakkt_types::api::RemoveRelationApiParams { relation_id: id };
+    let result = relations::remove_relation(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+// ─── Projects ────────────────────────────────────────────────────────────────
+
+async fn list_projects_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "projects:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let result = projects::list_projects(&ctx, trakkt_types::api::ListProjectsApiParams {}).await?;
+    Ok(Json(result))
+}
+
+async fn get_project_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "projects:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let params = trakkt_types::api::GetProjectApiParams { project_id: id };
+    let result = projects::get_project(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+async fn create_project_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(params): Json<trakkt_types::api::CreateProjectApiParams>,
+) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "projects:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let result = projects::create_project(&ctx, params).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+async fn update_project_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(mut params): Json<trakkt_types::api::UpdateProjectApiParams>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "projects:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    params.project_id = Some(id);
+    let result = projects::update_project(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+async fn delete_project_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "projects:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let params = trakkt_types::api::DeleteProjectApiParams { project_id: id };
+    let result = projects::delete_project(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+// ─── Milestones ──────────────────────────────────────────────────────────────
+
+async fn list_milestones_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "projects:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let params = trakkt_types::api::ListMilestonesApiParams { project_id: id };
+    let result = milestones::list_milestones(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+async fn create_milestone_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(mut params): Json<trakkt_types::api::CreateMilestoneApiParams>,
+) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "projects:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    params.project_id = Some(id);
+    let result = milestones::create_milestone(&ctx, params).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+async fn update_milestone_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(mut params): Json<trakkt_types::api::UpdateMilestoneApiParams>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "projects:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    params.milestone_id = Some(id);
+    let result = milestones::update_milestone(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+async fn delete_milestone_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "projects:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let params = trakkt_types::api::DeleteMilestoneApiParams { milestone_id: id };
+    let result = milestones::delete_milestone(&ctx, params).await?;
+    Ok(Json(result))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Router
 // ─────────────────────────────────────────────────────────────────────────────
@@ -340,6 +575,7 @@ async fn delete_issue_handler(
 /// Build the REST API router, mounted at `/api/v1`.
 pub fn rest_router() -> Router<AppState> {
     Router::new()
+        // Issues
         .route("/issues", get(list_issues_handler).post(create_issue_handler))
         .route("/issues/search", get(search_issues_handler))
         .route(
@@ -347,5 +583,36 @@ pub fn rest_router() -> Router<AppState> {
             get(get_issue_handler)
                 .patch(update_issue_handler)
                 .delete(delete_issue_handler),
+        )
+        // Comments
+        .route("/issues/{identifier}/comments", post(add_comment_handler))
+        // Relations
+        .route(
+            "/issues/{identifier}/relations",
+            get(list_relations_handler).post(add_relation_handler),
+        )
+        .route("/relations/{id}", delete(remove_relation_handler))
+        // Labels
+        .route("/labels", get(list_labels_handler).post(create_label_handler))
+        // Teams
+        .route("/teams", get(list_teams_handler))
+        // Statuses
+        .route("/statuses", get(list_statuses_handler))
+        // Projects
+        .route("/projects", get(list_projects_handler).post(create_project_handler))
+        .route(
+            "/projects/{id}",
+            get(get_project_handler)
+                .patch(update_project_handler)
+                .delete(delete_project_handler),
+        )
+        // Milestones
+        .route(
+            "/projects/{id}/milestones",
+            get(list_milestones_handler).post(create_milestone_handler),
+        )
+        .route(
+            "/milestones/{id}",
+            patch(update_milestone_handler).delete(delete_milestone_handler),
         )
 }
