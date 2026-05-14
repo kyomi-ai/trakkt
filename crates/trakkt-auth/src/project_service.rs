@@ -214,12 +214,14 @@ pub async fn create_project(
     let now = sql_compat::now(is_pg);
     let project_id = uuid::Uuid::new_v4().to_string();
 
+    let sd = sql_compat::cast_to_date(is_pg, "$8");
+    let td = sql_compat::cast_to_date(is_pg, "$9");
     let sql = format!(
         "INSERT INTO projects \
             (project_id, workspace_id, name, description, icon, color, \
              status, lead_id, start_date, target_date, sort_order, \
              created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, 'planned', $7, $8, $9, 0, {now}, {now})"
+         VALUES ($1, $2, $3, $4, $5, $6, 'planned', $7, {sd}, {td}, 0, {now}, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -333,11 +335,13 @@ pub async fn update_project(
         param_idx += 1;
     }
     if params.start_date.is_some() {
-        set_parts.push(format!("start_date = ${param_idx}"));
+        let cast = sql_compat::cast_to_date(is_pg, &format!("${param_idx}"));
+        set_parts.push(format!("start_date = {cast}"));
         param_idx += 1;
     }
     if params.target_date.is_some() {
-        set_parts.push(format!("target_date = ${param_idx}"));
+        let cast = sql_compat::cast_to_date(is_pg, &format!("${param_idx}"));
+        set_parts.push(format!("target_date = {cast}"));
         param_idx += 1;
     }
 
@@ -622,10 +626,11 @@ pub async fn create_milestone(
     let now = sql_compat::now(is_pg);
     let milestone_id = uuid::Uuid::new_v4().to_string();
 
+    let td = sql_compat::cast_to_date(is_pg, "$5");
     let sql = format!(
         "INSERT INTO project_milestones \
             (milestone_id, project_id, name, description, target_date, sort_order, created_at) \
-         VALUES ($1, $2, $3, $4, $5, 0, {now})"
+         VALUES ($1, $2, $3, $4, {td}, 0, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -687,6 +692,8 @@ pub async fn update_milestone(
     ws_manager: Option<&WebSocketManager>,
     workspace_id: &str,
 ) -> trakkt_core::Result<ProjectMilestone> {
+    let is_pg = db.is_postgres();
+
     // Dynamic SET clause.
     let mut set_parts: Vec<String> = Vec::new();
     let mut param_idx: usize = 1;
@@ -700,7 +707,8 @@ pub async fn update_milestone(
         param_idx += 1;
     }
     if target_date.is_some() {
-        set_parts.push(format!("target_date = ${param_idx}"));
+        let cast = sql_compat::cast_to_date(is_pg, &format!("${param_idx}"));
+        set_parts.push(format!("target_date = {cast}"));
         param_idx += 1;
     }
 
