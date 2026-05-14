@@ -15,16 +15,21 @@ use leptos_router::hooks::{use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Button, ButtonSize, ButtonVariant, EmptyState,
-    IssueStatusBadge, IssueStatusVariant,
+    Button, ButtonSize, ButtonVariant, ConfirmDialog, DatePicker, DynSelect, EmptyState,
+    IssueStatusBadge, IssueStatusVariant, INPUT_CLASS,
     PriorityIndicator, LabelBadge,
-    StatusBadge,
+    ToggleButton,
 };
-use crate::server_fns::projects::get_project;
+use crate::server_fns::projects::{
+    get_project, get_project_progress, list_milestones,
+    create_milestone, update_milestone, delete_milestone,
+    list_project_updates, create_project_update,
+    update_project,
+};
 use crate::server_fns::issues::list_issues;
+use crate::server_fns::team::list_workspace_members;
 use crate::utils::date::{format_date, format_short_date};
-use crate::utils::project::{status_label, status_variant};
-use trakkt_types::models::{IssueWithDetails, Project};
+use trakkt_types::models::{IssueWithDetails, Project, ProjectMilestone, ProjectProgress, ProjectUpdate};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Project Detail Page
@@ -56,6 +61,21 @@ pub fn ProjectDetailPage() -> impl IntoView {
         move |_| async move {
             list_issues(None, None, None, None, None, None, None, None).await
         },
+    );
+
+    let server_progress = Resource::new(
+        move || project_id.get(),
+        move |id| async move { get_project_progress(id).await },
+    );
+
+    let server_milestones = Resource::new(
+        move || project_id.get(),
+        move |id| async move { list_milestones(id).await },
+    );
+
+    let server_updates = Resource::new(
+        move || project_id.get(),
+        move |id| async move { list_project_updates(id).await },
     );
 
     // Resolve the project from SyncStore or server function.
@@ -142,8 +162,33 @@ pub fn ProjectDetailPage() -> impl IntoView {
                     match project_data.get() {
                         Some(Ok(Some(project))) => {
                             let issues = project_issues.get();
+                            let progress = server_progress.get().and_then(|r| r.ok());
+                            let milestones = match server_milestones.get() {
+                                Some(Ok(v)) => v,
+                                Some(Err(e)) => {
+                                    leptos::logging::warn!("Failed to load milestones: {e}");
+                                    Vec::new()
+                                }
+                                None => Vec::new(),
+                            };
+                            let updates = match server_updates.get() {
+                                Some(Ok(v)) => v,
+                                Some(Err(e)) => {
+                                    leptos::logging::warn!("Failed to load project updates: {e}");
+                                    Vec::new()
+                                }
+                                None => Vec::new(),
+                            };
                             view! {
-                                <ProjectDetailContent project=project issues=issues/>
+                                <ProjectDetailContent
+                                    project=project
+                                    issues=issues
+                                    progress=progress
+                                    milestones=milestones
+                                    server_milestones=server_milestones
+                                    updates=updates
+                                    server_updates=server_updates
+                                />
                             }.into_any()
                         }
                         Some(Ok(None)) => {
@@ -175,77 +220,351 @@ pub fn ProjectDetailPage() -> impl IntoView {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The main content of the project detail page — metadata + issue list.
+///
+/// Each metadata field is individually editable inline: click-to-edit name,
+/// status dropdown, lead dropdown, date pickers, and click-to-edit description.
+/// Mutations call `update_project` via `spawn_local` with optimistic local
+/// signal updates; the SyncStore will reconcile via websocket.
 #[component]
 fn ProjectDetailContent(
     project: Project,
     issues: Vec<IssueWithDetails>,
+    progress: Option<ProjectProgress>,
+    milestones: Vec<ProjectMilestone>,
+    server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
+    updates: Vec<ProjectUpdate>,
+    server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
 ) -> impl IntoView {
-    let variant = status_variant(&project.status);
-    let label = status_label(&project.status);
     let issue_count = issues.len();
+    let pid = StoredValue::new(project.project_id.clone());
+
+    // ── Editable name (click-to-edit) ────────────────────────────────────
+    let editing_name = RwSignal::new(false);
+    let name_value = RwSignal::new(project.name.clone());
+    let name_draft = RwSignal::new(project.name.clone());
+
+    let save_name = move || {
+        let new_name = name_draft.get_untracked();
+        if new_name.trim().is_empty() {
+            // Don't save empty names — revert.
+            name_draft.set(name_value.get_untracked());
+            editing_name.set(false);
+            return;
+        }
+        if new_name == name_value.get_untracked() {
+            editing_name.set(false);
+            return;
+        }
+        name_value.set(new_name.clone());
+        editing_name.set(false);
+        let project_id = pid.get_value();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = update_project(
+                project_id, Some(new_name), None, None, None, None, None, None, None,
+            ).await {
+                leptos::logging::warn!("Failed to update project name: {e}");
+            }
+        });
+    };
+
+    let name_keydown = move |ev: leptos::ev::KeyboardEvent| {
+        match ev.key().as_str() {
+            "Enter" => {
+                ev.prevent_default();
+                save_name();
+            }
+            "Escape" => {
+                ev.prevent_default();
+                name_draft.set(name_value.get_untracked());
+                editing_name.set(false);
+            }
+            _ => {}
+        }
+    };
+
+    // ── Editable status ────────────────────────────────────────────────
+    let status_value = RwSignal::new(project.status.clone());
+
+    // ── Editable lead (DynSelect) ────────────────────────────────────────
+    let lead_value = RwSignal::new(project.lead_id.clone().unwrap_or_default());
+
+    let members_resource = Resource::new(
+        || (),
+        move |_| async move { list_workspace_members().await },
+    );
+
+    let member_options = Signal::derive(move || {
+        let mut opts = vec![("".to_string(), "(Unassigned)".to_string())];
+        if let Some(Ok(members)) = members_resource.get() {
+            for m in members {
+                let label = m.name.unwrap_or_else(|| m.email.clone());
+                opts.push((m.user_id, label));
+            }
+        }
+        opts
+    });
+
+    // ── Editable dates (DatePicker) ──────────────────────────────────────
+    let start_date_value: RwSignal<Option<String>> = RwSignal::new(project.start_date.clone());
+    let target_date_value: RwSignal<Option<String>> = RwSignal::new(project.target_date.clone());
+
+    let start_date_signal = Signal::derive(move || start_date_value.get());
+    let target_date_signal = Signal::derive(move || target_date_value.get());
+
+    let on_start_date_change = {
+        Callback::new(move |v: Option<String>| {
+            start_date_value.set(v.clone());
+            let project_id = pid.get_value();
+            // Some("") = clear, Some(val) = set
+            let param = Some(v.unwrap_or_default());
+            leptos::task::spawn_local(async move {
+                if let Err(e) = update_project(
+                    project_id, None, None, None, None, None, None, param, None,
+                ).await {
+                    leptos::logging::warn!("Failed to update start date: {e}");
+                }
+            });
+        })
+    };
+
+    let on_target_date_change = {
+        Callback::new(move |v: Option<String>| {
+            target_date_value.set(v.clone());
+            let project_id = pid.get_value();
+            let param = Some(v.unwrap_or_default());
+            leptos::task::spawn_local(async move {
+                if let Err(e) = update_project(
+                    project_id, None, None, None, None, None, None, None, param,
+                ).await {
+                    leptos::logging::warn!("Failed to update target date: {e}");
+                }
+            });
+        })
+    };
+
+    // ── Editable description (click-to-edit textarea) ────────────────────
+    let editing_desc = RwSignal::new(false);
+    let desc_value = RwSignal::new(project.description.clone().unwrap_or_default());
+    let desc_draft = RwSignal::new(project.description.clone().unwrap_or_default());
+
+    let save_desc = move || {
+        let new_desc = desc_draft.get_untracked();
+        if new_desc == desc_value.get_untracked() {
+            editing_desc.set(false);
+            return;
+        }
+        desc_value.set(new_desc.clone());
+        editing_desc.set(false);
+        let project_id = pid.get_value();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = update_project(
+                project_id, None, Some(new_desc), None, None, None, None, None, None,
+            ).await {
+                leptos::logging::warn!("Failed to update description: {e}");
+            }
+        });
+    };
 
     view! {
         <div class="max-w-[860px] mx-auto w-full">
-            // ── Project name ──────────────────────────────────────────────
-            <h1 class="text-2xl font-display text-foreground">
-                {project.name.clone()}
-            </h1>
+            // ── Project name (click-to-edit) ─────────────────────────────
+            <Show
+                when=move || editing_name.get()
+                fallback=move || view! {
+                    <h1
+                        class="text-2xl font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+                        tabindex="0"
+                        role="button"
+                        aria-label="Click to edit project name"
+                        on:click=move |_| {
+                            name_draft.set(name_value.get_untracked());
+                            editing_name.set(true);
+                        }
+                        on:keydown=move |ev: leptos::ev::KeyboardEvent| {
+                            if ev.key() == "Enter" {
+                                name_draft.set(name_value.get_untracked());
+                                editing_name.set(true);
+                            }
+                        }
+                    >
+                        {move || name_value.get()}
+                    </h1>
+                }
+            >
+                <input
+                    type="text"
+                    class=format!("{INPUT_CLASS} !text-2xl !font-display !h-auto !py-1")
+                    prop:value=move || name_draft.get()
+                    on:input=move |ev| name_draft.set(event_target_value(&ev))
+                    on:keydown=name_keydown
+                    on:blur=move |_| save_name()
+                    autofocus=true
+                />
+            </Show>
 
-            // ── Metadata bar ──────────────────────────────────────────────
+            // ── Metadata bar ─────────────────────────────────────────────
             <div class="flex flex-wrap items-center gap-4 mt-4">
-                // Status
+                // Status (DynSelect for reactivity)
                 <div class="flex items-center gap-2">
                     <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Status"</span>
-                    <StatusBadge variant=variant>
-                        {label}
-                    </StatusBadge>
+                    <div class="w-36">
+                        <DynSelect
+                            value=Signal::derive(move || status_value.get())
+                            options=Signal::derive(|| vec![
+                                ("planned".to_string(), "Planned".to_string()),
+                                ("in_progress".to_string(), "In Progress".to_string()),
+                                ("paused".to_string(), "Paused".to_string()),
+                                ("completed".to_string(), "Completed".to_string()),
+                                ("cancelled".to_string(), "Cancelled".to_string()),
+                            ])
+                            on_change=move |new_status: String| {
+                                status_value.set(new_status.clone());
+                                let project_id = pid.get_value();
+                                leptos::task::spawn_local(async move {
+                                    if let Err(e) = update_project(
+                                        project_id, None, None, None, None, Some(new_status), None, None, None,
+                                    ).await {
+                                        leptos::logging::warn!("Failed to update status: {e}");
+                                    }
+                                });
+                            }
+                        />
+                    </div>
                 </div>
 
-                // Lead
-                {if project.lead_name.is_some() || project.lead_id.is_some() {
-                    let display = project.lead_name.clone()
-                        .unwrap_or_else(|| "Unknown".to_string());
-                    Some(view! {
-                        <div class="flex items-center gap-2">
-                            <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Lead"</span>
-                            <span class="text-sm text-foreground">{display}</span>
-                        </div>
-                    })
-                } else {
-                    None
-                }}
+                // Lead (DynSelect)
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Lead"</span>
+                    <div class="w-44">
+                        <DynSelect
+                            value=Signal::derive(move || lead_value.get())
+                            options=member_options
+                            on_change=move |new_lead: String| {
+                                lead_value.set(new_lead.clone());
+                                let project_id = pid.get_value();
+                                // Some("") = clear, Some(id) = set
+                                let param = Some(new_lead);
+                                leptos::task::spawn_local(async move {
+                                    if let Err(e) = update_project(
+                                        project_id, None, None, None, None, None, param, None, None,
+                                    ).await {
+                                        leptos::logging::warn!("Failed to update lead: {e}");
+                                    }
+                                });
+                            }
+                            placeholder="Unassigned"
+                        />
+                    </div>
+                </div>
 
-                // Start date
-                {project.start_date.as_deref().map(|d| {
-                    let formatted = format_date(d);
-                    view! {
-                        <div class="flex items-center gap-2">
-                            <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Start"</span>
-                            <span class="font-mono text-sm text-foreground">{formatted}</span>
-                        </div>
-                    }
-                })}
+                // Start date (DatePicker)
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Start"</span>
+                    <DatePicker
+                        value=start_date_signal
+                        on_change=on_start_date_change
+                        placeholder="Set start date"
+                    />
+                </div>
 
-                // Target date
-                {project.target_date.as_deref().map(|d| {
-                    let formatted = format_date(d);
-                    view! {
-                        <div class="flex items-center gap-2">
-                            <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Target"</span>
-                            <span class="font-mono text-sm text-foreground">{formatted}</span>
-                        </div>
-                    }
-                })}
+                // Target date (DatePicker)
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Target"</span>
+                    <DatePicker
+                        value=target_date_signal
+                        on_change=on_target_date_change
+                        placeholder="Set target date"
+                    />
+                </div>
             </div>
 
-            // ── Description ───────────────────────────────────────────────
-            {project.description.as_ref().map(|desc| {
-                view! {
-                    <div class="mt-4">
-                        <p class="text-sm text-muted-foreground">{desc.clone()}</p>
+            // ── Description (click-to-edit textarea) ─────────────────────
+            <div class="mt-4">
+                <Show
+                    when=move || editing_desc.get()
+                    fallback=move || {
+                        view! {
+                            <p
+                                class=move || {
+                                    if !desc_value.get().is_empty() {
+                                        "text-sm text-muted-foreground cursor-pointer hover:text-foreground/80 transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+                                    } else {
+                                        "text-sm text-muted-foreground/60 italic cursor-pointer hover:text-muted-foreground transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+                                    }
+                                }
+                                tabindex="0"
+                                role="button"
+                                aria-label="Click to edit description"
+                                on:click=move |_| {
+                                    desc_draft.set(desc_value.get_untracked());
+                                    editing_desc.set(true);
+                                }
+                                on:keydown=move |ev: leptos::ev::KeyboardEvent| {
+                                    if ev.key() == "Enter" {
+                                        desc_draft.set(desc_value.get_untracked());
+                                        editing_desc.set(true);
+                                    }
+                                }
+                            >
+                                {move || {
+                                    let v = desc_value.get();
+                                    if v.is_empty() {
+                                        "Add a description...".to_string()
+                                    } else {
+                                        v
+                                    }
+                                }}
+                            </p>
+                        }
+                    }
+                >
+                    <textarea
+                        class=format!("{INPUT_CLASS} !h-auto min-h-[80px] w-full resize-y")
+                        prop:value=move || desc_draft.get()
+                        on:input=move |ev| desc_draft.set(event_target_value(&ev))
+                        autofocus=true
+                    ></textarea>
+                    <div class="flex items-center gap-2 mt-2">
+                        <Button
+                            variant=ButtonVariant::Secondary
+                            size=ButtonSize::Sm
+                            on:click=move |_| save_desc()
+                        >
+                            "Save"
+                        </Button>
+                        <Button
+                            variant=ButtonVariant::GhostMuted
+                            size=ButtonSize::Sm
+                            on:click=move |_| {
+                                desc_draft.set(desc_value.get_untracked());
+                                editing_desc.set(false);
+                            }
+                        >
+                            "Cancel"
+                        </Button>
                     </div>
-                }
+                </Show>
+            </div>
+
+            // ── Progress bar ─────────────────────────────────────────────
+            {progress.filter(|p| p.total > 0).map(|p| {
+                view! { <ProgressSection progress=p/> }
             })}
+
+            // ── Milestones ──────────────────────────────────────────────
+            <MilestoneSection
+                project_id=project.project_id.clone()
+                milestones=milestones.clone()
+                issues=issues.clone()
+                server_milestones=server_milestones
+            />
+
+            // ── Health Updates ───────────────────────────────────────────
+            <HealthUpdateSection
+                project_id=project.project_id.clone()
+                updates=updates
+                server_updates=server_updates
+            />
 
             // ── Divider ───────────────────────────────────────────────────
             <div class="border-t border-border my-6"></div>
@@ -268,7 +587,8 @@ fn ProjectDetailContent(
                         description="Assign issues to this project to track them here."
                     />
                 }.into_any()
-            } else {
+            } else if milestones.is_empty() {
+                // No milestones — flat list, no grouping.
                 let rows = issues.iter().map(|issue| {
                     view! { <ProjectIssueRow issue=issue.clone()/> }
                 }).collect_view();
@@ -277,7 +597,744 @@ fn ProjectDetailContent(
                         {rows}
                     </div>
                 }.into_any()
+            } else {
+                // Group issues by milestone.
+                let mut groups: Vec<(Option<&str>, &str, Vec<&IssueWithDetails>)> = Vec::new();
+
+                for ms in &milestones {
+                    let group_issues: Vec<&IssueWithDetails> = issues
+                        .iter()
+                        .filter(|i| i.milestone_id.as_deref() == Some(ms.milestone_id.as_str()))
+                        .collect();
+                    if !group_issues.is_empty() {
+                        groups.push((Some(ms.milestone_id.as_str()), ms.name.as_str(), group_issues));
+                    }
+                }
+
+                // Collect issues with no milestone AND issues whose milestone_id
+                // doesn't match any known milestone (orphaned) into one group.
+                let known_ids: Vec<&str> = milestones.iter().map(|ms| ms.milestone_id.as_str()).collect();
+                let no_milestone: Vec<&IssueWithDetails> = issues
+                    .iter()
+                    .filter(|i| match &i.milestone_id {
+                        None => true,
+                        Some(mid) => !known_ids.contains(&mid.as_str()),
+                    })
+                    .collect();
+                if !no_milestone.is_empty() {
+                    groups.push((None, "No milestone", no_milestone));
+                }
+
+                let group_views = groups.iter().map(|(_ms_id, label, group_issues)| {
+                    let total = group_issues.len();
+                    let done = group_issues.iter().filter(|i| {
+                        i.status_category == "completed" || i.status_category == "cancelled"
+                    }).count();
+                    let status_text = format!("{done}/{total} done");
+
+                    let is_no_milestone = *label == "No milestone";
+                    let header_class = if is_no_milestone {
+                        "text-sm font-medium text-muted-foreground"
+                    } else {
+                        "text-sm font-medium text-foreground"
+                    };
+
+                    let rows = group_issues.iter().map(|issue| {
+                        view! { <ProjectIssueRow issue=(*issue).clone()/> }
+                    }).collect_view();
+
+                    view! {
+                        <div class="mb-6">
+                            <div class="flex items-center justify-between border-b border-border pb-2 mb-1">
+                                <span class=header_class>{label.to_string()}</span>
+                                <span class="text-xs text-muted-foreground">{status_text}</span>
+                            </div>
+                            <div role="list">
+                                {rows}
+                            </div>
+                        </div>
+                    }
+                }).collect_view();
+
+                view! {
+                    <div>
+                        {group_views}
+                    </div>
+                }.into_any()
             }}
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Progress Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Issue completion progress bar — teal fill over muted background.
+///
+/// Shows the fraction and percentage right-aligned: "67% (8 of 12)".
+/// Only rendered when `progress.total > 0` (guard is in the caller).
+#[component]
+fn ProgressSection(progress: ProjectProgress) -> impl IntoView {
+    let pct = progress.percent_done.round() as i64;
+    let done = progress.completed + progress.cancelled;
+
+    view! {
+        <div class="mt-6">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-sm font-medium text-foreground">"Progress"</span>
+                <span class="font-mono text-sm text-muted-foreground">
+                    {format!("{}% ({} of {})", pct, done, progress.total)}
+                </span>
+            </div>
+            <div class="h-1.5 bg-muted rounded-full overflow-hidden">
+                <div
+                    class="h-full bg-primary rounded-full transition-all duration-200"
+                    style=format!("width: {}%", progress.percent_done.clamp(0.0, 100.0))
+                ></div>
+            </div>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Milestone Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Milestone timeline section — lists project milestones with inline editing,
+/// creation, and deletion.
+///
+/// Each milestone row shows a status dot (filled if all assigned issues are
+/// done, empty ring otherwise), name, target date, issue count, and
+/// edit/delete actions.
+#[component]
+fn MilestoneSection(
+    project_id: String,
+    milestones: Vec<ProjectMilestone>,
+    issues: Vec<IssueWithDetails>,
+    server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
+) -> impl IntoView {
+    // ── State signals ──────────────────────────────────────────────────────
+    let editing_milestone_id: RwSignal<Option<String>> = RwSignal::new(None);
+    let adding_milestone: RwSignal<bool> = RwSignal::new(false);
+    let deleting_milestone_id: RwSignal<Option<String>> = RwSignal::new(None);
+
+    // Refetch callback used after mutations.
+    let refetch = move || server_milestones.refetch();
+
+    // ── Delete confirmation ────────────────────────────────────────────────
+    let delete_dialog_open = Signal::derive(move || deleting_milestone_id.get().is_some());
+
+    let on_confirm_delete = {
+        Callback::new(move |()| {
+            if let Some(mid) = deleting_milestone_id.get_untracked() {
+                deleting_milestone_id.set(None);
+                leptos::task::spawn_local(async move {
+                    if let Err(e) = delete_milestone(mid).await {
+                        leptos::logging::warn!("Failed to delete milestone: {e}");
+                    }
+                    refetch();
+                });
+            }
+        })
+    };
+
+    let on_cancel_delete = Callback::new(move |()| {
+        deleting_milestone_id.set(None);
+    });
+
+    view! {
+        <div class="mt-6">
+            <h3 class="text-sm font-medium text-foreground mb-3">"Milestones"</h3>
+
+            // ── Milestone rows ──────────────────────────────────────────
+            <div class="flex flex-col gap-1">
+                {milestones.iter().map(|ms| {
+                    let ms_id = ms.milestone_id.clone();
+                    let ms_name = ms.name.clone();
+                    let ms_target_date = ms.target_date.clone();
+
+                    // Count issues assigned to this milestone.
+                    let assigned: Vec<&IssueWithDetails> = issues
+                        .iter()
+                        .filter(|i| i.milestone_id.as_deref() == Some(&ms_id))
+                        .collect();
+                    let total = assigned.len();
+                    let done = assigned
+                        .iter()
+                        .filter(|i| {
+                            i.status_category == "completed" || i.status_category == "cancelled"
+                        })
+                        .count();
+                    let all_done = total > 0 && done == total;
+
+                    let ms_id_edit = ms_id.clone();
+                    let ms_id_delete = ms_id.clone();
+
+                    view! {
+                        <MilestoneRow
+                            milestone_id=ms_id
+                            name=ms_name
+                            target_date=ms_target_date
+                            done_count=done
+                            total_count=total
+                            all_done=all_done
+                            editing_milestone_id=editing_milestone_id
+                            on_edit=Callback::new(move |()| {
+                                editing_milestone_id.set(Some(ms_id_edit.clone()));
+                            })
+                            on_delete=Callback::new(move |()| {
+                                deleting_milestone_id.set(Some(ms_id_delete.clone()));
+                            })
+                            server_milestones=server_milestones
+                        />
+                    }
+                }).collect_view()}
+            </div>
+
+            // ── Add milestone form / button ─────────────────────────────
+            <Show
+                when=move || adding_milestone.get()
+                fallback=move || {
+                    view! {
+                        <div class="mt-2">
+                            <Button
+                                variant=ButtonVariant::GhostMuted
+                                size=ButtonSize::Sm
+                                on:click=move |_| adding_milestone.set(true)
+                            >
+                                <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                                "Add milestone"
+                            </Button>
+                        </div>
+                    }
+                }
+            >
+                <AddMilestoneForm
+                    project_id=project_id.clone()
+                    adding_milestone=adding_milestone
+                    server_milestones=server_milestones
+                />
+            </Show>
+        </div>
+
+        // ── Delete confirmation dialog ──────────────────────────────────
+        <ConfirmDialog
+            open=delete_dialog_open
+            title="Delete milestone?"
+            message="This will remove the milestone. Issues assigned to it will become unassigned."
+            confirm_text="Delete"
+            destructive=true
+            on_confirm=on_confirm_delete
+            on_cancel=on_cancel_delete
+        />
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Health Update Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the CSS class for the health status dot.
+fn health_dot_class(health: &str) -> &'static str {
+    match health {
+        "on_track" => "bg-primary",
+        "at_risk" => "bg-[var(--color-warning-foreground)]",
+        "off_track" => "bg-[var(--color-destructive)]",
+        _ => "bg-muted-foreground",
+    }
+}
+
+/// Returns the human-readable label for a health status value.
+fn health_label(health: &str) -> &'static str {
+    match health {
+        "on_track" => "On Track",
+        "at_risk" => "At Risk",
+        "off_track" => "Off Track",
+        _ => "Unknown",
+    }
+}
+
+/// Health update timeline section — lists project status updates with an
+/// inline form for posting new ones.
+///
+/// Each update card shows a colored health dot, label, formatted date,
+/// and optional body text. Cards are stacked newest-first.
+#[component]
+fn HealthUpdateSection(
+    project_id: String,
+    updates: Vec<ProjectUpdate>,
+    server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
+) -> impl IntoView {
+    let posting_update: RwSignal<bool> = RwSignal::new(false);
+    let post_health: RwSignal<String> = RwSignal::new("on_track".to_string());
+    let post_body: RwSignal<String> = RwSignal::new(String::new());
+
+    let pid = StoredValue::new(project_id.clone());
+    let do_post = move || {
+        let health_val = post_health.get_untracked();
+        let body_val = post_body.get_untracked();
+        let body_param = if body_val.trim().is_empty() {
+            None
+        } else {
+            Some(body_val)
+        };
+
+        let pid_c = pid.get_value();
+        leptos::task::spawn_local(async move {
+            match create_project_update(pid_c, health_val, body_param).await {
+                Ok(_) => {
+                    posting_update.set(false);
+                    post_health.set("on_track".to_string());
+                    post_body.set(String::new());
+                }
+                Err(e) => {
+                    leptos::logging::warn!("Failed to create project update: {e}");
+                }
+            }
+            server_updates.refetch();
+        });
+    };
+
+    let has_updates = !updates.is_empty();
+
+    view! {
+        <div class="mt-6">
+            <h3 class="text-sm font-medium text-foreground mb-3">"Updates"</h3>
+
+            // ── Update cards ──────────────────────────────────────────────
+            {if has_updates {
+                Some(view! {
+                    <div class="flex flex-col gap-2">
+                        {updates.iter().map(|update| {
+                            let dot_class = format!(
+                                "w-2 h-2 rounded-full shrink-0 {}",
+                                health_dot_class(&update.health)
+                            );
+                            let label = health_label(&update.health);
+                            let date = format_date(&update.created_at);
+                            let body = update.body.clone();
+
+                            view! {
+                                <div class="border border-border rounded-md p-3">
+                                    <div class="flex items-center gap-2">
+                                        <span class=dot_class></span>
+                                        <span class="text-sm font-medium text-foreground">{label}</span>
+                                        <span class="text-muted-foreground">{"\u{2014}"}</span>
+                                        <span class="font-mono text-xs text-muted-foreground">{date}</span>
+                                    </div>
+                                    {body.filter(|b| !b.trim().is_empty()).map(|b| {
+                                        view! {
+                                            <p class="text-sm text-foreground mt-1">{b}</p>
+                                        }
+                                    })}
+                                </div>
+                            }
+                        }).collect_view()}
+                    </div>
+                })
+            } else {
+                None
+            }}
+
+            // ── Post update form / button ─────────────────────────────────
+            <Show
+                when=move || posting_update.get()
+                fallback=move || {
+                    view! {
+                        <div class={if has_updates { "mt-2" } else { "" }}>
+                            <Button
+                                variant=ButtonVariant::GhostMuted
+                                size=ButtonSize::Sm
+                                on:click=move |_| posting_update.set(true)
+                            >
+                                <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                                "Post update"
+                            </Button>
+                        </div>
+                    }
+                }
+            >
+                <PostUpdateForm
+                    posting_update=posting_update
+                    post_health=post_health
+                    post_body=post_body
+                    on_post=Callback::new(move |()| do_post())
+                />
+            </Show>
+        </div>
+    }
+}
+
+/// Inline form for posting a new health update — health pill selector,
+/// body textarea, and Post/Cancel action buttons.
+#[component]
+fn PostUpdateForm(
+    posting_update: RwSignal<bool>,
+    post_health: RwSignal<String>,
+    post_body: RwSignal<String>,
+    on_post: Callback<()>,
+) -> impl IntoView {
+    let cancel = move || {
+        posting_update.set(false);
+        post_health.set("on_track".to_string());
+        post_body.set(String::new());
+    };
+
+    view! {
+        <div class="mt-2 border border-border rounded-md p-3">
+            // ── Health selector (pill buttons) ──────────────────────────
+            <div class="flex items-center gap-1 mb-3">
+                {["on_track", "at_risk", "off_track"].into_iter().map(|value| {
+                    let label = health_label(value);
+                    let dot_class = format!(
+                        "w-2 h-2 rounded-full shrink-0 {}",
+                        health_dot_class(value)
+                    );
+                    let value_owned = value.to_string();
+                    let value_for_click = value.to_string();
+
+                    view! {
+                        <ToggleButton
+                            variant=Signal::derive(move || {
+                                if post_health.get() == value_owned {
+                                    ButtonVariant::PillActive
+                                } else {
+                                    ButtonVariant::Pill
+                                }
+                            })
+                            size=ButtonSize::Pill
+                            on:click=move |_| post_health.set(value_for_click.clone())
+                        >
+                            <span class=dot_class.clone()></span>
+                            {label}
+                        </ToggleButton>
+                    }
+                }).collect_view()}
+            </div>
+
+            // ── Body textarea ───────────────────────────────────────────
+            <textarea
+                class=format!("{INPUT_CLASS} !h-auto min-h-[80px] w-full resize-y")
+                placeholder="What\u{2019}s the latest?"
+                prop:value=move || post_body.get()
+                on:input=move |ev| post_body.set(event_target_value(&ev))
+            ></textarea>
+
+            // ── Action buttons ──────────────────────────────────────────
+            <div class="flex items-center gap-2 mt-2">
+                <Button
+                    variant=ButtonVariant::Secondary
+                    size=ButtonSize::Sm
+                    on:click=move |_| on_post.run(())
+                >
+                    "Post"
+                </Button>
+                <Button
+                    variant=ButtonVariant::GhostMuted
+                    size=ButtonSize::Sm
+                    on:click=move |_| cancel()
+                >
+                    "Cancel"
+                </Button>
+            </div>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Milestone Row
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single milestone row — supports inline editing of name and target date.
+///
+/// Display mode: status dot + name + date + issue count + edit/delete buttons.
+/// Edit mode: name input + date picker + save on Enter/blur, cancel on Escape.
+#[component]
+fn MilestoneRow(
+    milestone_id: String,
+    name: String,
+    target_date: Option<String>,
+    done_count: usize,
+    total_count: usize,
+    all_done: bool,
+    editing_milestone_id: RwSignal<Option<String>>,
+    on_edit: Callback<()>,
+    on_delete: Callback<()>,
+    server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
+) -> impl IntoView {
+    let mid = milestone_id.clone();
+    let is_editing = Signal::derive(move || {
+        editing_milestone_id.get().as_deref() == Some(&mid)
+    });
+
+    // ── Edit state signals ──
+    let edit_name = RwSignal::new(name.clone());
+    let edit_date = RwSignal::new(target_date.clone());
+
+    // Reset edit fields when entering edit mode.
+    let name_for_reset = name.clone();
+    let date_for_reset = target_date.clone();
+    Effect::new(move || {
+        if is_editing.get() {
+            edit_name.set(name_for_reset.clone());
+            edit_date.set(date_for_reset.clone());
+        }
+    });
+
+    // ── Save handler ──
+    // Store originals so the save closure can be called multiple times (Fn, not FnOnce).
+    let original_name = StoredValue::new(name.clone());
+    let original_date = StoredValue::new(target_date.clone());
+    let mid_save = StoredValue::new(milestone_id.clone());
+
+    let do_save = move || {
+        let new_name = edit_name.get_untracked();
+        let new_date = edit_date.get_untracked();
+        editing_milestone_id.set(None);
+
+        // Only call server if something changed.
+        let name_changed = new_name != original_name.get_value();
+        let date_changed = new_date != original_date.get_value();
+        if !name_changed && !date_changed {
+            return;
+        }
+
+        let mid_c = mid_save.get_value();
+        let name_param = if name_changed { Some(new_name) } else { None };
+        // For target_date: None = no change, Some("") = clear, Some(val) = set.
+        let date_param = if date_changed {
+            Some(new_date.unwrap_or_default())
+        } else {
+            None
+        };
+        leptos::task::spawn_local(async move {
+            if let Err(e) = update_milestone(mid_c, name_param, None, date_param).await {
+                leptos::logging::warn!("Failed to update milestone: {e}");
+            }
+            server_milestones.refetch();
+        });
+    };
+
+    let save_on_keydown = move |ev: leptos::ev::KeyboardEvent| {
+        match ev.key().as_str() {
+            "Enter" => {
+                ev.prevent_default();
+                do_save();
+            }
+            "Escape" => {
+                ev.prevent_default();
+                editing_milestone_id.set(None);
+            }
+            _ => {}
+        }
+    };
+
+    // ── Date formatting ──
+    let date_display = target_date
+        .as_deref()
+        .map(format_short_date)
+        .unwrap_or_else(|| "No date".to_string());
+
+    // ── Issue count display ──
+    let count_display = format!("{done_count}/{total_count} done");
+
+    // ── Status dot class ──
+    let dot_class = if all_done {
+        "w-2 h-2 rounded-full bg-primary shrink-0"
+    } else {
+        "w-2 h-2 rounded-full border-2 border-muted-foreground shrink-0"
+    };
+
+    view! {
+        <div class="flex items-center gap-2 py-1 group">
+            // Status dot
+            <span class=dot_class></span>
+
+            <Show
+                when=move || is_editing.get()
+                fallback={
+                    let name_display = name.clone();
+                    let date_display = date_display.clone();
+                    let count_display = count_display.clone();
+                    move || view! {
+                        // Name (click to edit)
+                        <span
+                            class="text-sm text-foreground cursor-pointer hover:text-primary transition-colors duration-200"
+                            on:click=move |_| on_edit.run(())
+                        >
+                            {name_display.clone()}
+                        </span>
+
+                        // Target date
+                        <span class="font-mono text-xs text-muted-foreground">
+                            {date_display.clone()}
+                        </span>
+
+                        // Issue count
+                        <span class="text-xs text-muted-foreground">
+                            {count_display.clone()}
+                        </span>
+
+                        // Spacer to push buttons right
+                        <span class="flex-1"></span>
+
+                        // Edit button
+                        <span class="opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                            <Button
+                                variant=ButtonVariant::GhostMuted
+                                size=ButtonSize::IconXs
+                                aria_label="Edit milestone"
+                                on:click=move |_| on_edit.run(())
+                            >
+                                <Icon icon=phosphor_leptos::PENCIL_SIMPLE size="14px"/>
+                            </Button>
+                        </span>
+
+                        // Delete button
+                        <span class="opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                            <Button
+                                variant=ButtonVariant::GhostMuted
+                                size=ButtonSize::IconXs
+                                aria_label="Delete milestone"
+                                on:click=move |_| on_delete.run(())
+                            >
+                                <Icon icon=phosphor_leptos::X size="14px"/>
+                            </Button>
+                        </span>
+                    }
+                }
+            >
+                {
+                    let edit_date_signal = Signal::derive(move || edit_date.get());
+                    let on_date_change = Callback::new(move |v: Option<String>| {
+                        edit_date.set(v);
+                    });
+                    view! {
+                        // Name input
+                        <input
+                            type="text"
+                            class=format!("{INPUT_CLASS} !h-7 !py-0 !w-48")
+                            prop:value=move || edit_name.get()
+                            on:input=move |ev| {
+                                edit_name.set(event_target_value(&ev));
+                            }
+                            on:keydown=save_on_keydown
+                            autofocus=true
+                        />
+
+                        // Date picker
+                        <DatePicker
+                            value=edit_date_signal
+                            on_change=on_date_change
+                            placeholder="No date"
+                        />
+
+                        // Save / Cancel buttons
+                        <Button
+                            variant=ButtonVariant::Secondary
+                            size=ButtonSize::Xs
+                            on:click=move |_| do_save()
+                        >
+                            "Save"
+                        </Button>
+                        <Button
+                            variant=ButtonVariant::GhostMuted
+                            size=ButtonSize::Xs
+                            on:click=move |_| editing_milestone_id.set(None)
+                        >
+                            "Cancel"
+                        </Button>
+                    }
+                }
+            </Show>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Add Milestone Form
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Inline form for creating a new milestone — name input + optional date
+/// picker + Add/Cancel buttons.
+#[component]
+fn AddMilestoneForm(
+    project_id: String,
+    adding_milestone: RwSignal<bool>,
+    server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
+) -> impl IntoView {
+    let new_name = RwSignal::new(String::new());
+    let new_date: RwSignal<Option<String>> = RwSignal::new(None);
+
+    let pid = project_id.clone();
+    let do_create = move || {
+        let name_val = new_name.get_untracked();
+        if name_val.trim().is_empty() {
+            return;
+        }
+        let date_val = new_date.get_untracked();
+        adding_milestone.set(false);
+
+        let pid_c = pid.clone();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = create_milestone(pid_c, name_val, None, date_val).await {
+                leptos::logging::warn!("Failed to create milestone: {e}");
+            }
+            server_milestones.refetch();
+        });
+    };
+
+    let do_create_enter = do_create.clone();
+    let on_keydown = move |ev: leptos::ev::KeyboardEvent| {
+        match ev.key().as_str() {
+            "Enter" => {
+                ev.prevent_default();
+                do_create_enter();
+            }
+            "Escape" => {
+                ev.prevent_default();
+                adding_milestone.set(false);
+            }
+            _ => {}
+        }
+    };
+
+    let date_signal = Signal::derive(move || new_date.get());
+    let on_date_change = Callback::new(move |v: Option<String>| {
+        new_date.set(v);
+    });
+
+    view! {
+        <div class="mt-2 flex items-center gap-2">
+            <input
+                type="text"
+                class=format!("{INPUT_CLASS} !h-7 !py-0 !w-48")
+                placeholder="Milestone name"
+                prop:value=move || new_name.get()
+                on:input=move |ev| new_name.set(event_target_value(&ev))
+                on:keydown=on_keydown
+                autofocus=true
+            />
+            <DatePicker
+                value=date_signal
+                on_change=on_date_change
+                placeholder="No date"
+            />
+            <Button
+                variant=ButtonVariant::Secondary
+                size=ButtonSize::Sm
+                on:click=move |_| do_create()
+            >
+                "Add"
+            </Button>
+            <Button
+                variant=ButtonVariant::GhostMuted
+                size=ButtonSize::Sm
+                on:click=move |_| adding_milestone.set(false)
+            >
+                "Cancel"
+            </Button>
         </div>
     }
 }
