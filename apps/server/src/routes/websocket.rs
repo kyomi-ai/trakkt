@@ -386,6 +386,13 @@ async fn handle_sync_bootstrap(
             vec![]
         });
 
+    let comments = trakkt_auth::comment_service::list_comments_for_workspace(db, workspace_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(user_id, workspace_id, error = %e, "list_comments_for_workspace failed during bootstrap");
+            vec![]
+        });
+
     // 4. Get the current sync watermark.
     let latest_sync_id =
         trakkt_auth::sync_log_service::get_latest_sync_id(db, workspace_id)
@@ -440,6 +447,12 @@ async fn handle_sync_bootstrap(
         .filter_map(|n| serde_json::to_value(n).ok())
         .collect();
     stream_entities(manager, user_id, workspace_id, entity_types::NOTIFICATION, "notification_id", notification_values).await;
+
+    let comment_values: Vec<serde_json::Value> = comments
+        .iter()
+        .filter_map(|c| serde_json::to_value(c).ok())
+        .collect();
+    stream_entities(manager, user_id, workspace_id, entity_types::COMMENT, "comment_id", comment_values).await;
 
     // 6. Signal completion with the current sync watermark.
     send_sync_response(

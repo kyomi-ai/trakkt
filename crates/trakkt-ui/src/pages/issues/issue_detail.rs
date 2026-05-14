@@ -27,7 +27,7 @@ use crate::components::{
     LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton,
 };
 use crate::pages::issues::issue_list::NewIssueModal;
-use crate::server_fns::comments::{create_comment, list_comments};
+use crate::server_fns::comments::create_comment;
 use crate::server_fns::issues::{get_issue, list_issues, set_issue_labels, update_issue};
 use crate::server_fns::labels::list_labels;
 use crate::server_fns::projects::list_milestones;
@@ -248,14 +248,18 @@ fn IssueDetailContent(
         initial.get()
     });
 
-    // ── Comments: fetched locally, refetched via version bump ────────
-    let comments_tk = initial_team_key.clone();
-    let (comment_version, set_comment_version) = signal(0u32);
-    let comments_resource = Resource::new(
-        move || (comments_tk.clone(), number, comment_version.get()),
-        move |(tk, num, _)| async move { list_comments(tk, num).await },
-    );
-    let refetch_comments = Callback::new(move |()| set_comment_version.update(|v| *v += 1));
+    // ── Comments: derived from SyncStore (real-time via WebSocket) ────
+    let issue_id_for_comments = initial.get_untracked().issue_id.clone();
+    let comments = Signal::derive(move || {
+        sync_store.map(|store| {
+            let mut filtered: Vec<Comment> = store.comments().get()
+                .into_iter()
+                .filter(|c| c.issue_id == issue_id_for_comments)
+                .collect();
+            filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            filtered
+        }).unwrap_or_default()
+    });
 
     // ── Sub-issues: fetched via server function ────────────────────
     let sub_issue_issue_id = initial.get_untracked().issue_id.clone();
@@ -368,15 +372,12 @@ fn IssueDetailContent(
 
                 // ── Comments ───────────────────────────────────────────
                 {move || {
-                    let comments = comments_resource.get()
-                        .and_then(|r| r.ok())
-                        .unwrap_or_default();
+                    let c = comments.get();
                     view! {
                         <CommentsSection
                             team_key=initial.get_untracked().team_key.clone()
                             number=number
-                            comments=comments
-                            on_comment_added=refetch_comments
+                            comments=c
                         />
                     }
                 }}
@@ -1995,7 +1996,6 @@ fn CommentsSection(
     team_key: String,
     number: i32,
     comments: Vec<Comment>,
-    on_comment_added: Callback<()>,
 ) -> impl IntoView {
     // Group comments into top-level and replies
     let top_level: Vec<Comment> = comments
@@ -2046,7 +2046,7 @@ fn CommentsSection(
             </div>
 
             // ── New comment form ───────────────────────────────────────
-            <NewCommentForm team_key=team_key.clone() number=number on_created=on_comment_added/>
+            <NewCommentForm team_key=team_key.clone() number=number/>
         </div>
     }
 }
@@ -2100,7 +2100,7 @@ fn CommentItem(comment: Comment) -> impl IntoView {
 
 /// Form for adding a new comment with kode WYSIWYG editor.
 #[component]
-fn NewCommentForm(team_key: String, number: i32, on_created: Callback<()>) -> impl IntoView {
+fn NewCommentForm(team_key: String, number: i32) -> impl IntoView {
     use kode_leptos::TreeWysiwygEditor;
 
     let content = RwSignal::new(String::new());
@@ -2121,7 +2121,8 @@ fn NewCommentForm(team_key: String, number: i32, on_created: Callback<()>) -> im
                 Ok(_) => {
                     content.set(String::new());
                     set_submitting.set(false);
-                    on_created.run(());
+                    // Comment will appear reactively via the SyncStore pipeline
+                    // (server broadcasts sync action -> WS -> sync engine -> store update).
                 }
                 Err(e) => {
                     tracing::warn!("Failed to create comment: {e}");

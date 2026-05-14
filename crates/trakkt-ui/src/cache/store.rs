@@ -15,7 +15,7 @@
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
-use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
+use trakkt_types::models::{Comment, Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
 
 // ── Inner storage ─────────────────────────────────────────────────────────────
 
@@ -33,6 +33,7 @@ struct SyncStoreInner {
     views: ArcRwSignal<Vec<View>>,
     favorites: ArcRwSignal<Vec<Favorite>>,
     notifications: ArcRwSignal<Vec<Notification>>,
+    comments: ArcRwSignal<Vec<Comment>>,
     initialized: ArcRwSignal<bool>,
 }
 
@@ -71,6 +72,7 @@ impl SyncStore {
                 views: ArcRwSignal::new(Vec::new()),
                 favorites: ArcRwSignal::new(Vec::new()),
                 notifications: ArcRwSignal::new(Vec::new()),
+                comments: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
             })),
         }
@@ -126,6 +128,12 @@ impl SyncStore {
         Signal::derive(move || sig.get())
     }
 
+    /// Reactive signal over the current comments list.
+    pub fn comments(&self) -> Signal<Vec<Comment>> {
+        let sig = self.inner.with_value(|inner| inner.comments.clone());
+        Signal::derive(move || sig.get())
+    }
+
     /// `true` once the store has been hydrated from IndexedDB.
     ///
     /// Pages that read from this store should show a loading state until this
@@ -175,6 +183,11 @@ impl SyncStore {
     /// Replace the entire notifications list (called during IDB hydration).
     pub fn set_notifications(&self, items: Vec<Notification>) {
         self.inner.with_value(|inner| inner.notifications.set(items));
+    }
+
+    /// Replace the entire comments list (called during IDB hydration).
+    pub fn set_comments(&self, items: Vec<Comment>) {
+        self.inner.with_value(|inner| inner.comments.set(items));
     }
 
     // ── Single-item upserts (live sync) ───────────────────────────────────────
@@ -283,6 +296,19 @@ impl SyncStore {
         });
     }
 
+    /// Insert or update a comment by `comment_id`.
+    pub fn upsert_comment(&self, item: Comment) {
+        self.inner.with_value(|inner| {
+            inner.comments.update(|list| {
+                if let Some(existing) = list.iter_mut().find(|c| c.comment_id == item.comment_id) {
+                    *existing = item;
+                } else {
+                    list.push(item);
+                }
+            });
+        });
+    }
+
     // ── Single-item removes (delete sync) ────────────────────────────────────
 
     /// Remove an issue by `issue_id`.
@@ -357,6 +383,15 @@ impl SyncStore {
         });
     }
 
+    /// Remove a comment by `comment_id`.
+    pub fn remove_comment(&self, comment_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.comments.update(|list| {
+                list.retain(|c| c.comment_id != comment_id);
+            });
+        });
+    }
+
     // ── State transitions ─────────────────────────────────────────────────────
 
     /// Mark the store as fully hydrated from IndexedDB.
@@ -382,6 +417,7 @@ impl SyncStore {
             inner.views.set(Vec::new());
             inner.favorites.set(Vec::new());
             inner.notifications.set(Vec::new());
+            inner.comments.set(Vec::new());
             inner.initialized.set(false);
         });
     }

@@ -82,6 +82,21 @@ pub async fn create_comment(
     );
     trakkt_core::db_execute!(db, &sql, &comment_id, issue_id, user_id, body, parent_id)?;
 
+    // Re-fetch with joined user data (needed for sync broadcast and return value).
+    let row = trakkt_core::db_fetch_one!(
+        db,
+        CommentRow,
+        "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
+                u.name AS author_name, NULL AS author_avatar, \
+                CAST(c.created_at AS TEXT) AS created_at, \
+                CAST(c.updated_at AS TEXT) AS updated_at \
+         FROM comments c \
+         JOIN users u ON u.user_id = c.user_id \
+         WHERE c.comment_id = $1",
+        &comment_id
+    )?;
+    let comment = row.into_dto();
+
     // Resolve workspace once — needed for sync log, broadcast, and notifications.
     let resolved_workspace_id = get_workspace_for_issue(db, issue_id).await;
 
@@ -94,14 +109,22 @@ pub async fn create_comment(
                 &comment_id,
                 workspace_id,
                 SyncActionType::Insert,
-                None,
+                serde_json::to_value(&comment).ok(),
             )
             .await
             {
                 tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment create");
             }
             if let Some(ws) = ws_manager {
-                sync_log_service::broadcast_sync_notify(ws, entity_types::COMMENT, workspace_id).await;
+                sync_log_service::broadcast_sync_action(
+                    ws,
+                    workspace_id,
+                    entity_types::COMMENT,
+                    &comment_id,
+                    SyncActionType::Insert,
+                    serde_json::to_value(&comment).ok(),
+                )
+                .await;
             }
         }
         Err(e) => {
@@ -136,20 +159,7 @@ pub async fn create_comment(
         }
     }
 
-    // Re-fetch with joined user data.
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        CommentRow,
-        "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
-                u.name AS author_name, NULL AS author_avatar, \
-                CAST(c.created_at AS TEXT) AS created_at, \
-                CAST(c.updated_at AS TEXT) AS updated_at \
-         FROM comments c \
-         JOIN users u ON u.user_id = c.user_id \
-         WHERE c.comment_id = $1",
-        &comment_id
-    )?;
-    Ok(row.into_dto())
+    Ok(comment)
 }
 
 /// List all comments for an issue, ordered by creation date (oldest first).
@@ -171,6 +181,31 @@ pub async fn list_comments(
          WHERE c.issue_id = $1 \
          ORDER BY c.created_at ASC",
         issue_id
+    )?;
+    Ok(rows.into_iter().map(CommentRow::into_dto).collect())
+}
+
+/// List all comments for a workspace, ordered by creation date (oldest first).
+///
+/// Joins through `issues` to filter by workspace_id and includes author name.
+/// Used by the WebSocket bootstrap to hydrate the client's SyncStore.
+pub async fn list_comments_for_workspace(
+    db: &DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Vec<Comment>> {
+    let rows: Vec<CommentRow> = trakkt_core::db_fetch_all!(
+        db,
+        CommentRow,
+        "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
+                u.name AS author_name, NULL AS author_avatar, \
+                CAST(c.created_at AS TEXT) AS created_at, \
+                CAST(c.updated_at AS TEXT) AS updated_at \
+         FROM comments c \
+         JOIN issues i ON i.issue_id = c.issue_id \
+         JOIN users u ON u.user_id = c.user_id \
+         WHERE i.workspace_id = $1 \
+         ORDER BY c.created_at ASC",
+        workspace_id
     )?;
     Ok(rows.into_iter().map(CommentRow::into_dto).collect())
 }
@@ -234,14 +269,22 @@ pub async fn update_comment(
                 comment_id,
                 &workspace_id,
                 SyncActionType::Update,
-                None,
+                serde_json::to_value(&comment).ok(),
             )
             .await
             {
                 tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment update");
             }
             if let Some(ws) = ws_manager {
-                sync_log_service::broadcast_sync_notify(ws, entity_types::COMMENT, &workspace_id).await;
+                sync_log_service::broadcast_sync_action(
+                    ws,
+                    &workspace_id,
+                    entity_types::COMMENT,
+                    comment_id,
+                    SyncActionType::Update,
+                    serde_json::to_value(&comment).ok(),
+                )
+                .await;
             }
         }
         Err(e) => {
@@ -305,7 +348,15 @@ pub async fn delete_comment(
                 tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment delete");
             }
             if let Some(ws) = ws_manager {
-                sync_log_service::broadcast_sync_notify(ws, entity_types::COMMENT, &workspace_id).await;
+                sync_log_service::broadcast_sync_action(
+                    ws,
+                    &workspace_id,
+                    entity_types::COMMENT,
+                    comment_id,
+                    SyncActionType::Delete,
+                    None,
+                )
+                .await;
             }
         }
         Err(e) => {
