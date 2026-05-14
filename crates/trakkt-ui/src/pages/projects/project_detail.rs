@@ -556,7 +556,7 @@ fn ProjectDetailContent(
             // ── Milestones ──────────────────────────────────────────────
             <MilestoneSection
                 project_id=project.project_id.clone()
-                milestones=milestones
+                milestones=milestones.clone()
                 issues=issues.clone()
                 server_milestones=server_milestones
             />
@@ -589,13 +589,78 @@ fn ProjectDetailContent(
                         description="Assign issues to this project to track them here."
                     />
                 }.into_any()
-            } else {
+            } else if milestones.is_empty() {
+                // No milestones — flat list, no grouping.
                 let rows = issues.iter().map(|issue| {
                     view! { <ProjectIssueRow issue=issue.clone()/> }
                 }).collect_view();
                 view! {
                     <div role="list">
                         {rows}
+                    </div>
+                }.into_any()
+            } else {
+                // Group issues by milestone.
+                let mut groups: Vec<(Option<&str>, &str, Vec<&IssueWithDetails>)> = Vec::new();
+
+                for ms in &milestones {
+                    let group_issues: Vec<&IssueWithDetails> = issues
+                        .iter()
+                        .filter(|i| i.milestone_id.as_deref() == Some(ms.milestone_id.as_str()))
+                        .collect();
+                    if !group_issues.is_empty() {
+                        groups.push((Some(ms.milestone_id.as_str()), ms.name.as_str(), group_issues));
+                    }
+                }
+
+                // Collect issues with no milestone AND issues whose milestone_id
+                // doesn't match any known milestone (orphaned) into one group.
+                let known_ids: Vec<&str> = milestones.iter().map(|ms| ms.milestone_id.as_str()).collect();
+                let no_milestone: Vec<&IssueWithDetails> = issues
+                    .iter()
+                    .filter(|i| match &i.milestone_id {
+                        None => true,
+                        Some(mid) => !known_ids.contains(&mid.as_str()),
+                    })
+                    .collect();
+                if !no_milestone.is_empty() {
+                    groups.push((None, "No milestone", no_milestone));
+                }
+
+                let group_views = groups.iter().map(|(_ms_id, label, group_issues)| {
+                    let total = group_issues.len();
+                    let done = group_issues.iter().filter(|i| {
+                        i.status_category == "completed" || i.status_category == "cancelled"
+                    }).count();
+                    let status_text = format!("{done}/{total} done");
+
+                    let is_no_milestone = *label == "No milestone";
+                    let header_class = if is_no_milestone {
+                        "text-sm font-medium text-muted-foreground"
+                    } else {
+                        "text-sm font-medium text-foreground"
+                    };
+
+                    let rows = group_issues.iter().map(|issue| {
+                        view! { <ProjectIssueRow issue=(*issue).clone()/> }
+                    }).collect_view();
+
+                    view! {
+                        <div class="mb-6">
+                            <div class="flex items-center justify-between border-b border-border pb-2 mb-1">
+                                <span class=header_class>{label.to_string()}</span>
+                                <span class="text-xs text-muted-foreground">{status_text}</span>
+                            </div>
+                            <div role="list">
+                                {rows}
+                            </div>
+                        </div>
+                    }
+                }).collect_view();
+
+                view! {
+                    <div>
+                        {group_views}
                     </div>
                 }.into_any()
             }}
