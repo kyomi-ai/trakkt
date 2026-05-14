@@ -125,22 +125,48 @@ pub fn LoginPage(
     };
 
     // ── Already authenticated? Redirect away from login page ──────────
-    // Matches React: Login.jsx line 124 — `if (isAuthenticated) { navigate(redirect) }`
-    //
-    // Uses spawn_local (not Resource::new) so it doesn't consume a serialized
-    // resource ID. Resource IDs must be identical between SSR and client or
-    // hydration markers will be misaligned, causing a tachys panic.
+    // For OAuth flows (oauth_continue param present), the redirect target is
+    // /api/v1/oauth/authorize/continue which consumes a one-time Redis state
+    // via GETDEL. Only one request may hit that endpoint. To prevent a race
+    // between this auto-redirect and the login form's success handler, we
+    // gate the form behind `oauth_checking`: true while the auth check is
+    // in-flight, false once we know the user must log in. If they're already
+    // authenticated, we redirect immediately and the form never appears.
     #[cfg(target_arch = "wasm32")]
-    {
+    let oauth_checking = {
+        let query = use_query_map();
+        let has_oauth = query.with_untracked(|q| {
+            q.get("oauth_continue").filter(|s| !s.is_empty()).is_some()
+        });
+        let (checking, set_checking) = signal(has_oauth);
+
         let redirect_for_check = redirect_url;
         let nav_for_check = navigate;
         let user_ctx = leptos::prelude::expect_context::<leptos::prelude::LocalResource<Result<crate::server_fns::context::UserContext, leptos::prelude::ServerFnError>>>();
         Effect::new(move || {
-            if let Some(Ok(_)) = user_ctx.get() {
-                nav_for_check.get_value()(&redirect_for_check(), Default::default());
+            match user_ctx.get() {
+                Some(Ok(_)) => {
+                    let dest = redirect_for_check();
+                    if dest.starts_with("/api/") {
+                        if let Some(window) = web_sys::window() {
+                            let _ = window.location().set_href(&dest);
+                        }
+                    } else {
+                        nav_for_check.get_value()(&dest, Default::default());
+                    }
+                }
+                Some(Err(_)) => {
+                    set_checking.set(false);
+                }
+                None => {}
             }
         });
-    }
+
+        checking
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let oauth_checking = signal(false).0;
 
     // ── Auth config resource ────────────────────────────────────────────
     let auth_config = Resource::new(|| (), |_| get_auth_config());

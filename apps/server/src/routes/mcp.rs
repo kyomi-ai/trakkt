@@ -327,12 +327,12 @@ async fn handle_post(
 ) -> Response {
     let is_initialize = request.method == "initialize";
 
-    // Authenticate all requests except `initialize` (which triggers the OAuth flow).
-    // In personal mode, bypass auth entirely.
-    if !is_initialize && request.method != "notifications/initialized" && !state.config.is_personal()
-        && resolve_mcp_auth(&headers, &state).await.is_none()
-    {
-        return StatusCode::UNAUTHORIZED.into_response();
+    // Authenticate ALL requests in non-personal mode. Claude.ai uses the 401
+    // on `initialize` to discover that OAuth is required and prompt the user.
+    // Letting `initialize` through unauthenticated causes claude.ai to think
+    // it's connected and show "no tools available" instead of prompting for auth.
+    if !state.config.is_personal() && resolve_mcp_auth(&headers, &state).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Not authenticated"}))).into_response();
     }
 
     let response = match request.method.as_str() {
@@ -367,8 +367,14 @@ async fn handle_post(
 // GET /mcp — SSE stream (placeholder)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn handle_sse(_headers: HeaderMap) -> impl IntoResponse {
-    (StatusCode::OK, "event: ping\ndata: {}\n\n")
+async fn handle_sse(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if resolve_mcp_auth(&headers, &state).await.is_none() && !state.config.is_personal() {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Not authenticated"}))).into_response();
+    }
+    (StatusCode::OK, "event: ping\ndata: {}\n\n").into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
