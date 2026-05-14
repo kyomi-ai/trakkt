@@ -30,7 +30,7 @@ use crate::components::{
     Alert, AlertVariant,
     Button, ButtonSize, ButtonVariant, ConfirmDialog, EmptyState,
     Modal, ModalSize,
-    SearchInput, StyledSelect, INPUT_CLASS,
+    SearchInput, StyledSelect, TeamIcon, INPUT_CLASS,
 };
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{
@@ -546,8 +546,18 @@ fn IssueListInner(
         <div class="bg-background flex flex-col h-full">
             // ── Page header ─────────────────────────────────────────────────
             <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
-                <h1 class="text-sm font-semibold text-foreground">
-                    {move || resolved_team.get().map(|t| t.name.clone()).unwrap_or_else(|| "Issues".to_string())}
+                <h1 class="flex items-center gap-2 text-sm font-semibold text-foreground">
+                    {move || {
+                        if let Some(team) = resolved_team.get() {
+                            let name = team.name.clone();
+                            view! {
+                                <TeamIcon team=team size="20px"/>
+                                <span>{name}</span>
+                            }.into_any()
+                        } else {
+                            view! { <span>"Issues"</span> }.into_any()
+                        }
+                    }}
                 </h1>
                 <div class="flex items-center gap-3">
                     // View toggle (segmented control)
