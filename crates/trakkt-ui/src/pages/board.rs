@@ -662,7 +662,92 @@ fn BoardColumn(
                         && let Ok(issue_id) = dt.get_data("text/plain")
                         && !issue_id.is_empty()
                     {
+                        // ── FLIP animation: capture FIRST rect ──────────────
+                        let card_id = format!("card-{issue_id}");
+                        let first_rect = leptos::prelude::document()
+                            .get_element_by_id(&card_id)
+                            .map(|el| el.get_bounding_client_rect());
+
                         on_drop.run((issue_id, status_id_drop.clone(), insert_idx));
+
+                        let reduced_motion = web_sys::window()
+                            .and_then(|w| w.match_media("(prefers-reduced-motion: reduce)").ok().flatten())
+                            .is_some_and(|mql| mql.matches());
+
+                        if !reduced_motion {
+                            if let Some(first) = first_rect {
+                                let first_left = first.left();
+                                let first_top = first.top();
+                                let card_id_for_raf = card_id.clone();
+
+                                request_animation_frame(move || {
+                                    let Some(el) = leptos::prelude::document()
+                                        .get_element_by_id(&card_id_for_raf)
+                                    else {
+                                        return;
+                                    };
+                                    let last = el.get_bounding_client_rect();
+                                    let delta_x = first_left - last.left();
+                                    let delta_y = first_top - last.top();
+
+                                    if delta_x.abs() < 1.0 && delta_y.abs() < 1.0 {
+                                        return;
+                                    }
+
+                                    let html_el: web_sys::HtmlElement = el.unchecked_into();
+                                    let style = html_el.style();
+                                    if let Err(e) = style.set_property("transform", &format!("translate({delta_x}px, {delta_y}px)")) {
+                                        tracing::warn!("FLIP: failed to set transform: {e:?}");
+                                    }
+                                    if let Err(e) = style.set_property("transition", "none") {
+                                        tracing::warn!("FLIP: failed to set transition: {e:?}");
+                                    }
+                                    if let Err(e) = style.set_property("z-index", "50") {
+                                        tracing::warn!("FLIP: failed to set z-index: {e:?}");
+                                    }
+
+                                    let card_id_for_play = card_id_for_raf.clone();
+
+                                    request_animation_frame(move || {
+                                        let Some(el) = leptos::prelude::document()
+                                            .get_element_by_id(&card_id_for_play)
+                                        else {
+                                            return;
+                                        };
+                                        let html_el: web_sys::HtmlElement = el.unchecked_into();
+                                        let style = html_el.style();
+                                        if let Err(e) = style.set_property("transition", "transform 300ms cubic-bezier(0.45, 0, 0.55, 1)") {
+                                            tracing::warn!("FLIP: failed to set transition: {e:?}");
+                                        }
+                                        if let Err(e) = style.set_property("transform", "translate(0, 0)") {
+                                            tracing::warn!("FLIP: failed to set transform: {e:?}");
+                                        }
+
+                                        let card_id_for_cleanup = card_id_for_play.clone();
+                                        set_timeout(
+                                            move || {
+                                                if let Some(el) = leptos::prelude::document()
+                                                    .get_element_by_id(&card_id_for_cleanup)
+                                                {
+                                                    let html_el: web_sys::HtmlElement = el.unchecked_into();
+                                                    let style = html_el.style();
+                                                    if let Err(e) = style.remove_property("transform") {
+                                                        tracing::warn!("FLIP: failed to remove transform: {e:?}");
+                                                    }
+                                                    if let Err(e) = style.remove_property("transition") {
+                                                        tracing::warn!("FLIP: failed to remove transition: {e:?}");
+                                                    }
+                                                    if let Err(e) = style.remove_property("z-index") {
+                                                        tracing::warn!("FLIP: failed to remove z-index: {e:?}");
+                                                    }
+                                                }
+                                            },
+                                            std::time::Duration::from_millis(320),
+                                        );
+                                    });
+                                });
+                            }
+                        }
                     }
                     set_drag_target.set(None);
                     set_drop_insert_idx.set(None);
@@ -814,8 +899,11 @@ fn BoardCard(
         });
     };
 
+    let card_dom_id = format!("card-{issue_id}");
+
     view! {
         <div
+            id=card_dom_id
             class=card_class
             draggable="true"
             tabindex="0"
