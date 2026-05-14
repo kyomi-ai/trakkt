@@ -257,7 +257,7 @@ fn IssueDetailContent(
                 .into_iter()
                 .filter(|c| c.issue_id == issue_id_for_comments)
                 .collect();
-            filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            filtered.sort_by_key(|a| a.created_at);
             filtered
         }).unwrap_or_default()
     });
