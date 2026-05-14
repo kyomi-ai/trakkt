@@ -24,7 +24,9 @@
 use std::collections::HashSet;
 
 use leptos::prelude::*;
-use leptos_router::hooks::use_navigate;
+use leptos_router::hooks::{use_location, use_navigate};
+use leptos_router::location::State;
+use leptos_router::NavigateOptions;
 use phosphor_leptos::Icon;
 use wasm_bindgen::JsCast;
 
@@ -32,6 +34,7 @@ use crate::components::{Avatar, Button, ButtonSize, ButtonVariant, Checkbox, Iss
 use crate::pages::issues::filters::{LabelFilterDropdown, PriorityFilterDropdown, ProjectFilterDropdown};
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::server_fns::issues::{update_issue, set_issue_sort_order};
+use crate::types::IssueNavState;
 use trakkt_types::models::{IssueWithDetails, Status};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -793,13 +796,22 @@ fn BoardCard(
     let issue_href_for_click = issue_href.clone();
     let issue_href_for_keydown = issue_href.clone();
 
+    let location = use_location();
+
     let navigate_to_issue = move |_: web_sys::MouseEvent| {
         if did_drag.get_untracked() {
             set_did_drag.set(false);
             return;
         }
+        let path = location.pathname.get_untracked();
+        let search = location.search.get_untracked();
+        let nav_state = IssueNavState::from_current_path(&path, &search);
+        let json = nav_state.to_json();
         let nav = use_navigate();
-        nav(&issue_href_for_click, Default::default());
+        nav(&issue_href_for_click, NavigateOptions {
+            state: State::from(wasm_bindgen::JsValue::from_str(&json)),
+            ..Default::default()
+        });
     };
 
     view! {
@@ -838,8 +850,15 @@ fn BoardCard(
             on:click=navigate_to_issue
             on:keydown=move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Enter" {
+                    let path = location.pathname.get_untracked();
+                    let search = location.search.get_untracked();
+                    let nav_state = IssueNavState::from_current_path(&path, &search);
+                    let json = nav_state.to_json();
                     let nav = use_navigate();
-                    nav(&issue_href_for_keydown, Default::default());
+                    nav(&issue_href_for_keydown, NavigateOptions {
+                        state: State::from(wasm_bindgen::JsValue::from_str(&json)),
+                        ..Default::default()
+                    });
                 }
             }
         >

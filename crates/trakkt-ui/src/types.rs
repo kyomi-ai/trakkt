@@ -68,6 +68,68 @@ pub struct TeamInvitation {
     pub expires_at: String,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue navigation state (browser history state for back button)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// State passed via the browser History API when navigating to an issue.
+///
+/// Allows the issue detail back button to return to the originating view
+/// (team issues, board, my issues, project view) instead of a hardcoded path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IssueNavState {
+    pub back_path: String,
+    pub back_label: String,
+}
+
+impl IssueNavState {
+    /// Build nav state from the current router location.
+    ///
+    /// Combines `path` and `search` into `back_path` and derives a
+    /// human-readable `back_label` for the back button tooltip.
+    pub fn from_current_path(path: &str, search: &str) -> Self {
+        let back_path = if search.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{search}")
+        };
+        let back_label = derive_back_label(path);
+        Self { back_path, back_label }
+    }
+
+    pub fn to_json(&self) -> String {
+        match serde_json::to_string(self) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("Failed to serialize IssueNavState: {e}");
+                String::new()
+            }
+        }
+    }
+}
+
+/// Derive a human-readable label from a URL path for the back button.
+fn derive_back_label(path: &str) -> String {
+    if path == "/my-issues" {
+        return "My Issues".to_string();
+    }
+    // /teams/TRA/issues → "TRA Issues"
+    if let Some(rest) = path.strip_prefix("/teams/")
+        && let Some(key) = rest.split('/').next()
+    {
+        return format!("{key} Issues");
+    }
+    // /projects/:id → "Project Issues"
+    if path.starts_with("/projects/") {
+        return "Project Issues".to_string();
+    }
+    // /inbox → "Inbox"
+    if path == "/inbox" {
+        return "Inbox".to_string();
+    }
+    "Issues".to_string()
+}
+
 /// A pending ownership transfer.
 ///
 /// Mirrors the JSON shape returned by `GET /api/v1/workspaces/ownership/transfers`.

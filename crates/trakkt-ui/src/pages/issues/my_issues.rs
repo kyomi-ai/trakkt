@@ -19,7 +19,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use leptos::prelude::*;
-use leptos_router::hooks::use_navigate;
+use leptos_router::hooks::{use_location, use_navigate};
+use leptos_router::location::State;
+use leptos_router::NavigateOptions;
 use phosphor_leptos::Icon;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -35,6 +37,7 @@ use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::issues::list_issues;
 use crate::server_fns::watchers::list_watched_issue_ids;
+use crate::types::IssueNavState;
 use crate::utils::keyboard::is_input_focused;
 use trakkt_types::models::IssueWithDetails;
 
@@ -229,6 +232,7 @@ pub fn MyIssuesPage() -> impl IntoView {
 
     // ── j/k/Enter keyboard listener (window-level, active on this page) ────
     let nav = use_navigate();
+    let location = use_location();
     Effect::new(move |_| {
         let Some(window) = web_sys::window() else { return };
         let nav = nav.clone();
@@ -266,7 +270,14 @@ pub fn MyIssuesPage() -> impl IntoView {
                         let ids = issue_identifiers.get_untracked();
                         if let Some(identifier) = ids.get(idx) {
                             ev.prevent_default();
-                            nav(&format!("/issues/{identifier}"), Default::default());
+                            let path = location.pathname.get_untracked();
+                            let search = location.search.get_untracked();
+                            let nav_state = IssueNavState::from_current_path(&path, &search);
+                            let json = nav_state.to_json();
+                            nav(&format!("/issues/{identifier}"), NavigateOptions {
+                                state: State::from(wasm_bindgen::JsValue::from_str(&json)),
+                                ..Default::default()
+                            });
                         }
                     }
                 }

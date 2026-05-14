@@ -8,10 +8,14 @@
 //! Order: Priority | Status | Issue ID (with team key) | Title | Labels | Date | Assignee
 
 use leptos::prelude::*;
+use leptos_router::hooks::{use_location, use_navigate};
+use leptos_router::location::State;
+use leptos_router::NavigateOptions;
 
 use crate::components::{
     Avatar, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator,
 };
+use crate::types::IssueNavState;
 use crate::utils::date::format_short_date;
 use trakkt_types::models::IssueWithDetails;
 
@@ -45,8 +49,10 @@ pub fn IssueRow(
 ) -> impl IntoView {
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
     let issue_href = format!("/issues/{issue_key}");
+    let issue_href_click = issue_href.clone();
     let status = IssueStatusVariant::parse(&issue.status_category);
     let row_ref = NodeRef::<leptos::html::A>::new();
+    let location = use_location();
 
     let is_selected = Memo::new(move |_| selected_index.get() == Some(index));
 
@@ -79,6 +85,25 @@ pub fn IssueRow(
             class=row_class
             role="listitem"
             tabindex="0"
+            on:click={
+                let issue_href = issue_href_click.clone();
+                move |ev: web_sys::MouseEvent| {
+                    // Let modifier clicks (ctrl, meta, shift, middle-click) use default browser behavior
+                    if ev.meta_key() || ev.ctrl_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0 {
+                        return;
+                    }
+                    ev.prevent_default();
+                    let path = location.pathname.get_untracked();
+                    let search = location.search.get_untracked();
+                    let nav_state = IssueNavState::from_current_path(&path, &search);
+                    let json = nav_state.to_json();
+                    let nav = use_navigate();
+                    nav(&issue_href, NavigateOptions {
+                        state: State::from(wasm_bindgen::JsValue::from_str(&json)),
+                        ..Default::default()
+                    });
+                }
+            }
         >
             // Priority icon (first — most important for triage scanning)
             <PriorityIndicator priority=issue.priority/>
