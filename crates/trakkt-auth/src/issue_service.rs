@@ -132,7 +132,7 @@ const ISSUE_DETAIL_SELECT: &str = "\
            i.priority, \
            i.assignee_id, assignee.name AS assignee_name, \
            i.creator_id, creator.name AS creator_name, \
-           CAST(i.due_date AS TEXT) AS due_date, \
+           SUBSTR(CAST(i.due_date AS TEXT), 1, 10) AS due_date, \
            i.project_id, p.name AS project_name, i.milestone_id, \
            (SELECT t2.key || '-' || p2.number FROM issue_relations r2 \
             JOIN issues p2 ON p2.issue_id = r2.source_issue_id \
@@ -313,7 +313,7 @@ pub async fn create_issue(
         IssueRow,
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
-                CAST(due_date AS TEXT) AS due_date, \
+                SUBSTR(CAST(due_date AS TEXT), 1, 10) AS due_date, \
                 project_id, milestone_id, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
@@ -709,7 +709,7 @@ pub async fn update_issue(
         IssueRow,
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
-                CAST(due_date AS TEXT) AS due_date, \
+                SUBSTR(CAST(due_date AS TEXT), 1, 10) AS due_date, \
                 project_id, milestone_id, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
@@ -809,7 +809,7 @@ pub async fn delete_issue(
         sqlx::query_as::<_, IssueRow>(
             "SELECT i.issue_id, i.workspace_id, i.team_id, i.number, i.title, i.description, \
                     i.status_id, i.priority, i.assignee_id, i.creator_id, \
-                    CAST(i.due_date AS TEXT) AS due_date, \
+                    SUBSTR(CAST(i.due_date AS TEXT), 1, 10) AS due_date, \
                     i.project_id, i.milestone_id, i.sort_order, \
                     CAST(i.created_at AS TEXT) AS created_at, \
                     CAST(i.updated_at AS TEXT) AS updated_at \

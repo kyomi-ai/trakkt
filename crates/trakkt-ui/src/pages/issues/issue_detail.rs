@@ -22,7 +22,7 @@ use phosphor_leptos::Icon;
 
 use crate::components::{
     Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
-    DropdownItem, DropdownMenu, DropdownTrigger,
+    DatePicker, DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
     LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton,
 };
@@ -675,6 +675,24 @@ fn MetadataSidebar(
         });
     };
 
+    // ── Due date change handler ───────────────────────────────────────
+    let on_due_date_change = move |date: Option<String>| {
+        let tk = stored_tk.get_value();
+        let is_clear = date.is_none();
+        leptos::task::spawn_local(async move {
+            let _ = update_issue(
+                tk,
+                number,
+                None, None, None, None, None,
+                date,
+                None, None, None,
+                if is_clear { Some("due_date".to_string()) } else { None },
+            )
+            .await;
+            on_change.run(());
+        });
+    };
+
     let status_variant = IssueStatusVariant::parse(&current_status_category);
     let (status_open, set_status_open) = signal(false);
     let (priority_open, set_priority_open) = signal(false);
@@ -1152,18 +1170,14 @@ fn MetadataSidebar(
                 }
             }
 
-            // ── Due date (display only — date picker is future work) ───
+            // ── Due date ────────────────────────────────────────────────
             <div>
                 <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Due"</div>
-                {if let Some(ref date) = issue.due_date {
-                    view! {
-                        <span class="text-sm text-foreground">{date.clone()}</span>
-                    }.into_any()
-                } else {
-                    view! {
-                        <span class="text-sm text-muted-foreground">"No due date"</span>
-                    }.into_any()
-                }}
+                <DatePicker
+                    value=Signal::derive(move || issue.due_date.clone())
+                    on_change=Callback::new(on_due_date_change)
+                    placeholder="Set due date..."
+                />
             </div>
 
             // ── Watch toggle ──────────────────────────────────────────────
