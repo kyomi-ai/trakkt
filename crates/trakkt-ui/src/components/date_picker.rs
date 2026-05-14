@@ -35,7 +35,8 @@ const TRIGGER_BASE: &str = "inline-flex items-center gap-1.5 whitespace-nowrap \
 /// Generate a 6x7 (42-day) calendar grid starting from Monday of the week
 /// containing the first day of the given month.
 fn calendar_grid(year: i32, month: u32) -> Vec<NaiveDate> {
-    let first_of_month = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+    let first_of_month = NaiveDate::from_ymd_opt(year, month, 1)
+        .expect("calendar_grid called with invalid year/month");
     // Monday = 0, Sunday = 6
     let start_offset = first_of_month.weekday().num_days_from_monday();
     let grid_start = first_of_month - Duration::days(start_offset as i64);
@@ -77,7 +78,7 @@ fn today_or_fallback() -> NaiveDate {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        NaiveDate::from_ymd_opt(2000, 1, 1).unwrap()
+        NaiveDate::from_ymd_opt(2000, 1, 1).expect("constant date")
     }
 }
 
