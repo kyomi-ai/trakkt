@@ -100,6 +100,22 @@ pub async fn list_sub_issues(
     Ok(sub_issues)
 }
 
+/// Get the parent issue ID for a given child issue (team_key + number).
+///
+/// Returns `None` if the issue has no parent.
+#[server(prefix = "/leptos-api")]
+pub async fn get_parent_issue_id(
+    team_key: String,
+    number: i32,
+) -> Result<Option<String>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let issue_id = resolve_issue_id(ac.db(), &ac.ws_id, &team_key, number).await?;
+    let parent_id = trakkt_auth::relation_service::get_parent_issue_id(ac.db(), &issue_id)
+        .await
+        .into_sfn()?;
+    Ok(parent_id)
+}
+
 // ─── Write operations ──────────────────────────────────────────────────────
 
 /// Create a new issue in the specified team, or the default team if none given.
@@ -151,12 +167,26 @@ pub async fn create_issue(
         label_ids: parsed_label_ids,
         project_id,
         milestone_id,
-        parent_issue_id: resolved_parent_issue_id,
     };
 
     let issue = trakkt_auth::issue_service::create_issue(ac.db(), &params, ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
+
+    // If a parent was specified, create the parent relation after issue creation.
+    if let Some(parent_id) = resolved_parent_issue_id {
+        trakkt_auth::relation_service::set_parent(
+            ac.db(),
+            &ac.ws_id,
+            &issue.issue_id,
+            &parent_id,
+            Some(&ac.auth.user_id),
+            ac.ctx.ws_manager.as_ref(),
+        )
+        .await
+        .into_sfn()?;
+    }
+
     Ok(issue)
 }
 
@@ -171,6 +201,10 @@ pub async fn create_issue(
 ///
 /// `clear_fields` is a comma-separated list of relation fields to set to NULL:
 /// `"sort_order"`, `"parent"`, `"project"`, `"milestone"` (any combination).
+///
+/// Parent issue changes are handled via `relation_service` rather than the issues
+/// table. Pass `parent_issue_id` to set a parent, or include `"parent"` in
+/// `clear_fields` to remove the current parent.
 #[server(prefix = "/leptos-api")]
 pub async fn update_issue(
     team_key: String,
@@ -212,17 +246,38 @@ pub async fn update_issue(
         } else {
             milestone_id.map(|s| if s.is_empty() { None } else { Some(s) })
         },
-        parent_issue_id: if clears.contains(&"parent") {
-            Some(None)
-        } else {
-            parent_issue_id.map(|s| if s.is_empty() { None } else { Some(s) })
-        },
         sort_order: if clears.contains(&"sort_order") { Some(None) } else { None },
         team_id: None,
     };
     let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, &team_key, number, &updates, Some(&ac.auth.user_id), ac.ctx.ws_manager.as_ref())
         .await
         .into_sfn()?;
+
+    // Handle parent relation changes via relation_service.
+    if clears.contains(&"parent") {
+        trakkt_auth::relation_service::clear_parent(
+            ac.db(),
+            &ac.ws_id,
+            &issue.issue_id,
+            ac.ctx.ws_manager.as_ref(),
+        )
+        .await
+        .into_sfn()?;
+    } else if let Some(ref new_parent_id) = parent_issue_id
+        && !new_parent_id.is_empty()
+    {
+        trakkt_auth::relation_service::set_parent(
+            ac.db(),
+            &ac.ws_id,
+            &issue.issue_id,
+            new_parent_id,
+            Some(&ac.auth.user_id),
+            ac.ctx.ws_manager.as_ref(),
+        )
+        .await
+        .into_sfn()?;
+    }
+
     Ok(issue)
 }
 

@@ -710,22 +710,22 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "add_relation",
-                "description": "Add a relation between two issues. Currently supports 'blocks' relation type (directional: source blocks target).",
+                "description": "Add a relation between two issues. Supports 'blocks' (source blocks target) and 'parent' (source is parent of target) relation types.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "source_issue": {
                             "type": "string",
-                            "description": "Source issue identifier in 'TRA-35' format (the issue that blocks)"
+                            "description": "Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue."
                         },
                         "target_issue": {
                             "type": "string",
-                            "description": "Target issue identifier in 'TRA-35' format (the issue that is blocked)"
+                            "description": "Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue."
                         },
                         "relation_type": {
                             "type": "string",
-                            "description": "Relation type. Currently only 'blocks' is supported.",
-                            "enum": ["blocks"]
+                            "description": "Relation type: 'blocks' or 'parent'.",
+                            "enum": ["blocks", "parent"]
                         }
                     },
                     "required": ["source_issue", "target_issue", "relation_type"]
@@ -1033,6 +1033,8 @@ async fn tool_create_issue(
         })
         .unwrap_or_default();
 
+    let parent_issue_id = args.get("parent_issue_id").and_then(|v| v.as_str()).map(String::from);
+
     let params = CreateIssueParams {
         workspace_id: auth.workspace_id.clone(),
         team_id: resolved_team_id,
@@ -1045,10 +1047,23 @@ async fn tool_create_issue(
         label_ids,
         project_id: args.get("project_id").and_then(|v| v.as_str()).map(String::from),
         milestone_id: args.get("milestone_id").and_then(|v| v.as_str()).map(String::from),
-        parent_issue_id: args.get("parent_issue_id").and_then(|v| v.as_str()).map(String::from),
     };
 
     let issue = issue_service::create_issue(&state.db, &params, Some(&state.ws_manager)).await?;
+
+    // If a parent was specified, create the parent relation after issue creation.
+    if let Some(ref parent_id) = parent_issue_id {
+        relation_service::set_parent(
+            &state.db,
+            &auth.workspace_id,
+            &issue.issue_id,
+            parent_id,
+            Some(&auth.user_id),
+            Some(&state.ws_manager),
+        )
+        .await?;
+    }
+
     serde_json::to_string_pretty(&issue).map_err(trakkt_core::Error::from)
 }
 
@@ -1105,9 +1120,6 @@ async fn tool_update_issue(
         milestone_id: args.get("milestone_id").map(|v| {
             v.as_str().map(String::from)
         }),
-        parent_issue_id: args.get("parent_issue_id").map(|v| {
-            v.as_str().map(String::from)
-        }),
         sort_order: args.get("sort_order").map(|v| {
             v.as_f64()
         }),
@@ -1124,6 +1136,29 @@ async fn tool_update_issue(
         Some(&state.ws_manager),
     )
     .await?;
+
+    // Handle parent_issue_id changes via relation_service.
+    if let Some(parent_val) = args.get("parent_issue_id") {
+        if parent_val.is_null() || parent_val.as_str().is_some_and(|s| s.is_empty()) {
+            relation_service::clear_parent(
+                &state.db,
+                &auth.workspace_id,
+                &issue.issue_id,
+                Some(&state.ws_manager),
+            )
+            .await?;
+        } else if let Some(parent_id) = parent_val.as_str() {
+            relation_service::set_parent(
+                &state.db,
+                &auth.workspace_id,
+                &issue.issue_id,
+                parent_id,
+                Some(&auth.user_id),
+                Some(&state.ws_manager),
+            )
+            .await?;
+        }
+    }
 
     // If labels were provided, replace them on the issue.
     if let Some(label_values) = args.get("labels").and_then(|v| v.as_array()) {

@@ -75,7 +75,7 @@ struct WorkspaceIdRow {
     workspace_id: String,
 }
 
-const VALID_RELATION_TYPES: &[&str] = &["blocks"];
+const VALID_RELATION_TYPES: &[&str] = &["blocks", "parent"];
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -114,6 +114,46 @@ async fn validate_no_circular_blocking(
         for next in blocked {
             queue.push_back(next);
         }
+    }
+    Ok(())
+}
+
+/// Validate that creating a parent relation from `source_issue_id` (parent) to
+/// `target_issue_id` (child) would not create a circular parent chain.
+///
+/// Walks up from the proposed parent through existing parent relations. If
+/// the child is encountered as an ancestor, the new relation would create a cycle.
+async fn validate_no_circular_parent(
+    db: &DbPool,
+    source_issue_id: &str,
+    target_issue_id: &str,
+) -> trakkt_core::Result<()> {
+    // Delegate to the shared cycle-detection logic in issue_service.
+    // For parent relations, source = parent, target = child.
+    // We walk up from the proposed parent (source) and check if the child (target)
+    // is already an ancestor — which would create a cycle.
+    crate::issue_service::validate_no_circular_reference(db, target_issue_id, source_issue_id).await
+}
+
+/// Validate that the child (`target_issue_id`) does not already have a parent relation.
+async fn validate_single_parent(
+    db: &DbPool,
+    target_issue_id: &str,
+) -> trakkt_core::Result<()> {
+    let existing: Option<String> = trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query_scalar::<_, String>(
+            "SELECT relation_id FROM issue_relations \
+             WHERE target_issue_id = $1 AND relation_type = 'parent'",
+        )
+        .bind(target_issue_id)
+        .fetch_optional(p)
+        .await
+    })?;
+
+    if existing.is_some() {
+        return Err(trakkt_core::Error::BadRequest(
+            "This issue already has a parent. Remove the existing parent first.".to_string(),
+        ));
     }
     Ok(())
 }
@@ -183,6 +223,12 @@ pub async fn create_relation(
     // Validate no circular blocking chains for "blocks" relations.
     if relation_type == "blocks" {
         validate_no_circular_blocking(db, source_issue_id, target_issue_id).await?;
+    }
+
+    // Validate parent relations: no cycles, and only one parent per child.
+    if relation_type == "parent" {
+        validate_no_circular_parent(db, source_issue_id, target_issue_id).await?;
+        validate_single_parent(db, target_issue_id).await?;
     }
 
     // Insert the relation.
@@ -319,6 +365,11 @@ pub async fn delete_relation(
 ///
 /// Returns relations where the issue is either the source or target, with
 /// joined details about the *other* issue in each relation.
+///
+/// Direction mapping:
+/// - "blocks": source blocks target. If issue is source => "blocks", if target => "blocked_by"
+/// - "parent": source is parent, target is child. If issue is source => "parent" (has child),
+///   if target => "child_of" (has parent)
 pub async fn list_relations_for_issue(
     db: &DbPool,
     issue_id: &str,
@@ -336,8 +387,11 @@ pub async fn list_relations_for_issue(
             other_i.title, \
             s.category AS status_category, \
             CASE \
-                WHEN r.source_issue_id = $1 THEN r.relation_type \
-                ELSE 'blocked_by' \
+                WHEN r.source_issue_id = $1 AND r.relation_type = 'blocks' THEN 'blocks' \
+                WHEN r.target_issue_id = $1 AND r.relation_type = 'blocks' THEN 'blocked_by' \
+                WHEN r.source_issue_id = $1 AND r.relation_type = 'parent' THEN 'parent' \
+                WHEN r.target_issue_id = $1 AND r.relation_type = 'parent' THEN 'child_of' \
+                ELSE r.relation_type \
             END AS direction \
          FROM issue_relations r \
          JOIN issues other_i ON other_i.issue_id = CASE \
@@ -353,4 +407,81 @@ pub async fn list_relations_for_issue(
         workspace_id
     )?;
     Ok(rows.into_iter().map(IssueRelationDetailRow::into_dto).collect())
+}
+
+// ─── Parent helpers ────────────────────────────────────────────────────────
+
+/// Get the parent issue_id for a given child issue.
+///
+/// Returns `Some(parent_id)` if a parent relation exists, `None` otherwise.
+pub async fn get_parent_issue_id(
+    db: &DbPool,
+    issue_id: &str,
+) -> trakkt_core::Result<Option<String>> {
+    let parent: Option<String> = trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query_scalar::<_, String>(
+            "SELECT source_issue_id FROM issue_relations \
+             WHERE target_issue_id = $1 AND relation_type = 'parent'",
+        )
+        .bind(issue_id)
+        .fetch_optional(p)
+        .await
+    })?;
+    Ok(parent)
+}
+
+/// Set the parent of a child issue.
+///
+/// Clears any existing parent first, then creates the new parent relation.
+/// Validates single-parent constraint and cycle prevention.
+pub async fn set_parent(
+    db: &DbPool,
+    workspace_id: &str,
+    child_issue_id: &str,
+    parent_issue_id: &str,
+    created_by: Option<&str>,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<IssueRelation> {
+    // Clear any existing parent first (idempotent).
+    clear_parent(db, workspace_id, child_issue_id, ws_manager).await?;
+
+    // Create the new parent relation (source = parent, target = child).
+    create_relation(
+        db,
+        workspace_id,
+        parent_issue_id,
+        child_issue_id,
+        "parent",
+        created_by,
+        ws_manager,
+    )
+    .await
+}
+
+/// Clear the parent relation for a child issue.
+///
+/// Finds and deletes the parent relation where the child is the target.
+/// No-op if the child has no parent.
+pub async fn clear_parent(
+    db: &DbPool,
+    workspace_id: &str,
+    child_issue_id: &str,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    let relation_id: Option<String> = trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query_scalar::<_, String>(
+            "SELECT relation_id FROM issue_relations \
+             WHERE target_issue_id = $1 AND relation_type = 'parent' AND workspace_id = $2",
+        )
+        .bind(child_issue_id)
+        .bind(workspace_id)
+        .fetch_optional(p)
+        .await
+    })?;
+
+    if let Some(rid) = relation_id {
+        delete_relation(db, &rid, workspace_id, ws_manager).await?;
+    }
+
+    Ok(())
 }

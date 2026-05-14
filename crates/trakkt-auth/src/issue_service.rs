@@ -33,7 +33,6 @@ struct IssueRow {
     due_date: Option<String>,
     project_id: Option<String>,
     milestone_id: Option<String>,
-    parent_issue_id: Option<String>,
     sort_order: Option<f64>,
     created_at: String,
     updated_at: String,
@@ -55,7 +54,6 @@ impl IssueRow {
             due_date: self.due_date,
             project_id: self.project_id,
             milestone_id: self.milestone_id,
-            parent_issue_id: self.parent_issue_id,
             sort_order: self.sort_order,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -85,7 +83,8 @@ struct IssueDetailRow {
     project_id: Option<String>,
     project_name: Option<String>,
     milestone_id: Option<String>,
-    parent_issue_id: Option<String>,
+    parent_identifier: Option<String>,
+    parent_title: Option<String>,
     sort_order: Option<f64>,
     created_at: String,
     updated_at: String,
@@ -113,19 +112,14 @@ impl IssueDetailRow {
             project_id: self.project_id,
             project_name: self.project_name,
             milestone_id: self.milestone_id,
-            parent_issue_id: self.parent_issue_id,
+            parent_identifier: self.parent_identifier,
+            parent_title: self.parent_title,
             sort_order: self.sort_order,
             created_at: self.created_at,
             updated_at: self.updated_at,
             labels,
         }
     }
-}
-
-/// Minimal row type for verifying parent issue existence.
-#[derive(sqlx::FromRow)]
-struct ParentCheckRow {
-    issue_id: String,
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -140,7 +134,14 @@ const ISSUE_DETAIL_SELECT: &str = "\
            i.creator_id, creator.name AS creator_name, \
            CAST(i.due_date AS TEXT) AS due_date, \
            i.project_id, p.name AS project_name, i.milestone_id, \
-           i.parent_issue_id, i.sort_order, \
+           (SELECT t2.key || '-' || p2.number FROM issue_relations r2 \
+            JOIN issues p2 ON p2.issue_id = r2.source_issue_id \
+            JOIN teams t2 ON t2.team_id = p2.team_id \
+            WHERE r2.target_issue_id = i.issue_id AND r2.relation_type = 'parent') AS parent_identifier, \
+           (SELECT p2.title FROM issue_relations r2 \
+            JOIN issues p2 ON p2.issue_id = r2.source_issue_id \
+            WHERE r2.target_issue_id = i.issue_id AND r2.relation_type = 'parent') AS parent_title, \
+           i.sort_order, \
            CAST(i.created_at AS TEXT) AS created_at, \
            CAST(i.updated_at AS TEXT) AS updated_at \
     FROM issues i \
@@ -231,26 +232,6 @@ pub async fn create_issue(
     // Look up the default status for this workspace.
     let default_status = crate::status_service::get_default_status(db, &params.workspace_id).await?;
 
-    // Validate parent_issue_id if provided.
-    if let Some(ref parent_id) = params.parent_issue_id {
-        // Self-reference is impossible at creation (new UUID), but validate parent exists
-        // in the same workspace.
-        let parent_exists: Option<String> = trakkt_core::db_fetch_optional!(
-            db,
-            ParentCheckRow,
-            "SELECT issue_id FROM issues WHERE issue_id = $1 AND workspace_id = $2",
-            parent_id.as_str(),
-            &params.workspace_id
-        )?
-        .map(|r| r.issue_id);
-
-        if parent_exists.is_none() {
-            return Err(trakkt_core::Error::BadRequest(
-                "Parent issue not found in this workspace".to_string(),
-            ));
-        }
-    }
-
     // Atomic number generation: the subquery computes the next number inside the
     // INSERT statement so the MAX read and INSERT happen atomically, preventing
     // race conditions where concurrent creates read the same MAX.
@@ -260,10 +241,10 @@ pub async fn create_issue(
         "INSERT INTO issues \
             (issue_id, workspace_id, team_id, number, title, description, \
              status_id, priority, assignee_id, creator_id, due_date, \
-             project_id, milestone_id, parent_issue_id, created_at, updated_at) \
+             project_id, milestone_id, created_at, updated_at) \
          VALUES ($1, $2, $3, \
                  (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = $3), \
-                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, $13, {now}, {now})"
+                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, {now}, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -279,8 +260,7 @@ pub async fn create_issue(
         &params.creator_id,
         params.due_date.as_deref(),
         params.project_id.as_deref(),
-        params.milestone_id.as_deref(),
-        params.parent_issue_id.as_deref()
+        params.milestone_id.as_deref()
     )?;
 
     // Attach labels.
@@ -334,7 +314,7 @@ pub async fn create_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
-                project_id, milestone_id, parent_issue_id, sort_order, \
+                project_id, milestone_id, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE issue_id = $1",
@@ -647,11 +627,6 @@ pub async fn update_issue(
         param_idx += 1;
     }
 
-    if updates.parent_issue_id.is_some() {
-        set_parts.push(format!("parent_issue_id = ${param_idx}"));
-        param_idx += 1;
-    }
-
     if updates.sort_order.is_some() {
         set_parts.push(format!("sort_order = ${param_idx}"));
         param_idx += 1;
@@ -679,25 +654,6 @@ pub async fn update_issue(
     let sql = format!(
         "UPDATE issues SET {set_clause} WHERE issue_id = ${id_idx}"
     );
-
-    // Validate parent_issue_id — workspace isolation + prevent circular references.
-    if let Some(Some(ref proposed_parent_id)) = updates.parent_issue_id {
-        // Verify the proposed parent belongs to the same workspace.
-        let parent_exists: Option<ParentCheckRow> = trakkt_core::db_fetch_optional!(
-            db,
-            ParentCheckRow,
-            "SELECT issue_id FROM issues WHERE issue_id = $1 AND workspace_id = $2",
-            proposed_parent_id.as_str(),
-            workspace_id
-        )?;
-        if parent_exists.is_none() {
-            return Err(trakkt_core::Error::BadRequest(
-                "Parent issue not found in this workspace".to_string(),
-            ));
-        }
-
-        validate_no_circular_reference(db, &issue_id, proposed_parent_id).await?;
-    }
 
     // Bind dynamically. Map to rows_affected() inside the closure so both
     // pool arms return the same type (u64).
@@ -729,9 +685,6 @@ pub async fn update_issue(
         if let Some(ref v) = updates.milestone_id {
             query = query.bind(v.as_deref());
         }
-        if let Some(ref v) = updates.parent_issue_id {
-            query = query.bind(v.as_deref());
-        }
         if let Some(ref v) = updates.sort_order {
             query = query.bind(*v);
         }
@@ -757,7 +710,7 @@ pub async fn update_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 CAST(due_date AS TEXT) AS due_date, \
-                project_id, milestone_id, parent_issue_id, sort_order, \
+                project_id, milestone_id, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE issue_id = $1",
@@ -857,7 +810,7 @@ pub async fn delete_issue(
             "SELECT i.issue_id, i.workspace_id, i.team_id, i.number, i.title, i.description, \
                     i.status_id, i.priority, i.assignee_id, i.creator_id, \
                     CAST(i.due_date AS TEXT) AS due_date, \
-                    i.project_id, i.milestone_id, i.parent_issue_id, i.sort_order, \
+                    i.project_id, i.milestone_id, i.sort_order, \
                     CAST(i.created_at AS TEXT) AS created_at, \
                     CAST(i.updated_at AS TEXT) AS updated_at \
              FROM issues i \
@@ -1066,10 +1019,11 @@ pub async fn set_sort_order(
 /// Validate that setting `proposed_parent_id` as the parent of `issue_id`
 /// would not create a circular reference.
 ///
-/// Walks up the ancestor chain from the proposed parent. If `issue_id` is
-/// encountered, the assignment would create a cycle. Limits traversal to 10
-/// levels to prevent infinite loops from corrupt data.
-async fn validate_no_circular_reference(
+/// Walks up the ancestor chain from the proposed parent via `issue_relations`
+/// (relation_type = 'parent'). If `issue_id` is encountered, the assignment
+/// would create a cycle. Limits traversal to 10 levels to prevent infinite
+/// loops from corrupt data.
+pub(crate) async fn validate_no_circular_reference(
     db: &DbPool,
     issue_id: &str,
     proposed_parent_id: &str,
@@ -1082,16 +1036,17 @@ async fn validate_no_circular_reference(
 
     let mut current_id = proposed_parent_id.to_owned();
     for _ in 0..10 {
-        let parent: Option<Option<String>> = trakkt_core::db_with_pool!(db, |p| {
-            sqlx::query_scalar::<_, Option<String>>(
-                "SELECT parent_issue_id FROM issues WHERE issue_id = $1",
+        let parent: Option<String> = trakkt_core::db_with_pool!(db, |p| {
+            sqlx::query_scalar::<_, String>(
+                "SELECT source_issue_id FROM issue_relations \
+                 WHERE target_issue_id = $1 AND relation_type = 'parent'",
             )
             .bind(&current_id)
             .fetch_optional(p)
             .await
         })?;
 
-        match parent.flatten() {
+        match parent {
             Some(pid) => {
                 if pid == issue_id {
                     return Err(trakkt_core::Error::BadRequest(
@@ -1110,13 +1065,18 @@ async fn validate_no_circular_reference(
 }
 
 /// List sub-issues (direct children) of a given parent issue.
+///
+/// Queries via the `issue_relations` table (relation_type = 'parent',
+/// source = parent, target = child).
 pub async fn list_sub_issues(
     db: &DbPool,
     parent_issue_id: &str,
     workspace_id: &str,
 ) -> trakkt_core::Result<Vec<IssueWithDetails>> {
     let sql = format!(
-        "{ISSUE_DETAIL_SELECT} WHERE i.parent_issue_id = $1 AND i.workspace_id = $2 \
+        "{ISSUE_DETAIL_SELECT} \
+         JOIN issue_relations r ON r.target_issue_id = i.issue_id \
+         WHERE r.source_issue_id = $1 AND r.relation_type = 'parent' AND i.workspace_id = $2 \
          ORDER BY i.priority ASC, i.created_at DESC"
     );
 
