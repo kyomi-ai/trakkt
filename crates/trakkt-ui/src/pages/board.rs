@@ -674,8 +674,9 @@ fn BoardColumn(
                             .and_then(|w| w.match_media("(prefers-reduced-motion: reduce)").ok().flatten())
                             .is_some_and(|mql| mql.matches());
 
-                        if !reduced_motion {
-                            if let Some(first) = first_rect {
+                        if !reduced_motion
+                            && let Some(first) = first_rect
+                        {
                                 let first_left = first.left();
                                 let first_top = first.top();
                                 let card_id_for_raf = card_id.clone();
@@ -746,7 +747,6 @@ fn BoardColumn(
                                         );
                                     });
                                 });
-                            }
                         }
                     }
                     set_drag_target.set(None);
