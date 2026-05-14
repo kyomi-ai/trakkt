@@ -5,6 +5,7 @@
 //! This crate holds cross-crate types used by trakkt-core, trakkt-auth,
 //! trakkt-ui, and the server binary.
 
+pub mod api;
 pub mod enums;
 pub mod models;
 pub mod sync;

@@ -2,6 +2,7 @@
 
 //! trakkt-server — Axum HTTP server for the Trakkt backend.
 
+pub mod api;
 pub mod leptos_frontend;
 pub mod middleware;
 pub mod routes;
