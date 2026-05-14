@@ -25,8 +25,8 @@ struct CommentRow {
     parent_id: Option<String>,
     author_name: Option<String>,
     author_avatar: Option<String>,
-    created_at: String,
-    updated_at: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl CommentRow {
@@ -88,8 +88,8 @@ pub async fn create_comment(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
-                CAST(c.created_at AS TEXT) AS created_at, \
-                CAST(c.updated_at AS TEXT) AS updated_at \
+                c.created_at, \
+                c.updated_at \
          FROM comments c \
          JOIN users u ON u.user_id = c.user_id \
          WHERE c.comment_id = $1",
@@ -174,8 +174,8 @@ pub async fn list_comments(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
-                CAST(c.created_at AS TEXT) AS created_at, \
-                CAST(c.updated_at AS TEXT) AS updated_at \
+                c.created_at, \
+                c.updated_at \
          FROM comments c \
          JOIN users u ON u.user_id = c.user_id \
          WHERE c.issue_id = $1 \
@@ -198,8 +198,8 @@ pub async fn list_comments_for_workspace(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
-                CAST(c.created_at AS TEXT) AS created_at, \
-                CAST(c.updated_at AS TEXT) AS updated_at \
+                c.created_at, \
+                c.updated_at \
          FROM comments c \
          JOIN issues i ON i.issue_id = c.issue_id \
          JOIN users u ON u.user_id = c.user_id \
@@ -251,8 +251,8 @@ pub async fn update_comment(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
-                CAST(c.created_at AS TEXT) AS created_at, \
-                CAST(c.updated_at AS TEXT) AS updated_at \
+                c.created_at, \
+                c.updated_at \
          FROM comments c \
          JOIN users u ON u.user_id = c.user_id \
          WHERE c.comment_id = $1",
@@ -308,8 +308,8 @@ pub async fn delete_comment(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
-                CAST(c.created_at AS TEXT) AS created_at, \
-                CAST(c.updated_at AS TEXT) AS updated_at \
+                c.created_at, \
+                c.updated_at \
          FROM comments c \
          JOIN users u ON u.user_id = c.user_id \
          WHERE c.comment_id = $1",

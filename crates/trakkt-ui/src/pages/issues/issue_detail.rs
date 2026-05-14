@@ -37,7 +37,7 @@ use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::team::list_workspace_members;
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
 use crate::types::WorkspaceMember;
-use crate::utils::relative_time::relative_time;
+use crate::utils::relative_time::{format_datetime, relative_time};
 use trakkt_types::models::{Comment, IssueWithDetails};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -257,7 +257,7 @@ fn IssueDetailContent(
                 .into_iter()
                 .filter(|c| c.issue_id == issue_id_for_comments)
                 .collect();
-            filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            filtered.sort_by_key(|a| a.created_at);
             filtered
         }).unwrap_or_default()
     });
@@ -1810,7 +1810,7 @@ fn CommentItem(comment: Comment) -> impl IntoView {
         .author_name
         .clone()
         .unwrap_or_else(|| "Unknown".to_string());
-    let timestamp = relative_time(&comment.created_at);
+    let timestamp = format_datetime(&comment.created_at);
 
     view! {
         <div class="flex gap-3">
