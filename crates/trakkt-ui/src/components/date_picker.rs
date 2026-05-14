@@ -147,8 +147,8 @@ pub fn DatePicker(
     // selection (or today if nothing selected).
     let initialize_view = move || {
         let target = parsed_value()
-            .or_else(|| today())
-            .unwrap_or_else(|| today_or_fallback());
+            .or_else(today)
+            .unwrap_or_else(today_or_fallback);
         set_view_year.set(target.year());
         set_view_month.set(target.month());
         set_focused_date.set(Some(parsed_value().unwrap_or(target)));
@@ -225,9 +225,9 @@ pub fn DatePicker(
                     _ => 0,
                 };
                 let current = focused_date.get_untracked()
-                    .or_else(|| parsed_value())
-                    .or_else(|| today())
-                    .unwrap_or_else(|| today_or_fallback());
+                    .or_else(parsed_value)
+                    .or_else(today)
+                    .unwrap_or_else(today_or_fallback);
                 let new_date = current + Duration::days(delta);
                 set_focused_date.set(Some(new_date));
                 // Update viewed month if focus crosses a month boundary
