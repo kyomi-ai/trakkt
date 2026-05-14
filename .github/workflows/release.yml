@@ -81,7 +81,7 @@ jobs:
           repositories: trakkt-cloud
 
       - name: Dispatch deploy to trakkt-cloud
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
           repository: kyomi-ai/trakkt-cloud
