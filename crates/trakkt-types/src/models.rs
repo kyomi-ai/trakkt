@@ -5,9 +5,9 @@
 //! These structs are the wire format shared between server and UI. They use
 //! only serde (no sqlx) so the trakkt-ui crate can compile them to WASM.
 //!
-//! Timestamps and optional foreign keys are `String` / `Option<String>` because
-//! both Postgres and SQLite serialize timestamps as text through sqlx, and
-//! keeping them as strings avoids pulling in chrono on the WASM side.
+//! Timestamp fields are being migrated from `String` to `chrono::DateTime<Utc>`.
+//! `Comment` uses typed timestamps; other structs still use `String` and will
+//! be migrated incrementally.
 
 use serde::{Deserialize, Serialize};
 
@@ -218,8 +218,8 @@ pub struct Comment {
     pub parent_id: Option<String>,
     pub author_name: Option<String>,
     pub author_avatar: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A notification for a user about an issue event.

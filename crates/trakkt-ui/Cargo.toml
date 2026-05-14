@@ -87,7 +87,7 @@ base64 = { workspace = true }
 tracing = { workspace = true }
 
 # Date/time
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["wasmbind"] }
 
 # Internal crates (server-only — gated behind ssr feature)
 trakkt-core = { workspace = true, optional = true }
