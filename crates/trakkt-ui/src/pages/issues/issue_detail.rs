@@ -33,7 +33,9 @@ use crate::server_fns::labels::list_labels;
 use crate::server_fns::projects::list_milestones;
 use crate::server_fns::relations::{add_relation, list_issue_relations, remove_relation};
 use crate::server_fns::statuses::list_statuses;
+use crate::server_fns::team::list_workspace_members;
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
+use crate::types::WorkspaceMember;
 use crate::utils::relative_time::relative_time;
 use trakkt_types::models::{Comment, IssueWithDetails};
 
@@ -578,6 +580,9 @@ fn MetadataSidebar(
     // Fetch statuses dynamically for the status dropdown.
     let statuses_resource = LocalResource::new(move || list_statuses(None));
 
+    // Fetch workspace members for the assignee dropdown.
+    let members_resource = LocalResource::new(list_workspace_members);
+
     // ── Status change handler ───────────────────────────────────────────
     let stored_tk = StoredValue::new(issue_team_key.clone());
     let on_status_change = move |new_status_id: String| {
@@ -607,6 +612,30 @@ fn MetadataSidebar(
                 Some(prio),
                 None, None, None, None, None,
                 None,
+            )
+            .await;
+            on_change.run(());
+        });
+    };
+
+    // ── Assignee reactive state ──────────────────────────────────────────
+    let (current_assignee_id, set_current_assignee_id) = signal(issue.assignee_id.clone());
+    let (current_assignee_name, set_current_assignee_name) = signal(issue.assignee_name.clone());
+
+    // ── Assignee change handler ────────────────────────────────────────
+    let on_assignee_change = move |user_id: String, display_name: Option<String>| {
+        let is_clear = user_id.is_empty();
+        set_current_assignee_id.set(if is_clear { None } else { Some(user_id.clone()) });
+        set_current_assignee_name.set(display_name);
+        let tk = stored_tk.get_value();
+        leptos::task::spawn_local(async move {
+            let _ = update_issue(
+                tk,
+                number,
+                None, None, None, None,
+                if is_clear { None } else { Some(user_id) },
+                None, None, None, None,
+                if is_clear { Some("assignee".to_string()) } else { None },
             )
             .await;
             on_change.run(());
@@ -658,6 +687,18 @@ fn MetadataSidebar(
             statuses.set(loaded);
         }
     });
+
+    let members = RwSignal::new(Vec::<WorkspaceMember>::new());
+
+    Effect::new(move || {
+        if let Some(Ok(loaded)) = members_resource.get() {
+            members.set(loaded);
+        }
+    });
+
+    let (assignee_open, set_assignee_open) = signal(false);
+    let assignee_trigger_ref = NodeRef::<leptos::html::Div>::new();
+    let (assignee_search, set_assignee_search) = signal(String::new());
 
     let current_status_name = {
         let id = current_status_id.clone();
@@ -795,21 +836,86 @@ fn MetadataSidebar(
                 </DropdownMenu>
             </div>
 
-            // ── Assignee (display only — picker is future work) ────────
+            // ── Assignee ───────────────────────────────────────────────
             <div>
                 <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Assignee"</div>
-                {if let Some(ref name) = issue.assignee_name {
-                    view! {
-                        <div class="flex items-center gap-1.5">
-                            <Avatar name=name.clone() size=AvatarSize::Sm/>
-                            <span class="text-sm text-foreground">{name.clone()}</span>
-                        </div>
-                    }.into_any()
-                } else {
-                    view! {
-                        <span class="text-sm text-muted-foreground">"Unassigned"</span>
-                    }.into_any()
-                }}
+                <div node_ref=assignee_trigger_ref>
+                    <DropdownTrigger
+                        label="Assign..."
+                        value=Signal::derive(move || current_assignee_name.get())
+                        icon=Arc::new(move || {
+                            if let Some(n) = current_assignee_name.get() {
+                                view! { <Avatar name=n size=AvatarSize::Sm/> }.into_any()
+                            } else {
+                                view! { <Icon icon=phosphor_leptos::USER size="14px"/> }.into_any()
+                            }
+                        }) as ChildrenFn
+                        on_click=Callback::new(move |()| set_assignee_open.update(|o| *o = !*o))
+                    />
+                </div>
+                <DropdownMenu
+                    trigger_ref=assignee_trigger_ref
+                    open=Signal::derive(move || assignee_open.get())
+                    on_close=Callback::new(move |()| { set_assignee_open.set(false); set_assignee_search.set(String::new()); })
+                    search_placeholder="Filter members..."
+                    on_search=Callback::new(move |text: String| set_assignee_search.set(text))
+                >
+                    {move || {
+                        let search = assignee_search.get().to_lowercase();
+                        let filtered: Vec<_> = members.get()
+                            .into_iter()
+                            .filter(|m| {
+                                if search.is_empty() {
+                                    return true;
+                                }
+                                let name_match = m.name.as_deref()
+                                    .map(|n| n.to_lowercase().contains(&search))
+                                    .unwrap_or(false);
+                                let email_match = m.email.to_lowercase().contains(&search);
+                                name_match || email_match
+                            })
+                            .collect();
+                        let none_item = view! {
+                            <DropdownItem
+                                label="Unassigned".to_string()
+                                selected=Signal::derive(move || current_assignee_id.get().is_none())
+                                on_select=Callback::new(move |()| {
+                                    on_assignee_change(String::new(), None);
+                                    set_assignee_open.set(false);
+                                })
+                            />
+                        };
+                        let member_items = filtered.into_iter().map(|member| {
+                            let user_id = member.user_id.clone();
+                            let user_id_check = member.user_id.clone();
+                            let display_name = member.name.clone()
+                                .unwrap_or_else(|| member.email.clone());
+                            let avatar_name = display_name.clone();
+                            let label = display_name.clone();
+                            view! {
+                                <DropdownItem
+                                    label=label
+                                    selected=Signal::derive(move || {
+                                        current_assignee_id.get().as_deref() == Some(user_id_check.as_str())
+                                    })
+                                    on_select=Callback::new({
+                                        let id = user_id.clone();
+                                        let name = display_name.clone();
+                                        move |()| {
+                                            on_assignee_change(id.clone(), Some(name.clone()));
+                                            set_assignee_open.set(false);
+                                        }
+                                    })
+                                    icon=Arc::new({
+                                        let name = avatar_name.clone();
+                                        move || view! { <Avatar name=name.clone() size=AvatarSize::Sm/> }.into_any()
+                                    }) as ChildrenFn
+                                />
+                            }
+                        }).collect_view();
+                        view! { {none_item} {member_items} }
+                    }}
+                </DropdownMenu>
             </div>
 
             // ── Labels ─────────────────────────────────────────────────
