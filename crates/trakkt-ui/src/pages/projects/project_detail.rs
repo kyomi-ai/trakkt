@@ -312,7 +312,6 @@ fn ProjectDetailContent(
     let target_date_signal = Signal::derive(move || target_date_value.get());
 
     let on_start_date_change = {
-        let pid = pid.clone();
         Callback::new(move |v: Option<String>| {
             start_date_value.set(v.clone());
             let project_id = pid.get_value();
@@ -329,7 +328,6 @@ fn ProjectDetailContent(
     };
 
     let on_target_date_change = {
-        let pid = pid.clone();
         Callback::new(move |v: Option<String>| {
             target_date_value.set(v.clone());
             let project_id = pid.get_value();
@@ -728,7 +726,6 @@ fn MilestoneSection(
     let delete_dialog_open = Signal::derive(move || deleting_milestone_id.get().is_some());
 
     let on_confirm_delete = {
-        let refetch = refetch.clone();
         Callback::new(move |()| {
             if let Some(mid) = deleting_milestone_id.get_untracked() {
                 deleting_milestone_id.set(None);
@@ -1136,7 +1133,7 @@ fn MilestoneRow(
     // ── Date formatting ──
     let date_display = target_date
         .as_deref()
-        .map(|d| format_short_date(d))
+        .map(format_short_date)
         .unwrap_or_else(|| "No date".to_string());
 
     // ── Issue count display ──
