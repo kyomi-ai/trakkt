@@ -12,6 +12,7 @@ pub mod card;
 pub mod checkbox;
 pub mod command_palette;
 pub mod confirm_dialog;
+pub mod date_picker;
 pub mod dropdown;
 pub mod empty_state;
 pub mod input;
@@ -41,6 +42,7 @@ pub use card::{Card, CardContent, CardDescription, CardFooter, CardHeader, CardT
 pub use command_palette::CommandPalette;
 pub use checkbox::Checkbox;
 pub use confirm_dialog::ConfirmDialog;
+pub use date_picker::DatePicker;
 pub use dropdown::{DropdownItem, DropdownMenu, DropdownTrigger};
 pub use empty_state::{EmptyState, EmptyStateVariant};
 pub use input::INPUT_CLASS;
