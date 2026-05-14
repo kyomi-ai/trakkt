@@ -37,6 +37,7 @@ use crate::pages::settings::{
     teams_settings::TeamsSettingsPage,
     workspace::WorkspacePage,
 };
+use crate::pages::teams::team_settings::TeamSettingsPage;
 
 /// Shell HTML page that loads the WASM bundle.
 #[component]
@@ -111,6 +112,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/my-issues") view=MyIssuesPage/>
 
                     // Team-scoped views — components read :key from route params internally
+                    <Route path=path!("/teams/:key/settings") view=TeamSettingsPage/>
                     <Route path=path!("/teams/:key/issues") view=IssueListForTeam/>
 
                     // Legacy /issues redirect — send to /my-issues
