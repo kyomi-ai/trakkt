@@ -8,6 +8,7 @@
 //! duplicate business logic.
 
 pub mod context;
+pub mod issues;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -142,9 +143,12 @@ pub struct ApiOperation {
 
 /// Collect all registered API operations.
 ///
-/// Submodules will be added here as operations are implemented in later phases.
+/// Each domain module provides an `operations()` function that returns its
+/// operations. They are aggregated here into a single registry.
 pub fn all_operations() -> Vec<ApiOperation> {
-    Vec::new()
+    let mut ops = Vec::new();
+    ops.extend(issues::operations());
+    ops
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,7 +231,16 @@ mod tests {
     }
 
     #[test]
-    fn all_operations_initially_empty() {
-        assert!(all_operations().is_empty());
+    fn all_operations_includes_issue_ops() {
+        let ops = all_operations();
+        assert_eq!(ops.len(), 6, "expected 6 issue operations");
+
+        let names: Vec<&str> = ops.iter().map(|op| op.name).collect();
+        assert!(names.contains(&"list_issues"));
+        assert!(names.contains(&"get_issue"));
+        assert!(names.contains(&"create_issue"));
+        assert!(names.contains(&"update_issue"));
+        assert!(names.contains(&"delete_issue"));
+        assert!(names.contains(&"search_issues"));
     }
 }
