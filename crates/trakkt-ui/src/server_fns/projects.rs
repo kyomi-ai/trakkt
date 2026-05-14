@@ -10,7 +10,7 @@
 //! The workspace-root `clippy.toml` raises the threshold to 14.
 
 use leptos::prelude::*;
-use trakkt_types::models::{Project, ProjectMember, ProjectMilestone};
+use trakkt_types::models::{Project, ProjectMember, ProjectMilestone, ProjectProgress, ProjectUpdate};
 
 // Helpers — delegate to shared extractors in parent module
 #[cfg(feature = "ssr")]
@@ -223,7 +223,130 @@ pub async fn create_milestone(
     Ok(milestone)
 }
 
+/// Update fields on an existing milestone.
+///
+/// For `target_date`, uses the same sentinel pattern as `update_project`:
+/// - `None` = no change
+/// - `Some("")` = clear the field (set to NULL)
+/// - `Some("value")` = set to new value
+#[server(prefix = "/leptos-api")]
+pub async fn update_milestone(
+    milestone_id: String,
+    name: Option<String>,
+    description: Option<String>,
+    target_date: Option<String>,
+) -> Result<ProjectMilestone, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let project_id = resolve_milestone_project(ac.db(), &milestone_id).await?;
+    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
+    let milestone = trakkt_auth::project_service::update_milestone(
+        ac.db(),
+        &milestone_id,
+        name.as_deref(),
+        description.as_deref(),
+        target_date
+            .as_ref()
+            .map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
+        ac.ctx.ws_manager.as_ref(),
+        &ac.ws_id,
+    )
+    .await
+    .into_sfn()?;
+    Ok(milestone)
+}
+
+/// Delete a milestone by its ID.
+#[server(prefix = "/leptos-api")]
+pub async fn delete_milestone(milestone_id: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let project_id = resolve_milestone_project(ac.db(), &milestone_id).await?;
+    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
+    trakkt_auth::project_service::delete_milestone(
+        ac.db(),
+        &milestone_id,
+        ac.ctx.ws_manager.as_ref(),
+        &ac.ws_id,
+    )
+    .await
+    .into_sfn()?;
+    Ok(())
+}
+
+// ─── Project Updates ──────────────────────────────────────────────────────
+
+/// List all status updates for a project, newest first.
+#[server(prefix = "/leptos-api")]
+pub async fn list_project_updates(
+    project_id: String,
+) -> Result<Vec<ProjectUpdate>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
+    let updates = trakkt_auth::project_service::list_project_updates(ac.db(), &project_id)
+        .await
+        .into_sfn()?;
+    Ok(updates)
+}
+
+/// Create a new status update on a project.
+#[server(prefix = "/leptos-api")]
+pub async fn create_project_update(
+    project_id: String,
+    health: String,
+    body: Option<String>,
+) -> Result<ProjectUpdate, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
+    let update = trakkt_auth::project_service::create_project_update(
+        ac.db(),
+        &project_id,
+        &ac.auth.user_id,
+        &health,
+        body.as_deref(),
+        ac.ctx.ws_manager.as_ref(),
+        &ac.ws_id,
+    )
+    .await
+    .into_sfn()?;
+    Ok(update)
+}
+
+// ─── Project Progress ─────────────────────────────────────────────────────
+
+/// Get issue progress stats for a project.
+#[server(prefix = "/leptos-api")]
+pub async fn get_project_progress(
+    project_id: String,
+) -> Result<ProjectProgress, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
+    let progress = trakkt_auth::project_service::get_project_progress(ac.db(), &project_id)
+        .await
+        .into_sfn()?;
+    Ok(progress)
+}
+
 // ─── Helpers (server-only) ─────────────────────────────────────────────────
+
+/// Resolve the owning project_id for a milestone.
+#[cfg(feature = "ssr")]
+async fn resolve_milestone_project(
+    db: &trakkt_core::DbPool,
+    milestone_id: &str,
+) -> Result<String, ServerFnError> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        project_id: String,
+    }
+    let row: Option<Row> = trakkt_core::db_fetch_optional!(
+        db,
+        Row,
+        "SELECT project_id FROM project_milestones WHERE milestone_id = $1",
+        milestone_id
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    row.map(|r| r.project_id)
+        .ok_or_else(|| ServerFnError::new("Milestone not found"))
+}
 
 /// Verify that a project belongs to the user's current workspace.
 #[cfg(feature = "ssr")]

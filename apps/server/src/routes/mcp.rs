@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use trakkt_auth::{comment_service, issue_service, label_service, relation_service, status_service, team_service};
+use trakkt_auth::{comment_service, issue_service, label_service, project_service, relation_service, status_service, team_service};
 use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate};
 
 use crate::state::AppState;
@@ -771,6 +771,207 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                         }
                     }
                 }
+            },
+            // ─── Project / Milestone tools ─────────────────────────
+            {
+                "name": "list_projects",
+                "description": "List all projects in the workspace.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "get_project",
+                "description": "Get a single project by its ID, including milestones.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "The project ID"
+                        }
+                    },
+                    "required": ["project_id"]
+                }
+            },
+            {
+                "name": "create_project",
+                "description": "Create a new project in the workspace.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Project name (required)"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Markdown description of the project"
+                        },
+                        "icon": {
+                            "type": "string",
+                            "description": "Icon identifier for the project"
+                        },
+                        "color": {
+                            "type": "string",
+                            "description": "Hex color code (e.g. '#0D9488')"
+                        },
+                        "lead_id": {
+                            "type": "string",
+                            "description": "User ID to set as project lead"
+                        },
+                        "start_date": {
+                            "type": "string",
+                            "description": "Start date in ISO 8601 format (YYYY-MM-DD)"
+                        },
+                        "target_date": {
+                            "type": "string",
+                            "description": "Target completion date in ISO 8601 format (YYYY-MM-DD)"
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "update_project",
+                "description": "Update fields on an existing project. Only provided fields are changed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "The project ID (required)"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "New project name"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "New markdown description"
+                        },
+                        "icon": {
+                            "type": "string",
+                            "description": "New icon identifier"
+                        },
+                        "color": {
+                            "type": "string",
+                            "description": "New hex color code"
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "New project status (e.g. 'planned', 'in_progress', 'paused', 'completed', 'cancelled')"
+                        },
+                        "lead_id": {
+                            "type": ["string", "null"],
+                            "description": "User ID to set as project lead, or null to clear"
+                        },
+                        "start_date": {
+                            "type": ["string", "null"],
+                            "description": "Start date in ISO 8601 format, or null to clear"
+                        },
+                        "target_date": {
+                            "type": ["string", "null"],
+                            "description": "Target date in ISO 8601 format, or null to clear"
+                        }
+                    },
+                    "required": ["project_id"]
+                }
+            },
+            {
+                "name": "delete_project",
+                "description": "Permanently delete a project and its milestones.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "The project ID to delete"
+                        }
+                    },
+                    "required": ["project_id"]
+                }
+            },
+            {
+                "name": "list_milestones",
+                "description": "List all milestones in a project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "The project ID to list milestones for"
+                        }
+                    },
+                    "required": ["project_id"]
+                }
+            },
+            {
+                "name": "create_milestone",
+                "description": "Create a new milestone in a project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "The project ID to create the milestone in"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Milestone name (required)"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Markdown description of the milestone"
+                        },
+                        "target_date": {
+                            "type": "string",
+                            "description": "Target date in ISO 8601 format (YYYY-MM-DD)"
+                        }
+                    },
+                    "required": ["project_id", "name"]
+                }
+            },
+            {
+                "name": "update_milestone",
+                "description": "Update fields on an existing milestone.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "milestone_id": {
+                            "type": "string",
+                            "description": "The milestone ID (required)"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "New milestone name"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "New markdown description"
+                        },
+                        "target_date": {
+                            "type": ["string", "null"],
+                            "description": "Target date in ISO 8601 format, or null to clear"
+                        }
+                    },
+                    "required": ["milestone_id"]
+                }
+            },
+            {
+                "name": "delete_milestone",
+                "description": "Delete a milestone. Issues linked to this milestone will be unlinked.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "milestone_id": {
+                            "type": "string",
+                            "description": "The milestone ID to delete"
+                        }
+                    },
+                    "required": ["milestone_id"]
+                }
             }
         ]
     }))
@@ -833,6 +1034,9 @@ async fn handle_tools_call(
         "list_teams" => "teams:read",
         "add_relation" | "remove_relation" => "issues:write",
         "list_issue_relations" => "issues:read",
+        "list_projects" | "get_project" | "list_milestones" => "projects:read",
+        "create_project" | "update_project" | "delete_project"
+        | "create_milestone" | "update_milestone" | "delete_milestone" => "projects:write",
         _ => "",
     };
     if !required_scope.is_empty() && !auth.has_scope(required_scope) {
@@ -858,6 +1062,15 @@ async fn handle_tools_call(
         "add_relation" => tool_add_relation(&arguments, &auth, state).await,
         "remove_relation" => tool_remove_relation(&arguments, &auth, state).await,
         "list_issue_relations" => tool_list_issue_relations(&arguments, &auth, state).await,
+        "list_projects" => tool_list_projects(&auth, state).await,
+        "get_project" => tool_get_project(&arguments, &auth, state).await,
+        "create_project" => tool_create_project(&arguments, &auth, state).await,
+        "update_project" => tool_update_project(&arguments, &auth, state).await,
+        "delete_project" => tool_delete_project(&arguments, &auth, state).await,
+        "list_milestones" => tool_list_milestones(&arguments, &auth, state).await,
+        "create_milestone" => tool_create_milestone(&arguments, &auth, state).await,
+        "update_milestone" => tool_update_milestone(&arguments, &auth, state).await,
+        "delete_milestone" => tool_delete_milestone(&arguments, &auth, state).await,
         _ => return JsonRpcResponse::error(id, -32602, format!("Unknown tool: {tool_name}")),
     };
 
@@ -1405,4 +1618,253 @@ async fn tool_list_issue_relations(
     ).await?;
 
     serde_json::to_string_pretty(&relations).map_err(trakkt_core::Error::from)
+}
+
+// ─── Project / Milestone tools ─────────────────────────────────────────────
+
+/// Helper to verify a project belongs to a workspace, returning the project.
+async fn verify_project_ownership(
+    state: &AppState,
+    project_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<trakkt_types::models::Project> {
+    let project = project_service::get_project(&state.db, project_id)
+        .await?
+        .ok_or_else(|| trakkt_core::Error::NotFound("Project not found".into()))?;
+    if project.workspace_id != workspace_id {
+        return Err(trakkt_core::Error::NotFound("Project not found".into()));
+    }
+    Ok(project)
+}
+
+/// Helper to resolve a milestone's project_id from the database.
+async fn resolve_milestone_project_id(
+    state: &AppState,
+    milestone_id: &str,
+) -> trakkt_core::Result<String> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        project_id: String,
+    }
+    let row: Option<Row> = trakkt_core::db_fetch_optional!(
+        &state.db,
+        Row,
+        "SELECT project_id FROM project_milestones WHERE milestone_id = $1",
+        milestone_id
+    )?;
+    row.map(|r| r.project_id)
+        .ok_or_else(|| trakkt_core::Error::NotFound("Milestone not found".into()))
+}
+
+/// list_projects — list all projects in the workspace.
+async fn tool_list_projects(
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let projects = project_service::list_projects(&state.db, &auth.workspace_id).await?;
+    serde_json::to_string_pretty(&projects).map_err(trakkt_core::Error::from)
+}
+
+/// get_project — get a single project with its milestones.
+async fn tool_get_project(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let project_id = arg_str(args, "project_id")?;
+    let project = verify_project_ownership(state, project_id, &auth.workspace_id).await?;
+    let milestones = project_service::list_milestones(&state.db, project_id).await?;
+    let result = json!({ "project": project, "milestones": milestones });
+    serde_json::to_string_pretty(&result).map_err(trakkt_core::Error::from)
+}
+
+/// create_project — create a new project in the workspace.
+async fn tool_create_project(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let name = arg_str(args, "name")?;
+
+    let params = project_service::CreateProjectParams {
+        workspace_id: &auth.workspace_id,
+        name,
+        description: args.get("description").and_then(|v| v.as_str()),
+        icon: args.get("icon").and_then(|v| v.as_str()),
+        color: args.get("color").and_then(|v| v.as_str()),
+        lead_id: args.get("lead_id").and_then(|v| v.as_str()),
+        start_date: args.get("start_date").and_then(|v| v.as_str()),
+        target_date: args.get("target_date").and_then(|v| v.as_str()),
+    };
+
+    let project = project_service::create_project(
+        &state.db,
+        &params,
+        Some(&state.ws_manager),
+    )
+    .await?;
+
+    serde_json::to_string_pretty(&project).map_err(trakkt_core::Error::from)
+}
+
+/// update_project — update fields on an existing project.
+async fn tool_update_project(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let project_id = arg_str(args, "project_id")?;
+    verify_project_ownership(state, project_id, &auth.workspace_id).await?;
+
+    // For nullable fields: absent = no change, JSON null = clear, string = set.
+    // args.get("field").map(|v| v.as_str().map(String::from)) produces:
+    //   absent  -> None          (no change)
+    //   null    -> Some(None)    (clear)
+    //   string  -> Some(Some(s)) (set)
+    let lead_id_owned: Option<Option<String>> =
+        args.get("lead_id").map(|v| v.as_str().map(String::from));
+    let start_date_owned: Option<Option<String>> =
+        args.get("start_date").map(|v| v.as_str().map(String::from));
+    let target_date_owned: Option<Option<String>> =
+        args.get("target_date").map(|v| v.as_str().map(String::from));
+
+    let params = project_service::UpdateProjectParams {
+        project_id,
+        name: args.get("name").and_then(|v| v.as_str()),
+        description: args.get("description").and_then(|v| v.as_str()),
+        icon: args.get("icon").and_then(|v| v.as_str()),
+        color: args.get("color").and_then(|v| v.as_str()),
+        status: args.get("status").and_then(|v| v.as_str()),
+        lead_id: lead_id_owned
+            .as_ref()
+            .map(|opt| opt.as_deref()),
+        start_date: start_date_owned
+            .as_ref()
+            .map(|opt| opt.as_deref()),
+        target_date: target_date_owned
+            .as_ref()
+            .map(|opt| opt.as_deref()),
+    };
+
+    let project = project_service::update_project(
+        &state.db,
+        &params,
+        Some(&state.ws_manager),
+    )
+    .await?;
+
+    serde_json::to_string_pretty(&project).map_err(trakkt_core::Error::from)
+}
+
+/// delete_project — permanently delete a project and its milestones.
+async fn tool_delete_project(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let project_id = arg_str(args, "project_id")?;
+    verify_project_ownership(state, project_id, &auth.workspace_id).await?;
+
+    project_service::delete_project(
+        &state.db,
+        project_id,
+        Some(&state.ws_manager),
+    )
+    .await?;
+
+    Ok(format!("Project {project_id} deleted"))
+}
+
+/// list_milestones — list all milestones in a project.
+async fn tool_list_milestones(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let project_id = arg_str(args, "project_id")?;
+    verify_project_ownership(state, project_id, &auth.workspace_id).await?;
+
+    let milestones = project_service::list_milestones(&state.db, project_id).await?;
+    serde_json::to_string_pretty(&milestones).map_err(trakkt_core::Error::from)
+}
+
+/// create_milestone — create a new milestone in a project.
+async fn tool_create_milestone(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let project_id = arg_str(args, "project_id")?;
+    verify_project_ownership(state, project_id, &auth.workspace_id).await?;
+
+    let name = arg_str(args, "name")?;
+
+    let milestone = project_service::create_milestone(
+        &state.db,
+        project_id,
+        name,
+        args.get("description").and_then(|v| v.as_str()),
+        args.get("target_date").and_then(|v| v.as_str()),
+        Some(&state.ws_manager),
+        &auth.workspace_id,
+    )
+    .await?;
+
+    serde_json::to_string_pretty(&milestone).map_err(trakkt_core::Error::from)
+}
+
+/// update_milestone — update fields on an existing milestone.
+async fn tool_update_milestone(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let milestone_id = arg_str(args, "milestone_id")?;
+
+    // Verify the milestone's project belongs to this workspace.
+    let project_id = resolve_milestone_project_id(state, milestone_id).await?;
+    verify_project_ownership(state, &project_id, &auth.workspace_id).await?;
+
+    // For target_date: absent = no change, JSON null = clear, string = set.
+    let target_date_owned: Option<Option<String>> =
+        args.get("target_date").map(|v| v.as_str().map(String::from));
+    let target_date: Option<Option<&str>> = target_date_owned
+        .as_ref()
+        .map(|opt| opt.as_deref());
+
+    let milestone = project_service::update_milestone(
+        &state.db,
+        milestone_id,
+        args.get("name").and_then(|v| v.as_str()),
+        args.get("description").and_then(|v| v.as_str()),
+        target_date,
+        Some(&state.ws_manager),
+        &auth.workspace_id,
+    )
+    .await?;
+
+    serde_json::to_string_pretty(&milestone).map_err(trakkt_core::Error::from)
+}
+
+/// delete_milestone — delete a milestone, unlinking associated issues.
+async fn tool_delete_milestone(
+    args: &Value,
+    auth: &McpAuth,
+    state: &AppState,
+) -> trakkt_core::Result<String> {
+    let milestone_id = arg_str(args, "milestone_id")?;
+
+    // Verify the milestone's project belongs to this workspace.
+    let project_id = resolve_milestone_project_id(state, milestone_id).await?;
+    verify_project_ownership(state, &project_id, &auth.workspace_id).await?;
+
+    project_service::delete_milestone(
+        &state.db,
+        milestone_id,
+        Some(&state.ws_manager),
+        &auth.workspace_id,
+    )
+    .await?;
+
+    Ok(format!("Milestone {milestone_id} deleted"))
 }
