@@ -11,7 +11,9 @@
 use std::sync::Arc;
 
 use leptos::prelude::*;
-use leptos_router::hooks::{use_navigate, use_params_map};
+use leptos_router::hooks::{use_location, use_navigate, use_params_map};
+use leptos_router::location::State;
+use leptos_router::NavigateOptions;
 use phosphor_leptos::Icon;
 
 use crate::components::{
@@ -28,6 +30,7 @@ use crate::server_fns::projects::{
 };
 use crate::server_fns::issues::list_issues;
 use crate::server_fns::team::list_workspace_members;
+use crate::types::IssueNavState;
 use crate::utils::date::{format_date, format_short_date};
 use trakkt_types::models::{IssueWithDetails, Project, ProjectMilestone, ProjectProgress, ProjectUpdate};
 
@@ -1350,7 +1353,9 @@ fn AddMilestoneForm(
 fn ProjectIssueRow(issue: IssueWithDetails) -> impl IntoView {
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
     let issue_href = format!("/issues/{issue_key}");
+    let issue_href_click = issue_href.clone();
     let status = IssueStatusVariant::parse(&issue.status_category);
+    let location = use_location();
 
     view! {
         <a
@@ -1358,6 +1363,24 @@ fn ProjectIssueRow(issue: IssueWithDetails) -> impl IntoView {
             class="h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer no-underline text-inherit"
             role="listitem"
             tabindex="0"
+            on:click={
+                let issue_href = issue_href_click.clone();
+                move |ev: web_sys::MouseEvent| {
+                    if ev.meta_key() || ev.ctrl_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0 {
+                        return;
+                    }
+                    ev.prevent_default();
+                    let path = location.pathname.get_untracked();
+                    let search = location.search.get_untracked();
+                    let nav_state = IssueNavState::from_current_path(&path, &search);
+                    let json = nav_state.to_json();
+                    let nav = use_navigate();
+                    nav(&issue_href, NavigateOptions {
+                        state: State::from(wasm_bindgen::JsValue::from_str(&json)),
+                        ..Default::default()
+                    });
+                }
+            }
         >
             // Priority icon
             <PriorityIndicator priority=issue.priority/>

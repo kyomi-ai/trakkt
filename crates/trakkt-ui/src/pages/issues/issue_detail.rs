@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use leptos::prelude::*;
-use leptos_router::hooks::{use_navigate, use_params_map};
+use leptos_router::hooks::{use_location, use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
@@ -36,7 +36,7 @@ use crate::server_fns::relations::{add_relation, list_issue_relations, remove_re
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::team::list_workspace_members;
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
-use crate::types::WorkspaceMember;
+use crate::types::{IssueNavState, WorkspaceMember};
 use crate::utils::relative_time::{format_datetime, relative_time};
 use trakkt_types::models::{Comment, IssueWithDetails};
 
@@ -163,6 +163,29 @@ pub fn IssueDetailPage() -> impl IntoView {
         }
     });
 
+    // ── Read navigation state from browser History API ───────────────
+    let nav_state = {
+        let location = use_location();
+        let state = location.state.get_untracked();
+        let js = state.to_js_value();
+        js.as_string()
+            .and_then(|s| match serde_json::from_str::<IssueNavState>(&s) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    tracing::warn!("Failed to parse IssueNavState: {e}");
+                    None
+                }
+            })
+    };
+    let back_path = nav_state
+        .as_ref()
+        .map(|s| s.back_path.clone())
+        .unwrap_or_else(|| "/my-issues".to_string());
+    let back_label = nav_state
+        .as_ref()
+        .map(|s| s.back_label.clone())
+        .unwrap_or_else(|| "My Issues".to_string());
+
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Header ─────────────────────────────────────────────────────
@@ -170,10 +193,13 @@ pub fn IssueDetailPage() -> impl IntoView {
                 <Button
                     variant=ButtonVariant::GhostMuted
                     size=ButtonSize::IconSm
-                    aria_label="Back to issues"
-                    on:click=move |_| {
-                        let nav = use_navigate();
-                        nav("/issues", Default::default());
+                    aria_label=format!("Back to {back_label}")
+                    on:click={
+                        let back_path = back_path.clone();
+                        move |_| {
+                            let nav = use_navigate();
+                            nav(&back_path, Default::default());
+                        }
                     }
                 >
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>

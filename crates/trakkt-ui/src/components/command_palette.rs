@@ -9,11 +9,15 @@
 //! navigation as a v1 requirement.
 
 use leptos::prelude::*;
-use leptos_router::hooks::use_navigate;
+use leptos_router::hooks::{use_location, use_navigate};
+use leptos_router::location::State;
+use leptos_router::NavigateOptions;
 use phosphor_leptos::Icon;
+use wasm_bindgen::JsValue;
 
 use crate::cache::store::SyncStore;
 use crate::server_fns::issues::list_issues;
+use crate::types::IssueNavState;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -191,6 +195,7 @@ pub fn CommandPalette(
     let result_count = Memo::new(move |_| filtered_results.get().len());
 
     // ── Execute the selected action ─────────────────────────────────────────
+    let location = use_location();
     let execute_action = move |action: &PaletteAction| {
         let nav = use_navigate();
         match &action.kind {
@@ -198,7 +203,14 @@ pub fn CommandPalette(
                 nav(path, Default::default());
             }
             ActionKind::NavigateIssue(identifier) => {
-                nav(&format!("/issues/{identifier}"), Default::default());
+                let path = location.pathname.get_untracked();
+                let search = location.search.get_untracked();
+                let nav_state = IssueNavState::from_current_path(&path, &search);
+                let json = nav_state.to_json();
+                nav(&format!("/issues/{identifier}"), NavigateOptions {
+                    state: State::from(JsValue::from_str(&json)),
+                    ..Default::default()
+                });
             }
         }
         on_close.run(());

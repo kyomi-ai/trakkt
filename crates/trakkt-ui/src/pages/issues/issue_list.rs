@@ -21,7 +21,9 @@
 use std::sync::Arc;
 
 use leptos::prelude::*;
-use leptos_router::hooks::use_navigate;
+use leptos_router::hooks::{use_location, use_navigate};
+use leptos_router::location::State;
+use leptos_router::NavigateOptions;
 use phosphor_leptos::{Icon, IconWeight};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -43,6 +45,7 @@ use crate::pages::views::ViewFilters;
 use crate::server_fns::issues::{create_issue, list_issues};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::{create_view, delete_view, update_view};
+use crate::types::IssueNavState;
 use crate::utils::keyboard::is_input_focused;
 use trakkt_types::models::{Status, Team};
 
@@ -459,8 +462,9 @@ fn IssueListInner(
     let issue_identifiers = RwSignal::new(Vec::<String>::new());
 
     // ── j/k/Enter/c keyboard listener (window-level, active on this page) ──
-    // Hoist use_navigate to component construction time (not inside closures).
+    // Hoist use_navigate and use_location to component construction time (not inside closures).
     let nav = use_navigate();
+    let location = use_location();
     Effect::new(move |_| {
         let Some(window) = web_sys::window() else { return };
         let nav = nav.clone();
@@ -504,7 +508,14 @@ fn IssueListInner(
                         let ids = issue_identifiers.get_untracked();
                         if let Some(identifier) = ids.get(idx) {
                             ev.prevent_default();
-                            nav(&format!("/issues/{identifier}"), Default::default());
+                            let path = location.pathname.get_untracked();
+                            let search = location.search.get_untracked();
+                            let nav_state = IssueNavState::from_current_path(&path, &search);
+                            let json = nav_state.to_json();
+                            nav(&format!("/issues/{identifier}"), NavigateOptions {
+                                state: State::from(wasm_bindgen::JsValue::from_str(&json)),
+                                ..Default::default()
+                            });
                         }
                     }
                 }

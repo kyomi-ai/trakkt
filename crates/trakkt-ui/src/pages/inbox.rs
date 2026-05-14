@@ -8,12 +8,16 @@
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
+use leptos_router::location::State;
+use leptos_router::NavigateOptions;
 use phosphor_leptos::{Icon, IconWeight};
+use wasm_bindgen::JsValue;
 
 use crate::cache::store::SyncStore;
 use crate::server_fns::notifications::{
     list_notifications, mark_all_notifications_read, mark_notification_read,
 };
+use crate::types::IssueNavState;
 use crate::utils::relative_time::relative_time;
 use trakkt_types::models::Notification;
 
@@ -312,7 +316,12 @@ fn NotificationRow(
                 .map(|issue| format!("/issues/{}-{}", issue.team_key, issue.number))
         });
         if let Some(h) = href {
-            nav(&h, Default::default());
+            let nav_state = IssueNavState::from_current_path("/inbox", "");
+            let json = nav_state.to_json();
+            nav(&h, NavigateOptions {
+                state: State::from(JsValue::from_str(&json)),
+                ..Default::default()
+            });
         }
     };
 
