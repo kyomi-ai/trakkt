@@ -62,6 +62,7 @@ impl<'a> ApiCtx<'a> {
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
+    Unauthorized(String),
     Forbidden(String),
     Conflict(String),
     Internal(String),
@@ -72,6 +73,7 @@ impl std::fmt::Display for ApiError {
         match self {
             ApiError::NotFound(msg) => write!(f, "not found: {msg}"),
             ApiError::BadRequest(msg) => write!(f, "bad request: {msg}"),
+            ApiError::Unauthorized(msg) => write!(f, "unauthorized: {msg}"),
             ApiError::Forbidden(msg) => write!(f, "forbidden: {msg}"),
             ApiError::Conflict(msg) => write!(f, "conflict: {msg}"),
             ApiError::Internal(msg) => write!(f, "internal: {msg}"),

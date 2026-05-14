@@ -231,12 +231,16 @@ async fn authenticate_bearer_token(
 
     let row = row?;
 
-    // Parse scopes from JSON array string
-    let scopes: Vec<String> = row
-        .scopes
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let scopes: Vec<String> = match row.scopes.as_deref() {
+        None => vec![],
+        Some(s) => match serde_json::from_str::<Vec<String>>(s) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "api_token has malformed scopes JSON; treating as empty");
+                vec![]
+            }
+        },
+    };
 
     // Resolve workspace_id: prefer token's workspace_id, fall back to first
     // workspace the user belongs to.

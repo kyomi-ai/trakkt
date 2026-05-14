@@ -5,5 +5,6 @@
 pub mod auth_token;
 pub mod mcp;
 pub mod oauth;
+pub mod rest;
 pub mod team_icon;
 pub mod websocket;
