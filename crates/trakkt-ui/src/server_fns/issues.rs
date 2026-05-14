@@ -263,19 +263,19 @@ pub async fn update_issue(
         )
         .await
         .into_sfn()?;
-    } else if let Some(ref new_parent_id) = parent_issue_id {
-        if !new_parent_id.is_empty() {
-            trakkt_auth::relation_service::set_parent(
-                ac.db(),
-                &ac.ws_id,
-                &issue.issue_id,
-                new_parent_id,
-                Some(&ac.auth.user_id),
-                ac.ctx.ws_manager.as_ref(),
-            )
-            .await
-            .into_sfn()?;
-        }
+    } else if let Some(ref new_parent_id) = parent_issue_id
+        && !new_parent_id.is_empty()
+    {
+        trakkt_auth::relation_service::set_parent(
+            ac.db(),
+            &ac.ws_id,
+            &issue.issue_id,
+            new_parent_id,
+            Some(&ac.auth.user_id),
+            ac.ctx.ws_manager.as_ref(),
+        )
+        .await
+        .into_sfn()?;
     }
 
     Ok(issue)
