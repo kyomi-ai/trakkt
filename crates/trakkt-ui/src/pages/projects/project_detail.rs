@@ -15,19 +15,20 @@ use leptos_router::hooks::{use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Button, ButtonSize, ButtonVariant, ConfirmDialog, DatePicker, EmptyState,
+    Button, ButtonSize, ButtonVariant, ConfirmDialog, DatePicker, DynSelect, EmptyState,
     IssueStatusBadge, IssueStatusVariant, INPUT_CLASS,
     PriorityIndicator, LabelBadge,
-    StatusBadge, ToggleButton,
+    ToggleButton,
 };
 use crate::server_fns::projects::{
     get_project, get_project_progress, list_milestones,
     create_milestone, update_milestone, delete_milestone,
     list_project_updates, create_project_update,
+    update_project,
 };
 use crate::server_fns::issues::list_issues;
+use crate::server_fns::team::list_workspace_members;
 use crate::utils::date::{format_date, format_short_date};
-use crate::utils::project::{status_label, status_variant};
 use trakkt_types::models::{IssueWithDetails, Project, ProjectMilestone, ProjectProgress, ProjectUpdate};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +220,11 @@ pub fn ProjectDetailPage() -> impl IntoView {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The main content of the project detail page — metadata + issue list.
+///
+/// Each metadata field is individually editable inline: click-to-edit name,
+/// status dropdown, lead dropdown, date pickers, and click-to-edit description.
+/// Mutations call `update_project` via `spawn_local` with optimistic local
+/// signal updates; the SyncStore will reconcile via websocket.
 #[component]
 fn ProjectDetailContent(
     project: Project,
@@ -229,73 +235,318 @@ fn ProjectDetailContent(
     updates: Vec<ProjectUpdate>,
     server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
 ) -> impl IntoView {
-
-    let variant = status_variant(&project.status);
-    let label = status_label(&project.status);
     let issue_count = issues.len();
+    let pid = StoredValue::new(project.project_id.clone());
+
+    // ── Editable name (click-to-edit) ────────────────────────────────────
+    let editing_name = RwSignal::new(false);
+    let name_value = RwSignal::new(project.name.clone());
+    let name_draft = RwSignal::new(project.name.clone());
+
+    let save_name = move || {
+        let new_name = name_draft.get_untracked();
+        if new_name.trim().is_empty() {
+            // Don't save empty names — revert.
+            name_draft.set(name_value.get_untracked());
+            editing_name.set(false);
+            return;
+        }
+        if new_name == name_value.get_untracked() {
+            editing_name.set(false);
+            return;
+        }
+        name_value.set(new_name.clone());
+        editing_name.set(false);
+        let project_id = pid.get_value();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = update_project(
+                project_id, Some(new_name), None, None, None, None, None, None, None,
+            ).await {
+                leptos::logging::warn!("Failed to update project name: {e}");
+            }
+        });
+    };
+
+    let name_keydown = move |ev: leptos::ev::KeyboardEvent| {
+        match ev.key().as_str() {
+            "Enter" => {
+                ev.prevent_default();
+                save_name();
+            }
+            "Escape" => {
+                ev.prevent_default();
+                name_draft.set(name_value.get_untracked());
+                editing_name.set(false);
+            }
+            _ => {}
+        }
+    };
+
+    // ── Editable status ────────────────────────────────────────────────
+    let status_value = RwSignal::new(project.status.clone());
+
+    // ── Editable lead (DynSelect) ────────────────────────────────────────
+    let lead_value = RwSignal::new(project.lead_id.clone().unwrap_or_default());
+
+    let members_resource = Resource::new(
+        || (),
+        move |_| async move { list_workspace_members().await },
+    );
+
+    let member_options = Signal::derive(move || {
+        let mut opts = vec![("".to_string(), "(Unassigned)".to_string())];
+        if let Some(Ok(members)) = members_resource.get() {
+            for m in members {
+                let label = m.name.unwrap_or_else(|| m.email.clone());
+                opts.push((m.user_id, label));
+            }
+        }
+        opts
+    });
+
+    // ── Editable dates (DatePicker) ──────────────────────────────────────
+    let start_date_value: RwSignal<Option<String>> = RwSignal::new(project.start_date.clone());
+    let target_date_value: RwSignal<Option<String>> = RwSignal::new(project.target_date.clone());
+
+    let start_date_signal = Signal::derive(move || start_date_value.get());
+    let target_date_signal = Signal::derive(move || target_date_value.get());
+
+    let on_start_date_change = {
+        let pid = pid.clone();
+        Callback::new(move |v: Option<String>| {
+            start_date_value.set(v.clone());
+            let project_id = pid.get_value();
+            // Some("") = clear, Some(val) = set
+            let param = Some(v.unwrap_or_default());
+            leptos::task::spawn_local(async move {
+                if let Err(e) = update_project(
+                    project_id, None, None, None, None, None, None, param, None,
+                ).await {
+                    leptos::logging::warn!("Failed to update start date: {e}");
+                }
+            });
+        })
+    };
+
+    let on_target_date_change = {
+        let pid = pid.clone();
+        Callback::new(move |v: Option<String>| {
+            target_date_value.set(v.clone());
+            let project_id = pid.get_value();
+            let param = Some(v.unwrap_or_default());
+            leptos::task::spawn_local(async move {
+                if let Err(e) = update_project(
+                    project_id, None, None, None, None, None, None, None, param,
+                ).await {
+                    leptos::logging::warn!("Failed to update target date: {e}");
+                }
+            });
+        })
+    };
+
+    // ── Editable description (click-to-edit textarea) ────────────────────
+    let editing_desc = RwSignal::new(false);
+    let desc_value = RwSignal::new(project.description.clone().unwrap_or_default());
+    let desc_draft = RwSignal::new(project.description.clone().unwrap_or_default());
+
+    let save_desc = move || {
+        let new_desc = desc_draft.get_untracked();
+        if new_desc == desc_value.get_untracked() {
+            editing_desc.set(false);
+            return;
+        }
+        desc_value.set(new_desc.clone());
+        editing_desc.set(false);
+        let project_id = pid.get_value();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = update_project(
+                project_id, None, Some(new_desc), None, None, None, None, None, None,
+            ).await {
+                leptos::logging::warn!("Failed to update description: {e}");
+            }
+        });
+    };
 
     view! {
         <div class="max-w-[860px] mx-auto w-full">
-            // ── Project name ──────────────────────────────────────────────
-            <h1 class="text-2xl font-display text-foreground">
-                {project.name.clone()}
-            </h1>
+            // ── Project name (click-to-edit) ─────────────────────────────
+            <Show
+                when=move || editing_name.get()
+                fallback=move || view! {
+                    <h1
+                        class="text-2xl font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+                        tabindex="0"
+                        role="button"
+                        aria-label="Click to edit project name"
+                        on:click=move |_| {
+                            name_draft.set(name_value.get_untracked());
+                            editing_name.set(true);
+                        }
+                        on:keydown=move |ev: leptos::ev::KeyboardEvent| {
+                            if ev.key() == "Enter" {
+                                name_draft.set(name_value.get_untracked());
+                                editing_name.set(true);
+                            }
+                        }
+                    >
+                        {move || name_value.get()}
+                    </h1>
+                }
+            >
+                <input
+                    type="text"
+                    class=format!("{INPUT_CLASS} !text-2xl !font-display !h-auto !py-1")
+                    prop:value=move || name_draft.get()
+                    on:input=move |ev| name_draft.set(event_target_value(&ev))
+                    on:keydown=name_keydown
+                    on:blur=move |_| save_name()
+                    autofocus=true
+                />
+            </Show>
 
-            // ── Metadata bar ──────────────────────────────────────────────
+            // ── Metadata bar ─────────────────────────────────────────────
             <div class="flex flex-wrap items-center gap-4 mt-4">
-                // Status
+                // Status (DynSelect for reactivity)
                 <div class="flex items-center gap-2">
                     <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Status"</span>
-                    <StatusBadge variant=variant>
-                        {label}
-                    </StatusBadge>
+                    <div class="w-36">
+                        <DynSelect
+                            value=Signal::derive(move || status_value.get())
+                            options=Signal::derive(|| vec![
+                                ("planned".to_string(), "Planned".to_string()),
+                                ("in_progress".to_string(), "In Progress".to_string()),
+                                ("paused".to_string(), "Paused".to_string()),
+                                ("completed".to_string(), "Completed".to_string()),
+                                ("cancelled".to_string(), "Cancelled".to_string()),
+                            ])
+                            on_change=move |new_status: String| {
+                                status_value.set(new_status.clone());
+                                let project_id = pid.get_value();
+                                leptos::task::spawn_local(async move {
+                                    if let Err(e) = update_project(
+                                        project_id, None, None, None, None, Some(new_status), None, None, None,
+                                    ).await {
+                                        leptos::logging::warn!("Failed to update status: {e}");
+                                    }
+                                });
+                            }
+                        />
+                    </div>
                 </div>
 
-                // Lead
-                {if project.lead_name.is_some() || project.lead_id.is_some() {
-                    let display = project.lead_name.clone()
-                        .unwrap_or_else(|| "Unknown".to_string());
-                    Some(view! {
-                        <div class="flex items-center gap-2">
-                            <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Lead"</span>
-                            <span class="text-sm text-foreground">{display}</span>
-                        </div>
-                    })
-                } else {
-                    None
-                }}
+                // Lead (DynSelect)
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Lead"</span>
+                    <div class="w-44">
+                        <DynSelect
+                            value=Signal::derive(move || lead_value.get())
+                            options=member_options
+                            on_change=move |new_lead: String| {
+                                lead_value.set(new_lead.clone());
+                                let project_id = pid.get_value();
+                                // Some("") = clear, Some(id) = set
+                                let param = Some(new_lead);
+                                leptos::task::spawn_local(async move {
+                                    if let Err(e) = update_project(
+                                        project_id, None, None, None, None, None, param, None, None,
+                                    ).await {
+                                        leptos::logging::warn!("Failed to update lead: {e}");
+                                    }
+                                });
+                            }
+                            placeholder="Unassigned"
+                        />
+                    </div>
+                </div>
 
-                // Start date
-                {project.start_date.as_deref().map(|d| {
-                    let formatted = format_date(d);
-                    view! {
-                        <div class="flex items-center gap-2">
-                            <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Start"</span>
-                            <span class="font-mono text-sm text-foreground">{formatted}</span>
-                        </div>
-                    }
-                })}
+                // Start date (DatePicker)
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Start"</span>
+                    <DatePicker
+                        value=start_date_signal
+                        on_change=on_start_date_change
+                        placeholder="Set start date"
+                    />
+                </div>
 
-                // Target date
-                {project.target_date.as_deref().map(|d| {
-                    let formatted = format_date(d);
-                    view! {
-                        <div class="flex items-center gap-2">
-                            <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Target"</span>
-                            <span class="font-mono text-sm text-foreground">{formatted}</span>
-                        </div>
-                    }
-                })}
+                // Target date (DatePicker)
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Target"</span>
+                    <DatePicker
+                        value=target_date_signal
+                        on_change=on_target_date_change
+                        placeholder="Set target date"
+                    />
+                </div>
             </div>
 
-            // ── Description ───────────────────────────────────────────────
-            {project.description.as_ref().map(|desc| {
-                view! {
-                    <div class="mt-4">
-                        <p class="text-sm text-muted-foreground">{desc.clone()}</p>
+            // ── Description (click-to-edit textarea) ─────────────────────
+            <div class="mt-4">
+                <Show
+                    when=move || editing_desc.get()
+                    fallback=move || {
+                        view! {
+                            <p
+                                class=move || {
+                                    if !desc_value.get().is_empty() {
+                                        "text-sm text-muted-foreground cursor-pointer hover:text-foreground/80 transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+                                    } else {
+                                        "text-sm text-muted-foreground/60 italic cursor-pointer hover:text-muted-foreground transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+                                    }
+                                }
+                                tabindex="0"
+                                role="button"
+                                aria-label="Click to edit description"
+                                on:click=move |_| {
+                                    desc_draft.set(desc_value.get_untracked());
+                                    editing_desc.set(true);
+                                }
+                                on:keydown=move |ev: leptos::ev::KeyboardEvent| {
+                                    if ev.key() == "Enter" {
+                                        desc_draft.set(desc_value.get_untracked());
+                                        editing_desc.set(true);
+                                    }
+                                }
+                            >
+                                {move || {
+                                    let v = desc_value.get();
+                                    if v.is_empty() {
+                                        "Add a description...".to_string()
+                                    } else {
+                                        v
+                                    }
+                                }}
+                            </p>
+                        }
+                    }
+                >
+                    <textarea
+                        class=format!("{INPUT_CLASS} !h-auto min-h-[80px] w-full resize-y")
+                        prop:value=move || desc_draft.get()
+                        on:input=move |ev| desc_draft.set(event_target_value(&ev))
+                        autofocus=true
+                    ></textarea>
+                    <div class="flex items-center gap-2 mt-2">
+                        <Button
+                            variant=ButtonVariant::Secondary
+                            size=ButtonSize::Sm
+                            on:click=move |_| save_desc()
+                        >
+                            "Save"
+                        </Button>
+                        <Button
+                            variant=ButtonVariant::GhostMuted
+                            size=ButtonSize::Sm
+                            on:click=move |_| {
+                                desc_draft.set(desc_value.get_untracked());
+                                editing_desc.set(false);
+                            }
+                        >
+                            "Cancel"
+                        </Button>
                     </div>
-                }
-            })}
+                </Show>
+            </div>
 
             // ── Progress bar ─────────────────────────────────────────────
             {progress.filter(|p| p.total > 0).map(|p| {
