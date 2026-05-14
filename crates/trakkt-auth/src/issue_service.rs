@@ -445,11 +445,14 @@ pub async fn list_issues(
         param_idx += 1;
     }
 
-    if filters.label_id.is_some() {
+    if let Some(ref ids) = filters.label_ids
+        && !ids.is_empty()
+    {
+        let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(ids.len(), param_idx);
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM issue_labels WHERE issue_id = i.issue_id AND label_id = ${param_idx})"
+            "EXISTS (SELECT 1 FROM issue_labels WHERE issue_id = i.issue_id AND label_id IN {in_clause})"
         ));
-        param_idx += 1;
+        param_idx = next_idx;
     }
 
     // search must be the last filter — it does not increment param_idx.
@@ -509,8 +512,10 @@ pub async fn list_issues(
         if let Some(ref v) = filters.assignee_id {
             query = query.bind(v);
         }
-        if let Some(ref v) = filters.label_id {
-            query = query.bind(v);
+        if let Some(ref ids) = filters.label_ids {
+            for id in ids {
+                query = query.bind(id);
+            }
         }
         if let Some(ref v) = search_pattern {
             query = query.bind(v);

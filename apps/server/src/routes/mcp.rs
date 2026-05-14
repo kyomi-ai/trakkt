@@ -449,7 +449,7 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                         },
                         "label": {
                             "type": "string",
-                            "description": "Filter by label ID"
+                            "description": "Filter by label ID(s). Comma-separated for multiple (OR logic) — returns issues with any of the specified labels."
                         },
                         "search": {
                             "type": "string",
@@ -1194,7 +1194,9 @@ async fn tool_list_issues(
         exclude_status_categories,
         priority: args.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32),
         assignee_id: args.get("assignee").and_then(|v| v.as_str()).map(String::from),
-        label_id: args.get("label").and_then(|v| v.as_str()).map(String::from),
+        label_ids: args.get("label").and_then(|v| v.as_str()).map(|s| {
+            s.split(',').map(|id| id.trim().to_string()).filter(|id| !id.is_empty()).collect()
+        }),
         search: args.get("search").and_then(|v| v.as_str()).map(String::from),
         limit: Some(limit),
         offset: None,

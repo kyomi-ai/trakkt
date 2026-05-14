@@ -249,7 +249,7 @@ pub struct IssueFilters {
     pub exclude_status_categories: Option<Vec<String>>,
     pub priority: Option<i32>,
     pub assignee_id: Option<String>,
-    pub label_id: Option<String>,
+    pub label_ids: Option<Vec<String>>,
     pub search: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,

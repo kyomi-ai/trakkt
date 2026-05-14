@@ -66,7 +66,7 @@ pub async fn list_issues(
         status_id,
         priority,
         assignee_id,
-        label_id,
+        label_ids: label_id.map(|s| s.split(',').map(|id| id.trim().to_string()).filter(|id| !id.is_empty()).collect()),
         search,
         limit,
         offset,
