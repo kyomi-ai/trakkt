@@ -567,7 +567,7 @@ fn MetadataSidebar(
     let statuses_resource = LocalResource::new(move || list_statuses(None));
 
     // Fetch workspace members for the assignee dropdown.
-    let members_resource = LocalResource::new(move || list_workspace_members());
+    let members_resource = LocalResource::new(list_workspace_members);
 
     // ── Status change handler ───────────────────────────────────────────
     let stored_tk = StoredValue::new(issue_team_key.clone());
