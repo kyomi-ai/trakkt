@@ -239,7 +239,11 @@ pub async fn update_issue(
         } else {
             assignee_id.map(|s| if s.is_empty() { None } else { Some(s) })
         },
-        due_date: due_date.map(|s| if s.is_empty() { None } else { Some(s) }),
+        due_date: if clears.contains(&"due_date") {
+            Some(None)
+        } else {
+            due_date.map(|s| if s.is_empty() { None } else { Some(s) })
+        },
         project_id: if clears.contains(&"project") {
             Some(None)
         } else {

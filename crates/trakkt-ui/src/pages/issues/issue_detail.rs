@@ -678,15 +678,15 @@ fn MetadataSidebar(
     // ── Due date change handler ───────────────────────────────────────
     let on_due_date_change = move |date: Option<String>| {
         let tk = stored_tk.get_value();
-        let due = date.unwrap_or_default(); // empty string = clear
+        let is_clear = date.is_none();
         leptos::task::spawn_local(async move {
             let _ = update_issue(
                 tk,
                 number,
                 None, None, None, None, None,
-                Some(due),
+                date,
                 None, None, None,
-                None,
+                if is_clear { Some("due_date".to_string()) } else { None },
             )
             .await;
             on_change.run(());
