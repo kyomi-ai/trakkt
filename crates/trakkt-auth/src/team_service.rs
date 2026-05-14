@@ -25,6 +25,9 @@ struct TeamRow {
     key: String,
     description: Option<String>,
     icon: Option<String>,
+    icon_type: Option<String>,
+    icon_name: Option<String>,
+    icon_color: Option<String>,
     member_count: i64,
     created_at: String,
 }
@@ -38,6 +41,9 @@ impl TeamRow {
             key: self.key,
             description: self.description,
             icon: self.icon,
+            icon_type: self.icon_type,
+            icon_name: self.icon_name,
+            icon_color: self.icon_color,
             member_count: self.member_count,
             created_at: self.created_at,
         }
@@ -131,6 +137,7 @@ pub async fn create_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
@@ -170,13 +177,15 @@ pub async fn list_teams(
                 db,
                 TeamRow,
                 "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                        t.icon_type, t.icon_name, t.icon_color, \
                         COUNT(tm2.user_id) AS member_count, \
                         CAST(t.created_at AS TEXT) AS created_at \
                  FROM teams t \
                  INNER JOIN team_members tm ON tm.team_id = t.team_id AND tm.user_id = $2 \
                  LEFT JOIN team_members tm2 ON tm2.team_id = t.team_id \
                  WHERE t.workspace_id = $1 \
-                 GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, t.created_at \
+                 GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                          t.icon_type, t.icon_name, t.icon_color, t.created_at \
                  ORDER BY t.name ASC",
                 workspace_id,
                 uid
@@ -188,12 +197,14 @@ pub async fn list_teams(
                 db,
                 TeamRow,
                 "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                        t.icon_type, t.icon_name, t.icon_color, \
                         COUNT(tm.user_id) AS member_count, \
                         CAST(t.created_at AS TEXT) AS created_at \
                  FROM teams t \
                  LEFT JOIN team_members tm ON tm.team_id = t.team_id \
                  WHERE t.workspace_id = $1 \
-                 GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, t.created_at \
+                 GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                          t.icon_type, t.icon_name, t.icon_color, t.created_at \
                  ORDER BY t.name ASC",
                 workspace_id
             )?;
@@ -214,13 +225,15 @@ pub async fn list_joinable_teams(
         db,
         TeamRow,
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                t.icon_type, t.icon_name, t.icon_color, \
                 COUNT(tm.user_id) AS member_count, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
          LEFT JOIN team_members tm ON tm.team_id = t.team_id \
          WHERE t.workspace_id = $1 \
            AND t.team_id NOT IN (SELECT tm2.team_id FROM team_members tm2 WHERE tm2.user_id = $2) \
-         GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, t.created_at \
+         GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                  t.icon_type, t.icon_name, t.icon_color, t.created_at \
          ORDER BY t.name ASC",
         workspace_id,
         user_id
@@ -237,6 +250,7 @@ pub async fn get_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
@@ -255,6 +269,7 @@ pub async fn get_team_by_key(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 AND key = $2",
@@ -275,6 +290,7 @@ pub async fn get_default_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1",
@@ -392,6 +408,242 @@ pub async fn update_team(
         db,
         TeamRow,
         "SELECT team_id, workspace_id, name, key, description, icon, \
+                icon_type, icon_name, icon_color, \
+                CAST(0 AS BIGINT) AS member_count, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM teams WHERE team_id = $1",
+        team_id
+    )?;
+    let team = row.into_dto();
+
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::TEAM,
+            team_id,
+            SyncActionType::Update,
+            serde_json::to_value(&team).ok(),
+        )
+        .await;
+    }
+
+    Ok(team)
+}
+
+// ─── Icon management ────────────────────────────────────────────────────────
+
+/// Update a team's icon to a preset (icon_type = "preset") or clear it.
+///
+/// Pass `None` for all three fields to clear the icon entirely.
+pub async fn update_team_icon(
+    db: &DbPool,
+    team_id: &str,
+    workspace_id: &str,
+    icon_type: Option<&str>,
+    icon_name: Option<&str>,
+    icon_color: Option<&str>,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<Team> {
+    // When setting a preset, clear any custom upload data.
+    let result = trakkt_core::db_execute!(
+        db,
+        "UPDATE teams SET icon_type = $1, icon_name = $2, icon_color = $3, \
+         icon_data = NULL, icon_mime = NULL \
+         WHERE team_id = $4 AND workspace_id = $5",
+        icon_type,
+        icon_name,
+        icon_color,
+        team_id,
+        workspace_id
+    )?;
+
+    if result.rows_affected() == 0 {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "team {team_id} not found"
+        )));
+    }
+
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        SyncActionType::Update,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon update");
+    }
+
+    let row = trakkt_core::db_fetch_one!(
+        db,
+        TeamRow,
+        "SELECT team_id, workspace_id, name, key, description, icon, \
+                icon_type, icon_name, icon_color, \
+                CAST(0 AS BIGINT) AS member_count, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM teams WHERE team_id = $1",
+        team_id
+    )?;
+    let team = row.into_dto();
+
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::TEAM,
+            team_id,
+            SyncActionType::Update,
+            serde_json::to_value(&team).ok(),
+        )
+        .await;
+    }
+
+    Ok(team)
+}
+
+/// Upload a custom image as a team icon.
+///
+/// Sets `icon_type = "custom"` and stores the binary data + MIME type.
+/// Clears `icon_name` and `icon_color` since those are preset-only fields.
+pub async fn upload_team_icon(
+    db: &DbPool,
+    team_id: &str,
+    workspace_id: &str,
+    data: &[u8],
+    mime: &str,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<Team> {
+    let result = trakkt_core::db_execute!(
+        db,
+        "UPDATE teams SET icon_type = 'custom', icon_name = NULL, icon_color = NULL, \
+         icon_data = $1, icon_mime = $2 \
+         WHERE team_id = $3 AND workspace_id = $4",
+        data,
+        mime,
+        team_id,
+        workspace_id
+    )?;
+
+    if result.rows_affected() == 0 {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "team {team_id} not found"
+        )));
+    }
+
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        SyncActionType::Update,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon upload");
+    }
+
+    let row = trakkt_core::db_fetch_one!(
+        db,
+        TeamRow,
+        "SELECT team_id, workspace_id, name, key, description, icon, \
+                icon_type, icon_name, icon_color, \
+                CAST(0 AS BIGINT) AS member_count, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM teams WHERE team_id = $1",
+        team_id
+    )?;
+    let team = row.into_dto();
+
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::TEAM,
+            team_id,
+            SyncActionType::Update,
+            serde_json::to_value(&team).ok(),
+        )
+        .await;
+    }
+
+    Ok(team)
+}
+
+/// Fetch a team's custom icon binary data and MIME type.
+///
+/// Returns `None` if no custom icon is uploaded (`icon_data` is NULL).
+pub async fn get_team_icon_data(
+    db: &DbPool,
+    team_id: &str,
+) -> trakkt_core::Result<Option<(Vec<u8>, String)>> {
+    #[derive(sqlx::FromRow)]
+    struct IconDataRow {
+        icon_data: Option<Vec<u8>>,
+        icon_mime: Option<String>,
+    }
+
+    let row = trakkt_core::db_fetch_optional!(
+        db,
+        IconDataRow,
+        "SELECT icon_data, icon_mime FROM teams WHERE team_id = $1",
+        team_id
+    )?;
+
+    match row {
+        Some(r) => match (r.icon_data, r.icon_mime) {
+            (Some(data), Some(mime)) => Ok(Some((data, mime))),
+            _ => Ok(None),
+        },
+        None => Err(trakkt_core::Error::NotFound(format!(
+            "team {team_id} not found"
+        ))),
+    }
+}
+
+/// Remove a team's icon entirely (clears all icon fields).
+pub async fn delete_team_icon(
+    db: &DbPool,
+    team_id: &str,
+    workspace_id: &str,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<Team> {
+    let result = trakkt_core::db_execute!(
+        db,
+        "UPDATE teams SET icon_type = NULL, icon_name = NULL, icon_color = NULL, \
+         icon_data = NULL, icon_mime = NULL \
+         WHERE team_id = $1 AND workspace_id = $2",
+        team_id,
+        workspace_id
+    )?;
+
+    if result.rows_affected() == 0 {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "team {team_id} not found"
+        )));
+    }
+
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        SyncActionType::Update,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon delete");
+    }
+
+    let row = trakkt_core::db_fetch_one!(
+        db,
+        TeamRow,
+        "SELECT team_id, workspace_id, name, key, description, icon, \
+                icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
@@ -747,6 +999,7 @@ pub async fn get_user_teams(
         db,
         TeamRow,
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
+                t.icon_type, t.icon_name, t.icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
