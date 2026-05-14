@@ -25,7 +25,7 @@ const TRIGGER_BASE: &str = "inline-flex items-center gap-1.5 whitespace-nowrap \
     border border-border rounded-[4px] px-2 py-1 \
     text-xs font-normal cursor-pointer \
     transition-colors duration-200 \
-    hover:border-[--color-border-strong] hover:text-foreground \
+    hover:border-[var(--color-border-strong)] hover:text-foreground \
     focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -269,7 +269,7 @@ pub fn DatePicker(
             Some(date) => {
                 if let Some(t) = today() {
                     if date < t {
-                        format!("{base} text-[--color-destructive]")
+                        format!("{base} text-[var(--color-destructive)]")
                     } else {
                         format!("{base} text-foreground")
                     }
@@ -287,9 +287,9 @@ pub fn DatePicker(
             Some(date) => {
                 if let Some(t) = today() {
                     if date < t {
-                        "text-[--color-destructive]"
+                        "text-[var(--color-destructive)]"
                     } else if date <= t + Duration::days(3) {
-                        "text-[--color-warning-foreground]"
+                        "text-[var(--color-warning-foreground)]"
                     } else {
                         ""
                     }
