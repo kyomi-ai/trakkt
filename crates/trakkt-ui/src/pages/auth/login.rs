@@ -133,7 +133,7 @@ pub fn LoginPage(
     // in-flight, false once we know the user must log in. If they're already
     // authenticated, we redirect immediately and the form never appears.
     #[cfg(target_arch = "wasm32")]
-    let oauth_checking = {
+    let _oauth_checking = {
         let query = use_query_map();
         let has_oauth = query.with_untracked(|q| {
             q.get("oauth_continue").filter(|s| !s.is_empty()).is_some()
@@ -166,7 +166,7 @@ pub fn LoginPage(
     };
 
     #[cfg(not(target_arch = "wasm32"))]
-    let oauth_checking = signal(false).0;
+    let _oauth_checking = signal(false).0;
 
     // ── Auth config resource ────────────────────────────────────────────
     let auth_config = Resource::new(|| (), |_| get_auth_config());
