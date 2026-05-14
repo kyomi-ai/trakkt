@@ -7,8 +7,15 @@
 //! router and the REST router both delegate to these operations, eliminating
 //! duplicate business logic.
 
+pub mod comments;
 pub mod context;
 pub mod issues;
+pub mod labels;
+pub mod milestones;
+pub mod projects;
+pub mod relations;
+pub mod statuses;
+pub mod teams;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -150,6 +157,13 @@ pub struct ApiOperation {
 pub fn all_operations() -> Vec<ApiOperation> {
     let mut ops = Vec::new();
     ops.extend(issues::operations());
+    ops.extend(comments::operations());
+    ops.extend(labels::operations());
+    ops.extend(teams::operations());
+    ops.extend(statuses::operations());
+    ops.extend(relations::operations());
+    ops.extend(projects::operations());
+    ops.extend(milestones::operations());
     ops
 }
 
@@ -233,16 +247,50 @@ mod tests {
     }
 
     #[test]
-    fn all_operations_includes_issue_ops() {
+    fn all_operations_includes_all_ops() {
         let ops = all_operations();
-        assert_eq!(ops.len(), 6, "expected 6 issue operations");
-
         let names: Vec<&str> = ops.iter().map(|op| op.name).collect();
+
+        // Issue operations (6)
         assert!(names.contains(&"list_issues"));
         assert!(names.contains(&"get_issue"));
         assert!(names.contains(&"create_issue"));
         assert!(names.contains(&"update_issue"));
         assert!(names.contains(&"delete_issue"));
         assert!(names.contains(&"search_issues"));
+
+        // Comment operations (1)
+        assert!(names.contains(&"add_comment"));
+
+        // Label operations (2)
+        assert!(names.contains(&"list_labels"));
+        assert!(names.contains(&"create_label"));
+
+        // Team operations (1)
+        assert!(names.contains(&"list_teams"));
+
+        // Status operations (1)
+        assert!(names.contains(&"list_statuses"));
+
+        // Relation operations (3)
+        assert!(names.contains(&"add_relation"));
+        assert!(names.contains(&"remove_relation"));
+        assert!(names.contains(&"list_issue_relations"));
+
+        // Project operations (5)
+        assert!(names.contains(&"list_projects"));
+        assert!(names.contains(&"get_project"));
+        assert!(names.contains(&"create_project"));
+        assert!(names.contains(&"update_project"));
+        assert!(names.contains(&"delete_project"));
+
+        // Milestone operations (4)
+        assert!(names.contains(&"list_milestones"));
+        assert!(names.contains(&"create_milestone"));
+        assert!(names.contains(&"update_milestone"));
+        assert!(names.contains(&"delete_milestone"));
+
+        // Total: 6 + 1 + 2 + 1 + 1 + 3 + 5 + 4 = 23
+        assert_eq!(ops.len(), 23, "expected 23 total operations");
     }
 }

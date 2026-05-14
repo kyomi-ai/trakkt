@@ -142,3 +142,215 @@ pub struct SearchIssuesApiParams {
     /// Max results (default: 20, max: 100)
     pub limit: Option<i64>,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Comment operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for adding a comment to an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct AddCommentApiParams {
+    /// Issue identifier in 'TRA-35' format
+    pub issue_identifier: Option<String>,
+    /// Team key (e.g. 'TRA'). Required if issue_identifier is not provided
+    pub team_key: Option<String>,
+    /// Issue number within the team. Required if issue_identifier is not provided
+    pub issue_number: Option<i64>,
+    /// Markdown body of the comment (required)
+    pub body: String,
+    /// Parent comment ID for threaded replies
+    pub parent_id: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Label operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing all labels in the workspace.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListLabelsApiParams {}
+
+/// Parameters for creating a new label.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct CreateLabelApiParams {
+    /// Label name (must be unique within the workspace)
+    pub name: String,
+    /// Hex color code (e.g. '#FF5733' or 'FF5733')
+    pub color: String,
+    /// Team key to scope the label to a specific team
+    pub team_key: Option<String>,
+    /// Team ID to scope the label to a specific team
+    pub team_id: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Team operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing teams the authenticated user belongs to.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListTeamsApiParams {}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Status operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing statuses in the workspace.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListStatusesApiParams {
+    /// Team ID to include team-specific statuses
+    pub team_id: Option<String>,
+    /// Team key (e.g. 'TRA') as alternative to team_id
+    pub team_key: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Relation operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for adding a relation between two issues.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct AddRelationApiParams {
+    /// Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue
+    pub source_issue: String,
+    /// Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue
+    pub target_issue: String,
+    /// Relation type: 'blocks' or 'parent'
+    pub relation_type: String,
+}
+
+/// Parameters for removing a relation by its ID.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct RemoveRelationApiParams {
+    /// The relation ID to remove
+    pub relation_id: String,
+}
+
+/// Parameters for listing all relations for an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListRelationsApiParams {
+    /// Issue identifier in 'TRA-35' format
+    pub issue_identifier: Option<String>,
+    /// Team key (e.g. 'TRA'). Required if issue_identifier is not provided
+    pub team_key: Option<String>,
+    /// Issue number within the team. Required if issue_identifier is not provided
+    pub issue_number: Option<i64>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Project operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing all projects in the workspace.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListProjectsApiParams {}
+
+/// Parameters for getting a single project by ID.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct GetProjectApiParams {
+    /// The project ID
+    pub project_id: String,
+}
+
+/// Parameters for creating a new project.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct CreateProjectApiParams {
+    /// Project name (required)
+    pub name: String,
+    /// Markdown description of the project
+    pub description: Option<String>,
+    /// Icon identifier for the project
+    pub icon: Option<String>,
+    /// Hex color code (e.g. '#0D9488')
+    pub color: Option<String>,
+    /// User ID to set as project lead
+    pub lead_id: Option<String>,
+    /// Start date in ISO 8601 format (YYYY-MM-DD)
+    pub start_date: Option<String>,
+    /// Target completion date in ISO 8601 format (YYYY-MM-DD)
+    pub target_date: Option<String>,
+}
+
+/// Parameters for updating an existing project.
+///
+/// For clearable fields, use double-Option:
+/// - Field absent from JSON = no change (`None`)
+/// - Field set to `null` = clear the field (`Some(None)`)
+/// - Field set to a value = update the field (`Some(Some(value))`)
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct UpdateProjectApiParams {
+    /// The project ID (required)
+    pub project_id: String,
+    /// New project name
+    pub name: Option<String>,
+    /// New markdown description
+    pub description: Option<String>,
+    /// New icon identifier
+    pub icon: Option<String>,
+    /// New hex color code
+    pub color: Option<String>,
+    /// New project status (e.g. 'planned', 'in_progress', 'paused', 'completed', 'cancelled')
+    pub status: Option<String>,
+    /// User ID to set as project lead, or null to clear
+    pub lead_id: Option<Option<String>>,
+    /// Start date in ISO 8601 format, or null to clear
+    pub start_date: Option<Option<String>>,
+    /// Target date in ISO 8601 format, or null to clear
+    pub target_date: Option<Option<String>>,
+}
+
+/// Parameters for deleting a project.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct DeleteProjectApiParams {
+    /// The project ID to delete
+    pub project_id: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Milestone operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing milestones in a project.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListMilestonesApiParams {
+    /// The project ID to list milestones for
+    pub project_id: String,
+}
+
+/// Parameters for creating a new milestone.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct CreateMilestoneApiParams {
+    /// The project ID to create the milestone in
+    pub project_id: String,
+    /// Milestone name (required)
+    pub name: String,
+    /// Markdown description of the milestone
+    pub description: Option<String>,
+    /// Target date in ISO 8601 format (YYYY-MM-DD)
+    pub target_date: Option<String>,
+}
+
+/// Parameters for updating an existing milestone.
+///
+/// For clearable fields, use double-Option:
+/// - Field absent from JSON = no change (`None`)
+/// - Field set to `null` = clear the field (`Some(None)`)
+/// - Field set to a value = update the field (`Some(Some(value))`)
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct UpdateMilestoneApiParams {
+    /// The milestone ID (required)
+    pub milestone_id: String,
+    /// New milestone name
+    pub name: Option<String>,
+    /// New markdown description
+    pub description: Option<String>,
+    /// Target date in ISO 8601 format, or null to clear
+    pub target_date: Option<Option<String>>,
+}
+
+/// Parameters for deleting a milestone.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct DeleteMilestoneApiParams {
+    /// The milestone ID to delete
+    pub milestone_id: String,
+}
