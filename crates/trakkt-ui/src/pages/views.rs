@@ -17,6 +17,8 @@ pub struct ViewFilters {
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default)]
+    pub project_ids: Vec<String>,
+    #[serde(default)]
     pub search: String,
     #[serde(default)]
     pub team_id: String,
