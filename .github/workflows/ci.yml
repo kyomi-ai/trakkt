@@ -2,9 +2,10 @@
 # Trakkt — CI (Pull Request Checks)
 # =============================================================================
 # Runs on every PR to main, including new pushes to existing PRs.
-# Two jobs:
-#   1. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
-#   2. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
+# Three jobs:
+#   1. lint-suppression — blocks new #[allow(...)] and = "allow" in Cargo.toml
+#   2. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
+#   3. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
 # =============================================================================
 
 name: CI
@@ -18,6 +19,30 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Fast check: reject new lint suppressions
+  # ---------------------------------------------------------------------------
+  lint-suppression:
+    name: Lint Suppression Policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject new lint suppressions
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          RS=$(git diff "$BASE"...HEAD -- '*.rs' | grep '^+' | grep -v '^+++' | grep '#\[allow(' || true)
+          TOML=$(git diff "$BASE"...HEAD -- '*/Cargo.toml' 'Cargo.toml' | grep '^+' | grep -v '^+++' | grep '= "allow"' || true)
+          if [ -n "$RS" ] || [ -n "$TOML" ]; then
+            echo "::error::Lint suppressions detected. Fix the lint instead of suppressing it."
+            [ -n "$RS" ] && echo "" && echo "In .rs files:" && echo "$RS"
+            [ -n "$TOML" ] && echo "" && echo "In Cargo.toml:" && echo "$TOML"
+            exit 1
+          fi
+          echo "✅ No new lint suppressions."
+
   # ---------------------------------------------------------------------------
   # Slow check: cargo clippy (compiles + lints the entire workspace)
   # ---------------------------------------------------------------------------
