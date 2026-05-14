@@ -20,11 +20,11 @@ use crate::components::{
     PriorityIndicator, LabelBadge,
     StatusBadge,
 };
-use crate::server_fns::projects::get_project;
+use crate::server_fns::projects::{get_project, get_project_progress};
 use crate::server_fns::issues::list_issues;
 use crate::utils::date::{format_date, format_short_date};
 use crate::utils::project::{status_label, status_variant};
-use trakkt_types::models::{IssueWithDetails, Project};
+use trakkt_types::models::{IssueWithDetails, Project, ProjectProgress};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Project Detail Page
@@ -56,6 +56,11 @@ pub fn ProjectDetailPage() -> impl IntoView {
         move |_| async move {
             list_issues(None, None, None, None, None, None, None, None).await
         },
+    );
+
+    let server_progress = Resource::new(
+        move || project_id.get(),
+        move |id| async move { get_project_progress(id).await },
     );
 
     // Resolve the project from SyncStore or server function.
@@ -142,8 +147,13 @@ pub fn ProjectDetailPage() -> impl IntoView {
                     match project_data.get() {
                         Some(Ok(Some(project))) => {
                             let issues = project_issues.get();
+                            let progress = server_progress.get().and_then(|r| r.ok());
                             view! {
-                                <ProjectDetailContent project=project issues=issues/>
+                                <ProjectDetailContent
+                                    project=project
+                                    issues=issues
+                                    progress=progress
+                                />
                             }.into_any()
                         }
                         Some(Ok(None)) => {
@@ -179,7 +189,9 @@ pub fn ProjectDetailPage() -> impl IntoView {
 fn ProjectDetailContent(
     project: Project,
     issues: Vec<IssueWithDetails>,
+    progress: Option<ProjectProgress>,
 ) -> impl IntoView {
+
     let variant = status_variant(&project.status);
     let label = status_label(&project.status);
     let issue_count = issues.len();
@@ -247,6 +259,11 @@ fn ProjectDetailContent(
                 }
             })}
 
+            // ── Progress bar ─────────────────────────────────────────────
+            {progress.filter(|p| p.total > 0).map(|p| {
+                view! { <ProgressSection progress=p/> }
+            })}
+
             // ── Divider ───────────────────────────────────────────────────
             <div class="border-t border-border my-6"></div>
 
@@ -278,6 +295,37 @@ fn ProjectDetailContent(
                     </div>
                 }.into_any()
             }}
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Progress Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Issue completion progress bar — teal fill over muted background.
+///
+/// Shows the fraction and percentage right-aligned: "67% (8 of 12)".
+/// Only rendered when `progress.total > 0` (guard is in the caller).
+#[component]
+fn ProgressSection(progress: ProjectProgress) -> impl IntoView {
+    let pct = progress.percent_done.round() as i64;
+    let done = progress.completed + progress.cancelled;
+
+    view! {
+        <div class="mt-6">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-sm font-medium text-foreground">"Progress"</span>
+                <span class="font-mono text-sm text-muted-foreground">
+                    {format!("{}% ({} of {})", pct, done, progress.total)}
+                </span>
+            </div>
+            <div class="h-1.5 bg-muted rounded-full overflow-hidden">
+                <div
+                    class="h-full bg-primary rounded-full transition-all duration-200"
+                    style=format!("width: {}%", progress.percent_done.clamp(0.0, 100.0))
+                ></div>
+            </div>
         </div>
     }
 }
