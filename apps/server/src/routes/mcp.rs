@@ -37,9 +37,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-
 use crate::state::AppState;
+use super::auth_shared::{self, ResolvedAuth};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MCP_SERVER_NAME: &str = "trakkt-mcp";
@@ -88,178 +87,6 @@ impl JsonRpcResponse {
             error: Some(JsonRpcError { code, message: message.into() }),
         }
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Resolved MCP identity — from JWT or API token
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolved identity for MCP tool calls.
-///
-/// Populated from either a JWT `AuthUser` (OAuth 2.0) or a raw Bearer API
-/// token (legacy). Personal mode injects a local context.
-struct McpAuth {
-    workspace_id: String,
-    user_id: String,
-    scopes: Vec<String>,
-}
-
-impl McpAuth {
-    fn has_scope(&self, scope: &str) -> bool {
-        self.scopes.is_empty() || self.scopes.iter().any(|s| s == scope)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Legacy Bearer API token auth (fallback)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Internal row type for the api_tokens lookup query.
-#[derive(sqlx::FromRow)]
-struct ApiTokenLookupRow {
-    user_id: String,
-    workspace_id: Option<String>,
-    scopes: Option<String>,
-}
-
-/// Try to authenticate the request via JWT (OAuth 2.0) or legacy API token.
-/// Returns `None` if neither succeeds.
-///
-/// JWT is tried first because it produces a richer context (workspace context,
-/// user active/verified checks). The API token path is a simple hash lookup —
-/// kept for backward compatibility with existing API tokens.
-async fn resolve_mcp_auth(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Option<McpAuth> {
-    // Extract the raw token from Authorization header
-    let auth_header = headers.get("authorization")?.to_str().ok()?;
-    let token = auth_header.strip_prefix("Bearer ")?;
-
-    // 1. Try JWT validation first (OAuth 2.0 path).
-    //    If the token is a valid JWT, resolve user + workspace from the database
-    //    using the same logic as the AuthUser extractor.
-    if let Ok(decoded) = trakkt_auth::jwt::validate_token(token, &state.config.jwt_secret) {
-        let user_id = decoded
-            .claims
-            .extra
-            .get("user_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| decoded.claims.sub.clone());
-
-        // Verify user exists and is active
-        let user = trakkt_auth::user_service::get_user_by_id(&state.db, &user_id)
-            .await
-            .ok()??;
-
-        if !user.active {
-            return None;
-        }
-
-        // Get workspace_id from JWT claims, fall back to user's workspace context
-        let workspace_id = decoded
-            .claims
-            .extra
-            .get("workspace_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or({
-                // Synchronous fallback not possible here — but we can try
-                // the database lookup below if JWT didn't include workspace_id.
-                None
-            });
-
-        let workspace_id = match workspace_id {
-            Some(ws_id) => ws_id,
-            None => {
-                // Fall back to user's first workspace
-                let ctx = trakkt_auth::user_service::get_user_workspace_context(
-                    &state.db,
-                    &user_id,
-                )
-                .await
-                .ok()??;
-                ctx.0.workspace_id
-            }
-        };
-
-        return Some(McpAuth {
-            workspace_id,
-            user_id,
-            scopes: vec![], // JWT users have full access
-        });
-    }
-
-    // 2. Legacy API token path (SHA-256 hash lookup)
-    authenticate_bearer_token(token, &state.db).await
-}
-
-/// Validate a raw Bearer token against the `api_tokens` table (legacy path).
-///
-/// Hashes the plaintext token with SHA-256 and looks it up. Returns `None`
-/// if the token is invalid/expired/revoked.
-async fn authenticate_bearer_token(
-    token: &str,
-    db: &trakkt_core::DbPool,
-) -> Option<McpAuth> {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let token_hash = format!("{:x}", hasher.finalize());
-
-    let is_pg = db.is_postgres();
-    let bt = trakkt_core::sql_compat::bool_true(is_pg);
-
-    let sql = format!(
-        "SELECT user_id, workspace_id, scopes FROM api_tokens \
-         WHERE token_hash = $1 AND active = {bt} \
-         AND (expires_at IS NULL OR expires_at > $2)"
-    );
-    let now = chrono::Utc::now();
-
-    let row: Option<ApiTokenLookupRow> = trakkt_core::db_fetch_optional!(
-        db,
-        ApiTokenLookupRow,
-        &sql,
-        &token_hash,
-        &now
-    )
-    .ok()?;
-
-    let row = row?;
-
-    let scopes: Vec<String> = match row.scopes.as_deref() {
-        None => vec![],
-        Some(s) => match serde_json::from_str::<Vec<String>>(s) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "api_token has malformed scopes JSON; treating as empty");
-                vec![]
-            }
-        },
-    };
-
-    // Resolve workspace_id: prefer token's workspace_id, fall back to first
-    // workspace the user belongs to.
-    let workspace_id = match row.workspace_id {
-        Some(ws_id) => ws_id,
-        None => {
-            let ws: Option<(String,)> = trakkt_core::db_fetch_optional!(
-                db,
-                (String,),
-                "SELECT workspace_id FROM workspace_users WHERE user_id = $1 LIMIT 1",
-                &row.user_id
-            )
-            .ok()?;
-            ws?.0
-        }
-    };
-
-    Some(McpAuth {
-        workspace_id,
-        user_id: row.user_id,
-        scopes,
-    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -332,9 +159,17 @@ async fn handle_post(
     // on `initialize` to discover that OAuth is required and prompt the user.
     // Letting `initialize` through unauthenticated causes claude.ai to think
     // it's connected and show "no tools available" instead of prompting for auth.
-    if !state.config.is_personal() && resolve_mcp_auth(&headers, &state).await.is_none() {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Not authenticated"}))).into_response();
-    }
+    // Resolve auth once and reuse the result for both the gate check and
+    // session creation (avoids a redundant database round-trip).
+    let resolved_auth = if state.config.is_personal() {
+        None // Personal mode bypasses auth entirely
+    } else {
+        let auth = auth_shared::resolve_auth(&headers, &state).await;
+        if auth.is_none() {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Not authenticated"}))).into_response();
+        }
+        auth
+    };
 
     let response = match request.method.as_str() {
         "initialize" => handle_initialize(request.id, request.params),
@@ -351,11 +186,11 @@ async fn handle_post(
     let mut resp_headers = HeaderMap::new();
 
     if is_initialize {
-        let workspace_id = match resolve_mcp_auth(&headers, &state).await {
-            Some(auth) => auth.workspace_id,
-            None => "anonymous".to_string(),
-        };
-        let session_id = state.mcp_sessions.create_session(&workspace_id).await;
+        let workspace_id = resolved_auth
+            .as_ref()
+            .map(|a| a.workspace_id.as_str())
+            .unwrap_or("anonymous");
+        let session_id = state.mcp_sessions.create_session(workspace_id).await;
         if let Ok(val) = session_id.parse() {
             resp_headers.insert(MCP_SESSION_ID_HEADER, val);
         }
@@ -372,7 +207,7 @@ async fn handle_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if resolve_mcp_auth(&headers, &state).await.is_none() && !state.config.is_personal() {
+    if !state.config.is_personal() && auth_shared::resolve_auth(&headers, &state).await.is_none() {
         return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Not authenticated"}))).into_response();
     }
     (StatusCode::OK, "event: ping\ndata: {}\n\n").into_response()
@@ -460,13 +295,13 @@ async fn handle_tools_call(
 
     // Authenticate — personal mode skips token auth (single-user, no login).
     let auth = if state.config.is_personal() {
-        McpAuth {
+        ResolvedAuth {
             workspace_id: "workspace-local".to_string(),
             user_id: "user-local".to_string(),
             scopes: vec![],
         }
     } else {
-        match resolve_mcp_auth(headers, state).await {
+        match auth_shared::resolve_auth(headers, state).await {
             Some(auth) => auth,
             None => {
                 return JsonRpcResponse::error(
@@ -478,8 +313,15 @@ async fn handle_tools_call(
         }
     };
 
-    // Scope enforcement — all from registry
-    let required_scope = registry_tool_scope(tool_name).unwrap_or("");
+    // Build the operations list once — used for both scope lookup and dispatch.
+    let ops = trakkt_api::all_operations();
+
+    // Scope enforcement — look up in the pre-built ops list.
+    let required_scope = ops
+        .iter()
+        .find(|op| op.name == tool_name)
+        .map(|op| op.scope)
+        .unwrap_or("");
     if !required_scope.is_empty() && !auth.has_scope(required_scope) {
         return JsonRpcResponse::error(
             id,
@@ -488,8 +330,8 @@ async fn handle_tools_call(
         );
     }
 
-    // Dispatch — all through registry
-    let result = dispatch_registry_tool(tool_name, arguments, &auth, state).await;
+    // Dispatch through the pre-built ops list.
+    let result = dispatch_registry_tool(tool_name, arguments, &auth, state, &ops).await;
 
     match result {
         Ok(content) => JsonRpcResponse::success(id, json!({
@@ -516,29 +358,20 @@ async fn handle_tools_call(
 // Registry-driven tool dispatch
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Look up the required scope for a tool by name.
-///
-/// Returns `None` if the tool is not in the registry.
-fn registry_tool_scope(name: &str) -> Option<&'static str> {
-    trakkt_api::all_operations()
-        .into_iter()
-        .find(|op| op.name == name)
-        .map(|op| op.scope)
-}
-
 /// Dispatch a tool call through the shared API handler.
 ///
-/// Builds an [`ApiCtx`] from the MCP auth context, calls the handler, and
-/// serializes the result to a pretty-printed JSON string.
+/// Accepts the pre-built operations list from `handle_tools_call` to avoid
+/// redundant `all_operations()` calls. Builds an [`ApiCtx`] from the auth
+/// context, calls the handler, and serializes the result to JSON.
 async fn dispatch_registry_tool(
     name: &str,
     arguments: serde_json::Value,
-    auth: &McpAuth,
+    auth: &ResolvedAuth,
     state: &AppState,
+    ops: &[trakkt_api::ApiOperation],
 ) -> trakkt_core::Result<String> {
-    let ops = trakkt_api::all_operations();
     let op = ops
-        .into_iter()
+        .iter()
         .find(|o| o.name == name)
         .ok_or_else(|| trakkt_core::Error::BadRequest(format!("Unknown registry tool: {name}")))?;
 

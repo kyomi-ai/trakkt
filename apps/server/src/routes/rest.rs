@@ -23,177 +23,29 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use trakkt_api::{comments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
 use crate::state::AppState;
 
+use super::auth_shared::{self, ResolvedAuth};
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Auth — duplicated from routes/mcp.rs, will be deduplicated in Phase 4
+// Auth — thin wrapper around shared auth module
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolved identity for REST requests.
-///
-/// Mirrors `McpAuth` in `routes/mcp.rs`. Phase 4 will extract a shared auth
-/// module that both surfaces consume, eliminating this duplication.
-struct RestAuth {
-    workspace_id: String,
-    user_id: String,
-    scopes: Vec<String>,
-}
-
-impl RestAuth {
-    fn has_scope(&self, scope: &str) -> bool {
-        self.scopes.is_empty() || self.scopes.iter().any(|s| s == scope)
-    }
-}
-
-/// Internal row type for the `api_tokens` lookup query.
-///
-/// Duplicated from `routes/mcp.rs` — will be deduplicated in Phase 4.
-#[derive(sqlx::FromRow)]
-struct ApiTokenLookupRow {
-    user_id: String,
-    workspace_id: Option<String>,
-    scopes: Option<String>,
-}
-
-/// Try to authenticate via JWT (OAuth 2.0) or legacy API token.
-///
-/// Logic mirrors `resolve_mcp_auth` in `routes/mcp.rs`. Phase 4 will extract
-/// this into a shared `api::auth` module.
-async fn resolve_rest_auth(headers: &HeaderMap, state: &AppState) -> Option<RestAuth> {
-    let auth_header = headers.get("authorization")?.to_str().ok()?;
-    let token = auth_header.strip_prefix("Bearer ")?;
-
-    // 1. Try JWT validation first (OAuth 2.0 path).
-    if let Ok(decoded) = trakkt_auth::jwt::validate_token(token, &state.config.jwt_secret) {
-        let user_id = decoded
-            .claims
-            .extra
-            .get("user_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| decoded.claims.sub.clone());
-
-        // Verify user exists and is active.
-        let user = trakkt_auth::user_service::get_user_by_id(&state.db, &user_id)
-            .await
-            .ok()??;
-
-        if !user.active {
-            return None;
-        }
-
-        // Get workspace_id from JWT claims, fall back to user's workspace context.
-        let workspace_id = decoded
-            .claims
-            .extra
-            .get("workspace_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let workspace_id = match workspace_id {
-            Some(ws_id) => ws_id,
-            None => {
-                let ctx = trakkt_auth::user_service::get_user_workspace_context(
-                    &state.db,
-                    &user_id,
-                )
-                .await
-                .ok()??;
-                ctx.0.workspace_id
-            }
-        };
-
-        return Some(RestAuth {
-            workspace_id,
-            user_id,
-            scopes: vec![], // JWT users have full access
-        });
-    }
-
-    // 2. Legacy API token path (SHA-256 hash lookup).
-    authenticate_bearer_token(token, &state.db).await
-}
-
-/// Validate a raw Bearer token against the `api_tokens` table (legacy path).
-///
-/// Mirrors `authenticate_bearer_token` in `routes/mcp.rs`.
-async fn authenticate_bearer_token(
-    token: &str,
-    db: &trakkt_core::DbPool,
-) -> Option<RestAuth> {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let token_hash = format!("{:x}", hasher.finalize());
-
-    let is_pg = db.is_postgres();
-    let bt = trakkt_core::sql_compat::bool_true(is_pg);
-
-    let sql = format!(
-        "SELECT user_id, workspace_id, scopes FROM api_tokens \
-         WHERE token_hash = $1 AND active = {bt} \
-         AND (expires_at IS NULL OR expires_at > $2)"
-    );
-    let now = chrono::Utc::now();
-
-    let row: Option<ApiTokenLookupRow> = trakkt_core::db_fetch_optional!(
-        db,
-        ApiTokenLookupRow,
-        &sql,
-        &token_hash,
-        &now
-    )
-    .ok()?;
-
-    let row = row?;
-
-    let scopes: Vec<String> = match row.scopes.as_deref() {
-        None => vec![],
-        Some(s) => match serde_json::from_str::<Vec<String>>(s) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "api_token has malformed scopes JSON; treating as empty");
-                vec![]
-            }
-        },
-    };
-
-    let workspace_id = match row.workspace_id {
-        Some(ws_id) => ws_id,
-        None => {
-            let ws: Option<(String,)> = trakkt_core::db_fetch_optional!(
-                db,
-                (String,),
-                "SELECT workspace_id FROM workspace_users WHERE user_id = $1 LIMIT 1",
-                &row.user_id
-            )
-            .ok()?;
-            ws?.0
-        }
-    };
-
-    Some(RestAuth {
-        workspace_id,
-        user_id: row.user_id,
-        scopes,
-    })
-}
-
-/// Authenticate the request, returning `RestAuth` or an HTTP 401 error.
+/// Authenticate the request, returning `ResolvedAuth` or an HTTP 401 error.
 ///
 /// In personal mode, returns a local user context without token validation.
-async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<RestAuth, RestError> {
+async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<ResolvedAuth, RestError> {
     if state.config.is_personal() {
-        return Ok(RestAuth {
+        return Ok(ResolvedAuth {
             workspace_id: "workspace-local".to_string(),
             user_id: "user-local".to_string(),
             scopes: vec![],
         });
     }
 
-    resolve_rest_auth(headers, state).await.ok_or_else(|| {
+    auth_shared::resolve_auth(headers, state).await.ok_or_else(|| {
         RestError(ApiError::Unauthorized(
             "Authentication required. Provide a valid Bearer token in the Authorization header."
                 .to_string(),
@@ -202,7 +54,7 @@ async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<RestAuth,
 }
 
 /// Check that the resolved auth has the required scope.
-fn check_scope(auth: &RestAuth, scope: &str) -> Result<(), RestError> {
+fn check_scope(auth: &ResolvedAuth, scope: &str) -> Result<(), RestError> {
     if auth.has_scope(scope) {
         Ok(())
     } else {
@@ -572,9 +424,16 @@ async fn delete_milestone_handler(
 // Router
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `GET /openapi.json` — OpenAPI 3.1 spec (unauthenticated).
+async fn openapi_handler() -> Json<serde_json::Value> {
+    Json(trakkt_api::openapi::generate_openapi_spec())
+}
+
 /// Build the REST API router, mounted at `/api/v1`.
 pub fn rest_router() -> Router<AppState> {
     Router::new()
+        // OpenAPI spec (public, no auth)
+        .route("/openapi.json", get(openapi_handler))
         // Issues
         .route("/issues", get(list_issues_handler).post(create_issue_handler))
         .route("/issues/search", get(search_issues_handler))

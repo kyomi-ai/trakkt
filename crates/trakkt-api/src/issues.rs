@@ -55,6 +55,7 @@ pub async fn list_issues(
         exclude_status_categories,
         priority: params.priority,
         assignee_id: params.assignee,
+        creator_id: None,
         label_ids: params.label.map(|s| {
             s.split(',')
                 .map(|id| id.trim().to_string())
@@ -64,6 +65,8 @@ pub async fn list_issues(
         search: params.search,
         limit: Some(limit),
         offset: None,
+        include_archived: None,
+        only_archived: None,
     };
 
     let team_id = resolve_team(

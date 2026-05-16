@@ -12,6 +12,7 @@ pub mod context;
 pub mod issues;
 pub mod labels;
 pub mod milestones;
+pub mod openapi;
 pub mod projects;
 pub mod relations;
 pub mod statuses;
@@ -268,6 +269,10 @@ mod tests {
     fn all_operations_includes_all_ops() {
         let ops = all_operations();
         let names: Vec<&str> = ops.iter().map(|op| op.name).collect();
+
+        // Assert no duplicate operation names.
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), ops.len(), "duplicate operation names detected");
 
         // Issue operations (6)
         assert!(names.contains(&"list_issues"));

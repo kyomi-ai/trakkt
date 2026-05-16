@@ -2,6 +2,7 @@
 
 //! REST routes — external callers only.
 
+pub mod auth_shared;
 pub mod auth_token;
 pub mod mcp;
 pub mod oauth;
