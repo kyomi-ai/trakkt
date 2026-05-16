@@ -493,6 +493,15 @@ fn IssueListInner(
     // ── New Issue modal state ───────────────────────────────────────────────
     let (show_new_issue, set_show_new_issue) = signal(false);
 
+    if let Some(trigger) = use_context::<crate::components::CreateIssueTrigger>() {
+        Effect::new(move || {
+            if trigger.0.get() {
+                trigger.0.set(false);
+                set_show_new_issue.set(true);
+            }
+        });
+    }
+
     let on_issue_created = Callback::new(move |()| {
         set_show_new_issue.set(false);
         set_version.update(|v| *v += 1);

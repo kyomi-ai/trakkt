@@ -41,7 +41,7 @@ pub use avatar::{Avatar, AvatarSize};
 pub use badge::{Badge, BadgeVariant};
 pub use button::{Button, ButtonLink, ButtonSize, ButtonVariant, ToggleButton};
 pub use card::{Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle};
-pub use command_palette::CommandPalette;
+pub use command_palette::{CommandPalette, CreateIssueTrigger};
 pub use checkbox::Checkbox;
 pub use confirm_dialog::ConfirmDialog;
 pub use date_picker::DatePicker;
