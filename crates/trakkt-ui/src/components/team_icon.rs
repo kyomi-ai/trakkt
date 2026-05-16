@@ -158,7 +158,7 @@ pub fn TeamIcon(
             }
         }
         Some("custom") => {
-            let src = format!("/api/teams/{team_id}/icon");
+            let src = format!("/api/v1/teams/{team_id}/icon");
             view! {
                 <img
                     src=src
