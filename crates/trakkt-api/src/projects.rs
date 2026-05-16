@@ -15,7 +15,7 @@ use trakkt_types::api::{
     UpdateProjectApiParams,
 };
 
-use super::{ApiCtx, ApiError, ApiOperation, ApiResult};
+use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -84,7 +84,7 @@ pub async fn create_project(
     };
 
     let project =
-        project_service::create_project(ctx.db, &create_params, Some(ctx.ws_manager)).await?;
+        project_service::create_project(ctx.db, &create_params, ctx.ws_manager).await?;
 
     Ok(serde_json::to_value(&project)?)
 }
@@ -119,7 +119,7 @@ pub async fn update_project(
     };
 
     let project =
-        project_service::update_project(ctx.db, &update_params, Some(ctx.ws_manager)).await?;
+        project_service::update_project(ctx.db, &update_params, ctx.ws_manager).await?;
 
     Ok(serde_json::to_value(&project)?)
 }
@@ -133,7 +133,7 @@ pub async fn delete_project(
 ) -> ApiResult<serde_json::Value> {
     verify_project_ownership(ctx, &params.project_id).await?;
 
-    project_service::delete_project(ctx.db, &params.project_id, Some(ctx.ws_manager)).await?;
+    project_service::delete_project(ctx.db, &params.project_id, ctx.ws_manager).await?;
 
     Ok(json!({ "message": format!("Project {} deleted", params.project_id) }))
 }

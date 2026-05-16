@@ -413,7 +413,7 @@ fn handle_initialize(id: Option<Value>, _params: Option<Value>) -> JsonRpcRespon
 fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
     let mut tools = Vec::new();
 
-    for op in crate::api::all_operations() {
+    for op in trakkt_api::all_operations() {
         let schema = (op.json_schema)();
         let schema_value = match serde_json::to_value(&schema) {
             Ok(v) => v,
@@ -520,7 +520,7 @@ async fn handle_tools_call(
 ///
 /// Returns `None` if the tool is not in the registry.
 fn registry_tool_scope(name: &str) -> Option<&'static str> {
-    crate::api::all_operations()
+    trakkt_api::all_operations()
         .into_iter()
         .find(|op| op.name == name)
         .map(|op| op.scope)
@@ -536,13 +536,13 @@ async fn dispatch_registry_tool(
     auth: &McpAuth,
     state: &AppState,
 ) -> trakkt_core::Result<String> {
-    let ops = crate::api::all_operations();
+    let ops = trakkt_api::all_operations();
     let op = ops
         .into_iter()
         .find(|o| o.name == name)
         .ok_or_else(|| trakkt_core::Error::BadRequest(format!("Unknown registry tool: {name}")))?;
 
-    let ctx = crate::api::ApiCtx::from_bearer(
+    let ctx = trakkt_api::ApiCtx::from_bearer(
         auth.workspace_id.clone(),
         auth.user_id.clone(),
         &state.db,
@@ -550,12 +550,12 @@ async fn dispatch_registry_tool(
     );
 
     let result = (op.handler)(ctx, arguments).await.map_err(|e| match e {
-        crate::api::ApiError::NotFound(msg) => trakkt_core::Error::NotFound(msg),
-        crate::api::ApiError::BadRequest(msg) => trakkt_core::Error::BadRequest(msg),
-        crate::api::ApiError::Unauthorized(msg) => trakkt_core::Error::Forbidden(msg),
-        crate::api::ApiError::Forbidden(msg) => trakkt_core::Error::Forbidden(msg),
-        crate::api::ApiError::Conflict(msg) => trakkt_core::Error::Conflict(msg),
-        crate::api::ApiError::Internal(msg) => trakkt_core::Error::Internal(msg),
+        trakkt_api::ApiError::NotFound(msg) => trakkt_core::Error::NotFound(msg),
+        trakkt_api::ApiError::BadRequest(msg) => trakkt_core::Error::BadRequest(msg),
+        trakkt_api::ApiError::Unauthorized(msg) => trakkt_core::Error::Forbidden(msg),
+        trakkt_api::ApiError::Forbidden(msg) => trakkt_core::Error::Forbidden(msg),
+        trakkt_api::ApiError::Conflict(msg) => trakkt_core::Error::Conflict(msg),
+        trakkt_api::ApiError::Internal(msg) => trakkt_core::Error::Internal(msg),
     })?;
 
     serde_json::to_string_pretty(&result).map_err(trakkt_core::Error::from)

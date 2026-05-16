@@ -16,8 +16,8 @@ use trakkt_types::api::{
 };
 use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate};
 
-use super::context::{resolve_issue_key_and_number, resolve_team};
-use super::{ApiCtx, ApiError, ApiOperation, ApiResult};
+use crate::context::{resolve_issue_key_and_number, resolve_team};
+use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers
@@ -149,7 +149,7 @@ pub async fn create_issue(
     };
 
     let issue =
-        issue_service::create_issue(ctx.db, &create_params, Some(ctx.ws_manager)).await?;
+        issue_service::create_issue(ctx.db, &create_params, ctx.ws_manager).await?;
 
     // If a parent was specified, create the parent relation after issue creation.
     if let Some(ref parent_id) = parent_issue_id {
@@ -159,7 +159,7 @@ pub async fn create_issue(
             &issue.issue_id,
             parent_id,
             Some(&ctx.user_id),
-            Some(ctx.ws_manager),
+            ctx.ws_manager,
         )
         .await?;
     }
@@ -211,7 +211,7 @@ pub async fn update_issue(
         number,
         &updates,
         Some(&ctx.user_id),
-        Some(ctx.ws_manager),
+        ctx.ws_manager,
     )
     .await?;
 
@@ -224,7 +224,7 @@ pub async fn update_issue(
                     ctx.db,
                     &ctx.workspace_id,
                     &issue.issue_id,
-                    Some(ctx.ws_manager),
+                    ctx.ws_manager,
                 )
                 .await?;
             }
@@ -234,7 +234,7 @@ pub async fn update_issue(
                     ctx.db,
                     &ctx.workspace_id,
                     &issue.issue_id,
-                    Some(ctx.ws_manager),
+                    ctx.ws_manager,
                 )
                 .await?;
             }
@@ -246,7 +246,7 @@ pub async fn update_issue(
                     &issue.issue_id,
                     parent_id,
                     Some(&ctx.user_id),
-                    Some(ctx.ws_manager),
+                    ctx.ws_manager,
                 )
                 .await?;
             }
@@ -259,7 +259,7 @@ pub async fn update_issue(
             ctx.db,
             &issue.issue_id,
             label_ids,
-            Some(ctx.ws_manager),
+            ctx.ws_manager,
         )
         .await?;
     }
@@ -291,7 +291,7 @@ pub async fn delete_issue(
         &ctx.workspace_id,
         &team_key,
         number,
-        Some(ctx.ws_manager),
+        ctx.ws_manager,
     )
     .await?;
 

@@ -34,7 +34,7 @@ pub struct ApiCtx<'a> {
     pub db: &'a trakkt_core::DbPool,
     pub workspace_id: String,
     pub user_id: String,
-    pub ws_manager: &'a trakkt_auth::websocket::WebSocketManager,
+    pub ws_manager: Option<&'a trakkt_auth::websocket::WebSocketManager>,
 }
 
 impl<'a> ApiCtx<'a> {
@@ -46,6 +46,24 @@ impl<'a> ApiCtx<'a> {
         user_id: String,
         db: &'a trakkt_core::DbPool,
         ws_manager: &'a trakkt_auth::websocket::WebSocketManager,
+    ) -> Self {
+        Self {
+            db,
+            workspace_id,
+            user_id,
+            ws_manager: Some(ws_manager),
+        }
+    }
+
+    /// Construct an [`ApiCtx`] from Leptos server function context.
+    ///
+    /// Accepts `Option<&WebSocketManager>` directly because the Leptos
+    /// `ServerContext` stores it as `Option<WebSocketManager>`.
+    pub fn from_leptos(
+        workspace_id: String,
+        user_id: String,
+        db: &'a trakkt_core::DbPool,
+        ws_manager: Option<&'a trakkt_auth::websocket::WebSocketManager>,
     ) -> Self {
         Self {
             db,

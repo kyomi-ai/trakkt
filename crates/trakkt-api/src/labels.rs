@@ -11,8 +11,8 @@ use axum::http::Method;
 use trakkt_auth::label_service;
 use trakkt_types::api::{CreateLabelApiParams, ListLabelsApiParams};
 
-use super::context::resolve_team;
-use super::{ApiCtx, ApiOperation, ApiResult};
+use crate::context::resolve_team;
+use crate::{ApiCtx, ApiOperation, ApiResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers
@@ -51,7 +51,7 @@ pub async fn create_label(
         &params.name,
         &params.color,
         team_id.as_deref(),
-        Some(ctx.ws_manager),
+        ctx.ws_manager,
     )
     .await?;
 

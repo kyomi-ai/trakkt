@@ -12,8 +12,8 @@ use serde_json::json;
 use trakkt_auth::{issue_service, relation_service};
 use trakkt_types::api::{AddRelationApiParams, ListRelationsApiParams, RemoveRelationApiParams};
 
-use super::context::{parse_issue_identifier, resolve_issue_key_and_number};
-use super::{ApiCtx, ApiError, ApiOperation, ApiResult};
+use crate::context::{parse_issue_identifier, resolve_issue_key_and_number};
+use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers
@@ -65,7 +65,7 @@ pub async fn add_relation(
         &target_issue.issue_id,
         &params.relation_type,
         Some(&ctx.user_id),
-        Some(ctx.ws_manager),
+        ctx.ws_manager,
     )
     .await?;
 
@@ -83,7 +83,7 @@ pub async fn remove_relation(
         ctx.db,
         &params.relation_id,
         &ctx.workspace_id,
-        Some(ctx.ws_manager),
+        ctx.ws_manager,
     )
     .await?;
 

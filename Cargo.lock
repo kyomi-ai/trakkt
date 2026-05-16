@@ -4974,6 +4974,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "trakkt-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "schemars",
+ "serde_json",
+ "sqlx",
+ "tracing",
+ "trakkt-auth",
+ "trakkt-core",
+ "trakkt-types",
+]
+
+[[package]]
 name = "trakkt-auth"
 version = "0.1.0"
 dependencies = [
@@ -5057,6 +5071,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "trakkt-api",
  "trakkt-auth",
  "trakkt-core",
  "trakkt-types",

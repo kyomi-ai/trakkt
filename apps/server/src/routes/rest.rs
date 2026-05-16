@@ -25,7 +25,7 @@ use axum::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::api::{comments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
+use trakkt_api::{comments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
 use crate::state::AppState;
 
 // ─────────────────────────────────────────────────────────────────────────────

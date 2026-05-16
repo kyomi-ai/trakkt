@@ -11,8 +11,8 @@ use axum::http::Method;
 use trakkt_auth::{comment_service, issue_service};
 use trakkt_types::api::AddCommentApiParams;
 
-use super::context::resolve_issue_key_and_number;
-use super::{ApiCtx, ApiError, ApiOperation, ApiResult};
+use crate::context::resolve_issue_key_and_number;
+use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers
@@ -42,7 +42,7 @@ pub async fn add_comment(
         &ctx.user_id,
         &params.body,
         params.parent_id.as_deref(),
-        Some(ctx.ws_manager),
+        ctx.ws_manager,
     )
     .await?;
 

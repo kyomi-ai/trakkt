@@ -11,7 +11,7 @@ use axum::http::Method;
 use trakkt_auth::team_service;
 use trakkt_types::api::ListTeamsApiParams;
 
-use super::{ApiCtx, ApiOperation, ApiResult};
+use crate::{ApiCtx, ApiOperation, ApiResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers

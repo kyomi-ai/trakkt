@@ -15,8 +15,8 @@ use trakkt_types::api::{
     UpdateMilestoneApiParams,
 };
 
-use super::projects::verify_project_ownership;
-use super::{ApiCtx, ApiError, ApiOperation, ApiResult};
+use crate::projects::verify_project_ownership;
+use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -83,7 +83,7 @@ pub async fn create_milestone(
         &params.name,
         params.description.as_deref(),
         params.target_date.as_deref(),
-        Some(ctx.ws_manager),
+        ctx.ws_manager,
         &ctx.workspace_id,
     )
     .await?;
@@ -116,7 +116,7 @@ pub async fn update_milestone(
         params.name.as_deref(),
         params.description.as_deref(),
         params.target_date.as_ref().map(|opt| opt.as_deref()),
-        Some(ctx.ws_manager),
+        ctx.ws_manager,
         &ctx.workspace_id,
     )
     .await?;
@@ -138,7 +138,7 @@ pub async fn delete_milestone(
     project_service::delete_milestone(
         ctx.db,
         &params.milestone_id,
-        Some(ctx.ws_manager),
+        ctx.ws_manager,
         &ctx.workspace_id,
     )
     .await?;

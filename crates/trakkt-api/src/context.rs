@@ -5,7 +5,7 @@
 //! These functions are extracted from the MCP tool handlers so that both the
 //! MCP and REST surfaces can share the same resolution logic.
 
-use super::{ApiError, ApiResult};
+use crate::{ApiError, ApiResult};
 
 /// Parse a compound issue identifier like `"ENG-42"` into `(team_key, number)`.
 ///
