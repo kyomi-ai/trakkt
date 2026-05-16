@@ -13,6 +13,7 @@ use phosphor_leptos::{Icon, IconWeight};
 use std::sync::Arc;
 
 use crate::cache::store::SyncStore;
+use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon};
 use crate::components::{Button, CommandPalette, ConfirmDialog, CreateIssueTrigger, Modal, ModalSize, SearchInput, Spinner, TeamIcon, INPUT_CLASS};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
@@ -933,6 +934,35 @@ fn SidebarTeamSubNav(
     let settings_active = Signal::derive(move || path.get().starts_with(&settings_href_match));
     let team_active = Signal::derive(move || issues_active.get() || settings_active.get());
 
+    // Raw query string WITHOUT the leading '?' (leptos_router strips it).
+    let search = leptos_router::hooks::use_location().search;
+
+    // Active/Backlog sub-item hrefs
+    let active_href = format!("/teams/{}/issues?status=in_progress", team_key.to_lowercase());
+    let backlog_href = format!("/teams/{}/issues?status=backlog", team_key.to_lowercase());
+
+    // Issues weight (for Phosphor icon fill/light toggle)
+    let issues_weight = Signal::derive(move || {
+        if issues_active.get() { IconWeight::Fill } else { IconWeight::Light }
+    });
+
+    // Active state for Active/Backlog — match path + query param
+    let issues_href_match_for_active = issues_href.clone();
+    let started_active = Signal::derive(move || {
+        path.get().starts_with(&issues_href_match_for_active)
+            && search.get().split('&').any(|p| p == "status=in_progress")
+    });
+    let issues_href_match_for_backlog = issues_href.clone();
+    let backlog_active = Signal::derive(move || {
+        path.get().starts_with(&issues_href_match_for_backlog)
+            && search.get().split('&').any(|p| p == "status=backlog")
+    });
+
+    // Issues "plain" active: on the issues page but WITHOUT a status query param
+    let issues_no_filter_active = Signal::derive(move || {
+        issues_active.get() && !search.get().split('&').any(|p| p.starts_with("status="))
+    });
+
     // Auto-expand if the current path is within this team.
     let (expanded, set_expanded) = signal(false);
     let (menu_open, set_menu_open) = signal(false);
@@ -1048,9 +1078,19 @@ fn SidebarTeamSubNav(
             // Indented sub-items — shown when expanded
             {move || expanded.get().then(|| {
                 let ih = issues_href.clone();
+                let ah = active_href.clone();
+                let bh = backlog_href.clone();
                 view! {
                     <div class="ml-4">
-                        <SidebarSubNavItem href=ih icon=phosphor_leptos::LIST_BULLETS label="Issues" is_active=issues_active/>
+                        <SidebarSubNavItem href=ih label="Issues" is_active=issues_no_filter_active>
+                            <Icon icon=phosphor_leptos::LIST_BULLETS weight=issues_weight size="14px"/>
+                        </SidebarSubNavItem>
+                        <SidebarSubNavItem href=ah label="Active" is_active=started_active>
+                            {view_status_icon(IssueStatusVariant::Started, "14px".to_string())}
+                        </SidebarSubNavItem>
+                        <SidebarSubNavItem href=bh label="Backlog" is_active=backlog_active>
+                            {view_status_icon(IssueStatusVariant::Backlog, "14px".to_string())}
+                        </SidebarSubNavItem>
                     </div>
                 }
             })}
@@ -1093,16 +1133,16 @@ fn SidebarTeamSubNav(
 }
 
 /// Indented sub-nav item used within team sections.
+///
+/// Accepts `children` for the icon so callers can pass either Phosphor icons
+/// or custom SVGs (e.g. status circle variants for Active/Backlog views).
 #[component]
 fn SidebarSubNavItem(
     href: String,
-    icon: phosphor_leptos::IconData,
     label: &'static str,
     is_active: Signal<bool>,
+    children: Children,
 ) -> impl IntoView {
-    let weight = Signal::derive(move || {
-        if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
-    });
     let class = move || {
         let base = "flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-colors";
         if is_active.get() {
@@ -1113,7 +1153,7 @@ fn SidebarSubNavItem(
     };
     view! {
         <a href=href class=class>
-            <Icon icon=icon weight=weight size="14px"/>
+            {children()}
             {label}
         </a>
     }

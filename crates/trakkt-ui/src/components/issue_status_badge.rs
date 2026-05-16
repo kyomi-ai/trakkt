@@ -65,7 +65,7 @@ impl IssueStatusVariant {
 }
 
 /// Render the SVG icon for a status variant at the given pixel size.
-fn view_status_icon(variant: IssueStatusVariant, size: String) -> impl IntoView {
+pub fn view_status_icon(variant: IssueStatusVariant, size: String) -> impl IntoView {
     match variant {
         IssueStatusVariant::Backlog => view_backlog(size).into_any(),
         IssueStatusVariant::Unstarted => view_unstarted(size).into_any(),
