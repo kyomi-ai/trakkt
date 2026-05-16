@@ -13,7 +13,7 @@ use phosphor_leptos::{Icon, IconWeight};
 use std::sync::Arc;
 
 use crate::cache::store::SyncStore;
-use crate::components::{Button, CommandPalette, ConfirmDialog, Modal, ModalSize, SearchInput, Spinner, TeamIcon, INPUT_CLASS};
+use crate::components::{Button, CommandPalette, ConfirmDialog, CreateIssueTrigger, Modal, ModalSize, SearchInput, Spinner, TeamIcon, INPUT_CLASS};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
 
@@ -29,6 +29,7 @@ pub fn Layout() -> impl IntoView {
     // On SSR it remains empty; on WASM the sync engine populates it.
     let sync_store = SyncStore::new();
     provide_context(sync_store);
+    provide_context(CreateIssueTrigger(RwSignal::new(false)));
 
     let auth_confirmed = RwSignal::new(false);
     let nav = leptos_router::hooks::use_navigate();

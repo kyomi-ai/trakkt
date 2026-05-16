@@ -19,6 +19,9 @@ use crate::cache::store::SyncStore;
 use crate::server_fns::issues::list_issues;
 use crate::types::IssueNavState;
 
+#[derive(Clone, Copy)]
+pub struct CreateIssueTrigger(pub RwSignal<bool>);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,6 +55,8 @@ enum ActionKind {
     Navigate(String),
     /// Navigate to an issue by identifier (e.g. "TRA-42").
     NavigateIssue(String),
+    /// Open the new-issue modal on the team's issue list page.
+    CreateIssue,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,7 +81,7 @@ fn static_actions() -> Vec<PaletteAction> {
             label: "Create Issue".to_string(),
             description: None,
             icon: PaletteIcon::Plus,
-            kind: ActionKind::Navigate("/issues?action=new".to_string()),
+            kind: ActionKind::CreateIssue,
         },
     ]
 }
@@ -211,6 +216,22 @@ pub fn CommandPalette(
                     state: State::from(JsValue::from_str(&json)),
                     ..Default::default()
                 });
+            }
+            ActionKind::CreateIssue => {
+                if let Some(trigger) = use_context::<CreateIssueTrigger>()
+                    && let Some(store) = sync_store
+                {
+                    let teams = store.teams().get_untracked();
+                    if let Some(team) = teams.first() {
+                        let key = team.key.to_lowercase();
+                        let path = format!("/teams/{key}/issues");
+                        let current = location.pathname.get_untracked();
+                        if !current.starts_with(&path) {
+                            nav(&path, Default::default());
+                        }
+                        trigger.0.set(true);
+                    }
+                }
             }
         }
         on_close.run(());
