@@ -261,7 +261,6 @@ fn IssueDetailContent(
     let number = initial_issue.number;
     let issue_team_key_for_lookup = initial_issue.team_key.clone();
     let initial_team_key = initial_issue.team_key.clone();
-    let initial_description = initial_issue.description.clone().unwrap_or_default();
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let initial = RwSignal::new(initial_issue);
 
@@ -293,6 +292,7 @@ fn IssueDetailContent(
 
     // ── Fine-grained memos: only re-render when the specific field changes ──
     let title = Memo::new(move |_| issue.get().title.clone());
+    let description = Memo::new(move |_| issue.get().description.clone().unwrap_or_default());
     let parent_identifier = Memo::new(move |_| issue.get().parent_identifier.clone());
     let timestamps = Memo::new(move |_| {
         let i = issue.get();
@@ -347,7 +347,7 @@ fn IssueDetailContent(
                 <DescriptionEditor
                     team_key=initial_team_key.clone()
                     number=number
-                    description=initial_description.clone()
+                    description=Signal::from(description)
                 />
 
                 // ── Relations section (unified: parent, children, blocks, blocked-by) ──
@@ -1352,13 +1352,10 @@ fn LabelPicker(
 fn DescriptionEditor(
     team_key: String,
     number: i32,
-    description: String,
+    description: Signal<String>,
 ) -> impl IntoView {
     use kode_leptos::TreeWysiwygEditor;
 
-    // Initial content — passed to the editor once, not updated reactively
-    // (updating the content signal would cause re-render and focus loss).
-    let initial_content = Signal::stored(description);
     let latest_text = RwSignal::new(String::new());
     let edit_version = RwSignal::new(0u32);
 
@@ -1408,7 +1405,7 @@ fn DescriptionEditor(
     view! {
         <div class="mt-6" style="min-height: 120px;">
             <TreeWysiwygEditor
-                content=initial_content
+                content=description
                 on_change=on_change
                 show_fixed_toolbar=false
                 show_floating_toolbar=true
