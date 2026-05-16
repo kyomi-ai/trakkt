@@ -49,7 +49,7 @@ console_error_panic_hook = "0.1"
 phosphor-leptos = "0.8"
 
 # WYSIWYG markdown editor (client-side only, compiles to WASM)
-kode-leptos = "0.3.0"
+kode-leptos = "0.4"
 
 # Browser DOM access
 web-sys = { version = "0.3", features = [
