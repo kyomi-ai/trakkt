@@ -17,7 +17,7 @@ description = "Open-source issue tracker. Linear-quality UX, single binary, self
 # Shared dependency versions — all crates use these
 [workspace.dependencies]
 # Web framework
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "limit", "normalize-path", "set-header", "trace"] }
 

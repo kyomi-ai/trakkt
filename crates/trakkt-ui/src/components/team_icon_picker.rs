@@ -6,7 +6,8 @@
 //! 1. Large preview of the current team icon (48px)
 //! 2. Colour palette — 2 rows of 8 swatches
 //! 3. Icon grid — grouped by category with small labels
-//! 4. "Remove icon" clear button at the bottom
+//! 4. Custom icon upload (file input)
+//! 5. "Remove icon" clear button at the bottom
 
 use leptos::prelude::*;
 use phosphor_leptos::Icon;
@@ -102,10 +103,60 @@ pub fn TeamIconPicker(
         on_change.run((None, None, None));
     };
 
+    // Upload error message signal
+    let (upload_error, set_upload_error) = signal(Option::<String>::None);
+
+    // File upload handler
+    let team_id_for_upload = team.team_id.clone();
+    let on_file_change = move |ev: leptos::ev::Event| {
+        use wasm_bindgen::JsCast;
+
+        let target = ev.target();
+        let input: Option<web_sys::HtmlInputElement> = target
+            .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok());
+        let Some(input) = input else { return };
+        let Some(files) = input.files() else { return };
+        let Some(file) = files.get(0) else { return };
+
+        // Client-side size validation
+        if file.size() as usize > 51_200 {
+            set_upload_error.set(Some("File too large (max 50KB)".to_string()));
+            // Reset the input so the same file can be re-selected
+            input.set_value("");
+            return;
+        }
+
+        set_upload_error.set(None);
+
+        let team_id = team_id_for_upload.clone();
+        let set_upload_error = set_upload_error;
+        let set_selected_name = set_selected_name;
+        let set_selected_color = set_selected_color;
+
+        leptos::task::spawn_local(async move {
+            let result = upload_team_icon_file(&team_id, &file).await;
+            match result {
+                Ok(()) => {
+                    // Clear local preset state — the Axum handler already
+                    // persisted the upload, so do NOT call on_change here
+                    // (that would trigger update_team_icon which wipes icon_data).
+                    set_selected_name.set(None);
+                    set_selected_color.set(None);
+                }
+                Err(msg) => {
+                    set_upload_error.set(Some(msg));
+                }
+            }
+        });
+
+        // Reset the input so the same file can be re-selected
+        input.set_value("");
+    };
+
     // ── Render ─────────────────────────────────────────────────────────────
 
     view! {
-        <div class="flex flex-col gap-4">
+        <div class="flex flex-col gap-4 max-h-[400px] overflow-y-auto">
             // Preview
             <div class="flex items-center justify-center py-2">
                 {move || {
@@ -189,6 +240,26 @@ pub fn TeamIconPicker(
                 }).collect_view()}
             </div>
 
+            // Custom upload section
+            <div class="border-t border-border pt-2">
+                <label class="flex items-center justify-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted rounded-md cursor-pointer transition-colors duration-200">
+                    <Icon icon=phosphor_leptos::UPLOAD_SIMPLE size="16px"/>
+                    "Upload custom icon"
+                    <input
+                        type="file"
+                        accept="image/svg+xml,image/png,image/jpeg"
+                        class="hidden"
+                        on:change=on_file_change
+                    />
+                </label>
+                <p class="text-[10px] text-muted-foreground text-center mt-1">
+                    "SVG, PNG, or JPG \u{2022} Max 50KB"
+                </p>
+                {move || upload_error.get().map(|msg| view! {
+                    <p class="text-[10px] text-destructive text-center mt-1">{msg}</p>
+                })}
+            </div>
+
             // Clear button
             <div class="border-t border-border pt-2">
                 <Button
@@ -202,4 +273,64 @@ pub fn TeamIconPicker(
             </div>
         </div>
     }
+}
+
+// ─── Upload helper ────────────────────────────────────────────────────────────
+
+/// Upload a file to the team icon endpoint via fetch + FormData.
+#[cfg(target_arch = "wasm32")]
+async fn upload_team_icon_file(
+    team_id: &str,
+    file: &web_sys::File,
+) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let form_data = web_sys::FormData::new()
+        .map_err(|e| format!("FormData error: {e:?}"))?;
+    form_data
+        .append_with_blob_and_filename("icon", file, &file.name())
+        .map_err(|e| format!("FormData append error: {e:?}"))?;
+
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("POST");
+    opts.set_body(form_data.as_ref());
+
+    let url = format!("/api/v1/teams/{team_id}/icon");
+    let request = web_sys::Request::new_with_str_and_init(&url, &opts)
+        .map_err(|e| format!("Request error: {e:?}"))?;
+
+    let window = web_sys::window().ok_or("no window")?;
+    let resp_val = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("fetch error: {e:?}"))?;
+
+    let resp: web_sys::Response = resp_val
+        .dyn_into()
+        .map_err(|e| format!("response cast error: {e:?}"))?;
+
+    if !resp.ok() {
+        let status = resp.status();
+        // Try to get error message from response body
+        let body_text = match resp.text() {
+            Ok(promise) => match JsFuture::from(promise).await {
+                Ok(val) => val.as_string().unwrap_or_default(),
+                Err(_) => String::new(),
+            },
+            Err(_) => String::new(),
+        };
+        return Err(format!("Upload failed ({}): {}", status, body_text));
+    }
+
+    Ok(())
+}
+
+/// Server-side stub — never called at runtime but satisfies the compiler
+/// when SSR compiles the component module.
+#[cfg(not(target_arch = "wasm32"))]
+async fn upload_team_icon_file(
+    _team_id: &str,
+    _file: &web_sys::File,
+) -> Result<(), String> {
+    Err("upload only available in browser".into())
 }
