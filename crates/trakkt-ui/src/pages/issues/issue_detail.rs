@@ -136,8 +136,10 @@ pub fn IssueDetailPage() -> impl IntoView {
             if let Some(issue) = items.iter().find(|i| i.team_key == tk && i.number == num) {
                 return Some(Ok(Some(issue.clone())));
             }
+            // Issue not in SyncStore — may be archived (excluded from sync).
+            // Fall through to server_issue rather than returning None immediately.
             if store.initialized().get() {
-                return Some(Ok(None));
+                return server_issue.get();
             }
         }
         server_issue.get()

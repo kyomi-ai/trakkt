@@ -24,6 +24,7 @@ pub struct Team {
     pub icon_name: Option<String>,
     pub icon_color: Option<String>,
     pub member_count: i64,
+    pub settings: Option<TeamSettings>,
     pub created_at: String,
 }
 
@@ -104,6 +105,7 @@ pub struct IssueWithDetails {
     pub sort_order: Option<f64>,
     pub created_at: String,
     pub updated_at: String,
+    pub archived_at: Option<String>,
     pub labels: Vec<Label>,
 }
 
@@ -249,10 +251,15 @@ pub struct IssueFilters {
     pub exclude_status_categories: Option<Vec<String>>,
     pub priority: Option<i32>,
     pub assignee_id: Option<String>,
+    pub creator_id: Option<String>,
     pub label_ids: Option<Vec<String>>,
     pub search: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub include_archived: Option<bool>,
+    /// When true, return ONLY archived issues (archived_at IS NOT NULL).
+    /// Takes precedence over `include_archived`.
+    pub only_archived: Option<bool>,
 }
 
 /// Parameters for creating a new issue.
@@ -314,4 +321,18 @@ pub struct IssueRelationWithDetails {
     pub title: String,
     pub status_category: String,
     pub direction: String,
+}
+
+/// Per-team settings stored in teams.settings JSON column.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TeamSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_archive_days: Option<u32>,
+}
+
+/// Workspace-level settings stored in workspaces.settings JSON column.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_auto_archive_days: Option<u32>,
 }

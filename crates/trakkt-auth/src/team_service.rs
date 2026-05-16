@@ -8,7 +8,7 @@
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
-use trakkt_types::models::{IssueTeamMember, Team};
+use trakkt_types::models::{IssueTeamMember, Team, TeamSettings, WorkspaceSettings};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
@@ -29,11 +29,19 @@ struct TeamRow {
     icon_name: Option<String>,
     icon_color: Option<String>,
     member_count: i64,
+    settings: Option<String>,
     created_at: String,
 }
 
 impl TeamRow {
     fn into_dto(self) -> Team {
+        let settings = self.settings.and_then(|s| match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, team_id = %self.team_id, "Failed to deserialize team settings");
+                None
+            }
+        });
         Team {
             team_id: self.team_id,
             workspace_id: self.workspace_id,
@@ -45,6 +53,7 @@ impl TeamRow {
             icon_name: self.icon_name,
             icon_color: self.icon_color,
             member_count: self.member_count,
+            settings,
             created_at: self.created_at,
         }
     }
@@ -139,6 +148,7 @@ pub async fn create_team(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
+                settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         &team_id
@@ -179,13 +189,14 @@ pub async fn list_teams(
                 "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                         t.icon_type, t.icon_name, t.icon_color, \
                         COUNT(tm2.user_id) AS member_count, \
+                        t.settings, \
                         CAST(t.created_at AS TEXT) AS created_at \
                  FROM teams t \
                  INNER JOIN team_members tm ON tm.team_id = t.team_id AND tm.user_id = $2 \
                  LEFT JOIN team_members tm2 ON tm2.team_id = t.team_id \
                  WHERE t.workspace_id = $1 \
                  GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
-                          t.icon_type, t.icon_name, t.icon_color, t.created_at \
+                          t.icon_type, t.icon_name, t.icon_color, t.settings, t.created_at \
                  ORDER BY t.name ASC",
                 workspace_id,
                 uid
@@ -199,12 +210,13 @@ pub async fn list_teams(
                 "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                         t.icon_type, t.icon_name, t.icon_color, \
                         COUNT(tm.user_id) AS member_count, \
+                        t.settings, \
                         CAST(t.created_at AS TEXT) AS created_at \
                  FROM teams t \
                  LEFT JOIN team_members tm ON tm.team_id = t.team_id \
                  WHERE t.workspace_id = $1 \
                  GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
-                          t.icon_type, t.icon_name, t.icon_color, t.created_at \
+                          t.icon_type, t.icon_name, t.icon_color, t.settings, t.created_at \
                  ORDER BY t.name ASC",
                 workspace_id
             )?;
@@ -227,13 +239,14 @@ pub async fn list_joinable_teams(
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                 t.icon_type, t.icon_name, t.icon_color, \
                 COUNT(tm.user_id) AS member_count, \
+                t.settings, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
          LEFT JOIN team_members tm ON tm.team_id = t.team_id \
          WHERE t.workspace_id = $1 \
            AND t.team_id NOT IN (SELECT tm2.team_id FROM team_members tm2 WHERE tm2.user_id = $2) \
          GROUP BY t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
-                  t.icon_type, t.icon_name, t.icon_color, t.created_at \
+                  t.icon_type, t.icon_name, t.icon_color, t.settings, t.created_at \
          ORDER BY t.name ASC",
         workspace_id,
         user_id
@@ -252,6 +265,7 @@ pub async fn get_team(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
+                settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -271,6 +285,7 @@ pub async fn get_team_by_key(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
+                settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 AND key = $2",
         workspace_id,
@@ -292,6 +307,7 @@ pub async fn get_default_team(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
+                settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1",
         workspace_id
@@ -410,6 +426,7 @@ pub async fn update_team(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
+                settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -483,6 +500,7 @@ pub async fn update_team_icon(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
+                settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -552,6 +570,7 @@ pub async fn upload_team_icon(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
+                settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -645,6 +664,7 @@ pub async fn delete_team_icon(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
+                settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -1001,6 +1021,7 @@ pub async fn get_user_teams(
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                 t.icon_type, t.icon_name, t.icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
+                t.settings, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
          JOIN team_members tm ON tm.team_id = t.team_id \
@@ -1010,4 +1031,146 @@ pub async fn get_user_teams(
         user_id
     )?;
     Ok(rows.into_iter().map(TeamRow::into_dto).collect())
+}
+
+// ─── Team settings ─────────────────────────────────────────────────────────
+
+/// Update a team's settings JSON (full replace).
+///
+/// The `teams.settings` column is Postgres JSONB. We serialize to text and
+/// cast in SQL (same pattern as `workspace_service::update_workspace_settings`).
+pub async fn update_team_settings(
+    db: &DbPool,
+    team_id: &str,
+    workspace_id: &str,
+    settings: &TeamSettings,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<bool> {
+    let is_pg = db.is_postgres();
+    let json_cast = sql_compat::cast_to_json(is_pg, "$1");
+    let settings_str = serde_json::to_string(settings)
+        .map_err(|e| trakkt_core::Error::Internal(format!("JSON serialization failed: {e}")))?;
+    let sql = format!(
+        "UPDATE teams SET settings = {json_cast} WHERE team_id = $2 AND workspace_id = $3"
+    );
+    let result = trakkt_core::db_execute!(db, &sql, &settings_str, team_id, workspace_id)?;
+
+    if result.rows_affected() > 0 {
+        let team_data = match get_team(db, team_id).await {
+            Ok(Some(t)) => serde_json::to_value(&t).ok(),
+            Ok(None) => {
+                tracing::warn!(team_id, "update_team_settings: team not found after write");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, team_id, "update_team_settings: re-fetch failed");
+                None
+            }
+        };
+
+        if let Err(e) = sync_log_service::write_sync_entry(
+            db,
+            entity_types::TEAM,
+            team_id,
+            workspace_id,
+            SyncActionType::Update,
+            team_data.clone(),
+        )
+        .await
+        {
+            tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team settings update");
+        }
+
+        if let Some(ws) = ws_manager {
+            sync_log_service::broadcast_sync_action(
+                ws,
+                workspace_id,
+                entity_types::TEAM,
+                team_id,
+                SyncActionType::Update,
+                team_data,
+            )
+            .await;
+        }
+    }
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Resolve the effective auto-archive-days for a team.
+///
+/// Resolution order:
+/// 1. Team's own `auto_archive_days` setting (if > 0)
+/// 2. Workspace-level `default_auto_archive_days` (if > 0)
+/// 3. `None` — archiving is disabled
+pub async fn get_team_archive_days(
+    db: &DbPool,
+    team_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<Option<u32>> {
+    #[derive(sqlx::FromRow)]
+    struct SettingsRow {
+        settings: Option<String>,
+    }
+
+    // 1. Try team-level setting.
+    let team_row = trakkt_core::db_fetch_optional!(
+        db,
+        SettingsRow,
+        "SELECT CAST(settings AS TEXT) AS settings FROM teams WHERE team_id = $1 AND workspace_id = $2",
+        team_id,
+        workspace_id
+    )?;
+
+    if let Some(row) = team_row
+        && let Some(ref json_str) = row.settings
+    {
+        match serde_json::from_str::<TeamSettings>(json_str) {
+            Ok(ts) => {
+                if let Some(days) = ts.auto_archive_days
+                    && days > 0
+                {
+                    return Ok(Some(days));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    team_id = %team_id,
+                    "Failed to parse team settings for archive days"
+                );
+            }
+        }
+    }
+
+    // 2. Fall back to workspace default.
+    let ws_row = trakkt_core::db_fetch_optional!(
+        db,
+        SettingsRow,
+        "SELECT CAST(settings AS TEXT) AS settings FROM workspaces WHERE workspace_id = $1",
+        workspace_id
+    )?;
+
+    if let Some(row) = ws_row
+        && let Some(ref json_str) = row.settings
+    {
+        match serde_json::from_str::<WorkspaceSettings>(json_str) {
+            Ok(ws) => {
+                if let Some(days) = ws.default_auto_archive_days
+                    && days > 0
+                {
+                    return Ok(Some(days));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    workspace_id = %workspace_id,
+                    "Failed to parse workspace settings for archive days"
+                );
+            }
+        }
+    }
+
+    Ok(None)
 }

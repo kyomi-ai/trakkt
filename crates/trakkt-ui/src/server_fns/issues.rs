@@ -320,6 +320,69 @@ pub async fn set_issue_sort_order(
     Ok(())
 }
 
+/// Fetch archived issues for a given team (or all teams if team_id is empty).
+///
+/// Returns only issues where `archived_at IS NOT NULL`. Used by the "Show
+/// archived" toggle to fetch issues that have been swept by the server-side
+/// archiver and are no longer present in the client-side SyncStore.
+#[server(prefix = "/leptos-api")]
+pub async fn get_archived_issues(
+    team_id: String,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<IssueWithDetails>, ServerFnError> {
+    use trakkt_types::models::IssueFilters;
+
+    let ac = AuthenticatedContext::extract().await?;
+    let clamped_limit = limit.unwrap_or(100).clamp(1, 200);
+    let team = if team_id.is_empty() { None } else { Some(team_id.as_str()) };
+
+    if team.is_some() {
+        // Team-scoped: return all archived issues for the team.
+        let filters = IssueFilters {
+            only_archived: Some(true),
+            limit: Some(clamped_limit),
+            offset,
+            ..Default::default()
+        };
+        let issues = trakkt_auth::issue_service::list_issues(ac.db(), &ac.ws_id, team, &filters)
+            .await
+            .into_sfn()?;
+        return Ok(issues);
+    }
+
+    // Cross-team (My Issues): fetch issues assigned to OR created by the user.
+    let assigned_filters = IssueFilters {
+        only_archived: Some(true),
+        assignee_id: Some(ac.auth.user_id.clone()),
+        limit: Some(clamped_limit),
+        ..Default::default()
+    };
+    let mut issues = trakkt_auth::issue_service::list_issues(ac.db(), &ac.ws_id, None, &assigned_filters)
+        .await
+        .into_sfn()?;
+
+    let creator_filters = IssueFilters {
+        only_archived: Some(true),
+        creator_id: Some(ac.auth.user_id.clone()),
+        limit: Some(clamped_limit),
+        ..Default::default()
+    };
+    let created = trakkt_auth::issue_service::list_issues(ac.db(), &ac.ws_id, None, &creator_filters)
+        .await
+        .into_sfn()?;
+
+    let existing_ids: std::collections::HashSet<String> =
+        issues.iter().map(|i| i.issue_id.clone()).collect();
+    for issue in created {
+        if !existing_ids.contains(&issue.issue_id) {
+            issues.push(issue);
+        }
+    }
+
+    Ok(issues)
+}
+
 /// Replace all labels on an issue.
 ///
 /// `label_ids` is a comma-separated string of label UUIDs.

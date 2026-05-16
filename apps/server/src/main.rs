@@ -105,6 +105,29 @@ async fn serve() {
     // Register Leptos server functions
     trakkt_ui::register_server_functions();
 
+    // Background archive sweep — runs hourly.
+    {
+        let archive_db = db.clone();
+        let archive_ws = state.ws_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // consume immediate tick — first run after 1 hour
+            loop {
+                interval.tick().await;
+                match trakkt_auth::archive_service::run_archive_sweep(&archive_db, &archive_ws).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(archived = count, "Archive sweep completed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Archive sweep failed");
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     let router = trakkt_server::build_router(state);
     let app = trakkt_server::wrap_service(router);
 

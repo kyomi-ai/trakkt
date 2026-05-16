@@ -121,6 +121,7 @@ pub fn start_sync_engine(
 
     // ── Watch connection state to send bootstrap or delta on connect ────────
     let ws_for_state = ws.clone();
+    let wid_state = workspace_id.to_owned();
 
     Effect::new(move |_| {
         let state = ws_for_state.connection_state.get();
@@ -128,10 +129,27 @@ pub fn start_sync_engine(
             return;
         }
 
-        web_sys::console::log_1(&"[trakkt-sync] sending sync_bootstrap".into());
-        if !ws_for_state.send(serde_json::json!({"type": "sync_bootstrap"})) {
-            web_sys::console::warn_1(&"[trakkt-sync] failed to send sync_bootstrap".into());
-        }
+        // Clear cached issues before bootstrap — archived issues won't appear
+        // in the new bootstrap and need to be removed from local store.
+        let wid = wid_state.clone();
+        let ws_send = ws_for_state.clone();
+        spawn_local(async move {
+            match db::init_cache_db(&wid).await {
+                Ok(cache_db) => {
+                    if let Err(e) = db::delete_all_of_type(&cache_db, entity_types::ISSUE, &wid).await {
+                        tracing::warn!("bootstrap: failed to clear issue cache: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("bootstrap: failed to open cache db for issue clear: {e}");
+                }
+            }
+
+            web_sys::console::log_1(&"[trakkt-sync] sending sync_bootstrap".into());
+            if !ws_send.send(serde_json::json!({"type": "sync_bootstrap"})) {
+                web_sys::console::warn_1(&"[trakkt-sync] failed to send sync_bootstrap".into());
+            }
+        });
     });
 }
 

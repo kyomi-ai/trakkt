@@ -42,12 +42,12 @@ use crate::pages::issues::filters::{
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::pages::views::ViewFilters;
-use crate::server_fns::issues::{create_issue, list_issues};
+use crate::server_fns::issues::{create_issue, get_archived_issues, list_issues};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::{create_view, delete_view, update_view};
 use crate::types::IssueNavState;
 use crate::utils::keyboard::is_input_focused;
-use trakkt_types::models::{Status, Team};
+use trakkt_types::models::{IssueWithDetails, Status, Team};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // localStorage helpers for view mode
@@ -143,6 +143,9 @@ fn IssueListInner(
     let (project_filter, set_project_filter) = signal(Vec::<String>::new());
     let (show_archived, set_show_archived) = signal(false);
 
+    // ── Server-fetched archived issues (fetched on demand when toggle is ON) ──
+    let archived_issues_signal = RwSignal::new(Vec::<IssueWithDetails>::new());
+
     // ── Sort state ─────────────────────────────────────────────────────────
     let (sort_field, set_sort_field) = signal(SortField::Priority);
     let (sort_direction, set_sort_direction) = signal(SortDirection::Asc);
@@ -177,6 +180,28 @@ fn IssueListInner(
             .get()
             .into_iter()
             .find(|t| t.key.to_lowercase() == key_lower)
+    });
+
+    // ── Fetch archived issues from server when toggle is ON ─────────────
+    Effect::new(move |_| {
+        let showing = show_archived.get();
+        if !showing {
+            archived_issues_signal.set(Vec::new());
+            return;
+        }
+        let team_id = match resolved_team.get() {
+            Some(t) => t.team_id.clone(),
+            None => return,
+        };
+        leptos::task::spawn_local(async move {
+            match get_archived_issues(team_id, None, None).await {
+                Ok(issues) => archived_issues_signal.set(issues),
+                Err(e) => {
+                    tracing::warn!("Failed to fetch archived issues: {e}");
+                    archived_issues_signal.set(Vec::new());
+                }
+            }
+        });
     });
 
     // ── Team-scoped views (custom tabs) ──────────────────────────────────
@@ -322,7 +347,8 @@ fn IssueListInner(
     });
 
     // Filtered issue list for list view — applies archive, search, status, priority,
-    // label, and project filters.
+    // label, and project filters. When show_archived is ON, merges in server-fetched
+    // archived issues (deduplicating by issue_id).
     let filtered_issues = Memo::new(move |_| {
         let raw = team_issues.get();
         let search_val = search.get().to_lowercase();
@@ -332,41 +358,59 @@ fn IssueListInner(
         let project_val = project_filter.get();
         let archived_visible = show_archived.get();
 
-        raw.into_iter()
+        let apply_filters = |issue: &IssueWithDetails| -> bool {
+            if !status_val.is_empty() && !status_val.contains(&issue.status_id) {
+                return false;
+            }
+            if !priority_val.is_empty() {
+                let p_str = issue.priority.to_string();
+                if !priority_val.contains(&p_str) {
+                    return false;
+                }
+            }
+            if !label_val.is_empty() {
+                let has_match = issue.labels.iter().any(|l| label_val.contains(&l.label_id));
+                if !has_match {
+                    return false;
+                }
+            }
+            if !project_val.is_empty() {
+                match &issue.project_id {
+                    Some(pid) if project_val.contains(pid) => {}
+                    _ => return false,
+                }
+            }
+            if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
+                return false;
+            }
+            true
+        };
+
+        let mut result: Vec<IssueWithDetails> = raw
+            .into_iter()
             .filter(|issue| {
-                // Archive filter: hide archived issues unless the toggle is on.
+                // Archive filter: hide locally-archived issues unless the toggle is on.
                 if !archived_visible && is_archived(issue, ARCHIVE_DAYS) {
                     return false;
                 }
-                if !status_val.is_empty() && !status_val.contains(&issue.status_id) {
-                    return false;
-                }
-                if !priority_val.is_empty() {
-                    let p_str = issue.priority.to_string();
-                    if !priority_val.contains(&p_str) {
-                        return false;
-                    }
-                }
-                // Label filter: OR within labels — issue matches if it has ANY of the selected labels.
-                if !label_val.is_empty() {
-                    let has_match = issue.labels.iter().any(|l| label_val.contains(&l.label_id));
-                    if !has_match {
-                        return false;
-                    }
-                }
-                // Project filter: OR within projects — issue matches if its project_id is any of the selected.
-                if !project_val.is_empty() {
-                    match &issue.project_id {
-                        Some(pid) if project_val.contains(pid) => {}
-                        _ => return false,
-                    }
-                }
-                if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
-                    return false;
-                }
-                true
+                apply_filters(issue)
             })
-            .collect::<Vec<_>>()
+            .collect();
+
+        // When showing archived, merge in server-fetched archived issues
+        // (deduplicating by issue_id against what's already in the list).
+        if archived_visible {
+            let existing_ids: std::collections::HashSet<String> =
+                result.iter().map(|i| i.issue_id.clone()).collect();
+            let server_archived = archived_issues_signal.get();
+            for issue in server_archived {
+                if !existing_ids.contains(&issue.issue_id) && apply_filters(&issue) {
+                    result.push(issue);
+                }
+            }
+        }
+
+        result
     });
 
     // Sorted issue list — applies the selected sort field and direction on
