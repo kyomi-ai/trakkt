@@ -1122,23 +1122,23 @@ pub async fn get_team_archive_days(
         workspace_id
     )?;
 
-    if let Some(row) = team_row {
-        if let Some(ref json_str) = row.settings {
-            match serde_json::from_str::<TeamSettings>(json_str) {
-                Ok(ts) => {
-                    if let Some(days) = ts.auto_archive_days {
-                        if days > 0 {
-                            return Ok(Some(days));
-                        }
-                    }
+    if let Some(row) = team_row
+        && let Some(ref json_str) = row.settings
+    {
+        match serde_json::from_str::<TeamSettings>(json_str) {
+            Ok(ts) => {
+                if let Some(days) = ts.auto_archive_days
+                    && days > 0
+                {
+                    return Ok(Some(days));
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        team_id = %team_id,
-                        "Failed to parse team settings for archive days"
-                    );
-                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    team_id = %team_id,
+                    "Failed to parse team settings for archive days"
+                );
             }
         }
     }
@@ -1151,23 +1151,23 @@ pub async fn get_team_archive_days(
         workspace_id
     )?;
 
-    if let Some(row) = ws_row {
-        if let Some(ref json_str) = row.settings {
-            match serde_json::from_str::<WorkspaceSettings>(json_str) {
-                Ok(ws) => {
-                    if let Some(days) = ws.default_auto_archive_days {
-                        if days > 0 {
-                            return Ok(Some(days));
-                        }
-                    }
+    if let Some(row) = ws_row
+        && let Some(ref json_str) = row.settings
+    {
+        match serde_json::from_str::<WorkspaceSettings>(json_str) {
+            Ok(ws) => {
+                if let Some(days) = ws.default_auto_archive_days
+                    && days > 0
+                {
+                    return Ok(Some(days));
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        workspace_id = %workspace_id,
-                        "Failed to parse workspace settings for archive days"
-                    );
-                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    workspace_id = %workspace_id,
+                    "Failed to parse workspace settings for archive days"
+                );
             }
         }
     }
