@@ -5114,6 +5114,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "trakkt-api",
  "trakkt-auth",
  "trakkt-core",
  "trakkt-types",

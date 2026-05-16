@@ -103,6 +103,15 @@ impl AuthenticatedContext {
     pub(crate) fn db(&self) -> &trakkt_core::DbPool {
         &self.ctx.db
     }
+
+    pub(crate) fn api_ctx(&self) -> trakkt_api::ApiCtx<'_> {
+        trakkt_api::ApiCtx::from_leptos(
+            self.ws_id.clone(),
+            self.auth.user_id.clone(),
+            self.db(),
+            self.ctx.ws_manager.as_ref(),
+        )
+    }
 }
 
 /// Bundles headers, KV pool, client IP, and device info — the common preamble

@@ -135,59 +135,22 @@ pub async fn create_issue(
     parent_issue_id: Option<String>,
     team_id: Option<String>,
 ) -> Result<Issue, ServerFnError> {
-    use trakkt_types::models::CreateIssueParams;
-
     let ac = AuthenticatedContext::extract().await?;
-
-    // Use the provided team_id, or fall back to the default team.
-    let resolved_team_id = match team_id {
-        Some(id) => id,
-        None => {
-            let team = trakkt_auth::team_service::get_default_team(ac.db(), &ac.ws_id)
-                .await
-                .into_sfn()?;
-            team.team_id
-        }
+    let ctx = ac.api_ctx();
+    let parsed_labels: Vec<String> = label_ids.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let params = trakkt_types::api::CreateIssueApiParams {
+        title, team_key: None, team_id, description,
+        priority: Some(priority),
+        assignee: assignee_id,
+        labels: if parsed_labels.is_empty() { None } else { Some(parsed_labels) },
+        due_date, project_id, milestone_id,
+        parent_issue_id: parent_issue_id.filter(|s| !s.is_empty()),
     };
-
-    let parsed_label_ids = parse_label_ids(&label_ids);
-
-    // Treat empty string as None (sentinel pattern for clearable fields).
-    let resolved_parent_issue_id = parent_issue_id.filter(|s| !s.is_empty());
-
-    let params = CreateIssueParams {
-        workspace_id: ac.ws_id.clone(),
-        team_id: resolved_team_id,
-        creator_id: ac.auth.user_id.clone(),
-        title,
-        description,
-        priority,
-        assignee_id,
-        due_date,
-        label_ids: parsed_label_ids,
-        project_id,
-        milestone_id,
-    };
-
-    let issue = trakkt_auth::issue_service::create_issue(ac.db(), &params, ac.ctx.ws_manager.as_ref())
-        .await
-        .into_sfn()?;
-
-    // If a parent was specified, create the parent relation after issue creation.
-    if let Some(parent_id) = resolved_parent_issue_id {
-        trakkt_auth::relation_service::set_parent(
-            ac.db(),
-            &ac.ws_id,
-            &issue.issue_id,
-            &parent_id,
-            Some(&ac.auth.user_id),
-            ac.ctx.ws_manager.as_ref(),
-        )
-        .await
-        .into_sfn()?;
-    }
-
-    Ok(issue)
+    let result = trakkt_api::issues::create_issue(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Update fields on an existing issue.
@@ -220,82 +183,51 @@ pub async fn update_issue(
     parent_issue_id: Option<String>,
     clear_fields: Option<String>,
 ) -> Result<Issue, ServerFnError> {
-    use trakkt_types::models::IssueUpdate;
-
     let ac = AuthenticatedContext::extract().await?;
+    let ctx = ac.api_ctx();
 
-    let clears: Vec<&str> = clear_fields
-        .as_deref()
+    let clears: Vec<&str> = clear_fields.as_deref()
         .map(|s| s.split(',').map(str::trim).collect())
         .unwrap_or_default();
 
-    let updates = IssueUpdate {
-        title,
-        description: description.map(|s| if s.is_empty() { None } else { Some(s) }),
-        status_id,
-        priority,
-        assignee_id: if clears.contains(&"assignee") {
-            Some(None)
-        } else {
-            assignee_id.map(|s| if s.is_empty() { None } else { Some(s) })
-        },
-        due_date: if clears.contains(&"due_date") {
-            Some(None)
-        } else {
-            due_date.map(|s| if s.is_empty() { None } else { Some(s) })
-        },
-        project_id: if clears.contains(&"project") {
-            Some(None)
-        } else {
-            project_id.map(|s| if s.is_empty() { None } else { Some(s) })
-        },
-        milestone_id: if clears.contains(&"milestone") {
-            Some(None)
-        } else {
-            milestone_id.map(|s| if s.is_empty() { None } else { Some(s) })
-        },
-        sort_order: if clears.contains(&"sort_order") { Some(None) } else { None },
-        team_id: None,
-    };
-    let issue = trakkt_auth::issue_service::update_issue(ac.db(), &ac.ws_id, &team_key, number, &updates, Some(&ac.auth.user_id), ac.ctx.ws_manager.as_ref())
-        .await
-        .into_sfn()?;
-
-    // Handle parent relation changes via relation_service.
-    if clears.contains(&"parent") {
-        trakkt_auth::relation_service::clear_parent(
-            ac.db(),
-            &ac.ws_id,
-            &issue.issue_id,
-            ac.ctx.ws_manager.as_ref(),
-        )
-        .await
-        .into_sfn()?;
-    } else if let Some(ref new_parent_id) = parent_issue_id
-        && !new_parent_id.is_empty()
-    {
-        trakkt_auth::relation_service::set_parent(
-            ac.db(),
-            &ac.ws_id,
-            &issue.issue_id,
-            new_parent_id,
-            Some(&ac.auth.user_id),
-            ac.ctx.ws_manager.as_ref(),
-        )
-        .await
-        .into_sfn()?;
+    fn sentinel_to_opt(val: Option<String>, clear: bool) -> Option<Option<String>> {
+        if clear { Some(None) }
+        else { val.map(|s| if s.is_empty() { None } else { Some(s) }) }
     }
 
-    Ok(issue)
+    let params = trakkt_types::api::UpdateIssueApiParams {
+        issue_identifier: Some(format!("{team_key}-{number}")),
+        team_key: None, issue_number: None,
+        title,
+        description: description.map(|s| if s.is_empty() { None } else { Some(s) }),
+        status_id, priority,
+        assignee: sentinel_to_opt(assignee_id, clears.contains(&"assignee")),
+        labels: None,
+        due_date: sentinel_to_opt(due_date, clears.contains(&"due_date")),
+        move_to_team_key: None, move_to_team_id: None,
+        project_id: sentinel_to_opt(project_id, clears.contains(&"project")),
+        milestone_id: sentinel_to_opt(milestone_id, clears.contains(&"milestone")),
+        parent_issue_id: if clears.contains(&"parent") {
+            Some(None)
+        } else {
+            parent_issue_id.filter(|s| !s.is_empty()).map(Some)
+        },
+        sort_order: if clears.contains(&"sort_order") { Some(None) } else { None },
+    };
+    let result = trakkt_api::issues::update_issue(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Delete an issue by its team key + number (e.g. "ENG-42").
 #[server(prefix = "/leptos-api")]
 pub async fn delete_issue(team_key: String, number: i32) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    trakkt_auth::issue_service::delete_issue(ac.db(), &ac.ws_id, &team_key, number, ac.ctx.ws_manager.as_ref())
-        .await
-        .into_sfn()?;
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::DeleteIssueApiParams {
+        issue_identifier: Some(format!("{team_key}-{number}")),
+        team_key: None, issue_number: None,
+    };
+    trakkt_api::issues::delete_issue(&ctx, params).await.into_sfn()?;
     Ok(())
 }
 

@@ -22,28 +22,28 @@ use super::{AuthenticatedContext, IntoServerFnError};
 #[server(prefix = "/leptos-api")]
 pub async fn list_projects() -> Result<Vec<Project>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let projects = trakkt_auth::project_service::list_projects(ac.db(), &ac.ws_id)
-        .await
-        .into_sfn()?;
-    Ok(projects)
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::ListProjectsApiParams {};
+    let result = trakkt_api::projects::list_projects(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Get a single project by its ID.
 #[server(prefix = "/leptos-api")]
 pub async fn get_project(project_id: String) -> Result<Option<Project>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let project = trakkt_auth::project_service::get_project(ac.db(), &project_id)
-        .await
-        .into_sfn()?;
-
-    // Verify the project belongs to this workspace.
-    if let Some(ref p) = project
-        && p.workspace_id != ac.ws_id
-    {
-        return Ok(None);
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::GetProjectApiParams { project_id };
+    match trakkt_api::projects::get_project(&ctx, params).await {
+        Ok(value) => {
+            let project: Project = serde_json::from_value(
+                value.get("project").cloned().unwrap_or(serde_json::Value::Null)
+            ).into_sfn()?;
+            Ok(Some(project))
+        }
+        Err(trakkt_api::ApiError::NotFound(_)) => Ok(None),
+        Err(e) => Err(ServerFnError::new(e.to_string())),
     }
-
-    Ok(project)
 }
 
 // ─── Write operations ──────────────────────────────────────────────────────
@@ -60,23 +60,12 @@ pub async fn create_project(
     target_date: Option<String>,
 ) -> Result<Project, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let project = trakkt_auth::project_service::create_project(
-        ac.db(),
-        &trakkt_auth::project_service::CreateProjectParams {
-            workspace_id: &ac.ws_id,
-            name: &name,
-            description: description.as_deref(),
-            icon: icon.as_deref(),
-            color: color.as_deref(),
-            lead_id: lead_id.as_deref(),
-            start_date: start_date.as_deref(),
-            target_date: target_date.as_deref(),
-        },
-        ac.ctx.ws_manager.as_ref(),
-    )
-    .await
-    .into_sfn()?;
-    Ok(project)
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::CreateProjectApiParams {
+        name, description, icon, color, lead_id, start_date, target_date,
+    };
+    let result = trakkt_api::projects::create_project(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Update fields on an existing project.
@@ -98,36 +87,28 @@ pub async fn update_project(
     target_date: Option<String>,
 ) -> Result<Project, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
-
-    let project = trakkt_auth::project_service::update_project(
-        ac.db(),
-        &trakkt_auth::project_service::UpdateProjectParams {
-            project_id: &project_id,
-            name: name.as_deref(),
-            description: description.as_deref(),
-            icon: icon.as_deref(),
-            color: color.as_deref(),
-            status: status.as_deref(),
-            lead_id: lead_id.as_ref().map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
-            start_date: start_date.as_ref().map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
-            target_date: target_date.as_ref().map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
-        },
-        ac.ctx.ws_manager.as_ref(),
-    )
-    .await
-    .into_sfn()?;
-    Ok(project)
+    let ctx = ac.api_ctx();
+    // For clearable fields: empty string = clear, value = set, None = no change
+    fn opt_clear(val: Option<String>) -> Option<Option<String>> {
+        val.map(|s| if s.is_empty() { None } else { Some(s) })
+    }
+    let params = trakkt_types::api::UpdateProjectApiParams {
+        project_id: Some(project_id), name, description, icon, color, status,
+        lead_id: opt_clear(lead_id),
+        start_date: opt_clear(start_date),
+        target_date: opt_clear(target_date),
+    };
+    let result = trakkt_api::projects::update_project(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Delete a project by its ID.
 #[server(prefix = "/leptos-api")]
 pub async fn delete_project(project_id: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
-    trakkt_auth::project_service::delete_project(ac.db(), &project_id, ac.ctx.ws_manager.as_ref())
-        .await
-        .into_sfn()?;
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::DeleteProjectApiParams { project_id };
+    trakkt_api::projects::delete_project(&ctx, params).await.into_sfn()?;
     Ok(())
 }
 
@@ -192,11 +173,10 @@ pub async fn remove_project_member(
 #[server(prefix = "/leptos-api")]
 pub async fn list_milestones(project_id: String) -> Result<Vec<ProjectMilestone>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
-    let milestones = trakkt_auth::project_service::list_milestones(ac.db(), &project_id)
-        .await
-        .into_sfn()?;
-    Ok(milestones)
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::ListMilestonesApiParams { project_id };
+    let result = trakkt_api::milestones::list_milestones(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Create a new milestone in a project.
@@ -208,19 +188,12 @@ pub async fn create_milestone(
     target_date: Option<String>,
 ) -> Result<ProjectMilestone, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
-    let milestone = trakkt_auth::project_service::create_milestone(
-        ac.db(),
-        &project_id,
-        &name,
-        description.as_deref(),
-        target_date.as_deref(),
-        ac.ctx.ws_manager.as_ref(),
-        &ac.ws_id,
-    )
-    .await
-    .into_sfn()?;
-    Ok(milestone)
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::CreateMilestoneApiParams {
+        project_id: Some(project_id), name, description, target_date,
+    };
+    let result = trakkt_api::milestones::create_milestone(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Update fields on an existing milestone.
@@ -237,38 +210,22 @@ pub async fn update_milestone(
     target_date: Option<String>,
 ) -> Result<ProjectMilestone, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let project_id = resolve_milestone_project(ac.db(), &milestone_id).await?;
-    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
-    let milestone = trakkt_auth::project_service::update_milestone(
-        ac.db(),
-        &milestone_id,
-        name.as_deref(),
-        description.as_deref(),
-        target_date
-            .as_ref()
-            .map(|s| if s.is_empty() { None } else { Some(s.as_str()) }),
-        ac.ctx.ws_manager.as_ref(),
-        &ac.ws_id,
-    )
-    .await
-    .into_sfn()?;
-    Ok(milestone)
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::UpdateMilestoneApiParams {
+        milestone_id: Some(milestone_id), name, description,
+        target_date: target_date.map(|s| if s.is_empty() { None } else { Some(s) }),
+    };
+    let result = trakkt_api::milestones::update_milestone(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Delete a milestone by its ID.
 #[server(prefix = "/leptos-api")]
 pub async fn delete_milestone(milestone_id: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let project_id = resolve_milestone_project(ac.db(), &milestone_id).await?;
-    verify_project_ownership(ac.db(), &ac.ws_id, &project_id).await?;
-    trakkt_auth::project_service::delete_milestone(
-        ac.db(),
-        &milestone_id,
-        ac.ctx.ws_manager.as_ref(),
-        &ac.ws_id,
-    )
-    .await
-    .into_sfn()?;
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::DeleteMilestoneApiParams { milestone_id };
+    trakkt_api::milestones::delete_milestone(&ctx, params).await.into_sfn()?;
     Ok(())
 }
 
@@ -326,27 +283,6 @@ pub async fn get_project_progress(
 }
 
 // ─── Helpers (server-only) ─────────────────────────────────────────────────
-
-/// Resolve the owning project_id for a milestone.
-#[cfg(feature = "ssr")]
-async fn resolve_milestone_project(
-    db: &trakkt_core::DbPool,
-    milestone_id: &str,
-) -> Result<String, ServerFnError> {
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        project_id: String,
-    }
-    let row: Option<Row> = trakkt_core::db_fetch_optional!(
-        db,
-        Row,
-        "SELECT project_id FROM project_milestones WHERE milestone_id = $1",
-        milestone_id
-    )
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-    row.map(|r| r.project_id)
-        .ok_or_else(|| ServerFnError::new("Milestone not found"))
-}
 
 /// Verify that a project belongs to the user's current workspace.
 #[cfg(feature = "ssr")]
