@@ -10,6 +10,7 @@ use wasm_bindgen::JsCast;
 
 use phosphor_leptos::{Icon, IconWeight};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::store::SyncStore;
@@ -17,6 +18,11 @@ use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon
 use crate::components::{Button, CommandPalette, ConfirmDialog, CreateIssueTrigger, Modal, ModalSize, SearchInput, Spinner, TeamIcon, INPUT_CLASS};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
+
+/// Sidebar expand/collapse state shared across all `SidebarTeamSubNav` instances.
+/// Keyed by team key string. Persists across SPA navigation within a session.
+#[derive(Clone)]
+struct SidebarExpandState(RwSignal<HashMap<String, bool>>);
 
 /// Main authenticated layout with sidebar and content area.
 #[component]
@@ -31,6 +37,7 @@ pub fn Layout() -> impl IntoView {
     let sync_store = SyncStore::new();
     provide_context(sync_store);
     provide_context(CreateIssueTrigger(RwSignal::new(false)));
+    provide_context(SidebarExpandState(RwSignal::new(HashMap::new())));
 
     let auth_confirmed = RwSignal::new(false);
     let nav = leptos_router::hooks::use_navigate();
@@ -963,8 +970,27 @@ fn SidebarTeamSubNav(
         issues_active.get() && !search.get().split('&').any(|p| p.starts_with("status="))
     });
 
-    // Auto-expand if the current path is within this team.
-    let (expanded, set_expanded) = signal(false);
+    // ── Expand/collapse state from shared context ──────────────────────────
+    let expand_ctx = use_context::<SidebarExpandState>();
+
+    let expand_ctx_for_read = expand_ctx.clone();
+    let team_key_for_expand = team_key.clone();
+    let is_expanded = Signal::derive(move || {
+        expand_ctx_for_read
+            .as_ref()
+            .map(|ctx| ctx.0.get().get(&team_key_for_expand).copied().unwrap_or(false))
+            .unwrap_or(false)
+    });
+
+    let set_expand = {
+        let team_key_for_set = team_key.clone();
+        move |value: bool| {
+            if let Some(ref ctx) = expand_ctx {
+                ctx.0.update(|map| { map.insert(team_key_for_set.clone(), value); });
+            }
+        }
+    };
+
     let (menu_open, set_menu_open) = signal(false);
 
     let store = use_context::<SyncStore>();
@@ -972,15 +998,22 @@ fn SidebarTeamSubNav(
 
     let (show_leave_confirm, set_show_leave_confirm) = signal(false);
 
-    // Expand when navigating into a team's pages.
-    Effect::new(move |_| {
-        if team_active.get() {
-            set_expanded.set(true);
+    // Expand when navigating INTO this team (transition from inactive to active).
+    // Does NOT re-expand if already active (respects user manual collapse).
+    Effect::new({
+        let set_expand = set_expand.clone();
+        move |prev_active: Option<bool>| {
+            let active = team_active.get();
+            let was_active = prev_active.unwrap_or(false);
+            if active && !was_active {
+                set_expand(true);
+            }
+            active
         }
     });
 
     let chevron_class = move || {
-        if expanded.get() { "transition-transform duration-150" } else { "transition-transform duration-150 -rotate-90" }
+        if is_expanded.get() { "transition-transform duration-150" } else { "transition-transform duration-150 -rotate-90" }
     };
 
     // Close context menu on click-outside — register once, check state inside.
@@ -1030,7 +1063,13 @@ fn SidebarTeamSubNav(
                 // Left zone: expand/collapse + right-click context menu
                 <button
                     class="flex-1 min-w-0 flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-[var(--color-sidebar-foreground)] text-left"
-                    on:click=move |_| set_expanded.update(|v| *v = !*v)
+                    on:click={
+                        let set_expand = set_expand.clone();
+                        move |_| {
+                            let current = is_expanded.get_untracked();
+                            set_expand(!current);
+                        }
+                    }
                     on:contextmenu=move |ev| {
                         ev.prevent_default();
                         set_menu_open.set(true);
@@ -1076,7 +1115,7 @@ fn SidebarTeamSubNav(
             </Show>
 
             // Indented sub-items — shown when expanded
-            {move || expanded.get().then(|| {
+            {move || is_expanded.get().then(|| {
                 let ih = issues_href.clone();
                 let ah = active_href.clone();
                 let bh = backlog_href.clone();
