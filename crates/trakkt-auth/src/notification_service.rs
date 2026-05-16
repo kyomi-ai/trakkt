@@ -37,6 +37,7 @@ struct NotificationRow {
     read: bool,
     issue_title: Option<String>,
     issue_number: Option<i32>,
+    team_key: Option<String>,
     actor_id: Option<String>,
     actor_name: Option<String>,
     created_at: String,
@@ -53,6 +54,7 @@ impl NotificationRow {
             read: self.read,
             issue_title: self.issue_title,
             issue_number: self.issue_number,
+            team_key: self.team_key,
             actor_id: self.actor_id,
             actor_name: self.actor_name,
             created_at: self.created_at,
@@ -99,11 +101,13 @@ pub async fn create_notification(
         "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
                 n.type AS notification_type, n.read, \
                 i.title AS issue_title, i.number AS issue_number, \
+                t.key AS team_key, \
                 n.actor_id, \
                 u_actor.name AS actor_name, \
                 CAST(n.created_at AS TEXT) AS created_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
+         LEFT JOIN teams t ON t.team_id = i.team_id \
          LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id \
          WHERE n.notification_id = $1",
         &notification_id
@@ -161,11 +165,13 @@ pub async fn list_notifications(
         "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
                 n.type AS notification_type, n.read, \
                 i.title AS issue_title, i.number AS issue_number, \
+                t.key AS team_key, \
                 n.actor_id, \
                 u_actor.name AS actor_name, \
                 CAST(n.created_at AS TEXT) AS created_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
+         LEFT JOIN teams t ON t.team_id = i.team_id \
          LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id \
          WHERE n.user_id = $1 {unread_filter} \
          ORDER BY n.created_at DESC \

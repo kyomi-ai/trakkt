@@ -286,8 +286,17 @@ fn NotificationRow(
 
     let issue_id_for_lookup = notification.issue_id.clone();
     let issue_id_for_label = notification.issue_id.clone();
+    let team_key_for_label = notification.team_key.clone();
+    let issue_number_for_label = notification.issue_number;
+    let team_key_for_click = notification.team_key.clone();
+    let issue_number_for_click = notification.issue_number;
 
     let issue_label = Signal::derive(move || {
+        // Prefer data from the notification itself
+        if let (Some(tk), Some(num)) = (&team_key_for_label, issue_number_for_label) {
+            return Some(format!("{tk}-{num}"));
+        }
+        // Fallback to SyncStore for older notifications that may not have team_key
         sync_store.and_then(|store| {
             store.issues().get()
                 .iter()
@@ -309,12 +318,20 @@ fn NotificationRow(
                 on_read.run(());
             });
         }
-        let href = sync_store.and_then(|store| {
-            store.issues().get_untracked()
-                .iter()
-                .find(|i| i.issue_id == issue_id_for_lookup)
-                .map(|issue| format!("/issues/{}-{}", issue.team_key, issue.number))
-        });
+        let href = {
+            // Prefer data from the notification itself
+            let from_notification = team_key_for_click.as_ref().and_then(|tk| {
+                issue_number_for_click.map(|num| format!("/issues/{tk}-{num}"))
+            });
+            from_notification.or_else(|| {
+                sync_store.and_then(|store| {
+                    store.issues().get_untracked()
+                        .iter()
+                        .find(|i| i.issue_id == issue_id_for_lookup)
+                        .map(|issue| format!("/issues/{}-{}", issue.team_key, issue.number))
+                })
+            })
+        };
         if let Some(h) = href {
             let nav_state = IssueNavState::from_current_path("/inbox", "");
             let json = nav_state.to_json();
