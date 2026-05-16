@@ -260,18 +260,57 @@ fn IssueListInner(
         });
     };
 
-    // Reset active tab, filters, and sort when navigating between teams.
-    Effect::new(move |_| {
-        let _ = resolved_team.get();
-        set_active_tab.set("all".to_string());
-        set_search.set(String::new());
-        set_status_filter.set(Vec::new());
-        set_priority_filter.set(Vec::new());
-        set_label_filter.set(Vec::new());
-        set_project_filter.set(Vec::new());
-        set_sort_field.set(SortField::Priority);
-        set_sort_direction.set(SortDirection::Asc);
-    });
+    // Reset filters on team change, then re-apply ?status= query param if present.
+    // Single Effect subscribes to both resolved_team and search — no ordering dependency.
+    {
+        let location_search = use_location().search;
+        Effect::new(move |_| {
+            let _ = resolved_team.get();
+            let query = location_search.get();
+
+            set_active_tab.set("all".to_string());
+            set_search.set(String::new());
+            set_status_filter.set(Vec::new());
+            set_priority_filter.set(Vec::new());
+            set_label_filter.set(Vec::new());
+            set_project_filter.set(Vec::new());
+            set_sort_field.set(SortField::Priority);
+            set_sort_direction.set(SortDirection::Asc);
+
+            let status_param = query.split('&').find_map(|part| {
+                part.strip_prefix("status=")
+            });
+
+            if let Some(status) = status_param {
+                let (tab, categories): (&str, &[&str]) = match status {
+                    "in_progress" => ("active", &["started"]),
+                    "backlog" => ("backlog", &["backlog", "unstarted"]),
+                    _ => return,
+                };
+                set_active_tab.set(tab.to_string());
+                if let Some(store) = sync_store {
+                    // Tracked read — re-runs Effect when store becomes initialized
+                    // on cold deep-link loads where statuses aren't available yet.
+                    if !store.initialized().get() {
+                        return;
+                    }
+                    let team = resolved_team.get_untracked();
+                    let status_ids: Vec<String> = store
+                        .statuses()
+                        .get_untracked()
+                        .into_iter()
+                        .filter(|s| {
+                            categories.contains(&s.category.as_str())
+                                && (s.team_id.is_none()
+                                    || team.as_ref().map(|t| &t.team_id) == s.team_id.as_ref())
+                        })
+                        .map(|s| s.status_id)
+                        .collect();
+                    set_status_filter.set(status_ids);
+                }
+            }
+        });
+    }
 
     // Close context menu on click outside.
     Effect::new(move |_| {
