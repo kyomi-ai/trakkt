@@ -260,10 +260,15 @@ fn IssueListInner(
         });
     };
 
-    // Reset active tab and sort when navigating between teams.
+    // Reset active tab, filters, and sort when navigating between teams.
     Effect::new(move |_| {
         let _ = resolved_team.get();
         set_active_tab.set("all".to_string());
+        set_search.set(String::new());
+        set_status_filter.set(Vec::new());
+        set_priority_filter.set(Vec::new());
+        set_label_filter.set(Vec::new());
+        set_project_filter.set(Vec::new());
         set_sort_field.set(SortField::Priority);
         set_sort_direction.set(SortDirection::Asc);
     });
