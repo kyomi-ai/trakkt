@@ -912,8 +912,8 @@ fn SidebarCreateOrJoinTeam(on_done: Callback<()>) -> impl IntoView {
 }
 
 /// A team's sub-navigation: clickable team name toggles expanded state,
-/// showing/hiding the Issues and Settings sub-links. Right-click or click
-/// the dots menu to open a context menu with "Settings" and "Leave team".
+/// showing/hiding the Issues sub-link. Right-click or click the dots menu
+/// to open a context menu with "Settings" and "Leave team".
 #[component]
 fn SidebarTeamSubNav(
     team: trakkt_types::models::Team,
@@ -1048,11 +1048,9 @@ fn SidebarTeamSubNav(
             // Indented sub-items — shown when expanded
             {move || expanded.get().then(|| {
                 let ih = issues_href.clone();
-                let sh = settings_href.clone();
                 view! {
                     <div class="ml-4">
                         <SidebarSubNavItem href=ih icon=phosphor_leptos::LIST_BULLETS label="Issues" is_active=issues_active/>
-                        <SidebarSubNavItem href=sh icon=phosphor_leptos::GEAR_SIX label="Settings" is_active=settings_active/>
                     </div>
                 }
             })}
@@ -1132,7 +1130,7 @@ fn SidebarInboxNavItem() -> impl IntoView {
         if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
     });
     let class = move || {
-        let base = "flex items-center gap-3 px-3 py-3 rounded-md text-sm transition-colors";
+        let base = "flex items-center gap-3 px-3 py-1.5 rounded-md text-sm transition-colors";
         if is_active.get() {
             format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
         } else {
@@ -1186,7 +1184,7 @@ fn SidebarNavItem(
         if is_active.get() { IconWeight::Fill } else { IconWeight::Light }
     });
     let class = move || {
-        let base = "flex items-center gap-3 px-3 py-3 rounded-md text-sm transition-colors";
+        let base = "flex items-center gap-3 px-3 py-1.5 rounded-md text-sm transition-colors";
         if is_active.get() {
             format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
         } else {
