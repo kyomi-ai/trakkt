@@ -88,6 +88,7 @@ struct IssueDetailRow {
     sort_order: Option<f64>,
     created_at: String,
     updated_at: String,
+    archived_at: Option<String>,
 }
 
 impl IssueDetailRow {
@@ -117,6 +118,7 @@ impl IssueDetailRow {
             sort_order: self.sort_order,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            archived_at: self.archived_at,
             labels,
         }
     }
@@ -143,7 +145,8 @@ const ISSUE_DETAIL_SELECT: &str = "\
             WHERE r2.target_issue_id = i.issue_id AND r2.relation_type = 'parent') AS parent_title, \
            i.sort_order, \
            CAST(i.created_at AS TEXT) AS created_at, \
-           CAST(i.updated_at AS TEXT) AS updated_at \
+           CAST(i.updated_at AS TEXT) AS updated_at, \
+           CAST(i.archived_at AS TEXT) AS archived_at \
     FROM issues i \
     JOIN teams t ON t.team_id = i.team_id \
     JOIN statuses s ON s.status_id = i.status_id \
@@ -404,6 +407,11 @@ pub async fn list_issues(
     // dynamically via db_with_pool! below. Params are bound in the same
     // order as they appear in the SQL.
 
+    // Exclude archived issues by default (no bind parameter needed).
+    if !filters.include_archived.unwrap_or(false) {
+        conditions.push("i.archived_at IS NULL".to_string());
+    }
+
     if team_id.is_some() {
         conditions.push(format!("i.team_id = ${param_idx}"));
         param_idx += 1;
@@ -582,6 +590,10 @@ pub async fn update_issue(
     // Dynamic SET clause — params are numbered sequentially starting at $1.
     let mut set_parts: Vec<String> = Vec::new();
     let mut param_idx: usize = 1;
+
+    // Auto-unarchive: any update to an issue clears the archived_at timestamp.
+    // This is a literal (no bind parameter), so it does not affect param_idx.
+    set_parts.push("archived_at = NULL".to_string());
 
     if updates.title.is_some() {
         set_parts.push(format!("title = ${param_idx}"));
@@ -975,7 +987,7 @@ pub async fn set_sort_order(
 
     // UPDATE using the resolved issue_id directly — no subquery needed.
     let sql = format!(
-        "UPDATE issues SET sort_order = $1, updated_at = {now} WHERE issue_id = $2"
+        "UPDATE issues SET sort_order = $1, archived_at = NULL, updated_at = {now} WHERE issue_id = $2"
     );
 
     trakkt_core::db_with_pool!(db, |p| {

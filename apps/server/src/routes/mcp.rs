@@ -1200,6 +1200,7 @@ async fn tool_list_issues(
         search: args.get("search").and_then(|v| v.as_str()).map(String::from),
         limit: Some(limit),
         offset: None,
+        include_archived: args.get("include_archived").and_then(|v| v.as_bool()),
     };
 
     let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
