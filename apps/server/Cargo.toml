@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 trakkt-core = { workspace = true }
 trakkt-auth = { workspace = true }
+trakkt-api = { workspace = true }
 trakkt-types = { workspace = true }
 trakkt-ui = { workspace = true, features = ["ssr"] }
 leptos = "0.8"
@@ -22,6 +23,7 @@ redis = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

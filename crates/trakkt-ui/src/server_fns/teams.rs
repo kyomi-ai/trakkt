@@ -21,10 +21,10 @@ use super::{AuthenticatedContext, IntoServerFnError};
 #[server(prefix = "/leptos-api")]
 pub async fn list_teams() -> Result<Vec<Team>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let teams = trakkt_auth::team_service::list_teams(ac.db(), &ac.ws_id, Some(&ac.auth.user_id))
-        .await
-        .into_sfn()?;
-    Ok(teams)
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::ListTeamsApiParams {};
+    let result = trakkt_api::teams::list_teams(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// List all issue-tracker teams in the workspace (for admin settings).

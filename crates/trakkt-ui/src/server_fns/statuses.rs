@@ -12,12 +12,8 @@ use super::{AuthenticatedContext, IntoServerFnError};
 #[server(prefix = "/leptos-api")]
 pub async fn list_statuses(team_id: Option<String>) -> Result<Vec<Status>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let statuses = trakkt_auth::status_service::list_statuses(
-        ac.db(),
-        &ac.ws_id,
-        team_id.as_deref(),
-    )
-    .await
-    .into_sfn()?;
-    Ok(statuses)
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::ListStatusesApiParams { team_id, team_key: None };
+    let result = trakkt_api::statuses::list_statuses(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }

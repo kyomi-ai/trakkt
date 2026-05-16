@@ -18,6 +18,7 @@ ssr = [
     "leptos_meta/ssr",
     "dep:trakkt-core",
     "dep:trakkt-auth",
+    "dep:trakkt-api",
     "dep:tokio",
     "dep:uuid",
     "dep:axum",
@@ -94,6 +95,7 @@ chrono = { workspace = true, features = ["wasmbind"] }
 # Internal crates (server-only — gated behind ssr feature)
 trakkt-core = { workspace = true, optional = true }
 trakkt-auth = { workspace = true, optional = true }
+trakkt-api = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 webauthn-rs = { workspace = true, optional = true }

@@ -42,17 +42,12 @@ pub async fn list_labels(team_id: Option<String>) -> Result<Vec<Label>, ServerFn
 #[server(prefix = "/leptos-api")]
 pub async fn create_label(name: String, color: String, team_id: Option<String>) -> Result<Label, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let label = trakkt_auth::label_service::create_label(
-        ac.db(),
-        &ac.ws_id,
-        &name,
-        &color,
-        team_id.as_deref(),
-        ac.ctx.ws_manager.as_ref(),
-    )
-    .await
-    .into_sfn()?;
-    Ok(label)
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::CreateLabelApiParams {
+        name, color, team_key: None, team_id,
+    };
+    let result = trakkt_api::labels::create_label(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Update a label's name and color.

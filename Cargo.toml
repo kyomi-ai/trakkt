@@ -3,6 +3,7 @@ members = [
     "crates/trakkt-core",
     "crates/trakkt-auth",
     "crates/trakkt-types",
+    "crates/trakkt-api",
     "crates/trakkt-ui",
     "apps/server",
 ]
@@ -30,6 +31,7 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = { version = "1", features = ["chrono04"] }
 
 # Auth
 jsonwebtoken = { version = "10", features = ["use_pem", "rust_crypto"] }
@@ -76,6 +78,7 @@ trakkt-core = { path = "crates/trakkt-core" }
 trakkt-auth = { path = "crates/trakkt-auth" }
 trakkt-ui = { path = "crates/trakkt-ui" }
 trakkt-server = { path = "apps/server" }
+trakkt-api = { path = "crates/trakkt-api" }
 trakkt-types = { path = "crates/trakkt-types" }
 # Async trait
 async-trait = "0.1"

@@ -36,18 +36,13 @@ pub async fn create_comment(
     parent_id: Option<String>,
 ) -> Result<Comment, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let issue_id = super::issues::resolve_issue_id(ac.db(), &ac.ws_id, &team_key, issue_number).await?;
-    let comment = trakkt_auth::comment_service::create_comment(
-        ac.db(),
-        &issue_id,
-        &ac.auth.user_id,
-        &body,
-        parent_id.as_deref(),
-        ac.ctx.ws_manager.as_ref(),
-    )
-    .await
-    .into_sfn()?;
-    Ok(comment)
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::AddCommentApiParams {
+        issue_identifier: Some(format!("{team_key}-{issue_number}")),
+        team_key: None, issue_number: None, body, parent_id,
+    };
+    let result = trakkt_api::comments::add_comment(&ctx, params).await.into_sfn()?;
+    serde_json::from_value(result).into_sfn()
 }
 
 /// Update a comment's body. Only the author can edit their own comments.

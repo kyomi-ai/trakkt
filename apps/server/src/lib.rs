@@ -77,6 +77,7 @@ pub fn build_router(state: state::AppState) -> Router {
         .route("/api/health", axum::routing::get(health_handler))
         .route("/health", axum::routing::get(health_handler))
         .nest("/api/v1/auth", routes::auth_token::routes())
+        .nest("/api/v1", routes::rest::rest_router())
         .nest("/api/v1/teams", routes::team_icon::routes())
         .nest("/mcp", routes::mcp::routes())
         .merge(routes::oauth::well_known_routes())
