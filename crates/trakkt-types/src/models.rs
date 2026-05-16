@@ -251,11 +251,15 @@ pub struct IssueFilters {
     pub exclude_status_categories: Option<Vec<String>>,
     pub priority: Option<i32>,
     pub assignee_id: Option<String>,
+    pub creator_id: Option<String>,
     pub label_ids: Option<Vec<String>>,
     pub search: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub include_archived: Option<bool>,
+    /// When true, return ONLY archived issues (archived_at IS NOT NULL).
+    /// Takes precedence over `include_archived`.
+    pub only_archived: Option<bool>,
 }
 
 /// Parameters for creating a new issue.

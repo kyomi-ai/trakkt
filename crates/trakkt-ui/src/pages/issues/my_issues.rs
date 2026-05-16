@@ -35,7 +35,7 @@ use crate::pages::issues::issue_list::SaveViewModal;
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::server_fns::context::UserContext;
-use crate::server_fns::issues::list_issues;
+use crate::server_fns::issues::{get_archived_issues, list_issues};
 use crate::server_fns::watchers::list_watched_issue_ids;
 use crate::types::IssueNavState;
 use crate::utils::keyboard::is_input_focused;
@@ -66,6 +66,27 @@ pub fn MyIssuesPage() -> impl IntoView {
     let (show_archived, set_show_archived) = signal(false);
     let (show_save_view, set_show_save_view) = signal(false);
 
+    // ── Server-fetched archived issues (fetched on demand when toggle is ON) ──
+    let archived_issues_signal = RwSignal::new(Vec::<IssueWithDetails>::new());
+
+    Effect::new(move |_| {
+        let showing = show_archived.get();
+        if !showing {
+            archived_issues_signal.set(Vec::new());
+            return;
+        }
+        // My Issues page is cross-team, so fetch all archived issues (empty team_id).
+        leptos::task::spawn_local(async move {
+            match get_archived_issues(String::new(), None, None).await {
+                Ok(issues) => archived_issues_signal.set(issues),
+                Err(e) => {
+                    tracing::warn!("Failed to fetch archived issues: {e}");
+                    archived_issues_signal.set(Vec::new());
+                }
+            }
+        });
+    });
+
     // ── Sort state (default: updated date, newest first for My Issues) ────
     let (sort_field, set_sort_field) = signal(SortField::UpdatedDate);
     let (sort_direction, set_sort_direction) = signal(SortDirection::Desc);
@@ -93,8 +114,10 @@ pub fn MyIssuesPage() -> impl IntoView {
     );
 
     // ── All issues (raw, unfiltered) ──────────────────────────────────────
+    // Merges SyncStore / server fallback issues with server-fetched archived
+    // issues (when show_archived is ON), deduplicating by issue_id.
     let all_issues = Memo::new(move |_| {
-        if let Some(store) = sync_store {
+        let base = if let Some(store) = sync_store {
             let issues = store.issues().get();
             if !issues.is_empty() || store.initialized().get() {
                 issues
@@ -123,7 +146,21 @@ pub fn MyIssuesPage() -> impl IntoView {
                 }
                 None => Vec::new(),
             }
+        };
+
+        // Merge server-fetched archived issues (deduplicating by issue_id).
+        let server_archived = archived_issues_signal.get();
+        if server_archived.is_empty() {
+            return base;
         }
+        let existing_ids: HashSet<String> = base.iter().map(|i| i.issue_id.clone()).collect();
+        let mut merged = base;
+        for issue in server_archived {
+            if !existing_ids.contains(&issue.issue_id) {
+                merged.push(issue);
+            }
+        }
+        merged
     });
 
     // ── Filter helper (closure over search/status/priority/archive signals) ─

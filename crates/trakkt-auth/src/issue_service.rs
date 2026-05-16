@@ -407,8 +407,10 @@ pub async fn list_issues(
     // dynamically via db_with_pool! below. Params are bound in the same
     // order as they appear in the SQL.
 
-    // Exclude archived issues by default (no bind parameter needed).
-    if !filters.include_archived.unwrap_or(false) {
+    // Archive filtering: only_archived takes precedence over include_archived.
+    if filters.only_archived.unwrap_or(false) {
+        conditions.push("i.archived_at IS NOT NULL".to_string());
+    } else if !filters.include_archived.unwrap_or(false) {
         conditions.push("i.archived_at IS NULL".to_string());
     }
 
@@ -450,6 +452,11 @@ pub async fn list_issues(
 
     if filters.assignee_id.is_some() {
         conditions.push(format!("i.assignee_id = ${param_idx}"));
+        param_idx += 1;
+    }
+
+    if filters.creator_id.is_some() {
+        conditions.push(format!("i.creator_id = ${param_idx}"));
         param_idx += 1;
     }
 
@@ -518,6 +525,9 @@ pub async fn list_issues(
             query = query.bind(v);
         }
         if let Some(ref v) = filters.assignee_id {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = filters.creator_id {
             query = query.bind(v);
         }
         if let Some(ref ids) = filters.label_ids {

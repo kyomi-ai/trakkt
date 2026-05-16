@@ -455,6 +455,10 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                             "type": "string",
                             "description": "Search text to match against issue titles"
                         },
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": "If true, include archived issues (issues auto-archived after being in completed/cancelled state past the team's archive threshold). Default is false."
+                        },
                         "limit": {
                             "type": "integer",
                             "description": "Maximum number of issues to return (default: 50, max: 100)",
@@ -678,6 +682,10 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                         "include_closed": {
                             "type": "boolean",
                             "description": "If true, include completed and cancelled issues in results. Default is false."
+                        },
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": "If true, include archived issues (issues auto-archived after being in completed/cancelled state past the team's archive threshold). Default is false."
                         },
                         "limit": {
                             "type": "integer",
@@ -1194,6 +1202,7 @@ async fn tool_list_issues(
         exclude_status_categories,
         priority: args.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32),
         assignee_id: args.get("assignee").and_then(|v| v.as_str()).map(String::from),
+        creator_id: None,
         label_ids: args.get("label").and_then(|v| v.as_str()).map(|s| {
             s.split(',').map(|id| id.trim().to_string()).filter(|id| !id.is_empty()).collect()
         }),
@@ -1201,6 +1210,7 @@ async fn tool_list_issues(
         limit: Some(limit),
         offset: None,
         include_archived: args.get("include_archived").and_then(|v| v.as_bool()),
+        only_archived: None,
     };
 
     let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
@@ -1503,6 +1513,7 @@ async fn tool_search_issues(
     let limit_raw = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
     let limit = limit_raw.clamp(1, 100);
     let include_closed = args.get("include_closed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let include_archived = args.get("include_archived").and_then(|v| v.as_bool());
 
     let team_id = resolve_team_id_from_args(args, &state.db, &auth.workspace_id).await?;
 
@@ -1515,6 +1526,7 @@ async fn tool_search_issues(
     let filters = IssueFilters {
         search: Some(query.to_string()),
         exclude_status_categories,
+        include_archived,
         limit: Some(limit),
         ..Default::default()
     };
