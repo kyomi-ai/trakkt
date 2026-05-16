@@ -125,7 +125,7 @@ fn IconTrigger(team: Team, on_change: Callback<(Option<String>, Option<String>, 
             <span class="text-sm text-muted-foreground">"Click to change"</span>
         </div>
         <Popover trigger_ref=trigger_ref open=Signal::from(picker_open) on_close=Callback::new(move |()| picker_open.set(false)) placement=Placement::BOTTOM_START>
-            <div class="p-3 w-[300px]"><TeamIconPicker team=team_for_picker.get_value() on_change=on_change/></div>
+            <div class="p-3 w-[300px] bg-popover border border-border rounded-lg shadow-lg"><TeamIconPicker team=team_for_picker.get_value() on_change=on_change/></div>
         </Popover>
     }
 }
