@@ -11,10 +11,12 @@ use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_params_map};
 use phosphor_leptos::{Icon, IconWeight};
 
+use trakkt_types::models::Team;
+
 use crate::cache::store::SyncStore;
 use crate::components::{
     ActionStatus, Button, ButtonSize, ButtonVariant, Card, CardContent, CardDescription,
-    CardHeader, CardTitle, ConfirmDialog, Skeleton, INPUT_CLASS,
+    CardHeader, CardTitle, ConfirmDialog, Skeleton, TeamIcon, TeamIconPicker, INPUT_CLASS,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,7 +89,7 @@ pub fn TeamSettingsPage() -> impl IntoView {
                     } else if let Some(t) = team.get() {
                         view! {
                             <div class="space-y-6 max-w-2xl">
-                                <TeamGeneralCard team_id=t.team_id.clone() name=t.name.clone() team_key=t.key.clone()/>
+                                <TeamGeneralCard team=t.clone()/>
                                 <TeamDangerZone team_id=t.team_id.clone() team_name=t.name.clone()/>
                             </div>
                         }.into_any()
@@ -107,9 +109,10 @@ pub fn TeamSettingsPage() -> impl IntoView {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[component]
-fn TeamGeneralCard(team_id: String, name: String, team_key: String) -> impl IntoView {
-    let (edit_name, set_edit_name) = signal(name);
-    let (edit_key, set_edit_key) = signal(team_key);
+fn TeamGeneralCard(team: Team) -> impl IntoView {
+    let team_id = team.team_id.clone();
+    let (edit_name, set_edit_name) = signal(team.name.clone());
+    let (edit_key, set_edit_key) = signal(team.key.clone());
     let (validation_error, set_validation_error) = signal(Option::<String>::None);
 
     let save_action = Action::new({
@@ -154,6 +157,29 @@ fn TeamGeneralCard(team_id: String, name: String, team_key: String) -> impl Into
         save_action.dispatch((n, k));
     };
 
+    // Icon picker state
+    let team_for_picker = StoredValue::new(team.clone());
+    let icon_team_id = team_id.clone();
+    let on_icon_change = Callback::new(move |(icon_type, icon_name, icon_color): (Option<String>, Option<String>, Option<String>)| {
+        let team_id = icon_team_id.clone();
+        let icon_type = icon_type.clone();
+        let icon_name = icon_name.clone();
+        let icon_color = icon_color.clone();
+        leptos::task::spawn_local(async move {
+            if icon_type.is_none() && icon_name.is_none() && icon_color.is_none() {
+                if let Err(e) = crate::server_fns::teams::clear_team_icon(team_id).await {
+                    tracing::warn!("Failed to clear team icon: {e}");
+                }
+            } else {
+                if let Err(e) = crate::server_fns::teams::update_team_icon(
+                    team_id, icon_type, icon_name, icon_color,
+                ).await {
+                    tracing::warn!("Failed to update team icon: {e}");
+                }
+            }
+        });
+    });
+
     view! {
         <Card>
             <CardHeader>
@@ -161,7 +187,7 @@ fn TeamGeneralCard(team_id: String, name: String, team_key: String) -> impl Into
                     <div>
                         <CardTitle>"General"</CardTitle>
                         <CardDescription>
-                            "Update team name and key. The key is used as the prefix for issue identifiers."
+                            "Update team name, key, and icon."
                         </CardDescription>
                     </div>
                     <ActionStatus action=save_action/>
@@ -169,6 +195,17 @@ fn TeamGeneralCard(team_id: String, name: String, team_key: String) -> impl Into
             </CardHeader>
             <CardContent>
                 <div class="space-y-4">
+                    // Icon picker section
+                    <div>
+                        <label class="block text-sm font-medium text-foreground mb-2">"Team icon"</label>
+                        <div class="flex items-center gap-4">
+                            <TeamIcon team=team.clone() size="48px"/>
+                            <div class="flex-1">
+                                <TeamIconPicker team=team_for_picker.get_value() on_change=on_icon_change/>
+                            </div>
+                        </div>
+                    </div>
+
                     <div>
                         <label class="block text-sm font-medium text-foreground mb-2">"Team name"</label>
                         <input

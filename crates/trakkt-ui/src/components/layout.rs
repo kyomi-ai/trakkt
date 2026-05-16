@@ -486,12 +486,12 @@ fn SidebarFavoritesSection() -> impl IntoView {
                     {items.into_iter().filter_map(|fav| {
                         match fav.target_type.as_str() {
                             "team" => {
-                                let team = teams.iter().find(|t| t.team_id == fav.target_id)?;
+                                let team = teams.iter().find(|t| t.team_id == fav.target_id)?.clone();
                                 let key = team.key.to_lowercase();
                                 let href = format!("/teams/{key}/issues");
                                 let name = team.name.clone();
                                 Some(view! {
-                                    <SidebarEntityItem href=href name=name icon=phosphor_leptos::USERS_THREE/>
+                                    <SidebarFavoriteTeamItem team=team href=href name=name/>
                                 }.into_any())
                             }
                             "project" => {
@@ -633,6 +633,38 @@ fn SidebarEntityItem(
                     </div>
                 }
             })}
+        </div>
+    }
+}
+
+/// A team item in the favorites list — uses TeamIcon instead of a static Phosphor icon.
+#[component]
+fn SidebarFavoriteTeamItem(team: trakkt_types::models::Team, href: String, name: String) -> impl IntoView {
+    let path = leptos_router::hooks::use_location().pathname;
+    let href_match = href.clone();
+    let is_active = Signal::derive(move || path.get().starts_with(&href_match));
+    let wrapper_class = move || {
+        let base = "group flex items-center rounded-md transition-colors";
+        if is_active.get() {
+            format!("{base} bg-[var(--color-sidebar-active)]")
+        } else {
+            format!("{base} hover:bg-[var(--color-sidebar-hover)]")
+        }
+    };
+    let link_class = move || {
+        let base = "flex-1 min-w-0 flex items-center gap-3 px-3 py-1.5 text-sm";
+        if is_active.get() {
+            format!("{base} text-[var(--color-sidebar-foreground)] font-medium")
+        } else {
+            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)]")
+        }
+    };
+    view! {
+        <div class=wrapper_class>
+            <a href=href class=link_class>
+                <TeamIcon team=team size="16px"/>
+                <span class="truncate">{name}</span>
+            </a>
         </div>
     }
 }
