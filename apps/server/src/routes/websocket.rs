@@ -327,13 +327,21 @@ async fn handle_sync_bootstrap(
 
     tracing::debug!(user_id, workspace_id, "Handling sync_bootstrap");
 
-    // 1. Fetch all issues (empty filters = all issues).
-    let issues = trakkt_auth::issue_service::list_issues(db, workspace_id, None, &IssueFilters::default())
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_issues failed during bootstrap");
-            vec![]
-        });
+    // 1. Fetch all non-archived issues (archived issues are excluded from bootstrap).
+    let issues = trakkt_auth::issue_service::list_issues(
+        db,
+        workspace_id,
+        None,
+        &IssueFilters {
+            include_archived: Some(false),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(user_id, workspace_id, error = %e, "list_issues failed during bootstrap");
+        vec![]
+    });
 
     // 2. Fetch all labels.
     let labels = trakkt_auth::label_service::list_labels(db, workspace_id)
