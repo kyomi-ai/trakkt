@@ -160,6 +160,25 @@ async fn validate_single_parent(
 
 // ─── Service functions ──────────────────────────────────────────────────────
 
+/// Fetch a single relation by ID and workspace (returns `None` if not found).
+pub async fn get_relation_by_id(
+    db: &DbPool,
+    relation_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<Option<IssueRelation>> {
+    let row: Option<IssueRelationRow> = trakkt_core::db_fetch_optional!(
+        db,
+        IssueRelationRow,
+        "SELECT relation_id, workspace_id, source_issue_id, target_issue_id, \
+                relation_type, created_by, CAST(created_at AS TEXT) AS created_at \
+         FROM issue_relations \
+         WHERE relation_id = $1 AND workspace_id = $2",
+        relation_id,
+        workspace_id
+    )?;
+    Ok(row.map(IssueRelationRow::into_dto))
+}
+
 /// Create a new relation between two issues.
 ///
 /// Validates that:

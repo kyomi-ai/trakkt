@@ -9,6 +9,7 @@
 use axum::http::Method;
 use serde_json::json;
 
+use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
 use trakkt_auth::{comment_service, issue_service, relation_service, team_service};
 use trakkt_types::api::{
     CreateIssueApiParams, DeleteIssueApiParams, GetIssueApiParams, ListIssuesApiParams,
@@ -167,6 +168,12 @@ pub async fn create_issue(
         .await?;
     }
 
+    // Record activity — never fails the mutation.
+    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+    if let Err(e) = recorder.record(&issue.issue_id, "created", None).await {
+        tracing::warn!(issue_id = %issue.issue_id, "Failed to record create activity: {e}");
+    }
+
     Ok(serde_json::to_value(&issue)?)
 }
 
@@ -182,6 +189,11 @@ pub async fn update_issue(
         params.team_key.as_deref(),
         params.issue_number,
     )?;
+
+    // Snapshot before update — used to diff changes for activity recording.
+    let before_issue =
+        issue_service::get_issue(ctx.db, &ctx.workspace_id, &team_key, number).await?;
+    let before_snapshot = before_issue.as_ref().map(IssueSnapshot::from_issue_with_details);
 
     // Resolve "move to team" separately from the identifying team_key.
     let move_team_id = resolve_team(
@@ -272,6 +284,16 @@ pub async fn update_issue(
     let updated = issue_service::get_issue_by_id(ctx.db, &issue.issue_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("issue {team_key}-{number} not found")))?;
+
+    // Record activity diff — never fails the mutation.
+    if let Some(ref before) = before_snapshot {
+        let after = IssueSnapshot::from_issue_with_details(&updated);
+        let recorder =
+            ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+        if let Err(e) = recorder.record_issue_diff(&issue.issue_id, before, &after).await {
+            tracing::warn!(issue_id = %issue.issue_id, "Failed to record activity diff: {e}");
+        }
+    }
 
     Ok(serde_json::to_value(&updated)?)
 }

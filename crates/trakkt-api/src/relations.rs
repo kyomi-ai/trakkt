@@ -9,6 +9,7 @@
 use axum::http::Method;
 use serde_json::json;
 
+use trakkt_auth::activity_service::ActivityRecorder;
 use trakkt_auth::{issue_service, relation_service};
 use trakkt_types::api::{AddRelationApiParams, ListRelationsApiParams, RemoveRelationApiParams};
 
@@ -69,6 +70,40 @@ pub async fn add_relation(
     )
     .await?;
 
+    // Record activity on both issues — never fails the mutation.
+    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+
+    let source_identifier = format!("{source_key}-{source_num}");
+    let target_identifier = format!("{target_key}-{target_num}");
+
+    let source_meta = json!({
+        "relation_type": params.relation_type,
+        "direction": "outward",
+        "related_issue_id": target_issue.issue_id,
+        "related_identifier": target_identifier,
+        "related_title": target_issue.title,
+    });
+    if let Err(e) = recorder
+        .record(&source_issue.issue_id, "relation_added", Some(&source_meta))
+        .await
+    {
+        tracing::warn!(issue_id = %source_issue.issue_id, "Failed to record relation activity on source: {e}");
+    }
+
+    let target_meta = json!({
+        "relation_type": params.relation_type,
+        "direction": "inward",
+        "related_issue_id": source_issue.issue_id,
+        "related_identifier": source_identifier,
+        "related_title": source_issue.title,
+    });
+    if let Err(e) = recorder
+        .record(&target_issue.issue_id, "relation_added", Some(&target_meta))
+        .await
+    {
+        tracing::warn!(issue_id = %target_issue.issue_id, "Failed to record relation activity on target: {e}");
+    }
+
     Ok(serde_json::to_value(&relation)?)
 }
 
@@ -79,6 +114,11 @@ pub async fn remove_relation(
     ctx: &ApiCtx<'_>,
     params: RemoveRelationApiParams,
 ) -> ApiResult<serde_json::Value> {
+    // Fetch the relation before deletion so we can record activity on both issues.
+    let relation_before =
+        relation_service::get_relation_by_id(ctx.db, &params.relation_id, &ctx.workspace_id)
+            .await;
+
     relation_service::delete_relation(
         ctx.db,
         &params.relation_id,
@@ -86,6 +126,35 @@ pub async fn remove_relation(
         ctx.ws_manager,
     )
     .await?;
+
+    // Record activity on both issues — never fails the mutation.
+    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+    match relation_before {
+        Ok(Some(rel)) => {
+            let meta = json!({
+                "relation_id": params.relation_id,
+                "relation_type": rel.relation_type,
+            });
+            if let Err(e) = recorder
+                .record(&rel.source_issue_id, "relation_removed", Some(&meta))
+                .await
+            {
+                tracing::warn!(relation_id = %params.relation_id, "Failed to record relation_removed on source: {e}");
+            }
+            if let Err(e) = recorder
+                .record(&rel.target_issue_id, "relation_removed", Some(&meta))
+                .await
+            {
+                tracing::warn!(relation_id = %params.relation_id, "Failed to record relation_removed on target: {e}");
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(relation_id = %params.relation_id, "relation_removed: pre-fetch returned None");
+        }
+        Err(e) => {
+            tracing::warn!(relation_id = %params.relation_id, error = %e, "relation_removed: pre-fetch failed, activity not recorded");
+        }
+    }
 
     Ok(json!({ "message": "Relation removed successfully" }))
 }
