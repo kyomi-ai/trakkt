@@ -134,6 +134,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     add_relation(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "remove_relation",
@@ -148,6 +150,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     remove_relation(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "list_issue_relations",
@@ -162,6 +166,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     list_relations(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
     ]
 }

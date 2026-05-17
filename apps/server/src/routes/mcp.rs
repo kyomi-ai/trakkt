@@ -380,6 +380,7 @@ async fn dispatch_registry_tool(
         auth.user_id.clone(),
         &state.db,
         &state.ws_manager,
+        &*state.attachment_storage,
     );
 
     let result = (op.handler)(ctx, arguments).await.map_err(|e| match e {

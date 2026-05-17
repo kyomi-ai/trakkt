@@ -68,5 +68,7 @@ pub fn operations() -> Vec<ApiOperation> {
                 add_comment(&ctx, params).await
             })
         }),
+        binary_input: None,
+        binary_output: None,
     }]
 }

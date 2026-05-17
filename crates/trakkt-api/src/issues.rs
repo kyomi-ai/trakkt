@@ -360,6 +360,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     list_issues(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "search_issues",
@@ -374,6 +376,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     search_issues(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "get_issue",
@@ -388,6 +392,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     get_issue(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "create_issue",
@@ -402,6 +408,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     create_issue(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "update_issue",
@@ -416,6 +424,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     update_issue(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "delete_issue",
@@ -430,6 +440,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     delete_issue(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
     ]
 }

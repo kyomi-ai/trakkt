@@ -103,7 +103,7 @@ async fn list_issues_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = issues::list_issues(&ctx, params).await?;
     Ok(Json(result))
 }
@@ -116,7 +116,7 @@ async fn search_issues_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = issues::search_issues(&ctx, params).await?;
     Ok(Json(result))
 }
@@ -129,7 +129,7 @@ async fn get_issue_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::GetIssueApiParams {
         issue_identifier: Some(identifier),
         team_key: None,
@@ -147,7 +147,7 @@ async fn create_issue_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = issues::create_issue(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -161,7 +161,7 @@ async fn update_issue_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.issue_identifier = Some(identifier);
     let result = issues::update_issue(&ctx, params).await?;
     Ok(Json(result))
@@ -175,7 +175,7 @@ async fn delete_issue_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::DeleteIssueApiParams {
         issue_identifier: Some(identifier),
         team_key: None,
@@ -195,7 +195,7 @@ async fn add_comment_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "comments:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.issue_identifier = Some(identifier);
     let result = comments::add_comment(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
@@ -209,7 +209,7 @@ async fn list_labels_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "labels:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = labels::list_labels(&ctx, trakkt_types::api::ListLabelsApiParams {}).await?;
     Ok(Json(result))
 }
@@ -221,7 +221,7 @@ async fn create_label_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "labels:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = labels::create_label(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -234,7 +234,7 @@ async fn list_teams_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "teams:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = teams::list_teams(&ctx, trakkt_types::api::ListTeamsApiParams {}).await?;
     Ok(Json(result))
 }
@@ -248,7 +248,7 @@ async fn list_statuses_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = statuses::list_statuses(&ctx, params).await?;
     Ok(Json(result))
 }
@@ -263,7 +263,7 @@ async fn add_relation_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.source_issue = Some(identifier);
     let result = relations::add_relation(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
@@ -276,7 +276,7 @@ async fn list_relations_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::ListRelationsApiParams {
         issue_identifier: Some(identifier),
         team_key: None,
@@ -293,7 +293,7 @@ async fn remove_relation_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::RemoveRelationApiParams { relation_id: id };
     let result = relations::remove_relation(&ctx, params).await?;
     Ok(Json(result))
@@ -307,7 +307,7 @@ async fn list_projects_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = projects::list_projects(&ctx, trakkt_types::api::ListProjectsApiParams {}).await?;
     Ok(Json(result))
 }
@@ -319,7 +319,7 @@ async fn get_project_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::GetProjectApiParams { project_id: id };
     let result = projects::get_project(&ctx, params).await?;
     Ok(Json(result))
@@ -332,7 +332,7 @@ async fn create_project_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = projects::create_project(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -345,7 +345,7 @@ async fn update_project_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.project_id = Some(id);
     let result = projects::update_project(&ctx, params).await?;
     Ok(Json(result))
@@ -358,7 +358,7 @@ async fn delete_project_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::DeleteProjectApiParams { project_id: id };
     let result = projects::delete_project(&ctx, params).await?;
     Ok(Json(result))
@@ -373,7 +373,7 @@ async fn list_milestones_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::ListMilestonesApiParams { project_id: id };
     let result = milestones::list_milestones(&ctx, params).await?;
     Ok(Json(result))
@@ -387,7 +387,7 @@ async fn create_milestone_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.project_id = Some(id);
     let result = milestones::create_milestone(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
@@ -401,7 +401,7 @@ async fn update_milestone_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.milestone_id = Some(id);
     let result = milestones::update_milestone(&ctx, params).await?;
     Ok(Json(result))
@@ -414,7 +414,7 @@ async fn delete_milestone_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::DeleteMilestoneApiParams { milestone_id: id };
     let result = milestones::delete_milestone(&ctx, params).await?;
     Ok(Json(result))

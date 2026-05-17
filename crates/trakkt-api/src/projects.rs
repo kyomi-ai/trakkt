@@ -158,6 +158,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     list_projects(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "get_project",
@@ -172,6 +174,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     get_project(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "create_project",
@@ -186,6 +190,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     create_project(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "update_project",
@@ -200,6 +206,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     update_project(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "delete_project",
@@ -214,6 +222,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     delete_project(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
     ]
 }

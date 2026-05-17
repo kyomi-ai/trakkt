@@ -355,3 +355,36 @@ pub struct DeleteMilestoneApiParams {
     /// The milestone ID to delete
     pub milestone_id: String,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Attachment operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for uploading an attachment.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct UploadAttachmentApiParams {
+    /// Base64-encoded file content
+    pub content_base64: String,
+    /// Original filename (e.g. "screenshot.png")
+    pub filename: String,
+    /// MIME content type (e.g. "image/png")
+    pub content_type: String,
+}
+
+/// Parameters for downloading an attachment.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct DownloadAttachmentApiParams {
+    /// The attachment ID to download
+    pub attachment_id: String,
+}
+
+/// Parameters for deleting an attachment.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct DeleteAttachmentApiParams {
+    /// The attachment ID to delete
+    pub attachment_id: String,
+}
+
+/// Parameters for listing attachments.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListAttachmentsApiParams {}
