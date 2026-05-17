@@ -95,6 +95,14 @@ async fn serve() {
     let attachment_storage = trakkt_auth::attachment_storage::create_storage(&config)
         .expect("Failed to initialize attachment storage");
 
+    // Stripe billing (optional — disabled when STRIPE_SECRET_KEY is not set)
+    let stripe = trakkt_auth::stripe_service::StripeService::new_from_env();
+    if stripe.is_some() {
+        tracing::info!("Stripe billing enabled");
+    } else {
+        tracing::info!("Stripe billing disabled (no STRIPE_SECRET_KEY)");
+    }
+
     let state = trakkt_server::state::AppState {
         db: db.clone(),
         kv: kv.clone(),
@@ -105,6 +113,7 @@ async fn serve() {
         ws_manager,
         mcp_sessions,
         attachment_storage: Arc::from(attachment_storage),
+        stripe,
     };
 
     // Register Leptos server functions

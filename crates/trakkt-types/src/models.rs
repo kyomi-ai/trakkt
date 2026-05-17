@@ -324,6 +324,21 @@ pub struct IssueRelationWithDetails {
     pub direction: String,
 }
 
+/// A single activity entry for an issue (field change, status transition, etc.).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueActivity {
+    pub activity_id: String,
+    pub issue_id: String,
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub action_type: String,
+    pub field: Option<String>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub metadata: Option<String>,
+    pub created_at: String,
+}
+
 /// Per-team settings stored in teams.settings JSON column.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TeamSettings {
