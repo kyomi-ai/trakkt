@@ -226,12 +226,12 @@ pub struct ListStatusesApiParams {
 /// Parameters for adding a relation between two issues.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct AddRelationApiParams {
-    /// Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue.
+    /// Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue. For 'duplicate': the duplicate issue.
     /// Optional so REST can inject it from the path parameter.
     pub source_issue: Option<String>,
-    /// Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue
+    /// Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue. For 'duplicate': the original issue.
     pub target_issue: String,
-    /// Relation type: 'blocks' or 'parent'
+    /// Relation type: 'blocks', 'parent', or 'duplicate'
     pub relation_type: String,
 }
 

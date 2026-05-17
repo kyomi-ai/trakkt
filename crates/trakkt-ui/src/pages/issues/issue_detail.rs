@@ -1541,8 +1541,8 @@ fn DescriptionEditor(
 /// Unified relations section showing ALL relation types in one list.
 ///
 /// Consolidates the old Parent sidebar section, SubIssuesSection, and
-/// RelationsSection into a single component. Displays parent, blocked-by,
-/// blocks, and child relations grouped in that order.
+/// RelationsSection into a single component. Displays parent, duplicate-of,
+/// blocked-by, blocks, has-duplicate, and child relations grouped in that order.
 ///
 /// Provides:
 /// - "+ Add relation" button that opens a modal with a relation-type selector and issue picker
@@ -1589,6 +1589,7 @@ fn RelationsSection(
             "child_of" => (current, selected_ident, "parent".to_string()),
             "blocks" => (current, selected_ident, "blocks".to_string()),
             "blocked_by" => (selected_ident, current, "blocks".to_string()),
+            "duplicate" => (current, selected_ident, "duplicate".to_string()),
             _ => return,
         };
 
@@ -1618,28 +1619,34 @@ fn RelationsSection(
             "child_of" => "Add child issue".to_string(),
             "blocks" => "Add issue this blocks".to_string(),
             "blocked_by" => "Add issue that blocks this".to_string(),
+            "duplicate" => "Add duplicate relation".to_string(),
             _ => "Add relation".to_string(),
         }
     });
 
-    // Sort relations into display order: Parent, Blocked by, Blocks, Child
+    // Sort relations into display order: Parent, Duplicate of, Blocked by,
+    // Blocks, Has duplicate, Child.
     // Note: `direction` describes the CURRENT issue's role, but labels describe
     // the OTHER issue. "parent" means current IS the parent → other is "Child".
     fn direction_order(direction: &str) -> u8 {
         match direction {
             "child_of" => 0,
-            "blocked_by" => 1,
-            "blocks" => 2,
-            "parent" => 3,
-            _ => 4,
+            "duplicate" => 1,
+            "blocked_by" => 2,
+            "blocks" => 3,
+            "has_duplicate" => 4,
+            "parent" => 5,
+            _ => 6,
         }
     }
 
     fn direction_label(direction: &str) -> &'static str {
         match direction {
             "child_of" => "Parent",
+            "duplicate" => "Duplicate of",
             "blocked_by" => "Blocked by",
             "blocks" => "Blocks",
+            "has_duplicate" => "Has duplicate",
             "parent" => "Child",
             _ => "Related",
         }
@@ -1764,6 +1771,7 @@ fn RelationsSection(
                         ("parent", "Parent"),
                         ("blocks", "Blocks"),
                         ("blocked_by", "Blocked by"),
+                        ("duplicate", "Duplicate of"),
                     ]
                     on_change=move |val| set_add_relation_type.set(val)
                 />

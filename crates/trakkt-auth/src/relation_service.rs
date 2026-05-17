@@ -75,7 +75,7 @@ struct WorkspaceIdRow {
     workspace_id: String,
 }
 
-const VALID_RELATION_TYPES: &[&str] = &["blocks", "parent"];
+const VALID_RELATION_TYPES: &[&str] = &["blocks", "parent", "duplicate"];
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -153,6 +153,32 @@ async fn validate_single_parent(
     if existing.is_some() {
         return Err(trakkt_core::Error::BadRequest(
             "This issue already has a parent. Remove the existing parent first.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that the source issue does not already have an outward duplicate relation.
+///
+/// An issue can only be a duplicate of ONE other issue. Multiple issues can
+/// point at the same original (i.e. the target can have many inward duplicates).
+async fn validate_single_duplicate(
+    db: &DbPool,
+    source_issue_id: &str,
+) -> trakkt_core::Result<()> {
+    let existing: Option<String> = trakkt_core::db_with_pool!(db, |p| {
+        sqlx::query_scalar::<_, String>(
+            "SELECT relation_id FROM issue_relations \
+             WHERE source_issue_id = $1 AND relation_type = 'duplicate'",
+        )
+        .bind(source_issue_id)
+        .fetch_optional(p)
+        .await
+    })?;
+
+    if existing.is_some() {
+        return Err(trakkt_core::Error::BadRequest(
+            "This issue is already marked as a duplicate. Remove the existing duplicate relation first.".to_string(),
         ));
     }
     Ok(())
@@ -248,6 +274,11 @@ pub async fn create_relation(
     if relation_type == "parent" {
         validate_no_circular_parent(db, source_issue_id, target_issue_id).await?;
         validate_single_parent(db, target_issue_id).await?;
+    }
+
+    // Validate duplicate relations: only one outward duplicate per source issue.
+    if relation_type == "duplicate" {
+        validate_single_duplicate(db, source_issue_id).await?;
     }
 
     // Insert the relation.
@@ -389,6 +420,8 @@ pub async fn delete_relation(
 /// - "blocks": source blocks target. If issue is source => "blocks", if target => "blocked_by"
 /// - "parent": source is parent, target is child. If issue is source => "parent" (has child),
 ///   if target => "child_of" (has parent)
+/// - "duplicate": source is duplicate of target. If issue is source => "duplicate",
+///   if target => "has_duplicate"
 pub async fn list_relations_for_issue(
     db: &DbPool,
     issue_id: &str,
@@ -410,6 +443,8 @@ pub async fn list_relations_for_issue(
                 WHEN r.target_issue_id = $1 AND r.relation_type = 'blocks' THEN 'blocked_by' \
                 WHEN r.source_issue_id = $1 AND r.relation_type = 'parent' THEN 'parent' \
                 WHEN r.target_issue_id = $1 AND r.relation_type = 'parent' THEN 'child_of' \
+                WHEN r.source_issue_id = $1 AND r.relation_type = 'duplicate' THEN 'duplicate' \
+                WHEN r.target_issue_id = $1 AND r.relation_type = 'duplicate' THEN 'has_duplicate' \
                 ELSE r.relation_type \
             END AS direction \
          FROM issue_relations r \
