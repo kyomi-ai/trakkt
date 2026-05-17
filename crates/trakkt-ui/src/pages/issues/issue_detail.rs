@@ -1560,9 +1560,13 @@ fn RelationsSection(
     let issue_identifier = format!("{team_key}-{number}");
     let tk = team_key.clone();
     let (version, set_version) = signal(0u32);
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+    let ws_version = Signal::derive(move || {
+        sync_store.map(|s| s.relations_version().get()).unwrap_or(0)
+    });
     let relations_resource = Resource::new(
-        move || (tk.clone(), number, version.get()),
-        move |(tk, num, _)| async move { list_issue_relations(tk, num).await },
+        move || (tk.clone(), number, version.get(), ws_version.get()),
+        move |(tk, num, _, _)| async move { list_issue_relations(tk, num).await },
     );
 
     // ── "Add relation" modal state ───────────────────────────────────
