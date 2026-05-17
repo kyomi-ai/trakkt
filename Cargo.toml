@@ -4,6 +4,7 @@ members = [
     "crates/trakkt-auth",
     "crates/trakkt-types",
     "crates/trakkt-api",
+    "crates/trakkt-github",
     "crates/trakkt-ui",
     "apps/server",
 ]
@@ -80,6 +81,7 @@ trakkt-ui = { path = "crates/trakkt-ui" }
 trakkt-server = { path = "apps/server" }
 trakkt-api = { path = "crates/trakkt-api" }
 trakkt-types = { path = "crates/trakkt-types" }
+trakkt-github = { path = "crates/trakkt-github" }
 # Async trait
 async-trait = "0.1"
 
