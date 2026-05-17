@@ -90,6 +90,28 @@ pub struct Config {
 
     /// Backend base URL for constructing OAuth redirect URIs
     pub base_url: String,
+
+    // ── Attachments ────────────────────────────────────────────────────
+    /// Storage backend for file attachments: "local" or "s3"
+    pub attachment_storage: String,
+
+    /// Local filesystem path for attachment storage (when storage=local)
+    pub attachment_local_path: String,
+
+    /// S3-compatible endpoint URL (when storage=s3)
+    pub attachment_s3_endpoint: Option<String>,
+
+    /// S3 bucket name (when storage=s3)
+    pub attachment_s3_bucket: Option<String>,
+
+    /// S3 access key (when storage=s3)
+    pub attachment_s3_access_key: Option<String>,
+
+    /// S3 secret key (when storage=s3)
+    pub attachment_s3_secret_key: Option<String>,
+
+    /// S3 region (when storage=s3)
+    pub attachment_s3_region: Option<String>,
 }
 
 impl Config {
@@ -157,6 +179,13 @@ impl Config {
                 .unwrap_or_else(|_| "support@trakkt.app".into()),
             frontend_url,
             base_url,
+            attachment_storage: env::var("ATTACHMENT_STORAGE").unwrap_or_else(|_| "local".into()),
+            attachment_local_path: env::var("ATTACHMENT_LOCAL_PATH").unwrap_or_else(|_| "./data/attachments".into()),
+            attachment_s3_endpoint: env::var("ATTACHMENT_S3_ENDPOINT").ok(),
+            attachment_s3_bucket: env::var("ATTACHMENT_S3_BUCKET").ok(),
+            attachment_s3_access_key: env::var("ATTACHMENT_S3_ACCESS_KEY").ok(),
+            attachment_s3_secret_key: env::var("ATTACHMENT_S3_SECRET_KEY").ok(),
+            attachment_s3_region: env::var("ATTACHMENT_S3_REGION").ok(),
         }
     }
 
@@ -187,6 +216,13 @@ impl Config {
             support_email: "test@trakkt.app".into(),
             frontend_url: "http://localhost:5173".into(),
             base_url: "http://localhost:8003".into(),
+            attachment_storage: "local".into(),
+            attachment_local_path: "/tmp/trakkt-test-attachments".into(),
+            attachment_s3_endpoint: None,
+            attachment_s3_bucket: None,
+            attachment_s3_access_key: None,
+            attachment_s3_secret_key: None,
+            attachment_s3_region: None,
         }
     }
 }

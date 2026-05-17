@@ -49,5 +49,7 @@ pub fn operations() -> Vec<ApiOperation> {
                 list_teams(&ctx, params).await
             })
         }),
+        binary_input: None,
+        binary_output: None,
     }]
 }

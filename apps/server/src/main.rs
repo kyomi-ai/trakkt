@@ -91,6 +91,10 @@ async fn serve() {
     // MCP session manager
     let mcp_sessions = trakkt_auth::mcp_session_manager::MCPSessionManager::new(kv.clone());
 
+    // Attachment storage backend
+    let attachment_storage = trakkt_auth::attachment_storage::create_storage(&config)
+        .expect("Failed to initialize attachment storage");
+
     // Stripe billing (optional — disabled when STRIPE_SECRET_KEY is not set)
     let stripe = trakkt_auth::stripe_service::StripeService::new_from_env();
     if stripe.is_some() {
@@ -108,6 +112,7 @@ async fn serve() {
         webauthn: Arc::new(webauthn),
         ws_manager,
         mcp_sessions,
+        attachment_storage: Arc::from(attachment_storage),
         stripe,
     };
 

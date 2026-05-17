@@ -61,5 +61,7 @@ pub fn operations() -> Vec<ApiOperation> {
                 list_issue_activities(&ctx, params).await
             })
         }),
+        binary_input: None,
+        binary_output: None,
     }]
 }

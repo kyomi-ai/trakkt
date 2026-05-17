@@ -8,10 +8,12 @@ trakkt-core = { workspace = true }
 trakkt-auth = { workspace = true }
 trakkt-types = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 schemars = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

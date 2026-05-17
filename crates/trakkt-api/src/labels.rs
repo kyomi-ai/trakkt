@@ -78,6 +78,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     list_labels(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "create_label",
@@ -92,6 +94,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     create_label(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
     ]
 }

@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn all_24_operations_present() {
+    fn all_28_operations_present() {
         let spec = generate_openapi_spec();
         let paths = spec["paths"].as_object().expect("paths should be an object");
 
@@ -227,7 +227,7 @@ mod tests {
         }
         operation_ids.sort();
 
-        assert_eq!(operation_ids.len(), 24, "expected 24 operations, got {}: {operation_ids:?}", operation_ids.len());
+        assert_eq!(operation_ids.len(), 28, "expected 28 operations, got {}: {operation_ids:?}", operation_ids.len());
     }
 
     #[test]

@@ -126,7 +126,7 @@ pub fn build_router(state: state::AppState) -> Router {
         .layer(axum::middleware::from_fn(middleware::security_headers))
         .layer(middleware::cors_layer())
         .layer(TraceLayer::new_for_http())
-        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        .layer(RequestBodyLimitLayer::new(16 * 1024 * 1024))
 }
 
 async fn health_handler() -> &'static str {

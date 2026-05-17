@@ -33,6 +33,7 @@ reqwest = { workspace = true }
 aes-gcm = { workspace = true }
 lettre = { workspace = true }
 totp-rs = { workspace = true }
+rust-s3 = { workspace = true }
 async-stripe = { workspace = true }
 async-stripe-webhook = { workspace = true }
 async-stripe-billing = { workspace = true }

@@ -8,6 +8,7 @@
 //! duplicate business logic.
 
 pub mod activities;
+pub mod attachments;
 pub mod comments;
 pub mod context;
 pub mod issues;
@@ -37,6 +38,7 @@ pub struct ApiCtx<'a> {
     pub workspace_id: String,
     pub user_id: String,
     pub ws_manager: Option<&'a trakkt_auth::websocket::WebSocketManager>,
+    pub attachment_storage: Option<&'a dyn trakkt_auth::attachment_storage::AttachmentStorage>,
 }
 
 impl<'a> ApiCtx<'a> {
@@ -48,12 +50,14 @@ impl<'a> ApiCtx<'a> {
         user_id: String,
         db: &'a trakkt_core::DbPool,
         ws_manager: &'a trakkt_auth::websocket::WebSocketManager,
+        attachment_storage: &'a dyn trakkt_auth::attachment_storage::AttachmentStorage,
     ) -> Self {
         Self {
             db,
             workspace_id,
             user_id,
             ws_manager: Some(ws_manager),
+            attachment_storage: Some(attachment_storage),
         }
     }
 
@@ -72,6 +76,7 @@ impl<'a> ApiCtx<'a> {
             workspace_id,
             user_id,
             ws_manager,
+            attachment_storage: None,
         }
     }
 }
@@ -143,6 +148,24 @@ pub type DynHandler = Box<
         + Sync,
 >;
 
+/// Specifies how the REST transport handles binary input for an operation.
+pub struct BinaryInputSpec {
+    /// Multipart field name the REST transport extracts (e.g. "file")
+    pub multipart_field: &'static str,
+    /// JSON param key where base64 content is placed
+    pub base64_param: &'static str,
+    /// JSON param key for original filename
+    pub filename_param: &'static str,
+    /// JSON param key for content type
+    pub content_type_param: &'static str,
+}
+
+/// Specifies that the operation returns binary data instead of JSON.
+pub struct BinaryOutputSpec {
+    /// JSON param key containing the MIME content type for the response
+    pub content_type_field: &'static str,
+}
+
 /// A registered API operation.
 ///
 /// Stores enough metadata for both the MCP `tools/list` response and the REST
@@ -168,6 +191,12 @@ pub struct ApiOperation {
 
     /// Type-erased async handler.
     pub handler: DynHandler,
+
+    /// If set, REST transport parses multipart instead of JSON.
+    pub binary_input: Option<BinaryInputSpec>,
+
+    /// If set, REST transport returns raw bytes instead of JSON.
+    pub binary_output: Option<BinaryOutputSpec>,
 }
 
 /// Collect all registered API operations.
@@ -176,6 +205,7 @@ pub struct ApiOperation {
 /// operations. They are aggregated here into a single registry.
 pub fn all_operations() -> Vec<ApiOperation> {
     let mut ops = Vec::new();
+    ops.extend(attachments::operations());
     ops.extend(issues::operations());
     ops.extend(comments::operations());
     ops.extend(labels::operations());
@@ -315,10 +345,16 @@ mod tests {
         assert!(names.contains(&"update_milestone"));
         assert!(names.contains(&"delete_milestone"));
 
+        // Attachment operations (4)
+        assert!(names.contains(&"upload_attachment"));
+        assert!(names.contains(&"download_attachment"));
+        assert!(names.contains(&"delete_attachment"));
+        assert!(names.contains(&"list_attachments"));
+
         // Activity operations (1)
         assert!(names.contains(&"list_issue_activities"));
 
-        // Total: 6 + 1 + 2 + 1 + 1 + 3 + 5 + 4 + 1 = 24
-        assert_eq!(ops.len(), 24, "expected 24 total operations");
+        // Total: 6 + 1 + 2 + 1 + 1 + 3 + 5 + 4 + 4 + 1 = 28
+        assert_eq!(ops.len(), 28, "expected 28 total operations");
     }
 }

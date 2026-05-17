@@ -61,5 +61,7 @@ pub fn operations() -> Vec<ApiOperation> {
                 list_statuses(&ctx, params).await
             })
         }),
+        binary_input: None,
+        binary_output: None,
     }]
 }

@@ -16,15 +16,17 @@
 //! In personal mode, auth is bypassed — a local user context is injected.
 
 use axum::{
-    extract::{Path, Query, State},
+    body::Body,
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
 };
+use base64::Engine;
 use serde_json::json;
 
-use trakkt_api::{activities, comments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
+use trakkt_api::{activities, attachments, comments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
 use crate::state::AppState;
 
 use super::auth_shared::{self, ResolvedAuth};
@@ -103,7 +105,7 @@ async fn list_issues_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = issues::list_issues(&ctx, params).await?;
     Ok(Json(result))
 }
@@ -116,7 +118,7 @@ async fn search_issues_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = issues::search_issues(&ctx, params).await?;
     Ok(Json(result))
 }
@@ -129,7 +131,7 @@ async fn get_issue_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::GetIssueApiParams {
         issue_identifier: Some(identifier),
         team_key: None,
@@ -147,7 +149,7 @@ async fn create_issue_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = issues::create_issue(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -161,7 +163,7 @@ async fn update_issue_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.issue_identifier = Some(identifier);
     let result = issues::update_issue(&ctx, params).await?;
     Ok(Json(result))
@@ -175,7 +177,7 @@ async fn delete_issue_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::DeleteIssueApiParams {
         issue_identifier: Some(identifier),
         team_key: None,
@@ -195,7 +197,7 @@ async fn add_comment_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "comments:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.issue_identifier = Some(identifier);
     let result = comments::add_comment(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
@@ -209,7 +211,7 @@ async fn list_labels_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "labels:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = labels::list_labels(&ctx, trakkt_types::api::ListLabelsApiParams {}).await?;
     Ok(Json(result))
 }
@@ -221,7 +223,7 @@ async fn create_label_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "labels:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = labels::create_label(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -234,7 +236,7 @@ async fn list_teams_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "teams:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = teams::list_teams(&ctx, trakkt_types::api::ListTeamsApiParams {}).await?;
     Ok(Json(result))
 }
@@ -248,7 +250,7 @@ async fn list_statuses_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = statuses::list_statuses(&ctx, params).await?;
     Ok(Json(result))
 }
@@ -263,7 +265,7 @@ async fn add_relation_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.source_issue = Some(identifier);
     let result = relations::add_relation(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
@@ -276,7 +278,7 @@ async fn list_relations_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::ListRelationsApiParams {
         issue_identifier: Some(identifier),
         team_key: None,
@@ -293,7 +295,7 @@ async fn remove_relation_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::RemoveRelationApiParams { relation_id: id };
     let result = relations::remove_relation(&ctx, params).await?;
     Ok(Json(result))
@@ -308,7 +310,7 @@ async fn list_issue_activities_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::ListIssueActivitiesApiParams {
         issue_identifier: Some(identifier),
         team_key: None,
@@ -326,7 +328,7 @@ async fn list_projects_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = projects::list_projects(&ctx, trakkt_types::api::ListProjectsApiParams {}).await?;
     Ok(Json(result))
 }
@@ -338,7 +340,7 @@ async fn get_project_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::GetProjectApiParams { project_id: id };
     let result = projects::get_project(&ctx, params).await?;
     Ok(Json(result))
@@ -351,7 +353,7 @@ async fn create_project_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let result = projects::create_project(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
@@ -364,7 +366,7 @@ async fn update_project_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.project_id = Some(id);
     let result = projects::update_project(&ctx, params).await?;
     Ok(Json(result))
@@ -377,7 +379,7 @@ async fn delete_project_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::DeleteProjectApiParams { project_id: id };
     let result = projects::delete_project(&ctx, params).await?;
     Ok(Json(result))
@@ -392,7 +394,7 @@ async fn list_milestones_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::ListMilestonesApiParams { project_id: id };
     let result = milestones::list_milestones(&ctx, params).await?;
     Ok(Json(result))
@@ -406,7 +408,7 @@ async fn create_milestone_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.project_id = Some(id);
     let result = milestones::create_milestone(&ctx, params).await?;
     Ok((StatusCode::CREATED, Json(result)))
@@ -420,7 +422,7 @@ async fn update_milestone_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     params.milestone_id = Some(id);
     let result = milestones::update_milestone(&ctx, params).await?;
     Ok(Json(result))
@@ -433,9 +435,181 @@ async fn delete_milestone_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "projects:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
     let params = trakkt_types::api::DeleteMilestoneApiParams { milestone_id: id };
     let result = milestones::delete_milestone(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+// ─── Attachments ────────────────────────────────────────────────────────────
+
+/// `POST /attachments` — upload a file via multipart form.
+///
+/// Accepts a multipart form with a "file" field. The handler extracts the file,
+/// base64-encodes it, and delegates to the shared upload handler.
+async fn upload_attachment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "attachments:write")?;
+
+    const MAX_ATTACHMENT_SIZE: usize = 10 * 1024 * 1024;
+
+    // Extract the file field from multipart with streaming size check
+    let mut file_data: Option<(String, String, Vec<u8>)> = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        RestError(ApiError::BadRequest(format!("Multipart parse error: {e}")))
+    })? {
+        if field.name() == Some("file") {
+            let filename = field
+                .file_name()
+                .unwrap_or("unnamed")
+                .to_string();
+            let content_type = field
+                .content_type()
+                .unwrap_or("application/octet-stream")
+                .to_string();
+
+            let mut buf = Vec::with_capacity(4096);
+            let mut stream = field;
+            while let Some(chunk) = stream.chunk().await.map_err(|e| {
+                RestError(ApiError::BadRequest(format!("Failed to read file field: {e}")))
+            })? {
+                if buf.len() + chunk.len() > MAX_ATTACHMENT_SIZE {
+                    return Err(RestError(ApiError::BadRequest(format!(
+                        "File too large (max {} bytes)",
+                        MAX_ATTACHMENT_SIZE
+                    ))));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+
+            file_data = Some((filename, content_type, buf));
+            break;
+        }
+    }
+
+    let (filename, content_type, bytes) = file_data.ok_or_else(|| {
+        RestError(ApiError::BadRequest(
+            "Missing 'file' field in multipart form".into(),
+        ))
+    })?;
+
+    // Base64-encode and build the params
+    let content_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let params = trakkt_types::api::UploadAttachmentApiParams {
+        content_base64,
+        filename,
+        content_type,
+    };
+
+    let ctx = ApiCtx::from_bearer(
+        auth.workspace_id,
+        auth.user_id,
+        &state.db,
+        &state.ws_manager,
+        &*state.attachment_storage,
+    );
+    let result = attachments::upload_attachment(&ctx, params).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// `GET /attachments/{attachment_id}/download` — download a file as raw bytes.
+///
+/// Returns the file content with appropriate Content-Type and Content-Disposition headers.
+async fn download_attachment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(attachment_id): Path<String>,
+) -> Result<Response, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "attachments:read")?;
+
+    let ctx = ApiCtx::from_bearer(
+        auth.workspace_id,
+        auth.user_id,
+        &state.db,
+        &state.ws_manager,
+        &*state.attachment_storage,
+    );
+    let params = trakkt_types::api::DownloadAttachmentApiParams { attachment_id };
+    let result = attachments::download_attachment(&ctx, params).await?;
+
+    // Extract fields from the handler's JSON response
+    let content_type = result
+        .get("content_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("application/octet-stream");
+    let filename = result
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("download");
+    let content_base64 = result
+        .get("content_base64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RestError(ApiError::Internal("Missing content_base64 in response".into())))?;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(content_base64)
+        .map_err(|e| RestError(ApiError::Internal(format!("Failed to decode content: {e}"))))?;
+
+    let ascii_safe = filename.replace('\\', "\\\\").replace('"', "\\\"");
+    let encoded = percent_encoding::utf8_percent_encode(filename, percent_encoding::NON_ALPHANUMERIC);
+    let disposition = format!("inline; filename=\"{ascii_safe}\"; filename*=UTF-8''{encoded}");
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .header("content-disposition", disposition)
+        .header("content-length", bytes.len().to_string())
+        .body(Body::from(bytes))
+        .map_err(|e| RestError(ApiError::Internal(format!("Failed to build response: {e}"))))?;
+
+    Ok(response)
+}
+
+/// `DELETE /attachments/{attachment_id}` — delete an attachment.
+async fn delete_attachment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(attachment_id): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "attachments:write")?;
+    let ctx = ApiCtx::from_bearer(
+        auth.workspace_id,
+        auth.user_id,
+        &state.db,
+        &state.ws_manager,
+        &*state.attachment_storage,
+    );
+    let params = trakkt_types::api::DeleteAttachmentApiParams { attachment_id };
+    let result = attachments::delete_attachment(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+/// `GET /attachments` — list all attachments in the workspace.
+async fn list_attachments_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "attachments:read")?;
+    let ctx = ApiCtx::from_bearer(
+        auth.workspace_id,
+        auth.user_id,
+        &state.db,
+        &state.ws_manager,
+        &*state.attachment_storage,
+    );
+    let result = attachments::list_attachments(
+        &ctx,
+        trakkt_types::api::ListAttachmentsApiParams {},
+    )
+    .await?;
     Ok(Json(result))
 }
 
@@ -495,4 +669,8 @@ pub fn rest_router() -> Router<AppState> {
             "/milestones/{id}",
             patch(update_milestone_handler).delete(delete_milestone_handler),
         )
+        // Attachments
+        .route("/attachments", get(list_attachments_handler).post(upload_attachment_handler))
+        .route("/attachments/{attachment_id}/download", get(download_attachment_handler))
+        .route("/attachments/{attachment_id}", delete(delete_attachment_handler))
 }

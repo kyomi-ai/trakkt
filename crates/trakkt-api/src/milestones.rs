@@ -166,6 +166,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     list_milestones(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "create_milestone",
@@ -180,6 +182,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     create_milestone(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "update_milestone",
@@ -194,6 +198,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     update_milestone(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
         ApiOperation {
             name: "delete_milestone",
@@ -208,6 +214,8 @@ pub fn operations() -> Vec<ApiOperation> {
                     delete_milestone(&ctx, params).await
                 })
             }),
+            binary_input: None,
+            binary_output: None,
         },
     ]
 }

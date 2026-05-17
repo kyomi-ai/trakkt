@@ -67,6 +67,9 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # TOTP 2FA
 totp-rs = { version = "5", features = ["otpauth", "gen_secret", "qr"] }
 
+# URL encoding (Content-Disposition filenames)
+percent-encoding = "2"
+
 # Utilities
 thiserror = "2"
 tracing = "0.1"
@@ -93,6 +96,9 @@ async-stripe-shared = { version = "=1.0.0-rc.1" }
 async-stripe-types = { version = "=1.0.0-rc.1" }
 # Async trait
 async-trait = "0.1"
+
+# S3 storage (attachments)
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
 
 # Concurrent data structures
 dashmap = "6"
