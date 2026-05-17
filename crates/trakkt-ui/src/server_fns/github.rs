@@ -208,6 +208,62 @@ pub async fn disconnect_github() -> Result<(), ServerFnError> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GitHub link display types and server functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GitHub link data for display in the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubLinkDisplay {
+    pub link_id: String,
+    pub link_type: String,
+    pub repo_full_name: String,
+    pub ref_identifier: String,
+    pub title: Option<String>,
+    pub state: Option<String>,
+    pub url: String,
+    pub author_login: Option<String>,
+    pub close_intent: bool,
+    pub created_at: String,
+}
+
+/// List all GitHub links (PRs, branches, commits) for an issue.
+#[server(prefix = "/leptos-api")]
+pub async fn list_github_links_for_issue(
+    team_key: String,
+    number: i32,
+) -> Result<Vec<GitHubLinkDisplay>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let db = ac.db();
+
+    let issue = trakkt_auth::issue_service::get_issue(db, &ac.ws_id, &team_key, number)
+        .await
+        .into_sfn()?
+        .ok_or_else(|| ServerFnError::new(format!("Issue {team_key}-{number} not found")))?;
+
+    let links = trakkt_github::schema::list_links_for_issue(db, &issue.issue_id)
+        .await
+        .into_sfn()?;
+
+    let display_links: Vec<GitHubLinkDisplay> = links
+        .into_iter()
+        .map(|link| GitHubLinkDisplay {
+            link_id: link.link_id,
+            link_type: link.link_type,
+            repo_full_name: link.repo_full_name,
+            ref_identifier: link.ref_identifier,
+            title: link.title,
+            state: link.state,
+            url: link.url,
+            author_login: link.author_login,
+            close_intent: link.close_intent,
+            created_at: link.created_at,
+        })
+        .collect();
+
+    Ok(display_links)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers (server-only)
 // ─────────────────────────────────────────────────────────────────────────────
 

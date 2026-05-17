@@ -26,7 +26,7 @@ use axum::{
 use base64::Engine;
 use serde_json::json;
 
-use trakkt_api::{activities, attachments, comments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
+use trakkt_api::{activities, attachments, comments, github_links, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
 use crate::state::AppState;
 
 use super::auth_shared::{self, ResolvedAuth};
@@ -331,6 +331,25 @@ async fn list_issue_activities_handler(
         issue_number: None,
     };
     let result = activities::list_issue_activities(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+// ─── GitHub Links ──────────────────────────────────────────────────────────
+
+async fn list_issue_github_links_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "issues:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
+    let params = trakkt_types::api::ListGitHubLinksApiParams {
+        issue_identifier: Some(identifier),
+        team_key: None,
+        issue_number: None,
+    };
+    let result = github_links::list_issue_github_links(&ctx, params).await?;
     Ok(Json(result))
 }
 
@@ -660,6 +679,8 @@ pub fn rest_router() -> Router<AppState> {
         .route("/relations/{id}", delete(remove_relation_handler))
         // Activities
         .route("/issues/{identifier}/activities", get(list_issue_activities_handler))
+        // GitHub Links
+        .route("/issues/{identifier}/github-links", get(list_issue_github_links_handler))
         // Labels
         .route("/labels", get(list_labels_handler).post(create_label_handler))
         // Teams

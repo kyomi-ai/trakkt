@@ -418,3 +418,18 @@ pub struct ListIssueActivitiesApiParams {
     /// Team key (e.g. 'TRA'). Required if issue_identifier is not provided
     pub team_key: Option<String>,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GitHub link operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing GitHub links associated with an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListGitHubLinksApiParams {
+    /// Issue identifier in 'TRA-35' format
+    pub issue_identifier: Option<String>,
+    /// Team key (e.g. 'TRA'). Required if issue_identifier is not provided
+    pub team_key: Option<String>,
+    /// Issue number within the team. Required if issue_identifier is not provided
+    pub issue_number: Option<i64>,
+}
