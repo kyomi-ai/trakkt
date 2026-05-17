@@ -1627,7 +1627,7 @@ fn RelationsSection(
     let modal_title = Memo::new(move |_| {
         match add_relation_type.get().as_str() {
             "parent" => "Set parent issue".to_string(),
-            "child_of" => "Add child issue".to_string(),
+            "child_of" => "Add sub-issue".to_string(),
             "blocks" => "Add issue this blocks".to_string(),
             "blocked_by" => "Add issue that blocks this".to_string(),
             "duplicate" => "Add duplicate relation".to_string(),
@@ -1636,9 +1636,9 @@ fn RelationsSection(
     });
 
     // Sort relations into display order: Parent, Duplicate of, Blocked by,
-    // Blocks, Has duplicate, Child.
+    // Blocks, Has duplicate, Sub-issue.
     // Note: `direction` describes the CURRENT issue's role, but labels describe
-    // the OTHER issue. "parent" means current IS the parent → other is "Child".
+    // the OTHER issue. "parent" means current IS the parent → other is "Sub-issue".
     fn direction_order(direction: &str) -> u8 {
         match direction {
             "child_of" => 0,
@@ -1658,7 +1658,7 @@ fn RelationsSection(
             "blocked_by" => "Blocked by",
             "blocks" => "Blocks",
             "has_duplicate" => "Has duplicate",
-            "parent" => "Child",
+            "parent" => "Sub-issue",
             _ => "Related",
         }
     }
@@ -1778,7 +1778,7 @@ fn RelationsSection(
                 <StyledSelect
                     value=add_relation_type.get_untracked()
                     options=vec![
-                        ("child_of", "Child"),
+                        ("child_of", "Sub-issue"),
                         ("parent", "Parent"),
                         ("blocks", "Blocks"),
                         ("blocked_by", "Blocked by"),
