@@ -91,6 +91,14 @@ async fn serve() {
     // MCP session manager
     let mcp_sessions = trakkt_auth::mcp_session_manager::MCPSessionManager::new(kv.clone());
 
+    // Stripe billing (optional — disabled when STRIPE_SECRET_KEY is not set)
+    let stripe = trakkt_auth::stripe_service::StripeService::new_from_env();
+    if stripe.is_some() {
+        tracing::info!("Stripe billing enabled");
+    } else {
+        tracing::info!("Stripe billing disabled (no STRIPE_SECRET_KEY)");
+    }
+
     let state = trakkt_server::state::AppState {
         db: db.clone(),
         kv: kv.clone(),
@@ -100,6 +108,7 @@ async fn serve() {
         webauthn: Arc::new(webauthn),
         ws_manager,
         mcp_sessions,
+        stripe,
     };
 
     // Register Leptos server functions

@@ -33,5 +33,12 @@ reqwest = { workspace = true }
 aes-gcm = { workspace = true }
 lettre = { workspace = true }
 totp-rs = { workspace = true }
+async-stripe = { workspace = true }
+async-stripe-webhook = { workspace = true }
+async-stripe-billing = { workspace = true }
+async-stripe-checkout = { workspace = true }
+async-stripe-core = { workspace = true }
+async-stripe-shared = { workspace = true }
+async-stripe-types = { workspace = true }
 [lints]
 workspace = true

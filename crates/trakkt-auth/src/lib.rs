@@ -4,6 +4,7 @@
 
 pub mod archive_service;
 pub mod auth_service;
+pub mod billing_service;
 pub mod comment_service;
 pub mod cookies;
 pub mod email_service;
@@ -26,6 +27,7 @@ pub mod redis_ops;
 pub mod security_service;
 pub mod session;
 pub mod status_service;
+pub mod stripe_service;
 pub mod sync_log_service;
 pub mod team_service;
 pub mod token_refresh;
