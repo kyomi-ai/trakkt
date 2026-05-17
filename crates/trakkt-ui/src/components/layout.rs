@@ -992,6 +992,7 @@ fn SidebarTeamSubNav(
     };
 
     let (menu_open, set_menu_open) = signal(false);
+    let menu_trigger_ref = NodeRef::<leptos::html::Div>::new();
 
     let store = use_context::<SyncStore>();
     let nav = leptos_router::hooks::use_navigate();
@@ -1016,37 +1017,6 @@ fn SidebarTeamSubNav(
         if is_expanded.get() { "transition-transform duration-150" } else { "transition-transform duration-150 -rotate-90" }
     };
 
-    // Close context menu on click-outside — register once, check state inside.
-    let outer_ref = NodeRef::<leptos::html::Div>::new();
-    Effect::new(move |_| {
-        let Some(window) = web_sys::window() else { return };
-        let outer = outer_ref.get();
-        let cb = Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |ev: web_sys::MouseEvent| {
-            if !menu_open.get_untracked() { return; }
-            if let Some(ref el) = outer
-                && let Some(target) = ev.target()
-            {
-                let target_node: web_sys::Node = target.unchecked_into();
-                if !el.contains(Some(&target_node)) {
-                    set_menu_open.set(false);
-                }
-            }
-        });
-        let _ = window.add_event_listener_with_callback(
-            "click",
-            cb.as_ref().unchecked_ref(),
-        );
-        let cb_cleanup = send_wrapper::SendWrapper::new(cb);
-        on_cleanup(move || {
-            let Some(window) = web_sys::window() else { return };
-            let cb = cb_cleanup.take();
-            let _ = window.remove_event_listener_with_callback(
-                "click",
-                cb.as_ref().unchecked_ref(),
-            );
-        });
-    });
-
     let display_name = name.clone();
     let leave_confirm_message = format!(
         "Are you sure you want to leave {}? You'll no longer see this team's issues.",
@@ -1057,7 +1027,7 @@ fn SidebarTeamSubNav(
     let team_id_for_leave = team_id.clone();
 
     view! {
-        <div class="mt-0.5 relative" node_ref=outer_ref>
+        <div class="mt-0.5">
             // Row wrapper — owns group hover for the entire row
             <div class="group flex items-center rounded-md hover:bg-[var(--color-sidebar-hover)] transition-colors">
                 // Left zone: expand/collapse + right-click context menu
@@ -1082,37 +1052,43 @@ fn SidebarTeamSubNav(
                 // Right zone: actions (hover-reveal)
                 <div class="flex items-center gap-1 pr-2 opacity-0 group-hover:opacity-100 transition-opacity">
                     <FavoriteToggle target_type="team" target_id=team_id.clone()/>
-                    <button
-                        class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors"
-                        on:click=move |_| set_menu_open.set(true)
-                        title="More actions"
-                    >
-                        <Icon icon=phosphor_leptos::DOTS_THREE weight=IconWeight::Bold size="14px"/>
-                    </button>
+                    <div node_ref=menu_trigger_ref>
+                        <button
+                            class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors"
+                            on:click=move |_| set_menu_open.set(true)
+                            title="More actions"
+                        >
+                            <Icon icon=phosphor_leptos::DOTS_THREE weight=IconWeight::Bold size="14px"/>
+                        </button>
+                    </div>
                 </div>
             </div>
 
-            // Context menu dropdown
-            <Show when=move || menu_open.get()>
-                <div class="absolute left-0 right-0 top-full mt-1 bg-popover border border-border rounded-lg shadow-lg py-1 z-50">
-                    <a
-                        href=settings_href_for_menu.clone()
-                        class="block w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
-                        on:click=move |_| set_menu_open.set(false)
-                    >
-                        "Settings"
-                    </a>
-                    <button
-                        class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
-                        on:click=move |_| {
-                            set_menu_open.set(false);
-                            set_show_leave_confirm.set(true);
-                        }
-                    >
-                        "Leave team"
-                    </button>
-                </div>
-            </Show>
+            // Context menu dropdown — portalled via Popover for positioning near trigger
+            <Popover
+                trigger_ref=menu_trigger_ref
+                open=Signal::derive(move || menu_open.get())
+                on_close=Callback::new(move |()| set_menu_open.set(false))
+                placement=Placement::BOTTOM_START
+                class="bg-popover border border-border rounded-lg shadow-lg py-1"
+            >
+                <a
+                    href=settings_href_for_menu.clone()
+                    class="block w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
+                    on:click=move |_| set_menu_open.set(false)
+                >
+                    "Settings"
+                </a>
+                <button
+                    class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
+                    on:click=move |_| {
+                        set_menu_open.set(false);
+                        set_show_leave_confirm.set(true);
+                    }
+                >
+                    "Leave team"
+                </button>
+            </Popover>
 
             // Indented sub-items — shown when expanded
             {move || is_expanded.get().then(|| {
