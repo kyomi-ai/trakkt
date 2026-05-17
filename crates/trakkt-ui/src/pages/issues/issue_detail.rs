@@ -310,7 +310,8 @@ fn IssueDetailContent(
          i.assignee_id.clone(), i.assignee_name.clone(),
          i.due_date.clone(),
          i.labels.clone(),
-         i.project_id.clone(), i.project_name.clone(), i.milestone_id.clone())
+         i.project_id.clone(), i.project_name.clone(), i.milestone_id.clone(),
+         i.estimate)
     });
 
     // Shared lightbox state for all editors (description, comments)
@@ -639,6 +640,42 @@ fn MetadataSidebar(
             on_change.run(());
         });
     };
+
+    // ── Estimate: look up team settings from SyncStore ────────────────
+    let issue_team_id = issue.team_id.clone();
+    let current_estimate = issue.estimate;
+    let team_settings: Signal<Option<trakkt_types::models::TeamSettings>> = Signal::derive({
+        let team_id = issue_team_id.clone();
+        move || {
+            sync_store
+                .and_then(|store| {
+                    store.teams().get().into_iter()
+                        .find(|t| t.team_id == team_id)
+                        .and_then(|t| t.settings.clone())
+                })
+        }
+    });
+    let estimates_enabled = Memo::new(move |_| team_settings.get().and_then(|s| s.estimate_scale).is_some());
+
+    // ── Estimate change handler ────────────────────────────────────────
+    let on_estimate_change = move |value: Option<i32>| {
+        let tk = stored_tk.get_value();
+        let is_clear = value.is_none();
+        leptos::task::spawn_local(async move {
+            let _ = update_issue(
+                tk,
+                number,
+                None, None, None, None, None, None, None, None, None,
+                if is_clear { None } else { value },
+                if is_clear { Some("estimate".to_string()) } else { None },
+            )
+            .await;
+            on_change.run(());
+        });
+    };
+
+    let (estimate_open, set_estimate_open) = signal(false);
+    let estimate_trigger_ref = NodeRef::<leptos::html::Div>::new();
 
     let status_variant = IssueStatusVariant::parse(&current_status_category);
     let (status_open, set_status_open) = signal(false);
@@ -1126,6 +1163,70 @@ fn MetadataSidebar(
                     placeholder="Set due date..."
                 />
             </div>
+
+            // ── Estimate (only when team has estimates enabled) ──────────
+            {move || {
+                if !estimates_enabled.get() {
+                    return None;
+                }
+                let settings = team_settings.get()?;
+                let scale = settings.estimate_scale.as_ref()?;
+                let options = scale.options(settings.estimate_extended, settings.estimate_allow_zero);
+                let stored_options = StoredValue::new(options);
+                let current = current_estimate;
+                let scale_for_label = scale.clone();
+                Some(view! {
+                    <div>
+                        <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Estimate"</div>
+                        <div node_ref=estimate_trigger_ref>
+                            <DropdownTrigger
+                                label="Estimate"
+                                value=Signal::derive(move || {
+                                    current.map(|v| scale_for_label.format_label(v))
+                                })
+                                icon=Arc::new(move || {
+                                    view! { <Icon icon=phosphor_leptos::GAUGE size="14px"/> }.into_any()
+                                }) as ChildrenFn
+                                on_click=Callback::new(move |()| set_estimate_open.update(|o| *o = !*o))
+                            />
+                        </div>
+                        <DropdownMenu
+                            trigger_ref=estimate_trigger_ref
+                            open=Signal::derive(move || estimate_open.get())
+                            on_close=Callback::new(move |()| set_estimate_open.set(false))
+                        >
+                            {move || {
+                                // "No estimate" option (clears the value)
+                                let none_item = view! {
+                                    <DropdownItem
+                                        label="No estimate".to_string()
+                                        selected=Signal::derive(move || current.is_none())
+                                        on_select=Callback::new(move |()| {
+                                            on_estimate_change(None);
+                                            set_estimate_open.set(false);
+                                        })
+                                    />
+                                };
+                                let option_items = stored_options.get_value().iter().map(|opt| {
+                                    let value = opt.value;
+                                    let label = opt.label.clone();
+                                    view! {
+                                        <DropdownItem
+                                            label=label
+                                            selected=Signal::derive(move || current == Some(value))
+                                            on_select=Callback::new(move |()| {
+                                                on_estimate_change(Some(value));
+                                                set_estimate_open.set(false);
+                                            })
+                                        />
+                                    }
+                                }).collect_view();
+                                view! { {none_item} {option_items} }
+                            }}
+                        </DropdownMenu>
+                    </div>
+                })
+            }}
 
             // ── Watch toggle ──────────────────────────────────────────────
             <WatchToggle team_key=issue_team_key.clone() number=number/>
