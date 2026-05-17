@@ -5,6 +5,7 @@
 use axum::extract::FromRef;
 use trakkt_auth::mcp_session_manager::MCPSessionManager;
 use trakkt_auth::middleware::AuthState;
+use trakkt_auth::stripe_service::StripeService;
 use trakkt_auth::websocket::WebSocketManager;
 use webauthn_rs::Webauthn;
 
@@ -19,6 +20,7 @@ pub struct AppState {
     pub webauthn: std::sync::Arc<Webauthn>,
     pub ws_manager: WebSocketManager,
     pub mcp_sessions: MCPSessionManager,
+    pub stripe: Option<StripeService>,
 }
 
 impl FromRef<AppState> for AuthState {
