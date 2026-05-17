@@ -5051,6 +5051,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "jsonwebtoken",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
