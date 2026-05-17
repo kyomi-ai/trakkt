@@ -25,7 +25,7 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 
 ### Error Handling
 - Never silently discard errors with `let _ =`. At minimum, log with `tracing::warn!`.
-- Never use `unwrap_or_default()` on deserialization (JSON parse, filter decode, etc.) — use `match` and log the error with `tracing::warn!`.
+- Never use `unwrap_or_default()` on serialization or deserialization (JSON parse, `to_value`, filter decode, etc.) — use `match` and log the error with `tracing::warn!`.
 - Service errors propagate as `trakkt_core::Error` variants.
 - Server function errors convert via `IntoServerFnError` trait.
 
