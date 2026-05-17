@@ -106,6 +106,14 @@ pub struct IssueWithDetails {
     pub created_at: String,
     pub updated_at: String,
     pub archived_at: Option<String>,
+    /// Whether this issue has any child issues (via `issue_relations` parent type).
+    pub has_children: bool,
+    /// Whether this issue is blocked by another issue (target of a `blocks` relation).
+    pub is_blocked: bool,
+    /// Whether this issue blocks another issue (source of a `blocks` relation).
+    pub is_blocking: bool,
+    /// Whether this issue has any relations at all (source or target).
+    pub has_relations: bool,
     pub labels: Vec<Label>,
 }
 
