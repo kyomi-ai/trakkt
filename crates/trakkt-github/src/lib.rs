@@ -8,6 +8,7 @@
 //! The client does NOT perform any database operations — callers handle
 //! token caching and persistence.
 
+pub mod events;
 pub mod patterns;
 pub mod schema;
 pub mod webhook;
