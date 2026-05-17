@@ -35,6 +35,9 @@ struct SyncStoreInner {
     notifications: ArcRwSignal<Vec<Notification>>,
     comments: ArcRwSignal<Vec<Comment>>,
     initialized: ArcRwSignal<bool>,
+    /// Version counter bumped when an activity sync action arrives.
+    /// Used by the timeline component to trigger a refetch.
+    activities_version: ArcRwSignal<u32>,
 }
 
 // ── Public handle ─────────────────────────────────────────────────────────────
@@ -74,6 +77,7 @@ impl SyncStore {
                 notifications: ArcRwSignal::new(Vec::new()),
                 comments: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
+                activities_version: ArcRwSignal::new(0),
             })),
         }
     }
@@ -141,6 +145,25 @@ impl SyncStore {
     pub fn initialized(&self) -> Signal<bool> {
         let sig = self.inner.with_value(|inner| inner.initialized.clone());
         Signal::derive(move || sig.get())
+    }
+
+    /// Version counter for activities — bumped on each activity sync action.
+    ///
+    /// The issue timeline component uses this as a reactive dependency to
+    /// trigger a refetch of activities from the server.
+    pub fn activities_version(&self) -> Signal<u32> {
+        let sig = self.inner.with_value(|inner| inner.activities_version.clone());
+        Signal::derive(move || sig.get())
+    }
+
+    /// Bump the activities version counter.
+    ///
+    /// Called by the sync engine when an "activity" entity type arrives via
+    /// WebSocket, signaling that the timeline should refetch.
+    pub fn bump_activities_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.activities_version.update(|v| *v += 1);
+        });
     }
 
     // ── Bulk setters (bootstrap / hydration) ─────────────────────────────────
@@ -419,6 +442,7 @@ impl SyncStore {
             inner.notifications.set(Vec::new());
             inner.comments.set(Vec::new());
             inner.initialized.set(false);
+            inner.activities_version.set(0);
         });
     }
 }
