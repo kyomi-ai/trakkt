@@ -39,6 +39,9 @@ async-trait = { workspace = true }
 rust-embed = "8"
 any_spawner = { version = "0.3", features = ["tokio"] }
 tokio-tungstenite = { version = "0.28", default-features = false }
+async-stripe-webhook = { workspace = true }
+async-stripe-shared = { workspace = true }
+async-stripe-types = { workspace = true }
 
 [dev-dependencies]
 trakkt-core = { workspace = true, features = ["test-helpers"] }
