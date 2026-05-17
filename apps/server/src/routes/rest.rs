@@ -249,7 +249,7 @@ async fn update_team_settings_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "teams:write")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage, state.github_client.as_deref(), Some(&*state.encryption_key), &state.config.frontend_url);
     params.team_key = Some(identifier);
     let result = teams::update_team_settings(&ctx, params).await?;
     Ok(Json(result))
