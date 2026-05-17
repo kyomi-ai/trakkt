@@ -3,6 +3,7 @@
 //! Shared UI components — no server-side dependencies.
 
 pub mod action_status;
+pub mod attachment_hooks;
 pub mod avatar;
 pub mod layout;
 pub mod alert;
@@ -19,6 +20,7 @@ pub mod input;
 pub mod issue_status_badge;
 pub mod label;
 pub mod label_badge;
+pub mod lightbox;
 pub mod modal;
 pub mod navigation_progress;
 pub mod popover;
@@ -36,6 +38,7 @@ pub mod toast;
 pub mod tooltip;
 
 pub use action_status::ActionStatus;
+pub use attachment_hooks::LightboxState;
 pub use alert::{Alert, AlertDescription, AlertTitle, AlertVariant};
 pub use avatar::{Avatar, AvatarSize};
 pub use badge::{Badge, BadgeVariant};
@@ -51,6 +54,7 @@ pub use input::INPUT_CLASS;
 pub use issue_status_badge::{IssueStatusBadge, IssueStatusVariant};
 pub use label::Label;
 pub use label_badge::LabelBadge;
+pub use lightbox::Lightbox;
 pub use modal::{Modal, ModalSize};
 pub use navigation_progress::NavigationProgress;
 pub use priority_indicator::PriorityIndicator;
