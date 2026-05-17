@@ -8,7 +8,14 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "ssr")]
-use super::{extract_auth, extract_context};
+use super::{extract_auth, extract_context, IntoServerFnError};
+
+/// Minimal row for fetching a workspace's subscription status (context only).
+#[cfg(feature = "ssr")]
+#[derive(Debug, sqlx::FromRow)]
+struct WorkspaceStatusRow {
+    subscription_status: Option<String>,
+}
 
 /// Combined user, workspace, and capability context.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,6 +30,7 @@ pub struct UserContext {
     pub is_personal_mode: bool,
     pub is_self_hosted: bool,
     pub billing_enabled: bool,
+    pub subscription_status: Option<String>,
     pub capabilities: HashMap<String, bool>,
 }
 
@@ -31,6 +39,26 @@ pub struct UserContext {
 pub async fn get_user_context() -> Result<UserContext, ServerFnError> {
     let auth = extract_auth().await?;
     let ctx = extract_context()?;
+
+    let billing_enabled = ctx.stripe.is_some();
+
+    // Load subscription status from the workspace if billing is enabled.
+    let subscription_status = if billing_enabled {
+        if let Some(ws_id) = auth.workspace.workspace_id.as_deref() {
+            let row: Option<WorkspaceStatusRow> = trakkt_core::db_fetch_optional!(
+                &ctx.db,
+                WorkspaceStatusRow,
+                "SELECT subscription_status FROM workspaces WHERE workspace_id = $1",
+                ws_id
+            )
+            .into_sfn()?;
+            row.and_then(|r| r.subscription_status)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     Ok(UserContext {
         user_id: auth.user_id,
@@ -47,7 +75,8 @@ pub async fn get_user_context() -> Result<UserContext, ServerFnError> {
         is_owner: auth.workspace.is_owner,
         is_personal_mode: ctx.config.is_personal(),
         is_self_hosted: ctx.config.self_hosted,
-        billing_enabled: false,
+        billing_enabled,
+        subscription_status,
         capabilities: HashMap::new(),
     })
 }

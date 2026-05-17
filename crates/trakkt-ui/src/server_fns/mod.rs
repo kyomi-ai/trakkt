@@ -4,6 +4,7 @@
 
 pub mod activities;
 pub mod auth;
+pub mod billing;
 pub mod comments;
 pub mod context;
 pub mod favorites;

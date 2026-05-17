@@ -61,6 +61,11 @@ pub struct Workspace {
     pub user_limit: Option<i32>,
     pub settings: Option<serde_json::Value>,
     pub default_team_id: Option<String>,
+    pub subscription_status: Option<String>,
+    pub stripe_customer_id: Option<String>,
+    pub stripe_subscription_id: Option<String>,
+    pub subscription_period_start: Option<DateTime<Utc>>,
+    pub subscription_period_end: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

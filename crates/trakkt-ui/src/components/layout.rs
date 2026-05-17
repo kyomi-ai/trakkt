@@ -15,8 +15,9 @@ use std::sync::Arc;
 
 use crate::cache::store::SyncStore;
 use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon};
-use crate::components::{Button, CommandPalette, ConfirmDialog, CreateIssueTrigger, Modal, ModalSize, SearchInput, Spinner, TeamIcon, INPUT_CLASS};
+use crate::components::{Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, Modal, ModalSize, SearchInput, Spinner, TeamIcon, INPUT_CLASS};
 use crate::components::popover::{Popover, Placement};
+use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
 
 /// Sidebar expand/collapse state shared across all `SidebarTeamSubNav` instances.
@@ -213,6 +214,7 @@ pub fn Layout() -> impl IntoView {
                             <span class="text-sm font-bold text-foreground">"Trakkt"</span>
                         </a>
                     </div>
+                    <BillingBanner/>
                     <main class="flex-1 overflow-y-auto">
                         <Outlet/>
                     </main>
@@ -1251,5 +1253,77 @@ fn SidebarNavItem(
             <Icon icon=icon weight=weight size="18px"/>
             {label}
         </a>
+    }
+}
+
+/// Persistent banner shown when the workspace subscription is past due.
+///
+/// Reads the `UserContext` resource provided by the `App` component. Only
+/// visible to workspace owners when `subscription_status == "past_due"`.
+/// Clicking the link opens the Stripe billing portal.
+#[component]
+fn BillingBanner() -> impl IntoView {
+    let user_ctx = expect_context::<LocalResource<Result<UserContext, ServerFnError>>>();
+
+    let should_show = Signal::derive(move || {
+        user_ctx
+            .get()
+            .and_then(|r| r.ok())
+            .map(|ctx| {
+                ctx.is_owner
+                    && ctx.billing_enabled
+                    && ctx.subscription_status.as_deref() == Some("past_due")
+            })
+            .unwrap_or(false)
+    });
+
+    let (portal_loading, set_portal_loading) = signal(false);
+
+    let on_fix_click = move |_: web_sys::MouseEvent| {
+        if portal_loading.get_untracked() {
+            return;
+        }
+        set_portal_loading.set(true);
+        leptos::task::spawn_local(async move {
+            match crate::server_fns::billing::create_billing_portal_session().await {
+                Ok(url) => {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        if let Some(window) = web_sys::window() {
+                            let _ = window.location().set_href(&url);
+                        }
+                    }
+                    let _ = url;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create billing portal session: {e}");
+                    set_portal_loading.set(false);
+                }
+            }
+        });
+    };
+
+    view! {
+        <Show when=move || should_show.get()>
+            <div class="bg-warning/10 border-b border-warning/30 px-4 py-2.5 flex items-center justify-between gap-3">
+                <div class="flex items-center gap-2 text-sm text-warning-foreground">
+                    <Icon icon=phosphor_leptos::WARNING weight=IconWeight::Fill size="16px" attr:class="flex-shrink-0"/>
+                    <span>"Payment failed \u{2014} team invites are paused."</span>
+                </div>
+                <Button
+                    variant=ButtonVariant::Ghost
+                    size=ButtonSize::Sm
+                    on:click=on_fix_click
+                >
+                    {move || {
+                        if portal_loading.get() {
+                            "Opening...".to_string()
+                        } else {
+                            "Update payment method \u{2192}".to_string()
+                        }
+                    }}
+                </Button>
+            </div>
+        </Show>
     }
 }
