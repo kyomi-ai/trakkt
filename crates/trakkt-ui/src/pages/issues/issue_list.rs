@@ -855,9 +855,9 @@ fn IssueListInner(
                                 } else {
                                     // Normal tab: name + "..." button on hover + optional dropdown
                                     let active_class = if is_active {
-                                        "inline-flex items-center gap-1 group relative px-3 py-1 text-[13px] font-medium rounded-md transition-colors bg-secondary text-foreground"
+                                        "inline-flex items-center gap-1 group relative px-3 py-1 text-[13px] font-medium rounded-md transition-colors bg-secondary text-foreground cursor-pointer"
                                     } else {
-                                        "inline-flex items-center gap-1 group relative px-3 py-1 text-[13px] font-medium rounded-md transition-colors text-muted-foreground hover:text-foreground hover:bg-secondary/50"
+                                        "inline-flex items-center gap-1 group relative px-3 py-1 text-[13px] font-medium rounded-md transition-colors text-muted-foreground hover:text-foreground hover:bg-secondary/50 cursor-pointer"
                                     };
 
                                     let vid_dots = view_id.clone();
