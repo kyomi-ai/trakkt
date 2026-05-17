@@ -58,6 +58,14 @@ url = "2"
 
 # Hashing
 sha2 = "0.10"
+hmac = "0.12"
+
+# Constant-time comparison
+subtle = "2"
+
+# Hex encoding
+hex = "0.4"
+
 # Random
 rand = "0.9"
 

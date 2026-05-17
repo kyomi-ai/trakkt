@@ -254,6 +254,21 @@ pub async fn suspend_installation(
     Ok(())
 }
 
+/// Update the target_repos JSONB for an installation.
+pub async fn update_installation_repos(
+    db: &DbPool,
+    installation_id: &str,
+    target_repos: Option<&serde_json::Value>,
+) -> trakkt_core::Result<()> {
+    let target_repos_json = target_repos.map(|v| v.to_string());
+    trakkt_core::db_execute!(
+        db,
+        "UPDATE github_installations SET target_repos = $1 WHERE installation_id = $2",
+        &target_repos_json, installation_id
+    )?;
+    Ok(())
+}
+
 /// Clear the suspended status of an installation.
 pub async fn unsuspend_installation(
     db: &DbPool,
