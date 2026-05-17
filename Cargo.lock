@@ -5045,6 +5045,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "trakkt-github"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "jsonwebtoken",
+ "rand_core 0.6.4",
+ "regex",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "trakkt-auth",
+ "trakkt-core",
+ "uuid",
+]
+
+[[package]]
 name = "trakkt-server"
 version = "0.1.0"
 dependencies = [
