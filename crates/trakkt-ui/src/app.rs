@@ -30,6 +30,7 @@ use crate::pages::projects::project_detail::ProjectDetailPage;
 use crate::pages::projects::project_list::ProjectListPage;
 use crate::pages::github_callback::GitHubCallbackPage;
 use crate::pages::settings::{
+    billing::BillingPage,
     integrations::IntegrationsPage,
     labels::LabelsPage,
     profile::ProfilePage,
@@ -157,6 +158,7 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/labels") view=LabelsPage/>
                         <Route path=path!("/teams") view=TeamsSettingsPage/>
                         <Route path=path!("/integrations") view=IntegrationsPage/>
+                        <Route path=path!("/billing") view=BillingPage/>
                     </ParentRoute>
                 </ParentRoute>
             </Routes>

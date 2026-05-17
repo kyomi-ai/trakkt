@@ -10,8 +10,8 @@ use std::sync::Arc;
 use leptos::prelude::*;
 
 use crate::components::{
-    Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, Button, ButtonSize,
-    ButtonVariant, ConfirmDialog, EmptyState, Modal, ModalSize, Skeleton, INPUT_CLASS,
+    Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, Button, ButtonLink,
+    ButtonSize, ButtonVariant, ConfirmDialog, EmptyState, Modal, ModalSize, Skeleton, INPUT_CLASS,
 };
 use crate::components::select::DynSelect;
 use crate::server_fns::context::UserContext;
@@ -517,7 +517,9 @@ fn TeamPageInner() -> impl IntoView {
                 </Transition>
             </div>
 
-            // Invite Member Modal
+            // Invite Member Modal — gates on billing status when billing is enabled.
+            // If billing is enabled but subscription is not active/trialing,
+            // show a billing gate message instead of the invite form.
             <Modal
                 show=Signal::from(show_invite_modal)
                 on_close=on_close_modal
@@ -525,45 +527,84 @@ fn TeamPageInner() -> impl IntoView {
                 size=ModalSize::Md
                 footer=modal_footer.clone()
             >
-                <div class="space-y-4">
-                    <div>
-                        <label class="block text-sm font-medium text-foreground mb-1">
-                            "Email Address"
-                        </label>
-                        <input
-                            type="email"
-                            class=INPUT_CLASS
-                            placeholder="colleague@example.com"
-                            prop:value=invite_email
-                            on:input=move |ev| set_invite_email.set(event_target_value(&ev))
-                        />
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-foreground mb-1">
-                            "Role"
-                        </label>
-                        <crate::components::StyledSelect
-                            value=invite_role.get_untracked()
-                            options=vec![
-                                ("user", "User - Full feature access"),
-                                ("admin", "Admin - Can manage workspace settings"),
-                            ]
-                            on_change=move |val| set_invite_role.set(val)
-                        />
-                    </div>
-
-                    // Show invite action error
-                    {move || {
-                        invite_action.value().get().and_then(|r| r.err()).map(|e| {
-                            let msg = e.to_string();
-                            view! {
-                                <crate::components::Alert variant=crate::components::AlertVariant::Error>
-                                    <crate::components::AlertDescription>{msg}</crate::components::AlertDescription>
-                                </crate::components::Alert>
-                            }
+                {move || {
+                    let needs_billing = user_ctx.get()
+                        .and_then(|r| r.ok())
+                        .map(|ctx| {
+                            ctx.billing_enabled
+                                && !matches!(
+                                    ctx.subscription_status.as_deref(),
+                                    Some("active") | Some("trialing")
+                                )
                         })
-                    }}
-                </div>
+                        .unwrap_or(false);
+
+                    if needs_billing {
+                        view! {
+                            <div class="space-y-4 text-center py-4">
+                                <div class="w-16 h-16 mx-auto rounded-full bg-muted flex items-center justify-center">
+                                    <phosphor_leptos::Icon icon=phosphor_leptos::CREDIT_CARD weight=phosphor_leptos::IconWeight::Duotone size="32px" attr:class="text-muted-foreground"/>
+                                </div>
+                                <div class="space-y-2">
+                                    <h3 class="text-base font-semibold text-foreground">
+                                        "Billing required"
+                                    </h3>
+                                    <p class="text-sm text-muted-foreground">
+                                        "To invite team members, set up billing first."
+                                    </p>
+                                </div>
+                                <ButtonLink
+                                    href="/settings/billing"
+                                    variant=ButtonVariant::Default
+                                >
+                                    "Set Up Billing"
+                                </ButtonLink>
+                            </div>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-foreground mb-1">
+                                        "Email Address"
+                                    </label>
+                                    <input
+                                        type="email"
+                                        class=INPUT_CLASS
+                                        placeholder="colleague@example.com"
+                                        prop:value=invite_email
+                                        on:input=move |ev| set_invite_email.set(event_target_value(&ev))
+                                    />
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-foreground mb-1">
+                                        "Role"
+                                    </label>
+                                    <crate::components::StyledSelect
+                                        value=invite_role.get_untracked()
+                                        options=vec![
+                                            ("user", "User - Full feature access"),
+                                            ("admin", "Admin - Can manage workspace settings"),
+                                        ]
+                                        on_change=move |val| set_invite_role.set(val)
+                                    />
+                                </div>
+
+                                // Show invite action error
+                                {move || {
+                                    invite_action.value().get().and_then(|r| r.err()).map(|e| {
+                                        let msg = e.to_string();
+                                        view! {
+                                            <crate::components::Alert variant=crate::components::AlertVariant::Error>
+                                                <crate::components::AlertDescription>{msg}</crate::components::AlertDescription>
+                                            </crate::components::Alert>
+                                        }
+                                    })
+                                }}
+                            </div>
+                        }.into_any()
+                    }
+                }}
             </Modal>
 
             // Confirm Dialog
