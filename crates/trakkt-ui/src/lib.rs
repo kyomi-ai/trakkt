@@ -143,4 +143,14 @@ pub fn register_server_functions() {
     register_explicit::<GetGithubIntegrationStatus>();
     register_explicit::<ProcessGithubCallback>();
     register_explicit::<DisconnectGithub>();
+
+    // Billing
+    use server_fns::billing::*;
+    register_explicit::<GetBillingInfo>();
+    register_explicit::<CreateCheckout>();
+    register_explicit::<CancelBillingSubscription>();
+    register_explicit::<ReactivateBillingSubscription>();
+    register_explicit::<CreateBillingPortalSession>();
+    register_explicit::<GetBillingInvoices>();
+    register_explicit::<GetStripePublishableKey>();
 }

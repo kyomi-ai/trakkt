@@ -40,6 +40,47 @@ pub async fn get_billable_user_count(db: &DbPool, workspace_id: &str) -> trakkt_
     Ok(count)
 }
 
+// ─── Customer management ──────────────────────────────────────────────────
+
+/// Ensure a Stripe customer exists for the workspace, creating one if needed.
+///
+/// Returns the Stripe customer ID. If one already exists in the database,
+/// returns it directly. Otherwise creates a new customer via Stripe API
+/// and persists the ID.
+pub async fn ensure_customer_exists(
+    db: &DbPool,
+    stripe: &StripeService,
+    workspace_id: &str,
+    email: &str,
+    workspace_name: &str,
+) -> trakkt_core::Result<String> {
+    #[derive(sqlx::FromRow)]
+    struct CustRow { stripe_customer_id: Option<String> }
+
+    let row = trakkt_core::db_fetch_one!(
+        db, CustRow,
+        "SELECT stripe_customer_id FROM workspaces WHERE workspace_id = $1",
+        workspace_id
+    )?;
+
+    if let Some(existing) = row.stripe_customer_id {
+        return Ok(existing);
+    }
+
+    let new_id = stripe.create_customer(email, workspace_id, workspace_name)
+        .await
+        .map_err(|e| trakkt_core::Error::Internal(format!("Stripe customer creation failed: {e}")))?;
+
+    let is_pg = db.is_postgres();
+    let now = sql_compat::now(is_pg);
+    let sql = format!(
+        "UPDATE workspaces SET stripe_customer_id = $1, updated_at = {now} WHERE workspace_id = $2"
+    );
+    trakkt_core::db_execute!(db, &sql, &new_id, workspace_id)?;
+
+    Ok(new_id)
+}
+
 // ─── Seat sync ─────────────────────────────────────────────────────────────
 
 /// Minimal row for fetching a workspace's Stripe subscription ID.
