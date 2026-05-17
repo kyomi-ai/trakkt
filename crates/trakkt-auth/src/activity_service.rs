@@ -7,9 +7,11 @@
 //! provides a convenient API for recording individual actions or diffing
 //! entire issue snapshots to detect all changes at once.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
-use trakkt_types::models::IssueActivity;
+use trakkt_types::models::{IssueActivity, IssueWithDetails};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
@@ -80,6 +82,48 @@ pub struct IssueSnapshot {
     pub parent_identifier: Option<String>,
     pub due_date: Option<String>,
     pub labels: Vec<SnapshotLabel>,
+}
+
+impl IssueSnapshot {
+    /// Build a snapshot from an `IssueWithDetails` struct returned by `get_issue`
+    /// or `get_issue_by_id`. Fields not available on the detail struct (estimate,
+    /// milestone_name, parent_issue_id) default to `None`.
+    pub fn from_issue_with_details(issue: &IssueWithDetails) -> Self {
+        let description_hash = issue.description.as_ref().map(|d| {
+            let mut h = DefaultHasher::new();
+            d.hash(&mut h);
+            h.finish()
+        });
+
+        let labels = issue
+            .labels
+            .iter()
+            .map(|l| SnapshotLabel {
+                label_id: l.label_id.clone(),
+                name: l.name.clone(),
+                color: l.color.clone(),
+            })
+            .collect();
+
+        Self {
+            status_id: issue.status_id.clone(),
+            status_name: issue.status_name.clone(),
+            priority: issue.priority,
+            assignee_id: issue.assignee_id.clone(),
+            assignee_name: issue.assignee_name.clone(),
+            title: issue.title.clone(),
+            description_hash,
+            estimate: None,
+            project_id: issue.project_id.clone(),
+            project_name: issue.project_name.clone(),
+            milestone_id: issue.milestone_id.clone(),
+            milestone_name: None,
+            parent_issue_id: None,
+            parent_identifier: issue.parent_identifier.clone(),
+            due_date: issue.due_date.clone(),
+            labels,
+        }
+    }
 }
 
 // ─── Priority helper ─────────────────────────────────────────────────────────
@@ -304,11 +348,12 @@ impl<'a> ActivityRecorder<'a> {
             .await?;
         }
 
-        // Parent issue
-        if before.parent_issue_id != after.parent_issue_id {
+        // Parent issue — compare by identifier since IssueWithDetails
+        // doesn't expose parent_issue_id directly
+        if before.parent_identifier != after.parent_identifier {
             let meta = serde_json::json!({
-                "old_parent_issue_id": before.parent_issue_id,
-                "new_parent_issue_id": after.parent_issue_id,
+                "old_parent_identifier": before.parent_identifier,
+                "new_parent_identifier": after.parent_identifier,
             });
             self.insert_activity(
                 issue_id,

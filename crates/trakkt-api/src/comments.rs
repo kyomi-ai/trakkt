@@ -7,7 +7,9 @@
 //! tool handlers in `routes/mcp.rs` to eliminate duplication.
 
 use axum::http::Method;
+use serde_json::json;
 
+use trakkt_auth::activity_service::ActivityRecorder;
 use trakkt_auth::{comment_service, issue_service};
 use trakkt_types::api::AddCommentApiParams;
 
@@ -45,6 +47,13 @@ pub async fn add_comment(
         ctx.ws_manager,
     )
     .await?;
+
+    // Record activity — never fails the mutation.
+    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+    let meta = json!({ "comment_id": comment.comment_id });
+    if let Err(e) = recorder.record(&issue.issue_id, "comment_added", Some(&meta)).await {
+        tracing::warn!(issue_id = %issue.issue_id, "Failed to record comment activity: {e}");
+    }
 
     Ok(serde_json::to_value(&comment)?)
 }
