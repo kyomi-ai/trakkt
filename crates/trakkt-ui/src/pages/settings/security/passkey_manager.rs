@@ -24,48 +24,11 @@ use crate::server_fns::security::{
 };
 #[cfg(target_arch = "wasm32")]
 use crate::server_fns::security::{complete_passkey_registration, start_passkey_registration};
-
-/// Format an RFC 3339 date string as "Mon DD, YYYY".
-///
-/// Uses JS `Date.toLocaleDateString()` on the client (matches React exactly),
-/// and falls back to a truncated ISO string on the server.
-fn format_date(date_str: &str) -> String {
-    #[cfg(target_arch = "wasm32")]
-    {
-        use js_sys::{Date, Intl, Object, Reflect};
-        use wasm_bindgen::JsValue;
-
-        let date = Date::new(&JsValue::from_str(date_str));
-        if date.get_time().is_nan() {
-            return "Unknown".to_string();
-        }
-
-        let options = Object::new();
-        let _ = Reflect::set(&options, &"month".into(), &"short".into());
-        let _ = Reflect::set(&options, &"day".into(), &"numeric".into());
-        let _ = Reflect::set(&options, &"year".into(), &"numeric".into());
-
-        let locale = js_sys::Array::of1(&"en-US".into());
-        let formatter = Intl::DateTimeFormat::new(&locale, &options);
-        let format_fn = formatter.format();
-        format_fn
-            .call1(&wasm_bindgen::JsValue::NULL, &date)
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_else(|| "Unknown".to_string())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        date_str
-            .get(..10)
-            .unwrap_or("Unknown")
-            .to_string()
-    }
-}
+use crate::utils::date::format_date_locale;
 
 /// Format an RFC 3339 date string as a relative time (e.g. "5 min ago", "2 days ago").
 ///
-/// Falls back to `format_date()` for dates older than 7 days.
+/// Falls back to `format_date_locale()` for dates older than 7 days.
 fn format_relative_time(date_str: &str) -> String {
     #[cfg(target_arch = "wasm32")]
     {
@@ -100,12 +63,12 @@ fn format_relative_time(date_str: &str) -> String {
                 format!("{diff_days} days ago")
             }
         } else {
-            format_date(date_str)
+            format_date_locale(date_str)
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        format_date(date_str)
+        format_date_locale(date_str)
     }
 }
 
@@ -883,7 +846,7 @@ fn PasskeyRow(
     let created = passkey
         .created_at
         .as_deref()
-        .map(format_date)
+        .map(format_date_locale)
         .unwrap_or_else(|| "Unknown".to_string());
     let last_used = passkey
         .last_used

@@ -7,6 +7,7 @@
 
 use leptos::prelude::*;
 
+use super::api_key_manager::ApiKeyManager;
 use super::password_manager::PasswordManager;
 use super::two_factor_auth::TwoFactorAuth;
 use super::session_management::SessionManagement;
@@ -26,6 +27,7 @@ pub fn SecurityTab() -> impl IntoView {
                 <TwoFactorAuth/>
                 <PasskeyManager/>
                 <SessionManagement/>
+                <ApiKeyManager/>
             </div>
         </div>
     }

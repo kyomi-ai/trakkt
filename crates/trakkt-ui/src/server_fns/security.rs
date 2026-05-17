@@ -551,3 +551,147 @@ pub async fn rename_passkey(
     Ok("Passkey renamed successfully".to_string())
 }
 
+// ---------------------------------------------------------------------------
+// API Key management server functions
+// ---------------------------------------------------------------------------
+
+/// API key entry for the list view (no sensitive data).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApiKeyEntry {
+    pub token_id: String,
+    pub name: String,
+    pub token_prefix: Option<String>,
+    pub scopes: Vec<String>,
+    pub active: bool,
+    pub created_at: String,
+    pub last_used: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// Result of creating a new API key (includes the plaintext, shown once).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateApiKeyResult {
+    pub token_id: String,
+    pub token: String,
+}
+
+/// List all API keys for the authenticated user.
+#[server(prefix = "/leptos-api")]
+pub async fn list_api_keys() -> Result<Vec<ApiKeyEntry>, ServerFnError> {
+    let auth = extract_auth().await?;
+    let ctx = extract_context()?;
+
+    let tokens = trakkt_auth::user_service::get_user_api_tokens(&ctx.db, &auth.user_id)
+        .await
+        .into_sfn()?;
+
+    let entries = tokens
+        .into_iter()
+        .map(|t| {
+            let scopes: Vec<String> = match t.scopes.as_deref() {
+                Some(s) if !s.is_empty() => match serde_json::from_str(s) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, token_id = %t.token_id, "api_token has malformed scopes JSON");
+                        vec![]
+                    }
+                },
+                _ => vec![],
+            };
+            ApiKeyEntry {
+                token_id: t.token_id,
+                name: t.name,
+                token_prefix: t.token_prefix,
+                scopes,
+                active: t.active,
+                created_at: t.created_at.to_rfc3339(),
+                last_used: t.last_used.map(|dt| dt.to_rfc3339()),
+                expires_at: t.expires_at.map(|dt| dt.to_rfc3339()),
+            }
+        })
+        .collect();
+
+    Ok(entries)
+}
+
+/// Create a new API key for the authenticated user.
+///
+/// `scopes` is a comma-separated string (e.g. "issues:read,issues:write")
+/// because server functions do not support `Vec<String>` inputs via URL encoding.
+#[server(prefix = "/leptos-api")]
+pub async fn create_api_key(
+    name: String,
+    scopes: String,
+    expires_days: Option<i32>,
+) -> Result<CreateApiKeyResult, ServerFnError> {
+    let auth = extract_auth().await?;
+    let ctx = extract_context()?;
+
+    let trimmed_name = name.trim().to_string();
+    if trimmed_name.is_empty() {
+        return Err(ServerFnError::new("API key name cannot be empty"));
+    }
+    if trimmed_name.len() > 100 {
+        return Err(ServerFnError::new("API key name cannot exceed 100 characters"));
+    }
+
+    let workspace_id = super::workspace_id(&auth)?;
+
+    // Parse comma-separated scopes into a Vec
+    let scope_list: Vec<String> = scopes
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Validate scopes against the known set
+    const VALID_SCOPES: &[&str] = &[
+        "issues:read", "issues:write", "comments:write",
+        "labels:read", "labels:write", "teams:read",
+        "projects:read", "projects:write",
+    ];
+    for scope in &scope_list {
+        if !VALID_SCOPES.contains(&scope.as_str()) {
+            return Err(ServerFnError::new(format!("Invalid scope: {scope}")));
+        }
+    }
+
+    let (token_id, token_plaintext) = trakkt_auth::user_service::create_api_token(
+        &ctx.db,
+        &auth.user_id,
+        &trimmed_name,
+        workspace_id,
+        &scope_list,
+        expires_days,
+        &auth.user_id,
+    )
+    .await
+    .into_sfn()?;
+
+    Ok(CreateApiKeyResult {
+        token_id,
+        token: token_plaintext,
+    })
+}
+
+/// Revoke an API key by token ID.
+#[server(prefix = "/leptos-api")]
+pub async fn revoke_api_key(token_id: String) -> Result<String, ServerFnError> {
+    let auth = extract_auth().await?;
+    let ctx = extract_context()?;
+
+    let revoked = trakkt_auth::user_service::revoke_api_token(
+        &ctx.db,
+        &token_id,
+        &auth.user_id,
+    )
+    .await
+    .into_sfn()?;
+
+    if !revoked {
+        return Err(ServerFnError::new("API key not found or already revoked"));
+    }
+
+    Ok("API key revoked successfully".to_string())
+}
+

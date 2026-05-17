@@ -2,6 +2,7 @@
 
 //! Security settings sub-components.
 
+pub mod api_key_manager;
 pub mod passkey_manager;
 pub mod password_manager;
 pub mod security_tab;

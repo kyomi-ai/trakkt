@@ -733,6 +733,8 @@ pub async fn create_api_token(
     pool: &DbPool,
     user_id: &str,
     name: &str,
+    workspace_id: &str,
+    scopes: &[String],
     expires_days: Option<i32>,
     created_by: &str,
 ) -> trakkt_core::Result<(String, String)> {
@@ -748,15 +750,21 @@ pub async fn create_api_token(
         chrono::Utc::now() + chrono::Duration::days(days as i64)
     });
 
+    // Store the first 12 chars as a recognizable prefix (e.g. "trakkt-abcd...")
+    let token_prefix = token_plaintext.get(..12).unwrap_or(&token_plaintext).to_string();
+
+    let scopes_json = serde_json::to_string(scopes)
+        .map_err(|e| trakkt_core::Error::Internal(format!("JSON serialization failed: {e}")))?;
+
     let is_pg = pool.is_postgres();
     let bt = sql_compat::bool_true(is_pg);
     let sql = format!(
-        "INSERT INTO api_tokens (token_id, user_id, name, token_hash, active, expires_at, created_by) \
-         VALUES ($1, $2, $3, $4, {bt}, $5, $6)"
+        "INSERT INTO api_tokens (token_id, user_id, name, token_hash, active, expires_at, created_by, workspace_id, token_prefix, scopes) \
+         VALUES ($1, $2, $3, $4, {bt}, $5, $6, $7, $8, $9)"
     );
     trakkt_core::db_execute!(
         pool, &sql,
-        &token_id, user_id, name, &token_hash, &expires_at, created_by
+        &token_id, user_id, name, &token_hash, &expires_at, created_by, workspace_id, &token_prefix, &scopes_json
     )?;
 
     Ok((token_id, token_plaintext))
