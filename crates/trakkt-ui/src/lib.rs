@@ -137,4 +137,10 @@ pub fn register_server_functions() {
     register_explicit::<ListTeams>();
     register_explicit::<CreateTeam>();
     register_explicit::<GetDefaultTeam>();
+
+    // GitHub integration
+    use server_fns::github::*;
+    register_explicit::<GetGithubIntegrationStatus>();
+    register_explicit::<ProcessGithubCallback>();
+    register_explicit::<DisconnectGithub>();
 }

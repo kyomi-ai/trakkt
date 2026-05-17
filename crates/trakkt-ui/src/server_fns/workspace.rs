@@ -15,22 +15,8 @@ use crate::types::WorkspaceSettingsData;
 // Helpers (server-only)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Reject non-workspace-admin users.
-///
-/// Mirrors `require_workspace_admin()` in `apps/server/src/routes/workspaces.rs`.
 #[cfg(feature = "ssr")]
-fn require_workspace_admin(
-    auth: &trakkt_auth::middleware::AuthUser,
-) -> Result<(), ServerFnError> {
-    if !auth
-        .workspace
-        .workspace_roles
-        .contains(&trakkt_core::enums::WorkspaceRole::WorkspaceAdmin)
-    {
-        return Err(ServerFnError::new("Workspace admin access required"));
-    }
-    Ok(())
-}
+use super::require_workspace_admin;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Read operations

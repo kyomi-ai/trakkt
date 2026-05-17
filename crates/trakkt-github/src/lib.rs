@@ -27,6 +27,42 @@ pub struct InstallationToken {
     pub expires_at: String,
 }
 
+/// Installation details returned by GitHub's App API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubInstallationDetails {
+    pub id: u64,
+    pub account: GitHubAccount,
+    pub app_id: u64,
+    pub target_type: String,
+    pub permissions: serde_json::Value,
+    pub events: Vec<String>,
+    pub repository_selection: String,
+    pub suspended_at: Option<String>,
+}
+
+/// A GitHub account (organization or user) that installed the App.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubAccount {
+    pub login: String,
+    #[serde(rename = "type")]
+    pub account_type: String,
+    pub avatar_url: Option<String>,
+}
+
+/// A GitHub repository accessible to an installation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubRepository {
+    pub full_name: String,
+    pub name: String,
+    pub private: bool,
+}
+
+/// Wrapper for the paginated list-repos endpoint response.
+#[derive(Debug, Clone, Deserialize)]
+struct ListReposResponse {
+    pub repositories: Vec<GitHubRepository>,
+}
+
 /// A GitHub pull request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PullRequest {
@@ -247,6 +283,68 @@ impl GitHubClient {
             .json::<PullRequest>()
             .await
             .map_err(|e| Error::Internal(format!("failed to parse pull request response: {e}")))
+    }
+
+    /// Get installation details from GitHub (requires App JWT auth).
+    pub async fn get_installation_details(
+        &self,
+        installation_id: u64,
+    ) -> trakkt_core::Result<GitHubInstallationDetails> {
+        let jwt = self.app_jwt()?;
+        let url = format!("{GITHUB_API_BASE}/app/installations/{installation_id}");
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("Authorization", format!("Bearer {jwt}"))
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("GitHub API request failed: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(map_github_error(status.as_u16(), &url, response).await);
+        }
+
+        response
+            .json::<GitHubInstallationDetails>()
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "failed to parse installation details response: {e}"
+                ))
+            })
+    }
+
+    /// List accessible repositories for an installation (requires installation token).
+    pub async fn list_installation_repos(
+        &self,
+        token: &str,
+    ) -> trakkt_core::Result<Vec<GitHubRepository>> {
+        let url = format!("{GITHUB_API_BASE}/installation/repositories?per_page=100");
+
+        let response = self
+            .http
+            .get(&url)
+            .headers(api_headers(token))
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("GitHub API request failed: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(map_github_error(status.as_u16(), &url, response).await);
+        }
+
+        let parsed: ListReposResponse = response.json().await.map_err(|e| {
+            Error::Internal(format!(
+                "failed to parse installation repos response: {e}"
+            ))
+        })?;
+
+        Ok(parsed.repositories)
     }
 
     /// Accessor for the app name (used in User-Agent).

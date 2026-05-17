@@ -41,6 +41,7 @@ const TABS: &[SettingsTab] = &[
     SettingsTab { id: "team", name: "Team", icon: phosphor_leptos::USERS, path: "team" },
     SettingsTab { id: "labels", name: "Labels", icon: phosphor_leptos::TAG, path: "labels" },
     SettingsTab { id: "teams", name: "Teams", icon: phosphor_leptos::USERS_FOUR, path: "teams" },
+    SettingsTab { id: "integrations", name: "Integrations", icon: phosphor_leptos::PLUGS_CONNECTED, path: "integrations" },
 ];
 
 /// Return the list of tab IDs that should be visible for the given user context.
@@ -68,6 +69,10 @@ fn visible_tabs(ctx: &UserContext) -> Vec<&'static str> {
     // Labels and teams are always visible — even personal mode needs them
     tabs.push("labels");
     tabs.push("teams");
+
+    if is_admin && !ctx.is_personal_mode {
+        tabs.push("integrations");
+    }
 
     tabs
 }

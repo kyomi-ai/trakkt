@@ -220,6 +220,10 @@ pub fn ButtonLink(
     class: String,
     #[prop(optional, into)]
     aria_label: Option<String>,
+    #[prop(optional)]
+    target: Option<&'static str>,
+    #[prop(optional)]
+    rel: Option<&'static str>,
     children: Children,
 ) -> impl IntoView {
     let classes = format!(
@@ -231,7 +235,7 @@ pub fn ButtonLink(
     );
 
     view! {
-        <a href=href class=classes aria-label=aria_label.clone() title=aria_label>
+        <a href=href class=classes aria-label=aria_label.clone() title=aria_label target=target rel=rel>
             {children()}
         </a>
     }
