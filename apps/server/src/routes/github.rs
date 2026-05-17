@@ -402,10 +402,10 @@ async fn handle_installation_repos_changed(
 /// then falls back to the `webhook_secret_encrypted` field in `github_apps`.
 async fn resolve_webhook_secret(state: &AppState) -> Option<String> {
     // Prefer environment variable for self-hosted simplicity
-    if let Ok(secret) = std::env::var("GITHUB_WEBHOOK_SECRET") {
-        if !secret.is_empty() {
-            return Some(secret);
-        }
+    if let Ok(secret) = std::env::var("GITHUB_WEBHOOK_SECRET")
+        && !secret.is_empty()
+    {
+        return Some(secret);
     }
 
     // Fall back to database-stored app config
