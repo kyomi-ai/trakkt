@@ -71,6 +71,7 @@ pub struct Issue {
     pub due_date: Option<String>,
     pub project_id: Option<String>,
     pub milestone_id: Option<String>,
+    pub estimate: Option<i32>,
     pub sort_order: Option<f64>,
     pub created_at: String,
     pub updated_at: String,
@@ -98,6 +99,7 @@ pub struct IssueWithDetails {
     pub project_id: Option<String>,
     pub project_name: Option<String>,
     pub milestone_id: Option<String>,
+    pub estimate: Option<i32>,
     /// The parent issue's identifier (e.g. "ENG-42"), derived from a subquery
     /// on the `issue_relations` table. `None` if this issue has no parent.
     pub parent_identifier: Option<String>,
@@ -277,6 +279,7 @@ pub struct CreateIssueParams {
     pub label_ids: Vec<String>,
     pub project_id: Option<String>,
     pub milestone_id: Option<String>,
+    pub estimate: Option<i32>,
 }
 
 /// Fields that can be updated on an issue.
@@ -295,6 +298,7 @@ pub struct IssueUpdate {
     pub due_date: Option<Option<String>>,
     pub project_id: Option<Option<String>>,
     pub milestone_id: Option<Option<String>>,
+    pub estimate: Option<Option<i32>>,
     pub sort_order: Option<Option<f64>>,
     pub team_id: Option<String>,
 }
@@ -339,11 +343,136 @@ pub struct IssueActivity {
     pub created_at: String,
 }
 
+// ─── Estimate types ────────────────────────────────────────────────────────
+
+/// The scale used for issue point estimation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateScale {
+    Exponential,
+    Fibonacci,
+    Linear,
+    TShirt,
+}
+
+/// A single option in an estimate scale (value + display label).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EstimateOption {
+    pub value: i32,
+    pub label: String,
+}
+
+impl EstimateScale {
+    /// Generate the list of estimate options for this scale.
+    ///
+    /// - `extended`: include the extended range (larger values).
+    /// - `allow_zero`: prepend a "No estimate" option with value 0.
+    pub fn options(&self, extended: bool, allow_zero: bool) -> Vec<EstimateOption> {
+        let mut opts = Vec::new();
+        if allow_zero {
+            opts.push(EstimateOption { value: 0, label: self.format_label(0) });
+        }
+        let base: Vec<i32> = match self {
+            Self::Exponential => vec![1, 2, 4, 8, 16],
+            Self::Fibonacci => vec![1, 2, 3, 5, 8],
+            Self::Linear => vec![1, 2, 3, 4, 5],
+            Self::TShirt => vec![1, 2, 3, 4, 5],
+        };
+        let ext: Vec<i32> = match self {
+            Self::Exponential => vec![32, 64],
+            Self::Fibonacci => vec![13, 21],
+            Self::Linear => vec![6, 7, 8, 9, 10],
+            Self::TShirt => vec![6],
+        };
+        for v in &base {
+            opts.push(EstimateOption { value: *v, label: self.format_label(*v) });
+        }
+        if extended {
+            for v in &ext {
+                opts.push(EstimateOption { value: *v, label: self.format_label(*v) });
+            }
+        }
+        opts
+    }
+
+    /// Format a numeric value as a display label for this scale.
+    pub fn format_label(&self, value: i32) -> String {
+        match self {
+            Self::TShirt => match value {
+                0 => "No estimate",
+                1 => "XS",
+                2 => "S",
+                3 => "M",
+                4 => "L",
+                5 => "XL",
+                6 => "XXL",
+                _ => "?",
+            }
+            .to_string(),
+            _ => match value {
+                0 => "No estimate".to_string(),
+                1 => "1 Point".to_string(),
+                n => format!("{n} Points"),
+            },
+        }
+    }
+
+    /// Human-readable name of this scale.
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            Self::Exponential => "Exponential",
+            Self::Fibonacci => "Fibonacci",
+            Self::Linear => "Linear",
+            Self::TShirt => "T-Shirt",
+        }
+    }
+
+    /// Short preview string showing the scale values.
+    pub fn preview(&self) -> &'static str {
+        match self {
+            Self::Exponential => "1, 2, 4, 8, 16 Points",
+            Self::Fibonacci => "1, 2, 3, 5, 8 Points",
+            Self::Linear => "1, 2, 3, 4, 5 Points",
+            Self::TShirt => "XS, S, M, L, XL",
+        }
+    }
+}
+
+// ─── Team settings ─────────────────────────────────────────────────────────
+
 /// Per-team settings stored in teams.settings JSON column.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TeamSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_archive_days: Option<u32>,
+    /// Which estimation scale this team uses. `None` means estimates are disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimate_scale: Option<EstimateScale>,
+    /// Whether to include a "0 / No estimate" option in the picker.
+    #[serde(default)]
+    pub estimate_allow_zero: bool,
+    /// Whether to show extended range values (larger point values).
+    #[serde(default)]
+    pub estimate_extended: bool,
+    /// Whether unestimated issues count toward velocity/capacity totals.
+    #[serde(default = "default_true")]
+    pub estimate_count_unestimated: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for TeamSettings {
+    fn default() -> Self {
+        Self {
+            auto_archive_days: None,
+            estimate_scale: None,
+            estimate_allow_zero: false,
+            estimate_extended: false,
+            estimate_count_unestimated: true,
+        }
+    }
 }
 
 /// Workspace-level settings stored in workspaces.settings JSON column.

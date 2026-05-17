@@ -134,6 +134,7 @@ pub async fn create_issue(
     milestone_id: Option<String>,
     parent_issue_id: Option<String>,
     team_id: Option<String>,
+    estimate: Option<i32>,
 ) -> Result<Issue, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let ctx = ac.api_ctx();
@@ -148,6 +149,7 @@ pub async fn create_issue(
         labels: if parsed_labels.is_empty() { None } else { Some(parsed_labels) },
         due_date, project_id, milestone_id,
         parent_issue_id: parent_issue_id.filter(|s| !s.is_empty()),
+        estimate,
     };
     let result = trakkt_api::issues::create_issue(&ctx, params).await.into_sfn()?;
     serde_json::from_value(result).into_sfn()
@@ -181,6 +183,7 @@ pub async fn update_issue(
     project_id: Option<String>,
     milestone_id: Option<String>,
     parent_issue_id: Option<String>,
+    estimate: Option<i32>,
     clear_fields: Option<String>,
 ) -> Result<Issue, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
@@ -194,6 +197,12 @@ pub async fn update_issue(
         if clear { Some(None) }
         else { val.map(|s| if s.is_empty() { None } else { Some(s) }) }
     }
+
+    let estimate_param = if clears.contains(&"estimate") {
+        Some(None)
+    } else {
+        estimate.map(Some)
+    };
 
     let params = trakkt_types::api::UpdateIssueApiParams {
         issue_identifier: Some(format!("{team_key}-{number}")),
@@ -212,6 +221,7 @@ pub async fn update_issue(
         } else {
             parent_issue_id.filter(|s| !s.is_empty()).map(Some)
         },
+        estimate: estimate_param,
         sort_order: if clears.contains(&"sort_order") { Some(None) } else { None },
     };
     let result = trakkt_api::issues::update_issue(&ctx, params).await.into_sfn()?;

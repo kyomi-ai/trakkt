@@ -439,7 +439,7 @@ fn EditableTitle(
                 tk,
                 number,
                 Some(new_title),
-                None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None,
                 None,
             )
             .await;
@@ -540,7 +540,7 @@ fn MetadataSidebar(
                 number,
                 None, None,
                 Some(new_status_id),
-                None, None, None, None, None, None,
+                None, None, None, None, None, None, None,
                 None,
             )
             .await;
@@ -557,7 +557,7 @@ fn MetadataSidebar(
                 number,
                 None, None, None,
                 Some(prio),
-                None, None, None, None, None,
+                None, None, None, None, None, None,
                 None,
             )
             .await;
@@ -581,7 +581,7 @@ fn MetadataSidebar(
                 number,
                 None, None, None, None,
                 if is_clear { None } else { Some(user_id) },
-                None, None, None, None,
+                None, None, None, None, None,
                 if is_clear { Some("assignee".to_string()) } else { None },
             )
             .await;
@@ -598,7 +598,7 @@ fn MetadataSidebar(
                 tk, number,
                 None, None, None, None, None, None,
                 if is_clear { None } else { Some(project_id) },
-                None, None,
+                None, None, None,
                 Some(if is_clear { "project,milestone".to_string() } else { "milestone".to_string() }),
             ).await;
             on_change.run(());
@@ -615,7 +615,7 @@ fn MetadataSidebar(
                 None, None, None, None, None, None,
                 None,
                 if is_clear { None } else { Some(milestone_id) },
-                None,
+                None, None,
                 if is_clear { Some("milestone".to_string()) } else { None },
             ).await;
             on_change.run(());
@@ -632,7 +632,7 @@ fn MetadataSidebar(
                 number,
                 None, None, None, None, None,
                 date,
-                None, None, None,
+                None, None, None, None,
                 if is_clear { Some("due_date".to_string()) } else { None },
             )
             .await;
@@ -1389,7 +1389,7 @@ fn DescriptionEditor(
                 number,
                 None,
                 desc,
-                None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None,
                 None,
             )
             .await;

@@ -1182,7 +1182,7 @@ pub(crate) fn NewIssueModal(
         set_error_msg.set(None);
 
         leptos::task::spawn_local(async move {
-            match create_issue(title_val, desc, prio, None, None, String::new(), None, None, current_parent_id, current_team_id).await {
+            match create_issue(title_val, desc, prio, None, None, String::new(), None, None, current_parent_id, current_team_id, None).await {
                 Ok(_) => {
                     set_submitting.set(false);
                     on_created.run(());

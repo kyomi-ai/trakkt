@@ -33,6 +33,7 @@ struct IssueRow {
     due_date: Option<String>,
     project_id: Option<String>,
     milestone_id: Option<String>,
+    estimate: Option<i32>,
     sort_order: Option<f64>,
     created_at: String,
     updated_at: String,
@@ -54,6 +55,7 @@ impl IssueRow {
             due_date: self.due_date,
             project_id: self.project_id,
             milestone_id: self.milestone_id,
+            estimate: self.estimate,
             sort_order: self.sort_order,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -83,6 +85,7 @@ struct IssueDetailRow {
     project_id: Option<String>,
     project_name: Option<String>,
     milestone_id: Option<String>,
+    estimate: Option<i32>,
     parent_identifier: Option<String>,
     parent_title: Option<String>,
     sort_order: Option<f64>,
@@ -113,6 +116,7 @@ impl IssueDetailRow {
             project_id: self.project_id,
             project_name: self.project_name,
             milestone_id: self.milestone_id,
+            estimate: self.estimate,
             parent_identifier: self.parent_identifier,
             parent_title: self.parent_title,
             sort_order: self.sort_order,
@@ -135,7 +139,7 @@ const ISSUE_DETAIL_SELECT: &str = "\
            i.assignee_id, assignee.name AS assignee_name, \
            i.creator_id, creator.name AS creator_name, \
            SUBSTR(CAST(i.due_date AS TEXT), 1, 10) AS due_date, \
-           i.project_id, p.name AS project_name, i.milestone_id, \
+           i.project_id, p.name AS project_name, i.milestone_id, i.estimate, \
            (SELECT t2.key || '-' || p2.number FROM issue_relations r2 \
             JOIN issues p2 ON p2.issue_id = r2.source_issue_id \
             JOIN teams t2 ON t2.team_id = p2.team_id \
@@ -240,14 +244,15 @@ pub async fn create_issue(
     // race conditions where concurrent creates read the same MAX.
     // Numbers are scoped per-team (e.g. ENG-1, ENG-2, DES-1, DES-2).
     let due_date_cast = if is_pg { "CAST($10 AS TIMESTAMPTZ)" } else { "$10" };
+    let estimate_cast = if is_pg { "CAST($13 AS INTEGER)" } else { "$13" };
     let sql = format!(
         "INSERT INTO issues \
             (issue_id, workspace_id, team_id, number, title, description, \
              status_id, priority, assignee_id, creator_id, due_date, \
-             project_id, milestone_id, created_at, updated_at) \
+             project_id, milestone_id, estimate, created_at, updated_at) \
          VALUES ($1, $2, $3, \
                  (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = $3), \
-                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, {now}, {now})"
+                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, {estimate_cast}, {now}, {now})"
     );
     trakkt_core::db_execute!(
         db,
@@ -263,7 +268,8 @@ pub async fn create_issue(
         &params.creator_id,
         params.due_date.as_deref(),
         params.project_id.as_deref(),
-        params.milestone_id.as_deref()
+        params.milestone_id.as_deref(),
+        params.estimate
     )?;
 
     // Attach labels.
@@ -317,7 +323,7 @@ pub async fn create_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 SUBSTR(CAST(due_date AS TEXT), 1, 10) AS due_date, \
-                project_id, milestone_id, sort_order, \
+                project_id, milestone_id, estimate, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE issue_id = $1",
@@ -654,6 +660,15 @@ pub async fn update_issue(
         param_idx += 1;
     }
 
+    if updates.estimate.is_some() {
+        if is_pg {
+            set_parts.push(format!("estimate = CAST(${param_idx} AS INTEGER)"));
+        } else {
+            set_parts.push(format!("estimate = ${param_idx}"));
+        }
+        param_idx += 1;
+    }
+
     if updates.sort_order.is_some() {
         set_parts.push(format!("sort_order = ${param_idx}"));
         param_idx += 1;
@@ -712,6 +727,9 @@ pub async fn update_issue(
         if let Some(ref v) = updates.milestone_id {
             query = query.bind(v.as_deref());
         }
+        if let Some(ref v) = updates.estimate {
+            query = query.bind(*v);
+        }
         if let Some(ref v) = updates.sort_order {
             query = query.bind(*v);
         }
@@ -737,7 +755,7 @@ pub async fn update_issue(
         "SELECT issue_id, workspace_id, team_id, number, title, description, \
                 status_id, priority, assignee_id, creator_id, \
                 SUBSTR(CAST(due_date AS TEXT), 1, 10) AS due_date, \
-                project_id, milestone_id, sort_order, \
+                project_id, milestone_id, estimate, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM issues WHERE issue_id = $1",
@@ -837,7 +855,7 @@ pub async fn delete_issue(
             "SELECT i.issue_id, i.workspace_id, i.team_id, i.number, i.title, i.description, \
                     i.status_id, i.priority, i.assignee_id, i.creator_id, \
                     SUBSTR(CAST(i.due_date AS TEXT), 1, 10) AS due_date, \
-                    i.project_id, i.milestone_id, i.sort_order, \
+                    i.project_id, i.milestone_id, i.estimate, i.sort_order, \
                     CAST(i.created_at AS TEXT) AS created_at, \
                     CAST(i.updated_at AS TEXT) AS updated_at \
              FROM issues i \
