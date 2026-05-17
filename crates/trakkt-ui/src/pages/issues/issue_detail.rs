@@ -313,6 +313,9 @@ fn IssueDetailContent(
          i.project_id.clone(), i.project_name.clone(), i.milestone_id.clone())
     });
 
+    // Shared lightbox state for all editors (description, comments)
+    let lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>> = RwSignal::new(None);
+
     view! {
         <div class="max-w-[1140px] mx-auto w-full flex flex-col md:flex-row gap-8">
             // ── Left column: main content ─────────────────────────────
@@ -352,6 +355,7 @@ fn IssueDetailContent(
                     team_key=initial_team_key.clone()
                     number=number
                     description=Signal::from(description)
+                    lightbox_state=lightbox_state
                 />
 
                 // ── Relations section (unified: parent, children, blocks, blocked-by) ──
@@ -370,6 +374,7 @@ fn IssueDetailContent(
                     team_key=initial.get_untracked().team_key.clone()
                     number=number
                     comments=comments
+                    lightbox_state=lightbox_state
                 />
 
                 // ── Footer: timestamps ────────────────────────────────
@@ -396,6 +401,8 @@ fn IssueDetailContent(
             </div>
         </div>
 
+        // ── Lightbox overlay (shared across all editors on this page) ──
+        <crate::components::lightbox::Lightbox state=lightbox_state/>
     }
 }
 
@@ -1352,6 +1359,7 @@ fn DescriptionEditor(
     team_key: String,
     number: i32,
     description: Signal<String>,
+    lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
 ) -> impl IntoView {
     use kode_leptos::TreeWysiwygEditor;
 
@@ -1388,6 +1396,12 @@ fn DescriptionEditor(
         });
     });
 
+    // Attachment callbacks
+    let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete);
+    let on_delete = crate::components::attachment_hooks::make_delete_callback();
+    let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
+
     let theme_state = use_context::<crate::components::theme::ThemeState>();
     let theme_signal = Signal::derive(move || {
         let mut theme = trakkt_kode_theme();
@@ -1409,6 +1423,10 @@ fn DescriptionEditor(
                 show_fixed_toolbar=false
                 show_floating_toolbar=true
                 theme=theme_signal
+                on_upload=on_upload
+                on_delete_attachment=on_delete
+                on_click_attachment=on_click
+                upload_complete=upload_complete
             />
         </div>
     }
@@ -1801,6 +1819,7 @@ fn IssueTimeline(
     team_key: String,
     number: i32,
     comments: Signal<Vec<Comment>>,
+    lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
 ) -> impl IntoView {
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (filter, set_filter) = signal(TimelineFilter::All);
@@ -1919,13 +1938,13 @@ fn IssueTimeline(
                                     .collect();
                                 view! {
                                     <div>
-                                        <CommentItem comment=comment/>
+                                        <CommentItem comment=comment lightbox_state=lightbox_state/>
                                         // Threaded replies
                                         {if !comment_replies.is_empty() {
                                             Some(view! {
                                                 <div class="ml-10 space-y-3 mt-3">
                                                     {comment_replies.into_iter().map(|reply| {
-                                                        view! { <CommentItem comment=reply/> }
+                                                        view! { <CommentItem comment=reply lightbox_state=lightbox_state/> }
                                                     }).collect_view()}
                                                 </div>
                                             })
@@ -1954,7 +1973,7 @@ fn IssueTimeline(
             </div>
 
             // ── New comment form ───────────────────────────────────────
-            <NewCommentForm team_key=tk_for_form number=number/>
+            <NewCommentForm team_key=tk_for_form number=number lightbox_state=lightbox_state/>
         </div>
     }
 }
@@ -2105,12 +2124,17 @@ fn format_activity_description(activity: &IssueActivity) -> String {
 
 /// A single comment with avatar, author name, timestamp, and body.
 #[component]
-fn CommentItem(comment: Comment) -> impl IntoView {
+fn CommentItem(
+    comment: Comment,
+    lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
+) -> impl IntoView {
     let author = comment
         .author_name
         .clone()
         .unwrap_or_else(|| "Unknown".to_string());
     let timestamp = format_datetime(&comment.created_at);
+
+    let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
     view! {
         <div class="flex gap-3">
@@ -2120,10 +2144,12 @@ fn CommentItem(comment: Comment) -> impl IntoView {
                     <span class="text-sm font-medium text-foreground">{author}</span>
                     <span class="text-xs text-muted-foreground">{timestamp}</span>
                 </div>
-                <div class="mt-1 text-sm text-foreground" style="pointer-events: none;">
+                <div class="mt-1 text-sm text-foreground">
                     <kode_leptos::TreeWysiwygEditor
                         content=Signal::stored(comment.body.clone())
                         show_fixed_toolbar=false
+                        readonly=true
+                        on_click_attachment=on_click
                         theme={
                             let theme_state = use_context::<crate::components::theme::ThemeState>();
                             Signal::derive(move || {
@@ -2152,7 +2178,11 @@ fn CommentItem(comment: Comment) -> impl IntoView {
 
 /// Form for adding a new comment with kode WYSIWYG editor.
 #[component]
-fn NewCommentForm(team_key: String, number: i32) -> impl IntoView {
+fn NewCommentForm(
+    team_key: String,
+    number: i32,
+    lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
+) -> impl IntoView {
     use kode_leptos::TreeWysiwygEditor;
 
     let content = RwSignal::new(String::new());
@@ -2188,6 +2218,12 @@ fn NewCommentForm(team_key: String, number: i32) -> impl IntoView {
         content.set(text);
     });
 
+    // Attachment callbacks
+    let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete);
+    let on_delete = crate::components::attachment_hooks::make_delete_callback();
+    let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
+
     let theme_state = use_context::<crate::components::theme::ThemeState>();
     let theme_signal = Signal::derive(move || {
         let mut theme = trakkt_kode_theme();
@@ -2209,6 +2245,10 @@ fn NewCommentForm(team_key: String, number: i32) -> impl IntoView {
                     show_fixed_toolbar=false
                     show_floating_toolbar=true
                     theme=theme_signal
+                    on_upload=on_upload
+                    on_delete_attachment=on_delete
+                    on_click_attachment=on_click
+                    upload_complete=upload_complete
                 />
             </div>
             <div class="flex justify-end mt-3">
