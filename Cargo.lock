@@ -5402,6 +5402,7 @@ dependencies = [
  "futures-util",
  "leptos",
  "leptos_axum",
+ "percent-encoding",
  "rand 0.9.4",
  "redis",
  "rust-embed",

@@ -175,10 +175,12 @@ impl AttachmentStorage for S3AttachmentStorage {
 
 /// Extract extension from the original filename, falling back to content-type derivation.
 fn extension_from_filename<'a>(filename: &'a str, content_type: &str) -> &'a str {
-    if let Some(ext) = filename.rsplit('.').next() {
-        if !ext.is_empty() && ext.len() <= 10 && ext != filename {
-            return ext;
-        }
+    if let Some(ext) = filename.rsplit('.').next()
+        && !ext.is_empty()
+        && ext.len() <= 10
+        && ext != filename
+    {
+        return ext;
     }
     match content_type {
         "image/png" => "png",
