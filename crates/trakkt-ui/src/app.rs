@@ -28,7 +28,9 @@ use crate::pages::issues::my_issues::MyIssuesPage;
 use crate::pages::onboarding::OnboardingPage;
 use crate::pages::projects::project_detail::ProjectDetailPage;
 use crate::pages::projects::project_list::ProjectListPage;
+use crate::pages::github_callback::GitHubCallbackPage;
 use crate::pages::settings::{
+    integrations::IntegrationsPage,
     labels::LabelsPage,
     profile::ProfilePage,
     security::security_tab::SecurityTab,
@@ -123,6 +125,9 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/projects") view=ProjectListPage/>
                     <Route path=path!("/projects/:id") view=ProjectDetailPage/>
 
+                    // GitHub App installation callback
+                    <Route path=path!("/integrations/github/callback") view=GitHubCallbackPage/>
+
                     // Settings
                     <ParentRoute path=path!("/settings") view=|| view! {
                         <div class="flex flex-col h-full bg-muted overflow-x-hidden" style:flex-direction="column">
@@ -151,6 +156,7 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/team") view=TeamPage/>
                         <Route path=path!("/labels") view=LabelsPage/>
                         <Route path=path!("/teams") view=TeamsSettingsPage/>
+                        <Route path=path!("/integrations") view=IntegrationsPage/>
                     </ParentRoute>
                 </ParentRoute>
             </Routes>
