@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Reusable attachment callbacks for the kode WYSIWYG editor.
+//!
+//! Provides `make_upload_callback`, `make_delete_callback`, and
+//! `make_click_callback` — the three closures the `TreeWysiwygEditor` needs
+//! to integrate with Trakkt's attachment REST API.
+
+use std::sync::Arc;
+
+use leptos::prelude::*;
+use kode_leptos::{
+    AttachmentInsert, AttachmentNodeType, ClickAttachmentRequest,
+    DeleteAttachmentRequest, UploadComplete, UploadTrigger,
+};
+
+/// Maximum upload size (10 MB).
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Allowed file extensions for upload.
+const ALLOWED_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "svg",
+    "pdf", "csv", "txt", "json", "log",
+];
+
+/// Allowed MIME content types for upload.
+const ALLOWED_CONTENT_TYPES: &[&str] = &[
+    "image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml",
+    "application/pdf", "text/csv", "text/plain", "application/json",
+];
+
+/// State for the image lightbox overlay.
+#[derive(Clone, Debug)]
+pub struct LightboxState {
+    pub src: String,
+}
+
+/// Create the `on_upload` callback that uploads via fetch to `/api/v1/attachments`.
+///
+/// On success, signals `UploadComplete` with the inserted attachment metadata.
+/// On failure (validation or network), signals `UploadComplete { insert: None }` to
+/// remove the placeholder from the document.
+pub fn make_upload_callback(
+    upload_complete: RwSignal<Option<UploadComplete>>,
+) -> Arc<dyn Fn(UploadTrigger) + Send + Sync> {
+    Arc::new(move |trigger: UploadTrigger| {
+        let placeholder_id = trigger.placeholder_id.clone();
+
+        // Client-side size validation
+        if trigger.size > MAX_FILE_SIZE {
+            tracing::warn!(
+                "Attachment rejected: {} exceeds max size ({} > {})",
+                trigger.name, trigger.size, MAX_FILE_SIZE
+            );
+            upload_complete.set(Some(UploadComplete {
+                placeholder_id,
+                insert: None,
+            }));
+            return;
+        }
+
+        // Client-side extension/content-type validation
+        let ext = trigger.name.rsplit('.').next().unwrap_or("").to_lowercase();
+        if !ALLOWED_EXTENSIONS.contains(&ext.as_str())
+            && !ALLOWED_CONTENT_TYPES.contains(&trigger.content_type.as_str())
+        {
+            tracing::warn!(
+                "Attachment rejected: {} has disallowed type (ext={}, content_type={})",
+                trigger.name, ext, trigger.content_type
+            );
+            upload_complete.set(Some(UploadComplete {
+                placeholder_id,
+                insert: None,
+            }));
+            return;
+        }
+
+        // Spawn the async upload
+        leptos::task::spawn_local(async move {
+            match upload_file(&trigger.data, &trigger.name, &trigger.content_type).await {
+                Ok(resp) => {
+                    let insert = if trigger.content_type.starts_with("image/") {
+                        AttachmentInsert::Image {
+                            src: resp.url,
+                            alt: trigger.name,
+                            attachment_id: Some(resp.attachment_id),
+                            width: None,
+                            height: None,
+                        }
+                    } else {
+                        AttachmentInsert::File {
+                            href: resp.url,
+                            filename: trigger.name,
+                            attachment_id: Some(resp.attachment_id),
+                            size_bytes: Some(resp.size_bytes),
+                            content_type: Some(trigger.content_type),
+                        }
+                    };
+                    upload_complete.set(Some(UploadComplete {
+                        placeholder_id,
+                        insert: Some(insert),
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!("Attachment upload failed: {e}");
+                    upload_complete.set(Some(UploadComplete {
+                        placeholder_id,
+                        insert: None,
+                    }));
+                }
+            }
+        });
+    })
+}
+
+/// Create the `on_delete_attachment` callback that DELETEs via `/api/v1/attachments/{id}`.
+pub fn make_delete_callback() -> Arc<dyn Fn(DeleteAttachmentRequest) + Send + Sync> {
+    Arc::new(move |req: DeleteAttachmentRequest| {
+        if let Some(attachment_id) = req.attachment_id {
+            leptos::task::spawn_local(async move {
+                if let Err(e) = delete_attachment(&attachment_id).await {
+                    tracing::warn!("Failed to delete attachment {attachment_id}: {e}");
+                }
+            });
+        }
+    })
+}
+
+/// Create the `on_click_attachment` callback.
+///
+/// - Images: open in a lightbox overlay (via the provided signal).
+/// - Files: open in a new browser tab.
+pub fn make_click_callback(
+    lightbox_signal: RwSignal<Option<LightboxState>>,
+) -> Arc<dyn Fn(ClickAttachmentRequest) + Send + Sync> {
+    Arc::new(move |req: ClickAttachmentRequest| {
+        match req.node_type {
+            AttachmentNodeType::Image => {
+                lightbox_signal.set(Some(LightboxState {
+                    src: req.src_or_href,
+                }));
+            }
+            AttachmentNodeType::File => {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.open_with_url_and_target(&req.src_or_href, "_blank");
+                }
+            }
+        }
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal: browser fetch helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct UploadResponse {
+    attachment_id: String,
+    url: String,
+    size_bytes: u64,
+}
+
+/// Upload a file via the browser's fetch API (multipart form POST).
+async fn upload_file(data: &[u8], filename: &str, content_type: &str) -> Result<UploadResponse, String> {
+    use js_sys::{Array, Uint8Array};
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{Blob, BlobPropertyBag, FormData, Request, RequestInit, Response};
+
+    let window = web_sys::window().ok_or("no window")?;
+
+    // Create a Blob from the raw bytes
+    let uint8_array = Uint8Array::new_with_length(data.len() as u32);
+    uint8_array.copy_from(data);
+    let blob_parts = Array::new();
+    blob_parts.push(&uint8_array.buffer());
+    let opts = BlobPropertyBag::new();
+    opts.set_type(content_type);
+    let blob = Blob::new_with_buffer_source_sequence_and_options(&blob_parts, &opts)
+        .map_err(|_| "Failed to create Blob")?;
+
+    // Create FormData with the file
+    let form_data = FormData::new().map_err(|_| "Failed to create FormData")?;
+    form_data
+        .append_with_blob_and_filename("file", &blob, filename)
+        .map_err(|_| "Failed to append file to FormData")?;
+
+    // Build the fetch request
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_body_opt_form_data(Some(&form_data));
+    init.set_credentials(web_sys::RequestCredentials::Include);
+
+    let request = Request::new_with_str_and_init("/api/v1/attachments", &init)
+        .map_err(|_| "Failed to create Request")?;
+
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|_| "Fetch failed")?;
+    let resp: Response = resp_value.unchecked_into();
+
+    if !resp.ok() {
+        return Err(format!("Upload failed with status {}", resp.status()));
+    }
+
+    let json = JsFuture::from(resp.json().map_err(|_| "Failed to get JSON body")?)
+        .await
+        .map_err(|_| "Failed to parse JSON")?;
+
+    // Extract fields from the JSON response
+    let attachment_id = js_sys::Reflect::get(&json, &"attachment_id".into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .ok_or("Missing attachment_id in response")?;
+    let url = js_sys::Reflect::get(&json, &"url".into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .ok_or("Missing url in response")?;
+    let size_bytes = js_sys::Reflect::get(&json, &"size_bytes".into())
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as u64;
+
+    Ok(UploadResponse { attachment_id, url, size_bytes })
+}
+
+/// Delete an attachment via the browser's fetch API (DELETE request).
+async fn delete_attachment(attachment_id: &str) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{Request, RequestInit, Response};
+
+    let window = web_sys::window().ok_or("no window")?;
+
+    let init = RequestInit::new();
+    init.set_method("DELETE");
+    init.set_credentials(web_sys::RequestCredentials::Include);
+
+    let url = format!("/api/v1/attachments/{attachment_id}");
+    let request = Request::new_with_str_and_init(&url, &init)
+        .map_err(|_| "Failed to create DELETE request")?;
+
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|_| "DELETE fetch failed")?;
+    let resp: Response = resp_value.unchecked_into();
+
+    if !resp.ok() {
+        return Err(format!("Delete failed with status {}", resp.status()));
+    }
+
+    Ok(())
+}

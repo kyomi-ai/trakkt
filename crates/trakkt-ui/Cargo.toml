@@ -66,8 +66,8 @@ web-sys = { version = "0.3", features = [
     "Clipboard", "HtmlDivElement", "DomRect",
     "ScrollIntoViewOptions", "ScrollLogicalPosition",
     "WebSocket", "MessageEvent", "CloseEvent",
-    "FormData", "File", "FileList", "Blob",
-    "Headers", "Request", "RequestInit", "Response",
+    "FormData", "File", "FileList", "Blob", "BlobPropertyBag",
+    "Headers", "Request", "RequestInit", "RequestCredentials", "Response",
 ] }
 
 # Timers for WASM
