@@ -205,39 +205,40 @@ async fn github_webhook(
     let result = match event_key.as_str() {
         // Installation lifecycle events — handle synchronously
         "installation.deleted" | "installation.suspend" => {
-            handle_installation_suspend(&state, &installation).await
+            Some(handle_installation_suspend(&state, &installation).await)
         }
         "installation.unsuspend" => {
-            handle_installation_unsuspend(&state, &installation).await
+            Some(handle_installation_unsuspend(&state, &installation).await)
         }
         "installation_repositories.added" | "installation_repositories.removed" => {
-            handle_installation_repos_changed(&state, &installation, &payload).await
+            Some(handle_installation_repos_changed(&state, &installation, &payload).await)
         }
-        // Future event types (TRA-91) — log and mark as processed
+        // Events for TRA-91 queue — leave processed_at = NULL
         _ => {
             tracing::info!(
                 event = %event_key,
                 delivery_id = %delivery_id,
-                "Unhandled GitHub event type — logged for future processing"
+                "GitHub event recorded — awaiting processor (TRA-91)"
             );
-            Ok(())
+            None
         }
     };
 
     // ── 8. Mark event outcome ──────────────────────────────────────────────
 
     match result {
-        Ok(()) => {
+        Some(Ok(())) => {
             if let Err(e) = schema::mark_event_processed(&state.db, &event_id).await {
                 tracing::error!(event_id = %event_id, error = %e, "Failed to mark event as processed");
             }
         }
-        Err(e) => {
+        Some(Err(e)) => {
             tracing::error!(event_id = %event_id, error = %e, "GitHub event processing failed");
             if let Err(mark_err) = schema::mark_event_failed(&state.db, &event_id, &e.to_string()).await {
                 tracing::error!(event_id = %event_id, error = %mark_err, "Failed to mark event as failed");
             }
         }
+        None => {} // Not handled here — left for TRA-91 queue worker
     }
 
     // Always return 200 — GitHub retries on non-200 status codes.
