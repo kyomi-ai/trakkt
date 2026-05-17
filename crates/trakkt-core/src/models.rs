@@ -131,6 +131,9 @@ pub struct ApiToken {
     pub revoked_by: Option<String>,
     pub last_used: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    pub workspace_id: Option<String>,
+    pub token_prefix: Option<String>,
+    pub scopes: Option<String>,
 }
 
 /// OAuth client record from the `oauth_clients` table.

@@ -36,6 +36,39 @@ pub fn format_short_date(datetime: &str) -> String {
     }
 }
 
+/// Formats an RFC 3339 date using JS `Intl.DateTimeFormat` on the client
+/// (locale-aware) and a plain ISO → "May 8, 2026" on the server.
+pub fn format_date_locale(date_str: &str) -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use js_sys::{Date, Intl, Object, Reflect};
+        use wasm_bindgen::JsValue;
+
+        let date = Date::new(&JsValue::from_str(date_str));
+        if date.get_time().is_nan() {
+            return "Unknown".to_string();
+        }
+
+        let options = Object::new();
+        let _ = Reflect::set(&options, &"month".into(), &"short".into());
+        let _ = Reflect::set(&options, &"day".into(), &"numeric".into());
+        let _ = Reflect::set(&options, &"year".into(), &"numeric".into());
+
+        let locale = js_sys::Array::of1(&"en-US".into());
+        let formatter = Intl::DateTimeFormat::new(&locale, &options);
+        let format_fn = formatter.format();
+        format_fn
+            .call1(&JsValue::NULL, &date)
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "Unknown".to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        format_date(date_str)
+    }
+}
+
 /// Formats an optional date string (YYYY-MM-DD or ISO 8601) into "May 8, 2026".
 pub fn format_date(date: &str) -> String {
     let date_part = if date.len() >= 10 {
