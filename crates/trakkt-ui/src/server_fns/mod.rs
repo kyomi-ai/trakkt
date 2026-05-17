@@ -36,6 +36,7 @@ pub struct ServerContext {
     pub webauthn: Option<std::sync::Arc<webauthn_rs::Webauthn>>,
     pub ws_manager: Option<trakkt_auth::websocket::WebSocketManager>,
     pub mcp_sessions: Option<trakkt_auth::mcp_session_manager::MCPSessionManager>,
+    pub stripe: Option<trakkt_auth::stripe_service::StripeService>,
 }
 
 #[cfg(feature = "ssr")]
