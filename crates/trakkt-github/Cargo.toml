@@ -19,6 +19,8 @@ regex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+rsa = { version = "0.9", features = ["pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [lints]
 workspace = true

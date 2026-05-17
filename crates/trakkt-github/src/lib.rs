@@ -376,55 +376,35 @@ async fn map_github_error(
 mod tests {
     use super::*;
     use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+    use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+    use rsa::RsaPrivateKey;
+    use std::sync::LazyLock;
 
-    /// Test RSA private key (2048-bit, PKCS#8) generated specifically for unit tests.
-    /// This key is NOT used for any real authentication — it exists solely for
-    /// testing JWT signing logic.
-    const TEST_RSA_PRIVATE_KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----
-MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQCtHVU7fef+jOmo
-9tKSPQ6HS98emK3dGF1fjbaYO+Jgmt/hhQO17a2iKq6H2XzYkJBfvM8cBZb8vRLn
-O7cyoLOsGQverx4U9xog5KLFPQmHlbNoOjcPL3HdIab4mQFCwJxV6eUj1jnRfY9l
-PTAXOCsGlTU+2nNebXrS36pUHFu69xCzxF7nEZuvttKN6P3pZUisq0/Rsq6HQEae
-4SYzfSNrp8xw5pcNpa8A682TfTUVEV6mTj11aPZU1yekltalY9+ziKVvAdL4Jip3
-Rek/WnTom+qcP76TC79yMAq9B4utxYLRaJFMZqsKx/XyOrde9MZvmF7XaXfkATKe
-dwf8Y0/tAgMBAAECggEAFHA9o1/6l3WYkq/NbaGSyQt+pLSe9lcNkx3+nFuZnxE5
-9HzJUt3kXZyPbY+Sa1kqCnuWsjbAvEcwZ6eHugz6GYv9eEWRliUUayTDSOkralwU
-ye3xmTPfTB3QglJCMVjfPE94k7ITsnWSDABc4Kjrf4P3PNv6uf/P+/yXNgYBGIIo
-B41x1vfhqGkp5qUtDQcwYO90LFR5xg7kvT/15qBrp55iYQ+rM7xKAGi3bOdJg3tj
-10+IrqWwuOPRTcfuvL5yZxMr6lF1x4tewhuZ6RoMeOKlGwqI9Xoye6gqC91hZvnA
-1KLuxJiu7mAf5sYEGH8KGbU7hpaY7nlpJUaz2LT7awKBgQDmbxXYEgyo4qnz+HUT
-5TiTyt7BMSMGrI2MyR8x7JXCx0vrZxFP5ptMKrHPaD6Mpqf0uE4Fx1I4CP6OdlvP
-776tYPFwvoZI+c4kqRAq58zh0CXWzjlsHXOnfyupdZGrcHvG+4j8BbUhLqEOJK4z
-OzimJUzhTP0z8P3cXZ/1tmJ5vwKBgQDAUjstXxhIZn2hqbcWhrj55P9SzIsnEUA0
-7OC8QpeQ0DqpQgLLh/+PKj2BYe2iTTJubDXIihiNAzjJ1GltndWHohfLHQ6ibVdV
-m9d7YvPOhP6ntTjtM01JzC+urpc75C7sm3fyEFXftxgfo2aJx8CbJT6Yhyjvfu/2
-Gav5KhnpUwKBgQCsBzZJjoAA/OZgCpZs+e0Y+JT/qU06yEsMVYGCZdsQBHT7EoDs
-I37AiAcijfJUUn6ExasJyVnqF1ziwh2cyKCTExJsVvAtPsDUwZoeTdq4ogn9qQtZ
-WUtkOh5AblMHp/vf+xyy+RfV49e8lUmvWYDbGHGiqTVGN51tjD/E0hoGRQKBgGgA
-D+BJPGhqhCWYEVotIHqCS1ALLHTD72SvdBhaKnw1HoPJHpnRwXE59miw/EB4Xn04
-Jx17ECuxQlRieWC9qWrfTN6ZqABOAJxa2fvvVsinQs6OQWqEA5eUw3RDFaVdj8KD
-kClmjAmeiX0Sb7CyRIWhbmgtLwXULw92cnkbO0fhAn84L4t5K1NqHkB1riVVHSEz
-nkfT+kqKQlmRBIv219QaefPEpWV67KMWlzoAxW5Jw0cc1i8+4YhB/xVZq69QjFXb
-70k6GKi6CfRCua8CYGkZLQLwpw/zx9rbL51p7JcaUrmlEvc1PUcV41eSeRaqheOH
-lcInfsJ9bsfN3EClhyKo
------END PRIVATE KEY-----
-";
+    struct TestKeyPair {
+        private_pem: Vec<u8>,
+        public_pem: Vec<u8>,
+    }
 
-    /// Corresponding test RSA public key for verifying JWTs.
-    const TEST_RSA_PUBLIC_KEY: &[u8] = b"-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArR1VO33n/ozpqPbSkj0O
-h0vfHpit3RhdX422mDviYJrf4YUDte2toiquh9l82JCQX7zPHAWW/L0S5zu3MqCz
-rBkL3q8eFPcaIOSixT0Jh5WzaDo3Dy9x3SGm+JkBQsCcVenlI9Y50X2PZT0wFzgr
-BpU1PtpzXm160t+qVBxbuvcQs8Re5xGbr7bSjej96WVIrKtP0bKuh0BGnuEmM30j
-a6fMcOaXDaWvAOvNk301FRFepk49dWj2VNcnpJbWpWPfs4ilbwHS+CYqd0XpP1p0
-6JvqnD++kwu/cjAKvQeLrcWC0WiRTGarCsf18jq3XvTGb5he12l35AEynncH/GNP
-7QIDAQAB
------END PUBLIC KEY-----
-";
+    static TEST_KEYS: LazyLock<TestKeyPair> = LazyLock::new(|| {
+        let mut rng = rand_core::OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048)
+            .expect("failed to generate test RSA key");
+        let private_pem = private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("failed to encode private key")
+            .as_bytes()
+            .to_vec();
+        let public_key = private_key.to_public_key();
+        let public_pem = rsa::pkcs8::EncodePublicKey::to_public_key_pem(&public_key, LineEnding::LF)
+            .expect("failed to encode public key")
+            .as_bytes()
+            .to_vec();
+        TestKeyPair { private_pem, public_pem }
+    });
 
     #[test]
     fn jwt_generation_produces_valid_token() {
-        let client = GitHubClient::new(12345, TEST_RSA_PRIVATE_KEY, "test-app").unwrap();
+        let client = GitHubClient::new(12345, &TEST_KEYS.private_pem, "test-app").unwrap();
         let jwt = client.app_jwt().unwrap();
 
         // Decode and validate with the public key
@@ -433,7 +413,7 @@ a6fMcOaXDaWvAOvNk301FRFepk49dWj2VNcnpJbWpWPfs4ilbwHS+CYqd0XpP1p0
         // Allow some clock skew for test stability
         validation.leeway = 120;
 
-        let key = DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_KEY).unwrap();
+        let key = DecodingKey::from_rsa_pem(&TEST_KEYS.public_pem).unwrap();
         let token_data =
             jsonwebtoken::decode::<GitHubAppClaims>(&jwt, &key, &validation).unwrap();
 
@@ -468,7 +448,7 @@ a6fMcOaXDaWvAOvNk301FRFepk49dWj2VNcnpJbWpWPfs4ilbwHS+CYqd0XpP1p0
 
     #[test]
     fn new_accepts_valid_pem() {
-        let result = GitHubClient::new(99999, TEST_RSA_PRIVATE_KEY, "my-app");
+        let result = GitHubClient::new(99999, &TEST_KEYS.private_pem, "my-app");
         assert!(result.is_ok());
         let client = result.unwrap();
         assert_eq!(client.app_name(), "my-app");
@@ -476,7 +456,7 @@ a6fMcOaXDaWvAOvNk301FRFepk49dWj2VNcnpJbWpWPfs4ilbwHS+CYqd0XpP1p0
 
     #[test]
     fn jwt_claims_have_correct_timing() {
-        let client = GitHubClient::new(42, TEST_RSA_PRIVATE_KEY, "timing-test").unwrap();
+        let client = GitHubClient::new(42, &TEST_KEYS.private_pem, "timing-test").unwrap();
         let jwt = client.app_jwt().unwrap();
 
         // Decode with full signature validation using the public key
@@ -486,7 +466,7 @@ a6fMcOaXDaWvAOvNk301FRFepk49dWj2VNcnpJbWpWPfs4ilbwHS+CYqd0XpP1p0
         // Allow generous leeway since we're testing timing, not expiry
         validation.leeway = 120;
 
-        let key = DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_KEY).unwrap();
+        let key = DecodingKey::from_rsa_pem(&TEST_KEYS.public_pem).unwrap();
         let token_data =
             jsonwebtoken::decode::<GitHubAppClaims>(&jwt, &key, &validation).unwrap();
 
