@@ -26,8 +26,10 @@ use crate::components::{
     DatePicker, DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
     LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton, StyledSelect,
+    ToggleButton,
 };
 use crate::pages::issues::issue_list::NewIssueModal;
+use crate::server_fns::activities::list_issue_activities;
 use crate::server_fns::comments::create_comment;
 use crate::server_fns::issues::{get_issue, list_issues, set_issue_labels, update_issue};
 use crate::server_fns::labels::list_labels;
@@ -38,7 +40,7 @@ use crate::server_fns::team::list_workspace_members;
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
 use crate::types::{IssueNavState, WorkspaceMember};
 use crate::utils::relative_time::{format_datetime, relative_time};
-use trakkt_types::models::{Comment, IssueWithDetails};
+use trakkt_types::models::{Comment, IssueActivity, IssueWithDetails};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared kode theme builder
@@ -363,17 +365,12 @@ fn IssueDetailContent(
                 // ── Divider ────────────────────────────────────────────
                 <div class="border-t border-border my-6"></div>
 
-                // ── Comments ───────────────────────────────────────────
-                {move || {
-                    let c = comments.get();
-                    view! {
-                        <CommentsSection
-                            team_key=initial.get_untracked().team_key.clone()
-                            number=number
-                            comments=c
-                        />
-                    }
-                }}
+                // ── Activity timeline (activities + comments merged) ───
+                <IssueTimeline
+                    team_key=initial.get_untracked().team_key.clone()
+                    number=number
+                    comments=comments
+                />
 
                 // ── Footer: timestamps ────────────────────────────────
                 {move || {
@@ -1766,67 +1763,345 @@ fn AddRelationPicker(
 // ─────────────────────────────────────────────────────────────────────────────
 // Comments Section
 // ─────────────────────────────────────────────────────────────────────────────
+// Issue Timeline (activities + comments merged chronologically)
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Comments section with threaded display and new comment form.
+/// A single entry in the timeline — either an activity or a comment.
+#[derive(Clone)]
+enum TimelineEntry {
+    Activity(IssueActivity),
+    Comment(Comment),
+}
+
+impl TimelineEntry {
+    /// Sort key — normalized ISO timestamp for correct chronological ordering.
+    /// Activity timestamps from Postgres use space separator; comments use T.
+    fn sort_key(&self) -> String {
+        match self {
+            TimelineEntry::Activity(a) => a.created_at.replace(' ', "T"),
+            TimelineEntry::Comment(c) => c.created_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Filter mode for the timeline.
+#[derive(Clone, Copy, PartialEq)]
+enum TimelineFilter {
+    All,
+    CommentsOnly,
+}
+
+/// Activity timeline that merges activities and comments chronologically.
+///
+/// Activities are fetched reactively via `list_issue_activities`, using the
+/// `activities_version` signal from SyncStore as a refetch trigger. Comments
+/// come from the SyncStore (already reactive).
 #[component]
-fn CommentsSection(
+fn IssueTimeline(
     team_key: String,
     number: i32,
-    comments: Vec<Comment>,
+    comments: Signal<Vec<Comment>>,
 ) -> impl IntoView {
-    // Group comments into top-level and replies
-    let top_level: Vec<Comment> = comments
-        .iter()
-        .filter(|c| c.parent_id.is_none())
-        .cloned()
-        .collect();
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+    let (filter, set_filter) = signal(TimelineFilter::All);
 
-    let replies: Vec<Comment> = comments
-        .iter()
-        .filter(|c| c.parent_id.is_some())
-        .cloned()
-        .collect();
+    // Activities version from SyncStore — bumps on WebSocket activity events
+    let activities_version = Signal::derive(move || {
+        sync_store.map(|s| s.activities_version().get()).unwrap_or(0)
+    });
 
-    let comment_count = comments.len();
+    // Fetch activities reactively, re-fetching when version bumps
+    let tk = team_key.clone();
+    let activities_resource = Resource::new(
+        move || (tk.clone(), number, activities_version.get()),
+        move |(tk, num, _version)| async move {
+            list_issue_activities(tk, num).await
+        },
+    );
+
+    // Fetch workspace members for actor name resolution
+    let members_resource = LocalResource::new(list_workspace_members);
+    let members = RwSignal::new(Vec::<WorkspaceMember>::new());
+
+    Effect::new(move || {
+        if let Some(Ok(loaded)) = members_resource.get() {
+            members.set(loaded);
+        }
+    });
+
+    let tk_for_form = team_key.clone();
 
     view! {
         <div>
-            <h2 class="text-sm font-medium text-foreground mb-4">
-                {format!("Comments ({comment_count})")}
-            </h2>
+            // ── Header with filter toggle ─────────────────────────────
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-sm font-medium text-foreground">
+                    "Activity"
+                </h2>
+                <div class="flex items-center gap-1 bg-secondary/50 rounded-md p-0.5">
+                    <ToggleButton
+                        variant=Signal::derive(move || {
+                            if filter.get() == TimelineFilter::All {
+                                ButtonVariant::PillActive
+                            } else {
+                                ButtonVariant::Pill
+                            }
+                        })
+                        size=ButtonSize::Pill
+                        on:click=move |_| set_filter.set(TimelineFilter::All)
+                    >
+                        "All"
+                    </ToggleButton>
+                    <ToggleButton
+                        variant=Signal::derive(move || {
+                            if filter.get() == TimelineFilter::CommentsOnly {
+                                ButtonVariant::PillActive
+                            } else {
+                                ButtonVariant::Pill
+                            }
+                        })
+                        size=ButtonSize::Pill
+                        on:click=move |_| set_filter.set(TimelineFilter::CommentsOnly)
+                    >
+                        "Comments only"
+                    </ToggleButton>
+                </div>
+            </div>
 
-            // ── Comment list ───────────────────────────────────────────
-            <div class="space-y-4">
-                {top_level.into_iter().map(|comment| {
-                    let comment_id = comment.comment_id.clone();
-                    let comment_replies: Vec<Comment> = replies
+            // ── Timeline entries ───────────────────────────────────────
+            <div class="space-y-3">
+                {move || {
+                    let current_filter = filter.get();
+                    let current_comments = comments.get();
+
+                    // Build timeline entries
+                    let mut entries: Vec<TimelineEntry> = Vec::new();
+
+                    // Add top-level comments (exclude replies — they render nested)
+                    let top_level_comments: Vec<Comment> = current_comments
                         .iter()
-                        .filter(|r| r.parent_id.as_deref() == Some(&comment_id))
+                        .filter(|c| c.parent_id.is_none())
                         .cloned()
                         .collect();
-                    view! {
-                        <CommentItem comment=comment/>
-                        // ── Threaded replies ───────────────────────────
-                        {if !comment_replies.is_empty() {
-                            Some(view! {
-                                <div class="ml-10 space-y-4">
-                                    {comment_replies.into_iter().map(|reply| {
-                                        view! { <CommentItem comment=reply/> }
-                                    }).collect_view()}
-                                </div>
-                            })
-                        } else {
-                            None
-                        }}
+                    let replies: Vec<Comment> = current_comments
+                        .iter()
+                        .filter(|c| c.parent_id.is_some())
+                        .cloned()
+                        .collect();
+
+                    for comment in &top_level_comments {
+                        entries.push(TimelineEntry::Comment(comment.clone()));
                     }
-                }).collect_view()}
+
+                    // Add activities (skip comment_added — the comment itself appears)
+                    if current_filter == TimelineFilter::All
+                        && let Some(Ok(activities)) = activities_resource.get()
+                    {
+                        entries.extend(
+                            activities.into_iter()
+                                .filter(|a| a.action_type != "comment_added")
+                                .map(TimelineEntry::Activity)
+                        );
+                    }
+
+                    // Sort by timestamp
+                    entries.sort_by_key(|e| e.sort_key());
+
+                    // Render
+                    entries.into_iter().map(|entry| {
+                        match entry {
+                            TimelineEntry::Comment(comment) => {
+                                let comment_id = comment.comment_id.clone();
+                                let comment_replies: Vec<Comment> = replies
+                                    .iter()
+                                    .filter(|r| r.parent_id.as_deref() == Some(&comment_id))
+                                    .cloned()
+                                    .collect();
+                                view! {
+                                    <div>
+                                        <CommentItem comment=comment/>
+                                        // Threaded replies
+                                        {if !comment_replies.is_empty() {
+                                            Some(view! {
+                                                <div class="ml-10 space-y-3 mt-3">
+                                                    {comment_replies.into_iter().map(|reply| {
+                                                        view! { <CommentItem comment=reply/> }
+                                                    }).collect_view()}
+                                                </div>
+                                            })
+                                        } else {
+                                            None
+                                        }}
+                                    </div>
+                                }.into_any()
+                            }
+                            TimelineEntry::Activity(activity) => {
+                                let name = members.get_untracked()
+                                    .iter()
+                                    .find(|m| m.user_id == activity.actor_id)
+                                    .and_then(|m| m.name.clone())
+                                    .unwrap_or_else(|| "Someone".to_string());
+                                view! {
+                                    <ActivityEntry
+                                        activity=activity
+                                        actor_name=name
+                                    />
+                                }.into_any()
+                            }
+                        }
+                    }).collect_view()
+                }}
             </div>
 
             // ── New comment form ───────────────────────────────────────
-            <NewCommentForm team_key=team_key.clone() number=number/>
+            <NewCommentForm team_key=tk_for_form number=number/>
         </div>
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Activity Entry (compact single-line with icon)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Render a single activity entry as a compact line:
+/// `[icon] Actor name  action description  · relative time`
+#[component]
+fn ActivityEntry(
+    activity: IssueActivity,
+    actor_name: String,
+) -> impl IntoView {
+    let description = format_activity_description(&activity);
+    let timestamp = relative_time(&activity.created_at);
+    let icon = activity_icon(&activity.action_type);
+
+    view! {
+        <div class="flex items-center gap-2 py-1 text-xs text-muted-foreground">
+            <span class="shrink-0 w-5 h-5 flex items-center justify-center">
+                {icon}
+            </span>
+            <span class="font-medium text-foreground/80">{actor_name}</span>
+            <span>{description}</span>
+            <span class="shrink-0">{format!("\u{b7} {timestamp}")}</span>
+        </div>
+    }
+}
+
+/// Map activity action_type to a phosphor icon view.
+fn activity_icon(action_type: &str) -> leptos::prelude::AnyView {
+    match action_type {
+        "created" => view! { <Icon icon=phosphor_leptos::PLUS_CIRCLE size="14px"/> }.into_any(),
+        "status_changed" => view! { <Icon icon=phosphor_leptos::CIRCLE_DASHED size="14px"/> }.into_any(),
+        "priority_changed" => view! { <Icon icon=phosphor_leptos::CELL_SIGNAL_FULL size="14px"/> }.into_any(),
+        "assignee_changed" => view! { <Icon icon=phosphor_leptos::USER size="14px"/> }.into_any(),
+        "title_changed" | "description_changed" => view! { <Icon icon=phosphor_leptos::PENCIL_SIMPLE size="14px"/> }.into_any(),
+        "label_added" | "label_removed" => view! { <Icon icon=phosphor_leptos::TAG size="14px"/> }.into_any(),
+        "relation_added" => view! { <Icon icon=phosphor_leptos::LINK size="14px"/> }.into_any(),
+        "relation_removed" => view! { <Icon icon=phosphor_leptos::LINK_BREAK size="14px"/> }.into_any(),
+        "project_changed" => view! { <Icon icon=phosphor_leptos::BRIEFCASE size="14px"/> }.into_any(),
+        "milestone_changed" => view! { <Icon icon=phosphor_leptos::FLAG size="14px"/> }.into_any(),
+        "due_date_changed" => view! { <Icon icon=phosphor_leptos::CALENDAR_BLANK size="14px"/> }.into_any(),
+        "parent_changed" => view! { <Icon icon=phosphor_leptos::TREE_STRUCTURE size="14px"/> }.into_any(),
+        "moved_to_team" => view! { <Icon icon=phosphor_leptos::ARROWS_LEFT_RIGHT size="14px"/> }.into_any(),
+        "estimate_changed" => view! { <Icon icon=phosphor_leptos::GAUGE size="14px"/> }.into_any(),
+        _ => view! { <Icon icon=phosphor_leptos::CLOCK_COUNTER_CLOCKWISE size="14px"/> }.into_any(),
+    }
+}
+
+/// Format a human-readable description from an activity's action_type and values.
+fn format_activity_description(activity: &IssueActivity) -> String {
+    match activity.action_type.as_str() {
+        "created" => "created this issue".to_string(),
+        "status_changed" => {
+            match (&activity.old_value, &activity.new_value) {
+                (Some(old), Some(new)) => format!("changed status from {old} to {new}"),
+                (None, Some(new)) => format!("set status to {new}"),
+                _ => "changed status".to_string(),
+            }
+        }
+        "priority_changed" => {
+            match (&activity.old_value, &activity.new_value) {
+                (Some(old), Some(new)) => format!("changed priority from {old} to {new}"),
+                (None, Some(new)) => format!("set priority to {new}"),
+                _ => "changed priority".to_string(),
+            }
+        }
+        "assignee_changed" => {
+            match (&activity.old_value, &activity.new_value) {
+                (Some(old), Some(new)) => format!("reassigned from {old} to {new}"),
+                (None, Some(new)) => format!("assigned to {new}"),
+                (Some(old), None) => format!("unassigned {old}"),
+                _ => "changed assignee".to_string(),
+            }
+        }
+        "title_changed" => "changed the title".to_string(),
+        "description_changed" => "updated the description".to_string(),
+        "label_added" => {
+            match &activity.new_value {
+                Some(label) => format!("added label {label}"),
+                None => "added a label".to_string(),
+            }
+        }
+        "label_removed" => {
+            match &activity.old_value {
+                Some(label) => format!("removed label {label}"),
+                None => "removed a label".to_string(),
+            }
+        }
+        "relation_added" => "added a relation".to_string(),
+        "relation_removed" => "removed a relation".to_string(),
+        "project_changed" => {
+            match (&activity.old_value, &activity.new_value) {
+                (Some(old), Some(new)) => format!("moved from project {old} to {new}"),
+                (None, Some(new)) => format!("added to project {new}"),
+                (Some(old), None) => format!("removed from project {old}"),
+                _ => "changed project".to_string(),
+            }
+        }
+        "milestone_changed" => {
+            match (&activity.old_value, &activity.new_value) {
+                (Some(old), Some(new)) => format!("changed milestone from {old} to {new}"),
+                (None, Some(new)) => format!("set milestone to {new}"),
+                (Some(old), None) => format!("removed milestone {old}"),
+                _ => "changed milestone".to_string(),
+            }
+        }
+        "due_date_changed" => {
+            match (&activity.old_value, &activity.new_value) {
+                (Some(_old), Some(new)) => format!("changed due date to {new}"),
+                (None, Some(new)) => format!("set due date to {new}"),
+                (Some(_old), None) => "removed due date".to_string(),
+                _ => "changed due date".to_string(),
+            }
+        }
+        "parent_changed" => {
+            match (&activity.old_value, &activity.new_value) {
+                (Some(_), Some(new)) => format!("changed parent to {new}"),
+                (None, Some(new)) => format!("set parent to {new}"),
+                (Some(_), None) => "removed parent".to_string(),
+                _ => "changed parent".to_string(),
+            }
+        }
+        "moved_to_team" => {
+            match &activity.new_value {
+                Some(team) => format!("moved to team {team}"),
+                None => "moved to another team".to_string(),
+            }
+        }
+        "estimate_changed" => {
+            match (&activity.old_value, &activity.new_value) {
+                (Some(old), Some(new)) => format!("changed estimate from {old} to {new}"),
+                (None, Some(new)) => format!("set estimate to {new}"),
+                (Some(_), None) => "removed estimate".to_string(),
+                _ => "changed estimate".to_string(),
+            }
+        }
+        other => format!("performed action: {other}"),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Comment Item
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// A single comment with avatar, author name, timestamp, and body.
 #[component]
