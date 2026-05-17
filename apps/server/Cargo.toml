@@ -11,6 +11,7 @@ path = "src/main.rs"
 trakkt-core = { workspace = true }
 trakkt-auth = { workspace = true }
 trakkt-api = { workspace = true }
+trakkt-github = { workspace = true }
 trakkt-types = { workspace = true }
 trakkt-ui = { workspace = true, features = ["ssr"] }
 leptos = "0.8"

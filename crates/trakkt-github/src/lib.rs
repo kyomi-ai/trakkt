@@ -10,6 +10,7 @@
 
 pub mod patterns;
 pub mod schema;
+pub mod webhook;
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};

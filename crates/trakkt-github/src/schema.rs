@@ -195,12 +195,13 @@ pub async fn create_installation(
     let now = sql_compat::now(is_pg);
     let installation_id = uuid::Uuid::new_v4().to_string();
     let target_repos_json = target_repos.map(|v| v.to_string());
+    let repos_cast = sql_compat::cast_to_json(is_pg, "$7");
 
     let sql = format!(
         "INSERT INTO github_installations \
          (installation_id, workspace_id, github_app_id, github_installation_id, \
           account_login, account_type, target_repos, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, {now})"
+         VALUES ($1, $2, $3, $4, $5, $6, {repos_cast}, {now})"
     );
     trakkt_core::db_execute!(
         db, &sql,
@@ -251,6 +252,22 @@ pub async fn suspend_installation(
         "UPDATE github_installations SET suspended_at = {now} WHERE installation_id = $1"
     );
     trakkt_core::db_execute!(db, &sql, installation_id)?;
+    Ok(())
+}
+
+/// Update the target_repos JSONB for an installation.
+pub async fn update_installation_repos(
+    db: &DbPool,
+    installation_id: &str,
+    target_repos: Option<&serde_json::Value>,
+) -> trakkt_core::Result<()> {
+    let is_pg = db.is_postgres();
+    let target_repos_json = target_repos.map(|v| v.to_string());
+    let repos_cast = sql_compat::cast_to_json(is_pg, "$1");
+    let sql = format!(
+        "UPDATE github_installations SET target_repos = {repos_cast} WHERE installation_id = $2"
+    );
+    trakkt_core::db_execute!(db, &sql, &target_repos_json, installation_id)?;
     Ok(())
 }
 
@@ -381,12 +398,13 @@ pub async fn create_event(
     let now = sql_compat::now(is_pg);
     let event_id = uuid::Uuid::new_v4().to_string();
     let payload_json = payload_summary.map(|v| v.to_string());
+    let payload_cast = sql_compat::cast_to_json(is_pg, "$6");
 
     let sql = format!(
         "INSERT INTO github_events \
          (event_id, github_delivery_id, installation_id, event_type, action, \
           payload_summary, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, {now})"
+         VALUES ($1, $2, $3, $4, $5, {payload_cast}, {now})"
     );
     trakkt_core::db_execute!(
         db, &sql,
