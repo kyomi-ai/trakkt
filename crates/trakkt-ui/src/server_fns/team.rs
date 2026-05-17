@@ -162,6 +162,18 @@ pub async fn remove_member(user_id: String) -> Result<(), ServerFnError> {
     .await
     .into_sfn()?;
 
+    // Sync seat count with Stripe after successful removal.
+    if let Some(stripe) = &ac.ctx.stripe
+        && let Err(e) = trakkt_auth::billing_service::sync_seat_count(
+            ac.db(),
+            stripe,
+            &ac.ws_id,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "Failed to sync seat count after member removal");
+    }
+
     Ok(())
 }
 

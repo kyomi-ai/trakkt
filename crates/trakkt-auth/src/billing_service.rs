@@ -6,6 +6,8 @@
 use trakkt_core::DbPool;
 use trakkt_core::sql_compat;
 
+use crate::stripe_service::StripeService;
+
 /// Returns `true` if Stripe billing is enabled (STRIPE_SECRET_KEY is set).
 pub fn billing_enabled() -> bool {
     std::env::var("STRIPE_SECRET_KEY").is_ok()
@@ -36,4 +38,82 @@ pub async fn get_billable_user_count(db: &DbPool, workspace_id: &str) -> trakkt_
     );
     let count: i64 = trakkt_core::db_fetch_scalar!(db, i64, &sql, workspace_id)?;
     Ok(count)
+}
+
+// ─── Seat sync ─────────────────────────────────────────────────────────────
+
+/// Minimal row for fetching a workspace's Stripe subscription ID.
+#[derive(sqlx::FromRow)]
+struct WorkspaceSubscription {
+    stripe_subscription_id: Option<String>,
+}
+
+/// Sync the Stripe subscription quantity with the actual workspace member count.
+///
+/// No-op if the workspace has no active subscription. Only calls Stripe API
+/// if the local count differs from Stripe's quantity.
+pub async fn sync_seat_count(
+    db: &DbPool,
+    stripe: &StripeService,
+    workspace_id: &str,
+) -> trakkt_core::Result<()> {
+    // 1. Get workspace's stripe_subscription_id
+    let row = trakkt_core::db_fetch_optional!(
+        db, WorkspaceSubscription,
+        "SELECT stripe_subscription_id FROM workspaces WHERE workspace_id = $1",
+        workspace_id
+    )?;
+
+    let subscription_id = match row.and_then(|r| r.stripe_subscription_id) {
+        Some(id) => id,
+        // No subscription — free/solo workspace, nothing to sync
+        None => return Ok(()),
+    };
+
+    // 2. Count active workspace members
+    let user_count = get_billable_user_count(db, workspace_id).await?;
+
+    // 3. Get current Stripe quantity
+    let stripe_quantity = match stripe.get_subscription_quantity(&subscription_id).await {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::warn!(
+                workspace_id,
+                error = %e,
+                "Failed to get subscription quantity from Stripe"
+            );
+            return Ok(());
+        }
+    };
+
+    // 4. If different → update Stripe and local user_limit
+    if user_count as u64 == stripe_quantity {
+        return Ok(());
+    }
+
+    match stripe.update_seat_count(&subscription_id, user_count as u64).await {
+        Ok(()) => {
+            let is_pg = db.is_postgres();
+            let now = sql_compat::now(is_pg);
+            let sql = format!(
+                "UPDATE workspaces SET user_limit = $1, updated_at = {now} WHERE workspace_id = $2"
+            );
+            trakkt_core::db_execute!(db, &sql, user_count as i32, workspace_id)?;
+            tracing::info!(
+                workspace_id,
+                old_quantity = stripe_quantity,
+                new_quantity = user_count,
+                "Synced seat count with Stripe"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                workspace_id,
+                error = %e,
+                "Failed to sync seat count with Stripe"
+            );
+        }
+    }
+
+    Ok(())
 }

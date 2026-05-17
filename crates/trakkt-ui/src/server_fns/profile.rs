@@ -143,6 +143,12 @@ pub async fn accept_invitation(invitation_id: String) -> Result<(), ServerFnErro
     let auth = extract_auth().await?;
     let ctx = extract_context()?;
 
+    // Fetch the invitation first to capture workspace_id for billing sync.
+    let invitation = trakkt_auth::workspace_service::get_invitation(&ctx.db, &invitation_id)
+        .await
+        .into_sfn()?
+        .ok_or_else(|| ServerFnError::new("Invitation not found"))?;
+
     trakkt_auth::workspace_service::accept_invitation_for_user(
         &ctx.db,
         &invitation_id,
@@ -150,6 +156,18 @@ pub async fn accept_invitation(invitation_id: String) -> Result<(), ServerFnErro
     )
     .await
     .into_sfn()?;
+
+    // Sync seat count with Stripe after successful acceptance.
+    if let Some(stripe) = &ctx.stripe
+        && let Err(e) = trakkt_auth::billing_service::sync_seat_count(
+            &ctx.db,
+            stripe,
+            &invitation.workspace_id,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "Failed to sync seat count after invite acceptance");
+    }
 
     Ok(())
 }
