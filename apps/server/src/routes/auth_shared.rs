@@ -46,16 +46,14 @@ struct ApiTokenLookupRow {
 
 /// Try to authenticate via JWT (OAuth 2.0) or legacy API token.
 ///
-/// Returns `None` if neither method succeeds. JWT is tried first because it
-/// produces a richer context (workspace context, user active/verified checks).
-/// The API token path is a simple hash lookup — kept for backward
-/// compatibility with existing API tokens.
+/// Returns `None` if neither method succeeds. Checks in order:
+/// 1. `Authorization: Bearer <token>` header (JWT or API token)
+/// 2. `access_token` cookie (session JWT from browser)
 pub async fn resolve_auth(headers: &HeaderMap, state: &AppState) -> Option<ResolvedAuth> {
-    let auth_header = headers.get("authorization")?.to_str().ok()?;
-    let token = auth_header.strip_prefix("Bearer ")?;
+    let token = extract_token(headers)?;
 
     // 1. Try JWT validation first (OAuth 2.0 path).
-    if let Ok(decoded) = trakkt_auth::jwt::validate_token(token, &state.config.jwt_secret) {
+    if let Ok(decoded) = trakkt_auth::jwt::validate_token(&token, &state.config.jwt_secret) {
         let user_id = decoded
             .claims
             .extra
@@ -102,7 +100,7 @@ pub async fn resolve_auth(headers: &HeaderMap, state: &AppState) -> Option<Resol
     }
 
     // 2. Legacy API token path (SHA-256 hash lookup).
-    authenticate_bearer_token(token, &state.db).await
+    authenticate_bearer_token(&token, &state.db).await
 }
 
 /// Validate a raw Bearer token against the `api_tokens` table (legacy path).
@@ -170,4 +168,28 @@ async fn authenticate_bearer_token(
         user_id: row.user_id,
         scopes,
     })
+}
+
+/// Extract a bearer token from the Authorization header or `access_token` cookie.
+fn extract_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(auth_header) = headers.get("authorization") {
+        let value = auth_header.to_str().ok()?;
+        if let Some(token) = value.strip_prefix("Bearer ") {
+            return Some(token.to_string());
+        }
+    }
+
+    let cookie_name = &trakkt_core::constants::get().cookies.access_token_name;
+    let cookie_prefix = format!("{cookie_name}=");
+    if let Some(cookie_header) = headers.get("cookie") {
+        let cookies = cookie_header.to_str().ok()?;
+        for cookie in cookies.split(';') {
+            let cookie = cookie.trim();
+            if let Some(token) = cookie.strip_prefix(&cookie_prefix) {
+                return Some(token.to_string());
+            }
+        }
+    }
+
+    None
 }
