@@ -213,13 +213,60 @@ async fn github_webhook(
         "installation_repositories.added" | "installation_repositories.removed" => {
             Some(handle_installation_repos_changed(&state, &installation, &payload).await)
         }
-        // Events for TRA-91 queue — leave processed_at = NULL
+
+        // Pull request events — extract refs and upsert links
+        "pull_request.opened"
+        | "pull_request.synchronize"
+        | "pull_request.closed"
+        | "pull_request.reopened"
+        | "pull_request.edited"
+        | "pull_request.ready_for_review"
+        | "pull_request.converted_to_draft" => {
+            if let Some(inst) = &installation {
+                Some(
+                    trakkt_github::events::process_pull_request(
+                        &state.db,
+                        inst,
+                        action.as_deref().unwrap_or(""),
+                        &payload,
+                    )
+                    .await,
+                )
+            } else {
+                tracing::warn!(event = %event_key, "pull_request event with no installation — marking processed");
+                Some(Ok(()))
+            }
+        }
+
+        // Push events — extract refs from branch names and commit messages
+        "push" => {
+            if let Some(inst) = &installation {
+                Some(trakkt_github::events::process_push(&state.db, inst, &payload).await)
+            } else {
+                tracing::warn!(event = %event_key, "push event with no installation — marking processed");
+                Some(Ok(()))
+            }
+        }
+
+        // GitHub issue events — not yet implemented, mark as processed
+        e if e.starts_with("issues.") => {
+            tracing::info!(event = %event_key, "GitHub issue event recorded — ingest not yet implemented");
+            if let Err(e) = schema::mark_event_processed(&state.db, &event_id).await {
+                tracing::error!(event_id = %event_id, error = %e, "Failed to mark event as processed");
+            }
+            None // Already marked processed inline
+        }
+
+        // Unhandled events — log and mark processed
         _ => {
-            tracing::info!(
+            tracing::debug!(
                 event = %event_key,
                 delivery_id = %delivery_id,
-                "GitHub event recorded — awaiting processor (TRA-91)"
+                "Unhandled GitHub event — marking processed"
             );
+            if let Err(e) = schema::mark_event_processed(&state.db, &event_id).await {
+                tracing::error!(event_id = %event_id, error = %e, "Failed to mark event as processed");
+            }
             None
         }
     };
@@ -238,7 +285,7 @@ async fn github_webhook(
                 tracing::error!(event_id = %event_id, error = %mark_err, "Failed to mark event as failed");
             }
         }
-        None => {} // Not handled here — left for TRA-91 queue worker
+        None => {} // Event already marked processed inline
     }
 
     // Always return 200 — GitHub retries on non-200 status codes.

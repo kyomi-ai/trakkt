@@ -352,11 +352,12 @@ pub struct CreateLinkParams<'a> {
     pub close_intent: bool,
 }
 
-/// Create or retrieve an existing GitHub link for an issue.
+/// Upsert a GitHub link — create or update on conflict.
 ///
-/// Uses ON CONFLICT DO NOTHING on the dedup index (workspace_id, link_type, repo_full_name,
-/// ref_identifier). If the link already exists, returns the existing row.
-pub async fn create_link(
+/// On conflict (same workspace, issue, link_type, repo, ref_identifier),
+/// update the mutable fields: title, state, url, author_login, close_intent,
+/// github_id, github_node_id. Returns the resulting row.
+pub async fn upsert_link(
     db: &DbPool,
     params: &CreateLinkParams<'_>,
 ) -> trakkt_core::Result<GitHubLink> {
@@ -370,7 +371,16 @@ pub async fn create_link(
           github_id, github_node_id, repo_full_name, ref_identifier, \
           title, state, url, author_login, close_intent, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, {now}, {now}) \
-         ON CONFLICT (workspace_id, link_type, repo_full_name, ref_identifier) DO NOTHING"
+         ON CONFLICT (workspace_id, issue_id, link_type, repo_full_name, ref_identifier) \
+         DO UPDATE SET \
+            title = EXCLUDED.title, \
+            state = EXCLUDED.state, \
+            url = EXCLUDED.url, \
+            author_login = EXCLUDED.author_login, \
+            close_intent = EXCLUDED.close_intent, \
+            github_id = EXCLUDED.github_id, \
+            github_node_id = EXCLUDED.github_node_id, \
+            updated_at = {now}"
     );
     trakkt_core::db_execute!(
         db, &sql,
@@ -379,7 +389,7 @@ pub async fn create_link(
         params.title, params.state, params.url, params.author_login, params.close_intent
     )?;
 
-    // Fetch the row — either newly created or existing (conflict case)
+    // Fetch the row — either newly created or updated (conflict case).
     let row = trakkt_core::db_fetch_one!(
         db,
         GitHubLink,
@@ -389,10 +399,65 @@ pub async fn create_link(
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM github_links \
-         WHERE workspace_id = $1 AND link_type = $2 AND repo_full_name = $3 AND ref_identifier = $4",
-        params.workspace_id, params.link_type, params.repo_full_name, params.ref_identifier
+         WHERE workspace_id = $1 AND issue_id = $2 AND link_type = $3 \
+               AND repo_full_name = $4 AND ref_identifier = $5",
+        params.workspace_id, params.issue_id, params.link_type,
+        params.repo_full_name, params.ref_identifier
     )?;
     Ok(row)
+}
+
+/// Delete all links for a specific GitHub object (by type+repo+ref_identifier) in a
+/// workspace where the issue_id is NOT in the provided keep list.
+///
+/// Used when a PR is edited and refs are removed — the keep list contains the
+/// issue IDs still referenced, and any other links for this PR are deleted.
+/// Returns the number of rows deleted.
+pub async fn delete_links_not_matching_issues(
+    db: &DbPool,
+    workspace_id: &str,
+    link_type: &str,
+    repo_full_name: &str,
+    ref_identifier: &str,
+    keep_issue_ids: &[String],
+) -> trakkt_core::Result<u64> {
+    if keep_issue_ids.is_empty() {
+        // Delete all links for this object in this workspace
+        let result = trakkt_core::db_execute!(
+            db,
+            "DELETE FROM github_links \
+             WHERE workspace_id = $1 AND link_type = $2 \
+                   AND repo_full_name = $3 AND ref_identifier = $4",
+            workspace_id, link_type, repo_full_name, ref_identifier
+        )?;
+        return Ok(result.rows_affected());
+    }
+
+    // Build IN clause for the keep list.
+    let (in_clause, _) = trakkt_core::db::in_clause_placeholders(keep_issue_ids.len(), 5);
+    let sql = format!(
+        "DELETE FROM github_links \
+         WHERE workspace_id = $1 AND link_type = $2 \
+               AND repo_full_name = $3 AND ref_identifier = $4 \
+               AND issue_id NOT IN {in_clause}"
+    );
+
+    // Dynamically bind the keep_issue_ids. Use db_with_pool! since the
+    // number of binds is variable and the macros expect a fixed list.
+    let rows_affected: u64 = trakkt_core::db_with_pool!(db, |pool| {
+        let mut query = sqlx::query(&sql)
+            .bind(workspace_id)
+            .bind(link_type)
+            .bind(repo_full_name)
+            .bind(ref_identifier);
+        for id in keep_issue_ids {
+            query = query.bind(id);
+        }
+        let result = query.execute(pool).await?;
+        Ok::<u64, sqlx::Error>(result.rows_affected())
+    })?;
+
+    Ok(rows_affected)
 }
 
 /// Update the state (and optionally title) of a GitHub link.
