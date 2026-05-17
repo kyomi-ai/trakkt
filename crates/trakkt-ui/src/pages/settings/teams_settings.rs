@@ -508,7 +508,6 @@ fn TeamEstimateCard(team: Team) -> impl IntoView {
 
     // Event handlers
     let on_scale_change = {
-        let persist = persist.clone();
         move |val: String| {
             // When disabling estimates, reset toggles to defaults
             if val.is_empty() {
@@ -522,7 +521,6 @@ fn TeamEstimateCard(team: Team) -> impl IntoView {
     };
 
     let on_allow_zero = {
-        let persist = persist.clone();
         move |val: bool| {
             set_allow_zero.set(val);
             persist();
@@ -530,7 +528,6 @@ fn TeamEstimateCard(team: Team) -> impl IntoView {
     };
 
     let on_extended = {
-        let persist = persist.clone();
         move |val: bool| {
             set_extended.set(val);
             persist();
@@ -538,7 +535,6 @@ fn TeamEstimateCard(team: Team) -> impl IntoView {
     };
 
     let on_count_unestimated = {
-        let persist = persist.clone();
         move |val: bool| {
             set_count_unestimated.set(val);
             persist();
