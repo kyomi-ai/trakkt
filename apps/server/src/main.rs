@@ -91,6 +91,10 @@ async fn serve() {
     // MCP session manager
     let mcp_sessions = trakkt_auth::mcp_session_manager::MCPSessionManager::new(kv.clone());
 
+    // Attachment storage backend
+    let attachment_storage = trakkt_auth::attachment_storage::create_storage(&config)
+        .expect("Failed to initialize attachment storage");
+
     let state = trakkt_server::state::AppState {
         db: db.clone(),
         kv: kv.clone(),
@@ -100,6 +104,7 @@ async fn serve() {
         webauthn: Arc::new(webauthn),
         ws_manager,
         mcp_sessions,
+        attachment_storage: Arc::from(attachment_storage),
     };
 
     // Register Leptos server functions

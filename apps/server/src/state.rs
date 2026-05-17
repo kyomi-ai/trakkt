@@ -3,6 +3,7 @@
 //! Shared application state passed to all axum handlers.
 
 use axum::extract::FromRef;
+use trakkt_auth::attachment_storage::AttachmentStorage;
 use trakkt_auth::mcp_session_manager::MCPSessionManager;
 use trakkt_auth::middleware::AuthState;
 use trakkt_auth::websocket::WebSocketManager;
@@ -19,6 +20,7 @@ pub struct AppState {
     pub webauthn: std::sync::Arc<Webauthn>,
     pub ws_manager: WebSocketManager,
     pub mcp_sessions: MCPSessionManager,
+    pub attachment_storage: std::sync::Arc<dyn AttachmentStorage>,
 }
 
 impl FromRef<AppState> for AuthState {

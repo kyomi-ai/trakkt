@@ -86,6 +86,9 @@ trakkt-github = { path = "crates/trakkt-github" }
 # Async trait
 async-trait = "0.1"
 
+# S3 storage (attachments)
+rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
+
 # Concurrent data structures
 dashmap = "6"
 

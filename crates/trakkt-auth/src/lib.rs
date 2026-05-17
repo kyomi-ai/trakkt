@@ -3,6 +3,8 @@
 //! trakkt-auth — Authentication & encryption for the Trakkt backend.
 
 pub mod archive_service;
+pub mod attachment_service;
+pub mod attachment_storage;
 pub mod auth_service;
 pub mod comment_service;
 pub mod cookies;

@@ -33,5 +33,6 @@ reqwest = { workspace = true }
 aes-gcm = { workspace = true }
 lettre = { workspace = true }
 totp-rs = { workspace = true }
+rust-s3 = { workspace = true }
 [lints]
 workspace = true
