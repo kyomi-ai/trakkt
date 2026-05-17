@@ -23,6 +23,7 @@ pub struct AppState {
     pub mcp_sessions: MCPSessionManager,
     pub attachment_storage: std::sync::Arc<dyn AttachmentStorage>,
     pub stripe: Option<StripeService>,
+    pub github_client: Option<std::sync::Arc<trakkt_github::GitHubClient>>,
 }
 
 impl FromRef<AppState> for AuthState {

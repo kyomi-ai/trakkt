@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 trakkt-core = { workspace = true }
 trakkt-auth = { workspace = true }
+trakkt-types = { workspace = true }
 reqwest = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }

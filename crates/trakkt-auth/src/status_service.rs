@@ -185,6 +185,25 @@ pub async fn create_status(
     Ok(row.into_dto())
 }
 
+/// Get the first status in a given category for a workspace.
+pub async fn get_status_by_category(
+    db: &DbPool,
+    workspace_id: &str,
+    category: &str,
+) -> trakkt_core::Result<Option<Status>> {
+    let row = trakkt_core::db_fetch_optional!(
+        db,
+        StatusRow,
+        "SELECT status_id, workspace_id, team_id, name, category, position, color, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM statuses WHERE workspace_id = $1 AND category = $2 \
+         ORDER BY position LIMIT 1",
+        workspace_id,
+        category
+    )?;
+    Ok(row.map(StatusRow::into_dto))
+}
+
 /// Seed the 6 default global statuses for a workspace.
 ///
 /// Uses deterministic IDs (`{workspace_id}::backlog`, etc.) and conflict-safe

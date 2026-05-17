@@ -2,8 +2,9 @@
 
 //! Trakkt Rust backend — entry point.
 
-use trakkt_core::Config;
 use std::sync::Arc;
+
+use trakkt_core::Config;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -103,6 +104,14 @@ async fn serve() {
         tracing::info!("Stripe billing disabled (no STRIPE_SECRET_KEY)");
     }
 
+    // GitHub App client (optional — disabled when GITHUB_APP_ID is not set)
+    let github_client = trakkt_github::from_env().map(Arc::new);
+    if github_client.is_some() {
+        tracing::info!("GitHub App integration enabled");
+    } else {
+        tracing::info!("GitHub App integration disabled (GITHUB_APP_ID not set)");
+    }
+
     let state = trakkt_server::state::AppState {
         db: db.clone(),
         kv: kv.clone(),
@@ -114,6 +123,7 @@ async fn serve() {
         mcp_sessions,
         attachment_storage: Arc::from(attachment_storage),
         stripe,
+        github_client,
     };
 
     // Register Leptos server functions

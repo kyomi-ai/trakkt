@@ -460,6 +460,79 @@ pub async fn delete_links_not_matching_issues(
     Ok(rows_affected)
 }
 
+/// Find all PR links for a specific PR (by workspace, repo, and PR number).
+///
+/// Used during transition processing to find all issues linked to a given PR.
+pub async fn list_pr_links_by_ref(
+    db: &DbPool,
+    workspace_id: &str,
+    repo_full_name: &str,
+    ref_identifier: &str,
+) -> trakkt_core::Result<Vec<GitHubLink>> {
+    let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
+        db,
+        GitHubLink,
+        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
+                github_id, github_node_id, repo_full_name, ref_identifier, \
+                title, state, url, author_login, close_intent, \
+                CAST(created_at AS TEXT) AS created_at, \
+                CAST(updated_at AS TEXT) AS updated_at \
+         FROM github_links \
+         WHERE workspace_id = $1 AND link_type = $2 \
+               AND repo_full_name = $3 AND ref_identifier = $4",
+        workspace_id,
+        "pull_request",
+        repo_full_name,
+        ref_identifier
+    )?;
+    Ok(rows)
+}
+
+/// Find all PR links for a specific issue that have close_intent set.
+///
+/// Used for outbound notifications when an issue is manually completed.
+pub async fn list_close_intent_links_for_issue(
+    db: &DbPool,
+    issue_id: &str,
+) -> trakkt_core::Result<Vec<GitHubLink>> {
+    let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
+        db,
+        GitHubLink,
+        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
+                github_id, github_node_id, repo_full_name, ref_identifier, \
+                title, state, url, author_login, close_intent, \
+                CAST(created_at AS TEXT) AS created_at, \
+                CAST(updated_at AS TEXT) AS updated_at \
+         FROM github_links \
+         WHERE issue_id = $1 AND link_type = $2 AND close_intent = $3",
+        issue_id,
+        "pull_request",
+        true
+    )?;
+    Ok(rows)
+}
+
+/// Look up an installation by its internal ID.
+pub async fn get_installation_by_id(
+    db: &DbPool,
+    installation_id: &str,
+) -> trakkt_core::Result<Option<GitHubInstallation>> {
+    let row = trakkt_core::db_fetch_optional!(
+        db,
+        GitHubInstallation,
+        "SELECT installation_id, workspace_id, github_app_id, github_installation_id, \
+                account_login, account_type, target_repos, \
+                access_token_encrypted, \
+                CAST(token_expires_at AS TEXT) AS token_expires_at, \
+                CAST(created_at AS TEXT) AS created_at, \
+                CAST(suspended_at AS TEXT) AS suspended_at \
+         FROM github_installations \
+         WHERE installation_id = $1",
+        installation_id
+    )?;
+    Ok(row)
+}
+
 /// Update the state (and optionally title) of a GitHub link.
 pub async fn update_link_state(
     db: &DbPool,

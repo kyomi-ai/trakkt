@@ -11,6 +11,7 @@
 pub mod events;
 pub mod patterns;
 pub mod schema;
+pub mod transitions;
 pub mod webhook;
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
