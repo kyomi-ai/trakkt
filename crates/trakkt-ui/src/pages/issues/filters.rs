@@ -833,6 +833,9 @@ pub struct FilterFieldDef {
     pub category: Option<&'static str>,
     pub operators: &'static [OperatorDef],
     pub value_kind: ValueKind,
+    /// For boolean fields, the label shown in the chip's value segment.
+    /// Non-boolean fields should set this to `None`.
+    pub chip_value_label: Option<&'static str>,
 }
 
 /// Definition of an operator for a filter field.
@@ -849,6 +852,8 @@ pub enum ValueKind {
     EnumSelect,
     /// Dynamic set loaded from SyncStore (labels, projects) — rendered with search input + checkboxes.
     DynamicSelect,
+    /// No value picker needed — the field itself is the filter (e.g. "is sub-issue").
+    Boolean,
 }
 
 // ── Day-1 field definitions ────────────────────────────────────────────────
@@ -863,6 +868,7 @@ pub const STATUS_FIELD: FilterFieldDef = FilterFieldDef {
         OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
     ],
     value_kind: ValueKind::EnumSelect,
+    chip_value_label: None,
 };
 
 pub const PRIORITY_FIELD: FilterFieldDef = FilterFieldDef {
@@ -875,6 +881,7 @@ pub const PRIORITY_FIELD: FilterFieldDef = FilterFieldDef {
         OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
     ],
     value_kind: ValueKind::EnumSelect,
+    chip_value_label: None,
 };
 
 pub const LABEL_FIELD: FilterFieldDef = FilterFieldDef {
@@ -889,6 +896,7 @@ pub const LABEL_FIELD: FilterFieldDef = FilterFieldDef {
         OperatorDef { key: "not_all_of", label_singular: "do not include", label_plural: "exclude if all" },
     ],
     value_kind: ValueKind::DynamicSelect,
+    chip_value_label: None,
 };
 
 pub const PROJECT_FIELD: FilterFieldDef = FilterFieldDef {
@@ -901,11 +909,83 @@ pub const PROJECT_FIELD: FilterFieldDef = FilterFieldDef {
         OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
     ],
     value_kind: ValueKind::DynamicSelect,
+    chip_value_label: None,
+};
+
+// ── Relation boolean field definitions (TRA-105) ─────────────────────────
+
+pub const PARENT_ISSUES_FIELD: FilterFieldDef = FilterFieldDef {
+    key: "is_parent",
+    label: "Parent issues",
+    icon: phosphor_leptos::TREE_STRUCTURE,
+    category: Some("Relations"),
+    operators: &[
+        OperatorDef { key: "any_of", label_singular: "is", label_plural: "is" },
+        OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
+    ],
+    value_kind: ValueKind::Boolean,
+    chip_value_label: Some("parent issue"),
+};
+
+pub const SUB_ISSUES_FIELD: FilterFieldDef = FilterFieldDef {
+    key: "is_sub_issue",
+    label: "Sub-issues",
+    icon: phosphor_leptos::ARROW_BEND_DOWN_RIGHT,
+    category: Some("Relations"),
+    operators: &[
+        OperatorDef { key: "any_of", label_singular: "is", label_plural: "is" },
+        OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
+    ],
+    value_kind: ValueKind::Boolean,
+    chip_value_label: Some("sub-issue"),
+};
+
+pub const BLOCKED_ISSUES_FIELD: FilterFieldDef = FilterFieldDef {
+    key: "is_blocked",
+    label: "Blocked issues",
+    icon: phosphor_leptos::PROHIBIT,
+    category: Some("Relations"),
+    operators: &[
+        OperatorDef { key: "any_of", label_singular: "is", label_plural: "is" },
+        OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
+    ],
+    value_kind: ValueKind::Boolean,
+    chip_value_label: Some("blocked"),
+};
+
+pub const BLOCKING_ISSUES_FIELD: FilterFieldDef = FilterFieldDef {
+    key: "is_blocking",
+    label: "Blocking issues",
+    icon: phosphor_leptos::HAND_PALM,
+    category: Some("Relations"),
+    operators: &[
+        OperatorDef { key: "any_of", label_singular: "is", label_plural: "is" },
+        OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
+    ],
+    value_kind: ValueKind::Boolean,
+    chip_value_label: Some("blocking"),
+};
+
+pub const HAS_RELATIONS_FIELD: FilterFieldDef = FilterFieldDef {
+    key: "has_relations",
+    label: "Issues with relations",
+    icon: phosphor_leptos::ARROWS_LEFT_RIGHT,
+    category: Some("Relations"),
+    operators: &[
+        OperatorDef { key: "any_of", label_singular: "has", label_plural: "has" },
+        OperatorDef { key: "none_of", label_singular: "has no", label_plural: "has no" },
+    ],
+    value_kind: ValueKind::Boolean,
+    chip_value_label: Some("relations"),
 };
 
 /// Returns all available filter field definitions.
 pub fn all_filter_fields() -> &'static [&'static FilterFieldDef] {
-    &[&STATUS_FIELD, &PRIORITY_FIELD, &LABEL_FIELD, &PROJECT_FIELD]
+    &[
+        &STATUS_FIELD, &PRIORITY_FIELD, &LABEL_FIELD, &PROJECT_FIELD,
+        &PARENT_ISSUES_FIELD, &SUB_ISSUES_FIELD, &BLOCKED_ISSUES_FIELD,
+        &BLOCKING_ISSUES_FIELD, &HAS_RELATIONS_FIELD,
+    ]
 }
 
 /// Look up a field definition by key.
@@ -926,8 +1006,13 @@ fn find_operator_def(field_def: &FilterFieldDef, operator_key: &str) -> Option<&
 /// passes the filter (should be included).
 pub fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
     if clause.values.is_empty() {
-        // A clause with no values selected passes everything.
-        return true;
+        // Boolean fields have no values — they match on field/operator alone.
+        // Non-boolean fields with no values selected pass everything.
+        let is_boolean = find_field_def(&clause.field)
+            .is_some_and(|def| def.value_kind == ValueKind::Boolean);
+        if !is_boolean {
+            return true;
+        }
     }
     match (clause.field.as_str(), clause.operator.as_str()) {
         ("status", "any_of") => clause.values.contains(&issue.status_id),
@@ -946,6 +1031,17 @@ pub fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
         ("label", "none_of") => !issue.labels.iter().any(|l| clause.values.contains(&l.label_id)),
         ("project", "any_of") => issue.project_id.as_ref().is_some_and(|pid| clause.values.contains(pid)),
         ("project", "none_of") => !issue.project_id.as_ref().is_some_and(|pid| clause.values.contains(pid)),
+        // Relation boolean filters (TRA-105)
+        ("is_sub_issue", "any_of") => issue.parent_identifier.is_some(),
+        ("is_sub_issue", "none_of") => issue.parent_identifier.is_none(),
+        ("is_parent", "any_of") => issue.has_children,
+        ("is_parent", "none_of") => !issue.has_children,
+        ("is_blocked", "any_of") => issue.is_blocked,
+        ("is_blocked", "none_of") => !issue.is_blocked,
+        ("is_blocking", "any_of") => issue.is_blocking,
+        ("is_blocking", "none_of") => !issue.is_blocking,
+        ("has_relations", "any_of") => issue.has_relations,
+        ("has_relations", "none_of") => !issue.has_relations,
         // Unknown field/operator — pass through (don't block issues).
         _ => true,
     }
@@ -990,6 +1086,12 @@ pub fn FilterChip(
     // Value summary display text.
     let value_summary = Memo::new(move |_| {
         let Some(c) = clause.get() else { return String::new() };
+        // Boolean fields: show a descriptive label as the value (no picker).
+        if let Some(def) = find_field_def(&c.field)
+            && def.value_kind == ValueKind::Boolean
+        {
+            return def.chip_value_label.unwrap_or(def.label).to_string();
+        }
         let count = c.values.len();
         if count == 0 {
             return "select...".to_string();
@@ -1053,7 +1155,9 @@ pub fn FilterChip(
         let op_def = field_def.and_then(|f| find_operator_def(f, &c.operator));
         match op_def {
             Some(od) => {
-                if c.values.len() <= 1 {
+                // Boolean fields always use singular label.
+                let is_boolean = field_def.is_some_and(|f| f.value_kind == ValueKind::Boolean);
+                if is_boolean || c.values.len() <= 1 {
                     od.label_singular.to_string()
                 } else {
                     od.label_plural.to_string()
@@ -1086,7 +1190,13 @@ pub fn FilterChip(
         {move || {
             let Some(c) = clause.get() else { return ().into_any() };
             let field_def = find_field_def(&c.field);
-            let field_label = field_def.map(|f| f.label).unwrap_or(&c.field);
+            let is_boolean = field_def.is_some_and(|f| f.value_kind == ValueKind::Boolean);
+            // Boolean relation fields show "Issue" as the field label segment.
+            let field_label = if is_boolean {
+                "Issue"
+            } else {
+                field_def.map(|f| f.label).unwrap_or(&c.field)
+            };
             let field_icon = field_def.map(|f| f.icon);
 
             view! {
@@ -1130,53 +1240,64 @@ pub fn FilterChip(
                         }}
                     </DropdownMenu>
 
-                    // Value segment (clickable)
-                    <div node_ref=val_trigger_ref class="inline-flex">
-                        <button
-                            type="button"
-                            class="inline-flex items-center gap-1 cursor-pointer hover:text-primary transition-colors duration-200 font-medium focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                            on:click=move |_| set_val_open.update(|o| *o = !*o)
-                        >
-                            <LabelColorDots clauses=clauses clause_index=index/>
-                            {move || value_summary.get()}
-                        </button>
-                    </div>
-                    // Value picker dropdown
-                    <DropdownMenu
-                        trigger_ref=val_trigger_ref
-                        open=Signal::derive(move || val_open.get())
-                        on_close=Callback::new(move |()| set_val_open.set(false))
-                    >
-                        {match c.field.as_str() {
-                            "status" => view! {
-                                <StatusValuePicker
-                                    clauses=clauses
-                                    clause_index=index
-                                    team_id=team_id
-                                />
-                            }.into_any(),
-                            "priority" => view! {
-                                <PriorityValuePicker
-                                    clauses=clauses
-                                    clause_index=index
-                                />
-                            }.into_any(),
-                            "label" => view! {
-                                <LabelValuePicker
-                                    clauses=clauses
-                                    clause_index=index
-                                    team_id=team_id
-                                />
-                            }.into_any(),
-                            "project" => view! {
-                                <ProjectValuePicker
-                                    clauses=clauses
-                                    clause_index=index
-                                />
-                            }.into_any(),
-                            _ => ().into_any(),
-                        }}
-                    </DropdownMenu>
+                    // Value segment — static for boolean fields, clickable for others.
+                    {if is_boolean {
+                        // Boolean fields: show value as plain text (no picker).
+                        view! {
+                            <span class="inline-flex items-center font-medium">
+                                {move || value_summary.get()}
+                            </span>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div node_ref=val_trigger_ref class="inline-flex">
+                                <button
+                                    type="button"
+                                    class="inline-flex items-center gap-1 cursor-pointer hover:text-primary transition-colors duration-200 font-medium focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                    on:click=move |_| set_val_open.update(|o| *o = !*o)
+                                >
+                                    <LabelColorDots clauses=clauses clause_index=index/>
+                                    {move || value_summary.get()}
+                                </button>
+                            </div>
+                            // Value picker dropdown
+                            <DropdownMenu
+                                trigger_ref=val_trigger_ref
+                                open=Signal::derive(move || val_open.get())
+                                on_close=Callback::new(move |()| set_val_open.set(false))
+                            >
+                                {match c.field.as_str() {
+                                    "status" => view! {
+                                        <StatusValuePicker
+                                            clauses=clauses
+                                            clause_index=index
+                                            team_id=team_id
+                                        />
+                                    }.into_any(),
+                                    "priority" => view! {
+                                        <PriorityValuePicker
+                                            clauses=clauses
+                                            clause_index=index
+                                        />
+                                    }.into_any(),
+                                    "label" => view! {
+                                        <LabelValuePicker
+                                            clauses=clauses
+                                            clause_index=index
+                                            team_id=team_id
+                                        />
+                                    }.into_any(),
+                                    "project" => view! {
+                                        <ProjectValuePicker
+                                            clauses=clauses
+                                            clause_index=index
+                                        />
+                                    }.into_any(),
+                                    _ => ().into_any(),
+                                }}
+                            </DropdownMenu>
+                        }.into_any()
+                    }}
 
                     // Remove button
                     <button
@@ -1622,12 +1743,23 @@ fn ProjectValuePicker(
 /// A "+ Add Filter" button that opens a dropdown listing available fields.
 /// Selecting a field adds a new FilterClause with default operator and empty values,
 /// then the chip's value picker opens automatically.
+///
+/// Fields with `category: None` are rendered at the top level. Fields with a
+/// category (e.g. "Relations") are grouped under a divider + section header.
 #[component]
 pub fn AddFilterMenu(
     clauses: RwSignal<Vec<FilterClause>>,
 ) -> impl IntoView {
     let (open, set_open) = signal(false);
     let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Collect unique categories in stable order (BTreeSet for deterministic sort).
+    let categories: Vec<&'static str> = all_filter_fields()
+        .iter()
+        .filter_map(|f| f.category)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     view! {
         <div node_ref=trigger_ref class="inline-flex">
@@ -1645,32 +1777,55 @@ pub fn AddFilterMenu(
             open=Signal::derive(move || open.get())
             on_close=Callback::new(move |()| set_open.set(false))
         >
-            // Fields with a category are rendered in sub-menus (e.g. "Relations" → parent/sub-issue/blocking).
-            // Currently all fields are top-level (category: None). TRA-105 adds the first categorized fields.
-            {all_filter_fields().iter()
-                .filter(|f| f.category.is_none())
-                .map(|field_def| {
-                let key = field_def.key;
-                let label = field_def.label.to_string();
-                let icon_data = field_def.icon;
-                let default_op = field_def.operators.first().map(|o| o.key).unwrap_or("any_of");
-                view! {
-                    <DropdownItem
-                        label=label
-                        on_select=Callback::new(move |()| {
-                            clauses.update(|cs| {
-                                cs.push(FilterClause {
-                                    field: key.to_string(),
-                                    operator: default_op.to_string(),
-                                    values: Vec::new(),
+            // Shared helper to render a DropdownItem for a filter field definition.
+            {
+                let render_field_item = move |field_def: &&FilterFieldDef| {
+                    let key = field_def.key;
+                    let label = field_def.label.to_string();
+                    let icon_data = field_def.icon;
+                    let default_op = field_def.operators.first().map(|o| o.key).unwrap_or("any_of");
+                    view! {
+                        <DropdownItem
+                            label=label
+                            on_select=Callback::new(move |()| {
+                                clauses.update(|cs| {
+                                    cs.push(FilterClause {
+                                        field: key.to_string(),
+                                        operator: default_op.to_string(),
+                                        values: Vec::new(),
+                                    });
                                 });
-                            });
-                            set_open.set(false);
-                        })
-                        icon=Arc::new(move || view! { <Icon icon=icon_data size="14px"/> }.into_any()) as ChildrenFn
-                    />
+                                set_open.set(false);
+                            })
+                            icon=Arc::new(move || view! { <Icon icon=icon_data size="14px"/> }.into_any()) as ChildrenFn
+                        />
+                    }
+                };
+
+                view! {
+                    // Top-level fields (no category)
+                    {all_filter_fields().iter()
+                        .filter(|f| f.category.is_none())
+                        .map(&render_field_item)
+                        .collect_view()}
+
+                    // Categorized fields (e.g. "Relations" sub-section)
+                    {categories.iter().map(|cat| {
+                        view! {
+                            // Divider + category header
+                            <div class="border-t border-border my-1"/>
+                            <div class="px-2.5 py-1 text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
+                                {cat.to_string()}
+                            </div>
+                            // Category items
+                            {all_filter_fields().iter()
+                                .filter(|f| f.category == Some(cat))
+                                .map(&render_field_item)
+                                .collect_view()}
+                        }
+                    }).collect_view()}
                 }
-            }).collect_view()}
+            }
         </DropdownMenu>
     }
 }

@@ -89,6 +89,10 @@ struct IssueDetailRow {
     created_at: String,
     updated_at: String,
     archived_at: Option<String>,
+    has_children: i32,
+    is_blocked: i32,
+    is_blocking: i32,
+    has_relations: i32,
 }
 
 impl IssueDetailRow {
@@ -119,6 +123,10 @@ impl IssueDetailRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             archived_at: self.archived_at,
+            has_children: self.has_children != 0,
+            is_blocked: self.is_blocked != 0,
+            is_blocking: self.is_blocking != 0,
+            has_relations: self.has_relations != 0,
             labels,
         }
     }
@@ -146,7 +154,11 @@ const ISSUE_DETAIL_SELECT: &str = "\
            i.sort_order, \
            CAST(i.created_at AS TEXT) AS created_at, \
            CAST(i.updated_at AS TEXT) AS updated_at, \
-           CAST(i.archived_at AS TEXT) AS archived_at \
+           CAST(i.archived_at AS TEXT) AS archived_at, \
+           (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.source_issue_id = i.issue_id AND r2.relation_type = 'parent') THEN 1 ELSE 0 END) AS has_children, \
+           (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.target_issue_id = i.issue_id AND r2.relation_type = 'blocks') THEN 1 ELSE 0 END) AS is_blocked, \
+           (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.source_issue_id = i.issue_id AND r2.relation_type = 'blocks') THEN 1 ELSE 0 END) AS is_blocking, \
+           (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.source_issue_id = i.issue_id OR r2.target_issue_id = i.issue_id) THEN 1 ELSE 0 END) AS has_relations \
     FROM issues i \
     JOIN teams t ON t.team_id = i.team_id \
     JOIN statuses s ON s.status_id = i.status_id \
