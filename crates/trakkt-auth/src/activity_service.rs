@@ -10,6 +10,10 @@
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use trakkt_types::models::IssueActivity;
+use trakkt_types::sync::{SyncActionType, entity_types};
+
+use crate::sync_log_service;
+use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
 
@@ -113,15 +117,26 @@ pub struct ActivityRecorder<'a> {
     db: &'a DbPool,
     workspace_id: &'a str,
     actor_id: &'a str,
+    ws_manager: Option<&'a WebSocketManager>,
 }
 
 impl<'a> ActivityRecorder<'a> {
     /// Create a new recorder bound to a workspace and actor.
-    pub fn new(db: &'a DbPool, workspace_id: &'a str, actor_id: &'a str) -> Self {
+    ///
+    /// The optional `ws_manager` enables real-time WebSocket broadcast of
+    /// activity events. Pass `None` in tests or contexts without a live
+    /// WebSocket server.
+    pub fn new(
+        db: &'a DbPool,
+        workspace_id: &'a str,
+        actor_id: &'a str,
+        ws_manager: Option<&'a WebSocketManager>,
+    ) -> Self {
         Self {
             db,
             workspace_id,
             actor_id,
+            ws_manager,
         }
     }
 
@@ -371,6 +386,37 @@ impl<'a> ActivityRecorder<'a> {
             new_value,
             metadata_str
         )?;
+
+        // Sync log entry — best-effort, log on failure.
+        if let Err(e) = sync_log_service::write_sync_entry(
+            self.db,
+            entity_types::ACTIVITY,
+            &activity_id,
+            self.workspace_id,
+            SyncActionType::Insert,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                activity_id = %activity_id,
+                "Failed to write sync log entry for activity"
+            );
+        }
+
+        // Broadcast to workspace via WebSocket — best-effort.
+        if let Some(ws) = self.ws_manager {
+            sync_log_service::broadcast_sync_action(
+                ws,
+                self.workspace_id,
+                entity_types::ACTIVITY,
+                &activity_id,
+                SyncActionType::Insert,
+                None,
+            )
+            .await;
+        }
 
         Ok(())
     }
