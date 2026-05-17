@@ -36,12 +36,12 @@ use crate::components::{
 };
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{
-    parse_sort_field, sort_field_to_str, sort_issues, LabelFilterDropdown, PriorityFilterDropdown,
-    ProjectFilterDropdown, SortDirection, SortDropdown, SortField, StatusFilterDropdown,
+    apply_clause, parse_sort_field, sort_field_to_str, sort_issues, FilterBar, SortDirection,
+    SortDropdown, SortField,
 };
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
-use crate::pages::views::ViewFilters;
+use crate::pages::views::{FilterClause, LegacyViewFilters, ViewFilters};
 use crate::server_fns::issues::{create_issue, get_archived_issues, list_issues};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::{create_view, delete_view, update_view};
@@ -137,10 +137,7 @@ fn IssueListInner(
 
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
-    let (status_filter, set_status_filter) = signal(Vec::<String>::new());
-    let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
-    let (label_filter, set_label_filter) = signal(Vec::<String>::new());
-    let (project_filter, set_project_filter) = signal(Vec::<String>::new());
+    let filter_clauses = RwSignal::new(Vec::<FilterClause>::new());
     let (show_archived, set_show_archived) = signal(false);
 
     // ── Server-fetched archived issues (fetched on demand when toggle is ON) ──
@@ -245,10 +242,7 @@ fn IssueListInner(
         if current_tab == format!("view:{vid}") {
             set_active_tab.set("all".to_string());
             set_search.set(String::new());
-            set_status_filter.set(Vec::new());
-            set_priority_filter.set(Vec::new());
-            set_label_filter.set(Vec::new());
-            set_project_filter.set(Vec::new());
+            filter_clauses.set(Vec::new());
             set_sort_field.set(SortField::Priority);
             set_sort_direction.set(SortDirection::Asc);
         }
@@ -270,10 +264,7 @@ fn IssueListInner(
 
             set_active_tab.set("all".to_string());
             set_search.set(String::new());
-            set_status_filter.set(Vec::new());
-            set_priority_filter.set(Vec::new());
-            set_label_filter.set(Vec::new());
-            set_project_filter.set(Vec::new());
+            filter_clauses.set(Vec::new());
             set_sort_field.set(SortField::Priority);
             set_sort_direction.set(SortDirection::Asc);
 
@@ -306,7 +297,11 @@ fn IssueListInner(
                         })
                         .map(|s| s.status_id)
                         .collect();
-                    set_status_filter.set(status_ids);
+                    filter_clauses.set(vec![FilterClause {
+                        field: "status".to_string(),
+                        operator: "any_of".to_string(),
+                        values: status_ids,
+                    }]);
                 }
             }
         });
@@ -390,42 +385,25 @@ fn IssueListInner(
             .collect::<Vec<_>>()
     });
 
-    // Filtered issue list for list view — applies archive, search, status, priority,
-    // label, and project filters. When show_archived is ON, merges in server-fetched
-    // archived issues (deduplicating by issue_id).
+    // Filtered issue list for list view — applies archive, search, and composable
+    // filter clauses. When show_archived is ON, merges in server-fetched archived
+    // issues (deduplicating by issue_id).
     let filtered_issues = Memo::new(move |_| {
         let raw = team_issues.get();
         let search_val = search.get().to_lowercase();
-        let status_val = status_filter.get();
-        let priority_val = priority_filter.get();
-        let label_val = label_filter.get();
-        let project_val = project_filter.get();
+        let clauses = filter_clauses.get();
         let archived_visible = show_archived.get();
 
-        let apply_filters = |issue: &IssueWithDetails| -> bool {
-            if !status_val.is_empty() && !status_val.contains(&issue.status_id) {
-                return false;
-            }
-            if !priority_val.is_empty() {
-                let p_str = issue.priority.to_string();
-                if !priority_val.contains(&p_str) {
-                    return false;
-                }
-            }
-            if !label_val.is_empty() {
-                let has_match = issue.labels.iter().any(|l| label_val.contains(&l.label_id));
-                if !has_match {
-                    return false;
-                }
-            }
-            if !project_val.is_empty() {
-                match &issue.project_id {
-                    Some(pid) if project_val.contains(pid) => {}
-                    _ => return false,
-                }
-            }
+        let passes_filters = |issue: &IssueWithDetails| -> bool {
+            // Search filter (not a clause — always visible in toolbar).
             if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
                 return false;
+            }
+            // Apply each composable filter clause.
+            for clause in &clauses {
+                if !apply_clause(clause, issue) {
+                    return false;
+                }
             }
             true
         };
@@ -437,7 +415,7 @@ fn IssueListInner(
                 if !archived_visible && is_archived(issue, ARCHIVE_DAYS) {
                     return false;
                 }
-                apply_filters(issue)
+                passes_filters(issue)
             })
             .collect();
 
@@ -448,7 +426,7 @@ fn IssueListInner(
                 result.iter().map(|i| i.issue_id.clone()).collect();
             let server_archived = archived_issues_signal.get();
             for issue in server_archived {
-                if !existing_ids.contains(&issue.issue_id) && apply_filters(&issue) {
+                if !existing_ids.contains(&issue.issue_id) && passes_filters(&issue) {
                     result.push(issue);
                 }
             }
@@ -516,16 +494,22 @@ fn IssueListInner(
     });
 
     // ── Board-filtered statuses ──────────────────────────────────────────
-    // When a view tab sets status_filter, only show matching board columns.
+    // When filter clauses include a status "any_of" clause, only show matching
+    // board columns.
     let board_filtered_statuses = Memo::new(move |_| {
         let all = board_statuses.get();
-        let status_val = status_filter.get();
-        if status_val.is_empty() {
-            all
-        } else {
-            all.into_iter()
-                .filter(|s| status_val.contains(&s.status_id))
-                .collect()
+        let clauses = filter_clauses.get();
+        // Find the first status "any_of" clause (if any).
+        let status_values: Option<&Vec<String>> = clauses.iter().find_map(|c| {
+            if c.field == "status" && c.operator == "any_of" && !c.values.is_empty() {
+                Some(&c.values)
+            } else {
+                None
+            }
+        });
+        match status_values {
+            Some(vals) => all.into_iter().filter(|s| vals.contains(&s.status_id)).collect(),
+            None => all,
         }
     });
 
@@ -700,10 +684,7 @@ fn IssueListInner(
                 let on_all = move |_: web_sys::MouseEvent| {
                     set_active_tab.set("all".to_string());
                     set_search.set(String::new());
-                    set_status_filter.set(Vec::new());
-                    set_priority_filter.set(Vec::new());
-                    set_label_filter.set(Vec::new());
-                    set_project_filter.set(Vec::new());
+                    filter_clauses.set(Vec::new());
                     set_sort_field.set(SortField::Priority);
                     set_sort_direction.set(SortDirection::Asc);
                 };
@@ -711,9 +692,6 @@ fn IssueListInner(
                 let on_active = move |_: web_sys::MouseEvent| {
                     set_active_tab.set("active".to_string());
                     set_search.set(String::new());
-                    set_priority_filter.set(Vec::new());
-                    set_label_filter.set(Vec::new());
-                    set_project_filter.set(Vec::new());
                     set_sort_field.set(SortField::Priority);
                     set_sort_direction.set(SortDirection::Asc);
                     let team = resolved_team.get();
@@ -731,15 +709,16 @@ fn IssueListInner(
                     } else {
                         Vec::new()
                     };
-                    set_status_filter.set(status_ids);
+                    filter_clauses.set(vec![FilterClause {
+                        field: "status".to_string(),
+                        operator: "any_of".to_string(),
+                        values: status_ids,
+                    }]);
                 };
 
                 let on_backlog = move |_: web_sys::MouseEvent| {
                     set_active_tab.set("backlog".to_string());
                     set_search.set(String::new());
-                    set_priority_filter.set(Vec::new());
-                    set_label_filter.set(Vec::new());
-                    set_project_filter.set(Vec::new());
                     set_sort_field.set(SortField::Priority);
                     set_sort_direction.set(SortDirection::Asc);
                     let team = resolved_team.get();
@@ -757,7 +736,11 @@ fn IssueListInner(
                     } else {
                         Vec::new()
                     };
-                    set_status_filter.set(status_ids);
+                    filter_clauses.set(vec![FilterClause {
+                        field: "status".to_string(),
+                        operator: "any_of".to_string(),
+                        values: status_ids,
+                    }]);
                 };
 
                 Some(view! {
@@ -797,31 +780,47 @@ fn IssueListInner(
                                     }
                                     set_context_menu_view_id.set(None);
                                     set_active_tab.set(tab_id_click.clone());
-                                    match serde_json::from_str::<ViewFilters>(&filters_json) {
-                                        Ok(filters) => {
-                                            set_search.set(filters.search);
-                                            set_status_filter.set(filters.statuses);
-                                            set_priority_filter.set(
-                                                filters.priorities.iter().map(|p| p.to_string()).collect()
-                                            );
-                                            set_label_filter.set(filters.labels);
-                                            set_project_filter.set(filters.project_ids);
-                                            // Restore sort from saved view (or reset to defaults).
-                                            set_sort_field.set(
-                                                filters.sort_field.as_deref()
-                                                    .and_then(parse_sort_field)
-                                                    .unwrap_or(SortField::Priority)
-                                            );
-                                            set_sort_direction.set(
-                                                filters.sort_direction.as_deref()
-                                                    .and_then(SortDirection::parse)
-                                                    .unwrap_or(SortDirection::Asc)
-                                            );
+                                    // Determine format by probing for the "clauses" key.
+                                    // ViewFilters has #[serde(default)] on all fields, so
+                                    // serde_json always succeeds — we must check explicitly.
+                                    let is_new_format = filters_json.contains("\"clauses\"");
+                                    if is_new_format {
+                                        match serde_json::from_str::<ViewFilters>(&filters_json) {
+                                            Ok(filters) => {
+                                                filter_clauses.set(filters.clauses);
+                                                set_sort_field.set(
+                                                    filters.sort_field.as_deref()
+                                                        .and_then(parse_sort_field)
+                                                        .unwrap_or(SortField::Priority)
+                                                );
+                                                set_sort_direction.set(
+                                                    filters.sort_direction.as_deref()
+                                                        .and_then(SortDirection::parse)
+                                                        .unwrap_or(SortDirection::Asc)
+                                                );
+                                            }
+                                            Err(e) => tracing::warn!("Failed to parse view filters: {e}"),
                                         }
-                                        Err(e) => {
-                                            tracing::warn!("Failed to parse view filters: {e}");
+                                    } else {
+                                        match serde_json::from_str::<LegacyViewFilters>(&filters_json) {
+                                            Ok(legacy) => {
+                                                let converted = legacy.into_view_filters();
+                                                filter_clauses.set(converted.clauses);
+                                                set_sort_field.set(
+                                                    converted.sort_field.as_deref()
+                                                        .and_then(parse_sort_field)
+                                                        .unwrap_or(SortField::Priority)
+                                                );
+                                                set_sort_direction.set(
+                                                    converted.sort_direction.as_deref()
+                                                        .and_then(SortDirection::parse)
+                                                        .unwrap_or(SortDirection::Asc)
+                                                );
+                                            }
+                                            Err(e) => tracing::warn!("Failed to parse legacy view filters: {e}"),
                                         }
                                     }
+                                    set_search.set(String::new());
                                 };
 
                                 let vid_ctx = view_id.clone();
@@ -954,25 +953,17 @@ fn IssueListInner(
 
             // ── Toolbar (list view only) ────────────────────────────────────
             <Show when=move || view_mode.get() == "list">
-                <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0">
+                <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0 flex-wrap">
                     <SearchInput
                         value=Signal::derive(move || search.get())
                         on_input=Callback::new(move |v: String| set_search.set(v))
                         placeholder="Search issues..."
                         class="flex-1 max-w-sm"
                     />
-                    <StatusFilterDropdown
-                        value=status_filter
-                        on_change=Callback::new(move |v: Vec<String>| set_status_filter.set(v))
+                    <FilterBar
+                        clauses=filter_clauses
                         team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
                     />
-                    <PriorityFilterDropdown value=priority_filter on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))/>
-                    <LabelFilterDropdown
-                        value=label_filter
-                        on_change=Callback::new(move |v: Vec<String>| set_label_filter.set(v))
-                        team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
-                    />
-                    <ProjectFilterDropdown value=project_filter on_change=Callback::new(move |v: Vec<String>| set_project_filter.set(v))/>
                     <SortDropdown
                         field=Signal::derive(move || sort_field.get())
                         direction=Signal::derive(move || sort_direction.get())
@@ -1001,10 +992,7 @@ fn IssueListInner(
                         size=ButtonSize::Sm
                         disabled=Signal::derive(move || {
                             search.get().is_empty()
-                                && status_filter.get().is_empty()
-                                && priority_filter.get().is_empty()
-                                && label_filter.get().is_empty()
-                                && project_filter.get().is_empty()
+                                && filter_clauses.get().is_empty()
                         })
                         on:click=move |_| set_show_save_view.set(true)
                     >
@@ -1113,11 +1101,7 @@ fn IssueListInner(
         <SaveViewModal
             show=Signal::derive(move || show_save_view.get())
             on_close=Callback::new(move |()| set_show_save_view.set(false))
-            search=Signal::derive(move || search.get())
-            status_filter=Signal::derive(move || status_filter.get())
-            priority_filter=Signal::derive(move || priority_filter.get())
-            label_filter=Signal::derive(move || label_filter.get())
-            project_filter=Signal::derive(move || project_filter.get())
+            filter_clauses=Signal::derive(move || filter_clauses.get())
             team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
             view_mode=Signal::derive(move || view_mode.get())
             sort_field=Signal::derive(move || sort_field.get())
@@ -1356,24 +1340,16 @@ pub(crate) fn NewIssueModal(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Modal form for saving the current filter set as a named view.
+///
+/// Serializes the composable filter clauses using the new `ViewFilters` format.
 #[component]
 pub(crate) fn SaveViewModal(
     /// Whether the modal is visible.
     show: Signal<bool>,
     /// Called when the modal should close.
     on_close: Callback<()>,
-    /// Current search filter value.
-    search: Signal<String>,
-    /// Current status filter values (multi-select).
-    status_filter: Signal<Vec<String>>,
-    /// Current priority filter values (multi-select).
-    priority_filter: Signal<Vec<String>>,
-    /// Current label filter values (multi-select).
-    #[prop(optional, into)]
-    label_filter: Option<Signal<Vec<String>>>,
-    /// Current project filter values (multi-select).
-    #[prop(optional, into)]
-    project_filter: Option<Signal<Vec<String>>>,
+    /// Current composable filter clauses.
+    filter_clauses: Signal<Vec<FilterClause>>,
     /// Current team_id if on a team page.
     team_id: Signal<Option<String>>,
     /// Current view mode (list/board).
@@ -1404,34 +1380,26 @@ pub(crate) fn SaveViewModal(
             return;
         }
 
-        // Build filters JSON from current filter state.
-        let statuses: Vec<String> = status_filter.get_untracked();
-        let priority_strings = priority_filter.get_untracked();
-        let priorities: Vec<i32> = priority_strings.iter().filter_map(|s| s.parse::<i32>().ok()).collect();
-
-        let search_val = search.get_untracked();
         let team_id_val = team_id.get_untracked().unwrap_or_default();
 
-        let labels: Vec<String> = label_filter.map(|s| s.get_untracked()).unwrap_or_default();
-        let project_ids: Vec<String> = project_filter.map(|s| s.get_untracked()).unwrap_or_default();
-        let sf_str = sort_field.map(|s| sort_field_to_str(s.get_untracked()).to_string());
-        let sd_str = sort_direction.map(|s| s.get_untracked().as_str().to_string());
-        let filters = serde_json::json!({
-            "statuses": statuses,
-            "priorities": priorities,
-            "search": search_val,
-            "team_id": team_id_val,
-            "labels": labels,
-            "project_ids": project_ids,
-            "sort_field": sf_str,
-            "sort_direction": sd_str,
-        });
+        // Serialize using the new ViewFilters format.
+        let filters = ViewFilters {
+            clauses: filter_clauses.get_untracked(),
+            sort_field: sort_field.map(|s| sort_field_to_str(s.get_untracked()).to_string()),
+            sort_direction: sort_direction.map(|s| s.get_untracked().as_str().to_string()),
+        };
+        let filters_str = match serde_json::to_string(&filters) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Failed to serialize view filters: {e}");
+                set_error_msg.set(Some(format!("Failed to serialize filters: {e}")));
+                return;
+            }
+        };
 
         let display_options = serde_json::json!({
             "view_type": view_mode.get_untracked(),
         });
-
-        let filters_str = filters.to_string();
         let display_str = display_options.to_string();
 
         set_submitting.set(true);

@@ -5,11 +5,43 @@
 use serde::{Deserialize, Serialize};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Filter/display types for JSON deserialization
+// Composable filter clause — the new data model (TRA-103)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A single filter clause: a `(field, operator, values)` triple.
+///
+/// Example: `{ field: "status", operator: "any_of", values: ["uuid-1", "uuid-2"] }`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilterClause {
+    pub field: String,
+    pub operator: String,
+    pub values: Vec<String>,
+}
+
+/// New composable view filters — replaces the old flat field-per-filter struct.
+///
+/// Saved views serialize this to JSON. Backwards compatibility: the old format
+/// is handled via a migration path in `issue_list.rs` tab click handlers.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewFilters {
+    #[serde(default)]
+    pub clauses: Vec<FilterClause>,
+    /// Persisted sort field (e.g. "priority", "status", "created_date").
+    #[serde(default)]
+    pub sort_field: Option<String>,
+    /// Persisted sort direction ("asc" or "desc").
+    #[serde(default)]
+    pub sort_direction: Option<String>,
+}
+
+// ───────────────────────────────────────────────���─────────────────────────────
+// Legacy format — for deserializing old saved views
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The old flat filter format. Used to migrate saved views that were persisted
+/// before TRA-103 introduced the composable clause model.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyViewFilters {
     #[serde(default)]
     pub statuses: Vec<String>,
     #[serde(default)]
@@ -22,10 +54,48 @@ pub struct ViewFilters {
     pub search: String,
     #[serde(default)]
     pub team_id: String,
-    /// Persisted sort field (e.g. "priority", "status", "created_date").
     #[serde(default)]
     pub sort_field: Option<String>,
-    /// Persisted sort direction ("asc" or "desc").
     #[serde(default)]
     pub sort_direction: Option<String>,
+}
+
+impl LegacyViewFilters {
+    /// Convert the legacy format into the new composable format.
+    pub fn into_view_filters(self) -> ViewFilters {
+        let mut clauses = Vec::new();
+        if !self.statuses.is_empty() {
+            clauses.push(FilterClause {
+                field: "status".to_string(),
+                operator: "any_of".to_string(),
+                values: self.statuses,
+            });
+        }
+        if !self.priorities.is_empty() {
+            clauses.push(FilterClause {
+                field: "priority".to_string(),
+                operator: "any_of".to_string(),
+                values: self.priorities.iter().map(|p| p.to_string()).collect(),
+            });
+        }
+        if !self.labels.is_empty() {
+            clauses.push(FilterClause {
+                field: "label".to_string(),
+                operator: "any_of".to_string(),
+                values: self.labels,
+            });
+        }
+        if !self.project_ids.is_empty() {
+            clauses.push(FilterClause {
+                field: "project".to_string(),
+                operator: "any_of".to_string(),
+                values: self.project_ids,
+            });
+        }
+        ViewFilters {
+            clauses,
+            sort_field: self.sort_field,
+            sort_direction: self.sort_direction,
+        }
+    }
 }

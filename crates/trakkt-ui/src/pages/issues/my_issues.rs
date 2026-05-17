@@ -34,6 +34,7 @@ use crate::pages::issues::filters::{
 use crate::pages::issues::issue_list::SaveViewModal;
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
+use crate::pages::views::FilterClause;
 use crate::server_fns::context::UserContext;
 use crate::server_fns::issues::{get_archived_issues, list_issues};
 use crate::server_fns::watchers::list_watched_issue_ids;
@@ -561,9 +562,26 @@ pub fn MyIssuesPage() -> impl IntoView {
         <SaveViewModal
             show=Signal::derive(move || show_save_view.get())
             on_close=Callback::new(move |()| set_show_save_view.set(false))
-            search=Signal::derive(move || search.get())
-            status_filter=Signal::derive(move || status_filter.get())
-            priority_filter=Signal::derive(move || priority_filter.get())
+            filter_clauses=Signal::derive(move || {
+                let mut clauses = Vec::<FilterClause>::new();
+                let statuses = status_filter.get();
+                if !statuses.is_empty() {
+                    clauses.push(FilterClause {
+                        field: "status".to_string(),
+                        operator: "any_of".to_string(),
+                        values: statuses,
+                    });
+                }
+                let priorities = priority_filter.get();
+                if !priorities.is_empty() {
+                    clauses.push(FilterClause {
+                        field: "priority".to_string(),
+                        operator: "any_of".to_string(),
+                        values: priorities,
+                    });
+                }
+                clauses
+            })
             team_id=Signal::stored(None::<String>)
             view_mode=Signal::stored("list".to_string())
             sort_field=Signal::derive(move || sort_field.get())
