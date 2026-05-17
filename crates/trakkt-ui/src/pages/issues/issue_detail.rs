@@ -1774,10 +1774,11 @@ enum TimelineEntry {
 }
 
 impl TimelineEntry {
-    /// Sort key — returns a comparable timestamp string.
+    /// Sort key — normalized ISO timestamp for correct chronological ordering.
+    /// Activity timestamps from Postgres use space separator; comments use T.
     fn sort_key(&self) -> String {
         match self {
-            TimelineEntry::Activity(a) => a.created_at.clone(),
+            TimelineEntry::Activity(a) => a.created_at.replace(' ', "T"),
             TimelineEntry::Comment(c) => c.created_at.to_rfc3339(),
         }
     }
@@ -1935,10 +1936,15 @@ fn IssueTimeline(
                                 }.into_any()
                             }
                             TimelineEntry::Activity(activity) => {
+                                let name = members.get_untracked()
+                                    .iter()
+                                    .find(|m| m.user_id == activity.actor_id)
+                                    .and_then(|m| m.name.clone())
+                                    .unwrap_or_else(|| "Someone".to_string());
                                 view! {
                                     <ActivityEntry
                                         activity=activity
-                                        members=members
+                                        actor_name=name
                                     />
                                 }.into_any()
                             }
@@ -1962,17 +1968,8 @@ fn IssueTimeline(
 #[component]
 fn ActivityEntry(
     activity: IssueActivity,
-    members: RwSignal<Vec<WorkspaceMember>>,
+    actor_name: String,
 ) -> impl IntoView {
-    let actor_id = activity.actor_id.clone();
-    let actor_name = Signal::derive(move || {
-        members.get()
-            .iter()
-            .find(|m| m.user_id == actor_id)
-            .and_then(|m| m.name.clone())
-            .unwrap_or_else(|| "Someone".to_string())
-    });
-
     let description = format_activity_description(&activity);
     let timestamp = relative_time(&activity.created_at);
     let icon = activity_icon(&activity.action_type);
