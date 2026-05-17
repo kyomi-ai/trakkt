@@ -6,16 +6,25 @@
 //! filter dropdowns. This module provides the canonical implementations to
 //! eliminate duplication per CODING_STANDARDS.md ("No duplicated helper
 //! functions across modules").
+//!
+//! ## Composable Filter System (TRA-103)
+//!
+//! The composable filter system uses `FilterClause` triples (field, operator,
+//! values) and renders them as chips in a `FilterBar`. Field definitions are
+//! declared via `FilterFieldDef` structs; day-1 supports status and priority.
 
 use std::sync::Arc;
 
 use leptos::children::ChildrenFn;
 use leptos::prelude::*;
+use phosphor_leptos::Icon;
 
 use crate::components::{
+    Button, ButtonSize, ButtonVariant, Checkbox,
     DropdownItem, DropdownMenu, DropdownTrigger, IssueStatusBadge, IssueStatusVariant,
     PriorityIndicator,
 };
+use crate::pages::views::FilterClause;
 use crate::server_fns::labels::list_labels;
 use crate::server_fns::projects::list_projects;
 use crate::server_fns::statuses::list_statuses;
@@ -227,16 +236,24 @@ pub fn StatusFilterDropdown(
             if !s.is_empty() || store.initialized().get() {
                 s
             } else {
-                statuses_resource
-                    .get()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default()
+                match statuses_resource.get() {
+                    Some(Ok(items)) => items,
+                    Some(Err(e)) => {
+                        tracing::warn!("Failed to load statuses for filter dropdown: {e}");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
             }
         } else {
-            statuses_resource
-                .get()
-                .and_then(|r| r.ok())
-                .unwrap_or_default()
+            match statuses_resource.get() {
+                Some(Ok(items)) => items,
+                Some(Err(e)) => {
+                    tracing::warn!("Failed to load statuses for filter dropdown: {e}");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
         };
 
         // Filter by team when a team_id signal is provided and has a value.
@@ -551,16 +568,24 @@ pub fn LabelFilterDropdown(
             if !l.is_empty() || store.initialized().get() {
                 l
             } else {
-                labels_resource
-                    .get()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default()
+                match labels_resource.get() {
+                    Some(Ok(items)) => items,
+                    Some(Err(e)) => {
+                        tracing::warn!("Failed to load labels for filter dropdown: {e}");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
             }
         } else {
-            labels_resource
-                .get()
-                .and_then(|r| r.ok())
-                .unwrap_or_default()
+            match labels_resource.get() {
+                Some(Ok(items)) => items,
+                Some(Err(e)) => {
+                    tracing::warn!("Failed to load labels for filter dropdown: {e}");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
         };
 
         // Filter by team when a team_id signal is provided and has a value.
@@ -707,16 +732,24 @@ pub fn ProjectFilterDropdown(
             if !p.is_empty() || store.initialized().get() {
                 p
             } else {
-                projects_resource
-                    .get()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default()
+                match projects_resource.get() {
+                    Some(Ok(items)) => items,
+                    Some(Err(e)) => {
+                        tracing::warn!("Failed to load projects for filter dropdown: {e}");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
             }
         } else {
-            projects_resource
-                .get()
-                .and_then(|r| r.ok())
-                .unwrap_or_default()
+            match projects_resource.get() {
+                Some(Ok(items)) => items,
+                Some(Err(e)) => {
+                    tracing::warn!("Failed to load projects for filter dropdown: {e}");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
         }
     });
 
@@ -782,5 +815,542 @@ pub fn ProjectFilterDropdown(
                 }
             }).collect_view()}
         </DropdownMenu>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composable Filter System — Field Definitions (TRA-103)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Definition of a filterable field — describes how to render filter chips
+/// and what operators/values are available.
+pub struct FilterFieldDef {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub icon: phosphor_leptos::IconData,
+    pub operators: &'static [OperatorDef],
+    pub value_kind: ValueKind,
+}
+
+/// Definition of an operator for a filter field.
+pub struct OperatorDef {
+    pub key: &'static str,
+    pub label_singular: &'static str,
+    pub label_plural: &'static str,
+}
+
+/// Describes what kind of value picker to render for a field.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ValueKind {
+    /// Fixed set of enum values (status categories, priority levels).
+    EnumSelect,
+}
+
+// ── Day-1 field definitions ────────────────────────────────────────────────
+
+pub const STATUS_FIELD: FilterFieldDef = FilterFieldDef {
+    key: "status",
+    label: "Status",
+    icon: phosphor_leptos::CIRCLE_DASHED,
+    operators: &[
+        OperatorDef { key: "any_of", label_singular: "is", label_plural: "is any of" },
+        OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
+    ],
+    value_kind: ValueKind::EnumSelect,
+};
+
+pub const PRIORITY_FIELD: FilterFieldDef = FilterFieldDef {
+    key: "priority",
+    label: "Priority",
+    icon: phosphor_leptos::CELL_SIGNAL_HIGH,
+    operators: &[
+        OperatorDef { key: "any_of", label_singular: "is", label_plural: "is any of" },
+        OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
+    ],
+    value_kind: ValueKind::EnumSelect,
+};
+
+/// Returns all available filter field definitions.
+pub fn all_filter_fields() -> &'static [&'static FilterFieldDef] {
+    &[&STATUS_FIELD, &PRIORITY_FIELD]
+}
+
+/// Look up a field definition by key.
+pub fn find_field_def(key: &str) -> Option<&'static FilterFieldDef> {
+    all_filter_fields().iter().find(|f| f.key == key).copied()
+}
+
+/// Look up an operator definition for a given field and operator key.
+fn find_operator_def(field_def: &FilterFieldDef, operator_key: &str) -> Option<&'static OperatorDef> {
+    field_def.operators.iter().find(|op| op.key == operator_key)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composable Filter System — apply_clause helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Apply a single filter clause to an issue, returning `true` if the issue
+/// passes the filter (should be included).
+pub fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
+    if clause.values.is_empty() {
+        // A clause with no values selected passes everything.
+        return true;
+    }
+    match (clause.field.as_str(), clause.operator.as_str()) {
+        ("status", "any_of") => clause.values.contains(&issue.status_id),
+        ("status", "none_of") => !clause.values.contains(&issue.status_id),
+        ("priority", "any_of") => clause.values.contains(&issue.priority.to_string()),
+        ("priority", "none_of") => !clause.values.contains(&issue.priority.to_string()),
+        ("label", "any_of") => issue.labels.iter().any(|l| clause.values.contains(&l.label_id)),
+        ("label", "none_of") => !issue.labels.iter().any(|l| clause.values.contains(&l.label_id)),
+        ("project", "any_of") => issue.project_id.as_ref().is_some_and(|pid| clause.values.contains(pid)),
+        ("project", "none_of") => !issue.project_id.as_ref().is_some_and(|pid| clause.values.contains(pid)),
+        // Unknown field/operator — pass through (don't block issues).
+        _ => true,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composable Filter System — FilterChip component
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Renders a single filter clause as a chip in the filter bar.
+///
+/// Layout: `[icon] Field` `operator` `value summary` `x`
+///
+/// Interactions:
+/// - Click operator segment: dropdown with available operators for this field
+/// - Click value segment: dropdown with value picker (checkboxes)
+/// - Click x: remove this filter clause
+#[component]
+pub fn FilterChip(
+    /// Index of this clause in the parent's clauses signal.
+    index: usize,
+    /// The shared clauses signal — chip modifies it in place.
+    clauses: RwSignal<Vec<FilterClause>>,
+    /// Team_id for filtering statuses by team. Pass `Signal::stored(None)` if not team-scoped.
+    #[prop(into)]
+    team_id: Signal<Option<String>>,
+) -> impl IntoView {
+    // Read the current clause reactively.
+    let clause = Memo::new(move |_| {
+        let all = clauses.get();
+        all.get(index).cloned()
+    });
+
+    // Operator picker state.
+    let (op_open, set_op_open) = signal(false);
+    let op_trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Value picker state.
+    let (val_open, set_val_open) = signal(false);
+    let val_trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Value summary display text.
+    let value_summary = Memo::new(move |_| {
+        let Some(c) = clause.get() else { return String::new() };
+        let count = c.values.len();
+        if count == 0 {
+            return "select...".to_string();
+        }
+        if count == 1 {
+            // Try to resolve a human-readable label.
+            let val = &c.values[0];
+            match c.field.as_str() {
+                "priority" => match val.as_str() {
+                    "1" => return "Urgent".to_string(),
+                    "2" => return "High".to_string(),
+                    "3" => return "Medium".to_string(),
+                    "4" => return "Low".to_string(),
+                    _ => return val.clone(),
+                },
+                "status" => {
+                    // Try to look up the status name from SyncStore.
+                    if let Some(store) = use_context::<crate::cache::store::SyncStore>() {
+                        let statuses = store.statuses().get();
+                        if let Some(s) = statuses.iter().find(|s| s.status_id == *val) {
+                            return s.name.clone();
+                        }
+                    }
+                    return val.clone();
+                }
+                _ => return val.clone(),
+            }
+        }
+        // 2+ values: show count.
+        match c.field.as_str() {
+            "status" => format!("{count} statuses"),
+            "priority" => format!("{count} priorities"),
+            _ => format!("{count} values"),
+        }
+    });
+
+    // Operator label.
+    let operator_label = Memo::new(move |_| {
+        let Some(c) = clause.get() else { return String::new() };
+        let field_def = find_field_def(&c.field);
+        let op_def = field_def.and_then(|f| find_operator_def(f, &c.operator));
+        match op_def {
+            Some(od) => {
+                if c.values.len() <= 1 {
+                    od.label_singular.to_string()
+                } else {
+                    od.label_plural.to_string()
+                }
+            }
+            None => c.operator.clone(),
+        }
+    });
+
+    // Remove this clause.
+    let remove = move |_: web_sys::MouseEvent| {
+        clauses.update(|cs| {
+            if index < cs.len() {
+                cs.remove(index);
+            }
+        });
+    };
+
+    // Change operator for this clause.
+    let set_operator = move |new_op: &'static str| {
+        clauses.update(|cs| {
+            if let Some(c) = cs.get_mut(index) {
+                c.operator = new_op.to_string();
+            }
+        });
+        set_op_open.set(false);
+    };
+
+    view! {
+        {move || {
+            let Some(c) = clause.get() else { return ().into_any() };
+            let field_def = find_field_def(&c.field);
+            let field_label = field_def.map(|f| f.label).unwrap_or(&c.field);
+            let field_icon = field_def.map(|f| f.icon);
+
+            view! {
+                <div class="inline-flex items-center gap-1 h-7 px-2 rounded-md border border-border text-xs text-foreground bg-card transition-colors">
+                    // Field icon + label
+                    {field_icon.map(|icon| view! {
+                        <Icon icon=icon size="12px"/>
+                    })}
+                    <span class="text-muted-foreground">{field_label.to_string()}</span>
+
+                    // Operator segment (clickable)
+                    <div node_ref=op_trigger_ref class="inline-flex">
+                        <button
+                            type="button"
+                            class="cursor-pointer hover:text-primary transition-colors duration-200 text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            on:click=move |_| set_op_open.update(|o| *o = !*o)
+                        >
+                            {move || operator_label.get()}
+                        </button>
+                    </div>
+                    <DropdownMenu
+                        trigger_ref=op_trigger_ref
+                        open=Signal::derive(move || op_open.get())
+                        on_close=Callback::new(move |()| set_op_open.set(false))
+                    >
+                        {if let Some(fd) = field_def {
+                            fd.operators.iter().map(|op| {
+                                let op_key = op.key;
+                                let label = op.label_singular.to_string();
+                                let current_op = c.operator.clone();
+                                view! {
+                                    <DropdownItem
+                                        label=label
+                                        selected=Signal::derive(move || current_op == op_key)
+                                        on_select=Callback::new(move |()| set_operator(op_key))
+                                    />
+                                }
+                            }).collect_view().into_any()
+                        } else {
+                            ().into_any()
+                        }}
+                    </DropdownMenu>
+
+                    // Value segment (clickable)
+                    <div node_ref=val_trigger_ref class="inline-flex">
+                        <button
+                            type="button"
+                            class="cursor-pointer hover:text-primary transition-colors duration-200 font-medium focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            on:click=move |_| set_val_open.update(|o| *o = !*o)
+                        >
+                            {move || value_summary.get()}
+                        </button>
+                    </div>
+                    // Value picker dropdown
+                    <DropdownMenu
+                        trigger_ref=val_trigger_ref
+                        open=Signal::derive(move || val_open.get())
+                        on_close=Callback::new(move |()| set_val_open.set(false))
+                    >
+                        {match c.field.as_str() {
+                            "status" => view! {
+                                <StatusValuePicker
+                                    clauses=clauses
+                                    clause_index=index
+                                    team_id=team_id
+                                />
+                            }.into_any(),
+                            "priority" => view! {
+                                <PriorityValuePicker
+                                    clauses=clauses
+                                    clause_index=index
+                                />
+                            }.into_any(),
+                            _ => ().into_any(),
+                        }}
+                    </DropdownMenu>
+
+                    // Remove button
+                    <button
+                        type="button"
+                        class="ml-0.5 cursor-pointer text-muted-foreground hover:text-foreground transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        on:click=remove
+                    >
+                        "\u{00d7}"
+                    </button>
+                </div>
+            }.into_any()
+        }}
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composable Filter System — Value Pickers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Status value picker — renders checkboxes for all workspace statuses.
+#[component]
+fn StatusValuePicker(
+    clauses: RwSignal<Vec<FilterClause>>,
+    clause_index: usize,
+    /// Team_id for filtering statuses. `None` means show all statuses.
+    #[prop(into)]
+    team_id: Signal<Option<String>>,
+) -> impl IntoView {
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+
+    let statuses_resource = Resource::new(
+        || (),
+        move |_| async move { list_statuses(None).await },
+    );
+
+    let statuses = Memo::new(move |_| {
+        let all = if let Some(store) = sync_store {
+            let s = store.statuses().get();
+            if !s.is_empty() || store.initialized().get() {
+                s
+            } else {
+                match statuses_resource.get() {
+                    Some(Ok(items)) => items,
+                    Some(Err(e)) => {
+                        tracing::warn!("Failed to load statuses for filter picker: {e}");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
+            }
+        } else {
+            match statuses_resource.get() {
+                Some(Ok(items)) => items,
+                Some(Err(e)) => {
+                    tracing::warn!("Failed to load statuses for filter picker: {e}");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
+        };
+
+        if let Some(ref tid) = team_id.get() {
+            return all
+                .into_iter()
+                .filter(|s| {
+                    s.team_id.is_none() || s.team_id.as_deref() == Some(tid.as_str())
+                })
+                .collect();
+        }
+        all
+    });
+
+    let selected_values = Memo::new(move |_| {
+        let cs = clauses.get();
+        cs.get(clause_index)
+            .map(|c| c.values.clone())
+            .unwrap_or_default()
+    });
+
+    view! {
+        {move || statuses.get().into_iter().map(|status| {
+            let status_id = status.status_id.clone();
+            let status_id_for_check = status.status_id.clone();
+            let label = status.name.clone();
+            let variant = IssueStatusVariant::parse(&status.category);
+            view! {
+                <div
+                    class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
+                >
+                    <Checkbox
+                        checked=Signal::derive(move || selected_values.get().contains(&status_id_for_check))
+                        on_change=Callback::new(move |_: bool| {
+                            let val = status_id.clone();
+                            clauses.update(|cs| {
+                                if let Some(c) = cs.get_mut(clause_index) {
+                                    if let Some(pos) = c.values.iter().position(|v| v == &val) {
+                                        c.values.remove(pos);
+                                    } else {
+                                        c.values.push(val);
+                                    }
+                                }
+                            });
+                        })
+                    />
+                    <IssueStatusBadge status=variant size=14/>
+                    <span class="truncate">{label}</span>
+                </div>
+            }
+        }).collect_view()}
+    }
+}
+
+/// Priority value picker — renders checkboxes for Urgent(1), High(2), Medium(3), Low(4).
+#[component]
+fn PriorityValuePicker(
+    clauses: RwSignal<Vec<FilterClause>>,
+    clause_index: usize,
+) -> impl IntoView {
+    let priorities: &'static [(&str, &str, i32)] = &[
+        ("1", "Urgent", 1),
+        ("2", "High", 2),
+        ("3", "Medium", 3),
+        ("4", "Low", 4),
+    ];
+
+    let selected_values = Memo::new(move |_| {
+        let cs = clauses.get();
+        cs.get(clause_index)
+            .map(|c| c.values.clone())
+            .unwrap_or_default()
+    });
+
+    view! {
+        {priorities.iter().map(|(key, label, priority_val)| {
+            let key_for_check = key.to_string();
+            let key_for_cb = key.to_string();
+            let label = label.to_string();
+            let priority_val = *priority_val;
+            view! {
+                <div
+                    class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
+                >
+                    <Checkbox
+                        checked=Signal::derive(move || selected_values.get().contains(&key_for_check))
+                        on_change=Callback::new(move |_: bool| {
+                            let val = key_for_cb.clone();
+                            clauses.update(|cs| {
+                                if let Some(c) = cs.get_mut(clause_index) {
+                                    if let Some(pos) = c.values.iter().position(|v| v == &val) {
+                                        c.values.remove(pos);
+                                    } else {
+                                        c.values.push(val);
+                                    }
+                                }
+                            });
+                        })
+                    />
+                    <PriorityIndicator priority=priority_val/>
+                    <span class="truncate">{label}</span>
+                </div>
+            }
+        }).collect_view()}
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composable Filter System — AddFilterMenu component
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A "+ Add Filter" button that opens a dropdown listing available fields.
+/// Selecting a field adds a new FilterClause with default operator and empty values,
+/// then the chip's value picker opens automatically.
+#[component]
+pub fn AddFilterMenu(
+    clauses: RwSignal<Vec<FilterClause>>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    view! {
+        <div node_ref=trigger_ref class="inline-flex">
+            <Button
+                variant=ButtonVariant::Ghost
+                size=ButtonSize::Sm
+                on:click=move |_| set_open.update(|o| *o = !*o)
+            >
+                <Icon icon=phosphor_leptos::PLUS size="12px"/>
+                "Filter"
+            </Button>
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+        >
+            {all_filter_fields().iter().map(|field_def| {
+                let key = field_def.key;
+                let label = field_def.label.to_string();
+                let icon_data = field_def.icon;
+                view! {
+                    <DropdownItem
+                        label=label
+                        on_select=Callback::new(move |()| {
+                            clauses.update(|cs| {
+                                cs.push(FilterClause {
+                                    field: key.to_string(),
+                                    operator: "any_of".to_string(),
+                                    values: Vec::new(),
+                                });
+                            });
+                            set_open.set(false);
+                        })
+                        icon=Arc::new(move || view! { <Icon icon=icon_data size="14px"/> }.into_any()) as ChildrenFn
+                    />
+                }
+            }).collect_view()}
+        </DropdownMenu>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composable Filter System — FilterBar component
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wraps filter chips + the AddFilterMenu. Renders the composable filter bar.
+#[component]
+pub fn FilterBar(
+    /// The shared signal of all active filter clauses.
+    clauses: RwSignal<Vec<FilterClause>>,
+    /// Team_id for filtering status values by team. Pass a signal returning None
+    /// for workspace-level (no team) views.
+    #[prop(into)]
+    team_id: Signal<Option<String>>,
+) -> impl IntoView {
+    view! {
+        <div class="flex items-center gap-2 flex-wrap">
+            {move || {
+                let current = clauses.get();
+                current.iter().enumerate().map(|(idx, _)| {
+                    view! {
+                        <FilterChip
+                            index=idx
+                            clauses=clauses
+                            team_id=team_id
+                        />
+                    }
+                }).collect_view()
+            }}
+            <AddFilterMenu clauses=clauses/>
+        </div>
     }
 }
