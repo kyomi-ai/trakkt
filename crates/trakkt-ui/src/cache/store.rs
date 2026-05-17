@@ -38,6 +38,9 @@ struct SyncStoreInner {
     /// Version counter bumped when an activity sync action arrives.
     /// Used by the timeline component to trigger a refetch.
     activities_version: ArcRwSignal<u32>,
+    /// Version counter bumped when an issue_relation sync action arrives.
+    /// Used by the relations section to trigger a refetch.
+    relations_version: ArcRwSignal<u32>,
 }
 
 // ── Public handle ─────────────────────────────────────────────────────────────
@@ -78,6 +81,7 @@ impl SyncStore {
                 comments: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
                 activities_version: ArcRwSignal::new(0),
+                relations_version: ArcRwSignal::new(0),
             })),
         }
     }
@@ -163,6 +167,25 @@ impl SyncStore {
     pub fn bump_activities_version(&self) {
         self.inner.with_value(|inner| {
             inner.activities_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for relations — bumped on each issue_relation sync action.
+    ///
+    /// The relations section component uses this as a reactive dependency to
+    /// trigger a refetch of relations from the server.
+    pub fn relations_version(&self) -> Signal<u32> {
+        let sig = self.inner.with_value(|inner| inner.relations_version.clone());
+        Signal::derive(move || sig.get())
+    }
+
+    /// Bump the relations version counter.
+    ///
+    /// Called by the sync engine when an "issue_relation" entity type arrives
+    /// via WebSocket, signaling that the relations section should refetch.
+    pub fn bump_relations_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.relations_version.update(|v| *v += 1);
         });
     }
 
@@ -443,6 +466,7 @@ impl SyncStore {
             inner.comments.set(Vec::new());
             inner.initialized.set(false);
             inner.activities_version.set(0);
+            inner.relations_version.set(0);
         });
     }
 }

@@ -368,6 +368,11 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                     // version counter so reactive dependencies refetch.
                     store.bump_activities_version();
                 }
+                et if et == entity_types::ISSUE_RELATION => {
+                    // Relations are fetched on-demand by the relations section.
+                    // Bump the version counter so reactive dependencies refetch.
+                    store.bump_relations_version();
+                }
                 other => {
                     tracing::debug!(
                         entity_type = other,
@@ -410,6 +415,7 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                 et if et == entity_types::NOTIFICATION => store.remove_notification(entity_id),
                 et if et == entity_types::COMMENT => store.remove_comment(entity_id),
                 et if et == entity_types::ACTIVITY => store.bump_activities_version(),
+                et if et == entity_types::ISSUE_RELATION => store.bump_relations_version(),
                 other => {
                     tracing::debug!(
                         entity_type = other,
