@@ -38,6 +38,7 @@ pub struct ServerContext {
     pub ws_manager: Option<trakkt_auth::websocket::WebSocketManager>,
     pub mcp_sessions: Option<trakkt_auth::mcp_session_manager::MCPSessionManager>,
     pub stripe: Option<trakkt_auth::stripe_service::StripeService>,
+    pub github_client: Option<std::sync::Arc<trakkt_github::GitHubClient>>,
 }
 
 #[cfg(feature = "ssr")]
@@ -113,6 +114,9 @@ impl AuthenticatedContext {
             self.auth.user_id.clone(),
             self.db(),
             self.ctx.ws_manager.as_ref(),
+            self.ctx.github_client.as_deref(),
+            self.ctx.encryption_key.as_deref(),
+            &self.ctx.config.frontend_url,
         )
     }
 }

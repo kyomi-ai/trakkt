@@ -97,6 +97,7 @@ pub fn build_router(state: state::AppState) -> Router {
                 ws_manager: Some(state.ws_manager.clone()),
                 mcp_sessions: Some(state.mcp_sessions.clone()),
                 stripe: state.stripe.clone(),
+                github_client: state.github_client.clone(),
             };
             move |req: axum::http::Request<axum::body::Body>| {
                 let ctx = server_ctx.clone();

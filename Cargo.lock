@@ -5449,6 +5449,7 @@ dependencies = [
  "tracing",
  "trakkt-auth",
  "trakkt-core",
+ "trakkt-github",
  "trakkt-types",
  "uuid",
 ]
@@ -5540,6 +5541,7 @@ dependencies = [
  "tracing",
  "trakkt-auth",
  "trakkt-core",
+ "trakkt-types",
  "uuid",
 ]
 

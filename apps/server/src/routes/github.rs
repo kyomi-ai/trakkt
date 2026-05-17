@@ -223,15 +223,40 @@ async fn github_webhook(
         | "pull_request.ready_for_review"
         | "pull_request.converted_to_draft" => {
             if let Some(inst) = &installation {
-                Some(
-                    trakkt_github::events::process_pull_request(
-                        &state.db,
-                        inst,
-                        action.as_deref().unwrap_or(""),
-                        &payload,
-                    )
-                    .await,
+                let link_result = trakkt_github::events::process_pull_request(
+                    &state.db,
+                    inst,
+                    action.as_deref().unwrap_or(""),
+                    &payload,
                 )
+                .await;
+
+                // After link processing succeeds, apply automatic status transitions.
+                if link_result.is_ok() {
+                    if inst.suspended_at.is_some() {
+                        tracing::debug!(
+                            installation_id = %inst.installation_id,
+                            "Installation is suspended — skipping transition rules"
+                        );
+                    } else if let Some(ref github_client) = state.github_client
+                        && let Err(e) = trakkt_github::transitions::apply_transition_rules(
+                            &state.db,
+                            github_client,
+                            inst,
+                            &inst.workspace_id,
+                            action.as_deref().unwrap_or(""),
+                            &payload,
+                            &state.encryption_key,
+                            Some(&state.ws_manager),
+                            &state.config.frontend_url,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %e, "Failed to apply transition rules");
+                    }
+                }
+
+                Some(link_result)
             } else {
                 tracing::warn!(event = %event_key, "pull_request event with no installation — marking processed");
                 Some(Ok(()))

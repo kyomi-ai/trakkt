@@ -195,6 +195,9 @@ pub async fn update_issue(
         issue_service::get_issue(ctx.db, &ctx.workspace_id, &team_key, number).await?;
     let before_snapshot = before_issue.as_ref().map(IssueSnapshot::from_issue_with_details);
 
+    // Track whether a status_id change was requested (before the value is moved).
+    let status_change_requested = params.status_id.is_some();
+
     // Resolve "move to team" separately from the identifying team_key.
     let move_team_id = resolve_team(
         ctx.db,
@@ -293,6 +296,32 @@ pub async fn update_issue(
         if let Err(e) = recorder.record_issue_diff(&issue.issue_id, before, &after).await {
             tracing::warn!(issue_id = %issue.issue_id, "Failed to record activity diff: {e}");
         }
+    }
+
+    // Outbound GitHub notification: when status moves to "completed" category,
+    // post a comment on linked PRs (best-effort — never fails the update).
+    if status_change_requested
+        && updated.status_category == "completed"
+        && let Some(github_client) = ctx.github_client
+        && let Some(encryption_key) = ctx.encryption_key
+        && let Err(e) = trakkt_github::transitions::notify_github_links_on_completion(
+            ctx.db,
+            github_client,
+            encryption_key,
+            &updated.issue_id,
+            &updated.team_key,
+            updated.number,
+            &updated.title,
+            &updated.status_name,
+            ctx.frontend_url,
+        )
+        .await
+    {
+        tracing::warn!(
+            issue_id = %updated.issue_id,
+            error = %e,
+            "Failed to notify GitHub on issue completion"
+        );
     }
 
     Ok(serde_json::to_value(&updated)?)

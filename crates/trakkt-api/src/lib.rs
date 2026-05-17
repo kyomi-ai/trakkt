@@ -39,6 +39,9 @@ pub struct ApiCtx<'a> {
     pub user_id: String,
     pub ws_manager: Option<&'a trakkt_auth::websocket::WebSocketManager>,
     pub attachment_storage: Option<&'a dyn trakkt_auth::attachment_storage::AttachmentStorage>,
+    pub github_client: Option<&'a trakkt_github::GitHubClient>,
+    pub encryption_key: Option<&'a [u8; 32]>,
+    pub frontend_url: &'a str,
 }
 
 impl<'a> ApiCtx<'a> {
@@ -51,6 +54,9 @@ impl<'a> ApiCtx<'a> {
         db: &'a trakkt_core::DbPool,
         ws_manager: &'a trakkt_auth::websocket::WebSocketManager,
         attachment_storage: &'a dyn trakkt_auth::attachment_storage::AttachmentStorage,
+        github_client: Option<&'a trakkt_github::GitHubClient>,
+        encryption_key: Option<&'a [u8; 32]>,
+        frontend_url: &'a str,
     ) -> Self {
         Self {
             db,
@@ -58,6 +64,9 @@ impl<'a> ApiCtx<'a> {
             user_id,
             ws_manager: Some(ws_manager),
             attachment_storage: Some(attachment_storage),
+            github_client,
+            encryption_key,
+            frontend_url,
         }
     }
 
@@ -70,6 +79,9 @@ impl<'a> ApiCtx<'a> {
         user_id: String,
         db: &'a trakkt_core::DbPool,
         ws_manager: Option<&'a trakkt_auth::websocket::WebSocketManager>,
+        github_client: Option<&'a trakkt_github::GitHubClient>,
+        encryption_key: Option<&'a [u8; 32]>,
+        frontend_url: &'a str,
     ) -> Self {
         Self {
             db,
@@ -77,6 +89,9 @@ impl<'a> ApiCtx<'a> {
             user_id,
             ws_manager,
             attachment_storage: None,
+            github_client,
+            encryption_key,
+            frontend_url,
         }
     }
 }

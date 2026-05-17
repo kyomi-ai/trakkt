@@ -381,6 +381,9 @@ async fn dispatch_registry_tool(
         &state.db,
         &state.ws_manager,
         &*state.attachment_storage,
+        state.github_client.as_deref(),
+        Some(&*state.encryption_key),
+        &state.config.frontend_url,
     );
 
     let result = (op.handler)(ctx, arguments).await.map_err(|e| match e {
