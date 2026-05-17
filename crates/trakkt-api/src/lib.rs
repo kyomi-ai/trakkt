@@ -7,6 +7,7 @@
 //! router and the REST router both delegate to these operations, eliminating
 //! duplicate business logic.
 
+pub mod activities;
 pub mod comments;
 pub mod context;
 pub mod issues;
@@ -183,6 +184,7 @@ pub fn all_operations() -> Vec<ApiOperation> {
     ops.extend(relations::operations());
     ops.extend(projects::operations());
     ops.extend(milestones::operations());
+    ops.extend(activities::operations());
     ops
 }
 
@@ -313,7 +315,10 @@ mod tests {
         assert!(names.contains(&"update_milestone"));
         assert!(names.contains(&"delete_milestone"));
 
-        // Total: 6 + 1 + 2 + 1 + 1 + 3 + 5 + 4 = 23
-        assert_eq!(ops.len(), 23, "expected 23 total operations");
+        // Activity operations (1)
+        assert!(names.contains(&"list_issue_activities"));
+
+        // Total: 6 + 1 + 2 + 1 + 1 + 3 + 5 + 4 + 1 = 24
+        assert_eq!(ops.len(), 24, "expected 24 total operations");
     }
 }

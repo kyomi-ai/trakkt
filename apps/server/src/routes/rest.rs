@@ -24,7 +24,7 @@ use axum::{
 };
 use serde_json::json;
 
-use trakkt_api::{comments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
+use trakkt_api::{activities, comments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
 use crate::state::AppState;
 
 use super::auth_shared::{self, ResolvedAuth};
@@ -299,6 +299,25 @@ async fn remove_relation_handler(
     Ok(Json(result))
 }
 
+// ─── Activities ─────────────────────────────────────────────────────────────
+
+async fn list_issue_activities_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "issues:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager);
+    let params = trakkt_types::api::ListIssueActivitiesApiParams {
+        issue_identifier: Some(identifier),
+        team_key: None,
+        issue_number: None,
+    };
+    let result = activities::list_issue_activities(&ctx, params).await?;
+    Ok(Json(result))
+}
+
 // ─── Projects ────────────────────────────────────────────────────────────────
 
 async fn list_projects_handler(
@@ -451,6 +470,8 @@ pub fn rest_router() -> Router<AppState> {
             get(list_relations_handler).post(add_relation_handler),
         )
         .route("/relations/{id}", delete(remove_relation_handler))
+        // Activities
+        .route("/issues/{identifier}/activities", get(list_issue_activities_handler))
         // Labels
         .route("/labels", get(list_labels_handler).post(create_label_handler))
         // Teams

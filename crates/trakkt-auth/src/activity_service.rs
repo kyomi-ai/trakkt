@@ -7,25 +7,41 @@
 //! provides a convenient API for recording individual actions or diffing
 //! entire issue snapshots to detect all changes at once.
 
-use serde::Serialize;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::models::IssueActivity;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
 
-/// A single activity entry for an issue, as stored in `issue_activities`.
-#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
-pub struct IssueActivity {
-    pub activity_id: String,
-    pub issue_id: String,
-    pub workspace_id: String,
-    pub actor_id: String,
-    pub action_type: String,
-    pub field: Option<String>,
-    pub old_value: Option<String>,
-    pub new_value: Option<String>,
-    pub metadata: Option<String>,
-    pub created_at: String,
+#[derive(sqlx::FromRow)]
+struct IssueActivityRow {
+    activity_id: String,
+    issue_id: String,
+    workspace_id: String,
+    actor_id: String,
+    action_type: String,
+    field: Option<String>,
+    old_value: Option<String>,
+    new_value: Option<String>,
+    metadata: Option<String>,
+    created_at: String,
+}
+
+impl IssueActivityRow {
+    fn into_dto(self) -> IssueActivity {
+        IssueActivity {
+            activity_id: self.activity_id,
+            issue_id: self.issue_id,
+            workspace_id: self.workspace_id,
+            actor_id: self.actor_id,
+            action_type: self.action_type,
+            field: self.field,
+            old_value: self.old_value,
+            new_value: self.new_value,
+            metadata: self.metadata,
+            created_at: self.created_at,
+        }
+    }
 }
 
 // ─── Snapshot type ───────────────────────────────────────────────────────────
@@ -415,9 +431,9 @@ pub async fn list_issue_activities(
     db: &DbPool,
     issue_id: &str,
 ) -> trakkt_core::Result<Vec<IssueActivity>> {
-    let activities: Vec<IssueActivity> = trakkt_core::db_fetch_all!(
+    let rows: Vec<IssueActivityRow> = trakkt_core::db_fetch_all!(
         db,
-        IssueActivity,
+        IssueActivityRow,
         "SELECT activity_id, issue_id, workspace_id, actor_id, action_type, \
                 field, old_value, new_value, \
                 CAST(metadata AS TEXT) AS metadata, \
@@ -427,5 +443,5 @@ pub async fn list_issue_activities(
          ORDER BY created_at ASC",
         issue_id
     )?;
-    Ok(activities)
+    Ok(rows.into_iter().map(IssueActivityRow::into_dto).collect())
 }

@@ -355,3 +355,18 @@ pub struct DeleteMilestoneApiParams {
     /// The milestone ID to delete
     pub milestone_id: String,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Activity operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing issue activities.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListIssueActivitiesApiParams {
+    /// Issue identifier in 'TRA-35' format
+    pub issue_identifier: Option<String>,
+    /// Issue number within the team
+    pub issue_number: Option<i64>,
+    /// Team key (e.g. 'TRA'). Required if issue_identifier is not provided
+    pub team_key: Option<String>,
+}
