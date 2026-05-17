@@ -828,6 +828,9 @@ pub struct FilterFieldDef {
     pub key: &'static str,
     pub label: &'static str,
     pub icon: phosphor_leptos::IconData,
+    /// Optional category for grouping fields in the AddFilter menu.
+    /// Fields with a category are rendered in sub-menus rather than top-level.
+    pub category: Option<&'static str>,
     pub operators: &'static [OperatorDef],
     pub value_kind: ValueKind,
 }
@@ -844,6 +847,8 @@ pub struct OperatorDef {
 pub enum ValueKind {
     /// Fixed set of enum values (status categories, priority levels).
     EnumSelect,
+    /// Dynamic set loaded from SyncStore (labels, projects) — rendered with search input + checkboxes.
+    DynamicSelect,
 }
 
 // ── Day-1 field definitions ────────────────────────────────────────────────
@@ -852,6 +857,7 @@ pub const STATUS_FIELD: FilterFieldDef = FilterFieldDef {
     key: "status",
     label: "Status",
     icon: phosphor_leptos::CIRCLE_DASHED,
+    category: None,
     operators: &[
         OperatorDef { key: "any_of", label_singular: "is", label_plural: "is any of" },
         OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
@@ -863,6 +869,7 @@ pub const PRIORITY_FIELD: FilterFieldDef = FilterFieldDef {
     key: "priority",
     label: "Priority",
     icon: phosphor_leptos::CELL_SIGNAL_HIGH,
+    category: None,
     operators: &[
         OperatorDef { key: "any_of", label_singular: "is", label_plural: "is any of" },
         OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
@@ -870,9 +877,35 @@ pub const PRIORITY_FIELD: FilterFieldDef = FilterFieldDef {
     value_kind: ValueKind::EnumSelect,
 };
 
+pub const LABEL_FIELD: FilterFieldDef = FilterFieldDef {
+    key: "label",
+    label: "Labels",
+    icon: phosphor_leptos::TAG,
+    category: None,
+    operators: &[
+        OperatorDef { key: "all_of", label_singular: "include", label_plural: "include all of" },
+        OperatorDef { key: "any_of", label_singular: "include", label_plural: "include any of" },
+        OperatorDef { key: "not_any_of", label_singular: "do not include", label_plural: "exclude if any of" },
+        OperatorDef { key: "not_all_of", label_singular: "do not include", label_plural: "exclude if all" },
+    ],
+    value_kind: ValueKind::DynamicSelect,
+};
+
+pub const PROJECT_FIELD: FilterFieldDef = FilterFieldDef {
+    key: "project",
+    label: "Project",
+    icon: phosphor_leptos::BRIEFCASE,
+    category: None,
+    operators: &[
+        OperatorDef { key: "any_of", label_singular: "is", label_plural: "is any of" },
+        OperatorDef { key: "none_of", label_singular: "is not", label_plural: "is not" },
+    ],
+    value_kind: ValueKind::DynamicSelect,
+};
+
 /// Returns all available filter field definitions.
 pub fn all_filter_fields() -> &'static [&'static FilterFieldDef] {
-    &[&STATUS_FIELD, &PRIORITY_FIELD]
+    &[&STATUS_FIELD, &PRIORITY_FIELD, &LABEL_FIELD, &PROJECT_FIELD]
 }
 
 /// Look up a field definition by key.
@@ -901,7 +934,15 @@ pub fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
         ("status", "none_of") => !clause.values.contains(&issue.status_id),
         ("priority", "any_of") => clause.values.contains(&issue.priority.to_string()),
         ("priority", "none_of") => !clause.values.contains(&issue.priority.to_string()),
+        // Label: all_of — issue must have ALL selected labels.
+        ("label", "all_of") => clause.values.iter().all(|v| issue.labels.iter().any(|l| &l.label_id == v)),
+        // Label: any_of — issue has at least one of the selected labels.
         ("label", "any_of") => issue.labels.iter().any(|l| clause.values.contains(&l.label_id)),
+        // Label: not_any_of — issue has NONE of the selected labels.
+        ("label", "not_any_of") => !issue.labels.iter().any(|l| clause.values.contains(&l.label_id)),
+        // Label: not_all_of — issue does NOT have all of the selected labels (may have some).
+        ("label", "not_all_of") => !clause.values.iter().all(|v| issue.labels.iter().any(|l| &l.label_id == v)),
+        // Backward-compat arm for pre-TRA-104 persisted filter clauses that used "none_of" for labels.
         ("label", "none_of") => !issue.labels.iter().any(|l| clause.values.contains(&l.label_id)),
         ("project", "any_of") => issue.project_id.as_ref().is_some_and(|pid| clause.values.contains(pid)),
         ("project", "none_of") => !issue.project_id.as_ref().is_some_and(|pid| clause.values.contains(pid)),
@@ -974,6 +1015,24 @@ pub fn FilterChip(
                     }
                     return val.clone();
                 }
+                "label" => {
+                    if let Some(store) = use_context::<crate::cache::store::SyncStore>() {
+                        let labels = store.labels().get();
+                        if let Some(l) = labels.iter().find(|l| l.label_id == *val) {
+                            return l.name.clone();
+                        }
+                    }
+                    return val.clone();
+                }
+                "project" => {
+                    if let Some(store) = use_context::<crate::cache::store::SyncStore>() {
+                        let projects = store.projects().get();
+                        if let Some(p) = projects.iter().find(|p| p.project_id == *val) {
+                            return p.name.clone();
+                        }
+                    }
+                    return val.clone();
+                }
                 _ => return val.clone(),
             }
         }
@@ -981,6 +1040,8 @@ pub fn FilterChip(
         match c.field.as_str() {
             "status" => format!("{count} statuses"),
             "priority" => format!("{count} priorities"),
+            "label" => format!("{count} labels"),
+            "project" => format!("{count} projects"),
             _ => format!("{count} values"),
         }
     });
@@ -1073,9 +1134,10 @@ pub fn FilterChip(
                     <div node_ref=val_trigger_ref class="inline-flex">
                         <button
                             type="button"
-                            class="cursor-pointer hover:text-primary transition-colors duration-200 font-medium focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            class="inline-flex items-center gap-1 cursor-pointer hover:text-primary transition-colors duration-200 font-medium focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                             on:click=move |_| set_val_open.update(|o| *o = !*o)
                         >
+                            <LabelColorDots clauses=clauses clause_index=index/>
                             {move || value_summary.get()}
                         </button>
                     </div>
@@ -1095,6 +1157,19 @@ pub fn FilterChip(
                             }.into_any(),
                             "priority" => view! {
                                 <PriorityValuePicker
+                                    clauses=clauses
+                                    clause_index=index
+                                />
+                            }.into_any(),
+                            "label" => view! {
+                                <LabelValuePicker
+                                    clauses=clauses
+                                    clause_index=index
+                                    team_id=team_id
+                                />
+                            }.into_any(),
+                            "project" => view! {
+                                <ProjectValuePicker
                                     clauses=clauses
                                     clause_index=index
                                 />
@@ -1267,6 +1342,279 @@ fn PriorityValuePicker(
     }
 }
 
+/// Renders colored dots for label filter chips when 2+ labels are selected.
+/// Only renders for "label" field clauses; renders nothing for other fields.
+#[component]
+fn LabelColorDots(
+    clauses: RwSignal<Vec<FilterClause>>,
+    clause_index: usize,
+) -> impl IntoView {
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+
+    let dots = Memo::new(move |_| {
+        let cs = clauses.get();
+        let Some(c) = cs.get(clause_index) else { return Vec::new() };
+        if c.field != "label" || c.values.len() < 2 {
+            return Vec::new();
+        }
+        let Some(store) = sync_store else { return Vec::new() };
+        let labels = store.labels().get();
+        c.values.iter().filter_map(|val| {
+            labels.iter().find(|l| &l.label_id == val).map(|l| l.color.clone())
+        }).collect::<Vec<_>>()
+    });
+
+    view! {
+        {move || {
+            let colors = dots.get();
+            if colors.is_empty() {
+                ().into_any()
+            } else {
+                view! {
+                    <span class="inline-flex items-center gap-px">
+                        {colors.into_iter().map(|color| {
+                            view! {
+                                <span
+                                    class="inline-block w-2 h-2 rounded-full shrink-0"
+                                    style=format!("background-color: {color}")
+                                />
+                            }
+                        }).collect_view()}
+                    </span>
+                }.into_any()
+            }
+        }}
+    }
+}
+
+/// A reusable value picker for dynamically-loaded options with search filtering.
+///
+/// Used by both `LabelValuePicker` and `ProjectValuePicker`. Renders a search
+/// input at the top followed by a checkbox list filtered by the search term.
+/// Each option is a `(value_id, display_label, optional_color)` tuple.
+#[component]
+fn DynamicSelectPicker(
+    /// The options to display: `(value_id, display_label, optional_color)`.
+    #[prop(into)]
+    options: Signal<Vec<(String, String, Option<String>)>>,
+    /// Currently selected value IDs.
+    #[prop(into)]
+    selected: Signal<Vec<String>>,
+    /// Called when a value is toggled (passes the toggled value ID).
+    on_toggle: Callback<String>,
+    /// Placeholder text for the search input.
+    #[prop(into)]
+    placeholder: String,
+) -> impl IntoView {
+    let (search_text, set_search_text) = signal(String::new());
+
+    let filtered_options = Memo::new(move |_| {
+        let query = search_text.get().to_lowercase();
+        let all = options.get();
+        if query.is_empty() {
+            return all;
+        }
+        all.into_iter()
+            .filter(|(_, label, _)| label.to_lowercase().contains(&query))
+            .collect::<Vec<_>>()
+    });
+
+    view! {
+        <div class="px-2 py-1.5">
+            <input
+                type="text"
+                placeholder=placeholder
+                class="w-full text-[12px] px-2 py-1 bg-transparent border-none outline-none text-foreground placeholder:text-muted-foreground"
+                prop:value=move || search_text.get()
+                on:input=move |ev| {
+                    set_search_text.set(event_target_value(&ev));
+                }
+            />
+        </div>
+        <div class="border-t border-border my-1"/>
+        {move || filtered_options.get().into_iter().map(|(value_id, label, color)| {
+            let value_for_check = value_id.clone();
+            let value_for_toggle = value_id.clone();
+            view! {
+                <div
+                    class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
+                >
+                    <Checkbox
+                        checked=Signal::derive(move || selected.get().contains(&value_for_check))
+                        on_change=Callback::new(move |_: bool| {
+                            on_toggle.run(value_for_toggle.clone());
+                        })
+                    />
+                    {color.map(|c| view! {
+                        <span
+                            class="inline-block w-2.5 h-2.5 rounded-full shrink-0"
+                            style=format!("background-color: {c}")
+                        />
+                    })}
+                    <span class="truncate">{label}</span>
+                </div>
+            }
+        }).collect_view()}
+    }
+}
+
+/// Label value picker — loads labels and delegates to `DynamicSelectPicker`.
+///
+/// Reads labels from SyncStore (real-time) with a server function fallback.
+/// When `team_id` is provided, filters to workspace-scoped + team-specific labels.
+#[component]
+fn LabelValuePicker(
+    clauses: RwSignal<Vec<FilterClause>>,
+    clause_index: usize,
+    /// Team_id for filtering labels. `None` means show all labels.
+    #[prop(into)]
+    team_id: Signal<Option<String>>,
+) -> impl IntoView {
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+
+    let labels_resource = Resource::new(
+        || (),
+        move |_| async move { list_labels(None).await },
+    );
+
+    let options = Memo::new(move |_| {
+        let all = if let Some(store) = sync_store {
+            let l = store.labels().get();
+            if !l.is_empty() || store.initialized().get() {
+                l
+            } else {
+                match labels_resource.get() {
+                    Some(Ok(items)) => items,
+                    Some(Err(e)) => {
+                        tracing::warn!("Failed to load labels for filter picker: {e}");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
+            }
+        } else {
+            match labels_resource.get() {
+                Some(Ok(items)) => items,
+                Some(Err(e)) => {
+                    tracing::warn!("Failed to load labels for filter picker: {e}");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
+        };
+
+        let filtered = if let Some(ref tid) = team_id.get() {
+            all.into_iter()
+                .filter(|l| l.team_id.is_none() || l.team_id.as_deref() == Some(tid.as_str()))
+                .collect::<Vec<_>>()
+        } else {
+            all
+        };
+
+        filtered.into_iter()
+            .map(|l| (l.label_id, l.name, Some(l.color)))
+            .collect::<Vec<_>>()
+    });
+
+    let selected_values = Memo::new(move |_| {
+        let cs = clauses.get();
+        cs.get(clause_index)
+            .map(|c| c.values.clone())
+            .unwrap_or_default()
+    });
+
+    view! {
+        <DynamicSelectPicker
+            options=Signal::derive(move || options.get())
+            selected=Signal::derive(move || selected_values.get())
+            on_toggle=Callback::new(move |val: String| {
+                clauses.update(|cs| {
+                    if let Some(c) = cs.get_mut(clause_index) {
+                        if let Some(pos) = c.values.iter().position(|v| v == &val) {
+                            c.values.remove(pos);
+                        } else {
+                            c.values.push(val);
+                        }
+                    }
+                });
+            })
+            placeholder="Search labels..."
+        />
+    }
+}
+
+/// Project value picker — loads projects and delegates to `DynamicSelectPicker`.
+///
+/// Reads projects from SyncStore (real-time) with a server function fallback.
+#[component]
+fn ProjectValuePicker(
+    clauses: RwSignal<Vec<FilterClause>>,
+    clause_index: usize,
+) -> impl IntoView {
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+
+    let projects_resource = Resource::new(
+        || (),
+        move |_| async move { list_projects().await },
+    );
+
+    let options = Memo::new(move |_| {
+        let all = if let Some(store) = sync_store {
+            let p = store.projects().get();
+            if !p.is_empty() || store.initialized().get() {
+                p
+            } else {
+                match projects_resource.get() {
+                    Some(Ok(items)) => items,
+                    Some(Err(e)) => {
+                        tracing::warn!("Failed to load projects for filter picker: {e}");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
+            }
+        } else {
+            match projects_resource.get() {
+                Some(Ok(items)) => items,
+                Some(Err(e)) => {
+                    tracing::warn!("Failed to load projects for filter picker: {e}");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            }
+        };
+        all.into_iter()
+            .map(|p| (p.project_id, p.name, p.color))
+            .collect::<Vec<_>>()
+    });
+
+    let selected_values = Memo::new(move |_| {
+        let cs = clauses.get();
+        cs.get(clause_index)
+            .map(|c| c.values.clone())
+            .unwrap_or_default()
+    });
+
+    view! {
+        <DynamicSelectPicker
+            options=Signal::derive(move || options.get())
+            selected=Signal::derive(move || selected_values.get())
+            on_toggle=Callback::new(move |val: String| {
+                clauses.update(|cs| {
+                    if let Some(c) = cs.get_mut(clause_index) {
+                        if let Some(pos) = c.values.iter().position(|v| v == &val) {
+                            c.values.remove(pos);
+                        } else {
+                            c.values.push(val);
+                        }
+                    }
+                });
+            })
+            placeholder="Search projects..."
+        />
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Composable Filter System — AddFilterMenu component
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1297,10 +1645,15 @@ pub fn AddFilterMenu(
             open=Signal::derive(move || open.get())
             on_close=Callback::new(move |()| set_open.set(false))
         >
-            {all_filter_fields().iter().map(|field_def| {
+            // Fields with a category are rendered in sub-menus (e.g. "Relations" → parent/sub-issue/blocking).
+            // Currently all fields are top-level (category: None). TRA-105 adds the first categorized fields.
+            {all_filter_fields().iter()
+                .filter(|f| f.category.is_none())
+                .map(|field_def| {
                 let key = field_def.key;
                 let label = field_def.label.to_string();
                 let icon_data = field_def.icon;
+                let default_op = field_def.operators.first().map(|o| o.key).unwrap_or("any_of");
                 view! {
                     <DropdownItem
                         label=label
@@ -1308,7 +1661,7 @@ pub fn AddFilterMenu(
                             clauses.update(|cs| {
                                 cs.push(FilterClause {
                                     field: key.to_string(),
-                                    operator: "any_of".to_string(),
+                                    operator: default_op.to_string(),
                                     values: Vec::new(),
                                 });
                             });
