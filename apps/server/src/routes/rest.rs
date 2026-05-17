@@ -343,7 +343,7 @@ async fn list_issue_github_links_handler(
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "issues:read")?;
-    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage, state.github_client.as_deref(), Some(&*state.encryption_key), &state.config.frontend_url);
     let params = trakkt_types::api::ListGitHubLinksApiParams {
         issue_identifier: Some(identifier),
         team_key: None,
