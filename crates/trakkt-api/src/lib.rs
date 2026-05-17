@@ -11,6 +11,7 @@ pub mod activities;
 pub mod attachments;
 pub mod comments;
 pub mod context;
+pub mod github_links;
 pub mod issues;
 pub mod labels;
 pub mod milestones;
@@ -215,6 +216,7 @@ pub fn all_operations() -> Vec<ApiOperation> {
     ops.extend(projects::operations());
     ops.extend(milestones::operations());
     ops.extend(activities::operations());
+    ops.extend(github_links::operations());
     ops
 }
 
@@ -321,8 +323,9 @@ mod tests {
         assert!(names.contains(&"list_labels"));
         assert!(names.contains(&"create_label"));
 
-        // Team operations (1)
+        // Team operations (2)
         assert!(names.contains(&"list_teams"));
+        assert!(names.contains(&"update_team_settings"));
 
         // Status operations (1)
         assert!(names.contains(&"list_statuses"));
@@ -354,7 +357,10 @@ mod tests {
         // Activity operations (1)
         assert!(names.contains(&"list_issue_activities"));
 
-        // Total: 6 + 1 + 2 + 1 + 1 + 3 + 5 + 4 + 4 + 1 = 28
-        assert_eq!(ops.len(), 28, "expected 28 total operations");
+        // GitHub link operations (1)
+        assert!(names.contains(&"list_issue_github_links"));
+
+        // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 1 + 1 = 30
+        assert_eq!(ops.len(), 30, "expected 30 total operations");
     }
 }

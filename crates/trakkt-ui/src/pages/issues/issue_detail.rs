@@ -30,6 +30,7 @@ use crate::components::{
 };
 use crate::pages::issues::issue_list::NewIssueModal;
 use crate::server_fns::activities::list_issue_activities;
+use crate::server_fns::github::{list_github_links_for_issue, GitHubLinkDisplay};
 use crate::server_fns::comments::create_comment;
 use crate::server_fns::issues::{get_issue, list_issues, set_issue_labels, update_issue};
 use crate::server_fns::labels::list_labels;
@@ -365,6 +366,12 @@ fn IssueDetailContent(
                     number=number
                     issue_id=initial.get_untracked().issue_id.clone()
                     team_id=initial.get_untracked().team_id.clone()
+                />
+
+                // ── GitHub activity (PRs, branches, commits linked to this issue) ──
+                <GitHubActivitySection
+                    team_key=initial_team_key.clone()
+                    number=number
                 />
 
                 // ── Divider ────────────────────────────────────────────
@@ -2415,6 +2422,254 @@ fn IssueDetailSkeleton() -> impl IntoView {
                         </div>
                     }
                 }).collect_view()}
+            </div>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GitHub Activity Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Display linked GitHub activity (PRs, branches, commits) for an issue.
+///
+/// Only renders when there are GitHub links. Groups by type: PRs first,
+/// then branches, then commits. Shows first 3 if > 5 total, with an
+/// expander to show the rest.
+#[component]
+fn GitHubActivitySection(
+    team_key: String,
+    number: i32,
+) -> impl IntoView {
+    let tk = team_key.clone();
+    let links_resource = Resource::new(
+        move || (tk.clone(), number),
+        move |(tk, num)| async move { list_github_links_for_issue(tk, num).await },
+    );
+
+    let (expanded, set_expanded) = signal(false);
+
+    view! {
+        <Suspense fallback=|| ()>
+            {move || {
+                let links = match links_resource.get() {
+                    Some(Ok(l)) => l,
+                    Some(Err(e)) => {
+                        tracing::warn!("Failed to fetch GitHub links: {e}");
+                        return None;
+                    }
+                    None => return None,
+                };
+
+                if links.is_empty() {
+                    return None;
+                }
+
+                // Group by type: PRs first, then branches, then commits
+                let mut prs: Vec<GitHubLinkDisplay> = Vec::new();
+                let mut branches: Vec<GitHubLinkDisplay> = Vec::new();
+                let mut commits: Vec<GitHubLinkDisplay> = Vec::new();
+
+                for link in links {
+                    match link.link_type.as_str() {
+                        "pull_request" => prs.push(link),
+                        "branch" => branches.push(link),
+                        "commit" => commits.push(link),
+                        other => {
+                            tracing::warn!(link_type = %other, "unknown GitHub link type");
+                        }
+                    }
+                }
+
+                let mut ordered: Vec<GitHubLinkDisplay> = Vec::new();
+                ordered.extend(prs);
+                ordered.extend(branches);
+                ordered.extend(commits);
+
+                let total = ordered.len();
+                let is_expanded = expanded.get();
+                let show_expander = total > 5;
+                let visible_count = if show_expander && !is_expanded { 3 } else { total };
+                let hidden_count = total.saturating_sub(visible_count);
+
+                let visible_links = ordered.into_iter().take(visible_count).collect::<Vec<_>>();
+
+                let rows = visible_links.into_iter().map(|link| {
+                    render_github_link(link)
+                }).collect_view();
+
+                Some(view! {
+                    <div class="mt-6">
+                        <h2 class="text-xs text-muted-foreground font-medium uppercase tracking-wider mb-2">
+                            "Development"
+                        </h2>
+                        <div class="space-y-0.5">
+                            {rows}
+                        </div>
+                        {if show_expander && !is_expanded {
+                            Some(view! {
+                                <Button
+                                    variant=ButtonVariant::GhostMuted
+                                    size=ButtonSize::Sm
+                                    class="mt-1.5"
+                                    on:click=move |_| set_expanded.set(true)
+                                >
+                                    {format!("Show {} more", hidden_count)}
+                                </Button>
+                            })
+                        } else {
+                            None
+                        }}
+                    </div>
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// Map PR state to a design-token CSS class.
+fn pr_state_color(state: &str) -> &'static str {
+    match state {
+        "open" => "text-success-foreground",
+        "merged" => "text-purple-600",
+        "closed" => "text-error-foreground",
+        _ => "text-muted-foreground",
+    }
+}
+
+/// Render a single GitHub link row based on its type.
+fn render_github_link(link: GitHubLinkDisplay) -> impl IntoView {
+    match link.link_type.as_str() {
+        "pull_request" => render_pr_link(link).into_any(),
+        "branch" => render_branch_link(link).into_any(),
+        "commit" => render_commit_link(link).into_any(),
+        _ => view! { <div></div> }.into_any(),
+    }
+}
+
+/// Render a pull request link row.
+fn render_pr_link(link: GitHubLinkDisplay) -> impl IntoView {
+    let icon_class = link.state.as_deref().map(pr_state_color).unwrap_or("text-muted-foreground");
+
+    let state_label = link.state.clone();
+    let display_text = if let Some(ref title) = link.title {
+        format!("#{} {}", link.ref_identifier, title)
+    } else {
+        format!("#{}", link.ref_identifier)
+    };
+    let author_text = link.author_login.as_deref().map(|a| format!("@{a}"));
+    let time_text = relative_time(&link.created_at);
+    let close_intent = link.close_intent;
+    let url = link.url.clone();
+    let repo = link.repo_full_name.clone();
+
+    view! {
+        <div class="flex items-start gap-2 py-1.5">
+            <span class=format!("mt-0.5 shrink-0 {icon_class}")>
+                <Icon icon=phosphor_leptos::GIT_PULL_REQUEST size="14px"/>
+            </span>
+            <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2">
+                    <a
+                        href=url
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="text-sm text-foreground hover:text-accent transition-colors truncate"
+                    >
+                        {display_text}
+                    </a>
+                    {if let Some(ref state) = state_label {
+                        let badge_class = pr_state_color(state);
+                        Some(view! {
+                            <span class=format!("text-xs shrink-0 {badge_class}")>
+                                {state.clone()}
+                            </span>
+                        })
+                    } else {
+                        None
+                    }}
+                </div>
+                <div class="flex items-center gap-1 text-xs text-muted-foreground">
+                    <span>{repo}</span>
+                    {author_text.map(|a| view! { <><span>{"\u{2022}"}</span><span>{a}</span></> })}
+                    <span>{"\u{2022}"}</span>
+                    <span>{time_text}</span>
+                </div>
+                {if close_intent {
+                    Some(view! {
+                        <span class="text-xs text-muted-foreground italic">"Closes this issue"</span>
+                    })
+                } else {
+                    None
+                }}
+            </div>
+        </div>
+    }
+}
+
+/// Render a branch link row.
+fn render_branch_link(link: GitHubLinkDisplay) -> impl IntoView {
+    let url = link.url.clone();
+    let ref_id = link.ref_identifier.clone();
+    let repo = link.repo_full_name.clone();
+
+    view! {
+        <div class="flex items-start gap-2 py-1.5">
+            <span class="mt-0.5 shrink-0 text-muted-foreground">
+                <Icon icon=phosphor_leptos::GIT_BRANCH size="14px"/>
+            </span>
+            <div class="flex-1 min-w-0">
+                <a
+                    href=url
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="text-sm text-foreground hover:text-accent transition-colors truncate block"
+                >
+                    {ref_id}
+                </a>
+                <span class="text-xs text-muted-foreground">{repo}</span>
+            </div>
+        </div>
+    }
+}
+
+/// Render a commit link row.
+fn render_commit_link(link: GitHubLinkDisplay) -> impl IntoView {
+    let url = link.url.clone();
+    let short_sha = if link.ref_identifier.len() > 7 {
+        link.ref_identifier[..7].to_string()
+    } else {
+        link.ref_identifier.clone()
+    };
+    let display_text = if let Some(ref title) = link.title {
+        format!("{short_sha} {title}")
+    } else {
+        short_sha.clone()
+    };
+    let author_text = link.author_login.as_deref().map(|a| format!("@{a}"));
+    let time_text = relative_time(&link.created_at);
+    let repo = link.repo_full_name.clone();
+
+    view! {
+        <div class="flex items-start gap-2 py-1.5">
+            <span class="mt-0.5 shrink-0 text-muted-foreground">
+                <Icon icon=phosphor_leptos::GIT_COMMIT size="14px"/>
+            </span>
+            <div class="flex-1 min-w-0">
+                <a
+                    href=url
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="text-sm text-foreground hover:text-accent transition-colors truncate block"
+                >
+                    {display_text}
+                </a>
+                <div class="flex items-center gap-1 text-xs text-muted-foreground">
+                    <span>{repo}</span>
+                    {author_text.map(|a| view! { <><span>{"\u{2022}"}</span><span>{a}</span></> })}
+                    <span>{"\u{2022}"}</span>
+                    <span>{time_text}</span>
+                </div>
             </div>
         </div>
     }
