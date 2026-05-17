@@ -73,6 +73,8 @@ pub struct CreateIssueApiParams {
     pub milestone_id: Option<String>,
     /// Parent issue ID for sub-issues
     pub parent_issue_id: Option<String>,
+    /// Estimate points value (integer)
+    pub estimate: Option<i32>,
 }
 
 /// Parameters for updating an existing issue.
@@ -113,6 +115,8 @@ pub struct UpdateIssueApiParams {
     pub milestone_id: Option<Option<String>>,
     /// Parent issue ID, or null to clear
     pub parent_issue_id: Option<Option<String>>,
+    /// Estimate points value, or null to clear
+    pub estimate: Option<Option<i32>>,
     /// Sort order, or null to clear
     pub sort_order: Option<Option<f64>>,
 }
@@ -190,6 +194,17 @@ pub struct CreateLabelApiParams {
 /// Parameters for listing teams the authenticated user belongs to.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct ListTeamsApiParams {}
+
+/// Parameters for updating a team's settings.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct UpdateTeamSettingsApiParams {
+    /// Team key (e.g. 'TRA')
+    pub team_key: Option<String>,
+    /// Team ID
+    pub team_id: Option<String>,
+    /// New team settings (full replace)
+    pub settings: crate::models::TeamSettings,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Status operations
