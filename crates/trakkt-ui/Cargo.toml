@@ -19,6 +19,7 @@ ssr = [
     "dep:trakkt-core",
     "dep:trakkt-auth",
     "dep:trakkt-api",
+    "dep:trakkt-github",
     "dep:tokio",
     "dep:uuid",
     "dep:axum",
@@ -96,6 +97,7 @@ chrono = { workspace = true, features = ["wasmbind"] }
 trakkt-core = { workspace = true, optional = true }
 trakkt-auth = { workspace = true, optional = true }
 trakkt-api = { workspace = true, optional = true }
+trakkt-github = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 webauthn-rs = { workspace = true, optional = true }

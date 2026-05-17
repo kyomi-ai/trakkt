@@ -7,6 +7,7 @@ pub mod auth;
 pub mod comments;
 pub mod context;
 pub mod favorites;
+pub mod github;
 pub mod issues;
 pub mod labels;
 pub mod notifications;
@@ -138,6 +139,26 @@ impl AuthFlowContext {
         let device = auth::extract_device_info(&headers);
         Ok(Self { ctx, kv, ip, device })
     }
+}
+
+/// Reject non-workspace-admin users.
+///
+/// Shared across server-function modules that need admin-only operations
+/// (workspace settings, team management, integrations).
+#[cfg(feature = "ssr")]
+pub(crate) fn require_workspace_admin(
+    auth: &trakkt_auth::middleware::AuthUser,
+) -> Result<(), leptos::prelude::ServerFnError> {
+    if !auth
+        .workspace
+        .workspace_roles
+        .contains(&trakkt_core::enums::WorkspaceRole::WorkspaceAdmin)
+    {
+        return Err(leptos::prelude::ServerFnError::new(
+            "Workspace admin access required",
+        ));
+    }
+    Ok(())
 }
 
 /// Extension trait for error conversion.

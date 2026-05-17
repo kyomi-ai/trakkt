@@ -38,20 +38,8 @@ fn generate_invitation_id() -> String {
     format!("inv-{}", &hex[..24])
 }
 
-/// Reject non-workspace-admin users.
 #[cfg(feature = "ssr")]
-fn require_workspace_admin(
-    auth: &trakkt_auth::middleware::AuthUser,
-) -> Result<(), ServerFnError> {
-    if !auth
-        .workspace
-        .workspace_roles
-        .contains(&trakkt_core::enums::WorkspaceRole::WorkspaceAdmin)
-    {
-        return Err(ServerFnError::new("Workspace admin access required"));
-    }
-    Ok(())
-}
+use super::require_workspace_admin;
 
 /// Load the workspace record for the authenticated user.
 #[cfg(feature = "ssr")]

@@ -254,6 +254,30 @@ pub async fn suspend_installation(
     Ok(())
 }
 
+/// Clear the suspended status and update the account details of an installation.
+///
+/// Used during the reconnection flow (disconnect then reconnect) to reactivate
+/// an existing installation record with potentially updated account information.
+pub async fn reactivate_installation(
+    db: &DbPool,
+    installation_id: &str,
+    github_installation_id: i64,
+    account_login: &str,
+    account_type: &str,
+    target_repos: Option<&serde_json::Value>,
+) -> trakkt_core::Result<()> {
+    let target_repos_json = target_repos.map(|v| v.to_string());
+    trakkt_core::db_execute!(
+        db,
+        "UPDATE github_installations \
+         SET suspended_at = NULL, github_installation_id = $1, \
+             account_login = $2, account_type = $3, target_repos = $4 \
+         WHERE installation_id = $5",
+        github_installation_id, account_login, account_type, &target_repos_json, installation_id
+    )?;
+    Ok(())
+}
+
 /// Clear the suspended status of an installation.
 pub async fn unsuspend_installation(
     db: &DbPool,
