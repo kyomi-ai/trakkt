@@ -79,6 +79,7 @@ pub fn build_router(state: state::AppState) -> Router {
         .nest("/api/v1/auth", routes::auth_token::routes())
         .nest("/api/v1", routes::rest::rest_router())
         .nest("/api/v1/teams", routes::team_icon::routes())
+        .nest("/webhooks", routes::billing::routes())
         .nest("/mcp", routes::mcp::routes())
         .merge(routes::oauth::well_known_routes())
         .nest("/api/v1/oauth", routes::oauth::routes())

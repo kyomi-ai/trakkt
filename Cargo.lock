@@ -5276,6 +5276,9 @@ name = "trakkt-server"
 version = "0.1.0"
 dependencies = [
  "any_spawner",
+ "async-stripe-shared",
+ "async-stripe-types",
+ "async-stripe-webhook",
  "async-trait",
  "axum",
  "base64 0.22.1",
