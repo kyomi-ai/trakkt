@@ -221,6 +221,33 @@ pub async fn clear_team_icon(
     Ok(team)
 }
 
+/// Update a team's settings (estimate scale, toggles, etc.).
+///
+/// Accepts the settings as a JSON string because Leptos server functions
+/// cannot deserialize complex nested enums directly from URL-encoded form data.
+#[server(prefix = "/leptos-api")]
+pub async fn update_team_settings(
+    team_id: String,
+    settings_json: String,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let settings: trakkt_types::models::TeamSettings =
+        serde_json::from_str(&settings_json).map_err(|e| {
+            tracing::warn!(error = %e, "Failed to parse team settings JSON");
+            ServerFnError::new(format!("Invalid settings: {e}"))
+        })?;
+    trakkt_auth::team_service::update_team_settings(
+        ac.db(),
+        &team_id,
+        &ac.ws_id,
+        &settings,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(())
+}
+
 /// Create a new issue-tracker team in the current workspace.
 #[server(prefix = "/leptos-api")]
 pub async fn create_team(

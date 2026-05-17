@@ -200,10 +200,36 @@ pub async fn list_workspace_invitations() -> Result<Vec<TeamInvitation>, ServerF
 /// Create a new invitation. Requires admin.
 ///
 /// Mirrors `POST /api/v1/workspaces/invitations` in workspaces.rs.
+///
+/// When billing is enabled, this gates on an active subscription. Returns
+/// the error string `"billing_required"` so the UI can show the billing
+/// upgrade prompt instead of a generic error.
 #[server(prefix = "/leptos-api")]
 pub async fn invite_member(email: String, role: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     require_workspace_admin(&ac.auth)?;
+
+    // Billing gate: if Stripe billing is enabled, verify the workspace
+    // has an active subscription before allowing invitations.
+    if ac.ctx.stripe.is_some() {
+        let status: Option<String> = {
+            #[derive(sqlx::FromRow)]
+            struct StatusRow {
+                subscription_status: Option<String>,
+            }
+            let row = trakkt_core::db_fetch_one!(
+                ac.db(),
+                StatusRow,
+                "SELECT subscription_status FROM workspaces WHERE workspace_id = $1",
+                &ac.ws_id
+            )
+            .into_sfn()?;
+            row.subscription_status
+        };
+        if !trakkt_auth::billing_service::can_invite_users(status.as_deref()) {
+            return Err(ServerFnError::new("billing_required"));
+        }
+    }
 
     let email = email.trim().to_lowercase();
 

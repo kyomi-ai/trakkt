@@ -12,6 +12,8 @@ use leptos_router::hooks::{use_location, use_navigate};
 use leptos_router::location::State;
 use leptos_router::NavigateOptions;
 
+use phosphor_leptos::Icon;
+
 use crate::components::{
     Avatar, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator,
 };
@@ -53,6 +55,24 @@ pub fn IssueRow(
     let status = IssueStatusVariant::parse(&issue.status_category);
     let row_ref = NodeRef::<leptos::html::A>::new();
     let location = use_location();
+
+    // ── Estimate badge: look up team settings from SyncStore ─────────
+    let estimate_label = {
+        let sync_store = use_context::<crate::cache::store::SyncStore>();
+        let team_id = issue.team_id.clone();
+        let estimate = issue.estimate;
+        estimate.and_then(|val| {
+            // Resolve team settings to get the scale for formatting
+            let scale = sync_store
+                .and_then(|store| {
+                    store.teams().get_untracked().into_iter()
+                        .find(|t| t.team_id == team_id)
+                        .and_then(|t| t.settings)
+                        .and_then(|s| s.estimate_scale)
+                })?;
+            Some(scale.format_label(val))
+        })
+    };
 
     let is_selected = Memo::new(move |_| selected_index.get() == Some(index));
 
@@ -141,6 +161,16 @@ pub fn IssueRow(
                     }
                 }).collect_view()}
             </div>
+
+            // Estimate badge (only when team has estimates enabled and issue has an estimate)
+            {estimate_label.map(|label| {
+                view! {
+                    <span class="hidden sm:inline-flex items-center gap-0.5 text-xs text-muted-foreground shrink-0" title="Estimate">
+                        <Icon icon=phosphor_leptos::GAUGE size="12px" weight=phosphor_leptos::IconWeight::Bold/>
+                        <span class="font-mono">{label}</span>
+                    </span>
+                }
+            })}
 
             // Date (Geist Mono)
             <span class="font-mono text-xs text-muted-foreground shrink-0 hidden sm:inline">

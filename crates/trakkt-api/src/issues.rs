@@ -150,6 +150,7 @@ pub async fn create_issue(
         label_ids,
         project_id: params.project_id,
         milestone_id: params.milestone_id,
+        estimate: params.estimate,
     };
 
     let issue =
@@ -218,6 +219,7 @@ pub async fn update_issue(
         due_date: params.due_date,
         project_id: params.project_id,
         milestone_id: params.milestone_id,
+        estimate: params.estimate,
         sort_order: params.sort_order,
         team_id: move_team_id,
     };

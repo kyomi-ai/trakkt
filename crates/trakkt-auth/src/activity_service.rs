@@ -86,8 +86,8 @@ pub struct IssueSnapshot {
 
 impl IssueSnapshot {
     /// Build a snapshot from an `IssueWithDetails` struct returned by `get_issue`
-    /// or `get_issue_by_id`. Fields not available on the detail struct (estimate,
-    /// milestone_name, parent_issue_id) default to `None`.
+    /// or `get_issue_by_id`. Fields not available on the detail struct
+    /// (milestone_name, parent_issue_id) default to `None`.
     pub fn from_issue_with_details(issue: &IssueWithDetails) -> Self {
         let description_hash = issue.description.as_ref().map(|d| {
             let mut h = DefaultHasher::new();
@@ -113,7 +113,7 @@ impl IssueSnapshot {
             assignee_name: issue.assignee_name.clone(),
             title: issue.title.clone(),
             description_hash,
-            estimate: None,
+            estimate: issue.estimate,
             project_id: issue.project_id.clone(),
             project_name: issue.project_name.clone(),
             milestone_id: issue.milestone_id.clone(),

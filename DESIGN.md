@@ -268,7 +268,7 @@ The content area is one continuous warm surface. No visual separation between he
 
 ### Issue Row Order
 
-Left to right: **Priority icon | Status icon | Issue ID | Title | Labels | Date | Assignee avatar**
+Left to right: **Priority icon | Status icon | Issue ID | Title | Labels | Estimate (optional) | Date | Assignee avatar**
 
 Priority is first because it's the most important signal for triage scanning. Status is second because it's the most-changed field. Title and labels take the middle. Date and assignee are right-aligned metadata.
 

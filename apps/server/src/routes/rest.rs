@@ -241,6 +241,20 @@ async fn list_teams_handler(
     Ok(Json(result))
 }
 
+async fn update_team_settings_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(mut params): Json<trakkt_types::api::UpdateTeamSettingsApiParams>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "teams:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage);
+    params.team_key = Some(identifier);
+    let result = teams::update_team_settings(&ctx, params).await?;
+    Ok(Json(result))
+}
+
 // ─── Statuses ────────────────────────────────────────────────────────────────
 
 async fn list_statuses_handler(
@@ -662,6 +676,7 @@ pub fn rest_router() -> Router<AppState> {
         .route("/labels", get(list_labels_handler).post(create_label_handler))
         // Teams
         .route("/teams", get(list_teams_handler))
+        .route("/teams/{identifier}/settings", patch(update_team_settings_handler))
         // Statuses
         .route("/statuses", get(list_statuses_handler))
         // Projects
