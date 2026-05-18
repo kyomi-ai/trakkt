@@ -203,21 +203,44 @@ pub async fn remove_relation(
     .await?;
 
     // Record activity on both issues — never fails the mutation.
+    // Look up both issues to get their identifiers for rich activity metadata
+    // (matches the shape of relation_added metadata).
     let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
     match relation_before {
         Ok(Some(rel)) => {
-            let meta = json!({
+            let source_issue = issue_service::get_issue_by_id(ctx.db, &rel.source_issue_id).await;
+            let target_issue = issue_service::get_issue_by_id(ctx.db, &rel.target_issue_id).await;
+
+            let source_identifier = source_issue.as_ref().ok().and_then(|o| o.as_ref())
+                .map(|i| format!("{}-{}", i.team_key, i.number));
+            let target_identifier = target_issue.as_ref().ok().and_then(|o| o.as_ref())
+                .map(|i| format!("{}-{}", i.team_key, i.number));
+
+            let source_meta = json!({
                 "relation_id": params.relation_id,
                 "relation_type": rel.relation_type,
+                "direction": "outward",
+                "related_issue_id": rel.target_issue_id,
+                "related_identifier": target_identifier,
+                "related_title": target_issue.ok().flatten().map(|i| i.title),
             });
             if let Err(e) = recorder
-                .record(&rel.source_issue_id, "relation_removed", Some(&meta))
+                .record(&rel.source_issue_id, "relation_removed", Some(&source_meta))
                 .await
             {
                 tracing::warn!(relation_id = %params.relation_id, "Failed to record relation_removed on source: {e}");
             }
+
+            let target_meta = json!({
+                "relation_id": params.relation_id,
+                "relation_type": rel.relation_type,
+                "direction": "inward",
+                "related_issue_id": rel.source_issue_id,
+                "related_identifier": source_identifier,
+                "related_title": source_issue.ok().flatten().map(|i| i.title),
+            });
             if let Err(e) = recorder
-                .record(&rel.target_issue_id, "relation_removed", Some(&meta))
+                .record(&rel.target_issue_id, "relation_removed", Some(&target_meta))
                 .await
             {
                 tracing::warn!(relation_id = %params.relation_id, "Failed to record relation_removed on target: {e}");

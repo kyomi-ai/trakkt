@@ -1489,8 +1489,27 @@ fn DescriptionEditor(
         }
     });
 
+    // Derived signal that auto-links issue identifiers in the description markdown.
+    // The editor renders these as clickable links; on_change guards against
+    // saving auto-link-only changes back to the server.
+    let auto_linked_content = Signal::derive(move || {
+        crate::utils::auto_link::auto_link_issue_identifiers(&gated_content.get())
+    });
+
     let tk = team_key.clone();
     let on_change: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text: String| {
+        // Detect if this change was caused solely by auto-linking.
+        // If the incoming text matches what auto_link would produce from the
+        // current raw content, but differs from the raw content, it's an
+        // auto-link echo — update gated_content so subsequent edits have the
+        // linked version as baseline, but don't trigger a server save.
+        let current = gated_content.get_untracked();
+        let auto_linked = crate::utils::auto_link::auto_link_issue_identifiers(&current);
+        if text == auto_linked && text != current {
+            gated_content.set(text);
+            return;
+        }
+
         editing.set(true);
         latest_text.set(text);
         edit_version.update(|v| *v += 1);
@@ -1547,7 +1566,7 @@ fn DescriptionEditor(
     view! {
         <div class="mt-6" style="min-height: 120px;">
             <TreeWysiwygEditor
-                content=gated_content.read_only()
+                content=auto_linked_content
                 on_change=on_change
                 show_fixed_toolbar=false
                 show_floating_toolbar=true
@@ -2155,93 +2174,153 @@ fn activity_icon(action_type: &str) -> leptos::prelude::AnyView {
 }
 
 /// Format a human-readable description from an activity's action_type and values.
-fn format_activity_description(activity: &IssueActivity) -> String {
+///
+/// Returns an `AnyView` so that issue identifiers in the text can be rendered
+/// as clickable links (via [`crate::utils::auto_link::auto_link_view`]).
+/// Relation activities parse metadata JSON to extract identifiers directly.
+fn format_activity_description(activity: &IssueActivity) -> leptos::prelude::AnyView {
+    use crate::utils::auto_link::auto_link_view;
+
+    match activity.action_type.as_str() {
+        "relation_added" => {
+            if let Some(ref meta_str) = activity.metadata {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                    let identifier = meta.get("related_identifier").and_then(|v| v.as_str());
+                    let rel_type = meta.get("relation_type").and_then(|v| v.as_str());
+                    let direction = meta.get("direction").and_then(|v| v.as_str());
+                    if let (Some(identifier), Some(rel_type), Some(direction)) =
+                        (identifier, rel_type, direction)
+                    {
+                        let label = match (rel_type, direction) {
+                            ("blocks", "outward") => "blocks",
+                            ("blocks", "inward") => "blocked by",
+                            ("parent", "outward") => "sub-issue of",
+                            ("parent", "inward") => "parent of",
+                            ("duplicate", "outward") => "duplicate of",
+                            ("duplicate", "inward") => "has duplicate",
+                            _ => "related to",
+                        };
+                        let href = format!("/issues/{identifier}");
+                        let id_owned = identifier.to_string();
+                        return view! {
+                            <span>
+                                {format!("added {label} relation to ")}
+                                <a href=href class="text-accent-foreground hover:underline font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm">{id_owned}</a>
+                            </span>
+                        }
+                        .into_any();
+                    }
+                } else {
+                    tracing::warn!("Failed to parse relation_added metadata: {meta_str}");
+                }
+            }
+            view! { <span>"added a relation"</span> }.into_any()
+        }
+        "relation_removed" => {
+            if let Some(ref meta_str) = activity.metadata {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                    let identifier = meta.get("related_identifier").and_then(|v| v.as_str());
+                    let rel_type = meta.get("relation_type").and_then(|v| v.as_str());
+                    let direction = meta.get("direction").and_then(|v| v.as_str());
+                    if let (Some(identifier), Some(rel_type), Some(direction)) =
+                        (identifier, rel_type, direction)
+                    {
+                        let label = match (rel_type, direction) {
+                            ("blocks", "outward") => "blocks",
+                            ("blocks", "inward") => "blocked by",
+                            ("parent", "outward") => "sub-issue of",
+                            ("parent", "inward") => "parent of",
+                            ("duplicate", "outward") => "duplicate of",
+                            ("duplicate", "inward") => "has duplicate",
+                            _ => "related to",
+                        };
+                        let href = format!("/issues/{identifier}");
+                        let id_owned = identifier.to_string();
+                        return view! {
+                            <span>
+                                {format!("removed {label} relation to ")}
+                                <a href=href class="text-accent-foreground hover:underline font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm">{id_owned}</a>
+                            </span>
+                        }
+                        .into_any();
+                    }
+                } else {
+                    tracing::warn!("Failed to parse relation_removed metadata: {meta_str}");
+                }
+            }
+            view! { <span>"removed a relation"</span> }.into_any()
+        }
+        _ => {
+            let text = format_activity_text(activity);
+            auto_link_view(&text)
+        }
+    }
+}
+
+/// Build the plain-text description for non-relation activity types.
+fn format_activity_text(activity: &IssueActivity) -> String {
     match activity.action_type.as_str() {
         "created" => "created this issue".to_string(),
-        "status_changed" => {
-            match (&activity.old_value, &activity.new_value) {
-                (Some(old), Some(new)) => format!("changed status from {old} to {new}"),
-                (None, Some(new)) => format!("set status to {new}"),
-                _ => "changed status".to_string(),
-            }
-        }
-        "priority_changed" => {
-            match (&activity.old_value, &activity.new_value) {
-                (Some(old), Some(new)) => format!("changed priority from {old} to {new}"),
-                (None, Some(new)) => format!("set priority to {new}"),
-                _ => "changed priority".to_string(),
-            }
-        }
-        "assignee_changed" => {
-            match (&activity.old_value, &activity.new_value) {
-                (Some(old), Some(new)) => format!("reassigned from {old} to {new}"),
-                (None, Some(new)) => format!("assigned to {new}"),
-                (Some(old), None) => format!("unassigned {old}"),
-                _ => "changed assignee".to_string(),
-            }
-        }
+        "status_changed" => match (&activity.old_value, &activity.new_value) {
+            (Some(old), Some(new)) => format!("changed status from {old} to {new}"),
+            (None, Some(new)) => format!("set status to {new}"),
+            _ => "changed status".to_string(),
+        },
+        "priority_changed" => match (&activity.old_value, &activity.new_value) {
+            (Some(old), Some(new)) => format!("changed priority from {old} to {new}"),
+            (None, Some(new)) => format!("set priority to {new}"),
+            _ => "changed priority".to_string(),
+        },
+        "assignee_changed" => match (&activity.old_value, &activity.new_value) {
+            (Some(old), Some(new)) => format!("reassigned from {old} to {new}"),
+            (None, Some(new)) => format!("assigned to {new}"),
+            (Some(old), None) => format!("unassigned {old}"),
+            _ => "changed assignee".to_string(),
+        },
         "title_changed" => "changed the title".to_string(),
         "description_changed" => "updated the description".to_string(),
-        "label_added" => {
-            match &activity.new_value {
-                Some(label) => format!("added label {label}"),
-                None => "added a label".to_string(),
-            }
-        }
-        "label_removed" => {
-            match &activity.old_value {
-                Some(label) => format!("removed label {label}"),
-                None => "removed a label".to_string(),
-            }
-        }
-        "relation_added" => "added a relation".to_string(),
-        "relation_removed" => "removed a relation".to_string(),
-        "project_changed" => {
-            match (&activity.old_value, &activity.new_value) {
-                (Some(old), Some(new)) => format!("moved from project {old} to {new}"),
-                (None, Some(new)) => format!("added to project {new}"),
-                (Some(old), None) => format!("removed from project {old}"),
-                _ => "changed project".to_string(),
-            }
-        }
-        "milestone_changed" => {
-            match (&activity.old_value, &activity.new_value) {
-                (Some(old), Some(new)) => format!("changed milestone from {old} to {new}"),
-                (None, Some(new)) => format!("set milestone to {new}"),
-                (Some(old), None) => format!("removed milestone {old}"),
-                _ => "changed milestone".to_string(),
-            }
-        }
-        "due_date_changed" => {
-            match (&activity.old_value, &activity.new_value) {
-                (Some(_old), Some(new)) => format!("changed due date to {new}"),
-                (None, Some(new)) => format!("set due date to {new}"),
-                (Some(_old), None) => "removed due date".to_string(),
-                _ => "changed due date".to_string(),
-            }
-        }
-        "parent_changed" => {
-            match (&activity.old_value, &activity.new_value) {
-                (Some(_), Some(new)) => format!("changed parent to {new}"),
-                (None, Some(new)) => format!("set parent to {new}"),
-                (Some(_), None) => "removed parent".to_string(),
-                _ => "changed parent".to_string(),
-            }
-        }
-        "moved_to_team" => {
-            match &activity.new_value {
-                Some(team) => format!("moved to team {team}"),
-                None => "moved to another team".to_string(),
-            }
-        }
-        "estimate_changed" => {
-            match (&activity.old_value, &activity.new_value) {
-                (Some(old), Some(new)) => format!("changed estimate from {old} to {new}"),
-                (None, Some(new)) => format!("set estimate to {new}"),
-                (Some(_), None) => "removed estimate".to_string(),
-                _ => "changed estimate".to_string(),
-            }
-        }
+        "label_added" => match &activity.new_value {
+            Some(label) => format!("added label {label}"),
+            None => "added a label".to_string(),
+        },
+        "label_removed" => match &activity.old_value {
+            Some(label) => format!("removed label {label}"),
+            None => "removed a label".to_string(),
+        },
+        "project_changed" => match (&activity.old_value, &activity.new_value) {
+            (Some(old), Some(new)) => format!("moved from project {old} to {new}"),
+            (None, Some(new)) => format!("added to project {new}"),
+            (Some(old), None) => format!("removed from project {old}"),
+            _ => "changed project".to_string(),
+        },
+        "milestone_changed" => match (&activity.old_value, &activity.new_value) {
+            (Some(old), Some(new)) => format!("changed milestone from {old} to {new}"),
+            (None, Some(new)) => format!("set milestone to {new}"),
+            (Some(old), None) => format!("removed milestone {old}"),
+            _ => "changed milestone".to_string(),
+        },
+        "due_date_changed" => match (&activity.old_value, &activity.new_value) {
+            (Some(_old), Some(new)) => format!("changed due date to {new}"),
+            (None, Some(new)) => format!("set due date to {new}"),
+            (Some(_old), None) => "removed due date".to_string(),
+            _ => "changed due date".to_string(),
+        },
+        "parent_changed" => match (&activity.old_value, &activity.new_value) {
+            (Some(_), Some(new)) => format!("changed parent to {new}"),
+            (None, Some(new)) => format!("set parent to {new}"),
+            (Some(_), None) => "removed parent".to_string(),
+            _ => "changed parent".to_string(),
+        },
+        "moved_to_team" => match &activity.new_value {
+            Some(team) => format!("moved to team {team}"),
+            None => "moved to another team".to_string(),
+        },
+        "estimate_changed" => match (&activity.old_value, &activity.new_value) {
+            (Some(old), Some(new)) => format!("changed estimate from {old} to {new}"),
+            (None, Some(new)) => format!("set estimate to {new}"),
+            (Some(_), None) => "removed estimate".to_string(),
+            _ => "changed estimate".to_string(),
+        },
         other => format!("performed action: {other}"),
     }
 }
@@ -2274,7 +2353,7 @@ fn CommentItem(
                 </div>
                 <div class="mt-1 text-sm text-foreground">
                     <kode_leptos::TreeWysiwygEditor
-                        content=Signal::stored(comment.body.clone())
+                        content=Signal::stored(crate::utils::auto_link::auto_link_issue_identifiers(&comment.body))
                         show_fixed_toolbar=false
                         readonly=true
                         on_click_attachment=on_click
