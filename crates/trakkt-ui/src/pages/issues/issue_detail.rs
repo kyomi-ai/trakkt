@@ -1979,16 +1979,6 @@ fn IssueTimeline(
         },
     );
 
-    // Fetch workspace members for actor name resolution
-    let members_resource = LocalResource::new(list_workspace_members);
-    let members = RwSignal::new(Vec::<WorkspaceMember>::new());
-
-    Effect::new(move || {
-        if let Some(Ok(loaded)) = members_resource.get() {
-            members.set(loaded);
-        }
-    });
-
     let tk_for_form = team_key.clone();
 
     view! {
@@ -2096,10 +2086,7 @@ fn IssueTimeline(
                                 }.into_any()
                             }
                             TimelineEntry::Activity(activity) => {
-                                let name = members.get_untracked()
-                                    .iter()
-                                    .find(|m| m.user_id == activity.actor_id)
-                                    .and_then(|m| m.name.clone())
+                                let name = activity.actor_name.clone()
                                     .unwrap_or_else(|| "Someone".to_string());
                                 view! {
                                     <ActivityEntry

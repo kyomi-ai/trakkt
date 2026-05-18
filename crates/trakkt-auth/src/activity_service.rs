@@ -25,6 +25,7 @@ struct IssueActivityRow {
     issue_id: String,
     workspace_id: String,
     actor_id: String,
+    actor_name: Option<String>,
     action_type: String,
     field: Option<String>,
     old_value: Option<String>,
@@ -40,6 +41,7 @@ impl IssueActivityRow {
             issue_id: self.issue_id,
             workspace_id: self.workspace_id,
             actor_id: self.actor_id,
+            actor_name: self.actor_name,
             action_type: self.action_type,
             field: self.field,
             old_value: self.old_value,
@@ -525,13 +527,15 @@ pub async fn list_issue_activities(
     let rows: Vec<IssueActivityRow> = trakkt_core::db_fetch_all!(
         db,
         IssueActivityRow,
-        "SELECT activity_id, issue_id, workspace_id, actor_id, action_type, \
-                field, old_value, new_value, \
-                CAST(metadata AS TEXT) AS metadata, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM issue_activities \
-         WHERE issue_id = $1 \
-         ORDER BY created_at ASC",
+        "SELECT a.activity_id, a.issue_id, a.workspace_id, a.actor_id, \
+                u.name AS actor_name, \
+                a.action_type, a.field, a.old_value, a.new_value, \
+                CAST(a.metadata AS TEXT) AS metadata, \
+                CAST(a.created_at AS TEXT) AS created_at \
+         FROM issue_activities a \
+         LEFT JOIN users u ON u.user_id = a.actor_id \
+         WHERE a.issue_id = $1 \
+         ORDER BY a.created_at ASC",
         issue_id
     )?;
     Ok(rows.into_iter().map(IssueActivityRow::into_dto).collect())

@@ -343,6 +343,7 @@ pub struct IssueActivity {
     pub issue_id: String,
     pub workspace_id: String,
     pub actor_id: String,
+    pub actor_name: Option<String>,
     pub action_type: String,
     pub field: Option<String>,
     pub old_value: Option<String>,
