@@ -1462,6 +1462,9 @@ fn LabelPicker(
 /// Auto-saves on change with a 500ms debounce using a version counter:
 /// each edit increments the counter; after the delay, save only fires if
 /// the counter has not changed (i.e., no newer edits arrived).
+///
+/// Uses a gated content signal to prevent WebSocket echoes from
+/// overwriting local edits while a save is in flight.
 #[component]
 fn DescriptionEditor(
     team_key: String,
@@ -1474,8 +1477,21 @@ fn DescriptionEditor(
     let latest_text = RwSignal::new(String::new());
     let edit_version = RwSignal::new(0u32);
 
+    // Gated content signal: suppresses WebSocket echoes while editing.
+    // Only forwards external description changes when no local save is pending.
+    let editing = RwSignal::new(false);
+    let gated_content = RwSignal::new(description.get_untracked());
+
+    Effect::new(move || {
+        let external = description.get();
+        if !editing.get_untracked() {
+            gated_content.set(external);
+        }
+    });
+
     let tk = team_key.clone();
     let on_change: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text: String| {
+        editing.set(true);
         latest_text.set(text);
         edit_version.update(|v| *v += 1);
         let snapshot = edit_version.get_untracked();
@@ -1490,7 +1506,7 @@ fn DescriptionEditor(
             let desc = if current_text.trim().is_empty() {
                 Some(String::new())
             } else {
-                Some(current_text)
+                Some(current_text.clone())
             };
             let _ = update_issue(
                 tk,
@@ -1501,6 +1517,11 @@ fn DescriptionEditor(
                 None,
             )
             .await;
+            // Save acknowledged — allow external updates again and sync the
+            // gated signal to what we just saved so kode's content sync Effect
+            // sees no diff against its DocState.
+            gated_content.set(current_text);
+            editing.set(false);
         });
     });
 
@@ -1526,7 +1547,7 @@ fn DescriptionEditor(
     view! {
         <div class="mt-6" style="min-height: 120px;">
             <TreeWysiwygEditor
-                content=description
+                content=gated_content.read_only()
                 on_change=on_change
                 show_fixed_toolbar=false
                 show_floating_toolbar=true
