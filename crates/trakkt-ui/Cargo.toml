@@ -87,6 +87,9 @@ wasm-bindgen-futures = "0.4"
 # Base64 encoding
 base64 = { workspace = true }
 
+# Regex for auto-linking issue identifiers
+regex = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 

@@ -5614,6 +5614,7 @@ dependencies = [
  "leptos_meta",
  "leptos_router",
  "phosphor-leptos",
+ "regex",
  "send_wrapper",
  "serde",
  "serde_json",
