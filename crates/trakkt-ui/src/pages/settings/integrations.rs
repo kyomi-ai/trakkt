@@ -466,11 +466,9 @@ fn TransitionRuleRow(rule: TransitionRuleDisplay) -> impl IntoView {
 
     // Log toggle errors and revert the optimistic update on failure
     Effect::new(move || {
-        if let Some(result) = toggle_action.value().get() {
-            if let Err(e) = result {
-                tracing::warn!("Failed to toggle transition rule: {e}");
-                set_enabled.update(|v| *v = !*v);
-            }
+        if let Some(Err(e)) = toggle_action.value().get() {
+            tracing::warn!("Failed to toggle transition rule: {e}");
+            set_enabled.update(|v| *v = !*v);
         }
     });
 
