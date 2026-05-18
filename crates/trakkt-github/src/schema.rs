@@ -701,3 +701,25 @@ pub async fn seed_default_transition_rules(
 
     Ok(())
 }
+
+/// Update the `enabled` flag on a single transition rule.
+pub async fn update_transition_rule_enabled(
+    db: &DbPool,
+    rule_id: &str,
+    workspace_id: &str,
+    enabled: bool,
+) -> trakkt_core::Result<()> {
+    let is_pg = db.is_postgres();
+    let bool_val = if enabled {
+        sql_compat::bool_true(is_pg)
+    } else {
+        sql_compat::bool_false(is_pg)
+    };
+    let sql = format!(
+        "UPDATE github_transition_rules \
+         SET enabled = {bool_val} \
+         WHERE rule_id = $1 AND workspace_id = $2"
+    );
+    trakkt_core::db_execute!(db, &sql, rule_id, workspace_id)?;
+    Ok(())
+}

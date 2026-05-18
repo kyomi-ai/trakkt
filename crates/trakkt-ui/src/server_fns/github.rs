@@ -13,6 +13,16 @@ use serde::{Deserialize, Serialize};
 // Shared types (available on both client and server)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A single transition rule for display in the settings UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionRuleDisplay {
+    pub rule_id: String,
+    pub trigger_event: String,
+    pub close_intent_required: bool,
+    pub target_status_category: String,
+    pub enabled: bool,
+}
+
 /// The current state of GitHub integration for a workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GitHubIntegrationStatus {
@@ -205,6 +215,54 @@ pub async fn disconnect_github() -> Result<(), ServerFnError> {
         }
         None => Err(ServerFnError::new("No GitHub integration found")),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transition rule server functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// List all transition rules for the current workspace.
+///
+/// Requires workspace admin role.
+#[server(prefix = "/leptos-api")]
+pub async fn get_transition_rules() -> Result<Vec<TransitionRuleDisplay>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    let db = ac.db();
+
+    let rules = trakkt_github::schema::list_transition_rules(db, &ac.ws_id)
+        .await
+        .into_sfn()?;
+
+    Ok(rules
+        .into_iter()
+        .map(|r| TransitionRuleDisplay {
+            rule_id: r.rule_id,
+            trigger_event: r.trigger_event,
+            close_intent_required: r.close_intent_required,
+            target_status_category: r.target_status_category,
+            enabled: r.enabled,
+        })
+        .collect())
+}
+
+/// Toggle the `enabled` flag on a single transition rule.
+///
+/// Requires workspace admin role.
+#[server(prefix = "/leptos-api")]
+pub async fn toggle_transition_rule(
+    rule_id: String,
+    enabled: bool,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    let db = ac.db();
+
+    trakkt_github::schema::update_transition_rule_enabled(db, &rule_id, &ac.ws_id, enabled)
+        .await
+        .into_sfn()?;
+
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

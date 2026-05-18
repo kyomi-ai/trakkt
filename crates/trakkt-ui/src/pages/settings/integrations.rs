@@ -17,10 +17,11 @@ use phosphor_leptos::{Icon, IconWeight};
 
 use crate::components::{
     Alert, AlertDescription, AlertVariant, Button, ButtonLink, ButtonSize, ButtonVariant, Card,
-    CardContent, CardHeader, CardTitle, Skeleton, Spinner,
+    CardContent, CardHeader, CardTitle, Skeleton, Spinner, Switch,
 };
 use crate::server_fns::github::{
-    disconnect_github, get_github_integration_status, GitHubIntegrationStatus,
+    disconnect_github, get_github_integration_status, get_transition_rules,
+    toggle_transition_rule, GitHubIntegrationStatus, TransitionRuleDisplay,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -370,14 +371,144 @@ fn ConnectedCard(
                         <Icon icon=phosphor_leptos::ARROW_SQUARE_OUT weight=IconWeight::Light size="14px"/>
                     </a>
 
-                    // Status transition info
+                    // Status transition rules
                     <div class="border-t border-border pt-3 mt-3">
-                        <p class="text-xs text-muted-foreground">
-                            "Status transitions: Pull requests automatically move linked issues to In Progress when opened, and Done when merged with close intent."
-                        </p>
+                        <TransitionRulesSection/>
                     </div>
                 </div>
             </CardContent>
         </Card>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transition rules section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Displays all transition rules for the workspace with toggle switches.
+#[component]
+fn TransitionRulesSection() -> impl IntoView {
+    let rules_resource = Resource::new(|| (), |_| get_transition_rules());
+
+    view! {
+        <div class="space-y-3">
+            <div class="flex items-center justify-between">
+                <p class="text-sm font-medium text-foreground">"Status Transitions"</p>
+            </div>
+            <Transition fallback=move || view! {
+                <div class="space-y-2">
+                    <Skeleton class="h-4 w-full"/>
+                    <Skeleton class="h-4 w-full"/>
+                    <Skeleton class="h-4 w-full"/>
+                </div>
+            }>
+                {move || Suspend::new(async move {
+                    match rules_resource.await {
+                        Ok(rules) => {
+                            if rules.is_empty() {
+                                view! {
+                                    <p class="text-xs text-muted-foreground">
+                                        "No transition rules configured."
+                                    </p>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <div class="space-y-2">
+                                        {rules.into_iter().map(|rule| {
+                                            view! { <TransitionRuleRow rule=rule/> }
+                                        }).collect_view()}
+                                    </div>
+                                    <p class="text-xs text-muted-foreground mt-3">
+                                        "Rules with "
+                                        <span class="font-medium">"close intent"</span>
+                                        " only fire when the PR description contains "
+                                        <span class="font-mono text-[11px]">"\"Closes TRA-N\""</span>
+                                        " or similar keywords."
+                                    </p>
+                                }.into_any()
+                            }
+                        }
+                        Err(e) => {
+                            view! {
+                                <Alert variant=AlertVariant::Error>
+                                    <AlertDescription>
+                                        {format!("Failed to load transition rules: {e}")}
+                                    </AlertDescription>
+                                </Alert>
+                            }.into_any()
+                        }
+                    }
+                })}
+            </Transition>
+        </div>
+    }
+}
+
+/// A single transition rule row with a description and toggle switch.
+#[component]
+fn TransitionRuleRow(rule: TransitionRuleDisplay) -> impl IntoView {
+    let rule_id = rule.rule_id.clone();
+    let (enabled, set_enabled) = signal(rule.enabled);
+
+    let description = format_rule_description(&rule.trigger_event, rule.close_intent_required);
+    let target = format_target_status(&rule.target_status_category);
+
+    let toggle_action = Action::new(move |new_val: &bool| {
+        let rid = rule_id.clone();
+        let val = *new_val;
+        async move { toggle_transition_rule(rid, val).await }
+    });
+
+    let on_change = Callback::new(move |new_val: bool| {
+        set_enabled.set(new_val);
+        toggle_action.dispatch(new_val);
+    });
+
+    // Log toggle errors and revert the optimistic update on failure
+    Effect::new(move || {
+        if let Some(result) = toggle_action.value().get() {
+            if let Err(e) = result {
+                tracing::warn!("Failed to toggle transition rule: {e}");
+                set_enabled.update(|v| *v = !*v);
+            }
+        }
+    });
+
+    view! {
+        <div class="flex items-center justify-between py-1.5">
+            <div class="flex-1 min-w-0">
+                <p class="text-sm text-foreground">
+                    {description}
+                    " \u{2192} "
+                    <span class="font-medium">{target}</span>
+                </p>
+            </div>
+            <Switch
+                checked=Signal::derive(move || enabled.get())
+                on_change=on_change
+            />
+        </div>
+    }
+}
+
+fn format_rule_description(trigger_event: &str, close_intent: bool) -> String {
+    match (trigger_event, close_intent) {
+        ("pr_opened", _) => "When a PR is opened".to_string(),
+        ("pr_merged", true) => "When a PR is merged (with close intent)".to_string(),
+        ("pr_merged", false) => "When any PR is merged".to_string(),
+        ("pr_closed", true) => "When a PR is closed without merge (with close intent)".to_string(),
+        ("pr_closed", false) => "When any PR is closed without merge".to_string(),
+        (other, _) => other.to_string(),
+    }
+}
+
+fn format_target_status(category: &str) -> &'static str {
+    match category {
+        "started" => "In Progress",
+        "completed" => "Done",
+        "cancelled" => "Cancelled",
+        "backlog" => "Backlog",
+        "unstarted" => "Todo",
+        _ => "Unknown",
     }
 }
