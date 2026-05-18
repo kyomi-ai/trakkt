@@ -66,6 +66,8 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 - Primary accent: teal #0D9488 (NOT amber).
 - All interactive elements need `transition-colors` with `duration-200`.
 - All interactive elements need `focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring`.
+- Use design tokens (`text-success-foreground`, `text-error-foreground`, `text-muted-foreground`) instead of hardcoded Tailwind color classes (`text-green-600`, `text-red-600`). Only use raw color classes when no design token exists.
+- All `<a>` tags with `target="_blank"` must include `rel="noopener noreferrer"`.
 
 ## CI / Security Scanning
 - Test fixtures must not contain strings matching real secret patterns (e.g. `xoxb-`, `xoxp-`, `AKIA`). Trivy's secret scanner cannot distinguish `#[cfg(test)]` from production code. Use obviously-fake prefixes like `slack-bot-`, `test-key-` instead.
