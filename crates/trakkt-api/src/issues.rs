@@ -10,7 +10,7 @@ use axum::http::Method;
 use serde_json::json;
 
 use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
-use trakkt_auth::{comment_service, issue_service, relation_service, team_service};
+use trakkt_auth::{activity_service, comment_service, issue_service, relation_service, team_service};
 use trakkt_types::api::{
     CreateIssueApiParams, DeleteIssueApiParams, GetIssueApiParams, ListIssuesApiParams,
     SearchIssuesApiParams, UpdateIssueApiParams,
@@ -103,10 +103,14 @@ pub async fn get_issue(
         .ok_or_else(|| ApiError::NotFound(format!("issue {team_key}-{number} not found")))?;
 
     let comments = comment_service::list_comments(ctx.db, &issue.issue_id).await?;
+    let activities = activity_service::list_issue_activities(ctx.db, &issue.issue_id).await?;
+    let relations = relation_service::list_relations_for_issue(ctx.db, &issue.issue_id, &ctx.workspace_id).await?;
 
     let result = json!({
         "issue": issue,
-        "comments": comments
+        "comments": comments,
+        "activities": activities,
+        "relations": relations
     });
     Ok(result)
 }
@@ -434,7 +438,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "get_issue",
-            description: "Get a single issue by its team-scoped identifier (e.g. 'TRA-35'), including full details (description, labels, assignee, creator) and all comments.",
+            description: "Get a single issue by its team-scoped identifier (e.g. 'TRA-35'), including full details (description, labels, assignee, creator), all comments, activity log, and relations.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues/{identifier}",
