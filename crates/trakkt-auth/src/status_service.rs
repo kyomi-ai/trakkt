@@ -196,7 +196,7 @@ pub async fn get_status_by_category(
         StatusRow,
         "SELECT status_id, workspace_id, team_id, name, category, position, color, \
                 CAST(created_at AS TEXT) AS created_at \
-         FROM statuses WHERE workspace_id = $1 AND category = $2 \
+         FROM statuses WHERE workspace_id = $1 AND category = $2 AND team_id IS NULL \
          ORDER BY position LIMIT 1",
         workspace_id,
         category

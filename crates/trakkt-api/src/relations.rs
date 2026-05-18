@@ -9,8 +9,9 @@
 use axum::http::Method;
 use serde_json::json;
 
-use trakkt_auth::activity_service::ActivityRecorder;
-use trakkt_auth::{issue_service, relation_service};
+use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
+use trakkt_auth::{issue_service, relation_service, status_service};
+use trakkt_types::models::IssueUpdate;
 use trakkt_types::api::{AddRelationApiParams, ListRelationsApiParams, RemoveRelationApiParams};
 
 use crate::context::{parse_issue_identifier, resolve_issue_key_and_number};
@@ -102,6 +103,80 @@ pub async fn add_relation(
         .await
     {
         tracing::warn!(issue_id = %target_issue.issue_id, "Failed to record relation activity on target: {e}");
+    }
+
+    // Auto-close: when a duplicate relation is created, transition the source
+    // (duplicate) issue to the first global status in the "cancelled" category.
+    // Best-effort — don't fail the relation creation if this errors.
+    if params.relation_type == "duplicate" && source_issue.status_category != "cancelled" {
+        match status_service::get_status_by_category(ctx.db, &ctx.workspace_id, "cancelled").await {
+            Ok(Some(cancelled_status)) => {
+                let before = IssueSnapshot::from_issue_with_details(&source_issue);
+                let update = IssueUpdate {
+                    status_id: Some(cancelled_status.status_id),
+                    ..Default::default()
+                };
+                match issue_service::update_issue(
+                    ctx.db,
+                    &ctx.workspace_id,
+                    &source_key,
+                    source_num,
+                    &update,
+                    Some(&ctx.user_id),
+                    ctx.ws_manager,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        match issue_service::get_issue(
+                            ctx.db, &ctx.workspace_id, &source_key, source_num
+                        ).await {
+                            Ok(Some(updated)) => {
+                                let after = IssueSnapshot::from_issue_with_details(&updated);
+                                if let Err(e) = recorder.record_issue_diff(
+                                    &source_issue.issue_id, &before, &after
+                                ).await {
+                                    tracing::warn!(
+                                        issue_id = %source_issue.issue_id,
+                                        "Failed to record auto-close activity: {e}"
+                                    );
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    issue_id = %source_issue.issue_id,
+                                    "Re-fetch after auto-close returned None"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    issue_id = %source_issue.issue_id,
+                                    "Failed to re-fetch issue after auto-close: {e}"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            issue_id = %source_issue.issue_id,
+                            "Failed to auto-close duplicate issue: {e}"
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    workspace_id = %ctx.workspace_id,
+                    "No cancelled status found — skipping auto-close for duplicate"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workspace_id = %ctx.workspace_id,
+                    "Failed to look up cancelled status: {e}"
+                );
+            }
+        }
     }
 
     Ok(serde_json::to_value(&relation)?)
