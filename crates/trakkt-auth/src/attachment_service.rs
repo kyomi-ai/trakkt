@@ -275,3 +275,146 @@ pub async fn delete_attachment(
 
     Ok(attachment.storage_path)
 }
+
+// ─── Issue attachment linking ──────────────────────────────────────────────
+
+/// Attach an existing attachment to an issue.
+///
+/// Verifies that the attachment belongs to the given workspace, then inserts
+/// into the `issue_attachments` junction table. Uses `ON CONFLICT DO NOTHING`
+/// so re-attaching is idempotent.
+pub async fn attach_to_issue(
+    db: &DbPool,
+    workspace_id: &str,
+    issue_id: &str,
+    attachment_id: &str,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    // Verify attachment belongs to workspace.
+    let _attachment = get_attachment(db, attachment_id, workspace_id).await?;
+
+    let is_pg = db.is_postgres();
+    let now = sql_compat::now(is_pg);
+
+    let sql = format!(
+        "INSERT INTO issue_attachments (issue_id, attachment_id, created_at) \
+         VALUES ($1, $2, {now}) \
+         ON CONFLICT (issue_id, attachment_id) DO NOTHING"
+    );
+    trakkt_core::db_execute!(db, &sql, issue_id, attachment_id)?;
+
+    let entity_id = format!("{issue_id}:{attachment_id}");
+
+    // Sync log — best-effort.
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::ISSUE_ATTACHMENT,
+        &entity_id,
+        workspace_id,
+        SyncActionType::Insert,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, %entity_id, "Failed to write sync log entry for issue attachment link");
+    }
+
+    // WebSocket broadcast.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::ISSUE_ATTACHMENT,
+            &entity_id,
+            SyncActionType::Insert,
+            None,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+/// Detach an attachment from an issue.
+///
+/// Removes the row from the `issue_attachments` junction table. Does NOT
+/// delete the attachment record itself.
+pub async fn detach_from_issue(
+    db: &DbPool,
+    workspace_id: &str,
+    issue_id: &str,
+    attachment_id: &str,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    let _attachment = get_attachment(db, attachment_id, workspace_id).await?;
+
+    let result = trakkt_core::db_execute!(
+        db,
+        "DELETE FROM issue_attachments WHERE issue_id = $1 AND attachment_id = $2",
+        issue_id,
+        attachment_id
+    )?;
+
+    if result.rows_affected() == 0 {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "Attachment '{attachment_id}' is not linked to issue '{issue_id}'"
+        )));
+    }
+
+    let entity_id = format!("{issue_id}:{attachment_id}");
+
+    // Sync log — best-effort.
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::ISSUE_ATTACHMENT,
+        &entity_id,
+        workspace_id,
+        SyncActionType::Delete,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, %entity_id, "Failed to write sync log entry for issue attachment unlink");
+    }
+
+    // WebSocket broadcast.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::ISSUE_ATTACHMENT,
+            &entity_id,
+            SyncActionType::Delete,
+            None,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+/// List all attachments linked to an issue.
+///
+/// Joins `issue_attachments` with `attachments` and returns full attachment
+/// metadata, ordered by link creation time (newest first).
+pub async fn list_issue_attachments(
+    db: &DbPool,
+    workspace_id: &str,
+    issue_id: &str,
+) -> trakkt_core::Result<Vec<Attachment>> {
+    let rows: Vec<AttachmentRow> = trakkt_core::db_fetch_all!(
+        db,
+        AttachmentRow,
+        "SELECT a.attachment_id, a.workspace_id, a.filename, a.content_type, \
+                a.size_bytes, a.storage_path, a.uploaded_by, \
+                CAST(a.created_at AS TEXT) AS created_at \
+         FROM attachments a \
+         JOIN issue_attachments ia ON a.attachment_id = ia.attachment_id \
+         WHERE ia.issue_id = $1 AND a.workspace_id = $2 \
+         ORDER BY ia.created_at DESC",
+        issue_id,
+        workspace_id
+    )?;
+
+    Ok(rows.into_iter().map(AttachmentRow::into_dto).collect())
+}
