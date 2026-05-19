@@ -26,7 +26,7 @@ use axum::{
 use base64::Engine;
 use serde_json::json;
 
-use trakkt_api::{activities, attachments, comments, github_links, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
+use trakkt_api::{activities, attachments, comments, github_links, issue_attachments, issues, labels, milestones, projects, relations, statuses, teams, ApiCtx, ApiError};
 use crate::state::AppState;
 
 use super::auth_shared::{self, ResolvedAuth};
@@ -353,6 +353,60 @@ async fn list_issue_github_links_handler(
         issue_number: None,
     };
     let result = github_links::list_issue_github_links(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+// ─── Issue Attachments ─────────────────────────────────────────────────────
+
+/// `GET /issues/{identifier}/attachments` — list attachments linked to an issue.
+async fn list_issue_attachments_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "attachments:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage, state.github_client.as_deref(), Some(&*state.encryption_key), &state.config.frontend_url);
+    let params = trakkt_types::api::ListIssueAttachmentsApiParams {
+        issue_identifier: Some(identifier),
+        team_key: None,
+        issue_number: None,
+    };
+    let result = issue_attachments::list_issue_attachments(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+/// `POST /issues/{identifier}/attachments` — attach an attachment to an issue.
+async fn attach_to_issue_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(mut params): Json<trakkt_types::api::AttachToIssueApiParams>,
+) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "attachments:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage, state.github_client.as_deref(), Some(&*state.encryption_key), &state.config.frontend_url);
+    params.issue_identifier = Some(identifier);
+    let result = issue_attachments::attach_to_issue(&ctx, params).await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+/// `DELETE /issues/{identifier}/attachments/{attachment_id}` — detach an attachment from an issue.
+async fn detach_from_issue_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((identifier, attachment_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "attachments:write")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage, state.github_client.as_deref(), Some(&*state.encryption_key), &state.config.frontend_url);
+    let params = trakkt_types::api::DetachFromIssueApiParams {
+        issue_identifier: Some(identifier),
+        team_key: None,
+        issue_number: None,
+        attachment_id,
+    };
+    let result = issue_attachments::detach_from_issue(&ctx, params).await?;
     Ok(Json(result))
 }
 
@@ -696,6 +750,15 @@ pub fn rest_router() -> Router<AppState> {
         .route("/issues/{identifier}/activities", get(list_issue_activities_handler))
         // GitHub Links
         .route("/issues/{identifier}/github-links", get(list_issue_github_links_handler))
+        // Issue Attachments
+        .route(
+            "/issues/{identifier}/attachments",
+            get(list_issue_attachments_handler).post(attach_to_issue_handler),
+        )
+        .route(
+            "/issues/{identifier}/attachments/{attachment_id}",
+            delete(detach_from_issue_handler),
+        )
         // Labels
         .route("/labels", get(list_labels_handler).post(create_label_handler))
         // Teams

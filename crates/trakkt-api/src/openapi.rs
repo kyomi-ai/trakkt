@@ -110,6 +110,9 @@ fn derive_tag(rest_path: &str) -> &'static str {
     if rest_path.contains("/comments") {
         return "Comments";
     }
+    if rest_path.contains("/attachments") {
+        return "Attachments";
+    }
     if rest_path.starts_with("/issues") {
         return "Issues";
     }
@@ -211,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn all_30_operations_present() {
+    fn all_33_operations_present() {
         let spec = generate_openapi_spec();
         let paths = spec["paths"].as_object().expect("paths should be an object");
 
@@ -227,7 +230,7 @@ mod tests {
         }
         operation_ids.sort();
 
-        assert_eq!(operation_ids.len(), 30, "expected 30 operations, got {}: {operation_ids:?}", operation_ids.len());
+        assert_eq!(operation_ids.len(), 33, "expected 33 operations, got {}: {operation_ids:?}", operation_ids.len());
     }
 
     #[test]
@@ -269,6 +272,8 @@ mod tests {
         assert_eq!(derive_tag("/issues/{identifier}"), "Issues");
         assert_eq!(derive_tag("/issues/{identifier}/comments"), "Comments");
         assert_eq!(derive_tag("/issues/{identifier}/relations"), "Relations");
+        assert_eq!(derive_tag("/issues/{identifier}/attachments"), "Attachments");
+        assert_eq!(derive_tag("/attachments"), "Attachments");
         assert_eq!(derive_tag("/projects"), "Projects");
         assert_eq!(derive_tag("/projects/{id}/milestones"), "Milestones");
         assert_eq!(derive_tag("/milestones/{id}"), "Milestones");

@@ -405,6 +405,47 @@ pub struct DeleteAttachmentApiParams {
 pub struct ListAttachmentsApiParams {}
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Issue attachment operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing attachments linked to an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListIssueAttachmentsApiParams {
+    /// Issue identifier in 'TRA-35' format
+    pub issue_identifier: Option<String>,
+    /// Team key (e.g. 'TRA'). Required if issue_identifier is not provided
+    pub team_key: Option<String>,
+    /// Issue number within the team. Required if issue_identifier is not provided
+    pub issue_number: Option<i64>,
+}
+
+/// Parameters for attaching an existing attachment to an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct AttachToIssueApiParams {
+    /// Issue identifier in 'TRA-35' format
+    pub issue_identifier: Option<String>,
+    /// Team key (e.g. 'TRA'). Required if issue_identifier is not provided
+    pub team_key: Option<String>,
+    /// Issue number within the team. Required if issue_identifier is not provided
+    pub issue_number: Option<i64>,
+    /// The attachment ID to link to the issue
+    pub attachment_id: String,
+}
+
+/// Parameters for detaching an attachment from an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct DetachFromIssueApiParams {
+    /// Issue identifier in 'TRA-35' format
+    pub issue_identifier: Option<String>,
+    /// Team key (e.g. 'TRA'). Required if issue_identifier is not provided
+    pub team_key: Option<String>,
+    /// Issue number within the team. Required if issue_identifier is not provided
+    pub issue_number: Option<i64>,
+    /// The attachment ID to unlink from the issue
+    pub attachment_id: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Activity operations
 // ─────────────────────────────────────────────────────────────────────────────
 
