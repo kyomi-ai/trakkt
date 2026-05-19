@@ -451,8 +451,10 @@ fn EditableTitle(
                 None,
             )
             .await;
-            set_saving.set(false);
-            on_save.run(());
+            // Guard: component may have been destroyed while the future was in flight.
+            if set_saving.try_set(false).is_none() {
+                on_save.try_run(());
+            }
         });
     };
 
@@ -552,7 +554,7 @@ fn MetadataSidebar(
                 None,
             )
             .await;
-            on_change.run(());
+            on_change.try_run(());
         });
     };
 
@@ -569,7 +571,7 @@ fn MetadataSidebar(
                 None,
             )
             .await;
-            on_change.run(());
+            on_change.try_run(());
         });
     };
 
@@ -593,7 +595,7 @@ fn MetadataSidebar(
                 if is_clear { Some("assignee".to_string()) } else { None },
             )
             .await;
-            on_change.run(());
+            on_change.try_run(());
         });
     };
 
@@ -609,7 +611,7 @@ fn MetadataSidebar(
                 None, None, None,
                 Some(if is_clear { "project,milestone".to_string() } else { "milestone".to_string() }),
             ).await;
-            on_change.run(());
+            on_change.try_run(());
         });
     };
 
@@ -626,7 +628,7 @@ fn MetadataSidebar(
                 None, None,
                 if is_clear { Some("milestone".to_string()) } else { None },
             ).await;
-            on_change.run(());
+            on_change.try_run(());
         });
     };
 
@@ -644,7 +646,7 @@ fn MetadataSidebar(
                 if is_clear { Some("due_date".to_string()) } else { None },
             )
             .await;
-            on_change.run(());
+            on_change.try_run(());
         });
     };
 
@@ -677,7 +679,7 @@ fn MetadataSidebar(
                 if is_clear { Some("estimate".to_string()) } else { None },
             )
             .await;
-            on_change.run(());
+            on_change.try_run(());
         });
     };
 
@@ -1283,8 +1285,9 @@ fn WatchToggle(team_key: String, number: i32) -> impl IntoView {
             if let Err(e) = result {
                 tracing::warn!("Failed to toggle watch: {e}");
             }
-            set_loading.set(false);
-            set_version.update(|v| *v += 1);
+            // Guard: component may have been destroyed while the future was in flight.
+            let _ = set_loading.try_set(false);
+            let _ = set_version.try_update(|v| *v += 1);
         });
     };
 
@@ -1366,7 +1369,7 @@ fn LabelPicker(
         let label_ids_str = ids.join(",");
         leptos::task::spawn_local(async move {
             let _ = set_issue_labels(tk, number, label_ids_str).await;
-            on_change.run(());
+            on_change.try_run(());
         });
     };
 
@@ -1518,10 +1521,16 @@ fn DescriptionEditor(
         let tk = tk.clone();
         leptos::task::spawn_local(async move {
             gloo_timers::future::TimeoutFuture::new(500).await;
-            if edit_version.get_untracked() != snapshot {
+            // Guard: component may have been destroyed during the debounce wait.
+            let Some(current_version) = edit_version.try_get_untracked() else {
+                return;
+            };
+            if current_version != snapshot {
                 return;
             }
-            let current_text = latest_text.get_untracked();
+            let Some(current_text) = latest_text.try_get_untracked() else {
+                return;
+            };
             let desc = if current_text.trim().is_empty() {
                 Some(String::new())
             } else {
@@ -1539,8 +1548,9 @@ fn DescriptionEditor(
             // Save acknowledged — allow external updates again and sync the
             // gated signal to what we just saved so kode's content sync Effect
             // sees no diff against its DocState.
-            gated_content.set(current_text);
-            editing.set(false);
+            // Guard: component may have been destroyed while the save was in flight.
+            let _ = gated_content.try_set(current_text);
+            let _ = editing.try_set(false);
         });
     });
 
@@ -1648,7 +1658,7 @@ fn RelationsSection(
         leptos::task::spawn_local(async move {
             match add_relation(source, target, api_type).await {
                 Ok(_) => {
-                    set_version.update(|v| *v += 1);
+                    let _ = set_version.try_update(|v| *v += 1);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to add relation: {e}");
@@ -1778,7 +1788,7 @@ fn RelationsSection(
                                                 let rid = rel_id.clone();
                                                 leptos::task::spawn_local(async move {
                                                     match remove_relation(rid).await {
-                                                        Ok(_) => set_version.update(|v| *v += 1),
+                                                        Ok(_) => { let _ = set_version.try_update(|v| *v += 1); },
                                                         Err(e) => tracing::warn!("Failed to remove relation: {e}"),
                                                     }
                                                 });
@@ -2408,14 +2418,15 @@ fn NewCommentForm(
         leptos::task::spawn_local(async move {
             match create_comment(tk, number, body, None).await {
                 Ok(_) => {
-                    content.set(String::new());
-                    set_submitting.set(false);
+                    // Guard: component may have been destroyed while the future was in flight.
+                    let _ = content.try_set(String::new());
+                    let _ = set_submitting.try_set(false);
                     // Comment will appear reactively via the SyncStore pipeline
                     // (server broadcasts sync action -> WS -> sync engine -> store update).
                 }
                 Err(e) => {
                     tracing::warn!("Failed to create comment: {e}");
-                    set_submitting.set(false);
+                    let _ = set_submitting.try_set(false);
                 }
             }
         });
