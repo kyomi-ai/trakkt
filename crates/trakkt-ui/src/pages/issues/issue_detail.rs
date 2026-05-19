@@ -390,7 +390,7 @@ fn IssueDetailContent(
 
             // ── Right column: metadata sidebar ────────────────────────
             <div class="w-full md:w-[280px] shrink-0">
-                <MetadataSidebar issue=issue.into() on_change=noop/>
+                <MetadataSidebar issue=issue on_change=noop/>
             </div>
         </div>
 
