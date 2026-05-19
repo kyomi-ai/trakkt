@@ -269,7 +269,7 @@ fn IssueDetailContent(
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let initial = RwSignal::new(initial_issue);
 
-    let issue = Signal::derive(move || {
+    let issue = Memo::new(move |_| {
         if let Some(store) = sync_store {
             let items = store.issues().get();
             if let Some(found) = items.iter().find(|i| i.team_key == issue_team_key_for_lookup && i.number == number) {
@@ -281,7 +281,7 @@ fn IssueDetailContent(
 
     // ── Comments: derived from SyncStore (real-time via WebSocket) ────
     let issue_id_for_comments = initial.get_untracked().issue_id.clone();
-    let comments = Signal::derive(move || {
+    let comments = Memo::new(move |_| {
         sync_store.map(|store| {
             let mut filtered: Vec<Comment> = store.comments().get()
                 .into_iter()
@@ -362,7 +362,7 @@ fn IssueDetailContent(
                 <IssueTimeline
                     team_key=initial.get_untracked().team_key.clone()
                     number=number
-                    comments=comments
+                    comments=Signal::from(comments)
                     lightbox_state=lightbox_state
                 />
 
@@ -377,7 +377,7 @@ fn IssueDetailContent(
 
             // ── Right column: metadata sidebar ────────────────────────
             <div class="w-full md:w-[280px] shrink-0">
-                <MetadataSidebar issue=issue on_change=noop/>
+                <MetadataSidebar issue=Signal::from(issue) on_change=noop/>
             </div>
         </div>
 
@@ -565,10 +565,14 @@ fn MetadataSidebar(
 
     // Sync from server-pushed changes via the Memos
     Effect::new(move || {
-        set_current_assignee_id.set(assignee_id.get());
+        if set_current_assignee_id.try_set(assignee_id.get()).is_some() {
+            tracing::warn!("MetadataSidebar: assignee_id signal disposed before sync");
+        }
     });
     Effect::new(move || {
-        set_current_assignee_name.set(assignee_name.get());
+        if set_current_assignee_name.try_set(assignee_name.get()).is_some() {
+            tracing::warn!("MetadataSidebar: assignee_name signal disposed before sync");
+        }
     });
 
     // ── Assignee change handler ────────────────────────────────────────
@@ -687,16 +691,20 @@ fn MetadataSidebar(
     let statuses = RwSignal::new(Vec::<trakkt_types::models::Status>::new());
 
     Effect::new(move || {
-        if let Some(Ok(loaded)) = statuses_resource.get() {
-            statuses.set(loaded);
+        if let Some(Ok(loaded)) = statuses_resource.get()
+            && statuses.try_set(loaded).is_some()
+        {
+            tracing::warn!("MetadataSidebar: statuses signal disposed before load");
         }
     });
 
     let members = RwSignal::new(Vec::<WorkspaceMember>::new());
 
     Effect::new(move || {
-        if let Some(Ok(loaded)) = members_resource.get() {
-            members.set(loaded);
+        if let Some(Ok(loaded)) = members_resource.get()
+            && members.try_set(loaded).is_some()
+        {
+            tracing::warn!("MetadataSidebar: members signal disposed before load");
         }
     });
 
@@ -725,7 +733,11 @@ fn MetadataSidebar(
         if let Some(pid) = pid {
             leptos::task::spawn_local(async move {
                 match list_milestones(pid).await {
-                    Ok(loaded) => { let _ = milestones.try_set(loaded); }
+                    Ok(loaded) => {
+                        if milestones.try_set(loaded).is_some() {
+                            tracing::warn!("MetadataSidebar: milestones signal disposed before load");
+                        }
+                    }
                     Err(e) => { tracing::warn!("Failed to load milestones: {e}"); }
                 }
             });
@@ -1453,8 +1465,10 @@ fn DescriptionEditor(
 
     Effect::new(move || {
         let external = description.get();
-        if !editing.get_untracked() {
-            gated_content.set(external);
+        if !editing.get_untracked()
+            && gated_content.try_set(external).is_some()
+        {
+            tracing::warn!("DescriptionEditor: gated_content signal disposed before sync");
         }
     });
 
