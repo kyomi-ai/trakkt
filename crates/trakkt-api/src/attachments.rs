@@ -56,8 +56,7 @@ pub async fn upload_attachment(
             &params.filename,
             &params.content_type,
         )
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .await?;
 
     // Create the DB record
     let attachment = attachment_service::create_attachment(
@@ -98,10 +97,7 @@ pub async fn download_attachment(
             .await?;
 
     // Retrieve from storage
-    let bytes = storage
-        .retrieve(&attachment.storage_path)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let bytes = storage.retrieve(&attachment.storage_path).await?;
 
     // Return base64-encoded content — REST transport may intercept for raw bytes.
     let content_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
