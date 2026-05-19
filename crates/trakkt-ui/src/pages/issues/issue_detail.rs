@@ -312,34 +312,26 @@ fn IssueDetailContent(
             // ── Left column: main content ─────────────────────────────
             <div class="flex-1 min-w-0">
                 // ── Parent breadcrumb ─────────────────────────────────
-                {move || {
-                    let pid = parent_identifier.get()?;
-                    let ptitle = issue.get().parent_title.clone();
-                    let href = format!("/issues/{pid}");
-                    let label = if let Some(t) = ptitle {
-                        format!("{pid} {t}")
-                    } else {
-                        pid
-                    };
-                    Some(view! {
-                        <a
-                            href=href
-                            class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1 mb-1"
-                        >
-                            <Icon icon=phosphor_leptos::ARROW_BEND_UP_LEFT size="12px"/>
-                            {label}
-                        </a>
-                    })
-                }}
+                <Show when=move || parent_identifier.get().is_some()>
+                    <a
+                        href=move || format!("/issues/{}", parent_identifier.get().unwrap_or_default())
+                        class="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1 mb-1"
+                    >
+                        <Icon icon=phosphor_leptos::ARROW_BEND_UP_LEFT size="12px"/>
+                        {move || {
+                            let pid = parent_identifier.get().unwrap_or_default();
+                            let ptitle = issue.get().parent_title.clone();
+                            if let Some(t) = ptitle {
+                                format!("{pid} {t}")
+                            } else {
+                                pid
+                            }
+                        }}
+                    </a>
+                </Show>
 
                 // ── Title ──────────────────────────────────────────────
-                {
-                    let tk = initial_team_key.clone();
-                    move || {
-                        let t = title.get();
-                        view! { <EditableTitle team_key=tk.clone() number=number title=t on_save=noop/> }
-                    }
-                }
+                <EditableTitle team_key=initial_team_key.clone() number=number title=title on_save=noop/>
 
                 // ── Description ────────────────────────────────────────
                 <DescriptionEditor
@@ -375,17 +367,12 @@ fn IssueDetailContent(
                 />
 
                 // ── Footer: timestamps ────────────────────────────────
-                {move || {
-                    let (created, updated) = timestamps.get();
-                    view! {
-                        <div class="mt-6 pb-4">
-                            <div class="flex items-center gap-4 text-xs text-muted-foreground">
-                                <span>{format!("Created {}", relative_time(&created))}</span>
-                                <span>{format!("Updated {}", relative_time(&updated))}</span>
-                            </div>
-                        </div>
-                    }
-                }}
+                <div class="mt-6 pb-4">
+                    <div class="flex items-center gap-4 text-xs text-muted-foreground">
+                        <span>{move || { let (created, _) = timestamps.get(); format!("Created {}", relative_time(&created)) }}</span>
+                        <span>{move || { let (_, updated) = timestamps.get(); format!("Updated {}", relative_time(&updated)) }}</span>
+                    </div>
+                </div>
             </div>
 
             // ── Right column: metadata sidebar ────────────────────────
@@ -408,13 +395,13 @@ fn IssueDetailContent(
 fn EditableTitle(
     team_key: String,
     number: i32,
-    title: String,
+    title: Memo<String>,
     on_save: Callback<()>,
 ) -> impl IntoView {
     let (editing, set_editing) = signal(false);
-    let (current_title, set_current_title) = signal(title.clone());
+    let (current_title, set_current_title) = signal(title.get_untracked());
     let (saving, set_saving) = signal(false);
-    let original_title = title.clone();
+    let original_title = title.get_untracked();
     let input_ref = NodeRef::<leptos::html::Input>::new();
     let stored_team_key = StoredValue::new(team_key);
 
@@ -437,7 +424,7 @@ fn EditableTitle(
             )
             .await;
             // Guard: component may have been destroyed while the future was in flight.
-            if set_saving.try_set(false).is_none() {
+            if set_saving.try_set(false).is_some() {
                 on_save.try_run(());
             }
         });
@@ -450,13 +437,10 @@ fn EditableTitle(
         }
     });
 
-    let title_for_display = title.clone();
-
     view! {
         <Show
             when=move || editing.get()
             fallback=move || {
-                let t = title_for_display.clone();
                 view! {
                     <h1
                         class="font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors"
@@ -466,7 +450,7 @@ fn EditableTitle(
                         }
                         title="Click to edit title"
                     >
-                        {t}
+                        {move || title.get()}
                     </h1>
                 }
             }
@@ -746,7 +730,9 @@ fn MetadataSidebar(
                 }
             });
         } else {
-            milestones.set(Vec::new());
+            if milestones.try_set(Vec::new()).is_none() {
+                tracing::warn!("MetadataSidebar: milestones signal disposed before clear");
+            }
         }
     });
 
@@ -926,20 +912,13 @@ fn MetadataSidebar(
             </div>
 
             // ── Labels ─────────────────────────────────────────────────
-            {move || {
-                let current_labels = labels.get();
-                let tk = stored_tk.get_value();
-                let tid = team_id.get_untracked();
-                view! {
-                    <LabelPicker
-                        team_key=tk
-                        number=stored_number
-                        team_id=tid
-                        current_labels=current_labels
-                        on_change=on_change
-                    />
-                }
-            }}
+            <LabelPicker
+                team_key=stored_tk.get_value()
+                number=stored_number
+                team_id=team_id.get_untracked()
+                current_labels=labels
+                on_change=on_change
+            />
 
             // ── Project ───────────────────────────────────────────────
             <div>
@@ -1312,15 +1291,26 @@ fn LabelPicker(
     number: i32,
     /// The team_id of the issue, used to scope the label list.
     team_id: String,
-    current_labels: Vec<trakkt_types::models::Label>,
+    current_labels: Memo<Vec<trakkt_types::models::Label>>,
     on_change: Callback<()>,
 ) -> impl IntoView {
     let (show_picker, set_show_picker) = signal(false);
+    let initial = current_labels.get_untracked();
     let current_ids = RwSignal::new(
-        current_labels.iter().map(|l| l.label_id.clone()).collect::<Vec<_>>()
+        initial.iter().map(|l| l.label_id.clone()).collect::<Vec<_>>()
     );
-    let current_display = RwSignal::new(current_labels);
+    let current_display = RwSignal::new(initial);
     let stored_tk = StoredValue::new(team_key);
+
+    Effect::new(move || {
+        let external = current_labels.get();
+        if current_ids.try_set(external.iter().map(|l| l.label_id.clone()).collect::<Vec<_>>()).is_none() {
+            tracing::warn!("LabelPicker: current_ids signal disposed before sync effect ran");
+        }
+        if current_display.try_set(external).is_none() {
+            tracing::warn!("LabelPicker: current_display signal disposed before sync effect ran");
+        }
+    });
 
     let team_id_for_fetch = Some(team_id);
     let all_labels = LocalResource::new(move || {
