@@ -113,6 +113,9 @@ pub enum ApiError {
     Unauthorized(String),
     Forbidden(String),
     Conflict(String),
+    TooManyRequests(String),
+    NotImplemented(String),
+    ServiceUnavailable(String),
     Internal(String),
 }
 
@@ -124,6 +127,9 @@ impl std::fmt::Display for ApiError {
             ApiError::Unauthorized(msg) => write!(f, "unauthorized: {msg}"),
             ApiError::Forbidden(msg) => write!(f, "forbidden: {msg}"),
             ApiError::Conflict(msg) => write!(f, "conflict: {msg}"),
+            ApiError::TooManyRequests(msg) => write!(f, "too many requests: {msg}"),
+            ApiError::NotImplemented(msg) => write!(f, "not implemented: {msg}"),
+            ApiError::ServiceUnavailable(msg) => write!(f, "service unavailable: {msg}"),
             ApiError::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }
@@ -133,9 +139,15 @@ impl From<trakkt_core::Error> for ApiError {
     fn from(e: trakkt_core::Error) -> Self {
         match e {
             trakkt_core::Error::NotFound(msg) => ApiError::NotFound(msg),
-            trakkt_core::Error::BadRequest(msg) => ApiError::BadRequest(msg),
+            trakkt_core::Error::Unauthorized(msg) => ApiError::Unauthorized(msg),
             trakkt_core::Error::Forbidden(msg) => ApiError::Forbidden(msg),
+            trakkt_core::Error::BadRequest(msg) => ApiError::BadRequest(msg),
             trakkt_core::Error::Conflict(msg) => ApiError::Conflict(msg),
+            trakkt_core::Error::TooManyRequests(msg, _) => ApiError::TooManyRequests(msg),
+            trakkt_core::Error::NotImplemented(msg) => ApiError::NotImplemented(msg),
+            trakkt_core::Error::ServiceUnavailable(msg) => ApiError::ServiceUnavailable(msg),
+            trakkt_core::Error::Internal(msg) => ApiError::Internal(msg),
+            // Remaining: Sqlx, Migrate, Redis, SerdeJson — opaque infrastructure errors.
             other => ApiError::Internal(other.to_string()),
         }
     }
@@ -377,5 +389,20 @@ mod tests {
 
         // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 1 + 1 = 30
         assert_eq!(ops.len(), 30, "expected 30 total operations");
+    }
+
+    #[test]
+    fn core_error_maps_to_correct_api_error_variant() {
+        use trakkt_core::Error as CE;
+
+        assert!(matches!(ApiError::from(CE::NotFound("x".into())), ApiError::NotFound(_)));
+        assert!(matches!(ApiError::from(CE::Unauthorized("x".into())), ApiError::Unauthorized(_)));
+        assert!(matches!(ApiError::from(CE::Forbidden("x".into())), ApiError::Forbidden(_)));
+        assert!(matches!(ApiError::from(CE::BadRequest("x".into())), ApiError::BadRequest(_)));
+        assert!(matches!(ApiError::from(CE::Conflict("x".into())), ApiError::Conflict(_)));
+        assert!(matches!(ApiError::from(CE::TooManyRequests("x".into(), 60)), ApiError::TooManyRequests(_)));
+        assert!(matches!(ApiError::from(CE::NotImplemented("x".into())), ApiError::NotImplemented(_)));
+        assert!(matches!(ApiError::from(CE::ServiceUnavailable("x".into())), ApiError::ServiceUnavailable(_)));
+        assert!(matches!(ApiError::from(CE::Internal("x".into())), ApiError::Internal(_)));
     }
 }

@@ -344,6 +344,9 @@ async fn handle_tools_call(
                 trakkt_core::Error::BadRequest(msg) => (-32602, msg.clone()),
                 trakkt_core::Error::Forbidden(msg) => (-32001, msg.clone()),
                 trakkt_core::Error::Conflict(msg) => (-32602, msg.clone()),
+                trakkt_core::Error::TooManyRequests(msg, _) => (-32000, msg.clone()),
+                trakkt_core::Error::NotImplemented(msg) => (-32601, msg.clone()),
+                trakkt_core::Error::ServiceUnavailable(msg) => (-32000, msg.clone()),
                 _ => {
                     tracing::error!(tool = %tool_name, error = %e, "MCP tool call failed");
                     (-32603, format!("Internal error: {e}"))
@@ -392,6 +395,9 @@ async fn dispatch_registry_tool(
         trakkt_api::ApiError::Unauthorized(msg) => trakkt_core::Error::Forbidden(msg),
         trakkt_api::ApiError::Forbidden(msg) => trakkt_core::Error::Forbidden(msg),
         trakkt_api::ApiError::Conflict(msg) => trakkt_core::Error::Conflict(msg),
+        trakkt_api::ApiError::TooManyRequests(msg) => trakkt_core::Error::TooManyRequests(msg, 0),
+        trakkt_api::ApiError::NotImplemented(msg) => trakkt_core::Error::NotImplemented(msg),
+        trakkt_api::ApiError::ServiceUnavailable(msg) => trakkt_core::Error::ServiceUnavailable(msg),
         trakkt_api::ApiError::Internal(msg) => trakkt_core::Error::Internal(msg),
     })?;
 
