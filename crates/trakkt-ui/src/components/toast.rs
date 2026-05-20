@@ -89,6 +89,32 @@ pub fn toast_info(message: impl Into<String>) {
     add_toast(ToastVariant::Info, message);
 }
 
+/// Capture the toast context from a reactive scope so error toasts can
+/// be shown from detached contexts (`spawn_local`, callbacks).
+///
+/// Must be called from a component body or event handler. The returned
+/// closure is `Clone + 'static` and safe to move into `spawn_local`.
+pub fn capture_error_toast() -> impl Fn(String) + Clone + 'static {
+    let state = use_context::<ToastState>();
+    move |message: String| {
+        let Some(state) = state else { return };
+        let id = state.next_id.get_untracked();
+        state.next_id.set(id + 1);
+        let toast = Toast {
+            id,
+            message,
+            variant: ToastVariant::Error,
+        };
+        state.toasts.update(|toasts| toasts.push(toast));
+        set_timeout(
+            move || {
+                state.toasts.update(|toasts| toasts.retain(|t| t.id != id));
+            },
+            std::time::Duration::from_millis(5000),
+        );
+    }
+}
+
 /// Toast provider + container. Mount once at the app root.
 #[component]
 pub fn ToastProvider(children: Children) -> impl IntoView {

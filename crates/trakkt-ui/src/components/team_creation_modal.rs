@@ -127,6 +127,7 @@ pub fn TeamCreationModal(
     // ── Submit handler ──────────────────────────────────────────────────
     let store = use_context::<SyncStore>();
     let nav = leptos_router::hooks::use_navigate();
+    let show_error = crate::components::toast::capture_error_toast();
 
     let on_submit = move |_| {
         let name_val = name.get_untracked().trim().to_string();
@@ -149,6 +150,7 @@ pub fn TeamCreationModal(
         on_close.run(());
 
         let nav = nav.clone();
+        let show_error = show_error.clone();
 
         leptos::task::spawn_local(async move {
             let team = match crate::server_fns::teams::create_team(
@@ -161,7 +163,7 @@ pub fn TeamCreationModal(
             {
                 Ok(team) => team,
                 Err(e) => {
-                    crate::components::toast::toast_error(format!("Failed to create team: {e}"));
+                    show_error(format!("Failed to create team: {e}"));
                     return;
                 }
             };
