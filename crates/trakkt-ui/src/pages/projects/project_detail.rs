@@ -17,9 +17,9 @@ use leptos_router::NavigateOptions;
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Button, ButtonSize, ButtonVariant, ConfirmDialog, DatePicker, DynSelect, EmptyState,
+    Button, ButtonSize, ButtonVariant, ConfirmDialog, DatePicker, EmptyState,
     IssueStatusBadge, IssueStatusVariant, INPUT_CLASS,
-    PriorityIndicator, LabelBadge,
+    PriorityIndicator, LabelBadge, Select, SelectVariant,
     ToggleButton,
 };
 use crate::server_fns::projects::{
@@ -288,7 +288,7 @@ fn ProjectDetailContent(
     // ── Editable status ────────────────────────────────────────────────
     let status_value = RwSignal::new(project.status.clone());
 
-    // ── Editable lead (DynSelect) ────────────────────────────────────────
+    // ── Editable lead ──────────────────────────────────────────────────
     let lead_value = RwSignal::new(project.lead_id.clone().unwrap_or_default());
 
     let members_resource = Resource::new(
@@ -407,12 +407,12 @@ fn ProjectDetailContent(
 
             // ── Metadata bar ─────────────────────────────────────────────
             <div class="flex flex-wrap items-center gap-4 mt-4">
-                // Status (DynSelect for reactivity)
+                // Status
                 <div class="flex items-center gap-2">
                     <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Status"</span>
                     <div class="w-36">
-                        <DynSelect
-                            value=Signal::derive(move || status_value.get())
+                        <Select
+                            value=status_value
                             options=Signal::derive(|| vec![
                                 ("planned".to_string(), "Planned".to_string()),
                                 ("in_progress".to_string(), "In Progress".to_string()),
@@ -420,7 +420,7 @@ fn ProjectDetailContent(
                                 ("completed".to_string(), "Completed".to_string()),
                                 ("cancelled".to_string(), "Cancelled".to_string()),
                             ])
-                            on_change=move |new_status: String| {
+                            on_change=Callback::new(move |new_status: String| {
                                 status_value.set(new_status.clone());
                                 let project_id = pid.get_value();
                                 leptos::task::spawn_local(async move {
@@ -430,19 +430,20 @@ fn ProjectDetailContent(
                                         leptos::logging::warn!("Failed to update status: {e}");
                                     }
                                 });
-                            }
+                            })
+                            variant=SelectVariant::Form
                         />
                     </div>
                 </div>
 
-                // Lead (DynSelect)
+                // Lead
                 <div class="flex items-center gap-2">
                     <span class="text-xs text-muted-foreground font-medium uppercase tracking-wide">"Lead"</span>
                     <div class="w-44">
-                        <DynSelect
-                            value=Signal::derive(move || lead_value.get())
+                        <Select
+                            value=lead_value
                             options=member_options
-                            on_change=move |new_lead: String| {
+                            on_change=Callback::new(move |new_lead: String| {
                                 lead_value.set(new_lead.clone());
                                 let project_id = pid.get_value();
                                 // Some("") = clear, Some(id) = set
@@ -454,7 +455,8 @@ fn ProjectDetailContent(
                                         leptos::logging::warn!("Failed to update lead: {e}");
                                     }
                                 });
-                            }
+                            })
+                            variant=SelectVariant::Form
                             placeholder="Unassigned"
                         />
                     </div>

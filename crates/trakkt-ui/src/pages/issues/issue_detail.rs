@@ -25,7 +25,7 @@ use crate::components::{
     Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
     DatePicker, DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
-    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton, StyledSelect,
+    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Select, SelectVariant, Skeleton,
     ToggleButton,
 };
 use crate::pages::issues::issue_list::NewIssueModal;
@@ -1943,16 +1943,17 @@ fn RelationsSection(
         >
             // Relation type selector
             <div class="mb-3">
-                <StyledSelect
-                    value=add_relation_type.get_untracked()
-                    options=vec![
-                        ("child_of", "Sub-issue"),
-                        ("parent", "Parent"),
-                        ("blocks", "Blocks"),
-                        ("blocked_by", "Blocked by"),
-                        ("duplicate", "Duplicate of"),
-                    ]
-                    on_change=move |val| set_add_relation_type.set(val)
+                <Select
+                    value=add_relation_type
+                    options=Signal::derive(|| vec![
+                        ("child_of".to_string(), "Sub-issue".to_string()),
+                        ("parent".to_string(), "Parent".to_string()),
+                        ("blocks".to_string(), "Blocks".to_string()),
+                        ("blocked_by".to_string(), "Blocked by".to_string()),
+                        ("duplicate".to_string(), "Duplicate of".to_string()),
+                    ])
+                    on_change=Callback::new(move |val| set_add_relation_type.set(val))
+                    variant=SelectVariant::Form
                 />
             </div>
             // Inline issue picker (search + results)
