@@ -8,7 +8,8 @@
 use leptos::prelude::*;
 
 use crate::components::{
-    ActionStatus, Card, CardContent, CardDescription, CardHeader, CardTitle, Skeleton, INPUT_CLASS,
+    ActionStatus, Button, ButtonVariant, Card, CardContent, CardDescription, CardHeader, CardTitle,
+    Skeleton, TeamCreationModal, INPUT_CLASS,
 };
 use crate::server_fns::workspace::*;
 use crate::types::WorkspaceSettingsData;
@@ -56,6 +57,7 @@ pub fn WorkspacePage() -> impl IntoView {
                             view! {
                                 <div class="space-y-6">
                                     <WorkspaceNameCard data=data/>
+                                    <TeamsSection/>
                                 </div>
                             }.into_any()
                         },
@@ -119,6 +121,40 @@ fn WorkspaceNameCard(data: WorkspaceSettingsData) -> impl IntoView {
                 />
             </CardContent>
         </Card>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Teams Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[component]
+fn TeamsSection() -> impl IntoView {
+    let (show_create_modal, set_show_create_modal) = signal(false);
+
+    view! {
+        <Card>
+            <CardHeader>
+                <div class="flex items-center justify-between">
+                    <div>
+                        <CardTitle>"Teams"</CardTitle>
+                        <CardDescription>
+                            "Create and manage issue-tracker teams in this workspace."
+                        </CardDescription>
+                    </div>
+                    <Button
+                        variant=ButtonVariant::Default
+                        on:click=move |_| set_show_create_modal.set(true)
+                    >
+                        "Create Team"
+                    </Button>
+                </div>
+            </CardHeader>
+        </Card>
+        <TeamCreationModal
+            show=Signal::derive(move || show_create_modal.get())
+            on_close=Callback::new(move |()| set_show_create_modal.set(false))
+        />
     }
 }
 

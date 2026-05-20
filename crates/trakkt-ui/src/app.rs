@@ -78,6 +78,7 @@ pub fn App() -> impl IntoView {
 
     view! {
         <crate::components::theme::ThemeProvider initial_preference="system".to_string()>
+        <crate::components::toast::ToastProvider>
         <Router>
             <Routes fallback=|| view! {
                 <div class="min-h-screen bg-background flex items-center justify-center p-8">
@@ -163,6 +164,7 @@ pub fn App() -> impl IntoView {
                 </ParentRoute>
             </Routes>
         </Router>
+        </crate::components::toast::ToastProvider>
         </crate::components::theme::ThemeProvider>
     }
 }
