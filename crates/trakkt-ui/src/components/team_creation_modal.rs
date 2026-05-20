@@ -161,7 +161,7 @@ pub fn TeamCreationModal(
             {
                 Ok(team) => team,
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to create team");
+                    crate::components::toast::toast_error(format!("Failed to create team: {e}"));
                     return;
                 }
             };
