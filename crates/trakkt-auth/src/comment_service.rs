@@ -7,6 +7,7 @@
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::ActionSource;
 use trakkt_types::models::Comment;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
@@ -25,6 +26,8 @@ struct CommentRow {
     parent_id: Option<String>,
     author_name: Option<String>,
     author_avatar: Option<String>,
+    action_source: String,
+    action_source_label: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -39,6 +42,13 @@ impl CommentRow {
             parent_id: self.parent_id,
             author_name: self.author_name,
             author_avatar: self.author_avatar,
+            action_source: self.action_source
+                .parse::<ActionSource>()
+                .unwrap_or_else(|_| {
+                    tracing::warn!(raw = %self.action_source, "Unknown action_source value; defaulting to User");
+                    ActionSource::User
+                }),
+            action_source_label: self.action_source_label,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -88,6 +98,7 @@ pub async fn create_comment(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
+                c.action_source, c.action_source_label, \
                 c.created_at, \
                 c.updated_at \
          FROM comments c \
@@ -174,6 +185,7 @@ pub async fn list_comments(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
+                c.action_source, c.action_source_label, \
                 c.created_at, \
                 c.updated_at \
          FROM comments c \
@@ -198,6 +210,7 @@ pub async fn list_comments_for_workspace(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
+                c.action_source, c.action_source_label, \
                 c.created_at, \
                 c.updated_at \
          FROM comments c \
@@ -251,6 +264,7 @@ pub async fn update_comment(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
+                c.action_source, c.action_source_label, \
                 c.created_at, \
                 c.updated_at \
          FROM comments c \
@@ -308,6 +322,7 @@ pub async fn delete_comment(
         CommentRow,
         "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
                 u.name AS author_name, NULL AS author_avatar, \
+                c.action_source, c.action_source_label, \
                 c.created_at, \
                 c.updated_at \
          FROM comments c \

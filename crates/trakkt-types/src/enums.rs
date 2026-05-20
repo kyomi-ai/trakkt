@@ -99,3 +99,44 @@ impl std::fmt::Display for Priority {
         f.write_str(self.display_name())
     }
 }
+
+/// How a user-attributable action was initiated.
+///
+/// Tracks whether an action came from a browser session (`User`), an automated
+/// agent such as MCP or OAuth (`Agent`), or a bare API token (`Api`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionSource {
+    User,
+    Agent,
+    Api,
+}
+
+impl ActionSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+            Self::Api => "api",
+        }
+    }
+}
+
+impl std::fmt::Display for ActionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ActionSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user" => Ok(Self::User),
+            "agent" => Ok(Self::Agent),
+            "api" => Ok(Self::Api),
+            other => Err(format!("unknown action source: {other}")),
+        }
+    }
+}

@@ -8,6 +8,7 @@
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::ActionSource;
 use trakkt_types::models::Notification;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
@@ -40,6 +41,8 @@ struct NotificationRow {
     team_key: Option<String>,
     actor_id: Option<String>,
     actor_name: Option<String>,
+    action_source: String,
+    action_source_label: Option<String>,
     created_at: String,
 }
 
@@ -57,6 +60,13 @@ impl NotificationRow {
             team_key: self.team_key,
             actor_id: self.actor_id,
             actor_name: self.actor_name,
+            action_source: self.action_source
+                .parse::<ActionSource>()
+                .unwrap_or_else(|_| {
+                    tracing::warn!(raw = %self.action_source, "Unknown action_source value; defaulting to User");
+                    ActionSource::User
+                }),
+            action_source_label: self.action_source_label,
             created_at: self.created_at,
         }
     }
@@ -104,6 +114,7 @@ pub async fn create_notification(
                 t.key AS team_key, \
                 n.actor_id, \
                 u_actor.name AS actor_name, \
+                n.action_source, n.action_source_label, \
                 CAST(n.created_at AS TEXT) AS created_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
@@ -168,6 +179,7 @@ pub async fn list_notifications(
                 t.key AS team_key, \
                 n.actor_id, \
                 u_actor.name AS actor_name, \
+                n.action_source, n.action_source_label, \
                 CAST(n.created_at AS TEXT) AS created_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \

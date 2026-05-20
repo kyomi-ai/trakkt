@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::enums::ActionSource;
+
 /// A team within a workspace (e.g. "Engineering", "Design").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Team {
@@ -233,6 +235,8 @@ pub struct Comment {
     pub parent_id: Option<String>,
     pub author_name: Option<String>,
     pub author_avatar: Option<String>,
+    pub action_source: ActionSource,
+    pub action_source_label: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -251,6 +255,8 @@ pub struct Notification {
     pub team_key: Option<String>,
     pub actor_id: Option<String>,
     pub actor_name: Option<String>,
+    pub action_source: ActionSource,
+    pub action_source_label: Option<String>,
     pub created_at: String,
 }
 
@@ -349,6 +355,8 @@ pub struct IssueActivity {
     pub old_value: Option<String>,
     pub new_value: Option<String>,
     pub metadata: Option<String>,
+    pub action_source: ActionSource,
+    pub action_source_label: Option<String>,
     pub created_at: String,
 }
 
