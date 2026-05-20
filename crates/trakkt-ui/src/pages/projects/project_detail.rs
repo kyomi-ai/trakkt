@@ -157,6 +157,17 @@ pub fn ProjectDetailPage() -> impl IntoView {
                         }
                     }}
                 </span>
+                // Pin/unpin toggle for workspace sidebar
+                {move || {
+                    let id = project_id.get();
+                    if id.is_empty() {
+                        None
+                    } else {
+                        Some(view! {
+                            <crate::components::layout::FavoriteToggle target_type="project" target_id=id/>
+                        })
+                    }
+                }}
             </div>
 
             // ── Content ───────────────────────────────────────────────────
@@ -240,6 +251,9 @@ fn ProjectDetailContent(
 ) -> impl IntoView {
     let issue_count = issues.len();
     let pid = StoredValue::new(project.project_id.clone());
+
+    // Hoist use_navigate to component construction time (not inside closures).
+    let nav_create_view = use_navigate();
 
     // ── Editable name (click-to-edit) ────────────────────────────────────
     let editing_name = RwSignal::new(false);
@@ -575,9 +589,39 @@ fn ProjectDetailContent(
             <div class="border-t border-border my-6"></div>
 
             // ── Issues section ────────────────────────────────────────────
-            <h2 class="text-sm font-medium text-foreground mb-4">
-                {format!("Issues ({issue_count})")}
-            </h2>
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-sm font-medium text-foreground">
+                    {format!("Issues ({issue_count})")}
+                </h2>
+                <Button
+                    variant=ButtonVariant::Ghost
+                    size=ButtonSize::Sm
+                    on:click={
+                        let nav = nav_create_view.clone();
+                        move |_| {
+                            let project_id = pid.get_value();
+                            let filter = serde_json::json!([{
+                                "field": "project",
+                                "operator": "any_of",
+                                "values": [project_id]
+                            }]);
+                            let filter_str = filter.to_string();
+                            let encoded = percent_encoding::utf8_percent_encode(
+                                &filter_str,
+                                percent_encoding::NON_ALPHANUMERIC,
+                            );
+                            let url = format!("/workspace?filters={encoded}&new_view=1");
+                            nav(&url, NavigateOptions {
+                                resolve: false,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                >
+                    <Icon icon=phosphor_leptos::FUNNEL size="16px"/>
+                    "Create View"
+                </Button>
+            </div>
 
             {if issues.is_empty() {
                 let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {

@@ -929,6 +929,44 @@ pub(crate) fn IssueListInner(
     // ── Save View modal state ──────────────────────────────────────────────
     let (show_save_view, set_show_save_view) = signal(false);
 
+    // Auto-open save-view modal when ?new_view=1 is in URL.
+    // Strips the param after opening so refresh/share doesn't re-trigger.
+    {
+        let loc = use_location();
+        let nav_cleanup = use_navigate();
+        let opened = RwSignal::new(false);
+        Effect::new(move |_| {
+            if opened.get_untracked() {
+                return;
+            }
+            let query = loc.search.get();
+            let has_new_view = query
+                .split('&')
+                .any(|p| p == "new_view=1");
+            if has_new_view {
+                opened.set(true);
+                set_show_save_view.set(true);
+                let clean_query: String = query
+                    .split('&')
+                    .filter(|p| *p != "new_view=1")
+                    .collect::<Vec<_>>()
+                    .join("&");
+                let path = loc.pathname.get_untracked();
+                let url = if clean_query.is_empty() {
+                    path
+                } else {
+                    format!("{path}?{clean_query}")
+                };
+                nav_cleanup(&url, NavigateOptions {
+                    resolve: false,
+                    replace: true,
+                    scroll: false,
+                    ..Default::default()
+                });
+            }
+        });
+    }
+
     // ── Keyboard navigation state ──────────────────────────────────────────
     let (selected_index, set_selected_index) = signal(Option::<usize>::None);
 
