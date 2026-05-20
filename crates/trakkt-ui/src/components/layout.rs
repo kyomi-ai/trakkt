@@ -256,10 +256,9 @@ fn Sidebar(
                 <SidebarInboxNavItem/>
                 <SidebarNavItem href="/my-issues" icon=phosphor_leptos::LIST_CHECKS label="My Issues"/>
 
-                <SidebarFavoritesSection/>
+                <SidebarWorkspaceSection/>
 
                 <SidebarTeamsSection/>
-                <SidebarProjectsSection/>
             </nav>
 
             // User menu at bottom
@@ -454,75 +453,149 @@ fn SidebarTeamsSection() -> impl IntoView {
     }
 }
 
-/// Section for "Favorites" — shows user-pinned teams, projects, and views.
+/// Section for "Workspace" — shows preset views (In Progress, Backlog),
+/// user-saved workspace-scoped views, and pinned projects.
 ///
-/// Only renders when favorites exist. Each favorite resolves its name, icon,
-/// and link from the corresponding entity in SyncStore.
+/// Replaces the old SidebarFavoritesSection and SidebarProjectsSection.
+/// Workspace-scoped views are those with `team_id == None`.
+/// Pinned projects come from favorites with `target_type == "project"`.
 #[component]
-fn SidebarFavoritesSection() -> impl IntoView {
+fn SidebarWorkspaceSection() -> impl IntoView {
     let store = use_context::<SyncStore>();
+    let location = leptos_router::hooks::use_location();
+    let path = location.pathname;
+    let search = location.search;
+
+    // Active state for the two workspace presets — match pathname AND query param.
+    let active_active = Signal::derive(move || {
+        path.get() == "/workspace"
+            && search.get().split('&').any(|p| p == "view=active")
+    });
+    let backlog_active = Signal::derive(move || {
+        path.get() == "/workspace"
+            && search.get().split('&').any(|p| p == "view=backlog")
+    });
 
     view! {
         {move || {
             let Some(store) = store else { return view! { <span/> }.into_any() };
 
             // Show skeleton placeholders while the sync store is hydrating.
-            // Without this, the favorites section disappears entirely after
-            // client-side login until bootstrap completes.
             if !store.initialized().get() {
                 return view! {
                     <div class="px-3 pt-4 pb-1">
                         <span class="text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
-                            "Favorites"
+                            "Workspace"
                         </span>
                     </div>
                     <div class="space-y-1 px-2">
                         <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse"/>
                         <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse w-3/4"/>
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse w-2/3"/>
                     </div>
                 }.into_any();
             }
 
+            // Workspace-scoped views (team_id is None).
+            let mut workspace_views: Vec<trakkt_types::models::View> = store
+                .views()
+                .get()
+                .into_iter()
+                .filter(|v| v.team_id.is_none())
+                .collect();
+            workspace_views.sort_by_key(|v| v.position);
+
+            // Pinned projects — favorites where target_type == "project".
             let favorites = store.favorites().get();
-            if favorites.is_empty() {
-                return view! { <span/> }.into_any();
-            }
-            let teams = store.teams().get();
             let projects = store.projects().get();
-            // Limit to 10 items.
-            let items: Vec<_> = favorites.into_iter().take(10).collect();
+            let pinned_projects: Vec<_> = favorites
+                .iter()
+                .filter(|f| f.target_type == "project")
+                .filter_map(|f| {
+                    projects.iter().find(|p| p.project_id == f.target_id).cloned()
+                })
+                .collect();
+
             view! {
-                <SidebarSectionHeader label="Favorites"/>
+                <SidebarSectionHeader label="Workspace"/>
                 <div class="space-y-0.5">
-                    {items.into_iter().filter_map(|fav| {
-                        match fav.target_type.as_str() {
-                            "team" => {
-                                let team = teams.iter().find(|t| t.team_id == fav.target_id)?.clone();
-                                let key = team.key.to_lowercase();
-                                let href = format!("/teams/{key}/issues");
-                                let name = team.name.clone();
-                                Some(view! {
-                                    <SidebarFavoriteTeamItem team=team href=href name=name/>
-                                }.into_any())
-                            }
-                            "project" => {
-                                let project = projects.iter().find(|p| p.project_id == fav.target_id)?;
-                                let href = format!("/projects/{}", project.project_id);
-                                let name = project.name.clone();
-                                Some(view! {
-                                    <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER/>
-                                }.into_any())
-                            }
-                            // View favorites are skipped for now — the view model
-                            // doesn't include the team key needed to build the URL
-                            // to the team issues page where the view tab lives.
-                            "view" => None,
-                            _ => None,
+                    // Preset: In Progress
+                    <SidebarWorkspacePresetItem
+                        href="/workspace?view=active"
+                        label="In Progress"
+                        is_active=active_active
+                    >
+                        {view_status_icon(IssueStatusVariant::Started, "14px".to_string())}
+                    </SidebarWorkspacePresetItem>
+                    // Preset: Backlog
+                    <SidebarWorkspacePresetItem
+                        href="/workspace?view=backlog"
+                        label="Backlog"
+                        is_active=backlog_active
+                    >
+                        {view_status_icon(IssueStatusVariant::Backlog, "14px".to_string())}
+                    </SidebarWorkspacePresetItem>
+
+                    // User-saved workspace views
+                    {workspace_views.into_iter().map(|v| {
+                        let href = format!("/views/{}", v.view_id);
+                        let name = v.name.clone();
+                        view! {
+                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FUNNEL/>
+                        }
+                    }).collect_view()}
+
+                    // Pinned projects
+                    {pinned_projects.into_iter().map(|project| {
+                        let fav_id = project.project_id.clone();
+                        let href = format!("/projects/{}", project.project_id);
+                        let name = project.name.clone();
+                        view! {
+                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type="project" favorite_id=fav_id/>
                         }
                     }).collect_view()}
                 </div>
+
+                // Phase 3 of TRA-139 wires this to open the save-view modal
+                <div class="px-2 pt-1">
+                    <a
+                        href="/workspace?new_view=1"
+                        class="flex items-center gap-2 px-3 py-1 rounded-md text-[12px] text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors"
+                    >
+                        <Icon icon=phosphor_leptos::PLUS weight=IconWeight::Bold size="12px"/>
+                        "New View"
+                    </a>
+                </div>
             }.into_any()
         }}
+    }
+}
+
+/// Preset workspace view item with custom active-state detection.
+///
+/// Unlike `SidebarNavItem` which only checks pathname, this component checks
+/// both pathname and query string to differentiate between `/workspace?view=active`
+/// and `/workspace?view=backlog`.
+#[component]
+fn SidebarWorkspacePresetItem(
+    href: &'static str,
+    label: &'static str,
+    is_active: Signal<bool>,
+    children: Children,
+) -> impl IntoView {
+    let class = move || {
+        let base = "flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-colors";
+        if is_active.get() {
+            format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
+        } else {
+            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)]")
+        }
+    };
+    view! {
+        <a href=href class=class>
+            {children()}
+            {label}
+        </a>
     }
 }
 
@@ -648,76 +721,6 @@ fn SidebarEntityItem(
     }
 }
 
-/// A team item in the favorites list — uses TeamIcon instead of a static Phosphor icon.
-#[component]
-fn SidebarFavoriteTeamItem(team: trakkt_types::models::Team, href: String, name: String) -> impl IntoView {
-    let path = leptos_router::hooks::use_location().pathname;
-    let href_match = href.clone();
-    let is_active = Signal::derive(move || path.get().starts_with(&href_match));
-    let wrapper_class = move || {
-        let base = "group flex items-center rounded-md transition-colors";
-        if is_active.get() {
-            format!("{base} bg-[var(--color-sidebar-active)]")
-        } else {
-            format!("{base} hover:bg-[var(--color-sidebar-hover)]")
-        }
-    };
-    let link_class = move || {
-        let base = "flex-1 min-w-0 flex items-center gap-3 px-3 py-1.5 text-sm";
-        if is_active.get() {
-            format!("{base} text-[var(--color-sidebar-foreground)] font-medium")
-        } else {
-            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)]")
-        }
-    };
-    view! {
-        <div class=wrapper_class>
-            <a href=href class=link_class>
-                <TeamIcon team=team size="16px"/>
-                <span class="truncate">{name}</span>
-            </a>
-        </div>
-    }
-}
-
-/// Section header for "Projects" with dynamic project list from SyncStore.
-#[component]
-fn SidebarProjectsSection() -> impl IntoView {
-    let store = use_context::<SyncStore>();
-
-    view! {
-        {move || {
-            let Some(store) = store else { return view! { <span/> }.into_any() };
-
-            // Show skeleton placeholders while the sync store is hydrating.
-            if !store.initialized().get() {
-                return view! {
-                    <div class="space-y-1 px-2 pt-4">
-                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse"/>
-                    </div>
-                }.into_any();
-            }
-
-            let projects = store.projects().get();
-            if projects.is_empty() {
-                return view! { <span/> }.into_any();
-            }
-            view! {
-                <SidebarSectionHeader label="Projects"/>
-                <div class="space-y-0.5">
-                    {projects.into_iter().map(|project| {
-                        let fav_id = project.project_id.clone();
-                        let href = format!("/projects/{}", project.project_id);
-                        let name = project.name.clone();
-                        view! {
-                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type="project" favorite_id=fav_id/>
-                        }
-                    }).collect_view()}
-                </div>
-            }.into_any()
-        }}
-    }
-}
 
 
 /// Small, uppercase, muted section header (Linear-style).
@@ -871,7 +874,6 @@ fn SidebarTeamSubNav(
                 </button>
                 // Right zone: actions (hover-reveal)
                 <div class="flex items-center gap-1 pr-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <FavoriteToggle target_type="team" target_id=team_id.clone()/>
                     <div node_ref=menu_trigger_ref>
                         <button
                             class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors"

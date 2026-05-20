@@ -5,6 +5,7 @@ pub mod issue_detail;
 pub mod issue_list;
 pub mod issue_row;
 pub mod my_issues;
+pub mod workspace_view;
 
 use trakkt_types::models::IssueWithDetails;
 
