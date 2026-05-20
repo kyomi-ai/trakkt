@@ -11,11 +11,9 @@ use wasm_bindgen::JsCast;
 use phosphor_leptos::{Icon, IconWeight};
 
 use std::collections::HashMap;
-use std::sync::Arc;
-
 use crate::cache::store::SyncStore;
 use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon};
-use crate::components::{Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, Modal, ModalSize, SearchInput, Spinner, TeamIcon, INPUT_CLASS};
+use crate::components::{Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, Spinner, TeamCreationModal, TeamIcon};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
@@ -438,9 +436,10 @@ fn SidebarTeamsSection() -> impl IntoView {
                     </button>
                 </div>
 
-                <Show when=move || show_create.get()>
-                    <SidebarCreateOrJoinTeam on_done=Callback::new(move |()| set_show_create.set(false))/>
-                </Show>
+                <TeamCreationModal
+                    show=Signal::derive(move || show_create.get())
+                    on_close=Callback::new(move |()| set_show_create.set(false))
+                />
 
                 <div class="space-y-0.5">
                     {teams.into_iter().map(|team| {
@@ -728,197 +727,6 @@ fn SidebarSectionHeader(label: &'static str) -> impl IntoView {
         <div class="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
             {label}
         </div>
-    }
-}
-
-/// Modal for creating a new team or joining an existing one.
-#[component]
-fn SidebarCreateOrJoinTeam(on_done: Callback<()>) -> impl IntoView {
-    let store = use_context::<SyncStore>();
-
-    let (name, set_name) = signal(String::new());
-    let (error, set_error) = signal(Option::<String>::None);
-    let (submitting, set_submitting) = signal(false);
-    let input_ref = NodeRef::<leptos::html::Input>::new();
-
-    let (search, set_search) = signal(String::new());
-    let (joining, set_joining) = signal(Option::<String>::None);
-
-    let joinable_teams = LocalResource::new(crate::server_fns::teams::list_joinable_teams);
-
-    Effect::new(move || {
-        if let Some(input) = input_ref.get() {
-            let _ = input.focus();
-        }
-    });
-
-    let on_submit = move |ev: web_sys::SubmitEvent| {
-        ev.prevent_default();
-        let name_val = name.get_untracked().trim().to_string();
-        if name_val.is_empty() { return; }
-
-        let key: String = name_val
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .take(3)
-            .collect::<String>()
-            .to_uppercase();
-
-        if key.len() < 2 {
-            set_error.set(Some("Name too short for a team key".into()));
-            return;
-        }
-
-        set_submitting.set(true);
-        set_error.set(None);
-
-        leptos::task::spawn_local(async move {
-            match crate::server_fns::teams::create_team(name_val, key, None, None).await {
-                Ok(_) => {
-                    on_done.run(());
-                }
-                Err(e) => {
-                    set_error.set(Some(format!("{e}")));
-                    set_submitting.set(false);
-                }
-            }
-        });
-    };
-
-    let on_close = Callback::new(move |()| on_done.run(()));
-
-    let modal_body: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
-        view! {
-            <div class="space-y-4">
-                <div>
-                    <label class="block text-sm font-medium text-foreground mb-2">"Create new team"</label>
-                    <form class="flex gap-2" on:submit=on_submit>
-                        <input
-                            node_ref=input_ref
-                            type="text"
-                            placeholder="Team name..."
-                            class=INPUT_CLASS
-                            prop:value=move || name.get()
-                            on:input=move |ev| set_name.set(event_target_value(&ev))
-                            prop:disabled=move || submitting.get()
-                        />
-                        <Button
-                            disabled=Signal::derive(move || submitting.get() || name.get().trim().is_empty())
-                        >
-                            {move || if submitting.get() { "Creating..." } else { "Create" }}
-                        </Button>
-                    </form>
-                    <Show when=move || error.get().is_some()>
-                        <p class="mt-1 text-sm text-red-400">
-                            {move || error.get().unwrap_or_default()}
-                        </p>
-                    </Show>
-                </div>
-
-                <div class="flex items-center gap-3">
-                    <div class="flex-1 h-px bg-border"/>
-                    <span class="text-xs text-muted-foreground">"or"</span>
-                    <div class="flex-1 h-px bg-border"/>
-                </div>
-
-                <div>
-                    <label class="block text-sm font-medium text-foreground mb-2">"Join existing team"</label>
-                    <SearchInput
-                        value=Signal::derive(move || search.get())
-                        on_input=Callback::new(move |v: String| set_search.set(v))
-                        placeholder="Search teams..."
-                    />
-                    <div class="mt-2 max-h-48 overflow-y-auto rounded-md border border-border">
-                        <Suspense fallback=|| view! {
-                            <div class="px-4 py-3 text-sm text-muted-foreground">"Loading teams..."</div>
-                        }>
-                            {move || joinable_teams.get().map(|result| {
-                                match result {
-                                    Ok(ref teams) => {
-                                        let query = search.get().to_lowercase();
-                                        let filtered: Vec<_> = teams.iter()
-                                            .filter(|t| query.is_empty() || t.name.to_lowercase().contains(&query))
-                                            .cloned()
-                                            .collect();
-                                        if filtered.is_empty() {
-                                            view! {
-                                                <div class="px-4 py-3 text-sm text-muted-foreground">
-                                                    "No teams available to join"
-                                                </div>
-                                            }.into_any()
-                                        } else {
-                                            filtered.into_iter().map(|team| {
-                                                let team_id = team.team_id.clone();
-                                                let team_name = team.name.clone();
-                                                let member_count = team.member_count;
-                                                let is_joining = Signal::derive(move || {
-                                                    joining.get().as_deref() == Some(team_id.as_str())
-                                                });
-                                                let team_for_upsert = team.clone();
-                                                let tid = team.team_id.clone();
-                                                view! {
-                                                    <button
-                                                        class="w-full flex items-center justify-between px-4 py-2.5 text-sm text-foreground hover:bg-secondary transition-colors disabled:opacity-50"
-                                                        disabled=move || joining.get().is_some()
-                                                        on:click=move |_| {
-                                                            let tid = tid.clone();
-                                                            let team_for_upsert = team_for_upsert.clone();
-                                                            set_joining.set(Some(tid.clone()));
-                                                            leptos::task::spawn_local(async move {
-                                                                match crate::server_fns::teams::join_team(tid).await {
-                                                                    Ok(()) => {
-                                                                        if let Some(store) = store {
-                                                                            store.upsert_team(team_for_upsert);
-                                                                        }
-                                                                        on_done.run(());
-                                                                    }
-                                                                    Err(e) => {
-                                                                        web_sys::console::warn_1(&format!("join_team failed: {e}").into());
-                                                                        set_joining.set(None);
-                                                                    }
-                                                                }
-                                                            });
-                                                        }
-                                                    >
-                                                        <span class="truncate">{team_name}</span>
-                                                        <span class="text-xs text-muted-foreground flex-shrink-0 ml-2">
-                                                            {move || if is_joining.get() {
-                                                                "Joining...".to_string()
-                                                            } else {
-                                                                let n = member_count;
-                                                                if n == 1 { "1 member".to_string() } else { format!("{n} members") }
-                                                            }}
-                                                        </span>
-                                                    </button>
-                                                }
-                                            }).collect_view().into_any()
-                                        }
-                                    }
-                                    Err(ref e) => {
-                                        view! {
-                                            <div class="px-4 py-3 text-sm text-red-400">
-                                                {format!("Failed to load teams: {e}")}
-                                            </div>
-                                        }.into_any()
-                                    }
-                                }
-                            })}
-                        </Suspense>
-                    </div>
-                </div>
-            </div>
-        }.into_any()
-    });
-
-    view! {
-        <Modal
-            show=Signal::derive(move || true)
-            on_close=on_close
-            title="Add Team"
-            size=ModalSize::Sm
-        >
-            {modal_body()}
-        </Modal>
     }
 }
 
