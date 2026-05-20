@@ -240,11 +240,15 @@ pub fn TeamCreationModal(
                 }
             }
 
-            // Step 5: Navigate to the new team, then close modal
-            // (nav must run before on_close — closing disposes the modal's reactive scope)
+            // Step 5: Navigate to the new team, then close modal.
+            // on_close is deferred to a new microtask because it sets the
+            // parent's `show` signal to false, which disposes this modal's
+            // reactive scope. Running it synchronously would panic.
             let href = format!("/teams/{}/issues", team_key.to_lowercase());
             nav(&href, Default::default());
-            on_close.run(());
+            leptos::task::spawn_local(async move {
+                on_close.run(());
+            });
         });
     };
 
