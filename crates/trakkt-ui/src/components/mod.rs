@@ -3,6 +3,7 @@
 //! Shared UI components — no server-side dependencies.
 
 pub mod action_status;
+pub mod attachment_extension;
 pub mod attachment_hooks;
 pub mod avatar;
 pub mod layout;

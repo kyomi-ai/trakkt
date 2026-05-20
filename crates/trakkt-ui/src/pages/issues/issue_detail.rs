@@ -1549,9 +1549,125 @@ fn DescriptionEditor(
 
     // Attachment callbacks — pass issue_id so uploads are auto-linked.
     let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
-    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id));
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()));
     let on_delete = crate::components::attachment_hooks::make_delete_callback();
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
+
+    // ── "Attach file" slash command extension ───────────────────────────
+    let attach_file_input_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let (attach_triggered, set_attach_triggered) = signal(false);
+    let on_change_for_attach = on_change.clone();
+
+    let attach_ext = Arc::new(
+        crate::components::attachment_extension::AttachFileExtension::new(
+            Arc::new(move || set_attach_triggered.set(true)),
+        ),
+    );
+
+    // When the extension fires, click the hidden file input.
+    Effect::new(move || {
+        if attach_triggered.get() {
+            set_attach_triggered.set(false);
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(input_el) = attach_file_input_ref.get() {
+                    let input: &web_sys::HtmlInputElement = input_el.as_ref();
+                    input.click();
+                }
+            }
+        }
+    });
+
+    // When a file is selected via the extension's file picker, read, validate,
+    // upload, and inject the resulting markdown into the editor content.
+    let stored_issue_id = StoredValue::new(issue_id);
+    let on_attach_file_selected = move |_ev: leptos::ev::Event| {
+        let _stored_issue_id = stored_issue_id;
+        let _on_change_for_attach = on_change_for_attach.clone();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use crate::components::attachment_hooks::{
+                upload_file, ALLOWED_CONTENT_TYPES, ALLOWED_EXTENSIONS, MAX_FILE_SIZE,
+            };
+
+            let input_el = match attach_file_input_ref.get() {
+                Some(el) => el,
+                None => return,
+            };
+            let input: &web_sys::HtmlInputElement = input_el.as_ref();
+            let files = match input.files() {
+                Some(f) => f,
+                None => return,
+            };
+            let file = match files.get(0) {
+                Some(f) => f,
+                None => return,
+            };
+
+            let name = file.name();
+            let content_type = file.type_();
+            let size = file.size() as u64;
+
+            if size > MAX_FILE_SIZE {
+                tracing::warn!("Attach file: too large ({size} bytes)");
+                input.set_value("");
+                return;
+            }
+
+            let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+            if !ALLOWED_EXTENSIONS.contains(&ext.as_str())
+                && !ALLOWED_CONTENT_TYPES.contains(&content_type.as_str())
+            {
+                tracing::warn!("Attach file: type not allowed (ext={ext}, content_type={content_type})");
+                input.set_value("");
+                return;
+            }
+
+            let issue_id = _stored_issue_id.get_value();
+
+            leptos::task::spawn_local(async move {
+                let data = {
+                    use wasm_bindgen_futures::JsFuture;
+                    let promise = file.array_buffer();
+                    match JsFuture::from(promise).await {
+                        Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
+                        Err(_) => {
+                            tracing::warn!("Attach file: failed to read file bytes");
+                            return;
+                        }
+                    }
+                };
+
+                match upload_file(&data, &name, &content_type, Some(&issue_id)).await {
+                    Ok(resp) => {
+                        // Build inline markdown for the uploaded attachment.
+                        let markdown_snippet = if content_type.starts_with("image/") {
+                            format!("\n![{}]({})\n", name, resp.url)
+                        } else {
+                            format!("\n[{}]({})\n", name, resp.url)
+                        };
+                        // Append the snippet to the current editor content.
+                        // This triggers the content sync Effect in TreeWysiwygEditor,
+                        // which re-parses and renders the new image/file node.
+                        let Some(current) = gated_content.try_get_untracked() else {
+                            return;
+                        };
+                        let updated = format!("{}{}", current.trim_end(), markdown_snippet);
+                        let _ = gated_content.try_set(updated.clone());
+                        _on_change_for_attach(updated);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Attach file: upload failed: {e}");
+                    }
+                }
+                if let Some(input_el) = attach_file_input_ref.get() {
+                    let input: &web_sys::HtmlInputElement = input_el.as_ref();
+                    input.set_value("");
+                }
+            });
+        }
+    };
 
     let theme_state = use_context::<crate::components::theme::ThemeState>();
     let theme_signal = Signal::derive(move || {
@@ -1568,6 +1684,14 @@ fn DescriptionEditor(
 
     view! {
         <div class="mt-6" style="min-height: 120px;">
+            // Hidden file input for the "Attach file" slash command extension
+            <input
+                type="file"
+                node_ref=attach_file_input_ref
+                class="hidden"
+                accept=".png,.jpg,.jpeg,.gif,.webp,.svg,.pdf,.csv,.txt,.json,.log"
+                on:change=on_attach_file_selected
+            />
             <TreeWysiwygEditor
                 content=auto_linked_content
                 on_change=on_change
@@ -1578,6 +1702,7 @@ fn DescriptionEditor(
                 on_delete_attachment=on_delete
                 on_click_attachment=on_click
                 upload_complete=upload_complete
+                extensions=vec![attach_ext as Arc<dyn kode_leptos::Extension>]
             />
         </div>
     }
@@ -2436,9 +2561,124 @@ fn NewCommentForm(
 
     // Attachment callbacks — pass issue_id so uploads are auto-linked.
     let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
-    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id));
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()));
     let on_delete = crate::components::attachment_hooks::make_delete_callback();
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
+
+    // ── "Attach file" slash command extension ───────────────────────────
+    let attach_file_input_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let (attach_triggered, set_attach_triggered) = signal(false);
+    let on_change_for_attach = on_change.clone();
+
+    let attach_ext = Arc::new(
+        crate::components::attachment_extension::AttachFileExtension::new(
+            Arc::new(move || set_attach_triggered.set(true)),
+        ),
+    );
+
+    // When the extension fires, click the hidden file input.
+    Effect::new(move || {
+        if attach_triggered.get() {
+            set_attach_triggered.set(false);
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(input_el) = attach_file_input_ref.get() {
+                    let input: &web_sys::HtmlInputElement = input_el.as_ref();
+                    input.click();
+                }
+            }
+        }
+    });
+
+    // When a file is selected via the extension's file picker, read, validate,
+    // upload, and inject the resulting markdown into the editor content.
+    let stored_issue_id = StoredValue::new(issue_id);
+    let on_attach_file_selected = move |_ev: leptos::ev::Event| {
+        let _stored_issue_id = stored_issue_id;
+        let _on_change_for_attach = on_change_for_attach.clone();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use crate::components::attachment_hooks::{
+                upload_file, ALLOWED_CONTENT_TYPES, ALLOWED_EXTENSIONS, MAX_FILE_SIZE,
+            };
+
+            let input_el = match attach_file_input_ref.get() {
+                Some(el) => el,
+                None => return,
+            };
+            let input: &web_sys::HtmlInputElement = input_el.as_ref();
+            let files = match input.files() {
+                Some(f) => f,
+                None => return,
+            };
+            let file = match files.get(0) {
+                Some(f) => f,
+                None => return,
+            };
+
+            let name = file.name();
+            let content_type = file.type_();
+            let size = file.size() as u64;
+
+            if size > MAX_FILE_SIZE {
+                tracing::warn!("Attach file: too large ({size} bytes)");
+                input.set_value("");
+                return;
+            }
+
+            let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+            if !ALLOWED_EXTENSIONS.contains(&ext.as_str())
+                && !ALLOWED_CONTENT_TYPES.contains(&content_type.as_str())
+            {
+                tracing::warn!("Attach file: type not allowed (ext={ext}, content_type={content_type})");
+                input.set_value("");
+                return;
+            }
+
+            let issue_id = _stored_issue_id.get_value();
+
+            leptos::task::spawn_local(async move {
+                let data = {
+                    use wasm_bindgen_futures::JsFuture;
+                    let promise = file.array_buffer();
+                    match JsFuture::from(promise).await {
+                        Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
+                        Err(_) => {
+                            tracing::warn!("Attach file: failed to read file bytes");
+                            return;
+                        }
+                    }
+                };
+
+                match upload_file(&data, &name, &content_type, Some(&issue_id)).await {
+                    Ok(resp) => {
+                        // Build inline markdown for the uploaded attachment.
+                        let markdown_snippet = if content_type.starts_with("image/") {
+                            format!("\n![{}]({})\n", name, resp.url)
+                        } else {
+                            format!("\n[{}]({})\n", name, resp.url)
+                        };
+                        // Append the snippet to the current comment content.
+                        let Some(current) = content.try_get_untracked() else {
+                            return;
+                        };
+                        let updated = format!("{}{}", current.trim_end(), markdown_snippet);
+                        let _ = content.try_set(updated.clone());
+                        _on_change_for_attach(updated);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Attach file: upload failed: {e}");
+                    }
+                }
+                // Reset the file input so the same file can be re-selected.
+                if let Some(input_el) = attach_file_input_ref.get() {
+                    let input: &web_sys::HtmlInputElement = input_el.as_ref();
+                    input.set_value("");
+                }
+            });
+        }
+    };
 
     let theme_state = use_context::<crate::components::theme::ThemeState>();
     let theme_signal = Signal::derive(move || {
@@ -2454,6 +2694,14 @@ fn NewCommentForm(
 
     view! {
         <div class="mt-6">
+            // Hidden file input for the "Attach file" slash command extension
+            <input
+                type="file"
+                node_ref=attach_file_input_ref
+                class="hidden"
+                accept=".png,.jpg,.jpeg,.gif,.webp,.svg,.pdf,.csv,.txt,.json,.log"
+                on:change=on_attach_file_selected
+            />
             <div class="border border-border rounded-md overflow-hidden bg-card">
                 <TreeWysiwygEditor
                     content=content.read_only()
@@ -2465,6 +2713,7 @@ fn NewCommentForm(
                     on_delete_attachment=on_delete
                     on_click_attachment=on_click
                     upload_complete=upload_complete
+                    extensions=vec![attach_ext as Arc<dyn kode_leptos::Extension>]
                 />
             </div>
             <div class="flex justify-end mt-3">
@@ -2770,10 +3019,10 @@ fn AttachmentsSection(
                                                 } else {
                                                     #[cfg(target_arch = "wasm32")]
                                                     {
-                                                        if let Some(window) = web_sys::window() {
-                                                            if let Err(e) = window.open_with_url_and_target_and_features(&url, "_blank", "noopener,noreferrer") {
-                                                                tracing::warn!("Failed to open attachment in new tab: {e:?}");
-                                                            }
+                                                        if let Some(window) = web_sys::window()
+                                                            && let Err(e) = window.open_with_url_and_target_and_features(&url, "_blank", "noopener,noreferrer")
+                                                        {
+                                                            tracing::warn!("Failed to open attachment in new tab: {e:?}");
                                                         }
                                                     }
                                                 }
@@ -2834,7 +3083,7 @@ fn AttachmentsSection(
                                 </div>
                             }.into_any()
                         } else {
-                            view! {}.into_any()
+                            ().into_any()
                         }}
                     }
                 }}

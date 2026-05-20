@@ -146,10 +146,10 @@ pub fn make_click_callback(
                 }));
             }
             AttachmentNodeType::File => {
-                if let Some(window) = web_sys::window() {
-                    if let Err(e) = window.open_with_url_and_target_and_features(&req.src_or_href, "_blank", "noopener,noreferrer") {
-                        tracing::warn!("Failed to open file in new tab: {e:?}");
-                    }
+                if let Some(window) = web_sys::window()
+                    && let Err(e) = window.open_with_url_and_target_and_features(&req.src_or_href, "_blank", "noopener,noreferrer")
+                {
+                    tracing::warn!("Failed to open file in new tab: {e:?}");
                 }
             }
         }
