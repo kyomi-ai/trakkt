@@ -150,6 +150,7 @@ pub async fn create_issue(
         due_date, project_id, milestone_id,
         parent_issue_id: parent_issue_id.filter(|s| !s.is_empty()),
         estimate,
+        relations: None,
     };
     let result = trakkt_api::issues::create_issue(&ctx, params).await.into_sfn()?;
     serde_json::from_value(result).into_sfn()
