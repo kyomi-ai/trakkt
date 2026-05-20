@@ -386,6 +386,7 @@ pub enum SelectVariant {
 #[component]
 pub fn Select(
     /// Current selected value (controlled by parent).
+    /// In multi-select mode this is a comma-separated string of selected values.
     #[prop(into)]
     value: Signal<String>,
     /// Options list. Each entry is (value, label).
@@ -399,40 +400,83 @@ pub fn Select(
     /// Placeholder shown when value is empty (form variant only, typically).
     #[prop(optional, into)]
     placeholder: Option<String>,
+    /// Search placeholder — when Some, renders a search input in the menu
+    /// that filters items client-side by label match.
+    #[prop(optional, into)]
+    search_placeholder: Option<String>,
+    /// Optional per-item icon renderer. Takes the item's value string and
+    /// returns a view to show as the icon. Each item calls this to get its icon.
+    #[prop(optional)]
+    item_icon: Option<std::sync::Arc<dyn Fn(String) -> AnyView + Send + Sync>>,
+    /// Multi-select mode. When true, clicking an item toggles it in/out of a
+    /// comma-separated value string, and the menu stays open.
+    #[prop(optional)]
+    multi: bool,
 ) -> impl IntoView {
     let (is_open, set_is_open) = signal(false);
     let trigger_ref = NodeRef::<leptos::html::Div>::new();
 
     let placeholder_stored = StoredValue::new(placeholder);
+    let item_icon_stored = StoredValue::new(item_icon);
 
-    // Derive the label to display in the trigger: look up the current value
-    // in options. If empty and a placeholder exists, show the placeholder.
-    // If value not found in options, show the raw value.
+    // ── Search filtering ────────────────────────────────────────────────
+    let has_search = search_placeholder.is_some();
+    let search_placeholder_stored = StoredValue::new(search_placeholder);
+    let (search_query, set_search_query) = signal(String::new());
+
+    // ── Display label ───────────────────────────────────────────────────
+    // In single mode: look up value in options, fall back to raw value.
+    // In multi mode: "N selected" or single-item label or placeholder.
     let display_label = Memo::new(move |_| {
         let val = value.get();
-        if val.is_empty() {
-            return placeholder_stored.with_value(|p| {
-                p.clone().unwrap_or_else(String::new)
-            });
+        if multi {
+            let selected: Vec<&str> = val.split(',').filter(|s| !s.is_empty()).collect();
+            match selected.len() {
+                0 => placeholder_stored.with_value(|p| p.clone().unwrap_or_else(String::new)),
+                1 => {
+                    let single = selected[0];
+                    options
+                        .get()
+                        .iter()
+                        .find(|(v, _)| v == single)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| single.to_string())
+                }
+                n => format!("{n} selected"),
+            }
+        } else {
+            if val.is_empty() {
+                return placeholder_stored.with_value(|p| p.clone().unwrap_or_else(String::new));
+            }
+            options
+                .get()
+                .iter()
+                .find(|(v, _)| *v == val)
+                .map(|(_, l)| l.clone())
+                .unwrap_or_else(|| val.clone())
         }
-        options
-            .get()
-            .iter()
-            .find(|(v, _)| *v == val)
-            .map(|(_, l)| l.clone())
-            .unwrap_or_else(|| val.clone())
     });
 
     // Whether we are currently showing a placeholder (empty value).
     let is_placeholder = move || {
-        value.get().is_empty()
+        if multi {
+            value.get().split(',').filter(|s| !s.is_empty()).count() == 0
+        } else {
+            value.get().is_empty()
+        }
     };
 
     let on_trigger_click = move |_| {
         set_is_open.update(|open| *open = !*open);
     };
 
-    let on_close = Callback::new(move |()| set_is_open.set(false));
+    let on_close = Callback::new(move |()| {
+        set_is_open.set(false);
+        // Reset search query when menu closes so it's fresh on next open.
+        if has_search {
+            set_search_query.set(String::new());
+        }
+    });
 
     let trigger_view = match variant {
         SelectVariant::Compact => {
@@ -484,30 +528,130 @@ pub fn Select(
 
     let use_match_width = variant == SelectVariant::Form;
 
+    // ── Build the items closure (shared between search / no-search paths) ──
+    let items_fn: ChildrenFn = std::sync::Arc::new(move || {
+        let query = search_query.get().to_lowercase();
+        let items: Vec<AnyView> = options.get().into_iter()
+            // Filter by search query when search is active.
+            .filter(|(_, label_str)| {
+                query.is_empty() || label_str.to_lowercase().contains(&query)
+            })
+            .map(|(val_str, label_str)| {
+                let val_for_selected = val_str.clone();
+                let val_for_click = val_str.clone();
+
+                // Build per-item icon from the item_icon renderer.
+                let icon: Option<ChildrenFn> = item_icon_stored.with_value(|renderer| {
+                    renderer.as_ref().map(|render_fn| {
+                        let render_fn = render_fn.clone();
+                        let item_val = val_str.clone();
+                        std::sync::Arc::new(move || render_fn(item_val.clone())) as ChildrenFn
+                    })
+                });
+
+                if multi {
+                    // Multi-select: toggle value in/out of comma-separated list.
+                    let selected = Signal::derive(move || {
+                        value.get()
+                            .split(',')
+                            .any(|s| s == val_for_selected)
+                    });
+                    let on_select = Callback::new(move |()| {
+                        let current = value.get();
+                        let mut parts: Vec<String> = current
+                            .split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .collect();
+                        let clicked = val_for_click.clone();
+                        if let Some(pos) = parts.iter().position(|s| *s == clicked) {
+                            parts.remove(pos);
+                        } else {
+                            parts.push(clicked);
+                        }
+                        on_change.run(parts.join(","));
+                        // Do NOT close menu in multi mode.
+                    });
+                    render_dropdown_item(label_str, selected, on_select, icon)
+                } else {
+                    // Single-select: select and close.
+                    let selected = Signal::derive(move || value.get() == val_for_selected);
+                    let on_select = Callback::new(move |()| {
+                        on_change.run(val_for_click.clone());
+                        set_is_open.set(false);
+                    });
+                    render_dropdown_item(label_str, selected, on_select, icon)
+                }
+            }).collect();
+        items.into_any()
+    });
+    let items_stored = StoredValue::new(items_fn);
+
+    // ── Render menu with or without search props ────────────────────────
+    // Leptos `#[prop(optional, into)]` on `Option<String>` accepts `String`
+    // (not `Option<String>`), so we branch to avoid passing the prop when
+    // search is disabled.
+    let open_signal = Signal::derive(move || is_open.get());
+
+    let menu_view = if let Some(sp) = search_placeholder_stored.with_value(|s| s.clone()) {
+        let on_search = Callback::new(move |q: String| set_search_query.set(q));
+        view! {
+            <DropdownMenu
+                trigger_ref=trigger_ref
+                open=open_signal
+                on_close=on_close
+                match_width=use_match_width
+                search_placeholder=sp
+                on_search=on_search
+            >
+                {move || items_stored.with_value(|f| f())}
+            </DropdownMenu>
+        }.into_any()
+    } else {
+        view! {
+            <DropdownMenu
+                trigger_ref=trigger_ref
+                open=open_signal
+                on_close=on_close
+                match_width=use_match_width
+            >
+                {move || items_stored.with_value(|f| f())}
+            </DropdownMenu>
+        }.into_any()
+    };
+
     view! {
         {trigger_view}
-        <DropdownMenu
-            trigger_ref=trigger_ref
-            open=Signal::derive(move || is_open.get())
-            on_close=on_close
-            match_width=use_match_width
-        >
-            {move || {
-                options.get().into_iter().map(|(val_str, label_str)| {
-                    let val_for_selected = val_str.clone();
-                    let val_for_click = val_str.clone();
-                    view! {
-                        <DropdownItem
-                            label=label_str
-                            selected=Signal::derive(move || value.get() == val_for_selected)
-                            on_select=Callback::new(move |()| {
-                                on_change.run(val_for_click.clone());
-                                set_is_open.set(false);
-                            })
-                        />
-                    }
-                }).collect_view()
-            }}
-        </DropdownMenu>
+        {menu_view}
+    }
+}
+
+/// Render a [`DropdownItem`], conditionally passing the `icon` prop only when
+/// present. Leptos `#[prop(optional)]` props cannot be passed as `Option<T>`
+/// through the `view!` macro — the caller must either pass the inner `T` or
+/// omit the prop entirely. This helper encapsulates that branch.
+fn render_dropdown_item(
+    label: String,
+    selected: Signal<bool>,
+    on_select: Callback<()>,
+    icon: Option<ChildrenFn>,
+) -> AnyView {
+    if let Some(icon) = icon {
+        view! {
+            <DropdownItem
+                label=label
+                selected=selected
+                on_select=on_select
+                icon=icon
+            />
+        }.into_any()
+    } else {
+        view! {
+            <DropdownItem
+                label=label
+                selected=selected
+                on_select=on_select
+            />
+        }.into_any()
     }
 }
