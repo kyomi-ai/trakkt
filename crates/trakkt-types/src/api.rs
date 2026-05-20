@@ -494,3 +494,17 @@ pub struct ListGitHubLinksApiParams {
     /// Issue number within the team. Required if issue_identifier is not provided
     pub issue_number: Option<i64>,
 }
+
+/// Parameters for looking up issues by commit SHA.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct LookupCommitApiParams {
+    /// Commit SHA (full or abbreviated, minimum 7 characters). Prefix match is used.
+    pub sha: String,
+}
+
+/// Parameters for looking up issues by branch name.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct LookupBranchApiParams {
+    /// Branch name (exact match)
+    pub branch: String,
+}
