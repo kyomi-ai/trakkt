@@ -339,6 +339,7 @@ fn IssueDetailContent(
                     number=number
                     description=Signal::from(description)
                     lightbox_state=lightbox_state
+                    issue_id=initial.get_untracked().issue_id.clone()
                 />
 
                 // ── Relations section (unified: parent, children, blocks, blocked-by) ──
@@ -364,6 +365,7 @@ fn IssueDetailContent(
                     number=number
                     comments=Signal::from(comments)
                     lightbox_state=lightbox_state
+                    issue_id=initial.get_untracked().issue_id.clone()
                 />
 
                 // ── Footer: timestamps ────────────────────────────────
@@ -1452,6 +1454,8 @@ fn DescriptionEditor(
     number: i32,
     description: Signal<String>,
     lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
+    /// Issue ID for auto-linking inline uploads to this issue.
+    issue_id: String,
 ) -> impl IntoView {
     use kode_leptos::TreeWysiwygEditor;
 
@@ -1534,9 +1538,9 @@ fn DescriptionEditor(
         });
     });
 
-    // Attachment callbacks
+    // Attachment callbacks — pass issue_id so uploads are auto-linked.
     let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
-    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete);
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id));
     let on_delete = crate::components::attachment_hooks::make_delete_callback();
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
@@ -1970,6 +1974,8 @@ fn IssueTimeline(
     number: i32,
     comments: Signal<Vec<Comment>>,
     lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
+    /// Issue ID for auto-linking inline uploads in the comment form.
+    issue_id: String,
 ) -> impl IntoView {
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (filter, set_filter) = signal(TimelineFilter::All);
@@ -1989,6 +1995,7 @@ fn IssueTimeline(
     );
 
     let tk_for_form = team_key.clone();
+    let issue_id_for_comment_form = issue_id;
 
     view! {
         <div>
@@ -2110,7 +2117,7 @@ fn IssueTimeline(
             </div>
 
             // ── New comment form ───────────────────────────────────────
-            <NewCommentForm team_key=tk_for_form number=number lightbox_state=lightbox_state/>
+            <NewCommentForm team_key=tk_for_form number=number lightbox_state=lightbox_state issue_id=issue_id_for_comment_form/>
         </div>
     }
 }
@@ -2379,6 +2386,8 @@ fn NewCommentForm(
     team_key: String,
     number: i32,
     lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
+    /// Issue ID for auto-linking inline uploads to this issue.
+    issue_id: String,
 ) -> impl IntoView {
     use kode_leptos::TreeWysiwygEditor;
 
@@ -2416,9 +2425,9 @@ fn NewCommentForm(
         content.set(text);
     });
 
-    // Attachment callbacks
+    // Attachment callbacks — pass issue_id so uploads are auto-linked.
     let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
-    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete);
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id));
     let on_delete = crate::components::attachment_hooks::make_delete_callback();
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
