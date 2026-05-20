@@ -299,6 +299,8 @@ async fn handle_tools_call(
             workspace_id: "workspace-local".to_string(),
             user_id: "user-local".to_string(),
             scopes: vec![],
+            action_source: trakkt_types::enums::ActionSource::User,
+            action_source_label: None,
         }
     } else {
         match auth_shared::resolve_auth(headers, state).await {
@@ -387,6 +389,8 @@ async fn dispatch_registry_tool(
         state.github_client.as_deref(),
         Some(&*state.encryption_key),
         &state.config.frontend_url,
+        auth.action_source,
+        auth.action_source_label.clone(),
     );
 
     let result = (op.handler)(ctx, arguments).await.map_err(|e| match e {

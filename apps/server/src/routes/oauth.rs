@@ -446,16 +446,16 @@ async fn oauth_token(
     );
 
     // Validate client
-    let _client = lookup_active_client(&state, &params.client_id)
+    let client = lookup_active_client(&state, &params.client_id)
         .await
         .map_err(|e| e.into_response())?;
 
     match params.grant_type.as_str() {
-        "authorization_code" => handle_authorization_code(&state, &headers, &params)
+        "authorization_code" => handle_authorization_code(&state, &headers, &params, &client.name)
             .await
             .map(Json)
             .map_err(|e| e.into_response()),
-        "refresh_token" => handle_refresh_token(&state, &headers, &params)
+        "refresh_token" => handle_refresh_token(&state, &headers, &params, &client.name)
             .await
             .map(Json)
             .map_err(|e| e.into_response()),
@@ -472,6 +472,7 @@ async fn handle_authorization_code(
     state: &AppState,
     headers: &HeaderMap,
     params: &TokenRequest,
+    client_name: &str,
 ) -> Result<TokenResponse, (StatusCode, Json<serde_json::Value>)> {
     let code = params
         .code
@@ -541,12 +542,13 @@ async fn handle_authorization_code(
         ));
     }
 
-    // Build JWT claims with workspace context
+    // Build JWT claims with workspace context and client_name for agent detection.
     let jwt_config = &trakkt_core::constants::get().jwt;
     let mut extra = std::collections::HashMap::new();
     extra.insert("user_id".into(), json!(&user.user_id));
     extra.insert("email".into(), json!(&user.email));
     extra.insert("name".into(), json!(&user.name));
+    extra.insert("client_name".into(), json!(client_name));
 
     if let Some(ws_id) = workspace_id {
         extra.insert("workspace_id".into(), json!(ws_id));
@@ -612,6 +614,7 @@ async fn handle_refresh_token(
     state: &AppState,
     _headers: &HeaderMap,
     params: &TokenRequest,
+    client_name: &str,
 ) -> Result<TokenResponse, (StatusCode, Json<serde_json::Value>)> {
     let refresh_token = params.refresh_token.as_deref().ok_or_else(|| {
         (
@@ -688,13 +691,14 @@ async fn handle_refresh_token(
         ));
     };
 
-    // Issue new access token
+    // Issue new access token with client_name for agent detection.
     let jwt_config = &trakkt_core::constants::get().jwt;
     let mut extra = std::collections::HashMap::new();
     extra.insert("user_id".into(), json!(&user.user_id));
     extra.insert("email".into(), json!(&user.email));
     extra.insert("name".into(), json!(&user.name));
     extra.insert("workspace_id".into(), json!(&workspace_id));
+    extra.insert("client_name".into(), json!(client_name));
 
     let access_token = jwt::create_access_token_str(
         &user.user_id,
