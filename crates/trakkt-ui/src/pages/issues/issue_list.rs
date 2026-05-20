@@ -84,6 +84,245 @@ fn view_mode_storage_key(team_key: &Option<Signal<String>>) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// URL query param helpers for view state persistence
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parsed view state from URL query parameters.
+struct ParsedViewState {
+    /// Active tab: "all", "active", "backlog", or "view:<uuid>"
+    view: String,
+    /// Filter clauses deserialized from the `filters` JSON param.
+    filters: Vec<FilterClause>,
+    /// Sort field (if present in URL).
+    sort: Option<SortField>,
+    /// Sort direction (if present in URL).
+    sort_dir: Option<SortDirection>,
+}
+
+/// Parse URL query parameters into view state.
+///
+/// Handles both the new format (`view=active&filters=...&sort=...&sort_dir=...`)
+/// and the legacy format (`status=in_progress` / `status=backlog`) for backward
+/// compatibility with sidebar links.
+///
+/// The `query` string comes from `use_location().search` which does NOT include
+/// the leading `?`.
+fn parse_query_params(query: &str) -> ParsedViewState {
+    let mut view = None::<String>;
+    let mut filters_raw = None::<String>;
+    let mut sort_raw = None::<String>;
+    let mut sort_dir_raw = None::<String>;
+    let mut legacy_status = None::<String>;
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = pair.split_once('=') {
+            match key {
+                "view" => view = Some(value.to_string()),
+                "filters" => filters_raw = Some(value.to_string()),
+                "sort" => sort_raw = Some(value.to_string()),
+                "sort_dir" => sort_dir_raw = Some(value.to_string()),
+                "status" => legacy_status = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    // Backward compatibility: translate legacy `?status=` params into new format.
+    // Only applies when no `view` param is present (i.e., old-style sidebar links).
+    if view.is_none()
+        && let Some(ref status) = legacy_status
+    {
+        match status.as_str() {
+            "in_progress" => view = Some("active".to_string()),
+            "backlog" => view = Some("backlog".to_string()),
+            _ => {}
+        }
+    }
+
+    // Parse the `filters` JSON param.
+    let filters = match filters_raw {
+        Some(encoded) => {
+            let decoded = percent_encoding::percent_decode_str(&encoded)
+                .decode_utf8_lossy()
+                .to_string();
+            match serde_json::from_str::<Vec<FilterClause>>(&decoded) {
+                Ok(clauses) => clauses,
+                Err(e) => {
+                    tracing::warn!("Failed to parse filters from URL: {e}");
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+
+    let sort = sort_raw.as_deref().and_then(parse_sort_field);
+    let sort_dir = sort_dir_raw.as_deref().and_then(SortDirection::parse);
+
+    ParsedViewState {
+        view: view.unwrap_or_else(|| "all".to_string()),
+        filters,
+        sort,
+        sort_dir,
+    }
+}
+
+/// Build a URL query string from the current view state.
+///
+/// Only includes parameters that differ from defaults (clean URL = no params).
+/// Defaults: view=all, no filters, sort=priority, sort_dir=asc.
+fn build_query_string(
+    view: &str,
+    clauses: &[FilterClause],
+    sort: SortField,
+    direction: SortDirection,
+) -> String {
+    let mut params = Vec::<String>::new();
+
+    // View param — omit when "all" (default).
+    if view != "all" {
+        params.push(format!("view={view}"));
+    }
+
+    // For backward compat: when view=active, also include status=in_progress
+    // so old sidebar active-state detection still works.
+    if view == "active" {
+        params.push("status=in_progress".to_string());
+    } else if view == "backlog" {
+        params.push("status=backlog".to_string());
+    }
+
+    // Filters — omit when empty.
+    if !clauses.is_empty() {
+        match serde_json::to_string(clauses) {
+            Ok(json) => {
+                let encoded = percent_encoding::utf8_percent_encode(
+                    &json,
+                    percent_encoding::NON_ALPHANUMERIC,
+                )
+                .to_string();
+                params.push(format!("filters={encoded}"));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to serialize filter clauses to URL: {e}");
+            }
+        }
+    }
+
+    // Sort — omit when default (priority).
+    if sort != SortField::Priority {
+        params.push(format!("sort={}", sort_field_to_str(sort)));
+    }
+
+    // Sort direction — omit when default (asc).
+    if direction != SortDirection::Asc {
+        params.push(format!("sort_dir={}", direction.as_str()));
+    }
+
+    params.join("&")
+}
+
+/// Compute status IDs matching the given categories, filtered by team.
+///
+/// Shared by the init Effect (for "active"/"backlog" tabs) to avoid
+/// duplicating the SyncStore lookup logic from the tab click handlers.
+fn compute_status_ids(
+    sync_store: Option<crate::cache::store::SyncStore>,
+    team: &Option<Team>,
+    categories: &[&str],
+) -> Vec<String> {
+    let Some(store) = sync_store else {
+        return Vec::new();
+    };
+    store
+        .statuses()
+        .get_untracked()
+        .into_iter()
+        .filter(|s| {
+            categories.contains(&s.category.as_str())
+                && (s.team_id.is_none()
+                    || team.as_ref().map(|t| &t.team_id) == s.team_id.as_ref())
+        })
+        .map(|s| s.status_id)
+        .collect()
+}
+
+/// Load filter/sort state from a saved view's JSON in the SyncStore.
+///
+/// Used by the init Effect for `view:<uuid>` tabs. Same deserialization
+/// logic as the custom view click handler (handles both new and legacy
+/// filter formats).
+fn apply_view_filters_from_store(
+    sync_store: Option<crate::cache::store::SyncStore>,
+    team: &Option<Team>,
+    view_id: &str,
+    filter_clauses: &RwSignal<Vec<FilterClause>>,
+    set_sort_field: &WriteSignal<SortField>,
+    set_sort_direction: &WriteSignal<SortDirection>,
+) {
+    let Some(store) = sync_store else { return };
+    let Some(t) = team else { return };
+    let view = store
+        .views()
+        .get_untracked()
+        .into_iter()
+        .find(|v| v.view_id == view_id && v.team_id.as_deref() == Some(t.team_id.as_str()));
+    let Some(v) = view else {
+        tracing::warn!("View {view_id} not found in SyncStore");
+        return;
+    };
+    let filters_json = &v.filters;
+    let is_new_format = filters_json.contains("\"clauses\"");
+    if is_new_format {
+        match serde_json::from_str::<ViewFilters>(filters_json) {
+            Ok(filters) => {
+                filter_clauses.set(filters.clauses);
+                set_sort_field.set(
+                    filters
+                        .sort_field
+                        .as_deref()
+                        .and_then(parse_sort_field)
+                        .unwrap_or(SortField::Priority),
+                );
+                set_sort_direction.set(
+                    filters
+                        .sort_direction
+                        .as_deref()
+                        .and_then(SortDirection::parse)
+                        .unwrap_or(SortDirection::Asc),
+                );
+            }
+            Err(e) => tracing::warn!("Failed to parse view filters: {e}"),
+        }
+    } else {
+        match serde_json::from_str::<LegacyViewFilters>(filters_json) {
+            Ok(legacy) => {
+                let converted = legacy.into_view_filters();
+                filter_clauses.set(converted.clauses);
+                set_sort_field.set(
+                    converted
+                        .sort_field
+                        .as_deref()
+                        .and_then(parse_sort_field)
+                        .unwrap_or(SortField::Priority),
+                );
+                set_sort_direction.set(
+                    converted
+                        .sort_direction
+                        .as_deref()
+                        .and_then(SortDirection::parse)
+                        .unwrap_or(SortDirection::Asc),
+                );
+            }
+            Err(e) => tracing::warn!("Failed to parse legacy view filters: {e}"),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Issue List Page
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -150,6 +389,16 @@ fn IssueListInner(
     // ── Active tab state (team-scoped pages only) ─────────────────────────
     // Values: "all", "active", "backlog", "view:{view_id}"
     let (active_tab, set_active_tab) = signal("all".to_string());
+
+    // ── URL state persistence ───────────────────────────────────────────
+    // Prevents circular Effect loops: init reads URL → sets signals →
+    // URL-update Effect would write URL → re-trigger init. The init Effect
+    // sets this to `true` before writing signals, and back to `false` after.
+    let skip_url_update = RwSignal::new(false);
+    // When `true`, the URL-update Effect uses `replace: false` (push state)
+    // so the browser back button works for tab switches. Tab click handlers
+    // set this before changing signals; the Effect reads it and resets.
+    let push_next_nav = RwSignal::new(false);
 
     // ── Error state for server function failures ──────────────────────────
     let error_msg = RwSignal::new(Option::<String>::None);
@@ -254,56 +503,155 @@ fn IssueListInner(
         });
     };
 
-    // Reset filters on team change, then re-apply ?status= query param if present.
-    // Single Effect subscribes to both resolved_team and search — no ordering dependency.
+    // ── Init Effect: read URL query params and restore view state ─────────
+    // Subscribes to resolved_team (team switch resets URL) and location_search
+    // (URL changes from sidebar links / direct navigation).
+    // Sets `skip_url_update` to prevent the URL-update Effect from firing
+    // during init signal writes.
     {
         let location_search = use_location().search;
         Effect::new(move |_| {
             let _ = resolved_team.get();
             let query = location_search.get();
 
-            set_active_tab.set("all".to_string());
+            // Suppress URL-update Effect while we restore signals from the URL.
+            skip_url_update.set(true);
+
+            let parsed = parse_query_params(&query);
+
+            // Always reset search on URL-driven state change.
             set_search.set(String::new());
-            filter_clauses.set(Vec::new());
-            set_sort_field.set(SortField::Priority);
-            set_sort_direction.set(SortDirection::Asc);
 
-            let status_param = query.split('&').find_map(|part| {
-                part.strip_prefix("status=")
-            });
+            // Apply sort (or fall back to defaults).
+            set_sort_field.set(parsed.sort.unwrap_or(SortField::Priority));
+            set_sort_direction.set(parsed.sort_dir.unwrap_or(SortDirection::Asc));
 
-            if let Some(status) = status_param {
-                let (tab, categories): (&str, &[&str]) = match status {
-                    "in_progress" => ("active", &["started"]),
-                    "backlog" => ("backlog", &["backlog", "unstarted"]),
-                    _ => return,
-                };
-                set_active_tab.set(tab.to_string());
-                if let Some(store) = sync_store {
-                    // Tracked read — re-runs Effect when store becomes initialized
-                    // on cold deep-link loads where statuses aren't available yet.
-                    if !store.initialized().get() {
-                        return;
+            match parsed.view.as_str() {
+                "active" => {
+                    set_active_tab.set("active".to_string());
+                    // If the URL carried explicit filter clauses, use them.
+                    // Otherwise, compute status filter IDs from SyncStore
+                    // (same logic as the on_active click handler).
+                    if !parsed.filters.is_empty() {
+                        filter_clauses.set(parsed.filters);
+                    } else {
+                        let status_ids = compute_status_ids(
+                            sync_store,
+                            &resolved_team.get_untracked(),
+                            &["started"],
+                        );
+                        // If store isn't initialized yet (cold deep-link), the
+                        // tracked read on `store.initialized()` will re-run
+                        // this Effect once data arrives.
+                        if let Some(store) = sync_store
+                            && !store.initialized().get()
+                        {
+                            skip_url_update.set(false);
+                            return;
+                        }
+                        filter_clauses.set(vec![FilterClause {
+                            field: "status".to_string(),
+                            operator: "any_of".to_string(),
+                            values: status_ids,
+                        }]);
                     }
-                    let team = resolved_team.get_untracked();
-                    let status_ids: Vec<String> = store
-                        .statuses()
-                        .get_untracked()
-                        .into_iter()
-                        .filter(|s| {
-                            categories.contains(&s.category.as_str())
-                                && (s.team_id.is_none()
-                                    || team.as_ref().map(|t| &t.team_id) == s.team_id.as_ref())
-                        })
-                        .map(|s| s.status_id)
-                        .collect();
-                    filter_clauses.set(vec![FilterClause {
-                        field: "status".to_string(),
-                        operator: "any_of".to_string(),
-                        values: status_ids,
-                    }]);
+                }
+                "backlog" => {
+                    set_active_tab.set("backlog".to_string());
+                    if !parsed.filters.is_empty() {
+                        filter_clauses.set(parsed.filters);
+                    } else {
+                        let status_ids = compute_status_ids(
+                            sync_store,
+                            &resolved_team.get_untracked(),
+                            &["backlog", "unstarted"],
+                        );
+                        if let Some(store) = sync_store
+                            && !store.initialized().get()
+                        {
+                            skip_url_update.set(false);
+                            return;
+                        }
+                        filter_clauses.set(vec![FilterClause {
+                            field: "status".to_string(),
+                            operator: "any_of".to_string(),
+                            values: status_ids,
+                        }]);
+                    }
+                }
+                view_str if view_str.starts_with("view:") => {
+                    let view_id = &view_str[5..];
+                    set_active_tab.set(view_str.to_string());
+                    // Load filters from the saved view's JSON (same logic as
+                    // the custom view click handler). If the URL also carried
+                    // explicit filter params, prefer those (user may have
+                    // tweaked filters after switching to the view).
+                    if !parsed.filters.is_empty() {
+                        filter_clauses.set(parsed.filters);
+                    } else {
+                        apply_view_filters_from_store(
+                            sync_store,
+                            &resolved_team.get_untracked(),
+                            view_id,
+                            &filter_clauses,
+                            &set_sort_field,
+                            &set_sort_direction,
+                        );
+                    }
+                }
+                _ => {
+                    // "all" or any unrecognized value — default state.
+                    set_active_tab.set("all".to_string());
+                    filter_clauses.set(parsed.filters);
                 }
             }
+
+            skip_url_update.set(false);
+        });
+    }
+
+    // ── URL-update Effect: serialize view state into query params ─────────
+    // Watches all view state signals and updates the URL when they change.
+    // Uses `replace: true` by default (silent update), or `replace: false`
+    // (push state) when `push_next_nav` is set by a tab click handler.
+    {
+        let nav_for_url = use_navigate();
+        let pathname = use_location().pathname;
+        Effect::new(move |_| {
+            // Read all tracked signals to subscribe.
+            let tab = active_tab.get();
+            let clauses = filter_clauses.get();
+            let sf = sort_field.get();
+            let sd = sort_direction.get();
+
+            if skip_url_update.get_untracked() {
+                return;
+            }
+
+            // Only update URL on team-scoped pages.
+            if team_key.is_none() {
+                return;
+            }
+
+            let query = build_query_string(&tab, &clauses, sf, sd);
+            let path = pathname.get_untracked();
+            let new_url = if query.is_empty() {
+                path
+            } else {
+                format!("{path}?{query}")
+            };
+
+            let should_push = push_next_nav.get_untracked();
+            if should_push {
+                push_next_nav.set(false);
+            }
+
+            nav_for_url(&new_url, NavigateOptions {
+                resolve: false,
+                replace: !should_push,
+                scroll: false,
+                ..Default::default()
+            });
         });
     }
 
@@ -682,6 +1030,7 @@ fn IssueListInner(
                 team_key?;
 
                 let on_all = move |_: web_sys::MouseEvent| {
+                    push_next_nav.set(true);
                     set_active_tab.set("all".to_string());
                     set_search.set(String::new());
                     filter_clauses.set(Vec::new());
@@ -690,6 +1039,7 @@ fn IssueListInner(
                 };
 
                 let on_active = move |_: web_sys::MouseEvent| {
+                    push_next_nav.set(true);
                     set_active_tab.set("active".to_string());
                     set_search.set(String::new());
                     set_sort_field.set(SortField::Priority);
@@ -717,6 +1067,7 @@ fn IssueListInner(
                 };
 
                 let on_backlog = move |_: web_sys::MouseEvent| {
+                    push_next_nav.set(true);
                     set_active_tab.set("backlog".to_string());
                     set_search.set(String::new());
                     set_sort_field.set(SortField::Priority);
@@ -778,6 +1129,7 @@ fn IssueListInner(
                                     if renaming_view_id.get_untracked().is_some() {
                                         return;
                                     }
+                                    push_next_nav.set(true);
                                     set_context_menu_view_id.set(None);
                                     set_active_tab.set(tab_id_click.clone());
                                     // Determine format by probing for the "clauses" key.
