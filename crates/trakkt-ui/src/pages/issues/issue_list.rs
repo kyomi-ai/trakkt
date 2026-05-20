@@ -264,12 +264,17 @@ fn apply_view_filters_from_store(
     set_sort_direction: &WriteSignal<SortDirection>,
 ) {
     let Some(store) = sync_store else { return };
-    let Some(t) = team else { return };
     let view = store
         .views()
         .get_untracked()
         .into_iter()
-        .find(|v| v.view_id == view_id && v.team_id.as_deref() == Some(t.team_id.as_str()));
+        .find(|v| {
+            v.view_id == view_id
+                && match team {
+                    Some(t) => v.team_id.as_deref() == Some(t.team_id.as_str()),
+                    None => v.team_id.is_none(),
+                }
+        });
     let Some(v) = view else {
         tracing::warn!("View {view_id} not found in SyncStore");
         return;
@@ -347,14 +352,17 @@ pub fn IssueListForTeam() -> impl IntoView {
     view! { <IssueListInner team_key=team_key/> }
 }
 
-/// Inner implementation shared by `IssueListPage` (no team) and
-/// `IssueListForTeam` (team-scoped). All filtering, title, and create-issue
-/// logic lives here.
+/// Inner implementation shared by `IssueListPage` (no team),
+/// `IssueListForTeam` (team-scoped), and `WorkspaceViewPage` (saved view).
+/// All filtering, title, and create-issue logic lives here.
 #[component]
-fn IssueListInner(
+pub(crate) fn IssueListInner(
     /// Optional reactive team key. When `Some`, filters issues and statuses by team.
     #[prop(optional, into)]
     team_key: Option<Signal<String>>,
+    /// When set, the component loads this view on mount (used by /views/:view_id route).
+    #[prop(optional, into)]
+    initial_view_id: Option<Signal<String>>,
 ) -> impl IntoView {
     // ── View mode state ────────────────────────────────────────────────────
     let storage_key = view_mode_storage_key(&team_key);
@@ -450,16 +458,18 @@ fn IssueListInner(
         });
     });
 
-    // ── Team-scoped views (custom tabs) ──────────────────────────────────
-    let team_views = Memo::new(move |_| {
-        let team = resolved_team.get();
+    // ── Custom views (team-scoped or workspace-scoped) ─────────────────
+    let custom_views = Memo::new(move |_| {
         let Some(store) = sync_store else { return Vec::new() };
-        let Some(ref t) = team else { return Vec::new() };
+        let team = resolved_team.get();
         let mut views: Vec<trakkt_types::models::View> = store
             .views()
             .get()
             .into_iter()
-            .filter(|v| v.team_id.as_deref() == Some(t.team_id.as_str()))
+            .filter(|v| match &team {
+                Some(t) => v.team_id.as_deref() == Some(t.team_id.as_str()),
+                None => v.team_id.is_none(),
+            })
             .collect();
         views.sort_by_key(|v| v.position);
         views
@@ -610,6 +620,44 @@ fn IssueListInner(
         });
     }
 
+    // ── Initial view loading (from /views/:view_id route) ───────────────
+    // Uses a signal guard instead of prev.is_some() because the store may not
+    // be initialized on first run — the effect must re-fire when initialized
+    // flips to true, but only apply the view once.
+    let init_view_applied = RwSignal::new(false);
+    if let Some(ref init_view) = initial_view_id {
+        let init_view = init_view.clone();
+        Effect::new(move |_| {
+            if init_view_applied.get_untracked() {
+                return;
+            }
+            let vid = init_view.get();
+            if vid.is_empty() {
+                return;
+            }
+            if let Some(store) = sync_store {
+                if !store.initialized().get() {
+                    return;
+                }
+                let views = store.views().get();
+                if views.iter().any(|v| v.view_id == vid) {
+                    init_view_applied.set(true);
+                    skip_url_update.set(true);
+                    apply_view_filters_from_store(
+                        sync_store,
+                        &resolved_team.get_untracked(),
+                        &vid,
+                        &filter_clauses,
+                        &set_sort_field,
+                        &set_sort_direction,
+                    );
+                    set_active_tab.set(format!("view:{vid}"));
+                    skip_url_update.set(false);
+                }
+            }
+        });
+    }
+
     // ── URL-update Effect: serialize view state into query params ─────────
     // Watches all view state signals and updates the URL when they change.
     // Uses `replace: true` by default (silent update), or `replace: false`
@@ -628,8 +676,8 @@ fn IssueListInner(
                 return;
             }
 
-            // Only update URL on team-scoped pages.
-            if team_key.is_none() {
+            // Update URL on team-scoped pages and workspace view pages.
+            if team_key.is_none() && initial_view_id.is_none() {
                 return;
             }
 
@@ -994,6 +1042,21 @@ fn IssueListInner(
                                 <TeamIcon team=team size="20px"/>
                                 <span>{name}</span>
                             }.into_any()
+                        } else if initial_view_id.is_some() {
+                            // On /views/:view_id — show the view's name from the store.
+                            let view_name = move || {
+                                let vid = initial_view_id.as_ref().map(|s| s.get()).unwrap_or_default();
+                                if vid.is_empty() {
+                                    return "Issues".to_string();
+                                }
+                                sync_store
+                                    .and_then(|store| {
+                                        store.views().get().into_iter().find(|v| v.view_id == vid)
+                                    })
+                                    .map(|v| v.name.clone())
+                                    .unwrap_or_else(|| "Issues".to_string())
+                            };
+                            view! { <span>{view_name}</span> }.into_any()
                         } else {
                             view! { <span>"Issues"</span> }.into_any()
                         }
@@ -1111,7 +1174,7 @@ fn IssueListInner(
 
                         // Custom view tabs
                         {move || {
-                            let views = team_views.get();
+                            let views = custom_views.get();
                             let current_tab = active_tab.get();
                             let open_menu_id = context_menu_view_id.get();
                             let current_renaming = renaming_view_id.get();

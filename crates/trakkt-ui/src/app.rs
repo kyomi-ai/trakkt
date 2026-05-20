@@ -23,8 +23,9 @@ use crate::pages::auth::{
 use crate::pages::accept_ownership::AcceptOwnershipPage;
 use crate::pages::inbox::InboxPage;
 use crate::pages::issues::issue_detail::IssueDetailPage;
-use crate::pages::issues::issue_list::IssueListForTeam;
+use crate::pages::issues::issue_list::{IssueListForTeam, IssueListPage};
 use crate::pages::issues::my_issues::MyIssuesPage;
+use crate::pages::issues::workspace_view::WorkspaceViewPage;
 use crate::pages::onboarding::OnboardingPage;
 use crate::pages::projects::project_detail::ProjectDetailPage;
 use crate::pages::projects::project_list::ProjectListPage;
@@ -113,6 +114,12 @@ pub fn App() -> impl IntoView {
 
                     // My Issues — cross-team view of issues assigned to the current user
                     <Route path=path!("/my-issues") view=MyIssuesPage/>
+
+                    // Workspace-level issue list (cross-team)
+                    <Route path=path!("/workspace") view=IssueListPage/>
+
+                    // Saved workspace view — loads view by ID, renders cross-team issue list
+                    <Route path=path!("/views/:view_id") view=WorkspaceViewPage/>
 
                     // Team-scoped views — components read :key from route params internally
                     <Route path=path!("/teams/:key/settings") view=TeamSettingsPage/>
