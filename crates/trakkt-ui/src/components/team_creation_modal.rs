@@ -240,10 +240,11 @@ pub fn TeamCreationModal(
                 }
             }
 
-            // Step 5: Close modal and navigate to the new team
-            on_close.run(());
+            // Step 5: Navigate to the new team, then close modal
+            // (nav must run before on_close — closing disposes the modal's reactive scope)
             let href = format!("/teams/{}/issues", team_key.to_lowercase());
             nav(&href, Default::default());
+            on_close.run(());
         });
     };
 
