@@ -135,23 +135,22 @@ pub fn TeamCreationModal(
             return;
         }
 
-        set_submitting.set(true);
-        set_error.set(None);
-
         let icon_name_val = icon_name.get_untracked();
         let icon_color_val = icon_color.get_untracked();
-
-        // Capture advanced settings state
         let est_scale = estimate_scale.get_untracked();
         let est_allow_zero = allow_zero.get_untracked();
         let est_extended = extended_scale.get_untracked();
         let est_count_unestimated = count_unestimated.get_untracked();
 
+        // Close the modal immediately. Signal updates during event handlers
+        // are batched — the reactive flush (which disposes the modal's scope)
+        // happens after this handler returns. The spawn_local below is
+        // scheduled before the flush, so its captured values are safe.
+        on_close.run(());
+
         let nav = nav.clone();
-        let on_close = on_close;
 
         leptos::task::spawn_local(async move {
-            // Step 1: Create the team
             let team = match crate::server_fns::teams::create_team(
                 name_val,
                 key_val,
@@ -162,8 +161,7 @@ pub fn TeamCreationModal(
             {
                 Ok(team) => team,
                 Err(e) => {
-                    set_error.set(Some(format!("{e}")));
-                    set_submitting.set(false);
+                    tracing::error!(error = %e, "Failed to create team");
                     return;
                 }
             };
@@ -171,7 +169,6 @@ pub fn TeamCreationModal(
             let team_id = team.team_id.clone();
             let team_key = team.key.clone();
 
-            // Step 2: Set the preset icon via update_team_icon
             if let Err(e) = crate::server_fns::teams::update_team_icon(
                 team_id.clone(),
                 Some("preset".to_string()),
@@ -183,7 +180,6 @@ pub fn TeamCreationModal(
                 tracing::warn!(error = %e, "Failed to set team icon after creation");
             }
 
-            // Step 3: Update advanced settings if modified from defaults
             let has_advanced_changes = !est_scale.is_empty()
                 || est_allow_zero
                 || est_extended
@@ -231,8 +227,6 @@ pub fn TeamCreationModal(
                 }
             }
 
-            // Step 4: Update SyncStore so sidebar reflects the new team
-            // Re-fetch to get the team with icon fields populated.
             if let Some(store) = store {
                 match crate::server_fns::teams::get_team_by_key(team_key.clone()).await {
                     Ok(updated_team) => store.upsert_team(updated_team),
@@ -240,15 +234,8 @@ pub fn TeamCreationModal(
                 }
             }
 
-            // Step 5: Navigate to the new team, then close modal.
-            // on_close is deferred to a new microtask because it sets the
-            // parent's `show` signal to false, which disposes this modal's
-            // reactive scope. Running it synchronously would panic.
             let href = format!("/teams/{}/issues", team_key.to_lowercase());
             nav(&href, Default::default());
-            leptos::task::spawn_local(async move {
-                on_close.run(());
-            });
         });
     };
 
