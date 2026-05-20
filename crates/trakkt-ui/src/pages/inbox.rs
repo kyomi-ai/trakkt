@@ -281,6 +281,10 @@ fn NotificationRow(
     let is_unread = !notification.read;
     let notification_id = notification.notification_id.clone();
     let event_text = notification_event_text(&notification);
+    let via_suffix = crate::components::attribution::render_via_suffix(
+        notification.action_source,
+        notification.action_source_label.clone(),
+    );
     let issue_title = notification.issue_title.clone().unwrap_or_default();
     let timestamp = relative_time(&notification.created_at);
 
@@ -358,7 +362,7 @@ fn NotificationRow(
             <div class="flex-1 min-w-0">
                 <div class="flex items-baseline gap-2">
                     <span class=if is_unread { "text-sm font-medium text-foreground" } else { "text-sm text-muted-foreground" }>
-                        {event_text}
+                        {event_text}{via_suffix}
                     </span>
                     {move || issue_label.get().map(|label| view! {
                         <span class="text-xs text-muted-foreground font-mono">{label}</span>

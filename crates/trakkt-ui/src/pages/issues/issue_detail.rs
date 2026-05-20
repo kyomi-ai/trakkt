@@ -2270,13 +2270,17 @@ fn ActivityEntry(
     let description = format_activity_description(&activity);
     let timestamp = relative_time(&activity.created_at);
     let icon = activity_icon(&activity.action_type);
+    let via_suffix = crate::components::attribution::render_via_suffix(
+        activity.action_source,
+        activity.action_source_label.clone(),
+    );
 
     view! {
         <div class="flex items-center gap-2 py-1 text-xs text-muted-foreground">
             <span class="shrink-0 w-5 h-5 flex items-center justify-center">
                 {icon}
             </span>
-            <span class="font-medium text-foreground/80">{actor_name}</span>
+            <span class="font-medium text-foreground/80">{actor_name}{via_suffix}</span>
             <span>{description}</span>
             <span class="shrink-0">{format!("\u{b7} {timestamp}")}</span>
         </div>
@@ -2471,6 +2475,10 @@ fn CommentItem(
         .clone()
         .unwrap_or_else(|| "Unknown".to_string());
     let timestamp = format_datetime(&comment.created_at);
+    let via_suffix = crate::components::attribution::render_via_suffix(
+        comment.action_source,
+        comment.action_source_label.clone(),
+    );
 
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
@@ -2479,7 +2487,7 @@ fn CommentItem(
             <Avatar name=author.clone() size=AvatarSize::Md/>
             <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2">
-                    <span class="text-sm font-medium text-foreground">{author}</span>
+                    <span class="text-sm font-medium text-foreground">{author}{via_suffix}</span>
                     <span class="text-xs text-muted-foreground">{timestamp}</span>
                 </div>
                 <div class="mt-1 text-sm text-foreground">
