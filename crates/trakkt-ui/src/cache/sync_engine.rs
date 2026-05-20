@@ -413,28 +413,7 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
             }
         }
         SyncActionType::Delete => {
-            // Remove from IndexedDB (best-effort async).
-            let et = entity_type.to_owned();
-            let eid = entity_id.clone();
-            let wid = workspace_id.to_owned();
-            spawn_local(async move {
-                match db::init_cache_db(&wid).await {
-                    Ok(cache_db) => {
-                        if let Err(e) = db::delete(&cache_db, &et, &eid, &wid).await {
-                            tracing::warn!(
-                                entity_type = %et,
-                                entity_id = %eid,
-                                "sync_action delete from IDB failed: {e}"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("sync_action delete: failed to open cache db: {e}");
-                    }
-                }
-            });
-
-            // Remove from the reactive store.
+            // Remove from the reactive store (also handles IDB deletion).
             match entity_type {
                 et if et == entity_types::ISSUE => store.remove_issue(entity_id),
                 et if et == entity_types::LABEL => store.remove_label(entity_id),

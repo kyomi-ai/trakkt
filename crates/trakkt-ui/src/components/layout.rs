@@ -90,6 +90,7 @@ pub fn Layout() -> impl IntoView {
                 .clone()
                 .unwrap_or_else(|| "workspace-local".to_string());
             web_sys::console::log_1(&format!("[trakkt-sync] starting sync for {user_id} / {workspace_id}").into());
+            sync_store.set_workspace_id(workspace_id.clone());
 
             // 1. Hydrate from IDB (instant cached data)
             let wid_hydrate = workspace_id.clone();

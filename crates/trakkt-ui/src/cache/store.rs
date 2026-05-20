@@ -17,6 +17,11 @@ use send_wrapper::SendWrapper;
 
 use trakkt_types::models::{Comment, Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
 
+#[cfg(target_arch = "wasm32")]
+use leptos::task::spawn_local;
+#[cfg(target_arch = "wasm32")]
+use trakkt_types::sync::entity_types;
+
 // ── Inner storage ─────────────────────────────────────────────────────────────
 
 /// Non-Clone, non-Send inner storage for the store's reactive signals.
@@ -41,6 +46,12 @@ struct SyncStoreInner {
     /// Version counter bumped when an issue_relation sync action arrives.
     /// Used by the relations section to trigger a refetch.
     relations_version: ArcRwSignal<u32>,
+    /// Workspace ID for IndexedDB operations.
+    ///
+    /// Set once after the user context resolves. `remove_*` methods use this
+    /// to delete the corresponding IDB entry so stale data is not hydrated
+    /// on page refresh.
+    workspace_id: ArcRwSignal<Option<String>>,
 }
 
 // ── Public handle ─────────────────────────────────────────────────────────────
@@ -82,6 +93,7 @@ impl SyncStore {
                 initialized: ArcRwSignal::new(false),
                 activities_version: ArcRwSignal::new(0),
                 relations_version: ArcRwSignal::new(0),
+                workspace_id: ArcRwSignal::new(None),
             })),
         }
     }
@@ -149,6 +161,19 @@ impl SyncStore {
     pub fn initialized(&self) -> Signal<bool> {
         let sig = self.inner.with_value(|inner| inner.initialized.clone());
         Signal::derive(move || sig.get())
+    }
+
+    /// Set the workspace ID used for IndexedDB operations.
+    ///
+    /// Called once from the Layout after the user context resolves. Until
+    /// this is set, `remove_*` methods skip the IDB delete.
+    pub fn set_workspace_id(&self, id: String) {
+        self.inner.with_value(|inner| inner.workspace_id.set(Some(id)));
+    }
+
+    /// Read the current workspace ID, if set.
+    pub fn workspace_id(&self) -> Option<String> {
+        self.inner.with_value(|inner| inner.workspace_id.get_untracked())
     }
 
     /// Version counter for activities — bumped on each activity sync action.
@@ -355,6 +380,35 @@ impl SyncStore {
         });
     }
 
+    /// Spawn an async task to delete an entity from IndexedDB.
+    ///
+    /// No-op when `workspace_id` has not been set yet (SSR or pre-auth).
+    /// On WASM, opens the IDB cache and deletes the key. The delete is
+    /// idempotent — removing a non-existent key is a silent no-op.
+    #[cfg(target_arch = "wasm32")]
+    fn delete_from_idb(&self, entity_type: &'static str, entity_id: &str) {
+        let Some(wid) = self.workspace_id() else {
+            return;
+        };
+        let eid = entity_id.to_owned();
+        spawn_local(async move {
+            match super::db::init_cache_db(&wid).await {
+                Ok(cache_db) => {
+                    if let Err(e) = super::db::delete(&cache_db, entity_type, &eid, &wid).await {
+                        tracing::warn!(
+                            entity_type,
+                            entity_id = %eid,
+                            "SyncStore: IDB delete failed: {e}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("SyncStore: failed to open cache db for delete: {e}");
+                }
+            }
+        });
+    }
+
     // ── Single-item removes (delete sync) ────────────────────────────────────
 
     /// Remove an issue by `issue_id`.
@@ -364,6 +418,8 @@ impl SyncStore {
                 list.retain(|i| i.issue_id != issue_id);
             });
         });
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::ISSUE, issue_id);
     }
 
     /// Remove a label by `label_id`.
@@ -373,6 +429,8 @@ impl SyncStore {
                 list.retain(|l| l.label_id != label_id);
             });
         });
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::LABEL, label_id);
     }
 
     /// Remove a status by `status_id`.
@@ -382,6 +440,8 @@ impl SyncStore {
                 list.retain(|s| s.status_id != status_id);
             });
         });
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::STATUS, status_id);
     }
 
     /// Remove a team by `team_id`.
@@ -391,6 +451,8 @@ impl SyncStore {
                 list.retain(|t| t.team_id != team_id);
             });
         });
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::TEAM, team_id);
     }
 
     /// Remove a project by `project_id`.
@@ -400,6 +462,8 @@ impl SyncStore {
                 list.retain(|p| p.project_id != project_id);
             });
         });
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::PROJECT, project_id);
     }
 
     /// Remove a view by `view_id`.
@@ -409,6 +473,8 @@ impl SyncStore {
                 list.retain(|v| v.view_id != view_id);
             });
         });
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::VIEW, view_id);
     }
 
     /// Remove a favorite by `favorite_id`.
@@ -418,6 +484,8 @@ impl SyncStore {
                 list.retain(|f| f.favorite_id != favorite_id);
             });
         });
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::FAVORITE, favorite_id);
     }
 
     /// Remove a notification by `notification_id`.
@@ -427,6 +495,8 @@ impl SyncStore {
                 list.retain(|n| n.notification_id != notification_id);
             });
         });
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::NOTIFICATION, notification_id);
     }
 
     /// Remove a comment by `comment_id`.
@@ -436,6 +506,8 @@ impl SyncStore {
                 list.retain(|c| c.comment_id != comment_id);
             });
         });
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::COMMENT, comment_id);
     }
 
     // ── State transitions ─────────────────────────────────────────────────────
@@ -467,6 +539,7 @@ impl SyncStore {
             inner.initialized.set(false);
             inner.activities_version.set(0);
             inner.relations_version.set(0);
+            inner.workspace_id.set(None);
         });
     }
 }
