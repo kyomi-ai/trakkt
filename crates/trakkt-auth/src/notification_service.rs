@@ -82,16 +82,19 @@ pub async fn create_notification(
     issue_id: &str,
     notification_type: &str,
     actor_id: Option<&str>,
+    action_source: ActionSource,
+    action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
     let notification_id = uuid::Uuid::new_v4().to_string();
+    let action_source_str = action_source.as_str();
 
     let sql = format!(
         "INSERT INTO notifications \
-            (notification_id, workspace_id, user_id, issue_id, type, actor_id, read, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, {bf}, {now})",
+            (notification_id, workspace_id, user_id, issue_id, type, actor_id, action_source, action_source_label, read, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {bf}, {now})",
         bf = sql_compat::bool_false(is_pg),
     );
     trakkt_core::db_execute!(
@@ -102,7 +105,9 @@ pub async fn create_notification(
         user_id,
         issue_id,
         notification_type,
-        actor_id
+        actor_id,
+        action_source_str,
+        action_source_label
     )?;
 
     let notification = trakkt_core::db_fetch_optional!(

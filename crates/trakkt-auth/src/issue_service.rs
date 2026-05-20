@@ -9,6 +9,7 @@
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::ActionSource;
 use trakkt_types::models::{CreateIssueParams, Issue, IssueFilters, IssueUpdate, IssueWithDetails, Label};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
@@ -590,6 +591,8 @@ pub async fn update_issue(
     number: i32,
     updates: &IssueUpdate,
     actor_user_id: Option<&str>,
+    action_source: ActionSource,
+    action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Issue> {
     let is_pg = db.is_postgres();
@@ -830,11 +833,12 @@ pub async fn update_issue(
                 Ok(watchers) => {
                     for notification_type in types_to_notify {
                         for watcher_id in &watchers {
-                            if watcher_id == actor_id {
+                            if watcher_id == actor_id && action_source == ActionSource::User {
                                 continue;
                             }
                             if let Err(e) = crate::notification_service::create_notification(
-                                db, workspace_id, watcher_id, &issue_id, notification_type, Some(actor_id), ws_manager,
+                                db, workspace_id, watcher_id, &issue_id, notification_type, Some(actor_id),
+                                action_source, action_source_label, ws_manager,
                             ).await {
                                 tracing::warn!(error = %e, "Failed to create notification");
                             }

@@ -174,7 +174,7 @@ pub async fn create_issue(
     }
 
     // Record activity — never fails the mutation.
-    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
     if let Err(e) = recorder.record(&issue.issue_id, "created", None).await {
         tracing::warn!(issue_id = %issue.issue_id, "Failed to record create activity: {e}");
     }
@@ -235,6 +235,8 @@ pub async fn update_issue(
         number,
         &updates,
         Some(&ctx.user_id),
+        ctx.action_source,
+        ctx.action_source_label.as_deref(),
         ctx.ws_manager,
     )
     .await?;
@@ -298,7 +300,7 @@ pub async fn update_issue(
     if let Some(ref before) = before_snapshot {
         let after = IssueSnapshot::from_issue_with_details(&updated);
         let recorder =
-            ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+            ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
         if let Err(e) = recorder.record_issue_diff(&issue.issue_id, before, &after).await {
             tracing::warn!(issue_id = %issue.issue_id, "Failed to record activity diff: {e}");
         }

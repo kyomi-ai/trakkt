@@ -80,17 +80,20 @@ pub async fn create_comment(
     user_id: &str,
     body: &str,
     parent_id: Option<&str>,
+    action_source: ActionSource,
+    action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Comment> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
     let comment_id = uuid::Uuid::new_v4().to_string();
+    let action_source_str = action_source.as_str();
 
     let sql = format!(
-        "INSERT INTO comments (comment_id, issue_id, user_id, body, parent_id, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, {now}, {now})"
+        "INSERT INTO comments (comment_id, issue_id, user_id, body, parent_id, action_source, action_source_label, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, {now}, {now})"
     );
-    trakkt_core::db_execute!(db, &sql, &comment_id, issue_id, user_id, body, parent_id)?;
+    trakkt_core::db_execute!(db, &sql, &comment_id, issue_id, user_id, body, parent_id, action_source_str, action_source_label)?;
 
     // Re-fetch with joined user data (needed for sync broadcast and return value).
     let row = trakkt_core::db_fetch_one!(
@@ -153,12 +156,13 @@ pub async fn create_comment(
         match crate::watcher_service::list_watchers_of_issue(db, issue_id).await {
             Ok(watchers) => {
                 for watcher_id in &watchers {
-                    if *watcher_id == user_id {
+                    if *watcher_id == user_id && action_source == ActionSource::User {
                         continue;
                     }
                     if let Err(e) = crate::notification_service::create_notification(
                         db, ws_id, watcher_id, issue_id,
-                        crate::notification_service::TYPE_COMMENTED, Some(user_id), ws_manager,
+                        crate::notification_service::TYPE_COMMENTED, Some(user_id),
+                        action_source, action_source_label, ws_manager,
                     ).await {
                         tracing::warn!(error = %e, "Failed to create comment notification");
                     }

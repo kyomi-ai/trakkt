@@ -44,12 +44,14 @@ pub async fn add_comment(
         &ctx.user_id,
         &params.body,
         params.parent_id.as_deref(),
+        ctx.action_source,
+        ctx.action_source_label.as_deref(),
         ctx.ws_manager,
     )
     .await?;
 
     // Record activity — never fails the mutation.
-    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
     let meta = json!({ "comment_id": comment.comment_id });
     if let Err(e) = recorder.record(&issue.issue_id, "comment_added", Some(&meta)).await {
         tracing::warn!(issue_id = %issue.issue_id, "Failed to record comment activity: {e}");
