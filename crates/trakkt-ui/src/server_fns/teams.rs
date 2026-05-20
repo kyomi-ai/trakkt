@@ -167,21 +167,26 @@ pub async fn delete_team(
     Ok(())
 }
 
-/// Set the current user's personal default team.
+/// Set (or clear) the current user's personal default team.
+///
+/// Pass `Some(team_id)` to set a personal default, or `None` to clear it
+/// and fall back to the workspace default.
 #[server(prefix = "/leptos-api")]
-pub async fn set_my_default_team(team_id: String) -> Result<(), ServerFnError> {
+pub async fn set_my_default_team(team_id: Option<String>) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let team = trakkt_auth::team_service::get_team(ac.db(), &team_id)
-        .await
-        .into_sfn()?
-        .ok_or_else(|| ServerFnError::new("Team not found"))?;
-    if team.workspace_id != ac.ws_id {
-        return Err(ServerFnError::new("Team does not belong to this workspace"));
+    if let Some(ref tid) = team_id {
+        let team = trakkt_auth::team_service::get_team(ac.db(), tid)
+            .await
+            .into_sfn()?
+            .ok_or_else(|| ServerFnError::new("Team not found"))?;
+        if team.workspace_id != ac.ws_id {
+            return Err(ServerFnError::new("Team does not belong to this workspace"));
+        }
     }
     trakkt_auth::user_service::update_default_team(
         ac.db(),
         &ac.auth.user_id,
-        Some(&team_id),
+        team_id.as_deref(),
     )
     .await
     .into_sfn()?;
