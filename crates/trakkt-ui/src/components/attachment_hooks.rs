@@ -15,16 +15,16 @@ use kode_leptos::{
 };
 
 /// Maximum upload size (10 MB).
-const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Allowed file extensions for upload.
-const ALLOWED_EXTENSIONS: &[&str] = &[
+pub(crate) const ALLOWED_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "svg",
     "pdf", "csv", "txt", "json", "log",
 ];
 
 /// Allowed MIME content types for upload.
-const ALLOWED_CONTENT_TYPES: &[&str] = &[
+pub(crate) const ALLOWED_CONTENT_TYPES: &[&str] = &[
     "image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml",
     "application/pdf", "text/csv", "text/plain", "application/json",
 ];
@@ -146,8 +146,10 @@ pub fn make_click_callback(
                 }));
             }
             AttachmentNodeType::File => {
-                if let Some(window) = web_sys::window() {
-                    let _ = window.open_with_url_and_target(&req.src_or_href, "_blank");
+                if let Some(window) = web_sys::window()
+                    && let Err(e) = window.open_with_url_and_target_and_features(&req.src_or_href, "_blank", "noopener,noreferrer")
+                {
+                    tracing::warn!("Failed to open file in new tab: {e:?}");
                 }
             }
         }
@@ -158,17 +160,17 @@ pub fn make_click_callback(
 // Internal: browser fetch helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct UploadResponse {
-    attachment_id: String,
-    url: String,
-    size_bytes: u64,
+pub(crate) struct UploadResponse {
+    pub(crate) attachment_id: String,
+    pub(crate) url: String,
+    pub(crate) size_bytes: u64,
 }
 
 /// Upload a file via the browser's fetch API (multipart form POST).
 ///
 /// When `issue_id` is provided, it is appended as a query parameter so the
 /// backend can auto-link the attachment to the issue after storing it.
-async fn upload_file(data: &[u8], filename: &str, content_type: &str, issue_id: Option<&str>) -> Result<UploadResponse, String> {
+pub(crate) async fn upload_file(data: &[u8], filename: &str, content_type: &str, issue_id: Option<&str>) -> Result<UploadResponse, String> {
     use js_sys::{Array, Uint8Array};
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;

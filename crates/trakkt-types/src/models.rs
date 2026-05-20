@@ -490,3 +490,15 @@ pub struct WorkspaceSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_auto_archive_days: Option<u32>,
 }
+
+/// A file attachment linked to an issue.
+///
+/// WASM-safe serializable DTO for file attachment metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub attachment_id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub created_at: String,
+}
