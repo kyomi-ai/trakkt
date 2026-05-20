@@ -30,6 +30,7 @@ use crate::components::{
 };
 use crate::pages::issues::issue_list::NewIssueModal;
 use crate::server_fns::activities::list_issue_activities;
+use crate::server_fns::attachments::{list_issue_attachments, detach_attachment_from_issue};
 use crate::server_fns::github::{list_github_links_for_issue, GitHubLinkDisplay};
 use crate::server_fns::comments::create_comment;
 use crate::server_fns::issues::{get_issue, list_issues, set_issue_labels, update_issue};
@@ -348,6 +349,14 @@ fn IssueDetailContent(
                     number=number
                     issue_id=initial.get_untracked().issue_id.clone()
                     team_id=initial.get_untracked().team_id.clone()
+                />
+
+                // ── Attachments section (file uploads linked to this issue) ──
+                <AttachmentsSection
+                    team_key=initial_team_key.clone()
+                    number=number
+                    issue_id=initial.get_untracked().issue_id.clone()
+                    lightbox_state=lightbox_state
                 />
 
                 // ── GitHub activity (PRs, branches, commits linked to this issue) ──
@@ -2522,6 +2531,314 @@ fn IssueDetailSkeleton() -> impl IntoView {
                     }
                 }).collect_view()}
             </div>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Attachments Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Format a byte count as a human-readable string (e.g. "1.2 KB", "3.5 MB").
+fn format_bytes(bytes: i64) -> String {
+    let bytes = bytes as f64;
+    if bytes < 1024.0 {
+        format!("{} B", bytes as i64)
+    } else if bytes < 1_048_576.0 {
+        format!("{:.1} KB", bytes / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes / 1_048_576.0)
+    }
+}
+
+/// Return the appropriate Phosphor icon for a given content type.
+fn attachment_icon(content_type: &str) -> phosphor_leptos::IconData {
+    if content_type.starts_with("image/") {
+        phosphor_leptos::IMAGE
+    } else if content_type == "application/pdf" {
+        phosphor_leptos::FILE_PDF
+    } else if content_type.starts_with("text/")
+        || content_type == "application/json"
+    {
+        phosphor_leptos::FILE_TEXT
+    } else {
+        phosphor_leptos::FILE
+    }
+}
+
+/// Display linked attachments for an issue with upload and detach support.
+///
+/// Always renders (even when empty) — shows the header with an "+ Attach"
+/// button and lists attachment rows with thumbnails, filenames, sizes, and
+/// hover-reveal detach buttons.
+#[component]
+fn AttachmentsSection(
+    team_key: String,
+    number: i32,
+    /// The current issue's ID (used for upload auto-linking).
+    issue_id: String,
+    lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
+) -> impl IntoView {
+    let tk = team_key.clone();
+    let tk_for_detach = team_key.clone();
+    let (version, set_version) = signal(0u32);
+
+    let attachments_resource = Resource::new(
+        move || (tk.clone(), number, version.get()),
+        move |(tk, num, _)| async move { list_issue_attachments(tk, num).await },
+    );
+
+    // ── Upload via hidden file input ────────────────────────────────────
+    let file_input_ref: NodeRef<leptos::html::Input> = NodeRef::new();
+    let (uploading, set_uploading) = signal(false);
+    let stored_issue_id = StoredValue::new(issue_id);
+
+    // Upload handler: reads the selected file from the input, uploads via
+    // fetch to `/api/v1/attachments?issue_id=...`, then bumps version.
+    let on_file_selected = move |_ev: leptos::ev::Event| {
+        let _set_uploading = set_uploading;
+        let _stored_issue_id = stored_issue_id;
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use crate::components::attachment_hooks::{
+                upload_file, ALLOWED_CONTENT_TYPES, ALLOWED_EXTENSIONS, MAX_FILE_SIZE,
+            };
+
+            let input_el = match file_input_ref.get() {
+                Some(el) => el,
+                None => return,
+            };
+            let input: &web_sys::HtmlInputElement = input_el.as_ref();
+            let files = match input.files() {
+                Some(f) => f,
+                None => return,
+            };
+            let file = match files.get(0) {
+                Some(f) => f,
+                None => return,
+            };
+
+            let name = file.name();
+            let content_type = file.type_();
+            let size = file.size() as u64;
+
+            if size > MAX_FILE_SIZE {
+                tracing::warn!("File too large: {size} bytes");
+                input.set_value("");
+                return;
+            }
+
+            let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+            if !ALLOWED_EXTENSIONS.contains(&ext.as_str())
+                && !ALLOWED_CONTENT_TYPES.contains(&content_type.as_str())
+            {
+                tracing::warn!("File type not allowed: ext={ext}, content_type={content_type}");
+                input.set_value("");
+                return;
+            }
+
+            let issue_id = _stored_issue_id.get_value();
+            _set_uploading.set(true);
+
+            leptos::task::spawn_local(async move {
+                let data = {
+                    use js_sys::Uint8Array;
+                    use wasm_bindgen::JsCast;
+                    use wasm_bindgen_futures::JsFuture;
+                    let reader = match web_sys::FileReader::new() {
+                        Ok(r) => r,
+                        Err(_) => { _set_uploading.set(false); return; }
+                    };
+                    if reader.read_as_array_buffer(&file).is_err() {
+                        _set_uploading.set(false);
+                        return;
+                    }
+                    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+                        let r = reader.clone();
+                        let reject_clone = reject.clone();
+                        let onload = wasm_bindgen::closure::Closure::once_into_js(move || {
+                            match r.result() {
+                                Ok(val) => { let _ = resolve.call1(&wasm_bindgen::JsValue::NULL, &val); }
+                                Err(_) => { let _ = reject_clone.call0(&wasm_bindgen::JsValue::NULL); }
+                            }
+                        });
+                        let onerror = wasm_bindgen::closure::Closure::once_into_js(move || {
+                            let _ = reject.call0(&wasm_bindgen::JsValue::NULL);
+                        });
+                        reader.set_onload(Some(onload.unchecked_ref()));
+                        reader.set_onerror(Some(onerror.unchecked_ref()));
+                    });
+                    match JsFuture::from(promise).await {
+                        Ok(result) => Uint8Array::new(&result).to_vec(),
+                        Err(_) => {
+                            tracing::warn!("Failed to read file");
+                            _set_uploading.set(false);
+                            return;
+                        }
+                    }
+                };
+                match upload_file(&data, &name, &content_type, Some(&issue_id)).await {
+                    Ok(_) => {
+                        let _ = set_version.try_update(|v| *v += 1);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Attachment upload failed: {e}");
+                    }
+                }
+                _set_uploading.set(false);
+                if let Some(input_el) = file_input_ref.get() {
+                    let input: &web_sys::HtmlInputElement = input_el.as_ref();
+                    input.set_value("");
+                }
+            });
+        }
+    };
+
+    view! {
+        <div class="mt-6">
+            // ── Hidden file input ──────────────────────────────────────
+            <input
+                type="file"
+                node_ref=file_input_ref
+                class="hidden"
+                accept=".png,.jpg,.jpeg,.gif,.webp,.svg,.pdf,.csv,.txt,.json,.log"
+                on:change=on_file_selected
+            />
+
+            <Suspense fallback=|| ()>
+                {move || {
+                    let attachments = match attachments_resource.get() {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => { tracing::warn!("Failed to load attachments: {e}"); vec![] }
+                        None => vec![],
+                    };
+                    let total = attachments.len();
+
+                    view! {
+                        // ── Header ─────────────────────────────────────────
+                        <div class="flex items-center justify-between mb-2">
+                            <h2 class="text-xs text-muted-foreground font-medium">
+                                {if total > 0 {
+                                    format!("Attachments ({})", total)
+                                } else {
+                                    "Attachments".to_string()
+                                }}
+                            </h2>
+                            <Button
+                                variant=ButtonVariant::GhostMuted
+                                size=ButtonSize::Sm
+                                disabled=Signal::derive(move || uploading.get())
+                                on:click=move |_| {
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        if let Some(input_el) = file_input_ref.get() {
+                                            let input: &web_sys::HtmlInputElement = input_el.as_ref();
+                                            input.click();
+                                        }
+                                    }
+                                }
+                            >
+                                <Icon icon=phosphor_leptos::PLUS size="12px"/>
+                                {move || if uploading.get() { "Uploading..." } else { "Attach" }}
+                            </Button>
+                        </div>
+
+                        // ── Attachment rows ────────────────────────────────
+                        {if total > 0 {
+                            let tk_for_rows = tk_for_detach.clone();
+                            let rows = attachments.into_iter().map(|att| {
+                                let att_id_for_detach = att.attachment_id.clone();
+                                let download_url = format!("/api/v1/attachments/{}/download", att.attachment_id);
+                                let download_url_click = download_url.clone();
+                                let is_image = att.content_type.starts_with("image/");
+                                let icon_data = attachment_icon(&att.content_type);
+                                let size_str = format_bytes(att.size_bytes);
+                                let filename = att.filename.clone();
+                                let tk_row = tk_for_rows.clone();
+
+                                view! {
+                                    <div
+                                        class="group flex items-center gap-2 px-3 py-1.5 hover:bg-secondary/50 rounded-md transition-colors cursor-pointer"
+                                        on:click={
+                                            let url = download_url_click.clone();
+                                            move |_| {
+                                                if is_image {
+                                                    lightbox_state.set(Some(crate::components::attachment_hooks::LightboxState {
+                                                        src: url.clone(),
+                                                    }));
+                                                } else {
+                                                    #[cfg(target_arch = "wasm32")]
+                                                    {
+                                                        if let Some(window) = web_sys::window() {
+                                                            if let Err(e) = window.open_with_url_and_target_and_features(&url, "_blank", "noopener,noreferrer") {
+                                                                tracing::warn!("Failed to open attachment in new tab: {e:?}");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    >
+                                        // Thumbnail or icon
+                                        {if is_image {
+                                            let thumb_url = download_url.clone();
+                                            view! {
+                                                <img
+                                                    src=thumb_url
+                                                    alt=att.filename.clone()
+                                                    class="w-8 h-8 rounded object-cover shrink-0"
+                                                    loading="lazy"
+                                                />
+                                            }.into_any()
+                                        } else {
+                                            view! {
+                                                <span class="w-8 h-8 flex items-center justify-center text-muted-foreground shrink-0">
+                                                    <Icon icon=icon_data size="16px"/>
+                                                </span>
+                                            }.into_any()
+                                        }}
+                                        // Filename
+                                        <span class="text-sm text-foreground truncate flex-1 min-w-0">
+                                            {filename}
+                                        </span>
+                                        // File size
+                                        <span class="text-xs text-muted-foreground font-mono shrink-0">
+                                            {size_str}
+                                        </span>
+                                        <Button
+                                            variant=ButtonVariant::GhostMuted
+                                            size=ButtonSize::IconSm
+                                            class="opacity-0 group-hover:opacity-100 shrink-0"
+                                            aria_label="Detach file"
+                                            on:click=move |ev| {
+                                                ev.stop_propagation();
+                                                let aid = att_id_for_detach.clone();
+                                                let tk = tk_row.clone();
+                                                leptos::task::spawn_local(async move {
+                                                    match detach_attachment_from_issue(tk, number, aid).await {
+                                                        Ok(_) => { let _ = set_version.try_update(|v| *v += 1); },
+                                                        Err(e) => tracing::warn!("Failed to detach attachment: {e}"),
+                                                    }
+                                                });
+                                            }
+                                        >
+                                            <Icon icon=phosphor_leptos::X size="12px"/>
+                                        </Button>
+                                    </div>
+                                }
+                            }).collect_view();
+                            view! {
+                                <div class="space-y-0.5">
+                                    {rows}
+                                </div>
+                            }.into_any()
+                        } else {
+                            view! {}.into_any()
+                        }}
+                    }
+                }}
+            </Suspense>
         </div>
     }
 }

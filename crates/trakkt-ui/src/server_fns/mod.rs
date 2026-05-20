@@ -3,6 +3,7 @@
 //! Server functions — typed RPC that replaces REST API calls.
 
 pub mod activities;
+pub mod attachments;
 pub mod auth;
 pub mod billing;
 pub mod comments;
