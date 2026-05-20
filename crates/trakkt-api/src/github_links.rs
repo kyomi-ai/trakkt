@@ -8,7 +8,7 @@
 use axum::http::Method;
 
 use trakkt_auth::issue_service;
-use trakkt_types::api::ListGitHubLinksApiParams;
+use trakkt_types::api::{ListGitHubLinksApiParams, LookupBranchApiParams, LookupCommitApiParams};
 
 use crate::context::resolve_issue_key_and_number;
 use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
@@ -41,27 +41,112 @@ pub async fn list_issue_github_links(
     Ok(serde_json::to_value(&links)?)
 }
 
+/// Lookup issues associated with a commit SHA.
+///
+/// Uses prefix matching so abbreviated SHAs (7+ chars) work.
+pub async fn lookup_commit(
+    ctx: &ApiCtx<'_>,
+    params: LookupCommitApiParams,
+) -> ApiResult<serde_json::Value> {
+    if params.sha.len() < 7 {
+        return Err(ApiError::BadRequest(
+            "SHA must be at least 7 characters for prefix matching".to_string(),
+        ));
+    }
+
+    let safe_sha = params.sha.replace('%', "\\%").replace('_', "\\_");
+    let results = trakkt_github::schema::lookup_issues_by_ref(
+        ctx.db,
+        &ctx.workspace_id,
+        "commit",
+        &safe_sha,
+        true, // prefix match
+    )
+    .await?;
+
+    Ok(serde_json::to_value(&results)?)
+}
+
+/// Lookup issues associated with a branch name.
+///
+/// Uses exact matching on the branch name.
+pub async fn lookup_branch(
+    ctx: &ApiCtx<'_>,
+    params: LookupBranchApiParams,
+) -> ApiResult<serde_json::Value> {
+    if params.branch.is_empty() {
+        return Err(ApiError::BadRequest(
+            "Branch name must not be empty".to_string(),
+        ));
+    }
+
+    let results = trakkt_github::schema::lookup_issues_by_ref(
+        ctx.db,
+        &ctx.workspace_id,
+        "branch",
+        &params.branch,
+        false, // exact match
+    )
+    .await?;
+
+    Ok(serde_json::to_value(&results)?)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Operation registration
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Return all GitHub-link-related API operations.
 pub fn operations() -> Vec<ApiOperation> {
-    vec![ApiOperation {
-        name: "list_issue_github_links",
-        description:
-            "List all GitHub links (PRs, branches, commits) associated with an issue.",
-        scope: "issues:read",
-        rest_method: Method::GET,
-        rest_path: "/issues/{identifier}/github-links",
-        json_schema: || schemars::schema_for!(ListGitHubLinksApiParams),
-        handler: Box::new(|ctx, value| {
-            Box::pin(async move {
-                let params: ListGitHubLinksApiParams = serde_json::from_value(value)?;
-                list_issue_github_links(&ctx, params).await
-            })
-        }),
-        binary_input: None,
-        binary_output: None,
-    }]
+    vec![
+        ApiOperation {
+            name: "list_issue_github_links",
+            description:
+                "List all GitHub links (PRs, branches, commits) associated with an issue.",
+            scope: "issues:read",
+            rest_method: Method::GET,
+            rest_path: "/issues/{identifier}/github-links",
+            json_schema: || schemars::schema_for!(ListGitHubLinksApiParams),
+            handler: Box::new(|ctx, value| {
+                Box::pin(async move {
+                    let params: ListGitHubLinksApiParams = serde_json::from_value(value)?;
+                    list_issue_github_links(&ctx, params).await
+                })
+            }),
+            binary_input: None,
+            binary_output: None,
+        },
+        ApiOperation {
+            name: "lookup_commit",
+            description: "Look up which issues are linked to a given commit SHA. Uses prefix matching so abbreviated SHAs (7+ characters) work. Returns issue details including identifier, title, status, and description.",
+            scope: "issues:read",
+            rest_method: Method::GET,
+            rest_path: "/github/lookup/commit",
+            json_schema: || schemars::schema_for!(LookupCommitApiParams),
+            handler: Box::new(|ctx, value| {
+                Box::pin(async move {
+                    let params: LookupCommitApiParams = serde_json::from_value(value)?;
+                    lookup_commit(&ctx, params).await
+                })
+            }),
+            binary_input: None,
+            binary_output: None,
+        },
+        ApiOperation {
+            name: "lookup_branch",
+            description: "Look up which issues are linked to a given branch name. Returns issue details including identifier, title, status, and description.",
+            scope: "issues:read",
+            rest_method: Method::GET,
+            rest_path: "/github/lookup/branch",
+            json_schema: || schemars::schema_for!(LookupBranchApiParams),
+            handler: Box::new(|ctx, value| {
+                Box::pin(async move {
+                    let params: LookupBranchApiParams = serde_json::from_value(value)?;
+                    lookup_branch(&ctx, params).await
+                })
+            }),
+            binary_input: None,
+            binary_output: None,
+        },
+    ]
 }

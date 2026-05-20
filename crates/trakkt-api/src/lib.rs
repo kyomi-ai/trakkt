@@ -394,16 +394,18 @@ mod tests {
         // Activity operations (1)
         assert!(names.contains(&"list_issue_activities"));
 
-        // GitHub link operations (1)
+        // GitHub link operations (3)
         assert!(names.contains(&"list_issue_github_links"));
+        assert!(names.contains(&"lookup_commit"));
+        assert!(names.contains(&"lookup_branch"));
 
         // Issue attachment operations (3)
         assert!(names.contains(&"list_issue_attachments"));
         assert!(names.contains(&"attach_to_issue"));
         assert!(names.contains(&"detach_from_issue"));
 
-        // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 1 + 1 + 3 = 33
-        assert_eq!(ops.len(), 33, "expected 33 total operations");
+        // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 1 + 3 + 3 = 35
+        assert_eq!(ops.len(), 35, "expected 35 total operations");
     }
 
     #[test]

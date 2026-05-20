@@ -57,6 +57,26 @@ pub struct GitHubLink {
     pub updated_at: String,
 }
 
+/// Result row for reverse-lookup queries (commit SHA -> issues, branch -> issues).
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct RefLookupResult {
+    pub link_id: String,
+    pub ref_identifier: String,
+    pub repo_full_name: String,
+    pub link_title: Option<String>,
+    pub url: String,
+    pub author_login: Option<String>,
+    pub state: Option<String>,
+    pub link_created_at: String,
+    pub issue_id: String,
+    pub team_key: String,
+    pub number: i32,
+    pub issue_title: String,
+    pub description: Option<String>,
+    pub status_name: String,
+    pub status_category: String,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct GitHubEvent {
     pub event_id: String,
@@ -331,6 +351,48 @@ pub async fn list_links_for_issue(
          WHERE issue_id = $1 \
          ORDER BY created_at DESC",
         issue_id
+    )?;
+    Ok(rows)
+}
+
+/// Reverse lookup: find issues linked to a commit SHA (prefix match) or branch name (exact).
+///
+/// Returns GitHub link rows joined with issue details (team key, number, title,
+/// status, description) so callers get full ticket context.
+pub async fn lookup_issues_by_ref(
+    db: &DbPool,
+    workspace_id: &str,
+    link_type: &str,
+    ref_pattern: &str,
+    prefix_match: bool,
+) -> trakkt_core::Result<Vec<RefLookupResult>> {
+    let ref_condition = if prefix_match {
+        "gl.ref_identifier LIKE $3 || '%' ESCAPE '\\'".to_string()
+    } else {
+        "gl.ref_identifier = $3".to_string()
+    };
+
+    let sql = format!(
+        "SELECT gl.link_id, gl.ref_identifier, gl.repo_full_name, gl.title AS link_title, \
+                gl.url, gl.author_login, gl.state, \
+                CAST(gl.created_at AS TEXT) AS link_created_at, \
+                i.issue_id, t.key AS team_key, i.number, i.title AS issue_title, \
+                i.description, s.name AS status_name, s.category AS status_category \
+         FROM github_links gl \
+         JOIN issues i ON i.issue_id = gl.issue_id \
+         JOIN teams t ON t.team_id = i.team_id \
+         JOIN statuses s ON s.status_id = i.status_id \
+         WHERE gl.workspace_id = $1 AND gl.link_type = $2 AND {ref_condition} \
+         ORDER BY gl.created_at DESC"
+    );
+
+    let rows: Vec<RefLookupResult> = trakkt_core::db_fetch_all!(
+        db,
+        RefLookupResult,
+        &sql,
+        workspace_id,
+        link_type,
+        ref_pattern
     )?;
     Ok(rows)
 }
