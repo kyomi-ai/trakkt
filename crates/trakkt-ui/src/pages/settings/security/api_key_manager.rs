@@ -14,7 +14,7 @@ use phosphor_leptos::Icon;
 use crate::components::{
     Alert, AlertDescription, AlertVariant, Badge, BadgeVariant, Button, ButtonSize, ButtonVariant,
     Card, CardContent, CardDescription, CardHeader, CardTitle, ConfirmDialog, EmptyState,
-    Checkbox, Modal, ModalSize,
+    Checkbox, Modal, ModalSize, Select, SelectVariant,
 };
 use crate::components::INPUT_CLASS;
 use crate::server_fns::security::{
@@ -63,6 +63,7 @@ pub fn ApiKeyManager() -> impl IntoView {
     let create_name = RwSignal::new(String::new());
     let create_scopes = RwSignal::new(Vec::<String>::new());
     let create_expires = RwSignal::new(Option::<i32>::None);
+    let (expiry_str, set_expiry_str) = signal(String::new());
     let creating = RwSignal::new(false);
     let created_token = RwSignal::new(Option::<CreateApiKeyResult>::None);
     let copied = RwSignal::new(false);
@@ -93,6 +94,7 @@ pub fn ApiKeyManager() -> impl IntoView {
         create_name.set(String::new());
         create_scopes.set(Vec::new());
         create_expires.set(None);
+        set_expiry_str.set(String::new());
         created_token.set(None);
         copied.set(false);
         create_modal_open.set(true);
@@ -413,10 +415,17 @@ pub fn ApiKeyManager() -> impl IntoView {
                     // Expiry
                     <div class="space-y-2">
                         <label class="text-sm font-medium text-foreground">"Expiration"</label>
-                        <select
-                            class=INPUT_CLASS
-                            on:change=move |ev| {
-                                let val = event_target_value(&ev);
+                        <Select
+                            value=expiry_str
+                            options=Signal::derive(|| vec![
+                                ("".to_string(), "No expiration".to_string()),
+                                ("30".to_string(), "30 days".to_string()),
+                                ("60".to_string(), "60 days".to_string()),
+                                ("90".to_string(), "90 days".to_string()),
+                                ("365".to_string(), "1 year".to_string()),
+                            ])
+                            on_change=Callback::new(move |val: String| {
+                                set_expiry_str.set(val.clone());
                                 create_expires.set(match val.as_str() {
                                     "30" => Some(30),
                                     "60" => Some(60),
@@ -424,14 +433,10 @@ pub fn ApiKeyManager() -> impl IntoView {
                                     "365" => Some(365),
                                     _ => None,
                                 });
-                            }
-                        >
-                            <option value="">"No expiration"</option>
-                            <option value="30">"30 days"</option>
-                            <option value="60">"60 days"</option>
-                            <option value="90">"90 days"</option>
-                            <option value="365">"1 year"</option>
-                        </select>
+                            })
+                            variant=SelectVariant::Form
+                            placeholder="No expiration"
+                        />
                     </div>
 
                     // Actions

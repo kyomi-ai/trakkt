@@ -11,7 +11,7 @@ use leptos::prelude::*;
 use crate::components::{
     ActionStatus, Alert, AlertDescription, AlertVariant, Badge, BadgeVariant, Button, ButtonSize,
     ButtonVariant, Card, CardContent, CardDescription, CardHeader, CardTitle, ConfirmDialog,
-    DynSelect, EmptyState, Skeleton, Switch, TeamIcon, TeamIconPicker, INPUT_CLASS,
+    EmptyState, Select, SelectVariant, Skeleton, Switch, TeamIcon, TeamIconPicker, INPUT_CLASS,
 };
 use crate::components::popover::{Placement, Popover};
 use crate::server_fns::teams::*;
@@ -403,7 +403,7 @@ pub fn TeamsSettingsPage() -> impl IntoView {
 
 /// Build the dropdown options for estimate scale selection.
 ///
-/// Returns `(value, label)` pairs for the `DynSelect`. The first option is
+/// Returns `(value, label)` pairs for the `Select`. The first option is
 /// always "Not in use" (value `""`), followed by the four scale variants.
 fn estimate_scale_options() -> Vec<(String, String)> {
     let scales = [
@@ -564,10 +564,11 @@ fn TeamEstimateCard(team: Team) -> impl IntoView {
                             "Issue estimation"
                         </label>
                         <div class="flex-1 max-w-sm">
-                            <DynSelect
-                                value=Signal::derive(move || scale.get())
+                            <Select
+                                value=scale
                                 options=options_signal
-                                on_change=on_scale_change
+                                on_change=Callback::new(on_scale_change)
+                                variant=SelectVariant::Form
                                 placeholder="Not in use"
                             />
                         </div>

@@ -11,9 +11,9 @@ use leptos::prelude::*;
 
 use crate::components::{
     Alert, AlertDescription, AlertTitle, AlertVariant, Badge, BadgeVariant, Button, ButtonLink,
-    ButtonSize, ButtonVariant, ConfirmDialog, EmptyState, Modal, ModalSize, Skeleton, INPUT_CLASS,
+    ButtonSize, ButtonVariant, ConfirmDialog, EmptyState, Modal, ModalSize, Select, SelectVariant,
+    Skeleton, INPUT_CLASS,
 };
-use crate::components::select::DynSelect;
 use crate::server_fns::context::UserContext;
 use crate::server_fns::team::*;
 use crate::types::{OwnershipTransferData, TeamInvitation, WorkspaceMember};
@@ -580,13 +580,14 @@ fn TeamPageInner() -> impl IntoView {
                                     <label class="block text-sm font-medium text-foreground mb-1">
                                         "Role"
                                     </label>
-                                    <crate::components::StyledSelect
-                                        value=invite_role.get_untracked()
-                                        options=vec![
-                                            ("user", "User - Full feature access"),
-                                            ("admin", "Admin - Can manage workspace settings"),
-                                        ]
-                                        on_change=move |val| set_invite_role.set(val)
+                                    <Select
+                                        value=invite_role
+                                        options=Signal::derive(|| vec![
+                                            ("user".to_string(), "User - Full feature access".to_string()),
+                                            ("admin".to_string(), "Admin - Can manage workspace settings".to_string()),
+                                        ])
+                                        on_change=Callback::new(move |val| set_invite_role.set(val))
+                                        variant=SelectVariant::Form
                                     />
                                 </div>
 
@@ -854,13 +855,20 @@ fn MemberRow(
                         <div class="flex items-center gap-2 sm:gap-3 pt-2 sm:pt-0 border-t sm:border-t-0 border-border flex-shrink-0">
                             // Role select
                             <div class="w-[100px] sm:w-[120px]">
-                                <crate::components::StyledSelect
-                                    value=display_role.to_string()
-                                    options=vec![("user", "User"), ("admin", "Admin")]
-                                    on_change=move |val| {
+                                <Select
+                                    value=Signal::derive({
+                                        let role = display_role.to_string();
+                                        move || role.clone()
+                                    })
+                                    options=Signal::derive(|| vec![
+                                        ("user".to_string(), "User".to_string()),
+                                        ("admin".to_string(), "Admin".to_string()),
+                                    ])
+                                    on_change=Callback::new(move |val| {
                                         let uid = member_id_for_role.clone();
                                         update_role_action.dispatch((uid, val));
-                                    }
+                                    })
+                                    variant=SelectVariant::Form
                                 />
                             </div>
 
@@ -1047,8 +1055,8 @@ fn TransferOwnershipModal(
                                 }.into_any()
                             } else {
                                 view! {
-                                    <DynSelect
-                                        value=Signal::derive(move || transfer_selected_user_id.get())
+                                    <Select
+                                        value=transfer_selected_user_id
                                         options=Signal::derive(move || {
                                             eligible_members.get().into_iter().map(|m| {
                                                 let val = m.user_id.clone();
@@ -1059,7 +1067,8 @@ fn TransferOwnershipModal(
                                                 (val, label)
                                             }).collect()
                                         })
-                                        on_change=move |val| transfer_selected_user_id.set(val)
+                                        on_change=Callback::new(move |val| transfer_selected_user_id.set(val))
+                                        variant=SelectVariant::Form
                                         placeholder="Choose a workspace member..."
                                     />
                                 }.into_any()

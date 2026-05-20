@@ -32,7 +32,7 @@ use crate::components::{
     Alert, AlertVariant,
     Button, ButtonSize, ButtonVariant, ConfirmDialog, EmptyState,
     Modal, ModalSize,
-    SearchInput, StyledSelect, TeamIcon, INPUT_CLASS,
+    SearchInput, Select, SelectVariant, TeamIcon, INPUT_CLASS,
 };
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{
@@ -1507,7 +1507,7 @@ pub(crate) fn NewIssueModal(
     let (error_msg, set_error_msg) = signal(Option::<String>::None);
 
     // Reset form state when modal opens — signals are reset synchronously
-    // before StyledSelect reconstructs, ensuring clean state on every open.
+    // before Select reconstructs, ensuring clean state on every open.
     Effect::new(move || {
         if show.get() {
             set_title.set(String::new());
@@ -1670,16 +1670,17 @@ pub(crate) fn NewIssueModal(
                     <label class="text-sm font-medium text-foreground">
                         "Priority"
                     </label>
-                    <StyledSelect
-                        value=priority.get_untracked()
-                        options=vec![
-                            ("0", "None"),
-                            ("1", "Urgent"),
-                            ("2", "High"),
-                            ("3", "Medium"),
-                            ("4", "Low"),
-                        ]
-                        on_change=move |v: String| set_priority.set(v)
+                    <Select
+                        value=priority
+                        options=Signal::derive(|| vec![
+                            ("0".to_string(), "None".to_string()),
+                            ("1".to_string(), "Urgent".to_string()),
+                            ("2".to_string(), "High".to_string()),
+                            ("3".to_string(), "Medium".to_string()),
+                            ("4".to_string(), "Low".to_string()),
+                        ])
+                        on_change=Callback::new(move |v: String| set_priority.set(v))
+                        variant=SelectVariant::Form
                     />
                 </div>
             </form>
