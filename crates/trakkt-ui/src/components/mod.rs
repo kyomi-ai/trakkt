@@ -50,7 +50,7 @@ pub use command_palette::{CommandPalette, CreateIssueTrigger};
 pub use checkbox::Checkbox;
 pub use confirm_dialog::ConfirmDialog;
 pub use date_picker::DatePicker;
-pub use dropdown::{DropdownItem, DropdownMenu, DropdownTrigger};
+pub use dropdown::{DropdownItem, DropdownMenu, DropdownTrigger, Select, SelectVariant};
 pub use empty_state::{EmptyState, EmptyStateVariant};
 pub use input::INPUT_CLASS;
 pub use issue_status_badge::{IssueStatusBadge, IssueStatusVariant};

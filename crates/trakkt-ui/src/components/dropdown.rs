@@ -15,6 +15,7 @@
 //!   and optional keyboard shortcut.
 
 use leptos::prelude::*;
+use phosphor_leptos::Icon;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CSS class constants — derived from DESIGN.md § "Dropdowns"
@@ -36,6 +37,18 @@ const TRIGGER_BASE: &str = "inline-flex items-center gap-1.5 whitespace-nowrap \
     hover:border-[--color-border-strong] hover:text-foreground \
     focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
 
+/// Form-style trigger — taller, full-width, for settings/modals/forms.
+/// Matches the height and feel of text inputs (h-11 = 44px).
+const TRIGGER_FORM: &str = "flex h-11 w-full items-center justify-between whitespace-nowrap \
+    rounded-md border border-border bg-transparent px-3 py-2 \
+    text-sm cursor-pointer \
+    transition-colors duration-200 \
+    hover:border-[--color-border-strong] hover:text-foreground \
+    focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+
+/// Chevron icon classes on the form-variant trigger.
+const FORM_CHEVRON_CLASS: &str = "h-4 w-4 opacity-50";
+
 /// Menu container classes.
 ///
 /// DESIGN.md menu spec:
@@ -44,7 +57,7 @@ const TRIGGER_BASE: &str = "inline-flex items-center gap-1.5 whitespace-nowrap \
 /// - Border: `1px solid --border`, `--radius-md` (6px)
 /// - Shadow: `shadow-lg`
 /// - z-index handled by Popover portal
-const MENU_CLASS: &str = "w-[220px] bg-card border border-border rounded-md shadow-lg \
+const MENU_CLASS: &str = "min-w-[220px] bg-card border border-border rounded-md shadow-lg \
     overflow-hidden";
 
 /// Search input classes inside the menu.
@@ -199,6 +212,10 @@ pub fn DropdownMenu(
     /// filter the items it passes as `children` based on this string.
     #[prop(optional)]
     on_search: Option<Callback<String>>,
+    /// When `true`, the popover's `min-width` matches the trigger's width.
+    /// Used by form-style selects where the menu should span the trigger.
+    #[prop(optional)]
+    match_width: bool,
     /// Optional keyboard hints footer.
     #[prop(optional)]
     footer: Option<ChildrenFn>,
@@ -216,6 +233,7 @@ pub fn DropdownMenu(
             open=open
             on_close=on_close
             placement=crate::components::popover::Placement::BOTTOM_START
+            match_width=match_width
             class=MENU_CLASS
         >
             // Search input (optional)
@@ -339,5 +357,157 @@ pub fn DropdownItem(
                 }
             }
         </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SelectVariant + Select
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Visual variant for the [`Select`] trigger.
+///
+/// - `Compact` (default): 28px inline trigger matching filter-bar dropdowns.
+/// - `Form`: 44px full-width trigger matching text-input height for
+///   forms and settings pages.
+#[derive(Default, Clone, Copy, PartialEq)]
+pub enum SelectVariant {
+    #[default]
+    Compact,
+    Form,
+}
+
+/// High-level select component with two trigger variants.
+///
+/// Wraps [`DropdownMenu`] + [`DropdownItem`] with either a compact
+/// inline trigger or a form-field-height trigger.
+///
+/// - `Compact` (default): 28px, inline, matches filter bar dropdowns
+/// - `Form`: 44px, full-width, matches text input height for forms/settings
+#[component]
+pub fn Select(
+    /// Current selected value (controlled by parent).
+    #[prop(into)]
+    value: Signal<String>,
+    /// Options list. Each entry is (value, label).
+    #[prop(into)]
+    options: Signal<Vec<(String, String)>>,
+    /// Called when user selects an option.
+    on_change: Callback<String>,
+    /// Visual variant of the trigger.
+    #[prop(optional)]
+    variant: SelectVariant,
+    /// Placeholder shown when value is empty (form variant only, typically).
+    #[prop(optional, into)]
+    placeholder: Option<String>,
+) -> impl IntoView {
+    let (is_open, set_is_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    let placeholder_stored = StoredValue::new(placeholder);
+
+    // Derive the label to display in the trigger: look up the current value
+    // in options. If empty and a placeholder exists, show the placeholder.
+    // If value not found in options, show the raw value.
+    let display_label = Memo::new(move |_| {
+        let val = value.get();
+        if val.is_empty() {
+            return placeholder_stored.with_value(|p| {
+                p.clone().unwrap_or_else(String::new)
+            });
+        }
+        options
+            .get()
+            .iter()
+            .find(|(v, _)| *v == val)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| val.clone())
+    });
+
+    // Whether we are currently showing a placeholder (empty value).
+    let is_placeholder = move || {
+        value.get().is_empty()
+    };
+
+    let on_trigger_click = move |_| {
+        set_is_open.update(|open| *open = !*open);
+    };
+
+    let on_close = Callback::new(move |()| set_is_open.set(false));
+
+    let trigger_view = match variant {
+        SelectVariant::Compact => {
+            view! {
+                <div node_ref=trigger_ref class="inline-flex">
+                    <button
+                        type="button"
+                        class=move || {
+                            let text = if is_placeholder() {
+                                "text-muted-foreground"
+                            } else {
+                                "text-foreground"
+                            };
+                            format!("{TRIGGER_BASE} {text}")
+                        }
+                        on:click=on_trigger_click
+                        aria-expanded=move || is_open.get().to_string()
+                        aria-haspopup="listbox"
+                    >
+                        <span class="truncate">{move || display_label.get()}</span>
+                        <span class="text-[8px] text-muted-foreground leading-none shrink-0">"▾"</span>
+                    </button>
+                </div>
+            }.into_any()
+        }
+        SelectVariant::Form => {
+            view! {
+                <div node_ref=trigger_ref class="w-full">
+                    <button
+                        type="button"
+                        class=TRIGGER_FORM
+                        on:click=on_trigger_click
+                        aria-expanded=move || is_open.get().to_string()
+                        aria-haspopup="listbox"
+                    >
+                        <span class=move || {
+                            if is_placeholder() {
+                                "line-clamp-1 text-muted-foreground"
+                            } else {
+                                "line-clamp-1"
+                            }
+                        }>{move || display_label.get()}</span>
+                        <Icon icon=phosphor_leptos::CARET_DOWN attr:class=FORM_CHEVRON_CLASS/>
+                    </button>
+                </div>
+            }.into_any()
+        }
+    };
+
+    let use_match_width = variant == SelectVariant::Form;
+
+    view! {
+        {trigger_view}
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || is_open.get())
+            on_close=on_close
+            match_width=use_match_width
+        >
+            {move || {
+                options.get().into_iter().map(|(val_str, label_str)| {
+                    let val_for_selected = val_str.clone();
+                    let val_for_click = val_str.clone();
+                    view! {
+                        <DropdownItem
+                            label=label_str
+                            selected=Signal::derive(move || value.get() == val_for_selected)
+                            on_select=Callback::new(move |()| {
+                                on_change.run(val_for_click.clone());
+                                set_is_open.set(false);
+                            })
+                        />
+                    }
+                }).collect_view()
+            }}
+        </DropdownMenu>
     }
 }
