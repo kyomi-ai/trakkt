@@ -75,6 +75,23 @@ pub struct CreateIssueApiParams {
     pub parent_issue_id: Option<String>,
     /// Estimate points value (integer)
     pub estimate: Option<i32>,
+    /// Relations to create after issue creation. Each entry links the new issue
+    /// to an existing issue. Supports directional sugar: "blocked_by" creates a
+    /// "blocks" relation with the referenced issue as the blocker.
+    pub relations: Option<Vec<InlineRelation>>,
+}
+
+/// An inline relation to create alongside a new issue.
+///
+/// The `issue` field is the target issue identifier (e.g. "TRA-130").
+/// The `relation_type` is validated by the service layer against configured types.
+/// Directional sugar: "blocked_by" creates a "blocks" relation with the target as blocker.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct InlineRelation {
+    /// Target issue identifier (e.g. "TRA-130")
+    pub issue: String,
+    /// Relation type (e.g. "blocks", "blocked_by", "parent", "duplicate")
+    pub relation_type: String,
 }
 
 /// Parameters for updating an existing issue.

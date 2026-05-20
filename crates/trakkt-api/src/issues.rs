@@ -12,12 +12,12 @@ use serde_json::json;
 use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
 use trakkt_auth::{activity_service, comment_service, issue_service, relation_service, team_service};
 use trakkt_types::api::{
-    CreateIssueApiParams, DeleteIssueApiParams, GetIssueApiParams, ListIssuesApiParams,
-    SearchIssuesApiParams, UpdateIssueApiParams,
+    CreateIssueApiParams, DeleteIssueApiParams, GetIssueApiParams, InlineRelation,
+    ListIssuesApiParams, SearchIssuesApiParams, UpdateIssueApiParams,
 };
 use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate};
 
-use crate::context::{resolve_issue_key_and_number, resolve_team};
+use crate::context::{parse_issue_identifier, resolve_issue_key_and_number, resolve_team};
 use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +115,55 @@ pub async fn get_issue(
     Ok(result)
 }
 
+/// Map directional sugar to canonical relation types.
+///
+/// Returns (source_issue_id, target_issue_id, canonical_relation_type).
+/// "blocked_by" is sugar for "blocks" with swapped direction.
+fn normalize_relation_direction<'a>(
+    new_issue_id: &'a str,
+    other_issue_id: &'a str,
+    relation_type: &str,
+) -> (&'a str, &'a str, String) {
+    match relation_type {
+        "blocked_by" => (other_issue_id, new_issue_id, "blocks".to_string()),
+        other => (new_issue_id, other_issue_id, other.to_string()),
+    }
+}
+
+/// Resolve and create a single inline relation for a newly-created issue.
+async fn process_inline_relation(
+    ctx: &ApiCtx<'_>,
+    new_issue_id: &str,
+    inline_rel: &InlineRelation,
+) -> Result<serde_json::Value, String> {
+    let (target_key, target_num) =
+        parse_issue_identifier(&inline_rel.issue).ok_or_else(|| {
+            format!("Invalid issue identifier format: {}", inline_rel.issue)
+        })?;
+
+    let target_issue = issue_service::get_issue(ctx.db, &ctx.workspace_id, &target_key, target_num)
+        .await
+        .map_err(|e| format!("{e}"))?
+        .ok_or_else(|| format!("Issue {} not found", inline_rel.issue))?;
+
+    let (source_id, target_id, relation_type) =
+        normalize_relation_direction(new_issue_id, &target_issue.issue_id, &inline_rel.relation_type);
+
+    let relation = relation_service::create_relation(
+        ctx.db,
+        &ctx.workspace_id,
+        source_id,
+        target_id,
+        &relation_type,
+        Some(&ctx.user_id),
+        ctx.ws_manager,
+    )
+    .await
+    .map_err(|e| format!("{e}"))?;
+
+    serde_json::to_value(&relation).map_err(|e| format!("{e}"))
+}
+
 /// Create a new issue in the specified or default team.
 ///
 /// Ported from `tool_create_issue` in `routes/mcp.rs`.
@@ -141,6 +190,7 @@ pub async fn create_issue(
     let label_ids: Vec<String> = params.labels.unwrap_or_default();
 
     let parent_issue_id = params.parent_issue_id;
+    let inline_relations = params.relations;
 
     let create_params = CreateIssueParams {
         workspace_id: ctx.workspace_id.clone(),
@@ -173,13 +223,38 @@ pub async fn create_issue(
         .await?;
     }
 
+    // Process inline relations — failures are warnings, not errors.
+    let mut relations_created = Vec::new();
+    let mut relation_warnings = Vec::new();
+
+    if let Some(ref inline_rels) = inline_relations {
+        for inline_rel in inline_rels {
+            match process_inline_relation(ctx, &issue.issue_id, inline_rel).await {
+                Ok(val) => relations_created.push(val),
+                Err(warning) => relation_warnings.push(format!(
+                    "{} relation with {}: {}",
+                    inline_rel.relation_type, inline_rel.issue, warning
+                )),
+            }
+        }
+    }
+
     // Record activity — never fails the mutation.
     let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
     if let Err(e) = recorder.record(&issue.issue_id, "created", None).await {
         tracing::warn!(issue_id = %issue.issue_id, "Failed to record create activity: {e}");
     }
 
-    Ok(serde_json::to_value(&issue)?)
+    let mut response = serde_json::to_value(&issue)?;
+    if let serde_json::Value::Object(ref mut map) = response {
+        if !relations_created.is_empty() {
+            map.insert("relations_created".to_string(), serde_json::Value::Array(relations_created));
+        }
+        if !relation_warnings.is_empty() {
+            map.insert("relation_warnings".to_string(), serde_json::to_value(&relation_warnings)?);
+        }
+    }
+    Ok(response)
 }
 
 /// Update fields on an existing issue.
