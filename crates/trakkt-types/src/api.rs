@@ -384,6 +384,9 @@ pub struct UploadAttachmentApiParams {
     pub filename: String,
     /// MIME content type (e.g. "image/png")
     pub content_type: String,
+    /// Optional issue ID to auto-link the attachment to an issue after upload.
+    #[serde(default)]
+    pub issue_id: Option<String>,
 }
 
 /// Parameters for downloading an attachment.

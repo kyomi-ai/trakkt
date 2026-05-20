@@ -533,6 +533,11 @@ async fn delete_milestone_handler(
 
 // ─── Attachments ────────────────────────────────────────────────────────────
 
+#[derive(Debug, serde::Deserialize)]
+struct UploadAttachmentQuery {
+    issue_id: Option<String>,
+}
+
 /// `POST /attachments` — upload a file via multipart form.
 ///
 /// Accepts a multipart form with a "file" field. The handler extracts the file,
@@ -540,6 +545,7 @@ async fn delete_milestone_handler(
 async fn upload_attachment_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<UploadAttachmentQuery>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<serde_json::Value>), RestError> {
     let auth = authenticate(&headers, &state).await?;
@@ -594,6 +600,7 @@ async fn upload_attachment_handler(
         content_base64,
         filename,
         content_type,
+        issue_id: query.issue_id,
     };
 
     let ctx = ApiCtx::from_bearer(

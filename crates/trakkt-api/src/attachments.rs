@@ -71,6 +71,26 @@ pub async fn upload_attachment(
     )
     .await?;
 
+    // Auto-link to issue if issue_id was provided (inline upload from issue detail).
+    if let Some(ref issue_id) = params.issue_id
+        && !issue_id.is_empty()
+        && let Err(e) = attachment_service::attach_to_issue(
+            ctx.db,
+            &ctx.workspace_id,
+            issue_id,
+            &attachment.attachment_id,
+            ctx.ws_manager,
+        )
+        .await
+    {
+        tracing::warn!(
+            attachment_id = %attachment.attachment_id,
+            issue_id = %issue_id,
+            error = %e,
+            "Failed to auto-link attachment to issue"
+        );
+    }
+
     Ok(serde_json::json!({
         "attachment_id": attachment.attachment_id,
         "filename": attachment.filename,

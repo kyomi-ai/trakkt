@@ -40,8 +40,12 @@ pub struct LightboxState {
 /// On success, signals `UploadComplete` with the inserted attachment metadata.
 /// On failure (validation or network), signals `UploadComplete { insert: None }` to
 /// remove the placeholder from the document.
+///
+/// When `issue_id` is provided, the upload request includes it as a query parameter
+/// so the backend auto-links the attachment to the issue via the junction table.
 pub fn make_upload_callback(
     upload_complete: RwSignal<Option<UploadComplete>>,
+    issue_id: Option<String>,
 ) -> Arc<dyn Fn(UploadTrigger) + Send + Sync> {
     Arc::new(move |trigger: UploadTrigger| {
         let placeholder_id = trigger.placeholder_id.clone();
@@ -76,8 +80,9 @@ pub fn make_upload_callback(
         }
 
         // Spawn the async upload
+        let issue_id = issue_id.clone();
         leptos::task::spawn_local(async move {
-            match upload_file(&trigger.data, &trigger.name, &trigger.content_type).await {
+            match upload_file(&trigger.data, &trigger.name, &trigger.content_type, issue_id.as_deref()).await {
                 Ok(resp) => {
                     let insert = if trigger.content_type.starts_with("image/") {
                         AttachmentInsert::Image {
@@ -160,7 +165,10 @@ struct UploadResponse {
 }
 
 /// Upload a file via the browser's fetch API (multipart form POST).
-async fn upload_file(data: &[u8], filename: &str, content_type: &str) -> Result<UploadResponse, String> {
+///
+/// When `issue_id` is provided, it is appended as a query parameter so the
+/// backend can auto-link the attachment to the issue after storing it.
+async fn upload_file(data: &[u8], filename: &str, content_type: &str, issue_id: Option<&str>) -> Result<UploadResponse, String> {
     use js_sys::{Array, Uint8Array};
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
@@ -190,7 +198,11 @@ async fn upload_file(data: &[u8], filename: &str, content_type: &str) -> Result<
     init.set_body_opt_form_data(Some(&form_data));
     init.set_credentials(web_sys::RequestCredentials::Include);
 
-    let request = Request::new_with_str_and_init("/api/v1/attachments", &init)
+    let url = match issue_id {
+        Some(id) => format!("/api/v1/attachments?issue_id={}", js_sys::encode_uri_component(id)),
+        None => "/api/v1/attachments".to_string(),
+    };
+    let request = Request::new_with_str_and_init(&url, &init)
         .map_err(|_| "Failed to create Request")?;
 
     let resp_value = JsFuture::from(window.fetch_with_request(&request))

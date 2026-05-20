@@ -293,6 +293,20 @@ pub async fn attach_to_issue(
     // Verify attachment belongs to workspace.
     let _attachment = get_attachment(db, attachment_id, workspace_id).await?;
 
+    // Verify issue belongs to workspace.
+    let count: i64 = trakkt_core::db_fetch_scalar!(
+        db,
+        i64,
+        "SELECT COUNT(*) FROM issues WHERE issue_id = $1 AND workspace_id = $2",
+        issue_id,
+        workspace_id
+    )?;
+    if count == 0 {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "Issue '{issue_id}' not found in workspace"
+        )));
+    }
+
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
 
