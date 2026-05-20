@@ -7,9 +7,15 @@
 
 use leptos::prelude::*;
 
+use trakkt_types::models::Team;
+
 use crate::components::{
-    ActionStatus, Button, ButtonVariant, Card, CardContent, CardDescription, CardHeader, CardTitle,
-    Skeleton, TeamCreationModal, INPUT_CLASS,
+    ActionStatus, Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Card, CardContent,
+    CardDescription, CardHeader, CardTitle, EmptyState, Skeleton, TeamCreationModal, TeamIcon,
+    INPUT_CLASS,
+};
+use crate::server_fns::teams::{
+    get_workspace_default_team_id, list_all_teams, set_workspace_default_team,
 };
 use crate::server_fns::workspace::*;
 use crate::types::WorkspaceSettingsData;
@@ -130,7 +136,22 @@ fn WorkspaceNameCard(data: WorkspaceSettingsData) -> impl IntoView {
 
 #[component]
 fn TeamsSection() -> impl IntoView {
+    let (version, set_version) = signal(0u32);
+    let teams = Resource::new(move || version.get(), |_| list_all_teams());
+    let ws_default_id = Resource::new(move || version.get(), |_| get_workspace_default_team_id());
     let (show_create_modal, set_show_create_modal) = signal(false);
+
+    let set_default_action = Action::new(move |id: &String| {
+        let id = id.clone();
+        async move { set_workspace_default_team(id).await }
+    });
+
+    // Refresh the team list when the set-default action succeeds.
+    Effect::new(move || {
+        if let Some(Ok(())) = set_default_action.value().get() {
+            set_version.update(|v| *v += 1);
+        }
+    });
 
     view! {
         <Card>
@@ -139,7 +160,7 @@ fn TeamsSection() -> impl IntoView {
                     <div>
                         <CardTitle>"Teams"</CardTitle>
                         <CardDescription>
-                            "Create and manage issue-tracker teams in this workspace."
+                            "Manage issue-tracker teams in this workspace."
                         </CardDescription>
                     </div>
                     <Button
@@ -150,11 +171,97 @@ fn TeamsSection() -> impl IntoView {
                     </Button>
                 </div>
             </CardHeader>
+            <CardContent>
+                <Transition fallback=move || view! {
+                    <div class="space-y-3">
+                        <Skeleton class="h-12 w-full"/>
+                        <Skeleton class="h-12 w-full"/>
+                    </div>
+                }>
+                    {move || Suspend::new(async move {
+                        let default_id = ws_default_id.await.ok().flatten();
+                        match teams.await {
+                            Ok(team_list) if team_list.is_empty() => {
+                                view! {
+                                    <EmptyState
+                                        title="No teams yet"
+                                        description="Create your first team to start tracking issues"
+                                    />
+                                }.into_any()
+                            }
+                            Ok(team_list) => {
+                                view! { <div>{team_rows(team_list, default_id, set_default_action)}</div> }.into_any()
+                            }
+                            Err(e) => {
+                                view! {
+                                    <p class="text-sm text-error-foreground">{e.to_string()}</p>
+                                }.into_any()
+                            }
+                        }
+                    })}
+                </Transition>
+            </CardContent>
         </Card>
         <TeamCreationModal
             show=Signal::derive(move || show_create_modal.get())
-            on_close=Callback::new(move |()| set_show_create_modal.set(false))
+            on_close=Callback::new(move |()| {
+                set_show_create_modal.set(false);
+                set_version.update(|v| *v += 1);
+            })
         />
     }
+}
+
+/// Render each team as a linked row with icon, name, key badge, and default controls.
+fn team_rows(
+    team_list: Vec<Team>,
+    default_id: Option<String>,
+    set_default_action: Action<String, Result<(), ServerFnError>>,
+) -> impl IntoView {
+    team_list
+        .into_iter()
+        .map(|team| {
+            let is_ws_default =
+                default_id.as_deref() == Some(team.team_id.as_str());
+            let href = format!("/teams/{}/settings", team.key.to_lowercase());
+            let team_id_for_action = team.team_id.clone();
+
+            view! {
+                <a
+                    href=href
+                    class="flex items-center gap-3 py-2.5 px-2 border-b border-border last:border-b-0 hover:bg-muted/50 transition-colors rounded-sm group"
+                >
+                    <TeamIcon team=team.clone() size="28px"/>
+                    <span class="text-sm font-medium text-foreground flex-1 min-w-0 truncate">
+                        {team.name.clone()}
+                    </span>
+                    <Badge variant=BadgeVariant::Secondary>
+                        {team.key.clone()}
+                    </Badge>
+                    {if is_ws_default {
+                        view! {
+                            <Badge variant=BadgeVariant::Default>
+                                "Workspace default"
+                            </Badge>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <Button
+                                variant=ButtonVariant::Ghost
+                                size=ButtonSize::Sm
+                                on:click=move |e: web_sys::MouseEvent| {
+                                    e.prevent_default();
+                                    e.stop_propagation();
+                                    set_default_action.dispatch(team_id_for_action.clone());
+                                }
+                            >
+                                "Set as default"
+                            </Button>
+                        }.into_any()
+                    }}
+                </a>
+            }
+        })
+        .collect_view()
 }
 

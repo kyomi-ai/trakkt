@@ -2,10 +2,11 @@
 use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_params_map};
 use phosphor_leptos::{Icon, IconWeight};
-use trakkt_types::models::Team;
+use trakkt_types::models::{EstimateScale, Team, TeamSettings};
 use crate::cache::store::SyncStore;
-use crate::components::{ActionStatus, Button, ButtonSize, ButtonVariant, Card, CardContent, CardDescription, CardHeader, CardTitle, ConfirmDialog, Skeleton, TeamIcon, TeamIconPicker, INPUT_CLASS};
+use crate::components::{ActionStatus, Button, ButtonSize, ButtonVariant, Card, CardContent, CardDescription, CardHeader, CardTitle, ConfirmDialog, Select, SelectVariant, Skeleton, Switch, TeamIcon, TeamIconPicker, INPUT_CLASS};
 use crate::components::popover::{Placement, Popover};
+use crate::server_fns::teams::update_team_settings;
 
 #[component]
 pub fn TeamSettingsPage() -> impl IntoView {
@@ -33,7 +34,7 @@ pub fn TeamSettingsPage() -> impl IntoView {
                     if !initialized.get() {
                         view! { <div class="space-y-6 max-w-2xl"><Card><CardHeader><Skeleton class="h-5 w-1/3"/></CardHeader><CardContent><Skeleton class="h-10 w-full"/></CardContent></Card></div> }.into_any()
                     } else if let Some(t) = team.get() {
-                        view! { <div class="space-y-6 max-w-2xl"><TeamGeneralCard team=t.clone()/><TeamDangerZone team_id=t.team_id.clone() team_name=t.name.clone()/></div> }.into_any()
+                        view! { <div class="space-y-6 max-w-2xl"><TeamGeneralCard team=t.clone()/><TeamEstimateCard team=t.clone()/><TeamDangerZone team_id=t.team_id.clone() team_name=t.name.clone()/></div> }.into_any()
                     } else {
                         view! { <div class="text-muted-foreground">"Team not found."</div> }.into_any()
                     }
@@ -157,5 +158,231 @@ fn TeamDangerZone(team_id: String, team_name: String) -> impl IntoView {
                 on_cancel=Callback::new(move |()| set_show_delete_confirm.set(false))
             />
         }}
+    }
+}
+
+// ─── Team estimate settings card ─────────────────────────────────────────
+
+/// Build the dropdown options for estimate scale selection.
+///
+/// Returns `(value, label)` pairs for the `Select`. The first option is
+/// always "Not in use" (value `""`), followed by the four scale variants.
+fn estimate_scale_options() -> Vec<(String, String)> {
+    let scales = [
+        EstimateScale::Exponential,
+        EstimateScale::Fibonacci,
+        EstimateScale::Linear,
+        EstimateScale::TShirt,
+    ];
+    let mut opts = vec![("".to_string(), "Not in use".to_string())];
+    for scale in &scales {
+        let label = format!("{} ({})", scale.display_label(), scale.preview());
+        let value = match serde_json::to_string(scale) {
+            Ok(s) => s.trim_matches('"').to_string(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize EstimateScale variant");
+                continue;
+            }
+        };
+        opts.push((value, label));
+    }
+    opts
+}
+
+/// Parse an estimate scale value string back to an `Option<EstimateScale>`.
+///
+/// Empty string maps to `None` (disabled). Recognized serde values map to
+/// `Some(variant)`.
+fn parse_estimate_scale(value: &str) -> Option<EstimateScale> {
+    if value.is_empty() {
+        return None;
+    }
+    let quoted = format!("\"{value}\"");
+    match serde_json::from_str(&quoted) {
+        Ok(scale) => Some(scale),
+        Err(e) => {
+            tracing::warn!(error = %e, value, "failed to deserialize EstimateScale");
+            None
+        }
+    }
+}
+
+/// Per-team card showing estimate scale selection and toggle options.
+///
+/// Changes auto-save immediately by calling the `update_team_settings`
+/// server function on every change. An `ActionStatus` indicator shows
+/// saving/saved/error state next to the card title.
+#[component]
+fn TeamEstimateCard(team: Team) -> impl IntoView {
+    let settings = team.settings.clone().unwrap_or_default();
+    let team_id = team.team_id.clone();
+
+    // Local reactive state for each setting
+    let (scale, set_scale) = signal(
+        settings
+            .estimate_scale
+            .as_ref()
+            .and_then(|s| {
+                match serde_json::to_string(s) {
+                    Ok(v) => Some(v.trim_matches('"').to_string()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to serialize team estimate scale");
+                        None
+                    }
+                }
+            })
+            .unwrap_or_default(),
+    );
+    let (allow_zero, set_allow_zero) = signal(settings.estimate_allow_zero);
+    let (extended, set_extended) = signal(settings.estimate_extended);
+    let (count_unestimated, set_count_unestimated) = signal(settings.estimate_count_unestimated);
+
+    // Preserve the auto_archive_days from the original settings so we don't
+    // clobber it when saving estimate changes.
+    let auto_archive_days = settings.auto_archive_days;
+
+    // Save action — sends the full TeamSettings JSON to the server
+    let save_action = Action::new({
+        let team_id = team_id.clone();
+        move |settings_json: &String| {
+            let team_id = team_id.clone();
+            let json = settings_json.clone();
+            async move { update_team_settings(team_id, json).await }
+        }
+    });
+
+    // Helper: build and dispatch a save from current signal values
+    let persist = move || {
+        let ts = TeamSettings {
+            auto_archive_days,
+            estimate_scale: parse_estimate_scale(&scale.get_untracked()),
+            estimate_allow_zero: allow_zero.get_untracked(),
+            estimate_extended: extended.get_untracked(),
+            estimate_count_unestimated: count_unestimated.get_untracked(),
+        };
+        match serde_json::to_string(&ts) {
+            Ok(json) => {
+                save_action.dispatch(json);
+            }
+            Err(e) => tracing::warn!("Failed to serialize TeamSettings: {e}"),
+        }
+    };
+
+    let has_scale = Memo::new(move |_| !scale.get().is_empty());
+
+    // Static options (constructed once, shared via Signal)
+    let options = estimate_scale_options();
+    let options_signal = Signal::derive(move || options.clone());
+
+    // Event handlers
+    let on_scale_change = {
+        move |val: String| {
+            // When disabling estimates, reset toggles to defaults
+            if val.is_empty() {
+                set_allow_zero.set(false);
+                set_extended.set(false);
+                set_count_unestimated.set(true);
+            }
+            set_scale.set(val);
+            persist();
+        }
+    };
+
+    let on_allow_zero = {
+        move |val: bool| {
+            set_allow_zero.set(val);
+            persist();
+        }
+    };
+
+    let on_extended = {
+        move |val: bool| {
+            set_extended.set(val);
+            persist();
+        }
+    };
+
+    let on_count_unestimated = {
+        move |val: bool| {
+            set_count_unestimated.set(val);
+            persist();
+        }
+    };
+
+    view! {
+        <Card>
+            <CardHeader>
+                <div class="flex items-center justify-between">
+                    <div>
+                        <CardTitle>"Estimates"</CardTitle>
+                        <CardDescription>
+                            "Configure how estimates work for this team"
+                        </CardDescription>
+                    </div>
+                    <ActionStatus action=save_action/>
+                </div>
+            </CardHeader>
+            <CardContent>
+                <div class="space-y-4">
+                    // Scale dropdown
+                    <div class="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <label class="text-sm font-medium text-foreground sm:w-48 flex-shrink-0">
+                            "Issue estimation"
+                        </label>
+                        <div class="flex-1 max-w-sm">
+                            <Select
+                                value=scale
+                                options=options_signal
+                                on_change=Callback::new(on_scale_change)
+                                variant=SelectVariant::Form
+                                placeholder="Not in use"
+                            />
+                        </div>
+                    </div>
+
+                    // Toggle options — only shown when a scale is selected
+                    <Show when=move || has_scale.get()>
+                        <div class="border-t border-border pt-4 space-y-3">
+                            <div class="flex items-center justify-between">
+                                <div>
+                                    <span class="text-sm font-medium text-foreground">"Allow zero estimates"</span>
+                                    <p class="text-xs text-muted-foreground mt-0.5">
+                                        "Include a \"No estimate\" (0) option in the picker"
+                                    </p>
+                                </div>
+                                <Switch
+                                    checked=Signal::derive(move || allow_zero.get())
+                                    on_change=Callback::new(on_allow_zero)
+                                />
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <div>
+                                    <span class="text-sm font-medium text-foreground">"Extended estimate scale"</span>
+                                    <p class="text-xs text-muted-foreground mt-0.5">
+                                        "Show additional larger point values beyond the base scale"
+                                    </p>
+                                </div>
+                                <Switch
+                                    checked=Signal::derive(move || extended.get())
+                                    on_change=Callback::new(on_extended)
+                                />
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <div>
+                                    <span class="text-sm font-medium text-foreground">"Count unestimated issues"</span>
+                                    <p class="text-xs text-muted-foreground mt-0.5">
+                                        "Include issues without estimates in velocity and capacity totals"
+                                    </p>
+                                </div>
+                                <Switch
+                                    checked=Signal::derive(move || count_unestimated.get())
+                                    on_change=Callback::new(on_count_unestimated)
+                                />
+                            </div>
+                        </div>
+                    </Show>
+                </div>
+            </CardContent>
+        </Card>
     }
 }

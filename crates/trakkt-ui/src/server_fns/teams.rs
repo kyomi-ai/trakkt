@@ -102,6 +102,27 @@ pub async fn leave_team(team_id: String) -> Result<(), ServerFnError> {
     Ok(())
 }
 
+/// Get the workspace-level default team ID (not user-resolved).
+#[server(prefix = "/leptos-api")]
+pub async fn get_workspace_default_team_id() -> Result<Option<String>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let id = trakkt_auth::workspace_service::get_workspace_default_team_id(ac.db(), &ac.ws_id)
+        .await
+        .into_sfn()?;
+    Ok(id)
+}
+
+/// Get the current user's personal default team ID (raw, not resolved).
+#[server(prefix = "/leptos-api")]
+pub async fn get_my_default_team_id() -> Result<Option<String>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let user = trakkt_auth::user_service::get_user_by_id(ac.db(), &ac.auth.user_id)
+        .await
+        .into_sfn()?
+        .ok_or_else(|| ServerFnError::new("User not found"))?;
+    Ok(user.default_team_id)
+}
+
 // ─── Write operations ──────────────────────────────────────────────────────
 
 /// Update an issue-tracker team's name and/or key.
@@ -146,21 +167,26 @@ pub async fn delete_team(
     Ok(())
 }
 
-/// Set the current user's personal default team.
+/// Set (or clear) the current user's personal default team.
+///
+/// Pass `Some(team_id)` to set a personal default, or `None` to clear it
+/// and fall back to the workspace default.
 #[server(prefix = "/leptos-api")]
-pub async fn set_my_default_team(team_id: String) -> Result<(), ServerFnError> {
+pub async fn set_my_default_team(team_id: Option<String>) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let team = trakkt_auth::team_service::get_team(ac.db(), &team_id)
-        .await
-        .into_sfn()?
-        .ok_or_else(|| ServerFnError::new("Team not found"))?;
-    if team.workspace_id != ac.ws_id {
-        return Err(ServerFnError::new("Team does not belong to this workspace"));
+    if let Some(ref tid) = team_id {
+        let team = trakkt_auth::team_service::get_team(ac.db(), tid)
+            .await
+            .into_sfn()?
+            .ok_or_else(|| ServerFnError::new("Team not found"))?;
+        if team.workspace_id != ac.ws_id {
+            return Err(ServerFnError::new("Team does not belong to this workspace"));
+        }
     }
     trakkt_auth::user_service::update_default_team(
         ac.db(),
         &ac.auth.user_id,
-        Some(&team_id),
+        team_id.as_deref(),
     )
     .await
     .into_sfn()?;

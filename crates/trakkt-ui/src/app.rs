@@ -38,7 +38,6 @@ use crate::pages::settings::{
     security::security_tab::SecurityTab,
     settings_shell::SettingsShell,
     team::TeamPage,
-    teams_settings::TeamsSettingsPage,
     workspace::WorkspacePage,
 };
 use crate::pages::teams::team_settings::TeamSettingsPage;
@@ -164,7 +163,6 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/workspace") view=WorkspacePage/>
                         <Route path=path!("/team") view=TeamPage/>
                         <Route path=path!("/labels") view=LabelsPage/>
-                        <Route path=path!("/teams") view=TeamsSettingsPage/>
                         <Route path=path!("/integrations") view=IntegrationsPage/>
                         <Route path=path!("/billing") view=BillingPage/>
                     </ParentRoute>
