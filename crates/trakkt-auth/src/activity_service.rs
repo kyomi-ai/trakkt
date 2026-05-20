@@ -11,6 +11,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::ActionSource;
 use trakkt_types::models::{IssueActivity, IssueWithDetails};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
@@ -31,6 +32,8 @@ struct IssueActivityRow {
     old_value: Option<String>,
     new_value: Option<String>,
     metadata: Option<String>,
+    action_source: String,
+    action_source_label: Option<String>,
     created_at: String,
 }
 
@@ -47,6 +50,13 @@ impl IssueActivityRow {
             old_value: self.old_value,
             new_value: self.new_value,
             metadata: self.metadata,
+            action_source: self.action_source
+                .parse::<ActionSource>()
+                .unwrap_or_else(|_| {
+                    tracing::warn!(raw = %self.action_source, "Unknown action_source value; defaulting to User");
+                    ActionSource::User
+                }),
+            action_source_label: self.action_source_label,
             created_at: self.created_at,
         }
     }
@@ -531,6 +541,7 @@ pub async fn list_issue_activities(
                 u.name AS actor_name, \
                 a.action_type, a.field, a.old_value, a.new_value, \
                 CAST(a.metadata AS TEXT) AS metadata, \
+                a.action_source, a.action_source_label, \
                 CAST(a.created_at AS TEXT) AS created_at \
          FROM issue_activities a \
          LEFT JOIN users u ON u.user_id = a.actor_id \
