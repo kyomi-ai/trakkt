@@ -5,6 +5,7 @@
 pub mod action_status;
 pub mod attachment_extension;
 pub mod attachment_hooks;
+pub mod attribution;
 pub mod avatar;
 pub mod layout;
 pub mod alert;
