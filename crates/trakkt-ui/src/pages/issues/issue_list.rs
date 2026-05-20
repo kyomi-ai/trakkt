@@ -626,7 +626,7 @@ pub(crate) fn IssueListInner(
     // flips to true, but only apply the view once.
     let init_view_applied = RwSignal::new(false);
     if let Some(ref init_view) = initial_view_id {
-        let init_view = init_view.clone();
+        let init_view = *init_view;
         Effect::new(move |_| {
             if init_view_applied.get_untracked() {
                 return;
