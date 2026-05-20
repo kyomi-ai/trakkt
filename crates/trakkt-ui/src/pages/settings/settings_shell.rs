@@ -40,7 +40,6 @@ const TABS: &[SettingsTab] = &[
     SettingsTab { id: "workspace", name: "Workspace", icon: phosphor_leptos::GEAR, path: "workspace" },
     SettingsTab { id: "team", name: "Team", icon: phosphor_leptos::USERS, path: "team" },
     SettingsTab { id: "labels", name: "Labels", icon: phosphor_leptos::TAG, path: "labels" },
-    SettingsTab { id: "teams", name: "Teams", icon: phosphor_leptos::USERS_FOUR, path: "teams" },
     SettingsTab { id: "integrations", name: "Integrations", icon: phosphor_leptos::PLUGS_CONNECTED, path: "integrations" },
     SettingsTab { id: "billing", name: "Billing", icon: phosphor_leptos::CREDIT_CARD, path: "billing" },
 ];
@@ -67,9 +66,8 @@ fn visible_tabs(ctx: &UserContext) -> Vec<&'static str> {
         tabs.push("team");
     }
 
-    // Labels and teams are always visible — even personal mode needs them
+    // Labels are always visible — even personal mode needs them
     tabs.push("labels");
-    tabs.push("teams");
 
     if is_admin && !ctx.is_personal_mode {
         tabs.push("integrations");
