@@ -75,7 +75,7 @@ struct WorkspaceIdRow {
     workspace_id: String,
 }
 
-const VALID_RELATION_TYPES: &[&str] = &["blocks", "parent", "duplicate"];
+const VALID_RELATION_TYPES: &[&str] = &["blocks", "parent", "duplicate", "relates_to"];
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -445,6 +445,8 @@ pub async fn list_relations_for_issue(
                 WHEN r.target_issue_id = $1 AND r.relation_type = 'parent' THEN 'child_of' \
                 WHEN r.source_issue_id = $1 AND r.relation_type = 'duplicate' THEN 'duplicate' \
                 WHEN r.target_issue_id = $1 AND r.relation_type = 'duplicate' THEN 'has_duplicate' \
+                WHEN r.source_issue_id = $1 AND r.relation_type = 'relates_to' THEN 'relates_to' \
+                WHEN r.target_issue_id = $1 AND r.relation_type = 'relates_to' THEN 'relates_to' \
                 ELSE r.relation_type \
             END AS direction \
          FROM issue_relations r \
