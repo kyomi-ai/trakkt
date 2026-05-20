@@ -72,7 +72,7 @@ pub async fn add_relation(
     .await?;
 
     // Record activity on both issues — never fails the mutation.
-    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
 
     let source_identifier = format!("{source_key}-{source_num}");
     let target_identifier = format!("{target_key}-{target_num}");
@@ -123,6 +123,8 @@ pub async fn add_relation(
                     source_num,
                     &update,
                     Some(&ctx.user_id),
+                    ctx.action_source,
+                    ctx.action_source_label.as_deref(),
                     ctx.ws_manager,
                 )
                 .await
@@ -205,7 +207,7 @@ pub async fn remove_relation(
     // Record activity on both issues — never fails the mutation.
     // Look up both issues to get their identifiers for rich activity metadata
     // (matches the shape of relation_added metadata).
-    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.ws_manager);
+    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
     match relation_before {
         Ok(Some(rel)) => {
             let source_issue = issue_service::get_issue_by_id(ctx.db, &rel.source_issue_id).await;

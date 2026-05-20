@@ -173,6 +173,8 @@ pub struct ActivityRecorder<'a> {
     db: &'a DbPool,
     workspace_id: &'a str,
     actor_id: &'a str,
+    action_source: ActionSource,
+    action_source_label: Option<String>,
     ws_manager: Option<&'a WebSocketManager>,
 }
 
@@ -186,12 +188,16 @@ impl<'a> ActivityRecorder<'a> {
         db: &'a DbPool,
         workspace_id: &'a str,
         actor_id: &'a str,
+        action_source: ActionSource,
+        action_source_label: Option<String>,
         ws_manager: Option<&'a WebSocketManager>,
     ) -> Self {
         Self {
             db,
             workspace_id,
             actor_id,
+            action_source,
+            action_source_label,
             ws_manager,
         }
     }
@@ -424,10 +430,11 @@ impl<'a> ActivityRecorder<'a> {
             })?;
 
         let json_cast = sql_compat::cast_to_json(is_pg, "$9");
+        let action_source_str = self.action_source.as_str();
         let sql = format!(
             "INSERT INTO issue_activities \
-                (activity_id, issue_id, workspace_id, actor_id, action_type, field, old_value, new_value, metadata, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {json_cast}, {now})",
+                (activity_id, issue_id, workspace_id, actor_id, action_type, field, old_value, new_value, metadata, action_source, action_source_label, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {json_cast}, $10, $11, {now})",
         );
 
         trakkt_core::db_execute!(
@@ -441,7 +448,9 @@ impl<'a> ActivityRecorder<'a> {
             field,
             old_value,
             new_value,
-            metadata_str
+            metadata_str,
+            action_source_str,
+            self.action_source_label.as_deref()
         )?;
 
         // Sync log entry — best-effort, log on failure.
