@@ -36,6 +36,24 @@ use crate::cache::db;
 use crate::cache::store::SyncStore;
 use crate::cache::websocket::{ConnectionState, WebSocketClient};
 
+const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
+    entity_types::ISSUE,
+    entity_types::LABEL,
+    entity_types::STATUS,
+    entity_types::TEAM,
+    entity_types::PROJECT,
+    entity_types::PROJECT_MILESTONE,
+    entity_types::VIEW,
+    entity_types::FAVORITE,
+    entity_types::NOTIFICATION,
+    entity_types::COMMENT,
+    entity_types::WORKSPACE_SETTINGS,
+    entity_types::ATTACHMENT,
+    entity_types::ISSUE_ATTACHMENT,
+    entity_types::ISSUE_RELATION,
+    entity_types::ACTIVITY,
+];
+
 // ── Public entry point ──────────────────────────────────────────────────────
 
 /// Start the sync engine. Call **once** from the Layout after connecting the
@@ -91,7 +109,7 @@ pub fn start_sync_engine(
                 spawn_local(async move {
                     match db::init_cache_db(&wid).await {
                         Ok(cache_db) => {
-                            for et in [entity_types::ISSUE, entity_types::LABEL, entity_types::STATUS, entity_types::TEAM, entity_types::PROJECT, entity_types::VIEW, entity_types::FAVORITE, entity_types::NOTIFICATION, entity_types::COMMENT] {
+                            for et in ALL_CACHED_ENTITY_TYPES {
                                 if let Err(e) =
                                     db::delete_all_of_type(&cache_db, et, &wid).await
                                 {
@@ -122,6 +140,7 @@ pub fn start_sync_engine(
     // ── Watch connection state to send bootstrap or delta on connect ────────
     let ws_for_state = ws.clone();
     let wid_state = workspace_id.to_owned();
+    let store_state = *store;
 
     Effect::new(move |_| {
         let state = ws_for_state.connection_state.get();
@@ -129,19 +148,31 @@ pub fn start_sync_engine(
             return;
         }
 
-        // Clear cached issues before bootstrap — archived issues won't appear
-        // in the new bootstrap and need to be removed from local store.
+        // Clear the in-memory store so stale entries from IDB hydration
+        // don't persist while the bootstrap stream repopulates.
+        store_state.reset();
+
+        // Clear ALL entity types from IDB before bootstrap — stale entries
+        // (archived issues, removed labels, etc.) won't appear in the new
+        // bootstrap and need to be removed from local cache.
         let wid = wid_state.clone();
         let ws_send = ws_for_state.clone();
         spawn_local(async move {
             match db::init_cache_db(&wid).await {
                 Ok(cache_db) => {
-                    if let Err(e) = db::delete_all_of_type(&cache_db, entity_types::ISSUE, &wid).await {
-                        tracing::warn!("bootstrap: failed to clear issue cache: {e}");
+                    for et in ALL_CACHED_ENTITY_TYPES {
+                        if let Err(e) =
+                            db::delete_all_of_type(&cache_db, et, &wid).await
+                        {
+                            tracing::warn!(
+                                entity_type = et,
+                                "bootstrap: failed to clear entity cache: {e}"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("bootstrap: failed to open cache db for issue clear: {e}");
+                    tracing::warn!("bootstrap: failed to open cache db for pre-bootstrap clear: {e}");
                 }
             }
 
