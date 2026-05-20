@@ -14,6 +14,7 @@
 
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
+use trakkt_types::enums::ActionSource;
 
 use crate::state::AppState;
 
@@ -25,6 +26,8 @@ pub struct ResolvedAuth {
     pub workspace_id: String,
     pub user_id: String,
     pub scopes: Vec<String>,
+    pub action_source: ActionSource,
+    pub action_source_label: Option<String>,
 }
 
 impl ResolvedAuth {
@@ -42,6 +45,7 @@ struct ApiTokenLookupRow {
     user_id: String,
     workspace_id: Option<String>,
     scopes: Option<String>,
+    name: String,
 }
 
 /// Try to authenticate via JWT (OAuth 2.0) or legacy API token.
@@ -92,10 +96,23 @@ pub async fn resolve_auth(headers: &HeaderMap, state: &AppState) -> Option<Resol
             }
         };
 
+        // Check if this is an OAuth agent token (has client_name in extra claims).
+        let (action_source, action_source_label) = match decoded
+            .claims
+            .extra
+            .get("client_name")
+            .and_then(|v| v.as_str())
+        {
+            Some(name) => (ActionSource::Agent, Some(name.to_string())),
+            None => (ActionSource::User, None),
+        };
+
         return Some(ResolvedAuth {
             workspace_id,
             user_id,
             scopes: vec![], // JWT users have full access
+            action_source,
+            action_source_label,
         });
     }
 
@@ -119,7 +136,7 @@ async fn authenticate_bearer_token(
     let bt = trakkt_core::sql_compat::bool_true(is_pg);
 
     let sql = format!(
-        "SELECT user_id, workspace_id, scopes FROM api_tokens \
+        "SELECT user_id, workspace_id, scopes, name FROM api_tokens \
          WHERE token_hash = $1 AND active = {bt} \
          AND (expires_at IS NULL OR expires_at > $2)"
     );
@@ -167,6 +184,8 @@ async fn authenticate_bearer_token(
         workspace_id,
         user_id: row.user_id,
         scopes,
+        action_source: ActionSource::Api,
+        action_source_label: Some(row.name),
     })
 }
 

@@ -44,6 +44,8 @@ pub struct ApiCtx<'a> {
     pub github_client: Option<&'a trakkt_github::GitHubClient>,
     pub encryption_key: Option<&'a [u8; 32]>,
     pub frontend_url: &'a str,
+    pub action_source: trakkt_types::enums::ActionSource,
+    pub action_source_label: Option<String>,
 }
 
 impl<'a> ApiCtx<'a> {
@@ -59,6 +61,8 @@ impl<'a> ApiCtx<'a> {
         github_client: Option<&'a trakkt_github::GitHubClient>,
         encryption_key: Option<&'a [u8; 32]>,
         frontend_url: &'a str,
+        action_source: trakkt_types::enums::ActionSource,
+        action_source_label: Option<String>,
     ) -> Self {
         Self {
             db,
@@ -69,6 +73,8 @@ impl<'a> ApiCtx<'a> {
             github_client,
             encryption_key,
             frontend_url,
+            action_source,
+            action_source_label,
         }
     }
 
@@ -94,6 +100,8 @@ impl<'a> ApiCtx<'a> {
             github_client,
             encryption_key,
             frontend_url,
+            action_source: trakkt_types::enums::ActionSource::User,
+            action_source_label: None,
         }
     }
 }
