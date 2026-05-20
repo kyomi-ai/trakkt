@@ -947,30 +947,39 @@ fn SidebarTeamSubNav(
     // Raw query string WITHOUT the leading '?' (leptos_router strips it).
     let search = leptos_router::hooks::use_location().search;
 
-    // Active/Backlog sub-item hrefs
-    let active_href = format!("/teams/{}/issues?status=in_progress", team_key.to_lowercase());
-    let backlog_href = format!("/teams/{}/issues?status=backlog", team_key.to_lowercase());
+    // Active/Backlog sub-item hrefs — use the new `view=` format.
+    let active_href = format!("/teams/{}/issues?view=active", team_key.to_lowercase());
+    let backlog_href = format!("/teams/{}/issues?view=backlog", team_key.to_lowercase());
 
     // Issues weight (for Phosphor icon fill/light toggle)
     let issues_weight = Signal::derive(move || {
         if issues_active.get() { IconWeight::Fill } else { IconWeight::Light }
     });
 
-    // Active state for Active/Backlog — match path + query param
+    // Active state for Active/Backlog — match path + query param.
+    // Check BOTH the new `view=active` format and the legacy `status=in_progress`
+    // format for backward compatibility.
     let issues_href_match_for_active = issues_href.clone();
     let started_active = Signal::derive(move || {
         path.get().starts_with(&issues_href_match_for_active)
-            && search.get().split('&').any(|p| p == "status=in_progress")
+            && search.get().split('&').any(|p| {
+                p == "view=active" || p == "status=in_progress"
+            })
     });
     let issues_href_match_for_backlog = issues_href.clone();
     let backlog_active = Signal::derive(move || {
         path.get().starts_with(&issues_href_match_for_backlog)
-            && search.get().split('&').any(|p| p == "status=backlog")
+            && search.get().split('&').any(|p| {
+                p == "view=backlog" || p == "status=backlog"
+            })
     });
 
-    // Issues "plain" active: on the issues page but WITHOUT a status query param
+    // Issues "plain" active: on the issues page but WITHOUT a view/status query param
     let issues_no_filter_active = Signal::derive(move || {
-        issues_active.get() && !search.get().split('&').any(|p| p.starts_with("status="))
+        issues_active.get()
+            && !search.get().split('&').any(|p| {
+                p.starts_with("view=") || p.starts_with("status=")
+            })
     });
 
     // ── Expand/collapse state from shared context ──────────────────────────

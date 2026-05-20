@@ -90,6 +90,9 @@ base64 = { workspace = true }
 # Regex for auto-linking issue identifiers
 regex = { workspace = true }
 
+# URL encoding/decoding (for persisting filters in query params)
+percent-encoding = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 
