@@ -254,6 +254,7 @@ fn Sidebar(
             // Navigation
             <nav class="flex-1 p-3 space-y-1 overflow-y-auto">
                 <SidebarInboxNavItem/>
+                <SidebarNavItem href="/activity" icon=phosphor_leptos::LIGHTNING label="Activity"/>
                 <SidebarNavItem href="/my-issues" icon=phosphor_leptos::LIST_CHECKS label="My Issues"/>
 
                 <SidebarWorkspaceSection/>
