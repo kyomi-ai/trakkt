@@ -6,4 +6,5 @@ pub mod date;
 pub mod keyboard;
 pub mod project;
 pub mod relative_time;
+pub mod time_group;
 pub mod webauthn;

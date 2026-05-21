@@ -362,6 +362,32 @@ pub struct IssueActivity {
     pub created_at: String,
 }
 
+/// An activity entry with issue context for workspace-level activity feeds.
+///
+/// Extends [`IssueActivity`] with team key, issue number, and title so that
+/// cross-team activity feeds can display meaningful issue identifiers without
+/// additional lookups.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceActivity {
+    pub activity_id: String,
+    pub issue_id: String,
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub actor_name: Option<String>,
+    pub action_type: String,
+    pub field: Option<String>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub metadata: Option<String>,
+    pub action_source: ActionSource,
+    pub action_source_label: Option<String>,
+    pub created_at: String,
+    // Issue context
+    pub team_key: String,
+    pub issue_number: i32,
+    pub issue_title: String,
+}
+
 // ─── Estimate types ────────────────────────────────────────────────────────
 
 /// The scale used for issue point estimation.

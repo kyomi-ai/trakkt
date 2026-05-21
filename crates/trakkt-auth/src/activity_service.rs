@@ -12,7 +12,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use trakkt_types::enums::ActionSource;
-use trakkt_types::models::{IssueActivity, IssueWithDetails};
+use trakkt_types::models::{IssueActivity, IssueWithDetails, WorkspaceActivity};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
@@ -559,4 +559,103 @@ pub async fn list_issue_activities(
         issue_id
     )?;
     Ok(rows.into_iter().map(IssueActivityRow::into_dto).collect())
+}
+
+// ─── Workspace-level activity query ────────────────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct WorkspaceActivityRow {
+    activity_id: String,
+    issue_id: String,
+    workspace_id: String,
+    actor_id: String,
+    actor_name: Option<String>,
+    action_type: String,
+    field: Option<String>,
+    old_value: Option<String>,
+    new_value: Option<String>,
+    metadata: Option<String>,
+    action_source: String,
+    action_source_label: Option<String>,
+    created_at: String,
+    team_key: String,
+    issue_number: i32,
+    issue_title: String,
+}
+
+impl WorkspaceActivityRow {
+    fn into_dto(self) -> WorkspaceActivity {
+        WorkspaceActivity {
+            activity_id: self.activity_id,
+            issue_id: self.issue_id,
+            workspace_id: self.workspace_id,
+            actor_id: self.actor_id,
+            actor_name: self.actor_name,
+            action_type: self.action_type,
+            field: self.field,
+            old_value: self.old_value,
+            new_value: self.new_value,
+            metadata: self.metadata,
+            action_source: self.action_source
+                .parse::<ActionSource>()
+                .unwrap_or_else(|_| {
+                    tracing::warn!(raw = %self.action_source, "Unknown action_source value; defaulting to User");
+                    ActionSource::User
+                }),
+            action_source_label: self.action_source_label,
+            created_at: self.created_at,
+            team_key: self.team_key,
+            issue_number: self.issue_number,
+            issue_title: self.issue_title,
+        }
+    }
+}
+
+/// Fetch activities across all teams in a workspace, ordered by most recent first.
+///
+/// Optional filters narrow results by team key or action type. The nullable
+/// parameter pattern (`$N IS NULL OR column = $N`) keeps bind positions fixed
+/// regardless of which filters are active.
+pub async fn list_workspace_activities(
+    db: &DbPool,
+    workspace_id: &str,
+    team_key: Option<&str>,
+    action_type: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> trakkt_core::Result<Vec<WorkspaceActivity>> {
+    let is_pg = db.is_postgres();
+    let cast_text = if is_pg { "::TEXT" } else { "" };
+
+    // Inline LIMIT/OFFSET per CODING_STANDARDS.md (sanitized i64 values).
+    let sql = format!(
+        "SELECT a.activity_id, a.issue_id, a.workspace_id, a.actor_id, \
+                u.name AS actor_name, \
+                a.action_type, a.field, a.old_value, a.new_value, \
+                CAST(a.metadata AS TEXT) AS metadata, \
+                a.action_source, a.action_source_label, \
+                CAST(a.created_at AS TEXT) AS created_at, \
+                t.key AS team_key, \
+                i.number AS issue_number, \
+                i.title AS issue_title \
+         FROM issue_activities a \
+         LEFT JOIN users u ON u.user_id = a.actor_id \
+         JOIN issues i ON i.issue_id = a.issue_id \
+         JOIN teams t ON t.team_id = i.team_id \
+         WHERE a.workspace_id = $1 \
+           AND ($2{cast_text} IS NULL OR t.key = $2) \
+           AND ($3{cast_text} IS NULL OR a.action_type = $3) \
+         ORDER BY a.created_at DESC \
+         LIMIT {limit} OFFSET {offset}"
+    );
+
+    let rows: Vec<WorkspaceActivityRow> = trakkt_core::db_fetch_all!(
+        db,
+        WorkspaceActivityRow,
+        &sql,
+        workspace_id,
+        team_key,
+        action_type
+    )?;
+    Ok(rows.into_iter().map(WorkspaceActivityRow::into_dto).collect())
 }
