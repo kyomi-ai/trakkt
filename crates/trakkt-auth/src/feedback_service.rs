@@ -179,11 +179,12 @@ pub async fn submit_feedback(
     } else {
         sql_compat::bool_false(is_pg)
     };
+    let json_cast = sql_compat::cast_to_json(is_pg, "$7");
     let sql = format!(
         "INSERT INTO feedback \
             (id, user_id, workspace_id, feedback_type, description, screenshot_url, \
              include_context, context, status, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, {include_ctx_literal}, $7, 'new', {now})"
+         VALUES ($1, $2, $3, $4, $5, $6, {include_ctx_literal}, {json_cast}, 'new', {now})"
     );
     trakkt_core::db_execute!(
         db,
