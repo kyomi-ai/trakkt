@@ -499,7 +499,7 @@ fn SidebarTeamsSection() -> impl IntoView {
     }
 }
 
-/// Section for "Workspace" — shows preset views (In Progress, Backlog),
+/// Section for "Workspace" — shows preset views (Issues, Active, Backlog),
 /// user-saved workspace-scoped views, and pinned projects.
 ///
 /// Replaces the old SidebarFavoritesSection and SidebarProjectsSection.
@@ -512,7 +512,14 @@ fn SidebarWorkspaceSection() -> impl IntoView {
     let path = location.pathname;
     let search = location.search;
 
-    // Active state for the two workspace presets — match pathname AND query param.
+    // Active state for the three workspace presets — match pathname AND query param.
+    let issues_active = Signal::derive(move || {
+        let p = path.get();
+        let s = search.get();
+        p == "/workspace"
+            && (s.split('&').any(|seg| seg == "view=issues")
+                || !s.split('&').any(|seg| seg.starts_with("view=")))
+    });
     let active_active = Signal::derive(move || {
         path.get() == "/workspace"
             && search.get().split('&').any(|p| p == "view=active")
@@ -565,15 +572,20 @@ fn SidebarWorkspaceSection() -> impl IntoView {
             view! {
                 <SidebarSectionHeader label="Workspace"/>
                 <div class="space-y-0.5">
-                    // Preset: In Progress
+                    <SidebarWorkspacePresetItem
+                        href="/workspace?view=issues"
+                        label="Issues"
+                        is_active=issues_active
+                    >
+                        <Icon icon=phosphor_leptos::LIST_BULLETS weight=IconWeight::Light size="14px"/>
+                    </SidebarWorkspacePresetItem>
                     <SidebarWorkspacePresetItem
                         href="/workspace?view=active"
-                        label="In Progress"
+                        label="Active"
                         is_active=active_active
                     >
                         {view_status_icon(IssueStatusVariant::Started, "14px".to_string())}
                     </SidebarWorkspacePresetItem>
-                    // Preset: Backlog
                     <SidebarWorkspacePresetItem
                         href="/workspace?view=backlog"
                         label="Backlog"
