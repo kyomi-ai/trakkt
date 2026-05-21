@@ -160,6 +160,10 @@ pub struct SearchIssuesApiParams {
     pub team_id: Option<String>,
     /// If true, include completed and cancelled issues
     pub include_closed: Option<bool>,
+    /// Include archived issues in results (default: false)
+    pub include_archived: Option<bool>,
+    /// Also search comment bodies (default: true)
+    pub include_comments: Option<bool>,
     /// Max results (default: 20, max: 100)
     pub limit: Option<i64>,
 }
