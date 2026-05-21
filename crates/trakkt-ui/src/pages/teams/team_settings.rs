@@ -14,7 +14,7 @@ pub fn TeamSettingsPage() -> impl IntoView {
     let team_key = Signal::derive(move || params.read().get("key").unwrap_or_default());
     let store = use_context::<SyncStore>();
     let initialized = Signal::derive(move || store.is_some_and(|s| s.initialized().get()));
-    let team = Signal::derive(move || {
+    let team = Memo::new(move |_| {
         let key = team_key.get();
         store.and_then(|s| s.teams().get().into_iter().find(|t| t.key.eq_ignore_ascii_case(&key)))
     });
@@ -30,17 +30,37 @@ pub fn TeamSettingsPage() -> impl IntoView {
                 <h1 class="text-2xl font-display text-foreground">"Team Settings"</h1>
             </div>
             <div class="flex-1 overflow-y-auto p-4 md:p-6">
-                {move || {
-                    if !initialized.get() {
-                        view! { <div class="space-y-6 max-w-2xl"><Card><CardHeader><Skeleton class="h-5 w-1/3"/></CardHeader><CardContent><Skeleton class="h-10 w-full"/></CardContent></Card></div> }.into_any()
-                    } else if let Some(t) = team.get() {
-                        view! { <div class="space-y-6 max-w-2xl"><TeamGeneralCard team=t.clone()/><TeamEstimateCard team=t.clone()/><TeamDangerZone team_id=t.team_id.clone() team_name=t.name.clone()/></div> }.into_any()
-                    } else {
-                        view! { <div class="text-muted-foreground">"Team not found."</div> }.into_any()
+                <Show
+                    when=move || initialized.get()
+                    fallback=|| view! {
+                        <div class="space-y-6 max-w-2xl">
+                            <Card><CardHeader><Skeleton class="h-5 w-1/3"/></CardHeader>
+                            <CardContent><Skeleton class="h-10 w-full"/></CardContent></Card>
+                        </div>
                     }
-                }}
+                >
+                    <TeamSettingsBody team=team/>
+                </Show>
             </div>
         </div>
+    }
+}
+
+#[component]
+fn TeamSettingsBody(team: Memo<Option<Team>>) -> impl IntoView {
+    view! {
+        <Show
+            when=move || team.get().is_some()
+            fallback=|| view! { <div class="text-muted-foreground">"Team not found."</div> }
+        >
+            {move || team.get().map(|t| view! {
+                <div class="space-y-6 max-w-2xl">
+                    <TeamGeneralCard team=t.clone()/>
+                    <TeamEstimateCard team=t.clone()/>
+                    <TeamDangerZone team_id=t.team_id.clone() team_name=t.name.clone()/>
+                </div>
+            })}
+        </Show>
     }
 }
 
