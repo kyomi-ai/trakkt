@@ -1769,6 +1769,7 @@ fn RelationsSection(
             "blocks" => (current, selected_ident, "blocks".to_string()),
             "blocked_by" => (selected_ident, current, "blocks".to_string()),
             "duplicate" => (current, selected_ident, "duplicate".to_string()),
+            "relates_to" => (current, selected_ident, "relates_to".to_string()),
             _ => return,
         };
 
@@ -1799,6 +1800,7 @@ fn RelationsSection(
             "blocks" => "Add issue this blocks".to_string(),
             "blocked_by" => "Add issue that blocks this".to_string(),
             "duplicate" => "Add duplicate relation".to_string(),
+            "relates_to" => "Add related issue".to_string(),
             _ => "Add relation".to_string(),
         }
     });
@@ -1813,9 +1815,10 @@ fn RelationsSection(
             "duplicate" => 1,
             "blocked_by" => 2,
             "blocks" => 3,
-            "has_duplicate" => 4,
-            "parent" => 5,
-            _ => 6,
+            "relates_to" => 4,
+            "has_duplicate" => 5,
+            "parent" => 6,
+            _ => 7,
         }
     }
 
@@ -1826,6 +1829,7 @@ fn RelationsSection(
             "blocked_by" => "Blocked by",
             "blocks" => "Blocks",
             "has_duplicate" => "Has duplicate",
+            "relates_to" => "Related to",
             "parent" => "Sub-issue",
             _ => "Related",
         }
@@ -1951,6 +1955,7 @@ fn RelationsSection(
                         ("blocks".to_string(), "Blocks".to_string()),
                         ("blocked_by".to_string(), "Blocked by".to_string()),
                         ("duplicate".to_string(), "Duplicate of".to_string()),
+                        ("relates_to".to_string(), "Related to".to_string()),
                     ])
                     on_change=Callback::new(move |val| set_add_relation_type.set(val))
                     variant=SelectVariant::Form
