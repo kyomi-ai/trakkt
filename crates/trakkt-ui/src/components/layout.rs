@@ -36,7 +36,27 @@ pub fn Layout() -> impl IntoView {
     let sync_store = SyncStore::new();
     provide_context(sync_store);
     provide_context(CreateIssueTrigger(RwSignal::new(false)));
-    provide_context(SidebarExpandState(RwSignal::new(HashMap::new())));
+    let initial_expand_state: HashMap<String, bool> = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::window()
+                .and_then(|w| w.local_storage().ok().flatten())
+                .and_then(|storage| storage.get_item("trakkt:sidebar:teams").ok().flatten())
+                .and_then(|json| match serde_json::from_str::<HashMap<String, bool>>(&json) {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse sidebar expand state from localStorage: {e}");
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            HashMap::new()
+        }
+    };
+    provide_context(SidebarExpandState(RwSignal::new(initial_expand_state)));
 
     let auth_confirmed = RwSignal::new(false);
     let nav = leptos_router::hooks::use_navigate();
@@ -811,6 +831,18 @@ fn SidebarTeamSubNav(
         move |value: bool| {
             if let Some(ref ctx) = expand_ctx {
                 ctx.0.update(|map| { map.insert(team_key_for_set.clone(), value); });
+                // Persist to localStorage
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let map = ctx.0.get_untracked();
+                    if let Ok(json) = serde_json::to_string(&map)
+                        && let Some(storage) = web_sys::window()
+                            .and_then(|w| w.local_storage().ok().flatten())
+                        && let Err(e) = storage.set_item("trakkt:sidebar:teams", &json)
+                    {
+                        tracing::warn!("Failed to persist sidebar state to localStorage: {e:?}");
+                    }
+                }
             }
         }
     };
