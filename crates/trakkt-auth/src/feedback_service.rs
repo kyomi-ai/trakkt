@@ -221,7 +221,8 @@ pub async fn get_feedback(
 ) -> trakkt_core::Result<Option<Feedback>> {
     let sql = "SELECT id, user_id, workspace_id, feedback_type, description, \
                screenshot_url, include_context, CAST(context AS TEXT) AS context, status, \
-               created_at, resolved_at, resolution_notes, resolved_by \
+               CAST(created_at AS TEXT) AS created_at, \
+               CAST(resolved_at AS TEXT) AS resolved_at, resolution_notes, resolved_by \
                FROM feedback WHERE id = $1 AND workspace_id = $2";
     let row = trakkt_core::db_fetch_optional!(db, FeedbackRow, sql, id, workspace_id)?;
     Ok(row.map(FeedbackRow::into_dto))
@@ -243,7 +244,8 @@ pub async fn list_feedback(
             let sql = format!(
                 "SELECT id, user_id, workspace_id, feedback_type, description, \
                  screenshot_url, include_context, CAST(context AS TEXT) AS context, status, \
-                 created_at, resolved_at, resolution_notes, resolved_by \
+                 CAST(created_at AS TEXT) AS created_at, \
+                 CAST(resolved_at AS TEXT) AS resolved_at, resolution_notes, resolved_by \
                  FROM feedback WHERE workspace_id = $1 AND status = $2 \
                  ORDER BY created_at DESC LIMIT {limit} OFFSET {offset}"
             );
@@ -253,7 +255,8 @@ pub async fn list_feedback(
             let sql = format!(
                 "SELECT id, user_id, workspace_id, feedback_type, description, \
                  screenshot_url, include_context, CAST(context AS TEXT) AS context, status, \
-                 created_at, resolved_at, resolution_notes, resolved_by \
+                 CAST(created_at AS TEXT) AS created_at, \
+                 CAST(resolved_at AS TEXT) AS resolved_at, resolution_notes, resolved_by \
                  FROM feedback WHERE workspace_id = $1 \
                  ORDER BY created_at DESC LIMIT {limit} OFFSET {offset}"
             );
