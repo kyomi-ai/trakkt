@@ -89,7 +89,7 @@ fn view_mode_storage_key(team_key: &Option<Signal<String>>) -> String {
 
 /// Parsed view state from URL query parameters.
 struct ParsedViewState {
-    /// Active tab: "all", "active", "backlog", or "view:<uuid>"
+    /// Active tab: "issues", "active", "backlog", or "view:<uuid>"
     view: String,
     /// Filter clauses deserialized from the `filters` JSON param.
     filters: Vec<FilterClause>,
@@ -163,7 +163,7 @@ fn parse_query_params(query: &str) -> ParsedViewState {
     let sort_dir = sort_dir_raw.as_deref().and_then(SortDirection::parse);
 
     ParsedViewState {
-        view: view.unwrap_or_else(|| "all".to_string()),
+        view: view.unwrap_or_else(|| "issues".to_string()),
         filters,
         sort,
         sort_dir,
@@ -173,7 +173,7 @@ fn parse_query_params(query: &str) -> ParsedViewState {
 /// Build a URL query string from the current view state.
 ///
 /// Only includes parameters that differ from defaults (clean URL = no params).
-/// Defaults: view=all, no filters, sort=priority, sort_dir=asc.
+/// Defaults: view=issues, no filters, sort=priority, sort_dir=asc.
 fn build_query_string(
     view: &str,
     clauses: &[FilterClause],
@@ -182,8 +182,8 @@ fn build_query_string(
 ) -> String {
     let mut params = Vec::<String>::new();
 
-    // View param — omit when "all" (default).
-    if view != "all" {
+    // View param — omit when "issues" (default).
+    if view != "issues" {
         params.push(format!("view={view}"));
     }
 
@@ -395,8 +395,8 @@ pub(crate) fn IssueListInner(
     let (sort_direction, set_sort_direction) = signal(SortDirection::Asc);
 
     // ── Active tab state (team-scoped pages only) ─────────────────────────
-    // Values: "all", "active", "backlog", "view:{view_id}"
-    let (active_tab, set_active_tab) = signal("all".to_string());
+    // Values: "issues", "active", "backlog", "view:{view_id}"
+    let (active_tab, set_active_tab) = signal("issues".to_string());
 
     // ── URL state persistence ───────────────────────────────────────────
     // Prevents circular Effect loops: init reads URL → sets signals →
@@ -496,10 +496,10 @@ pub(crate) fn IssueListInner(
     let handle_tab_delete = move || {
         let Some(vid) = confirm_delete_view_id.get_untracked() else { return };
         set_confirm_delete_view_id.set(None);
-        // If the deleted view was the active tab, reset to "All Issues".
+        // If the deleted view was the active tab, reset to "Issues".
         let current_tab = active_tab.get_untracked();
         if current_tab == format!("view:{vid}") {
-            set_active_tab.set("all".to_string());
+            set_active_tab.set("issues".to_string());
             set_search.set(String::new());
             filter_clauses.set(Vec::new());
             set_sort_field.set(SortField::Priority);
@@ -537,22 +537,39 @@ pub(crate) fn IssueListInner(
             set_sort_direction.set(parsed.sort_dir.unwrap_or(SortDirection::Asc));
 
             match parsed.view.as_str() {
-                "active" => {
-                    set_active_tab.set("active".to_string());
-                    // If the URL carried explicit filter clauses, use them.
-                    // Otherwise, compute status filter IDs from SyncStore
-                    // (same logic as the on_active click handler).
+                "issues" => {
+                    set_active_tab.set("issues".to_string());
                     if !parsed.filters.is_empty() {
                         filter_clauses.set(parsed.filters);
                     } else {
                         let status_ids = compute_status_ids(
                             sync_store,
                             &resolved_team.get_untracked(),
-                            &["started"],
+                            &["backlog", "unstarted", "started"],
                         );
-                        // If store isn't initialized yet (cold deep-link), the
-                        // tracked read on `store.initialized()` will re-run
-                        // this Effect once data arrives.
+                        if let Some(store) = sync_store
+                            && !store.initialized().get()
+                        {
+                            skip_url_update.set(false);
+                            return;
+                        }
+                        filter_clauses.set(vec![FilterClause {
+                            field: "status".to_string(),
+                            operator: "any_of".to_string(),
+                            values: status_ids,
+                        }]);
+                    }
+                }
+                "active" => {
+                    set_active_tab.set("active".to_string());
+                    if !parsed.filters.is_empty() {
+                        filter_clauses.set(parsed.filters);
+                    } else {
+                        let status_ids = compute_status_ids(
+                            sync_store,
+                            &resolved_team.get_untracked(),
+                            &["unstarted", "started"],
+                        );
                         if let Some(store) = sync_store
                             && !store.initialized().get()
                         {
@@ -574,7 +591,7 @@ pub(crate) fn IssueListInner(
                         let status_ids = compute_status_ids(
                             sync_store,
                             &resolved_team.get_untracked(),
-                            &["backlog", "unstarted"],
+                            &["backlog"],
                         );
                         if let Some(store) = sync_store
                             && !store.initialized().get()
@@ -592,10 +609,6 @@ pub(crate) fn IssueListInner(
                 view_str if view_str.starts_with("view:") => {
                     let view_id = &view_str[5..];
                     set_active_tab.set(view_str.to_string());
-                    // Load filters from the saved view's JSON (same logic as
-                    // the custom view click handler). If the URL also carried
-                    // explicit filter params, prefer those (user may have
-                    // tweaked filters after switching to the view).
                     if !parsed.filters.is_empty() {
                         filter_clauses.set(parsed.filters);
                     } else {
@@ -610,9 +623,27 @@ pub(crate) fn IssueListInner(
                     }
                 }
                 _ => {
-                    // "all" or any unrecognized value — default state.
-                    set_active_tab.set("all".to_string());
-                    filter_clauses.set(parsed.filters);
+                    set_active_tab.set("issues".to_string());
+                    if !parsed.filters.is_empty() {
+                        filter_clauses.set(parsed.filters);
+                    } else {
+                        let status_ids = compute_status_ids(
+                            sync_store,
+                            &resolved_team.get_untracked(),
+                            &["backlog", "unstarted", "started"],
+                        );
+                        if let Some(store) = sync_store
+                            && !store.initialized().get()
+                        {
+                            skip_url_update.set(false);
+                            return;
+                        }
+                        filter_clauses.set(vec![FilterClause {
+                            field: "status".to_string(),
+                            operator: "any_of".to_string(),
+                            values: status_ids,
+                        }]);
+                    }
                 }
             }
 
@@ -1130,13 +1161,32 @@ pub(crate) fn IssueListInner(
             {move || {
                 team_key?;
 
-                let on_all = move |_: web_sys::MouseEvent| {
+                let on_issues = move |_: web_sys::MouseEvent| {
                     push_next_nav.set(true);
-                    set_active_tab.set("all".to_string());
+                    set_active_tab.set("issues".to_string());
                     set_search.set(String::new());
-                    filter_clauses.set(Vec::new());
                     set_sort_field.set(SortField::Priority);
                     set_sort_direction.set(SortDirection::Asc);
+                    let team = resolved_team.get();
+                    let status_ids: Vec<String> = if let (Some(store), Some(t)) = (sync_store, &team) {
+                        store
+                            .statuses()
+                            .get()
+                            .into_iter()
+                            .filter(|s| {
+                                (s.category == "backlog" || s.category == "unstarted" || s.category == "started")
+                                    && (s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
+                            })
+                            .map(|s| s.status_id)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    filter_clauses.set(vec![FilterClause {
+                        field: "status".to_string(),
+                        operator: "any_of".to_string(),
+                        values: status_ids,
+                    }]);
                 };
 
                 let on_active = move |_: web_sys::MouseEvent| {
@@ -1152,7 +1202,7 @@ pub(crate) fn IssueListInner(
                             .get()
                             .into_iter()
                             .filter(|s| {
-                                s.category == "started"
+                                (s.category == "unstarted" || s.category == "started")
                                     && (s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
                             })
                             .map(|s| s.status_id)
@@ -1180,7 +1230,7 @@ pub(crate) fn IssueListInner(
                             .get()
                             .into_iter()
                             .filter(|s| {
-                                (s.category == "backlog" || s.category == "unstarted")
+                                s.category == "backlog"
                                     && (s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
                             })
                             .map(|s| s.status_id)
@@ -1200,11 +1250,11 @@ pub(crate) fn IssueListInner(
                         // Default tabs
                         {move || {
                             let tab = active_tab.get();
-                            let all_v = if tab == "all" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
+                            let issues_v = if tab == "issues" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
                             let active_v = if tab == "active" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
                             let backlog_v = if tab == "backlog" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
                             view! {
-                                <Button variant=all_v size=ButtonSize::Pill on:click=on_all>"All Issues"</Button>
+                                <Button variant=issues_v size=ButtonSize::Pill on:click=on_issues>"Issues"</Button>
                                 <Button variant=active_v size=ButtonSize::Pill on:click=on_active>"Active"</Button>
                                 <Button variant=backlog_v size=ButtonSize::Pill on:click=on_backlog>"Backlog"</Button>
                             }
