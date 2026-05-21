@@ -10,6 +10,7 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 - Always create SQLite migrations alongside Postgres migrations. Same schema changes, adapted for SQLite syntax (e.g. no ON DELETE CASCADE).
 - Use `sql_compat` helpers (`now()`, `bool_true()`, `ilike()`, etc.) for dialect-dependent SQL fragments.
 - Generate UUIDs as `Uuid::new_v4().to_string()` for all entity IDs.
+- JSONB columns (e.g. `settings`) must use `CAST(col AS TEXT) AS col` in every SELECT query. The Rust row type declares `Option<String>`, which sqlx decodes as TEXT — Postgres JSONB is not compatible with TEXT without the explicit cast. NULL values happen to work without the cast, masking the bug until real data is written.
 
 ### Service Layer
 - All service functions are free functions with `db: &DbPool` as the first argument.
