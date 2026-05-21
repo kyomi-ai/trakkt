@@ -538,3 +538,21 @@ pub struct Attachment {
     pub size_bytes: i64,
     pub created_at: String,
 }
+
+/// User-submitted feedback (bug report, feature request, or question).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Feedback {
+    pub id: String,
+    pub user_id: String,
+    pub workspace_id: String,
+    pub feedback_type: String,
+    pub description: String,
+    pub screenshot_url: Option<String>,
+    pub include_context: bool,
+    pub context: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+    pub resolution_notes: Option<String>,
+    pub resolved_by: Option<String>,
+}

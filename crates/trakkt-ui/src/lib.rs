@@ -153,4 +153,8 @@ pub fn register_server_functions() {
     register_explicit::<CreateBillingPortalSession>();
     register_explicit::<GetBillingInvoices>();
     register_explicit::<GetStripePublishableKey>();
+
+    // Feedback
+    use server_fns::feedback::*;
+    register_explicit::<SubmitFeedback>();
 }

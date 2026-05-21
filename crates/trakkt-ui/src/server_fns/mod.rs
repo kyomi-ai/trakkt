@@ -9,6 +9,7 @@ pub mod billing;
 pub mod comments;
 pub mod context;
 pub mod favorites;
+pub mod feedback;
 pub mod github;
 pub mod issues;
 pub mod labels;
