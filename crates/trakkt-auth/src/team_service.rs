@@ -148,7 +148,7 @@ pub async fn create_team(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                settings, \
+                CAST(settings AS TEXT) AS settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         &team_id
@@ -189,7 +189,7 @@ pub async fn list_teams(
                 "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                         t.icon_type, t.icon_name, t.icon_color, \
                         COUNT(tm2.user_id) AS member_count, \
-                        t.settings, \
+                        CAST(t.settings AS TEXT) AS settings, \
                         CAST(t.created_at AS TEXT) AS created_at \
                  FROM teams t \
                  INNER JOIN team_members tm ON tm.team_id = t.team_id AND tm.user_id = $2 \
@@ -210,7 +210,7 @@ pub async fn list_teams(
                 "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                         t.icon_type, t.icon_name, t.icon_color, \
                         COUNT(tm.user_id) AS member_count, \
-                        t.settings, \
+                        CAST(t.settings AS TEXT) AS settings, \
                         CAST(t.created_at AS TEXT) AS created_at \
                  FROM teams t \
                  LEFT JOIN team_members tm ON tm.team_id = t.team_id \
@@ -239,7 +239,7 @@ pub async fn list_joinable_teams(
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                 t.icon_type, t.icon_name, t.icon_color, \
                 COUNT(tm.user_id) AS member_count, \
-                t.settings, \
+                CAST(t.settings AS TEXT) AS settings, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
          LEFT JOIN team_members tm ON tm.team_id = t.team_id \
@@ -265,7 +265,7 @@ pub async fn get_team(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                settings, \
+                CAST(settings AS TEXT) AS settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -285,7 +285,7 @@ pub async fn get_team_by_key(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                settings, \
+                CAST(settings AS TEXT) AS settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 AND key = $2",
         workspace_id,
@@ -307,7 +307,7 @@ pub async fn get_default_team(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                settings, \
+                CAST(settings AS TEXT) AS settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1",
         workspace_id
@@ -426,7 +426,7 @@ pub async fn update_team(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                settings, \
+                CAST(settings AS TEXT) AS settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -500,7 +500,7 @@ pub async fn update_team_icon(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                settings, \
+                CAST(settings AS TEXT) AS settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -570,7 +570,7 @@ pub async fn upload_team_icon(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                settings, \
+                CAST(settings AS TEXT) AS settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -664,7 +664,7 @@ pub async fn delete_team_icon(
         "SELECT team_id, workspace_id, name, key, description, icon, \
                 icon_type, icon_name, icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                settings, \
+                CAST(settings AS TEXT) AS settings, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM teams WHERE team_id = $1",
         team_id
@@ -1021,7 +1021,7 @@ pub async fn get_user_teams(
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                 t.icon_type, t.icon_name, t.icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                t.settings, \
+                CAST(t.settings AS TEXT) AS settings, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
          JOIN team_members tm ON tm.team_id = t.team_id \
