@@ -10,7 +10,7 @@ use axum::http::Method;
 use serde_json::json;
 
 use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
-use trakkt_auth::{activity_service, comment_service, issue_service, relation_service, team_service};
+use trakkt_auth::{activity_service, comment_service, issue_service, relation_service, search_service, team_service};
 use trakkt_types::api::{
     CreateIssueApiParams, DeleteIssueApiParams, GetIssueApiParams, InlineRelation,
     ListIssuesApiParams, SearchIssuesApiParams, UpdateIssueApiParams,
@@ -435,16 +435,16 @@ pub async fn delete_issue(
     Ok(json!({ "message": format!("Issue {team_key}-{number} deleted") }))
 }
 
-/// Search issues by title text.
+/// Search issues by text query using full-text search.
 ///
-/// Ported from `tool_search_issues` in `routes/mcp.rs`.
+/// On Postgres, uses tsvector with GIN indexes for ranked results and
+/// snippet context. On SQLite, falls back to LIKE matching.
 pub async fn search_issues(
     ctx: &ApiCtx<'_>,
     params: SearchIssuesApiParams,
 ) -> ApiResult<serde_json::Value> {
     let limit_raw = params.limit.unwrap_or(20);
     let limit = limit_raw.clamp(1, 100);
-    let include_closed = params.include_closed.unwrap_or(false);
 
     let team_id = resolve_team(
         ctx.db,
@@ -454,24 +454,19 @@ pub async fn search_issues(
     )
     .await?;
 
-    let exclude_status_categories = if !include_closed {
-        Some(vec!["completed".to_string(), "cancelled".to_string()])
-    } else {
-        None
+    let search_params = search_service::SearchParams {
+        query: params.query,
+        workspace_id: ctx.workspace_id.clone(),
+        team_id,
+        include_archived: params.include_archived.unwrap_or(false),
+        include_closed: params.include_closed.unwrap_or(false),
+        include_comments: params.include_comments.unwrap_or(true),
+        limit,
+        offset: 0,
     };
 
-    let filters = IssueFilters {
-        search: Some(params.query),
-        exclude_status_categories,
-        limit: Some(limit),
-        ..Default::default()
-    };
-
-    let issues =
-        issue_service::list_issues(ctx.db, &ctx.workspace_id, team_id.as_deref(), &filters)
-            .await?;
-
-    Ok(serde_json::to_value(&issues)?)
+    let results = search_service::search(ctx.db, &search_params).await?;
+    Ok(serde_json::to_value(&results)?)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -499,7 +494,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "search_issues",
-            description: "Search for issues by text query. Matches against issue titles. Returns results ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them.",
+            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns results ranked by relevance with snippet context showing where the match was found. By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues/search",
