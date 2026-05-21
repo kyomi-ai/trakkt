@@ -391,8 +391,9 @@ mod tests {
         assert!(names.contains(&"delete_attachment"));
         assert!(names.contains(&"list_attachments"));
 
-        // Activity operations (1)
+        // Activity operations (2)
         assert!(names.contains(&"list_issue_activities"));
+        assert!(names.contains(&"list_workspace_activities"));
 
         // GitHub link operations (3)
         assert!(names.contains(&"list_issue_github_links"));
@@ -404,8 +405,8 @@ mod tests {
         assert!(names.contains(&"attach_to_issue"));
         assert!(names.contains(&"detach_from_issue"));
 
-        // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 1 + 3 + 3 = 35
-        assert_eq!(ops.len(), 35, "expected 35 total operations");
+        // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 2 + 3 + 3 = 36
+        assert_eq!(ops.len(), 36, "expected 36 total operations");
     }
 
     #[test]

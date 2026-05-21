@@ -480,6 +480,19 @@ pub struct ListIssueActivitiesApiParams {
     pub team_key: Option<String>,
 }
 
+/// Parameters for listing workspace-level activities across all teams.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListWorkspaceActivitiesApiParams {
+    /// Filter by team key (e.g. "TRA")
+    pub team_key: Option<String>,
+    /// Filter by action type (e.g. "status_changed", "comment_added")
+    pub action_type: Option<String>,
+    /// Maximum number of activities to return (default: 50, max: 200)
+    pub limit: Option<i64>,
+    /// Offset for pagination
+    pub offset: Option<i64>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GitHub link operations
 // ─────────────────────────────────────────────────────────────────────────────

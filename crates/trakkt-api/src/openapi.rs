@@ -128,6 +128,9 @@ fn derive_tag(rest_path: &str) -> &'static str {
     if rest_path.starts_with("/projects") {
         return "Projects";
     }
+    if rest_path.starts_with("/activities") {
+        return "Activities";
+    }
     if rest_path.starts_with("/github") {
         return "GitHub";
     }
@@ -217,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn all_35_operations_present() {
+    fn all_36_operations_present() {
         let spec = generate_openapi_spec();
         let paths = spec["paths"].as_object().expect("paths should be an object");
 
@@ -233,7 +236,7 @@ mod tests {
         }
         operation_ids.sort();
 
-        assert_eq!(operation_ids.len(), 35, "expected 35 operations, got {}: {operation_ids:?}", operation_ids.len());
+        assert_eq!(operation_ids.len(), 36, "expected 36 operations, got {}: {operation_ids:?}", operation_ids.len());
     }
 
     #[test]
