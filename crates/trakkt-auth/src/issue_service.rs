@@ -503,14 +503,16 @@ pub async fn list_issues(
     let where_clause = conditions.join(" AND ");
 
     // Inline LIMIT/OFFSET per CODING_STANDARDS.md (sanitized i64 values).
-    let limit = filters.limit.unwrap_or(100);
-    let offset = filters.offset.unwrap_or(0);
+    let limit_offset = match (filters.limit, filters.offset.filter(|&o| o > 0)) {
+        (Some(limit), Some(offset)) => format!(" LIMIT {limit} OFFSET {offset}"),
+        (Some(limit), None) => format!(" LIMIT {limit}"),
+        (None, _) => String::new(),
+    };
 
     let sql = format!(
         "{ISSUE_DETAIL_SELECT} \
          WHERE {where_clause} \
-         ORDER BY i.priority ASC, i.created_at DESC \
-         LIMIT {limit} OFFSET {offset}"
+         ORDER BY i.priority ASC, i.created_at DESC{limit_offset}"
     );
 
     // Prepare the search term with wildcards, escaping LIKE special chars.
