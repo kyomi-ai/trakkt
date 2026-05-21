@@ -13,6 +13,7 @@ pub mod cookies;
 pub mod email_service;
 pub mod favorite_service;
 pub mod encryption;
+pub mod feedback_service;
 pub mod google_oauth;
 pub mod issue_service;
 pub mod jwt;
