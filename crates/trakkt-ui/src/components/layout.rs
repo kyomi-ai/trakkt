@@ -13,7 +13,7 @@ use phosphor_leptos::{Icon, IconWeight};
 use std::collections::HashMap;
 use crate::cache::store::SyncStore;
 use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon};
-use crate::components::{Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, Spinner, TeamCreationModal, TeamIcon};
+use crate::components::{Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, FeedbackModal, Spinner, TeamCreationModal, TeamIcon};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
@@ -30,11 +30,16 @@ pub fn Layout() -> impl IntoView {
     let (user_menu_open, set_user_menu_open) = signal(false);
     let (mobile_sidebar_open, set_mobile_sidebar_open) = signal(false);
     let (show_palette, set_show_palette) = signal(false);
+    let (show_feedback, set_show_feedback) = signal(false);
 
     // Provide SyncStore on all targets so page components can reference it.
     // On SSR it remains empty; on WASM the sync engine populates it.
     let sync_store = SyncStore::new();
     provide_context(sync_store);
+
+    // Initialize console.error interceptor for feedback context collection.
+    #[cfg(target_arch = "wasm32")]
+    crate::utils::feedback_context::init();
     provide_context(CreateIssueTrigger(RwSignal::new(false)));
     let initial_expand_state: HashMap<String, bool> = {
         #[cfg(target_arch = "wasm32")]
@@ -191,7 +196,7 @@ pub fn Layout() -> impl IntoView {
             <div class="h-dvh flex bg-background">
                 // Desktop sidebar
                 <div class="hidden md:block">
-                    <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open/>
+                    <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open set_show_feedback=set_show_feedback/>
                 </div>
 
                 // Mobile sidebar overlay
@@ -202,7 +207,7 @@ pub fn Layout() -> impl IntoView {
                             on:click=move |_| set_mobile_sidebar_open.set(false)
                         />
                         <div class="fixed inset-y-0 left-0 z-50 w-[220px]">
-                            <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open/>
+                            <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open set_show_feedback=set_show_feedback/>
                         </div>
                     </div>
                 </Show>
@@ -245,6 +250,12 @@ pub fn Layout() -> impl IntoView {
                 show=Signal::derive(move || show_palette.get())
                 on_close=Callback::new(move |()| set_show_palette.set(false))
             />
+
+            // Feedback modal — rendered at the app level, triggered from user menu.
+            <FeedbackModal
+                show=Signal::derive(move || show_feedback.get())
+                on_open_change=Callback::new(move |open: bool| set_show_feedback.set(open))
+            />
         </Show>
     }
 }
@@ -255,6 +266,7 @@ fn Sidebar(
     user_info: LocalResource<Result<SidebarUser, ServerFnError>>,
     user_menu_open: ReadSignal<bool>,
     set_user_menu_open: WriteSignal<bool>,
+    set_show_feedback: WriteSignal<bool>,
 ) -> impl IntoView {
     let user_menu_trigger_ref = NodeRef::<leptos::html::Div>::new();
 
@@ -293,6 +305,7 @@ fn Sidebar(
                             let display_name = user.name.clone().unwrap_or_else(|| user.email.clone());
                             let avatar_char = user.name.as_ref().and_then(|n| n.chars().next()).unwrap_or('?').to_uppercase().to_string();
                             let ws_name = user.workspace_name.clone().unwrap_or_default();
+                            let is_personal = user.is_personal_mode;
                             view! {
                                 <div node_ref=user_menu_trigger_ref>
                                     <button
@@ -332,6 +345,18 @@ fn Sidebar(
                                     <a href="/settings/profile" class="block px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors">
                                         "Settings"
                                     </a>
+                                    {(!is_personal).then(|| view! {
+                                        <button
+                                            class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors flex items-center gap-2"
+                                            on:click=move |_| {
+                                                set_user_menu_open.set(false);
+                                                set_show_feedback.set(true);
+                                            }
+                                        >
+                                            <Icon icon=phosphor_leptos::CHAT_CIRCLE weight=IconWeight::Regular size="16px"/>
+                                            "Send Feedback"
+                                        </button>
+                                    })}
                                     <button
                                         class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
                                         on:click=move |_| {
