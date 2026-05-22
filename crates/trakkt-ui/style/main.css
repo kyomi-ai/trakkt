@@ -968,6 +968,19 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
     font-style: italic;
 }
 
+/* ── Link hover: visible indicator so users know links are clickable ── */
+
+.wysiwyg-container .wysiwyg-link,
+.wysiwyg-container a {
+    cursor: pointer;
+    transition: color var(--kode-transition-duration, 0.15s) ease;
+}
+
+.wysiwyg-container .wysiwyg-link:hover,
+.wysiwyg-container a:hover {
+    color: var(--color-primary);
+}
+
 .kode-toolbar { overflow-y: hidden; }
 
 
