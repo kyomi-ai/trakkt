@@ -549,12 +549,17 @@ fn SidebarWorkspaceSection() -> impl IntoView {
                 }.into_any();
             }
 
-            // Workspace-scoped views (team_id is None).
+            // Workspace-scoped views (team_id is None), excluding any whose
+            // name collides with the hardcoded preset views above.
+            const PRESET_NAMES: &[&str] = &["Issues", "Active", "Backlog"];
             let mut workspace_views: Vec<trakkt_types::models::View> = store
                 .views()
                 .get()
                 .into_iter()
-                .filter(|v| v.team_id.is_none())
+                .filter(|v| {
+                    v.team_id.is_none()
+                        && !PRESET_NAMES.iter().any(|p| p.eq_ignore_ascii_case(&v.name))
+                })
                 .collect();
             workspace_views.sort_by_key(|v| v.position);
 
@@ -825,30 +830,20 @@ fn SidebarTeamSubNav(
         if issues_active.get() { IconWeight::Fill } else { IconWeight::Light }
     });
 
-    // Active state for Active/Backlog — match path + query param.
-    // Check BOTH the new `view=active` format and the legacy `status=in_progress`
-    // format for backward compatibility.
     let issues_href_match_for_active = issues_href.clone();
     let started_active = Signal::derive(move || {
         path.get().starts_with(&issues_href_match_for_active)
-            && search.get().split('&').any(|p| {
-                p == "view=active" || p == "status=in_progress"
-            })
+            && search.get().split('&').any(|p| p == "view=active")
     });
     let issues_href_match_for_backlog = issues_href.clone();
     let backlog_active = Signal::derive(move || {
         path.get().starts_with(&issues_href_match_for_backlog)
-            && search.get().split('&').any(|p| {
-                p == "view=backlog" || p == "status=backlog"
-            })
+            && search.get().split('&').any(|p| p == "view=backlog")
     });
 
-    // Issues "plain" active: on the issues page but WITHOUT a view/status query param
     let issues_no_filter_active = Signal::derive(move || {
         issues_active.get()
-            && !search.get().split('&').any(|p| {
-                p.starts_with("view=") || p.starts_with("status=")
-            })
+            && !search.get().split('&').any(|p| p.starts_with("view="))
     });
 
     // ── Expand/collapse state from shared context ──────────────────────────

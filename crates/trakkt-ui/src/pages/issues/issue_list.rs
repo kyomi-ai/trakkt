@@ -187,14 +187,6 @@ fn build_query_string(
         params.push(format!("view={view}"));
     }
 
-    // For backward compat: when view=active, also include status=in_progress
-    // so old sidebar active-state detection still works.
-    if view == "active" {
-        params.push("status=in_progress".to_string());
-    } else if view == "backlog" {
-        params.push("status=backlog".to_string());
-    }
-
     // Filters — omit when empty.
     if !clauses.is_empty() {
         match serde_json::to_string(clauses) {
@@ -459,6 +451,9 @@ pub(crate) fn IssueListInner(
     });
 
     // ── Custom views (team-scoped or workspace-scoped) ─────────────────
+    // Exclude views whose names collide with the hardcoded preset tabs
+    // (Issues, Active, Backlog) to prevent duplicates.
+    const PRESET_TAB_NAMES: &[&str] = &["Issues", "Active", "Backlog"];
     let custom_views = Memo::new(move |_| {
         let Some(store) = sync_store else { return Vec::new() };
         let team = resolved_team.get();
@@ -466,9 +461,15 @@ pub(crate) fn IssueListInner(
             .views()
             .get()
             .into_iter()
-            .filter(|v| match &team {
-                Some(t) => v.team_id.as_deref() == Some(t.team_id.as_str()),
-                None => v.team_id.is_none(),
+            .filter(|v| {
+                let scope_match = match &team {
+                    Some(t) => v.team_id.as_deref() == Some(t.team_id.as_str()),
+                    None => v.team_id.is_none(),
+                };
+                scope_match
+                    && !PRESET_TAB_NAMES
+                        .iter()
+                        .any(|p| p.eq_ignore_ascii_case(&v.name))
             })
             .collect();
         views.sort_by_key(|v| v.position);
