@@ -1548,9 +1548,10 @@ fn DescriptionEditor(
     });
 
     // Attachment callbacks — pass issue_id so uploads are auto-linked.
+    let error_toast = crate::components::toast::capture_error_toast();
     let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
-    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()));
-    let on_delete = crate::components::attachment_hooks::make_delete_callback();
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()), error_toast.clone());
+    let on_delete = crate::components::attachment_hooks::make_delete_callback(error_toast.clone());
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
     // ── "Attach file" slash command extension ───────────────────────────
@@ -1581,9 +1582,11 @@ fn DescriptionEditor(
     // When a file is selected via the extension's file picker, read, validate,
     // upload, and inject the resulting markdown into the editor content.
     let stored_issue_id = StoredValue::new(issue_id);
+    let error_toast_for_attach = error_toast.clone();
     let on_attach_file_selected = move |_ev: leptos::ev::Event| {
         let _stored_issue_id = stored_issue_id;
         let _on_change_for_attach = on_change_for_attach.clone();
+        let _error_toast = error_toast_for_attach.clone();
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -1611,6 +1614,7 @@ fn DescriptionEditor(
 
             if size > MAX_FILE_SIZE {
                 tracing::warn!("Attach file: too large ({size} bytes)");
+                _error_toast("File exceeds 10 MB size limit".to_string());
                 input.set_value("");
                 return;
             }
@@ -1620,11 +1624,13 @@ fn DescriptionEditor(
                 && !ALLOWED_CONTENT_TYPES.contains(&content_type.as_str())
             {
                 tracing::warn!("Attach file: type not allowed (ext={ext}, content_type={content_type})");
+                _error_toast("File type not allowed".to_string());
                 input.set_value("");
                 return;
             }
 
             let issue_id = _stored_issue_id.get_value();
+            let error_toast_spawn = _error_toast.clone();
 
             leptos::task::spawn_local(async move {
                 let data = {
@@ -1634,6 +1640,7 @@ fn DescriptionEditor(
                         Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
                         Err(_) => {
                             tracing::warn!("Attach file: failed to read file bytes");
+                            error_toast_spawn("Failed to read file".to_string());
                             return;
                         }
                     }
@@ -1659,6 +1666,7 @@ fn DescriptionEditor(
                     }
                     Err(e) => {
                         tracing::warn!("Attach file: upload failed: {e}");
+                        error_toast_spawn(format!("Upload failed: {e}"));
                     }
                 }
                 if let Some(input_el) = attach_file_input_ref.get() {
@@ -2574,9 +2582,10 @@ fn NewCommentForm(
     });
 
     // Attachment callbacks — pass issue_id so uploads are auto-linked.
+    let error_toast = crate::components::toast::capture_error_toast();
     let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
-    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()));
-    let on_delete = crate::components::attachment_hooks::make_delete_callback();
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()), error_toast.clone());
+    let on_delete = crate::components::attachment_hooks::make_delete_callback(error_toast.clone());
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
     // ── "Attach file" slash command extension ───────────────────────────
@@ -2607,9 +2616,11 @@ fn NewCommentForm(
     // When a file is selected via the extension's file picker, read, validate,
     // upload, and inject the resulting markdown into the editor content.
     let stored_issue_id = StoredValue::new(issue_id);
+    let error_toast_for_attach = error_toast.clone();
     let on_attach_file_selected = move |_ev: leptos::ev::Event| {
         let _stored_issue_id = stored_issue_id;
         let _on_change_for_attach = on_change_for_attach.clone();
+        let _error_toast = error_toast_for_attach.clone();
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -2637,6 +2648,7 @@ fn NewCommentForm(
 
             if size > MAX_FILE_SIZE {
                 tracing::warn!("Attach file: too large ({size} bytes)");
+                _error_toast("File exceeds 10 MB size limit".to_string());
                 input.set_value("");
                 return;
             }
@@ -2646,11 +2658,13 @@ fn NewCommentForm(
                 && !ALLOWED_CONTENT_TYPES.contains(&content_type.as_str())
             {
                 tracing::warn!("Attach file: type not allowed (ext={ext}, content_type={content_type})");
+                _error_toast("File type not allowed".to_string());
                 input.set_value("");
                 return;
             }
 
             let issue_id = _stored_issue_id.get_value();
+            let error_toast_spawn = _error_toast.clone();
 
             leptos::task::spawn_local(async move {
                 let data = {
@@ -2660,6 +2674,7 @@ fn NewCommentForm(
                         Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
                         Err(_) => {
                             tracing::warn!("Attach file: failed to read file bytes");
+                            error_toast_spawn("Failed to read file".to_string());
                             return;
                         }
                     }
@@ -2683,6 +2698,7 @@ fn NewCommentForm(
                     }
                     Err(e) => {
                         tracing::warn!("Attach file: upload failed: {e}");
+                        error_toast_spawn(format!("Upload failed: {e}"));
                     }
                 }
                 // Reset the file input so the same file can be re-selected.
@@ -2854,13 +2870,16 @@ fn AttachmentsSection(
     // ── Upload via hidden file input ────────────────────────────────────
     let file_input_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let (uploading, set_uploading) = signal(false);
+    let error_toast = crate::components::toast::capture_error_toast();
     let stored_issue_id = StoredValue::new(issue_id);
 
     // Upload handler: reads the selected file from the input, uploads via
     // fetch to `/api/v1/attachments?issue_id=...`, then bumps version.
+    let error_toast_for_upload = error_toast.clone();
     let on_file_selected = move |_ev: leptos::ev::Event| {
         let _set_uploading = set_uploading;
         let _stored_issue_id = stored_issue_id;
+        let _error_toast = error_toast_for_upload.clone();
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -2888,6 +2907,7 @@ fn AttachmentsSection(
 
             if size > MAX_FILE_SIZE {
                 tracing::warn!("File too large: {size} bytes");
+                _error_toast("File exceeds 10 MB size limit".to_string());
                 input.set_value("");
                 return;
             }
@@ -2897,12 +2917,14 @@ fn AttachmentsSection(
                 && !ALLOWED_CONTENT_TYPES.contains(&content_type.as_str())
             {
                 tracing::warn!("File type not allowed: ext={ext}, content_type={content_type}");
+                _error_toast("File type not allowed".to_string());
                 input.set_value("");
                 return;
             }
 
             let issue_id = _stored_issue_id.get_value();
             _set_uploading.set(true);
+            let error_toast_spawn = _error_toast.clone();
 
             leptos::task::spawn_local(async move {
                 let data = {
@@ -2936,6 +2958,7 @@ fn AttachmentsSection(
                         Ok(result) => Uint8Array::new(&result).to_vec(),
                         Err(_) => {
                             tracing::warn!("Failed to read file");
+                            error_toast_spawn("Failed to read file".to_string());
                             _set_uploading.set(false);
                             return;
                         }
@@ -2947,6 +2970,7 @@ fn AttachmentsSection(
                     }
                     Err(e) => {
                         tracing::warn!("Attachment upload failed: {e}");
+                        error_toast_spawn(format!("Upload failed: {e}"));
                     }
                 }
                 _set_uploading.set(false);
@@ -3010,7 +3034,8 @@ fn AttachmentsSection(
                         // ── Attachment rows ────────────────────────────────
                         {if total > 0 {
                             let tk_for_rows = tk_for_detach.clone();
-                            let rows = attachments.into_iter().map(|att| {
+                            let error_toast_for_rows = error_toast.clone();
+                            let rows = attachments.into_iter().map(move |att| {
                                 let att_id_for_detach = att.attachment_id.clone();
                                 let download_url = format!("/api/v1/attachments/{}/download", att.attachment_id);
                                 let download_url_click = download_url.clone();
@@ -3019,6 +3044,7 @@ fn AttachmentsSection(
                                 let size_str = format_bytes(att.size_bytes);
                                 let filename = att.filename.clone();
                                 let tk_row = tk_for_rows.clone();
+                                let error_toast_row = error_toast_for_rows.clone();
 
                                 view! {
                                     <div
@@ -3078,10 +3104,14 @@ fn AttachmentsSection(
                                                 ev.stop_propagation();
                                                 let aid = att_id_for_detach.clone();
                                                 let tk = tk_row.clone();
+                                                let error_toast_detach = error_toast_row.clone();
                                                 leptos::task::spawn_local(async move {
                                                     match detach_attachment_from_issue(tk, number, aid).await {
                                                         Ok(_) => { let _ = set_version.try_update(|v| *v += 1); },
-                                                        Err(e) => tracing::warn!("Failed to detach attachment: {e}"),
+                                                        Err(e) => {
+                                                            tracing::warn!("Failed to detach attachment: {e}");
+                                                            error_toast_detach(format!("Failed to remove attachment: {e}"));
+                                                        }
                                                     }
                                                 });
                                             }
