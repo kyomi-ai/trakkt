@@ -23,6 +23,7 @@ use crate::pages::auth::{
 use crate::pages::accept_ownership::AcceptOwnershipPage;
 use crate::pages::activity::ActivityPage;
 use crate::pages::inbox::InboxPage;
+use crate::pages::issues::archived::{ArchivedIssuesForTeam, ArchivedIssuesPage};
 use crate::pages::issues::issue_detail::IssueDetailPage;
 use crate::pages::issues::issue_list::{IssueListForTeam, IssueListPage};
 use crate::pages::issues::my_issues::MyIssuesPage;
@@ -119,6 +120,9 @@ pub fn App() -> impl IntoView {
                     // My Issues — cross-team view of issues assigned to the current user
                     <Route path=path!("/my-issues") view=MyIssuesPage/>
 
+                    // Archived issues — workspace-wide
+                    <Route path=path!("/archived") view=ArchivedIssuesPage/>
+
                     // Workspace-level issue list (cross-team)
                     <Route path=path!("/workspace") view=IssueListPage/>
 
@@ -128,6 +132,7 @@ pub fn App() -> impl IntoView {
                     // Team-scoped views — components read :key from route params internally
                     <Route path=path!("/teams/:key/settings") view=TeamSettingsPage/>
                     <Route path=path!("/teams/:key/issues") view=IssueListForTeam/>
+                    <Route path=path!("/teams/:key/archived") view=ArchivedIssuesForTeam/>
 
                     // Legacy /issues redirect — send to /my-issues
                     <Route path=path!("/issues") view=|| view! { <Redirect path="/my-issues"/> }/>
