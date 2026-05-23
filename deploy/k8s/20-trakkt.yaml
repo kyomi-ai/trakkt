@@ -31,7 +31,7 @@ spec:
       containers:
         - name: trakkt
           image: trakkt:latest  # Replace with your registry, e.g. ghcr.io/your-org/trakkt:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8003

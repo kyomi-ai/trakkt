@@ -112,13 +112,13 @@ pub fn build_router(state: state::AppState) -> Router {
                 }
             }
         }))
+        .route("/", axum::routing::get(leptos_frontend::serve_leptos_shell))
         .route("/login", axum::routing::get(leptos_frontend::serve_leptos_shell))
         .route("/signup", axum::routing::get(leptos_frontend::serve_leptos_shell))
         .fallback_service(
-            leptos_frontend::static_files_service()
-                .not_found_service(tower::service_fn(|_req| async {
-                    Ok::<_, std::convert::Infallible>(leptos_frontend::serve().await)
-                })),
+            leptos_frontend::static_files_service(tower::service_fn(|_req| async {
+                Ok::<_, std::convert::Infallible>(leptos_frontend::serve().await)
+            })),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -131,8 +131,11 @@ pub fn build_router(state: state::AppState) -> Router {
         .layer(RequestBodyLimitLayer::new(16 * 1024 * 1024))
 }
 
-async fn health_handler() -> &'static str {
-    "ok"
+async fn health_handler() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "commit": env!("TRAKKT_GIT_SHA"),
+    }))
 }
 
 /// Wrap a completed Router with path normalization and connect-info extraction.
