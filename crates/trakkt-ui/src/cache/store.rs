@@ -539,7 +539,6 @@ impl SyncStore {
             inner.initialized.set(false);
             inner.activities_version.set(0);
             inner.relations_version.set(0);
-            inner.workspace_id.set(None);
         });
     }
 }
