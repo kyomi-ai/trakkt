@@ -229,8 +229,16 @@ pub fn create_storage(config: &trakkt_core::Config) -> Result<Box<dyn Attachment
                 S3AttachmentStorage::new(endpoint, bucket, access_key, secret_key, region)?;
             Ok(Box::new(storage))
         }
-        _ => Ok(Box::new(LocalAttachmentStorage::new(
-            config.attachment_local_path.clone(),
-        ))),
+        _ => {
+            std::fs::create_dir_all(&config.attachment_local_path).map_err(|e| {
+                trakkt_core::Error::Internal(format!(
+                    "Failed to create attachment directory '{}': {e}",
+                    config.attachment_local_path
+                ))
+            })?;
+            Ok(Box::new(LocalAttachmentStorage::new(
+                config.attachment_local_path.clone(),
+            )))
+        }
     }
 }

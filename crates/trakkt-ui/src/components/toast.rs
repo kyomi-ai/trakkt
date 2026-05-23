@@ -94,7 +94,7 @@ pub fn toast_info(message: impl Into<String>) {
 ///
 /// Must be called from a component body or event handler. The returned
 /// closure is `Clone + 'static` and safe to move into `spawn_local`.
-pub fn capture_error_toast() -> impl Fn(String) + Clone + 'static {
+pub fn capture_error_toast() -> impl Fn(String) + Clone + Send + Sync + 'static {
     let state = use_context::<ToastState>();
     move |message: String| {
         let Some(state) = state else { return };

@@ -46,6 +46,7 @@ pub struct LightboxState {
 pub fn make_upload_callback(
     upload_complete: RwSignal<Option<UploadComplete>>,
     issue_id: Option<String>,
+    error_toast: impl Fn(String) + Clone + Send + Sync + 'static,
 ) -> Arc<dyn Fn(UploadTrigger) + Send + Sync> {
     Arc::new(move |trigger: UploadTrigger| {
         let placeholder_id = trigger.placeholder_id.clone();
@@ -56,6 +57,7 @@ pub fn make_upload_callback(
                 "Attachment rejected: {} exceeds max size ({} > {})",
                 trigger.name, trigger.size, MAX_FILE_SIZE
             );
+            error_toast("File exceeds 10 MB size limit".to_string());
             upload_complete.set(Some(UploadComplete {
                 placeholder_id,
                 insert: None,
@@ -72,6 +74,7 @@ pub fn make_upload_callback(
                 "Attachment rejected: {} has disallowed type (ext={}, content_type={})",
                 trigger.name, ext, trigger.content_type
             );
+            error_toast("File type not allowed".to_string());
             upload_complete.set(Some(UploadComplete {
                 placeholder_id,
                 insert: None,
@@ -81,6 +84,7 @@ pub fn make_upload_callback(
 
         // Spawn the async upload
         let issue_id = issue_id.clone();
+        let error_toast = error_toast.clone();
         leptos::task::spawn_local(async move {
             match upload_file(&trigger.data, &trigger.name, &trigger.content_type, issue_id.as_deref()).await {
                 Ok(resp) => {
@@ -108,6 +112,7 @@ pub fn make_upload_callback(
                 }
                 Err(e) => {
                     tracing::warn!("Attachment upload failed: {e}");
+                    error_toast(format!("Upload failed: {e}"));
                     upload_complete.set(Some(UploadComplete {
                         placeholder_id,
                         insert: None,
@@ -119,12 +124,16 @@ pub fn make_upload_callback(
 }
 
 /// Create the `on_delete_attachment` callback that DELETEs via `/api/v1/attachments/{id}`.
-pub fn make_delete_callback() -> Arc<dyn Fn(DeleteAttachmentRequest) + Send + Sync> {
+pub fn make_delete_callback(
+    error_toast: impl Fn(String) + Clone + Send + Sync + 'static,
+) -> Arc<dyn Fn(DeleteAttachmentRequest) + Send + Sync> {
     Arc::new(move |req: DeleteAttachmentRequest| {
         if let Some(attachment_id) = req.attachment_id {
+            let error_toast = error_toast.clone();
             leptos::task::spawn_local(async move {
                 if let Err(e) = delete_attachment(&attachment_id).await {
                     tracing::warn!("Failed to delete attachment {attachment_id}: {e}");
+                    error_toast(format!("Failed to remove attachment: {e}"));
                 }
             });
         }
