@@ -341,6 +341,7 @@ pub struct IssueRelationWithDetails {
     pub number: i32,
     pub title: String,
     pub status_category: String,
+    pub status_name: String,
     pub direction: String,
 }
 

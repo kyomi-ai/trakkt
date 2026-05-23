@@ -12,6 +12,7 @@
 //! - Backlog:     text-muted-foreground (dashed circle)
 //! - Unstarted:   text-muted-foreground (empty circle)
 //! - Started:     text-primary / teal   (half-filled circle)
+//! - Review:      text-primary / teal   (three-quarter-filled circle)
 //! - Completed:   text-primary / teal   (filled circle + checkmark)
 //! - Cancelled:   text-muted-foreground (circle + X)
 
@@ -23,16 +24,26 @@ pub enum IssueStatusVariant {
     Backlog,
     Unstarted,
     Started,
+    Review,
     Completed,
     Cancelled,
 }
 
 impl IssueStatusVariant {
-    /// Parse a status category string into a variant.
-    pub fn parse(s: &str) -> Self {
-        match s {
+    /// Parse a status category + name into a variant.
+    ///
+    /// The `status_name` distinguishes sub-states within a category — e.g.
+    /// "In Review" vs other `started` statuses get a distinct icon.
+    pub fn parse(category: &str, status_name: &str) -> Self {
+        match category {
             "unstarted" => Self::Unstarted,
-            "started" => Self::Started,
+            "started" => {
+                if status_name.eq_ignore_ascii_case("in review") {
+                    Self::Review
+                } else {
+                    Self::Started
+                }
+            }
             "completed" => Self::Completed,
             "cancelled" => Self::Cancelled,
             _ => Self::Backlog,
@@ -47,6 +58,7 @@ impl IssueStatusVariant {
             // maps to the same value today; update if tokens diverge.
             Self::Unstarted => "text-muted-foreground",
             Self::Started => "text-primary",
+            Self::Review => "text-primary",
             Self::Completed => "text-primary",
             Self::Cancelled => "text-muted-foreground",
         }
@@ -58,6 +70,7 @@ impl IssueStatusVariant {
             Self::Backlog => "Backlog",
             Self::Unstarted => "Unstarted",
             Self::Started => "Started",
+            Self::Review => "In Review",
             Self::Completed => "Completed",
             Self::Cancelled => "Cancelled",
         }
@@ -70,6 +83,7 @@ pub fn view_status_icon(variant: IssueStatusVariant, size: String) -> impl IntoV
         IssueStatusVariant::Backlog => view_backlog(size).into_any(),
         IssueStatusVariant::Unstarted => view_unstarted(size).into_any(),
         IssueStatusVariant::Started => view_started(size).into_any(),
+        IssueStatusVariant::Review => view_review(size).into_any(),
         IssueStatusVariant::Completed => view_completed(size).into_any(),
         IssueStatusVariant::Cancelled => view_cancelled(size).into_any(),
     }
@@ -117,6 +131,22 @@ fn view_started(size: String) -> impl IntoView {
         >
             <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" fill="none"/>
             <path d="M8 2a6 6 0 0 1 0 12" fill="currentColor"/>
+        </svg>
+    }
+}
+
+/// In Review: three-quarter-filled circle (top-left quarter unfilled).
+fn view_review(size: String) -> impl IntoView {
+    view! {
+        <svg
+            width=size.clone()
+            height=size
+            viewBox="0 0 16 16"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+        >
+            <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" fill="none"/>
+            <path d="M8 8 L8 2 A6 6 0 1 1 2 8 Z" fill="currentColor"/>
         </svg>
     }
 }

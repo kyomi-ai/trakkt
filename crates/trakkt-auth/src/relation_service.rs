@@ -51,6 +51,7 @@ struct IssueRelationDetailRow {
     number: i32,
     title: String,
     status_category: String,
+    status_name: String,
     direction: String,
 }
 
@@ -64,6 +65,7 @@ impl IssueRelationDetailRow {
             number: self.number,
             title: self.title,
             status_category: self.status_category,
+            status_name: self.status_name,
             direction: self.direction,
         }
     }
@@ -438,6 +440,7 @@ pub async fn list_relations_for_issue(
             other_i.number, \
             other_i.title, \
             s.category AS status_category, \
+            s.name AS status_name, \
             CASE \
                 WHEN r.source_issue_id = $1 AND r.relation_type = 'blocks' THEN 'blocks' \
                 WHEN r.target_issue_id = $1 AND r.relation_type = 'blocks' THEN 'blocked_by' \

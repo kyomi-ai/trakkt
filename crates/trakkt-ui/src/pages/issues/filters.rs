@@ -309,7 +309,7 @@ pub fn StatusFilterDropdown(
                 .get()
                 .iter()
                 .find(|s| s.status_id == v[0])
-                .map(|s| IssueStatusVariant::parse(&s.category))
+                .map(|s| IssueStatusVariant::parse(&s.category, &s.name))
         } else {
             None
         }
@@ -342,7 +342,7 @@ pub fn StatusFilterDropdown(
                 let status_id = status.status_id.clone();
                 let status_id_check = status.status_id.clone();
                 let label = status.name.clone();
-                let variant = IssueStatusVariant::parse(&status.category);
+                let variant = IssueStatusVariant::parse(&status.category, &status.name);
                 view! {
                     <DropdownItem
                         label=label
@@ -1393,7 +1393,7 @@ fn StatusValuePicker(
             let status_id = status.status_id.clone();
             let status_id_for_check = status.status_id.clone();
             let label = status.name.clone();
-            let variant = IssueStatusVariant::parse(&status.category);
+            let variant = IssueStatusVariant::parse(&status.category, &status.name);
             view! {
                 <div
                     class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
