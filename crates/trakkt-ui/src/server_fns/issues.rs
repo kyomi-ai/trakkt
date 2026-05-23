@@ -326,6 +326,37 @@ pub async fn get_archived_issues(
     Ok(issues)
 }
 
+/// Unarchive an issue by clearing its `archived_at` timestamp.
+///
+/// Uses `update_issue` with an empty update — the service layer always sets
+/// `archived_at = NULL` on any update (see issue_service.rs ~line 635).
+#[server(prefix = "/leptos-api")]
+pub async fn unarchive_issue(team_key: String, number: i32) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::UpdateIssueApiParams {
+        issue_identifier: Some(format!("{team_key}-{number}")),
+        team_key: None,
+        issue_number: None,
+        title: None,
+        description: None,
+        status_id: None,
+        priority: None,
+        assignee: None,
+        labels: None,
+        due_date: None,
+        move_to_team_key: None,
+        move_to_team_id: None,
+        project_id: None,
+        milestone_id: None,
+        parent_issue_id: None,
+        estimate: None,
+        sort_order: None,
+    };
+    trakkt_api::issues::update_issue(&ctx, params).await.into_sfn()?;
+    Ok(())
+}
+
 /// Replace all labels on an issue.
 ///
 /// `label_ids` is a comma-separated string of label UUIDs.

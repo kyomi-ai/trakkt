@@ -36,7 +36,7 @@ use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::pages::views::FilterClause;
 use crate::server_fns::context::UserContext;
-use crate::server_fns::issues::{get_archived_issues, list_issues};
+use crate::server_fns::issues::list_issues;
 use crate::server_fns::watchers::list_watched_issue_ids;
 use crate::types::IssueNavState;
 use crate::utils::keyboard::is_input_focused;
@@ -64,29 +64,7 @@ pub fn MyIssuesPage() -> impl IntoView {
     let (search, set_search) = signal(String::new());
     let (status_filter, set_status_filter) = signal(Vec::<String>::new());
     let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
-    let (show_archived, set_show_archived) = signal(false);
     let (show_save_view, set_show_save_view) = signal(false);
-
-    // ── Server-fetched archived issues (fetched on demand when toggle is ON) ──
-    let archived_issues_signal = RwSignal::new(Vec::<IssueWithDetails>::new());
-
-    Effect::new(move |_| {
-        let showing = show_archived.get();
-        if !showing {
-            archived_issues_signal.set(Vec::new());
-            return;
-        }
-        // My Issues page is cross-team, so fetch all archived issues (empty team_id).
-        leptos::task::spawn_local(async move {
-            match get_archived_issues(String::new(), None, None).await {
-                Ok(issues) => archived_issues_signal.set(issues),
-                Err(e) => {
-                    tracing::warn!("Failed to fetch archived issues: {e}");
-                    archived_issues_signal.set(Vec::new());
-                }
-            }
-        });
-    });
 
     // ── Sort state (default: updated date, newest first for My Issues) ────
     let (sort_field, set_sort_field) = signal(SortField::UpdatedDate);
@@ -115,10 +93,8 @@ pub fn MyIssuesPage() -> impl IntoView {
     );
 
     // ── All issues (raw, unfiltered) ──────────────────────────────────────
-    // Merges SyncStore / server fallback issues with server-fetched archived
-    // issues (when show_archived is ON), deduplicating by issue_id.
     let all_issues = Memo::new(move |_| {
-        let base = if let Some(store) = sync_store {
+        if let Some(store) = sync_store {
             let issues = store.issues().get();
             if !issues.is_empty() || store.initialized().get() {
                 issues
@@ -147,27 +123,13 @@ pub fn MyIssuesPage() -> impl IntoView {
                 }
                 None => Vec::new(),
             }
-        };
-
-        // Merge server-fetched archived issues (deduplicating by issue_id).
-        let server_archived = archived_issues_signal.get();
-        if server_archived.is_empty() {
-            return base;
         }
-        let existing_ids: HashSet<String> = base.iter().map(|i| i.issue_id.clone()).collect();
-        let mut merged = base;
-        for issue in server_archived {
-            if !existing_ids.contains(&issue.issue_id) {
-                merged.push(issue);
-            }
-        }
-        merged
     });
 
-    // ── Filter helper (closure over search/status/priority/archive signals) ─
+    // ── Filter helper (closure over search/status/priority signals) ────────
     let passes_filters = move |issue: &IssueWithDetails| -> bool {
-        // Archive filter: hide archived issues unless the toggle is on.
-        if !show_archived.get() && is_archived(issue, ARCHIVE_DAYS) {
+        // Exclude archived issues — they have their own dedicated page.
+        if is_archived(issue, ARCHIVE_DAYS) {
             return false;
         }
 
@@ -382,20 +344,6 @@ pub fn MyIssuesPage() -> impl IntoView {
                         set_sort_direction.set(d);
                     })
                 />
-                <button
-                    class=move || {
-                        if show_archived.get() {
-                            "px-2 py-1 text-xs rounded-md border border-primary bg-primary/10 text-primary transition-colors flex items-center gap-1"
-                        } else {
-                            "px-2 py-1 text-xs rounded-md border border-border text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
-                        }
-                    }
-                    on:click=move |_| set_show_archived.update(|v| *v = !*v)
-                    title="Show archived issues"
-                >
-                    <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
-                    {move || if show_archived.get() { "Hide archived" } else { "Show archived" }}
-                </button>
                 // "Save view" — always visible, disabled when no filters active
                 <Button
                     variant=ButtonVariant::Ghost

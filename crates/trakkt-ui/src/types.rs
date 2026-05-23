@@ -113,6 +113,17 @@ fn derive_back_label(path: &str) -> String {
     if path == "/my-issues" {
         return "My Issues".to_string();
     }
+    // /archived → "Archived"
+    if path == "/archived" {
+        return "Archived".to_string();
+    }
+    // /teams/TRA/archived → "TRA Archived"
+    if let Some(rest) = path.strip_prefix("/teams/")
+        && rest.ends_with("/archived")
+        && let Some(key) = rest.split('/').next()
+    {
+        return format!("{key} Archived");
+    }
     // /teams/TRA/issues → "TRA Issues"
     if let Some(rest) = path.strip_prefix("/teams/")
         && let Some(key) = rest.split('/').next()

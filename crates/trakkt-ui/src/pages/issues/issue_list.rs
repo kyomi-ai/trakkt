@@ -42,12 +42,12 @@ use crate::pages::issues::filters::{
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::pages::views::{FilterClause, LegacyViewFilters, ViewFilters};
-use crate::server_fns::issues::{create_issue, get_archived_issues, list_issues};
+use crate::server_fns::issues::{create_issue, list_issues};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::{create_view, delete_view, update_view};
 use crate::types::IssueNavState;
 use crate::utils::keyboard::is_input_focused;
-use trakkt_types::models::{IssueWithDetails, Status, Team};
+use trakkt_types::models::{Status, Team};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // localStorage helpers for view mode
@@ -377,10 +377,6 @@ pub(crate) fn IssueListInner(
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
     let filter_clauses = RwSignal::new(Vec::<FilterClause>::new());
-    let (show_archived, set_show_archived) = signal(false);
-
-    // ── Server-fetched archived issues (fetched on demand when toggle is ON) ──
-    let archived_issues_signal = RwSignal::new(Vec::<IssueWithDetails>::new());
 
     // ── Sort state ─────────────────────────────────────────────────────────
     let (sort_field, set_sort_field) = signal(SortField::Priority);
@@ -426,28 +422,6 @@ pub(crate) fn IssueListInner(
             .get()
             .into_iter()
             .find(|t| t.key.to_lowercase() == key_lower)
-    });
-
-    // ── Fetch archived issues from server when toggle is ON ─────────────
-    Effect::new(move |_| {
-        let showing = show_archived.get();
-        if !showing {
-            archived_issues_signal.set(Vec::new());
-            return;
-        }
-        let team_id = match resolved_team.get() {
-            Some(t) => t.team_id.clone(),
-            None => return,
-        };
-        leptos::task::spawn_local(async move {
-            match get_archived_issues(team_id, None, None).await {
-                Ok(issues) => archived_issues_signal.set(issues),
-                Err(e) => {
-                    tracing::warn!("Failed to fetch archived issues: {e}");
-                    archived_issues_signal.set(Vec::new());
-                }
-            }
-        });
     });
 
     // ── Custom views (team-scoped or workspace-scoped) ─────────────────
@@ -813,62 +787,41 @@ pub(crate) fn IssueListInner(
             .collect::<Vec<_>>()
     });
 
-    // Filtered issue list for list view — applies archive, search, and composable
-    // filter clauses. When show_archived is ON, merges in server-fetched archived
-    // issues (deduplicating by issue_id).
+    // Filtered issue list for list view — excludes archived issues, applies
+    // search and composable filter clauses. Archived issues are shown on
+    // the dedicated /archived page instead.
     let filtered_issues = Memo::new(move |_| {
         let raw = team_issues.get();
         let search_val = search.get().to_lowercase();
         let clauses = filter_clauses.get();
-        let archived_visible = show_archived.get();
 
-        let passes_filters = |issue: &IssueWithDetails| -> bool {
-            // Search filter (not a clause — always visible in toolbar).
-            // Matches against title, full identifier (e.g. "TRA-148"), or number (e.g. "148").
-            if !search_val.is_empty() {
-                let identifier = format!("{}-{}", issue.team_key, issue.number).to_lowercase();
-                let number_str = issue.number.to_string();
-                if !issue.title.to_lowercase().contains(&search_val)
-                    && !identifier.contains(&search_val)
-                    && !number_str.contains(&search_val)
-                {
-                    return false;
-                }
-            }
-            // Apply each composable filter clause.
-            for clause in &clauses {
-                if !apply_clause(clause, issue) {
-                    return false;
-                }
-            }
-            true
-        };
-
-        let mut result: Vec<IssueWithDetails> = raw
-            .into_iter()
+        raw.into_iter()
             .filter(|issue| {
-                // Archive filter: hide locally-archived issues unless the toggle is on.
-                if !archived_visible && is_archived(issue, ARCHIVE_DAYS) {
+                // Exclude archived issues — they have their own dedicated page.
+                if is_archived(issue, ARCHIVE_DAYS) {
                     return false;
                 }
-                passes_filters(issue)
-            })
-            .collect();
-
-        // When showing archived, merge in server-fetched archived issues
-        // (deduplicating by issue_id against what's already in the list).
-        if archived_visible {
-            let existing_ids: std::collections::HashSet<String> =
-                result.iter().map(|i| i.issue_id.clone()).collect();
-            let server_archived = archived_issues_signal.get();
-            for issue in server_archived {
-                if !existing_ids.contains(&issue.issue_id) && passes_filters(&issue) {
-                    result.push(issue);
+                // Search filter (not a clause — always visible in toolbar).
+                // Matches against title, full identifier (e.g. "TRA-148"), or number (e.g. "148").
+                if !search_val.is_empty() {
+                    let identifier = format!("{}-{}", issue.team_key, issue.number).to_lowercase();
+                    let number_str = issue.number.to_string();
+                    if !issue.title.to_lowercase().contains(&search_val)
+                        && !identifier.contains(&search_val)
+                        && !number_str.contains(&search_val)
+                    {
+                        return false;
+                    }
                 }
-            }
-        }
-
-        result
+                // Apply each composable filter clause.
+                for clause in &clauses {
+                    if !apply_clause(clause, issue) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect::<Vec<_>>()
     });
 
     // Sorted issue list — applies the selected sort field and direction on
@@ -1484,20 +1437,6 @@ pub(crate) fn IssueListInner(
                             set_sort_direction.set(d);
                         })
                     />
-                    <button
-                        class=move || {
-                            if show_archived.get() {
-                                "px-2 py-1 text-xs rounded-md border border-primary bg-primary/10 text-primary transition-colors flex items-center gap-1"
-                            } else {
-                                "px-2 py-1 text-xs rounded-md border border-border text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
-                            }
-                        }
-                        on:click=move |_| set_show_archived.update(|v| *v = !*v)
-                        title="Show archived issues"
-                    >
-                        <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
-                        {move || if show_archived.get() { "Hide archived" } else { "Show archived" }}
-                    </button>
                     // "Save view" — always visible, disabled when no filters active
                     <Button
                         variant=ButtonVariant::Ghost

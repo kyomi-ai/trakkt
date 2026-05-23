@@ -528,6 +528,9 @@ fn SidebarWorkspaceSection() -> impl IntoView {
         path.get() == "/workspace"
             && search.get().split('&').any(|p| p == "view=backlog")
     });
+    let archived_active = Signal::derive(move || {
+        path.get() == "/archived"
+    });
 
     view! {
         {move || {
@@ -597,6 +600,13 @@ fn SidebarWorkspaceSection() -> impl IntoView {
                         is_active=backlog_active
                     >
                         {view_status_icon(IssueStatusVariant::Backlog, "14px".to_string())}
+                    </SidebarWorkspacePresetItem>
+                    <SidebarWorkspacePresetItem
+                        href="/archived"
+                        label="Archived"
+                        is_active=archived_active
+                    >
+                        <Icon icon=phosphor_leptos::ARCHIVE weight=IconWeight::Light size="14px"/>
                     </SidebarWorkspacePresetItem>
 
                     // User-saved workspace views
@@ -814,9 +824,13 @@ fn SidebarTeamSubNav(
     let settings_href = format!("/teams/{}/settings", team_key.to_lowercase());
     let settings_href_match = settings_href.clone();
 
+    let archived_href = format!("/teams/{}/archived", team_key.to_lowercase());
+    let archived_href_match_for_team = archived_href.clone();
+
     let issues_active = Signal::derive(move || path.get().starts_with(&issues_href_match));
     let settings_active = Signal::derive(move || path.get().starts_with(&settings_href_match));
-    let team_active = Signal::derive(move || issues_active.get() || settings_active.get());
+    let team_archived_active = Signal::derive(move || path.get().starts_with(&archived_href_match_for_team));
+    let team_active = Signal::derive(move || issues_active.get() || settings_active.get() || team_archived_active.get());
 
     // Raw query string WITHOUT the leading '?' (leptos_router strips it).
     let search = leptos_router::hooks::use_location().search;
@@ -982,6 +996,7 @@ fn SidebarTeamSubNav(
                 let ih = issues_href.clone();
                 let ah = active_href.clone();
                 let bh = backlog_href.clone();
+                let arch_h = archived_href.clone();
                 view! {
                     <div class="ml-4">
                         <SidebarSubNavItem href=ih label="Issues" is_active=issues_no_filter_active>
@@ -992,6 +1007,9 @@ fn SidebarTeamSubNav(
                         </SidebarSubNavItem>
                         <SidebarSubNavItem href=bh label="Backlog" is_active=backlog_active>
                             {view_status_icon(IssueStatusVariant::Backlog, "14px".to_string())}
+                        </SidebarSubNavItem>
+                        <SidebarSubNavItem href=arch_h label="Archived" is_active=team_archived_active>
+                            <Icon icon=phosphor_leptos::ARCHIVE weight=IconWeight::Light size="14px"/>
                         </SidebarSubNavItem>
                     </div>
                 }
