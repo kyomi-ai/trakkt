@@ -184,6 +184,12 @@ spec:
               memory: "1Gi"
               cpu: "1000m"
 
+          volumeMounts:
+            - name: attachments
+              mountPath: /app/data/attachments
+            - name: tmp
+              mountPath: /tmp
+
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -192,3 +198,9 @@ spec:
             capabilities:
               drop:
                 - ALL
+
+      volumes:
+        - name: attachments
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
