@@ -217,34 +217,42 @@ pub fn IssueDetailPage() -> impl IntoView {
 
             // ── Content ────────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto p-4 md:p-6">
+                // Non-loaded states: loading, not-found, error
                 {move || {
                     match page_state.get() {
-                        PageState::Loaded(_, _) => {
-                            let issue = match issue_data.get_untracked() {
-                                Some(Ok(Some(i))) => i,
-                                _ => return view! { <IssueDetailSkeleton/> }.into_any(),
-                            };
-                            view! {
-                                <IssueDetailContent
-                                    initial_issue=issue
-                                />
-                            }.into_any()
-                        }
-                        PageState::NotFound => {
-                            view! { <IssueNotFound identifier=format!("{}-{}", team_key.get(), number.get())/> }.into_any()
-                        }
-                        PageState::Error => {
-                            view! {
-                                <div class="max-w-[860px] mx-auto w-full text-center py-16">
-                                    <p class="text-muted-foreground">"Failed to load issue. Please try again."</p>
-                                </div>
-                            }.into_any()
-                        }
-                        PageState::Loading => {
-                            view! { <IssueDetailSkeleton/> }.into_any()
-                        }
+                        PageState::Loading => Some(view! { <IssueDetailSkeleton/> }.into_any()),
+                        PageState::NotFound => Some(view! { <IssueNotFound identifier=format!("{}-{}", team_key.get(), number.get())/> }.into_any()),
+                        PageState::Error => Some(view! {
+                            <div class="max-w-[860px] mx-auto w-full text-center py-16">
+                                <p class="text-muted-foreground">"Failed to load issue. Please try again."</p>
+                            </div>
+                        }.into_any()),
+                        PageState::Loaded(_, _) => None,
                     }
                 }}
+                // Loaded state: <For> uses (team_key, number) as key so navigating
+                // between issues (e.g. TRA-5 → TRA-7) destroys the old component
+                // and creates a new one with the correct initial_issue data.
+                // Real-time SyncStore updates within the same issue do NOT change
+                // the key, so the component is reused (no unnecessary recreation).
+                <For
+                    each=move || {
+                        match page_state.get() {
+                            PageState::Loaded(tk, num) => vec![(tk, num)],
+                            _ => vec![],
+                        }
+                    }
+                    key=|(tk, num)| (tk.clone(), *num)
+                    children=move |_| {
+                        let issue = match issue_data.get() {
+                            Some(Ok(Some(i))) => i,
+                            _ => return view! { <IssueDetailSkeleton/> }.into_any(),
+                        };
+                        view! {
+                            <IssueDetailContent initial_issue=issue />
+                        }.into_any()
+                    }
+                />
             </div>
         </div>
     }
@@ -265,19 +273,42 @@ fn IssueDetailContent(
     initial_issue: IssueWithDetails,
 ) -> impl IntoView {
     let number = initial_issue.number;
-    let issue_team_key_for_lookup = initial_issue.team_key.clone();
     let initial_team_key = initial_issue.team_key.clone();
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let initial = RwSignal::new(initial_issue);
 
+    // Defense-in-depth: read route params reactively so the SyncStore lookup
+    // targets the correct issue even if the component is somehow reused across
+    // navigations (the <For> key in IssueDetailPage should prevent this, but
+    // this provides a second layer of safety).
+    let params = use_params_map();
+    let route_identity = Memo::new(move |_| {
+        let raw = params.get().get("identifier").unwrap_or_default();
+        let parts: Vec<&str> = raw.splitn(2, '-').collect();
+        if parts.len() == 2 {
+            (parts[0].to_string(), parts[1].parse::<i32>().unwrap_or(0))
+        } else {
+            (String::new(), 0)
+        }
+    });
+
     let issue = Memo::new(move |_| {
+        let (tk, num) = route_identity.get();
+        // Use reactive route params if valid, fall back to initial_issue
+        let (lookup_tk, lookup_num) = if !tk.is_empty() && num > 0 {
+            (tk, num)
+        } else {
+            let init = initial.get_untracked();
+            (init.team_key.clone(), init.number)
+        };
+
         if let Some(store) = sync_store {
             let items = store.issues().get();
-            if let Some(found) = items.iter().find(|i| i.team_key == issue_team_key_for_lookup && i.number == number) {
+            if let Some(found) = items.iter().find(|i| i.team_key == lookup_tk && i.number == lookup_num) {
                 return found.clone();
             }
         }
-        initial.get()
+        initial.get_untracked()
     });
 
     // ── Comments: derived from SyncStore (real-time via WebSocket) ────
