@@ -435,7 +435,7 @@ pub fn BoardContent(
                                     grouped().into_iter().map(|(status, issues)| {
                                         let status_id = status.status_id.clone();
                                         let status_name = status.name.clone();
-                                        let status_variant = IssueStatusVariant::parse(&status.category);
+                                        let status_variant = IssueStatusVariant::parse(&status.category, &status.name);
                                         let count = issues.len();
                                         let archived_count = if !archived_visible {
                                             *archived_counts.get(&status.status_id).unwrap_or(&0)
@@ -533,7 +533,7 @@ fn BoardDisplayOptions(
                         let status_id = status.status_id.clone();
                         let status_id_for_toggle = status_id.clone();
                         let status_name = status.name.clone();
-                        let status_variant = IssueStatusVariant::parse(&status.category);
+                        let status_variant = IssueStatusVariant::parse(&status.category, &status.name);
                         let is_visible = {
                             let sid = status_id.clone();
                             Signal::derive(move || !hidden.get().contains(&sid))

@@ -512,6 +512,7 @@ fn MetadataSidebar(
     let team_id = Memo::new(move |_| issue.get().team_id.clone());
     let status_id = Memo::new(move |_| issue.get().status_id.clone());
     let status_category = Memo::new(move |_| issue.get().status_category.clone());
+    let status_name = Memo::new(move |_| issue.get().status_name.clone());
     let priority = Memo::new(move |_| issue.get().priority);
     let assignee_id = Memo::new(move |_| issue.get().assignee_id.clone());
     let assignee_name = Memo::new(move |_| issue.get().assignee_name.clone());
@@ -694,7 +695,7 @@ fn MetadataSidebar(
     let (estimate_open, set_estimate_open) = signal(false);
     let estimate_trigger_ref = NodeRef::<leptos::html::Div>::new();
 
-    let status_variant = Memo::new(move |_| IssueStatusVariant::parse(&status_category.get()));
+    let status_variant = Memo::new(move |_| IssueStatusVariant::parse(&status_category.get(), &status_name.get()));
     let (status_open, set_status_open) = signal(false);
     let (priority_open, set_priority_open) = signal(false);
     let status_trigger_ref = NodeRef::<leptos::html::Div>::new();
@@ -785,7 +786,7 @@ fn MetadataSidebar(
                             let sid = status.status_id.clone();
                             let sid_check = status.status_id.clone();
                             let label = status.name.clone();
-                            let variant = IssueStatusVariant::parse(&status.category);
+                            let variant = IssueStatusVariant::parse(&status.category, &status.name);
                             view! {
                                 <DropdownItem
                                     label=label
@@ -1892,7 +1893,7 @@ fn RelationsSection(
                                 let rel_title = rel.title.clone();
                                 let direction = rel.direction.clone();
                                 let label = direction_label(&direction);
-                                let status_variant = IssueStatusVariant::parse(&rel.status_category);
+                                let status_variant = IssueStatusVariant::parse(&rel.status_category, &rel.status_name);
 
                                 view! {
                                     <div class="group flex items-center gap-2 px-3 py-1.5 hover:bg-secondary/50 rounded-md transition-colors">
@@ -2045,7 +2046,7 @@ fn AddRelationPicker(
                                     <div class="space-y-0.5">
                                         {filtered.into_iter().map(|issue| {
                                             let issue_for_click = issue.clone();
-                                            let status_variant = IssueStatusVariant::parse(&issue.status_category);
+                                            let status_variant = IssueStatusVariant::parse(&issue.status_category, &issue.status_name);
                                             let issue_key = format!("{}-{}", issue.team_key, issue.number);
                                             let issue_title = issue.title.clone();
                                             view! {

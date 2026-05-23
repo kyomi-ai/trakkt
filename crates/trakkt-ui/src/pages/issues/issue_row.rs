@@ -52,7 +52,7 @@ pub fn IssueRow(
     let issue_key = format!("{}-{}", issue.team_key, issue.number);
     let issue_href = format!("/issues/{issue_key}");
     let issue_href_click = issue_href.clone();
-    let status = IssueStatusVariant::parse(&issue.status_category);
+    let status = IssueStatusVariant::parse(&issue.status_category, &issue.status_name);
     let row_ref = NodeRef::<leptos::html::A>::new();
     let location = use_location();
 
