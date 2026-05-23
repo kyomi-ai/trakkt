@@ -33,7 +33,7 @@ pub fn TeamSettingsPage() -> impl IntoView {
                 <Show
                     when=move || initialized.get()
                     fallback=|| view! {
-                        <div class="space-y-6 max-w-2xl">
+                        <div class="space-y-6">
                             <Card><CardHeader><Skeleton class="h-5 w-1/3"/></CardHeader>
                             <CardContent><Skeleton class="h-10 w-full"/></CardContent></Card>
                         </div>
@@ -54,7 +54,7 @@ fn TeamSettingsBody(team: Memo<Option<Team>>) -> impl IntoView {
             fallback=|| view! { <div class="text-muted-foreground">"Team not found."</div> }
         >
             {move || team.get().map(|t| view! {
-                <div class="space-y-6 max-w-2xl">
+                <div class="space-y-6">
                     <TeamGeneralCard team=t.clone()/>
                     <TeamEstimateCard team=t.clone()/>
                     <TeamDangerZone team_id=t.team_id.clone() team_name=t.name.clone()/>
