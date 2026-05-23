@@ -829,6 +829,41 @@ pub async fn update_issue(
         .await;
     }
 
+    // When status changes, re-broadcast all issues this one is blocking.
+    // Their is_blocked flag may have changed (computed at query time via SQL EXISTS).
+    if updates.status_id.is_some() {
+        if let Some(ws) = ws_manager {
+            match crate::relation_service::find_blocked_issue_ids(db, &issue.issue_id).await {
+                Ok(blocked_ids) => {
+                    for blocked_id in blocked_ids {
+                        match get_issue_by_id(db, &blocked_id).await {
+                            Ok(Some(blocked_issue)) => {
+                                sync_log_service::broadcast_sync_action(
+                                    ws,
+                                    workspace_id,
+                                    entity_types::ISSUE,
+                                    &blocked_id,
+                                    SyncActionType::Update,
+                                    serde_json::to_value(&blocked_issue).ok(),
+                                )
+                                .await;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, blocked_id = %blocked_id,
+                                    "Failed to re-fetch blocked issue for re-broadcast");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, issue_id = %issue.issue_id,
+                        "Failed to find blocked issues for re-broadcast after status change");
+                }
+            }
+        }
+    }
+
     // ── Notification triggers (best-effort) ─────────────────────────────
     if let Some(actor_id) = actor_user_id {
         // Assignee auto-watch: when assigned, auto-add as watcher.
