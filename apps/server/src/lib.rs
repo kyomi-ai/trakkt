@@ -112,6 +112,7 @@ pub fn build_router(state: state::AppState) -> Router {
                 }
             }
         }))
+        .route("/", axum::routing::get(leptos_frontend::serve_leptos_shell))
         .route("/login", axum::routing::get(leptos_frontend::serve_leptos_shell))
         .route("/signup", axum::routing::get(leptos_frontend::serve_leptos_shell))
         .fallback_service(
