@@ -11,6 +11,9 @@ use std::sync::Arc;
 use kode_leptos::extension::{Extension, ExtensionToolbarItem};
 use leptos::prelude::*;
 
+/// Phosphor paperclip icon SVG for the slash command menu.
+const PAPERCLIP_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor"><path d="M209.66,82.34l-120,120a48,48,0,0,1-67.88-67.88l120-120A32,32,0,0,1,187.31,60.1l-120,120a16,16,0,0,1-22.62-22.62l120-120a8,8,0,0,0-11.32-11.32l-120,120a32,32,0,0,0,45.26,45.26l120-120a48,48,0,0,0-67.88-67.88l-120,120A64,64,0,0,0,100.69,214.63l120-120a8,8,0,0,0-11-11.32Z"/></svg>"#;
+
 /// A kode Extension that contributes an "Attach file" item to the slash
 /// command menu (via `toolbar_items`).
 ///
@@ -49,6 +52,7 @@ impl Extension for AttachFileExtension {
                 trigger();
             }),
             active_name: None,
+            icon_svg: Some(PAPERCLIP_SVG.to_string()),
         }]
     }
 }
