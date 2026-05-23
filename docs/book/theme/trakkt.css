@@ -1,0 +1,43 @@
+/* Trakkt documentation theme overrides */
+
+:root {
+  --sidebar-bg: #0f172a;
+  --sidebar-fg: #e2e8f0;
+  --sidebar-active: #0D9488;
+  --sidebar-spacer: #1e293b;
+}
+
+/* Teal accent for links */
+.content a {
+  color: #0D9488;
+}
+
+.content a:hover {
+  color: #0f766e;
+}
+
+/* Sidebar active link */
+.sidebar .active {
+  color: #0D9488;
+}
+
+/* Code block styling */
+code {
+  border-radius: 4px;
+}
+
+/* Table styling */
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+table th {
+  background-color: #f1f5f9;
+  font-weight: 600;
+}
+
+table td, table th {
+  padding: 8px 12px;
+  border: 1px solid #e2e8f0;
+}
