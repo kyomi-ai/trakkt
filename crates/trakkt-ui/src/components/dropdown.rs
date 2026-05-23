@@ -445,24 +445,31 @@ pub fn Select(
                 n => format!("{n} selected"),
             }
         } else {
-            if val.is_empty() {
-                return placeholder_stored.with_value(|p| p.clone().unwrap_or_else(String::new));
-            }
             options
                 .get()
                 .iter()
                 .find(|(v, _)| *v == val)
                 .map(|(_, l)| l.clone())
-                .unwrap_or_else(|| val.clone())
+                .unwrap_or_else(|| {
+                    if val.is_empty() {
+                        placeholder_stored.with_value(|p| p.clone().unwrap_or_default())
+                    } else {
+                        val.clone()
+                    }
+                })
         }
     });
 
-    // Whether we are currently showing a placeholder (empty value).
+    // Whether we are currently showing a placeholder (empty value with no
+    // matching option).  When an option has value "" (e.g. "All teams"), that
+    // is a real selection, not a placeholder.
     let is_placeholder = move || {
         if multi {
             value.get().split(',').filter(|s| !s.is_empty()).count() == 0
         } else {
-            value.get().is_empty()
+            let val = value.get();
+            val.is_empty()
+                && !options.get().iter().any(|(v, _)| v == &val)
         }
     };
 
