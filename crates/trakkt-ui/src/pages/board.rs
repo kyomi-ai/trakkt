@@ -185,22 +185,21 @@ pub fn BoardContent(
     let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
     let (label_filter, set_label_filter) = signal(Vec::<String>::new());
     let (project_filter, set_project_filter) = signal(Vec::<String>::new());
-    let (show_archived, set_show_archived) = signal(false);
 
     // Client-side filtered issues: archive + search + priority + label + project
-    // applied before grouping.
+    // applied before grouping. Archived issues are excluded — they have their
+    // own dedicated page.
     let filtered_issues = Memo::new(move |_| {
         let raw = issues.get();
         let search_val = search.get().to_lowercase();
         let priority_val = priority_filter.get();
         let label_val = label_filter.get();
         let project_val = project_filter.get();
-        let archived_visible = show_archived.get();
 
         raw.into_iter()
             .filter(|issue| {
-                // Archive filter: hide archived issues unless the toggle is on.
-                if !archived_visible && is_archived(issue, ARCHIVE_DAYS) {
+                // Exclude archived issues — they have their own dedicated page.
+                if is_archived(issue, ARCHIVE_DAYS) {
                     return false;
                 }
                 if !priority_val.is_empty() {
@@ -392,20 +391,6 @@ pub fn BoardContent(
                     }
                 />
                 <ProjectFilterDropdown value=project_filter on_change=Callback::new(move |v: Vec<String>| set_project_filter.set(v))/>
-                <button
-                    class=move || {
-                        if show_archived.get() {
-                            "px-2 py-1 text-xs rounded-md border border-primary bg-primary/10 text-primary transition-colors flex items-center gap-1"
-                        } else {
-                            "px-2 py-1 text-xs rounded-md border border-border text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
-                        }
-                    }
-                    on:click=move |_| set_show_archived.update(|v| *v = !*v)
-                    title="Show archived issues"
-                >
-                    <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
-                    {move || if show_archived.get() { "Hide archived" } else { "Show archived" }}
-                </button>
                 <BoardDisplayOptions
                     statuses=statuses
                     hidden=hidden_statuses
@@ -427,20 +412,21 @@ pub fn BoardContent(
                                 .filter(|(status, _)| !hidden.contains(&status.status_id))
                                 .collect::<Vec<_>>()
                         };
+                        let team_key_for_link = team_key.clone();
                         view! {
                             <div class="flex gap-4 h-full">
                                 {move || {
                                     let archived_counts = archived_counts_by_status.get();
-                                    let archived_visible = show_archived.get();
+                                    let tk = team_key_for_link.clone();
                                     grouped().into_iter().map(|(status, issues)| {
                                         let status_id = status.status_id.clone();
                                         let status_name = status.name.clone();
                                         let status_variant = IssueStatusVariant::parse(&status.category, &status.name);
                                         let count = issues.len();
-                                        let archived_count = if !archived_visible {
-                                            *archived_counts.get(&status.status_id).unwrap_or(&0)
-                                        } else {
-                                            0
+                                        let archived_count = *archived_counts.get(&status.status_id).unwrap_or(&0);
+                                        let archived_href = match &tk {
+                                            Some(key) => format!("/teams/{key}/archived"),
+                                            None => "/archived".to_string(),
                                         };
                                         view! {
                                             <BoardColumn
@@ -455,7 +441,7 @@ pub fn BoardContent(
                                                 set_drag_target=set_drag_target
                                                 on_drop=handle_drop
                                                 archived_count=archived_count
-                                                show_archived=archived_visible
+                                                archived_href=archived_href
                                             />
                                         }
                                     }).collect_view()
@@ -603,9 +589,9 @@ fn BoardColumn(
     /// Number of hidden archived issues in this column.
     #[prop(optional, default = 0)]
     archived_count: usize,
-    /// Whether archived issues are currently shown (affects card styling).
-    #[prop(optional, default = false)]
-    show_archived: bool,
+    /// URL to the archived issues page (for the "N archived" link).
+    #[prop(optional, into)]
+    archived_href: Option<String>,
 ) -> impl IntoView {
     let status_id_for_over = status_id.clone();
     let status_id_for_drop = status_id.clone();
@@ -774,7 +760,6 @@ fn BoardColumn(
                 } else {
                     let total = issues.len();
                     issues.into_iter().enumerate().map(|(idx, issue)| {
-                        let card_archived = show_archived && is_archived(&issue, ARCHIVE_DAYS);
                         view! {
                             // Drop indicator before this card
                             <Show when=move || drop_insert_idx.get() == Some(idx)>
@@ -786,7 +771,6 @@ fn BoardColumn(
                                 dragging=dragging
                                 set_dragging=set_dragging
                                 set_drop_insert_idx=set_drop_insert_idx
-                                archived=card_archived
                             />
                             // Drop indicator after the last card
                             {if idx == total - 1 {
@@ -801,13 +785,25 @@ fn BoardColumn(
                         }
                     }).collect_view().into_any()
                 }}
-                // ── Archived count indicator ───────────────────────────────
+                // ── Archived count indicator (links to archived page) ────
                 {if archived_count > 0 {
-                    view! {
-                        <div class="text-xs text-muted-foreground text-center py-2">
-                            {archived_count}" archived"
-                        </div>
-                    }.into_any()
+                    if let Some(ref href) = archived_href {
+                        let href = href.clone();
+                        view! {
+                            <a
+                                href=href
+                                class="text-xs text-muted-foreground hover:text-foreground text-center py-2 block transition-colors"
+                            >
+                                {archived_count}" archived"
+                            </a>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="text-xs text-muted-foreground text-center py-2">
+                                {archived_count}" archived"
+                            </div>
+                        }.into_any()
+                    }
                 } else {
                     ().into_any()
                 }}
@@ -849,10 +845,6 @@ fn BoardCard(
     set_dragging: WriteSignal<Option<String>>,
     /// Setter for the drop insertion index in the parent column.
     set_drop_insert_idx: WriteSignal<Option<usize>>,
-    /// Whether this card is archived (completed/cancelled older than threshold).
-    /// When true, the card renders with reduced opacity.
-    #[prop(optional, default = false)]
-    archived: bool,
 ) -> impl IntoView {
     let issue_id = issue.issue_id.clone();
     let issue_id_for_drag = issue_id.clone();
@@ -870,7 +862,7 @@ fn BoardCard(
 
     let card_class = move || {
         let base = "bg-card border border-border rounded-md p-4 shadow-sm hover:shadow-md transition-shadow cursor-grab focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
-        if is_dragging() || archived {
+        if is_dragging() {
             format!("{base} opacity-50")
         } else {
             base.to_string()
