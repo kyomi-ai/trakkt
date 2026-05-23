@@ -77,6 +77,12 @@ struct WorkspaceIdRow {
     workspace_id: String,
 }
 
+/// Internal row type for single-column ID queries.
+#[derive(sqlx::FromRow)]
+struct IdRow {
+    target_issue_id: String,
+}
+
 const VALID_RELATION_TYPES: &[&str] = &["blocks", "parent", "duplicate", "relates_to"];
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -104,15 +110,7 @@ async fn validate_no_circular_blocking(
                 "Circular blocking chain: this would create a cycle".to_string(),
             ));
         }
-        let blocked: Vec<String> = trakkt_core::db_with_pool!(db, |p| {
-            sqlx::query_scalar::<_, String>(
-                "SELECT target_issue_id FROM issue_relations \
-                 WHERE source_issue_id = $1 AND relation_type = 'blocks'",
-            )
-            .bind(&current_id)
-            .fetch_all(p)
-            .await
-        })?;
+        let blocked = find_blocked_issue_ids(db, &current_id).await?;
         for next in blocked {
             queue.push_back(next);
         }
@@ -184,6 +182,26 @@ async fn validate_single_duplicate(
         ));
     }
     Ok(())
+}
+
+// ─── Blocked-issue lookup ──────────────────────────────────────────────────
+
+/// Returns the IDs of all issues that `blocker_issue_id` is blocking.
+///
+/// Queries the `issue_relations` table for rows where the source (blocker) is
+/// `blocker_issue_id` and the relation type is "blocks".
+pub async fn find_blocked_issue_ids(
+    db: &DbPool,
+    blocker_issue_id: &str,
+) -> trakkt_core::Result<Vec<String>> {
+    let rows: Vec<IdRow> = trakkt_core::db_fetch_all!(
+        db,
+        IdRow,
+        "SELECT target_issue_id FROM issue_relations \
+         WHERE source_issue_id = $1 AND relation_type = 'blocks'",
+        blocker_issue_id
+    )?;
+    Ok(rows.into_iter().map(|r| r.target_issue_id).collect())
 }
 
 // ─── Service functions ──────────────────────────────────────────────────────
