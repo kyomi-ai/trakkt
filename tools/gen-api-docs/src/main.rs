@@ -213,7 +213,7 @@ fn extract_type(schema: &Value) -> String {
         Some("array") => {
             let items_type = schema
                 .get("items")
-                .map(|items| extract_type(items))
+                .map(extract_type)
                 .unwrap_or_else(|| "any".to_string());
             format!("array<{items_type}>")
         }
