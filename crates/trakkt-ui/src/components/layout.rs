@@ -13,7 +13,7 @@ use phosphor_leptos::{Icon, IconWeight};
 use std::collections::HashMap;
 use crate::cache::store::SyncStore;
 use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon};
-use crate::components::{Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, FeedbackModal, Spinner, TeamCreationModal, TeamIcon};
+use crate::components::{Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, FeedbackModal, Spinner, TeamCreationModal, TeamIcon};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
@@ -303,31 +303,34 @@ fn Sidebar(
                         match result {
                             Ok(ref user) => {
                             let display_name = user.name.clone().unwrap_or_else(|| user.email.clone());
-                            let avatar_char = user.name.as_ref().and_then(|n| n.chars().next()).unwrap_or('?').to_uppercase().to_string();
                             let ws_name = user.workspace_name.clone().unwrap_or_default();
+                            let email = user.email.clone();
+                            let header_name = display_name.clone();
+                            let header_email = email.clone();
                             let is_personal = user.is_personal_mode;
                             view! {
                                 <div node_ref=user_menu_trigger_ref>
                                     <button
-                                        class="w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm hover:bg-[var(--color-sidebar-hover)] transition-colors text-left"
+                                        class="w-full flex items-center gap-3 pl-2 pr-3 py-1 min-h-[44px] rounded-lg text-sm hover:bg-[var(--color-sidebar-hover)] transition-colors text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                         on:click=move |_| set_user_menu_open.update(|v| *v = !*v)
                                     >
                                         // Avatar
-                                        <div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-xs font-semibold flex-shrink-0">
-                                            {avatar_char.clone()}
-                                        </div>
+                                        <Avatar name=display_name.clone() size=AvatarSize::Md/>
                                         <div class="flex-1 min-w-0">
-                                            <div class="text-[var(--color-sidebar-foreground)] font-medium truncate text-sm">
+                                            <div class="text-sm font-medium text-[var(--color-sidebar-foreground)] truncate">
                                                 {display_name.clone()}
                                             </div>
-                                            <div class="text-[var(--color-sidebar-foreground-muted)] text-xs truncate">
+                                            <div class="text-xs text-[var(--color-sidebar-foreground-muted)] truncate">
                                                 {ws_name.clone()}
                                             </div>
                                         </div>
-                                        // Chevron
-                                        <svg class="w-4 h-4 text-[var(--color-sidebar-foreground-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
-                                        </svg>
+                                        // Animated chevron — rotates 180deg when menu is open
+                                        <span
+                                            class="text-[var(--color-sidebar-foreground-muted)] flex-shrink-0 transition-transform duration-200"
+                                            style=move || if user_menu_open.get() { "transform: rotate(180deg)" } else { "transform: rotate(0deg)" }
+                                        >
+                                            <Icon icon=phosphor_leptos::CARET_DOWN weight=IconWeight::Light size="16px"/>
+                                        </span>
                                     </button>
                                 </div>
 
@@ -338,27 +341,37 @@ fn Sidebar(
                                     on_close=Callback::new(move |()| set_user_menu_open.set(false))
                                     placement=Placement::TOP_START
                                     match_width=true
-                                    class="bg-popover border border-border rounded-lg shadow-lg py-1"
+                                    class="bg-[var(--color-sidebar)] border border-[var(--color-sidebar-border)] rounded-lg shadow-[0_8px_24px_rgba(0,0,0,0.3)] py-1"
                                 >
+                                    // User info header
+                                    <div class="px-3 py-2 border-b border-[var(--color-sidebar-border)]">
+                                        <div class="text-sm font-medium text-[var(--color-sidebar-foreground)]">{header_name.clone()}</div>
+                                        <div class="text-xs text-[var(--color-sidebar-foreground-muted)] truncate">{header_email.clone()}</div>
+                                    </div>
                                     // Workspace switcher (includes separator only when shown)
                                     <WorkspaceSwitcher set_user_menu_open=set_user_menu_open/>
-                                    <a href="/settings/profile" class="block px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors">
-                                        "Settings"
+                                    <a
+                                        href="/settings/profile"
+                                        on:click=move |_| set_user_menu_open.set(false)
+                                        class="w-full text-left px-4 py-2 text-sm text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors flex items-center space-x-3"
+                                    >
+                                        <Icon icon=phosphor_leptos::GEAR weight=IconWeight::Light size="16px"/>
+                                        <span>"Settings"</span>
                                     </a>
                                     {(!is_personal).then(|| view! {
                                         <button
-                                            class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors flex items-center gap-2"
+                                            class="w-full text-left px-4 py-2 text-sm text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors flex items-center space-x-3"
                                             on:click=move |_| {
                                                 set_user_menu_open.set(false);
                                                 set_show_feedback.set(true);
                                             }
                                         >
-                                            <Icon icon=phosphor_leptos::CHAT_CIRCLE weight=IconWeight::Regular size="16px"/>
-                                            "Send Feedback"
+                                            <Icon icon=phosphor_leptos::CHAT_CIRCLE weight=IconWeight::Light size="16px"/>
+                                            <span>"Send Feedback"</span>
                                         </button>
                                     })}
                                     <button
-                                        class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
+                                        class="w-full text-left px-4 py-2 text-sm text-error-foreground hover:bg-error/10 transition-colors flex items-center space-x-3"
                                         on:click=move |_| {
                                             set_user_menu_open.set(false);
                                             leptos::task::spawn_local(async move {
@@ -368,7 +381,8 @@ fn Sidebar(
                                             });
                                         }
                                     >
-                                        "Sign Out"
+                                        <Icon icon=phosphor_leptos::SIGN_OUT weight=IconWeight::Light size="16px"/>
+                                        <span>"Sign Out"</span>
                                     </button>
                                 </Popover>
                             }.into_any()
