@@ -1721,6 +1721,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gen-api-docs"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "trakkt-api",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

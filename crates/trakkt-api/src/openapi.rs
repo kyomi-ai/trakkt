@@ -35,7 +35,18 @@ pub fn generate_openapi_spec() -> Value {
         let mut parameters = extract_path_params(op.rest_path);
 
         if method == "get" {
-            parameters.extend(extract_query_params(&schema_value));
+            // Collect path parameter names so we can skip duplicates from query params.
+            let path_param_names: Vec<String> = parameters
+                .iter()
+                .filter_map(|p| p["name"].as_str().map(String::from))
+                .collect();
+            let query_params = extract_query_params(&schema_value)
+                .into_iter()
+                .filter(|p| {
+                    let name = p["name"].as_str().unwrap_or("");
+                    !path_param_names.iter().any(|pn| pn == name)
+                });
+            parameters.extend(query_params);
         }
 
         if !parameters.is_empty() {
@@ -113,6 +124,12 @@ fn derive_tag(rest_path: &str) -> &'static str {
     if rest_path.contains("/attachments") {
         return "Attachments";
     }
+    if rest_path.contains("/activities") {
+        return "Activities";
+    }
+    if rest_path.contains("/github-links") {
+        return "GitHub";
+    }
     if rest_path.starts_with("/issues") {
         return "Issues";
     }
@@ -127,9 +144,6 @@ fn derive_tag(rest_path: &str) -> &'static str {
     }
     if rest_path.starts_with("/projects") {
         return "Projects";
-    }
-    if rest_path.starts_with("/activities") {
-        return "Activities";
     }
     if rest_path.starts_with("/github") {
         return "GitHub";
@@ -284,5 +298,7 @@ mod tests {
         assert_eq!(derive_tag("/projects/{id}/milestones"), "Milestones");
         assert_eq!(derive_tag("/milestones/{id}"), "Milestones");
         assert_eq!(derive_tag("/labels"), "Labels");
+        assert_eq!(derive_tag("/issues/{identifier}/activities"), "Activities");
+        assert_eq!(derive_tag("/issues/{identifier}/github-links"), "GitHub");
     }
 }
