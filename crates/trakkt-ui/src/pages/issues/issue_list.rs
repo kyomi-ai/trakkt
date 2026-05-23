@@ -824,8 +824,16 @@ pub(crate) fn IssueListInner(
 
         let passes_filters = |issue: &IssueWithDetails| -> bool {
             // Search filter (not a clause — always visible in toolbar).
-            if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
-                return false;
+            // Matches against title, full identifier (e.g. "TRA-148"), or number (e.g. "148").
+            if !search_val.is_empty() {
+                let identifier = format!("{}-{}", issue.team_key, issue.number).to_lowercase();
+                let number_str = issue.number.to_string();
+                if !issue.title.to_lowercase().contains(&search_val)
+                    && !identifier.contains(&search_val)
+                    && !number_str.contains(&search_val)
+                {
+                    return false;
+                }
             }
             // Apply each composable filter clause.
             for clause in &clauses {
