@@ -2929,34 +2929,10 @@ fn AttachmentsSection(
 
             leptos::task::spawn_local(async move {
                 let data = {
-                    use js_sys::Uint8Array;
-                    use wasm_bindgen::JsCast;
                     use wasm_bindgen_futures::JsFuture;
-                    let reader = match web_sys::FileReader::new() {
-                        Ok(r) => r,
-                        Err(_) => { _set_uploading.set(false); return; }
-                    };
-                    if reader.read_as_array_buffer(&file).is_err() {
-                        _set_uploading.set(false);
-                        return;
-                    }
-                    let promise = js_sys::Promise::new(&mut |resolve, reject| {
-                        let r = reader.clone();
-                        let reject_clone = reject.clone();
-                        let onload = wasm_bindgen::closure::Closure::once_into_js(move || {
-                            match r.result() {
-                                Ok(val) => { let _ = resolve.call1(&wasm_bindgen::JsValue::NULL, &val); }
-                                Err(_) => { let _ = reject_clone.call0(&wasm_bindgen::JsValue::NULL); }
-                            }
-                        });
-                        let onerror = wasm_bindgen::closure::Closure::once_into_js(move || {
-                            let _ = reject.call0(&wasm_bindgen::JsValue::NULL);
-                        });
-                        reader.set_onload(Some(onload.unchecked_ref()));
-                        reader.set_onerror(Some(onerror.unchecked_ref()));
-                    });
+                    let promise = file.array_buffer();
                     match JsFuture::from(promise).await {
-                        Ok(result) => Uint8Array::new(&result).to_vec(),
+                        Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
                         Err(_) => {
                             tracing::warn!("Failed to read file");
                             error_toast_spawn("Failed to read file".to_string());
