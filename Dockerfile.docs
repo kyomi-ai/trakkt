@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# Trakkt — Documentation site Docker image (multi-stage build)
+# ---------------------------------------------------------------------------
+#
+# Stage 1: Compiles gen-api-docs, generates API reference markdown,
+#           installs mdBook, and builds the book.
+# Stage 2: Serves the static output with nginx.
+#
+# Usage:
+#   docker build -f Dockerfile.docs -t trakkt-docs:latest .
+# ---------------------------------------------------------------------------
+
+# ==========================================================================
+# Stage 1: builder — generate API docs and build the book
+# ==========================================================================
+FROM rust:bookworm AS builder
+
+# System dependencies for compiling gen-api-docs
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    clang \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install mdbook from pre-built binary (much faster than cargo install)
+RUN MDBOOK_VERSION=0.4.47 \
+    && wget -qO- "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+    | tar -xzf - -C /usr/local/bin \
+    && chmod +x /usr/local/bin/mdbook
+
+WORKDIR /build
+
+# Copy full source tree
+COPY . .
+
+# Strip local dev patches from Cargo.toml (path overrides not available in Docker)
+RUN sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
+
+# Generate API reference markdown
+RUN cargo run -p gen-api-docs
+
+# Build the book
+RUN mdbook build docs/book
+
+# ==========================================================================
+# Stage 2: runtime — serve static files with nginx
+# ==========================================================================
+FROM nginxinc/nginx-unprivileged:alpine
+
+COPY --from=builder /build/docs/book/build /usr/share/nginx/html
+
+# Custom nginx config for documentation site
+COPY deploy/nginx-docs.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s \
+    CMD wget -qO- http://localhost:8080/index.html || exit 1
