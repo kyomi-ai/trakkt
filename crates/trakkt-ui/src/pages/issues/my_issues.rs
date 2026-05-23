@@ -299,6 +299,36 @@ pub fn MyIssuesPage() -> impl IntoView {
         });
     });
 
+    // ── Issue count for the header ────────────────────────────────────────
+    // Total = all non-archived issues belonging to the user (assigned + created + watching),
+    // before search/status/priority filters are applied.
+    let total_my_issues = Memo::new(move |_| {
+        let Some(uid) = current_user_id.get() else { return 0 };
+        let issues = all_issues.get();
+        let watched = watched_ids_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        let watched_set: HashSet<String> = watched.into_iter().collect();
+
+        let mut seen = HashSet::new();
+        for i in &issues {
+            if is_archived(i, ARCHIVE_DAYS) {
+                continue;
+            }
+            if i.assignee_id.as_ref() == Some(&uid)
+                || i.creator_id == uid
+                || watched_set.contains(&i.issue_id)
+            {
+                seen.insert(i.issue_id.clone());
+            }
+        }
+        seen.len()
+    });
+    let filtered_my_issues = Memo::new(move |_| {
+        assigned_issues.get().len() + created_issues.get().len() + watching_issues.get().len()
+    });
+
     // ── Section collapse state (persisted in localStorage) ────────────────
     let (assigned_collapsed, set_assigned_collapsed) =
         signal(load_collapsed_state("trakkt-myissues-assigned-collapsed"));
@@ -323,7 +353,23 @@ pub fn MyIssuesPage() -> impl IntoView {
         <div class="bg-background flex flex-col h-full">
             // ── Page header ─────────────────────────────────────────────────
             <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
-                <h1 class="text-sm font-semibold text-foreground">"My Issues"</h1>
+                <h1 class="flex items-center gap-2 text-sm font-semibold text-foreground">
+                    "My Issues"
+                    <span class="text-sm font-normal text-muted-foreground">
+                        {move || {
+                            let filtered = filtered_my_issues.get();
+                            let total = total_my_issues.get();
+                            if total == 0 {
+                                return String::new();
+                            }
+                            if filtered == total {
+                                format!("({})", total)
+                            } else {
+                                format!("{} of {} issues", filtered, total)
+                            }
+                        }}
+                    </span>
+                </h1>
             </div>
 
             // ── Toolbar ─────────────────────────────────────────────────────

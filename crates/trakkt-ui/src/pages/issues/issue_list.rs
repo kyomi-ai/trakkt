@@ -1060,6 +1060,14 @@ pub(crate) fn IssueListInner(
         })
     });
 
+    // ── Issue count for the header ────────────────────────────────────────
+    // Total = all non-archived issues in scope (team or workspace).
+    // Filtered = issues after search + filter clauses (what's displayed).
+    let total_count = Memo::new(move |_| {
+        team_issues.get().iter().filter(|i| !is_archived(i, ARCHIVE_DAYS)).count()
+    });
+    let filtered_count = Memo::new(move |_| filtered_issues.get().len());
+
     // ── Render ──────────────────────────────────────────────────────────────
     view! {
         <div class="bg-background flex flex-col h-full">
@@ -1092,6 +1100,20 @@ pub(crate) fn IssueListInner(
                             view! { <span>"Issues"</span> }.into_any()
                         }
                     }}
+                    <span class="text-sm font-normal text-muted-foreground">
+                        {move || {
+                            let filtered = filtered_count.get();
+                            let total = total_count.get();
+                            if total == 0 {
+                                return String::new();
+                            }
+                            if filtered == total {
+                                format!("({})", total)
+                            } else {
+                                format!("{} of {} issues", filtered, total)
+                            }
+                        }}
+                    </span>
                 </h1>
                 <div class="flex items-center gap-3">
                     // View toggle (segmented control)
