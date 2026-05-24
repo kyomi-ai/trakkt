@@ -77,6 +77,7 @@ pub struct Issue {
     pub sort_order: Option<f64>,
     pub created_at: String,
     pub updated_at: String,
+    pub started_at: Option<String>,
     pub completed_at: Option<String>,
 }
 
@@ -110,6 +111,7 @@ pub struct IssueWithDetails {
     pub sort_order: Option<f64>,
     pub created_at: String,
     pub updated_at: String,
+    pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub archived_at: Option<String>,
     /// Whether this issue has any child issues (via `issue_relations` parent type).

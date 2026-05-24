@@ -41,6 +41,7 @@ pub enum SortField {
     Status,
     CreatedDate,
     UpdatedDate,
+    StartedDate,
     CompletedDate,
     Assignee,
     DueDate,
@@ -54,6 +55,7 @@ impl SortField {
             Self::Status => "Status",
             Self::CreatedDate => "Created date",
             Self::UpdatedDate => "Updated date",
+            Self::StartedDate => "Started date",
             Self::CompletedDate => "Completed date",
             Self::Assignee => "Assignee",
             Self::DueDate => "Due date",
@@ -67,6 +69,7 @@ impl SortField {
             Self::Status => SortDirection::Asc,
             Self::CreatedDate => SortDirection::Desc,
             Self::UpdatedDate => SortDirection::Desc,
+            Self::StartedDate => SortDirection::Desc,
             Self::CompletedDate => SortDirection::Desc,
             Self::Assignee => SortDirection::Asc,
             Self::DueDate => SortDirection::Asc,
@@ -74,11 +77,12 @@ impl SortField {
     }
 
     /// All variants in display order.
-    pub const ALL: [SortField; 7] = [
+    pub const ALL: [SortField; 8] = [
         Self::Priority,
         Self::Status,
         Self::CreatedDate,
         Self::UpdatedDate,
+        Self::StartedDate,
         Self::CompletedDate,
         Self::Assignee,
         Self::DueDate,
@@ -163,6 +167,11 @@ pub fn sort_issues(issues: &mut [IssueWithDetails], field: SortField, direction:
             }
             SortField::CreatedDate => a.created_at.cmp(&b.created_at),
             SortField::UpdatedDate => a.updated_at.cmp(&b.updated_at),
+            SortField::StartedDate => {
+                let ac = a.started_at.as_deref().unwrap_or("\u{ffff}");
+                let bc = b.started_at.as_deref().unwrap_or("\u{ffff}");
+                ac.cmp(bc)
+            }
             SortField::CompletedDate => {
                 let ac = a.completed_at.as_deref().unwrap_or("\u{ffff}");
                 let bc = b.completed_at.as_deref().unwrap_or("\u{ffff}");
@@ -189,6 +198,7 @@ pub fn parse_sort_field(s: &str) -> Option<SortField> {
         "status" => Some(SortField::Status),
         "created_date" => Some(SortField::CreatedDate),
         "updated_date" => Some(SortField::UpdatedDate),
+        "started_date" => Some(SortField::StartedDate),
         "completed_date" => Some(SortField::CompletedDate),
         "assignee" => Some(SortField::Assignee),
         "due_date" => Some(SortField::DueDate),
@@ -203,6 +213,7 @@ pub fn sort_field_to_str(field: SortField) -> &'static str {
         SortField::Status => "status",
         SortField::CreatedDate => "created_date",
         SortField::UpdatedDate => "updated_date",
+        SortField::StartedDate => "started_date",
         SortField::CompletedDate => "completed_date",
         SortField::Assignee => "assignee",
         SortField::DueDate => "due_date",
