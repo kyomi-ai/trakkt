@@ -6,6 +6,15 @@
 
 List all attachments in the workspace.
 
+**Scope:** `attachments:read`
+
+### Example
+
+```bash
+curl "https://your-trakkt-instance.com/api/v1/attachments" \
+  -H "Authorization: Bearer <token>"
+```
+
 ### Response
 
 Returns `200 OK` on success with the result as JSON.
@@ -18,14 +27,21 @@ Returns `200 OK` on success with the result as JSON.
 
 Upload a file attachment. Returns the attachment metadata including download URL.
 
+**Scope:** `attachments:write`
+
 ### Request Body
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `content_base64` | string | Yes | Base64-encoded file content |
-| `content_type` | string | Yes | MIME content type (e.g. "image/png") |
-| `filename` | string | Yes | Original filename (e.g. "screenshot.png") |
-| `issue_id` | any | No | Optional issue ID to auto-link the attachment to an issue after upload. |
+This endpoint accepts `multipart/form-data` with a `file` field containing the file to upload.
+
+Optional query parameters: `issue_id` (attach the file to an issue after upload).
+
+### Example
+
+```bash
+curl -X POST "https://your-trakkt-instance.com/api/v1/attachments" \
+  -H "Authorization: Bearer <token>" \
+  -F "file=@/path/to/document.pdf"
+```
 
 ### Response
 
@@ -39,11 +55,20 @@ Returns `201 Created` on success with the created resource as JSON.
 
 Delete an attachment by ID. Only the original uploader can delete.
 
+**Scope:** `attachments:write`
+
 ### Parameters
 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
 | `attachment_id` | path | string | Yes |  |
+
+### Example
+
+```bash
+curl -X DELETE "https://your-trakkt-instance.com/api/v1/attachments/att_abc123" \
+  -H "Authorization: Bearer <token>"
+```
 
 ### Response
 
@@ -57,11 +82,20 @@ Returns `200 OK` on success with the result as JSON.
 
 Download an attachment file by ID.
 
+**Scope:** `attachments:read`
+
 ### Parameters
 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
 | `attachment_id` | path | string | Yes |  |
+
+### Example
+
+```bash
+curl "https://your-trakkt-instance.com/api/v1/attachments/att_abc123/download" \
+  -H "Authorization: Bearer <token>"
+```
 
 ### Response
 
@@ -75,14 +109,22 @@ Returns `200 OK` on success with the result as JSON.
 
 List all attachments linked to an issue.
 
+**Scope:** `attachments:read`
+
 ### Parameters
 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
 | `identifier` | path | string | Yes |  |
-| `issue_identifier` | query | any | No |  |
-| `issue_number` | query | any | No |  |
-| `team_key` | query | any | No |  |
+| `issue_number` | query | integer (int64) (nullable) | No | Issue number within the team. Required if issue_identifier is not provided |
+| `team_key` | query | string (nullable) | No | Team key (e.g. 'TRA'). Required if issue_identifier is not provided |
+
+### Example
+
+```bash
+curl "https://your-trakkt-instance.com/api/v1/issues/TRA-35/attachments" \
+  -H "Authorization: Bearer <token>"
+```
 
 ### Response
 
@@ -96,6 +138,8 @@ Returns `200 OK` on success with the result as JSON.
 
 Attach an existing attachment to an issue. Idempotent — re-attaching is a no-op.
 
+**Scope:** `attachments:write`
+
 ### Parameters
 
 | Name | In | Type | Required | Description |
@@ -107,9 +151,18 @@ Attach an existing attachment to an issue. Idempotent — re-attaching is a no-o
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `attachment_id` | string | Yes | The attachment ID to link to the issue |
-| `issue_identifier` | any | No | Issue identifier in 'TRA-35' format |
-| `issue_number` | any | No | Issue number within the team. Required if issue_identifier is not provided |
-| `team_key` | any | No | Team key (e.g. 'TRA'). Required if issue_identifier is not provided |
+| `issue_identifier` | string (nullable) | No | Issue identifier in 'TRA-35' format |
+| `issue_number` | integer (int64) (nullable) | No | Issue number within the team. Required if issue_identifier is not provided |
+| `team_key` | string (nullable) | No | Team key (e.g. 'TRA'). Required if issue_identifier is not provided |
+
+### Example
+
+```bash
+curl -X POST "https://your-trakkt-instance.com/api/v1/issues/TRA-35/attachments" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"attachment_id": "example-attachment_id"}'
+```
 
 ### Response
 
@@ -123,12 +176,21 @@ Returns `201 Created` on success with the created resource as JSON.
 
 Detach an attachment from an issue. Does not delete the attachment itself.
 
+**Scope:** `attachments:write`
+
 ### Parameters
 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
 | `identifier` | path | string | Yes |  |
 | `attachment_id` | path | string | Yes |  |
+
+### Example
+
+```bash
+curl -X DELETE "https://your-trakkt-instance.com/api/v1/issues/TRA-35/attachments/att_abc123" \
+  -H "Authorization: Bearer <token>"
+```
 
 ### Response
 

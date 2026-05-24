@@ -55,6 +55,40 @@ Errors return a JSON object with an `error` field:
 | `409` | Conflict -- the operation conflicts with current state |
 | `429` | Too many requests -- rate limit exceeded |
 
+## Pagination
+
+List endpoints accept `limit` and `offset` query parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer | 50 | Maximum results to return (max: 100) |
+| `offset` | integer | 0 | Number of results to skip |
+
+Example:
+
+```bash
+curl "https://your-trakkt-instance.com/api/v1/issues?limit=25&offset=50" \
+  -H "Authorization: Bearer <token>"
+```
+
+## Filtering
+
+List endpoints support filtering by various criteria. Pass filter values as query parameters:
+
+```bash
+# Issues by team
+curl "https://your-trakkt-instance.com/api/v1/issues?team_key=TRA" \
+  -H "Authorization: Bearer <token>"
+
+# High-priority issues
+curl "https://your-trakkt-instance.com/api/v1/issues?priority=2" \
+  -H "Authorization: Bearer <token>"
+
+# Issues with specific label
+curl "https://your-trakkt-instance.com/api/v1/issues?label=<label-id>" \
+  -H "Authorization: Bearer <token>"
+```
+
 ## OpenAPI Specification
 
 Trakkt generates an OpenAPI 3.1.0 specification from its operation registry. The spec includes all 36 operations with their parameter schemas, request bodies, and response formats.
