@@ -38,6 +38,7 @@ struct IssueRow {
     sort_order: Option<f64>,
     created_at: String,
     updated_at: String,
+    started_at: Option<String>,
     completed_at: Option<String>,
 }
 
@@ -61,6 +62,7 @@ impl IssueRow {
             sort_order: self.sort_order,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            started_at: self.started_at,
             completed_at: self.completed_at,
         }
     }
@@ -94,6 +96,7 @@ struct IssueDetailRow {
     sort_order: Option<f64>,
     created_at: String,
     updated_at: String,
+    started_at: Option<String>,
     completed_at: Option<String>,
     archived_at: Option<String>,
     has_children: i32,
@@ -130,6 +133,7 @@ impl IssueDetailRow {
             sort_order: self.sort_order,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            started_at: self.started_at,
             completed_at: self.completed_at,
             archived_at: self.archived_at,
             has_children: self.has_children != 0,
@@ -163,6 +167,7 @@ const ISSUE_DETAIL_SELECT: &str = "\
            i.sort_order, \
            CAST(i.created_at AS TEXT) AS created_at, \
            CAST(i.updated_at AS TEXT) AS updated_at, \
+           CAST(i.started_at AS TEXT) AS started_at, \
            CAST(i.completed_at AS TEXT) AS completed_at, \
            CAST(i.archived_at AS TEXT) AS archived_at, \
            (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.source_issue_id = i.issue_id AND r2.relation_type = 'parent') THEN 1 ELSE 0 END) AS has_children, \
@@ -267,10 +272,10 @@ pub async fn create_issue(
         "INSERT INTO issues \
             (issue_id, workspace_id, team_id, number, title, description, \
              status_id, priority, assignee_id, creator_id, due_date, \
-             project_id, milestone_id, estimate, created_at, updated_at, completed_at) \
+             project_id, milestone_id, estimate, created_at, updated_at, started_at, completed_at) \
          VALUES ($1, $2, $3, \
                  (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = $3), \
-                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, {estimate_cast}, {now}, {now}, NULL)"
+                 $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, {estimate_cast}, {now}, {now}, NULL, NULL)"
     );
     trakkt_core::db_execute!(
         db,
@@ -344,6 +349,7 @@ pub async fn create_issue(
                 project_id, milestone_id, estimate, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at, \
+                CAST(started_at AS TEXT) AS started_at, \
                 CAST(completed_at AS TEXT) AS completed_at \
          FROM issues WHERE issue_id = $1",
         &issue_id
@@ -659,6 +665,19 @@ pub async fn update_issue(
                 ELSE completed_at \
             END"
         ));
+        // Set started_at based on the new status's category:
+        // - started + currently null -> set to now()
+        // - backlog/unstarted -> clear to null
+        // - completed/cancelled -> keep current value (ELSE branch)
+        set_parts.push(format!(
+            "started_at = CASE \
+                WHEN (SELECT category FROM statuses WHERE status_id = ${param_idx}) IN ('started') \
+                     AND started_at IS NULL THEN {now} \
+                WHEN (SELECT category FROM statuses WHERE status_id = ${param_idx}) IN ('backlog', 'unstarted') \
+                     THEN NULL \
+                ELSE started_at \
+            END"
+        ));
         param_idx += 1;
     }
 
@@ -794,6 +813,7 @@ pub async fn update_issue(
                 project_id, milestone_id, estimate, sort_order, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at, \
+                CAST(started_at AS TEXT) AS started_at, \
                 CAST(completed_at AS TEXT) AS completed_at \
          FROM issues WHERE issue_id = $1",
         &issue_id
@@ -931,6 +951,7 @@ pub async fn delete_issue(
                     i.project_id, i.milestone_id, i.estimate, i.sort_order, \
                     CAST(i.created_at AS TEXT) AS created_at, \
                     CAST(i.updated_at AS TEXT) AS updated_at, \
+                    CAST(i.started_at AS TEXT) AS started_at, \
                     CAST(i.completed_at AS TEXT) AS completed_at \
              FROM issues i \
              JOIN teams t ON t.team_id = i.team_id \
