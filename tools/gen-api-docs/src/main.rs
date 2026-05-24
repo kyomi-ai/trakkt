@@ -529,10 +529,10 @@ fn render_curl_example(op: &Operation) -> String {
                 parts.push("  -F \"file=@/path/to/document.pdf\"".to_string());
             } else {
                 parts.push("  -H \"Content-Type: application/json\"".to_string());
-                if let Some(ref schema) = op.request_body_schema {
-                    if let Some(payload) = build_example_payload(schema) {
-                        parts.push(format!("  -d '{payload}'"));
-                    }
+                if let Some(payload) =
+                    op.request_body_schema.as_ref().and_then(build_example_payload)
+                {
+                    parts.push(format!("  -d '{payload}'"));
                 }
             }
         }
