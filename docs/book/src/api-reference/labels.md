@@ -6,6 +6,15 @@
 
 List all labels in the workspace, ordered alphabetically by name.
 
+**Scope:** `labels:read`
+
+### Example
+
+```bash
+curl "https://your-trakkt-instance.com/api/v1/labels" \
+  -H "Authorization: Bearer <token>"
+```
+
 ### Response
 
 Returns `200 OK` on success with the result as JSON.
@@ -18,14 +27,25 @@ Returns `200 OK` on success with the result as JSON.
 
 Create a new label in the workspace. Optionally scope it to a team by providing team_key or team_id.
 
+**Scope:** `labels:write`
+
 ### Request Body
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `color` | string | Yes | Hex color code (e.g. '#FF5733' or 'FF5733') |
 | `name` | string | Yes | Label name (must be unique within the workspace) |
-| `team_id` | any | No | Team ID to scope the label to a specific team |
-| `team_key` | any | No | Team key to scope the label to a specific team |
+| `team_id` | string (nullable) | No | Team ID to scope the label to a specific team |
+| `team_key` | string (nullable) | No | Team key to scope the label to a specific team |
+
+### Example
+
+```bash
+curl -X POST "https://your-trakkt-instance.com/api/v1/labels" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My Project", "color": "#0D9488"}'
+```
 
 ### Response
 

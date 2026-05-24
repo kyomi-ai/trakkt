@@ -44,7 +44,9 @@ pub fn generate_openapi_spec() -> Value {
                 .into_iter()
                 .filter(|p| {
                     let name = p["name"].as_str().unwrap_or("");
-                    !path_param_names.iter().any(|pn| pn == name)
+                    !path_param_names.iter().any(|pn| {
+                        pn == name || name.ends_with(&format!("_{pn}"))
+                    })
                 });
             parameters.extend(query_params);
         }
@@ -189,12 +191,16 @@ fn extract_query_params(schema_value: &Value) -> Vec<Value> {
     properties
         .iter()
         .map(|(name, prop_schema)| {
-            json!({
+            let mut param = json!({
                 "name": name,
                 "in": "query",
                 "required": required_fields.contains(name),
                 "schema": prop_schema,
-            })
+            });
+            if let Some(desc) = prop_schema.get("description") {
+                param["description"] = desc.clone();
+            }
+            param
         })
         .collect()
 }
