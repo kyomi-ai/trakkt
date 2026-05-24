@@ -34,6 +34,11 @@
 # MCP Server
 
 - [Overview](mcp-guide/README.md)
+- [Setup](mcp-guide/setup.md)
+- [Authentication](mcp-guide/authentication.md)
+- [Tools Reference](mcp-guide/tools-reference.md)
+- [Agent Workflows](mcp-guide/workflows.md)
+- [Troubleshooting](mcp-guide/troubleshooting.md)
 
 # Self-Hosting
 
