@@ -101,6 +101,17 @@ pub fn any_in_array(is_pg: bool, param: &str, column: &str) -> String {
     }
 }
 
+/// Timestamp comparison: is the column within the last N seconds?
+/// Postgres: `column > NOW() - INTERVAL 'N seconds'`
+/// SQLite: `column > datetime('now', '-N seconds')`
+pub fn within_seconds(is_pg: bool, column: &str, seconds: i64) -> String {
+    if is_pg {
+        format!("{column} > NOW() - INTERVAL '{seconds} seconds'")
+    } else {
+        format!("{column} > datetime('now', '-{seconds} seconds')")
+    }
+}
+
 /// Timestamp comparison: is the column older than N seconds ago?
 /// Postgres: `column < NOW() - INTERVAL 'N seconds'`
 /// SQLite: `column < datetime('now', '-N seconds')`
@@ -294,6 +305,18 @@ mod tests {
     fn test_coalesce_now() {
         assert_eq!(coalesce_now(true, "col"), "COALESCE(col, NOW())");
         assert_eq!(coalesce_now(false, "col"), "COALESCE(col, datetime('now'))");
+    }
+
+    #[test]
+    fn test_within_seconds() {
+        assert_eq!(
+            within_seconds(true, "created_at", 60),
+            "created_at > NOW() - INTERVAL '60 seconds'"
+        );
+        assert_eq!(
+            within_seconds(false, "created_at", 60),
+            "created_at > datetime('now', '-60 seconds')"
+        );
     }
 
     #[test]
