@@ -48,10 +48,6 @@ const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
     entity_types::NOTIFICATION,
     entity_types::COMMENT,
     entity_types::WORKSPACE_SETTINGS,
-    entity_types::ATTACHMENT,
-    entity_types::ISSUE_ATTACHMENT,
-    entity_types::ISSUE_RELATION,
-    entity_types::ACTIVITY,
 ];
 
 // ── Public entry point ──────────────────────────────────────────────────────
