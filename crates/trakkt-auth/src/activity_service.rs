@@ -20,6 +20,13 @@ use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
 
+const DESCRIPTION_COALESCE_WINDOW_SECS: i64 = 60;
+
+#[derive(sqlx::FromRow)]
+struct CoalesceRow {
+    activity_id: String,
+}
+
 #[derive(sqlx::FromRow)]
 struct IssueActivityRow {
     activity_id: String,
@@ -300,15 +307,18 @@ impl<'a> ActivityRecorder<'a> {
             .await?;
         }
 
-        // Description (hash-based detection, no content stored)
+        // Description (hash-based detection, no content stored).
+        // Uses coalescing to avoid duplicate activity entries from
+        // rapid auto-saves (debounce fires every 500ms).
         if before.description_hash != after.description_hash {
-            self.insert_activity(
+            self.coalesce_or_insert_activity(
                 issue_id,
                 "description_changed",
                 Some("description"),
                 None,
                 None,
                 None,
+                DESCRIPTION_COALESCE_WINDOW_SECS,
             )
             .await?;
         }
@@ -405,6 +415,100 @@ impl<'a> ActivityRecorder<'a> {
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────
+
+    /// Insert a new activity, or update an existing recent one if a matching
+    /// activity from the same actor on the same issue already exists within
+    /// `coalesce_window_secs`.
+    ///
+    /// This prevents flooding the activity feed when a field is saved
+    /// repeatedly in quick succession (e.g. description auto-save).
+    async fn coalesce_or_insert_activity(
+        &self,
+        issue_id: &str,
+        action_type: &str,
+        field: Option<&str>,
+        old_value: Option<&str>,
+        new_value: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        coalesce_window_secs: i64,
+    ) -> trakkt_core::Result<()> {
+        let is_pg = self.db.is_postgres();
+        let recent_predicate =
+            sql_compat::within_seconds(is_pg, "created_at", coalesce_window_secs);
+
+        let field_predicate = if is_pg {
+            "field IS NOT DISTINCT FROM $4"
+        } else {
+            "field IS $4"
+        };
+
+        let find_sql = format!(
+            "SELECT activity_id \
+             FROM issue_activities \
+             WHERE issue_id = $1 \
+               AND actor_id = $2 \
+               AND action_type = $3 \
+               AND {field_predicate} \
+               AND {recent_predicate} \
+             ORDER BY created_at DESC \
+             LIMIT 1"
+        );
+
+        let existing: Option<CoalesceRow> = trakkt_core::db_fetch_optional!(
+            self.db,
+            CoalesceRow,
+            &find_sql,
+            issue_id,
+            self.actor_id,
+            action_type,
+            field
+        )?;
+
+        if let Some(row) = existing {
+            // Update the existing row's timestamp to "now".
+            let now = sql_compat::now(is_pg);
+            let update_sql = format!(
+                "UPDATE issue_activities SET created_at = {now} WHERE activity_id = $1"
+            );
+            trakkt_core::db_execute!(self.db, &update_sql, &row.activity_id)?;
+
+            // Sync log — best-effort, log on failure.
+            if let Err(e) = sync_log_service::write_sync_entry(
+                self.db,
+                entity_types::ACTIVITY,
+                &row.activity_id,
+                self.workspace_id,
+                SyncActionType::Update,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    activity_id = %row.activity_id,
+                    "Failed to write sync log entry for coalesced activity"
+                );
+            }
+
+            // Broadcast via WebSocket — best-effort.
+            if let Some(ws) = self.ws_manager {
+                sync_log_service::broadcast_sync_action(
+                    ws,
+                    self.workspace_id,
+                    entity_types::ACTIVITY,
+                    &row.activity_id,
+                    SyncActionType::Update,
+                    None,
+                )
+                .await;
+            }
+
+            Ok(())
+        } else {
+            self.insert_activity(issue_id, action_type, field, old_value, new_value, metadata)
+                .await
+        }
+    }
 
     /// Insert a single activity row.
     async fn insert_activity(
