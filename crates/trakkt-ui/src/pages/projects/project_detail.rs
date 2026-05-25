@@ -20,7 +20,7 @@ use crate::components::{
     Button, ButtonSize, ButtonVariant, ConfirmDialog, DatePicker, EmptyState,
     IssueStatusBadge, IssueStatusVariant, INPUT_CLASS,
     PriorityIndicator, LabelBadge, Select, SelectVariant,
-    ToggleButton,
+    TeamKeyBadge, ToggleButton,
 };
 use crate::server_fns::projects::{
     get_project, get_project_progress, list_milestones,
@@ -1397,11 +1397,21 @@ fn AddMilestoneForm(
 /// Order: Priority | Status | Issue ID (team-key + number) | Title | Labels | Date
 #[component]
 fn ProjectIssueRow(issue: IssueWithDetails) -> impl IntoView {
-    let issue_key = format!("{}-{}", issue.team_key, issue.number);
-    let issue_href = format!("/issues/{issue_key}");
+    let issue_href = format!("/issues/{}-{}", issue.team_key, issue.number);
     let issue_href_click = issue_href.clone();
     let status = IssueStatusVariant::parse(&issue.status_category, &issue.status_name);
     let location = use_location();
+
+    // Look up team color from SyncStore (same pattern as issue_row.rs)
+    let team_color = {
+        let sync_store = use_context::<crate::cache::store::SyncStore>();
+        let team_id = issue.team_id.clone();
+        sync_store.and_then(|store| {
+            store.teams().get_untracked().into_iter()
+                .find(|t| t.team_id == team_id)
+                .and_then(|t| t.icon_color.clone())
+        }).unwrap_or_else(|| crate::components::team_icon::DEFAULT_ICON_COLOR.to_string())
+    };
 
     view! {
         <a
@@ -1434,9 +1444,11 @@ fn ProjectIssueRow(issue: IssueWithDetails) -> impl IntoView {
             // Status icon
             <IssueStatusBadge status=status/>
 
-            // Issue ID (Geist Mono)
+            // Team badge (colored pill with team key)
+            <TeamKeyBadge team_key=issue.team_key.clone() color=team_color.clone()/>
+            // Issue number (Geist Mono)
             <span class="font-mono text-xs text-muted-foreground shrink-0">
-                {issue_key}
+                {issue.number}
             </span>
 
             // Title

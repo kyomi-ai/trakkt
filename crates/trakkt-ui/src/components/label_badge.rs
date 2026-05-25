@@ -12,7 +12,7 @@ use leptos::prelude::*;
 /// Determine whether a hex color is dark enough to need white text overlay.
 ///
 /// Uses the ITU-R BT.601 relative luminance formula (same as used by W3C WCAG).
-fn is_dark_color(hex: &str) -> bool {
+pub fn is_dark_color(hex: &str) -> bool {
     let hex = hex.trim_start_matches('#');
     if hex.len() < 6 {
         return true;
@@ -38,7 +38,7 @@ pub fn LabelBadge(
     let text_class = if is_dark_color(&color) {
         "text-white"
     } else {
-        "text-stone-900"
+        "text-foreground"
     };
     view! {
         <span
