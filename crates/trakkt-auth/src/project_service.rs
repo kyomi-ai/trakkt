@@ -612,6 +612,29 @@ pub async fn list_milestones(
     Ok(rows.into_iter().map(MilestoneRow::into_dto).collect())
 }
 
+/// List all milestones across all projects in a workspace.
+pub async fn list_milestones_for_workspace(
+    db: &DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Vec<ProjectMilestone>> {
+    let sql = "\
+        SELECT pm.milestone_id, pm.project_id, pm.name, pm.description, \
+               CAST(pm.target_date AS TEXT) AS target_date, \
+               pm.sort_order, \
+               CAST(pm.created_at AS TEXT) AS created_at \
+        FROM project_milestones pm \
+        JOIN projects p ON pm.project_id = p.project_id \
+        WHERE p.workspace_id = $1 \
+        ORDER BY pm.sort_order ASC, pm.created_at ASC";
+    let rows: Vec<MilestoneRow> = trakkt_core::db_fetch_all!(
+        db,
+        MilestoneRow,
+        sql,
+        workspace_id
+    )?;
+    Ok(rows.into_iter().map(MilestoneRow::into_dto).collect())
+}
+
 /// Create a new milestone in a project.
 pub async fn create_milestone(
     db: &DbPool,

@@ -401,6 +401,18 @@ async fn handle_sync_bootstrap(
             vec![]
         });
 
+    // Fetch milestones across all projects in the workspace.
+    let milestones = trakkt_auth::project_service::list_milestones_for_workspace(db, workspace_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(user_id, workspace_id, error = %e, "list_milestones_for_workspace failed during bootstrap");
+            vec![]
+        });
+
+    // Fetch workspace settings snapshot.
+    let ws_settings = trakkt_auth::workspace_service::get_workspace_settings_for_sync(db, workspace_id)
+        .await;
+
     // 4. Get the current sync watermark.
     let latest_sync_id =
         trakkt_auth::sync_log_service::get_latest_sync_id(db, workspace_id)
@@ -461,6 +473,17 @@ async fn handle_sync_bootstrap(
         .filter_map(|c| serde_json::to_value(c).ok())
         .collect();
     stream_entities(manager, user_id, workspace_id, entity_types::COMMENT, "comment_id", comment_values).await;
+
+    let milestone_values: Vec<serde_json::Value> = milestones
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+    stream_entities(manager, user_id, workspace_id, entity_types::PROJECT_MILESTONE, "milestone_id", milestone_values).await;
+
+    // Workspace settings is a single entity (not a list).
+    if let Some(ws_settings_val) = ws_settings {
+        stream_entities(manager, user_id, workspace_id, entity_types::WORKSPACE_SETTINGS, "workspace_id", vec![ws_settings_val]).await;
+    }
 
     // 6. Signal completion with the current sync watermark.
     send_sync_response(
