@@ -24,7 +24,8 @@ use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 /// Add a relation between two issues.
 ///
 /// Supports 'blocks' (source blocks target), 'parent' (source is parent of
-/// target), and 'duplicate' (source is duplicate of target) relation types.
+/// target), 'duplicate' (source is duplicate of target), and 'relates_to'
+/// (general association between issues) relation types.
 /// Both source and target are resolved from compound identifiers like 'TRA-35'.
 ///
 /// Ported from `tool_add_relation` in `routes/mcp.rs`.
@@ -292,7 +293,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "add_relation",
-            description: "Add a relation between two issues. Supports 'blocks' (source blocks target), 'parent' (source is parent of target), and 'duplicate' (source is duplicate of target) relation types.",
+            description: "Add a relation between two issues. Supports 'blocks' (source blocks target), 'parent' (source is parent of target), 'duplicate' (source is duplicate of target), and 'relates_to' (general association between issues) relation types.",
             scope: "issues:write",
             rest_method: Method::POST,
             rest_path: "/issues/{identifier}/relations",

@@ -90,7 +90,7 @@ pub struct CreateIssueApiParams {
 pub struct InlineRelation {
     /// Target issue identifier (e.g. "TRA-130")
     pub issue: String,
-    /// Relation type (e.g. "blocks", "blocked_by", "parent", "duplicate")
+    /// Relation type (e.g. "blocks", "blocked_by", "parent", "duplicate", "relates_to")
     pub relation_type: String,
 }
 
@@ -247,12 +247,12 @@ pub struct ListStatusesApiParams {
 /// Parameters for adding a relation between two issues.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct AddRelationApiParams {
-    /// Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue. For 'duplicate': the duplicate issue.
+    /// Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue. For 'duplicate': the duplicate issue. For 'relates_to': either issue (symmetric).
     /// Optional so REST can inject it from the path parameter.
     pub source_issue: Option<String>,
-    /// Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue. For 'duplicate': the original issue.
+    /// Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue. For 'duplicate': the original issue. For 'relates_to': either issue (symmetric).
     pub target_issue: String,
-    /// Relation type: 'blocks', 'parent', or 'duplicate'
+    /// Relation type: 'blocks', 'parent', 'duplicate', or 'relates_to'
     pub relation_type: String,
 }
 

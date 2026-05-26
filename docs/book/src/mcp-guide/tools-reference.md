@@ -55,7 +55,7 @@ See the [Relations API Reference](../api-reference/relations.md) for parameter d
 
 | Tool | Description | Scope |
 |------|-------------|-------|
-| `add_relation` | Add a relation between two issues. Types: `blocks`, `parent`, `duplicate`. | `issues:write` |
+| `add_relation` | Add a relation between two issues. Types: `blocks`, `parent`, `duplicate`, `relates_to`. | `issues:write` |
 | `remove_relation` | Remove a relation by its relation ID. | `issues:write` |
 | `list_issue_relations` | List all relations for an issue (both directions). | `issues:read` |
 
