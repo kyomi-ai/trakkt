@@ -14,9 +14,11 @@ use phosphor_leptos::{Icon, IconWeight};
 use wasm_bindgen::JsValue;
 
 use crate::cache::store::SyncStore;
+use crate::components::{EmptyState, SearchInput, Select, SelectVariant};
 use crate::server_fns::notifications::{
     list_notifications, mark_all_notifications_read, mark_notification_read,
 };
+use crate::server_fns::teams::list_teams;
 use crate::types::IssueNavState;
 use crate::utils::relative_time::relative_time;
 use crate::utils::time_group::{classify_time_group, TimeGroup};
@@ -39,9 +41,48 @@ pub fn InboxPage() -> impl IntoView {
     let (unread_only, set_unread_only) = signal(false);
     let (refetch_version, set_refetch_version) = signal(0u32);
 
+    // Filter state
+    let (team_filter, set_team_filter) = signal(String::new());
+    let (type_filter, set_type_filter) = signal(String::new());
+    let (search_text, set_search_text) = signal(String::new());
+
+    // Load teams for the team filter dropdown
+    let teams_resource = Resource::new(|| (), |_| async move { list_teams().await });
+
+    let team_options = Signal::derive(move || {
+        let mut opts = vec![("".to_string(), "All teams".to_string())];
+        if let Some(Ok(ref teams)) = teams_resource.get() {
+            for team in teams {
+                opts.push((team.key.clone(), team.name.clone()));
+            }
+        }
+        opts
+    });
+
+    let type_options = Signal::derive(|| {
+        vec![
+            ("".to_string(), "All types".to_string()),
+            ("commented".to_string(), "Comments".to_string()),
+            ("status_changed".to_string(), "Status changes".to_string()),
+            ("assigned".to_string(), "Assignments".to_string()),
+            ("priority_changed".to_string(), "Priority changes".to_string()),
+        ]
+    });
+
     let notifications_resource = Resource::new(
-        move || (unread_only.get(), refetch_version.get()),
-        |(uo, _)| async move { list_notifications(uo).await },
+        move || (
+            unread_only.get(),
+            refetch_version.get(),
+            team_filter.get(),
+            type_filter.get(),
+            search_text.get(),
+        ),
+        |(uo, _, tk, tf, search)| async move {
+            let team_key = if tk.is_empty() { None } else { Some(tk) };
+            let notification_type = if tf.is_empty() { None } else { Some(tf) };
+            let search = if search.is_empty() { None } else { Some(search) };
+            list_notifications(uo, notification_type, team_key, search).await
+        },
     );
 
     let sync_store = use_context::<SyncStore>();
@@ -65,6 +106,12 @@ pub fn InboxPage() -> impl IntoView {
             marking_all.set(false);
             set_refetch_version.update(|v| *v += 1);
         });
+    };
+
+    let has_active_filters = move || {
+        !team_filter.get().is_empty()
+            || !type_filter.get().is_empty()
+            || !search_text.get().is_empty()
     };
 
     const TAB_ACTIVE: &str = "px-3 py-1.5 text-sm rounded-md transition-colors bg-secondary text-foreground font-medium";
@@ -98,6 +145,28 @@ pub fn InboxPage() -> impl IntoView {
                 </button>
             </div>
 
+            // Filter bar
+            <div class="flex items-center gap-2 px-5 py-3 border-b border-border">
+                <SearchInput
+                    value=Signal::derive(move || search_text.get())
+                    on_input=Callback::new(move |v: String| set_search_text.set(v))
+                    placeholder="Search by title or identifier..."
+                    class="max-w-xs".to_string()
+                />
+                <Select
+                    value=Signal::derive(move || type_filter.get())
+                    options=type_options
+                    on_change=Callback::new(move |v: String| set_type_filter.set(v))
+                    variant=SelectVariant::Compact
+                />
+                <Select
+                    value=Signal::derive(move || team_filter.get())
+                    options=team_options
+                    on_change=Callback::new(move |v: String| set_team_filter.set(v))
+                    variant=SelectVariant::Compact
+                />
+            </div>
+
             <div class="flex-1 overflow-y-auto">
                 <Suspense fallback=move || view! {
                     <div class="flex items-center justify-center py-12">
@@ -108,12 +177,21 @@ pub fn InboxPage() -> impl IntoView {
                         notifications_resource.get().map(|result| {
                             match result {
                                 Ok(ref notifications) if notifications.is_empty() => {
-                                    view! {
-                                        <div class="flex flex-col items-center justify-center py-16 text-muted-foreground">
-                                            <Icon icon=phosphor_leptos::CHECK_CIRCLE weight=IconWeight::Light size="48px" attr:class="mb-4 text-muted-foreground/50"/>
-                                            <p class="text-lg font-medium">"All caught up"</p>
-                                        </div>
-                                    }.into_any()
+                                    if has_active_filters() {
+                                        view! {
+                                            <EmptyState
+                                                title="No matches"
+                                                description="No notifications match this filter. Try adjusting your search or filters."
+                                            />
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <div class="flex flex-col items-center justify-center py-16 text-muted-foreground">
+                                                <Icon icon=phosphor_leptos::CHECK_CIRCLE weight=IconWeight::Light size="48px" attr:class="mb-4 text-muted-foreground/50"/>
+                                                <p class="text-lg font-medium">"All caught up"</p>
+                                            </div>
+                                        }.into_any()
+                                    }
                                 }
                                 Ok(ref notifications) => {
                                     let grouped = group_notifications(notifications);

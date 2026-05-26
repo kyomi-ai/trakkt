@@ -17,13 +17,25 @@ use super::{AuthenticatedContext, IntoServerFnError};
 /// List notifications for the current user.
 ///
 /// When `unread_only` is true, only unread notifications are returned.
+/// Optional filters narrow by notification type, team key, or text search.
 #[server(prefix = "/leptos-api")]
-pub async fn list_notifications(unread_only: bool) -> Result<Vec<Notification>, ServerFnError> {
+pub async fn list_notifications(
+    unread_only: bool,
+    notification_type: Option<String>,
+    team_key: Option<String>,
+    search: Option<String>,
+) -> Result<Vec<Notification>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    let notifications =
-        trakkt_auth::notification_service::list_notifications(ac.db(), &ac.auth.user_id, unread_only)
-            .await
-            .into_sfn()?;
+    let notifications = trakkt_auth::notification_service::list_notifications(
+        ac.db(),
+        &ac.auth.user_id,
+        unread_only,
+        notification_type.as_deref(),
+        team_key.as_deref(),
+        search.as_deref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(notifications)
 }
 

@@ -159,16 +159,25 @@ pub async fn create_notification(
     Ok(())
 }
 
-/// List notifications for a user, optionally filtering to unread only.
+/// List notifications for a user with optional filters.
 ///
 /// Joins with `issues` to include issue title and number.
 /// Results are ordered by creation date (newest first), limited to 50.
+///
+/// Optional filters narrow results by notification type, team key, or
+/// text search (issue title / identifier). The nullable parameter pattern
+/// (`$N IS NULL OR column = $N`) keeps bind positions fixed regardless
+/// of which filters are active.
 pub async fn list_notifications(
     db: &DbPool,
     user_id: &str,
     unread_only: bool,
+    notification_type: Option<&str>,
+    team_key: Option<&str>,
+    search: Option<&str>,
 ) -> trakkt_core::Result<Vec<Notification>> {
     let is_pg = db.is_postgres();
+    let cast_text = if is_pg { "::TEXT" } else { "" };
 
     let unread_filter = if unread_only {
         let bf = sql_compat::bool_false(is_pg);
@@ -177,6 +186,7 @@ pub async fn list_notifications(
         String::new()
     };
 
+    // $1 = user_id, $2 = notification_type, $3 = team_key, $4 = search pattern
     let sql = format!(
         "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
                 n.type AS notification_type, n.read, \
@@ -191,12 +201,32 @@ pub async fn list_notifications(
          LEFT JOIN teams t ON t.team_id = i.team_id \
          LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id \
          WHERE n.user_id = $1 {unread_filter} \
+           AND ($2{cast_text} IS NULL OR n.type = $2) \
+           AND ($3{cast_text} IS NULL OR t.key = $3) \
+           AND ($4{cast_text} IS NULL OR i.title LIKE $4 ESCAPE '\\' \
+                OR (t.key || '-' || CAST(i.number AS TEXT)) LIKE $4 ESCAPE '\\') \
          ORDER BY n.created_at DESC \
          LIMIT {DEFAULT_NOTIFICATION_LIMIT}"
     );
 
-    let rows: Vec<NotificationRow> =
-        trakkt_core::db_fetch_all!(db, NotificationRow, &sql, user_id)?;
+    // Prepare the search term with wildcards, escaping LIKE special chars.
+    let search_pattern = search.map(|s| {
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        format!("%{escaped}%")
+    });
+
+    let rows: Vec<NotificationRow> = trakkt_core::db_fetch_all!(
+        db,
+        NotificationRow,
+        &sql,
+        user_id,
+        notification_type,
+        team_key,
+        search_pattern.as_deref()
+    )?;
     Ok(rows.into_iter().map(NotificationRow::into_dto).collect())
 }
 
