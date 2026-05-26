@@ -183,10 +183,6 @@ pub fn IssueDetailPage() -> impl IntoView {
                 }
             })
     };
-    let back_path = nav_state
-        .as_ref()
-        .map(|s| s.back_path.clone())
-        .unwrap_or_else(|| "/my-issues".to_string());
     let back_label = nav_state
         .as_ref()
         .map(|s| s.back_label.clone())
@@ -200,11 +196,24 @@ pub fn IssueDetailPage() -> impl IntoView {
                     variant=ButtonVariant::GhostMuted
                     size=ButtonSize::IconSm
                     aria_label=format!("Back to {back_label}")
-                    on:click={
-                        let back_path = back_path.clone();
-                        move |_| {
+                    on:click=move |_| {
+                        let Some(win) = web_sys::window() else {
+                            tracing::warn!("back button: no window object");
+                            return;
+                        };
+                        let Ok(history) = win.history() else {
+                            tracing::warn!("back button: window.history() unavailable");
                             let nav = use_navigate();
-                            nav(&back_path, Default::default());
+                            nav("/my-issues", Default::default());
+                            return;
+                        };
+                        if history.length().unwrap_or(0) > 1 {
+                            if let Err(e) = history.back() {
+                                tracing::warn!("history.back() failed: {e:?}");
+                            }
+                        } else {
+                            let nav = use_navigate();
+                            nav("/my-issues", Default::default());
                         }
                     }
                 >
