@@ -33,7 +33,7 @@ Returns `200 OK` on success with the result as JSON.
 
 **Operation:** `add_relation`
 
-Add a relation between two issues. Supports 'blocks' (source blocks target), 'parent' (source is parent of target), and 'duplicate' (source is duplicate of target) relation types.
+Add a relation between two issues. Supports 'blocks' (source blocks target), 'parent' (source is parent of target), 'duplicate' (source is duplicate of target), and 'relates_to' (general association between issues) relation types.
 
 **Scope:** `issues:write`
 
@@ -47,9 +47,9 @@ Add a relation between two issues. Supports 'blocks' (source blocks target), 'pa
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `relation_type` | string | Yes | Relation type: 'blocks', 'parent', or 'duplicate' |
-| `source_issue` | string (nullable) | No | Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue. For 'duplicate': the duplicate issue. Optional so REST can inject it from the path parameter. |
-| `target_issue` | string | Yes | Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue. For 'duplicate': the original issue. |
+| `relation_type` | string | Yes | Relation type: 'blocks', 'parent', 'duplicate', or 'relates_to' |
+| `source_issue` | string (nullable) | No | Source issue identifier in 'TRA-35' format. For 'blocks': the blocker. For 'parent': the parent issue. For 'duplicate': the duplicate issue. For 'relates_to': either issue (symmetric). Optional so REST can inject it from the path parameter. |
+| `target_issue` | string | Yes | Target issue identifier in 'TRA-35' format. For 'blocks': the blocked issue. For 'parent': the child issue. For 'duplicate': the original issue. For 'relates_to': either issue (symmetric). |
 
 ### Example
 

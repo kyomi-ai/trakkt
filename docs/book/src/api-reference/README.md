@@ -104,7 +104,7 @@ The API is organized into the following groups:
 | [Labels](labels.md) | 2 | List and create labels |
 | [Teams](teams.md) | 2 | List teams and update team settings |
 | [Statuses](statuses.md) | 1 | List all workflow statuses |
-| [Relations](relations.md) | 3 | Manage issue relations (blocks, parent, duplicate) |
+| [Relations](relations.md) | 3 | Manage issue relations (blocks, parent, duplicate, relates_to) |
 | [Projects](projects.md) | 5 | CRUD operations for projects |
 | [Milestones](milestones.md) | 4 | CRUD operations for milestones within projects |
 | [Attachments](attachments.md) | 7 | Upload, download, delete, list, and link attachments to issues |

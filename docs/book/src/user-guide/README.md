@@ -14,7 +14,7 @@ Issues are the primary unit of work. Each issue belongs to a team and has:
 - **Assignee** -- the team member responsible for the issue.
 - **Labels** -- user-defined tags for categorization (workspace-wide or team-scoped).
 - **Project and milestone** -- optional grouping for roadmap planning.
-- **Relations** -- links between issues: blocks/blocked-by, parent/child, and duplicate.
+- **Relations** -- links between issues: blocks/blocked-by, parent/child, duplicate, and relates-to.
 
 ## Teams
 
