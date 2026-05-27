@@ -71,6 +71,7 @@ pub async fn mark_all_notifications_read() -> Result<(), ServerFnError> {
     Ok(())
 }
 
+#[cfg(feature = "ssr")]
 const MAX_BULK_IDS: usize = 100;
 
 #[cfg(feature = "ssr")]
