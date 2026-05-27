@@ -642,17 +642,6 @@ fn SidebarWorkspaceSection() -> impl IntoView {
                         }
                     }).collect_view()}
                 </div>
-
-                // Phase 3 of TRA-139 wires this to open the save-view modal
-                <div class="px-2 pt-1">
-                    <a
-                        href="/workspace?new_view=1"
-                        class="flex items-center gap-2 px-3 py-1 rounded-md text-[12px] text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors"
-                    >
-                        <Icon icon=phosphor_leptos::PLUS weight=IconWeight::Bold size="12px"/>
-                        "New View"
-                    </a>
-                </div>
             }.into_any()
         }}
     }
