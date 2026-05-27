@@ -44,6 +44,7 @@ struct NotificationRow {
     action_source: String,
     action_source_label: Option<String>,
     created_at: String,
+    deleted_at: Option<String>,
 }
 
 impl NotificationRow {
@@ -120,7 +121,8 @@ pub async fn create_notification(
                 n.actor_id, \
                 u_actor.name AS actor_name, \
                 n.action_source, n.action_source_label, \
-                CAST(n.created_at AS TEXT) AS created_at \
+                CAST(n.created_at AS TEXT) AS created_at, \
+                CAST(n.deleted_at AS TEXT) AS deleted_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
          LEFT JOIN teams t ON t.team_id = i.team_id \
@@ -195,12 +197,13 @@ pub async fn list_notifications(
                 n.actor_id, \
                 u_actor.name AS actor_name, \
                 n.action_source, n.action_source_label, \
-                CAST(n.created_at AS TEXT) AS created_at \
+                CAST(n.created_at AS TEXT) AS created_at, \
+                CAST(n.deleted_at AS TEXT) AS deleted_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
          LEFT JOIN teams t ON t.team_id = i.team_id \
          LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id \
-         WHERE n.user_id = $1 {unread_filter} \
+         WHERE n.user_id = $1 AND n.deleted_at IS NULL {unread_filter} \
            AND ($2{cast_text} IS NULL OR n.type = $2) \
            AND ($3{cast_text} IS NULL OR t.key = $3) \
            AND ($4{cast_text} IS NULL OR i.title LIKE $4 ESCAPE '\\' \
@@ -241,7 +244,7 @@ pub async fn mark_as_read(
 
     let sql = format!(
         "UPDATE notifications SET read = {bt} \
-         WHERE notification_id = $1 AND user_id = $2"
+         WHERE notification_id = $1 AND user_id = $2 AND deleted_at IS NULL"
     );
     let result = trakkt_core::db_execute!(db, &sql, notification_id, user_id)?;
 
@@ -277,7 +280,7 @@ pub async fn mark_all_as_read(
 
     let sql = format!(
         "UPDATE notifications SET read = {bt} \
-         WHERE user_id = $1 AND read = {bf}"
+         WHERE user_id = $1 AND read = {bf} AND deleted_at IS NULL"
     );
     trakkt_core::db_execute!(db, &sql, user_id)?;
 
@@ -294,8 +297,85 @@ pub async fn count_unread(
 
     let sql = format!(
         "SELECT COUNT(*) FROM notifications \
-         WHERE user_id = $1 AND read = {bf}"
+         WHERE user_id = $1 AND read = {bf} AND deleted_at IS NULL"
     );
     let count: i64 = trakkt_core::db_fetch_scalar!(db, i64, &sql, user_id)?;
     Ok(count)
+}
+
+/// Execute a bulk UPDATE on notifications by ID. `$1` is always `user_id`;
+/// `$2..$N+1` are the notification IDs.
+async fn bulk_update_notifications(
+    db: &DbPool,
+    user_id: &str,
+    notification_ids: &[String],
+    set_and_where: &str,
+) -> trakkt_core::Result<()> {
+    if notification_ids.is_empty() {
+        return Ok(());
+    }
+
+    let (in_clause, _) = trakkt_core::db::in_clause_placeholders(notification_ids.len(), 2);
+    let sql = format!(
+        "UPDATE notifications SET {set_and_where} \
+           AND notification_id IN {in_clause}"
+    );
+
+    trakkt_core::db_with_pool!(db, |p| {
+        let mut query = sqlx::query(&sql).bind(user_id);
+        for id in notification_ids {
+            query = query.bind(id);
+        }
+        query.execute(p).await?;
+        Ok::<(), sqlx::Error>(())
+    })?;
+
+    Ok(())
+}
+
+/// Bulk mark specific notifications as read. Only affects the given user's
+/// non-deleted, currently-unread notifications.
+pub async fn bulk_mark_as_read(
+    db: &DbPool,
+    notification_ids: &[String],
+    user_id: &str,
+) -> trakkt_core::Result<()> {
+    let is_pg = db.is_postgres();
+    let bt = sql_compat::bool_true(is_pg);
+    let bf = sql_compat::bool_false(is_pg);
+    let clause = format!(
+        "read = {bt} WHERE user_id = $1 AND read = {bf} AND deleted_at IS NULL"
+    );
+    bulk_update_notifications(db, user_id, notification_ids, &clause).await
+}
+
+/// Bulk mark specific notifications as unread. Only affects the given user's
+/// non-deleted, currently-read notifications.
+pub async fn bulk_mark_as_unread(
+    db: &DbPool,
+    notification_ids: &[String],
+    user_id: &str,
+) -> trakkt_core::Result<()> {
+    let is_pg = db.is_postgres();
+    let bt = sql_compat::bool_true(is_pg);
+    let bf = sql_compat::bool_false(is_pg);
+    let clause = format!(
+        "read = {bf} WHERE user_id = $1 AND read = {bt} AND deleted_at IS NULL"
+    );
+    bulk_update_notifications(db, user_id, notification_ids, &clause).await
+}
+
+/// Soft-delete specific notifications. Only affects the given user's
+/// non-deleted notifications.
+pub async fn bulk_delete_notifications(
+    db: &DbPool,
+    notification_ids: &[String],
+    user_id: &str,
+) -> trakkt_core::Result<()> {
+    let is_pg = db.is_postgres();
+    let now = sql_compat::now(is_pg);
+    let clause = format!(
+        "deleted_at = {now} WHERE user_id = $1 AND deleted_at IS NULL"
+    );
+    bulk_update_notifications(db, user_id, notification_ids, &clause).await
 }
