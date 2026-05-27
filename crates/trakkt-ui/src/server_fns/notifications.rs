@@ -70,3 +70,60 @@ pub async fn mark_all_notifications_read() -> Result<(), ServerFnError> {
         .into_sfn()?;
     Ok(())
 }
+
+#[cfg(feature = "ssr")]
+const MAX_BULK_IDS: usize = 100;
+
+#[cfg(feature = "ssr")]
+fn parse_notification_ids(raw: &str) -> Result<Vec<String>, ServerFnError> {
+    let ids: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.len() > MAX_BULK_IDS {
+        return Err(ServerFnError::new(format!(
+            "bulk operations are limited to {MAX_BULK_IDS} notifications"
+        )));
+    }
+    Ok(ids)
+}
+
+/// Bulk mark notifications as read.
+///
+/// `notification_ids` is a comma-separated string of notification UUIDs.
+#[server(prefix = "/leptos-api")]
+pub async fn bulk_mark_notifications_read(notification_ids: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let ids = parse_notification_ids(&notification_ids)?;
+    trakkt_auth::notification_service::bulk_mark_as_read(ac.db(), &ids, &ac.auth.user_id)
+        .await
+        .into_sfn()?;
+    Ok(())
+}
+
+/// Bulk mark notifications as unread.
+///
+/// `notification_ids` is a comma-separated string of notification UUIDs.
+#[server(prefix = "/leptos-api")]
+pub async fn bulk_mark_notifications_unread(notification_ids: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let ids = parse_notification_ids(&notification_ids)?;
+    trakkt_auth::notification_service::bulk_mark_as_unread(ac.db(), &ids, &ac.auth.user_id)
+        .await
+        .into_sfn()?;
+    Ok(())
+}
+
+/// Bulk soft-delete notifications.
+///
+/// `notification_ids` is a comma-separated string of notification UUIDs.
+#[server(prefix = "/leptos-api")]
+pub async fn bulk_delete_notifications(notification_ids: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let ids = parse_notification_ids(&notification_ids)?;
+    trakkt_auth::notification_service::bulk_delete_notifications(ac.db(), &ids, &ac.auth.user_id)
+        .await
+        .into_sfn()?;
+    Ok(())
+}
