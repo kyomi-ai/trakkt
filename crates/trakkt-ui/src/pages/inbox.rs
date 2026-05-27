@@ -6,6 +6,8 @@
 //! This Week, Older). Supports filtering between All and Unread,
 //! mark-as-read on click, and bulk mark-all-as-read.
 
+use std::collections::HashSet;
+
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use leptos_router::location::State;
@@ -14,8 +16,12 @@ use phosphor_leptos::{Icon, IconWeight};
 use wasm_bindgen::JsValue;
 
 use crate::cache::store::SyncStore;
-use crate::components::{EmptyState, SearchInput, Select, SelectVariant};
+use crate::components::{
+    Button, ButtonSize, ButtonVariant, Checkbox, ConfirmDialog, EmptyState, SearchInput, Select,
+    SelectVariant,
+};
 use crate::server_fns::notifications::{
+    bulk_delete_notifications, bulk_mark_notifications_read, bulk_mark_notifications_unread,
     list_notifications, mark_all_notifications_read, mark_notification_read,
 };
 use crate::server_fns::teams::list_teams;
@@ -45,6 +51,21 @@ pub fn InboxPage() -> impl IntoView {
     let (team_filter, set_team_filter) = signal(String::new());
     let (type_filter, set_type_filter) = signal(String::new());
     let (search_text, set_search_text) = signal(String::new());
+
+    // Selection state for bulk actions
+    let selected = RwSignal::new(HashSet::<String>::new());
+    let bulk_pending = RwSignal::new(false);
+    let confirm_delete_open = RwSignal::new(false);
+    let pending_delete_ids = RwSignal::new(Vec::<String>::new());
+
+    // Clear selection when any filter changes
+    Effect::new(move |_| {
+        unread_only.get();
+        team_filter.get();
+        type_filter.get();
+        search_text.get();
+        selected.set(HashSet::new());
+    });
 
     // Load teams for the team filter dropdown
     let teams_resource = Resource::new(|| (), |_| async move { list_teams().await });
@@ -114,6 +135,125 @@ pub fn InboxPage() -> impl IntoView {
             || !search_text.get().is_empty()
     };
 
+    // ── Bulk action handlers ────────────────────────────────────────────
+    let handle_bulk_mark_read = move |_: web_sys::MouseEvent| {
+        if bulk_pending.get_untracked() {
+            return;
+        }
+        let ids: Vec<String> = selected.get_untracked().into_iter().collect();
+        if ids.is_empty() {
+            return;
+        }
+        bulk_pending.set(true);
+
+        // Optimistic SyncStore update
+        if let Some(store) = sync_store {
+            for id in &ids {
+                if let Some(mut n) = store
+                    .notifications()
+                    .get_untracked()
+                    .into_iter()
+                    .find(|n| &n.notification_id == id)
+                {
+                    n.read = true;
+                    store.upsert_notification(n);
+                }
+            }
+        }
+
+        let csv = ids.join(",");
+        selected.set(HashSet::new());
+        leptos::task::spawn_local(async move {
+            let _ = bulk_mark_notifications_read(csv).await;
+            bulk_pending.set(false);
+            set_refetch_version.update(|v| *v += 1);
+        });
+    };
+
+    let handle_bulk_mark_unread = move |_: web_sys::MouseEvent| {
+        if bulk_pending.get_untracked() {
+            return;
+        }
+        let ids: Vec<String> = selected.get_untracked().into_iter().collect();
+        if ids.is_empty() {
+            return;
+        }
+        bulk_pending.set(true);
+
+        // Optimistic SyncStore update
+        if let Some(store) = sync_store {
+            for id in &ids {
+                if let Some(mut n) = store
+                    .notifications()
+                    .get_untracked()
+                    .into_iter()
+                    .find(|n| &n.notification_id == id)
+                {
+                    n.read = false;
+                    store.upsert_notification(n);
+                }
+            }
+        }
+
+        let csv = ids.join(",");
+        selected.set(HashSet::new());
+        leptos::task::spawn_local(async move {
+            let _ = bulk_mark_notifications_unread(csv).await;
+            bulk_pending.set(false);
+            set_refetch_version.update(|v| *v += 1);
+        });
+    };
+
+    let handle_bulk_delete = move |_: web_sys::MouseEvent| {
+        if bulk_pending.get_untracked() {
+            return;
+        }
+        let ids: Vec<String> = selected.get_untracked().into_iter().collect();
+        if ids.is_empty() {
+            return;
+        }
+        pending_delete_ids.set(ids);
+        confirm_delete_open.set(true);
+    };
+
+    let on_delete_confirmed = Callback::new(move |()| {
+        confirm_delete_open.set(false);
+        let ids = pending_delete_ids.get_untracked();
+        pending_delete_ids.set(Vec::new());
+        if ids.is_empty() {
+            return;
+        }
+        bulk_pending.set(true);
+        let csv = ids.join(",");
+        selected.set(HashSet::new());
+        leptos::task::spawn_local(async move {
+            let _ = bulk_delete_notifications(csv).await;
+            bulk_pending.set(false);
+            set_refetch_version.update(|v| *v += 1);
+        });
+    });
+
+    let handle_clear_selection = move |_: web_sys::MouseEvent| {
+        selected.set(HashSet::new());
+    };
+
+    // ── Derived signals for toolbar ─────────────────────────────────────
+    let has_selection = Signal::derive(move || !selected.get().is_empty());
+    let selection_count = Signal::derive(move || selected.get().len());
+
+    let all_notification_ids = Signal::derive(move || {
+        notifications_resource
+            .get()
+            .and_then(|r| r.ok())
+            .map(|notifications| {
+                notifications
+                    .iter()
+                    .map(|n| n.notification_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+
     const TAB_ACTIVE: &str = "px-3 py-1.5 text-sm rounded-md transition-colors bg-secondary text-foreground font-medium";
     const TAB_INACTIVE: &str = "px-3 py-1.5 text-sm rounded-md transition-colors text-muted-foreground hover:text-foreground hover:bg-secondary/50";
 
@@ -145,26 +285,105 @@ pub fn InboxPage() -> impl IntoView {
                 </button>
             </div>
 
-            // Filter bar
-            <div class="flex items-center gap-2 px-5 py-3 border-b border-border">
-                <SearchInput
-                    value=Signal::derive(move || search_text.get())
-                    on_input=Callback::new(move |v: String| set_search_text.set(v))
-                    placeholder="Search by title or identifier..."
-                    class="max-w-xs".to_string()
-                />
-                <Select
-                    value=Signal::derive(move || type_filter.get())
-                    options=type_options
-                    on_change=Callback::new(move |v: String| set_type_filter.set(v))
-                    variant=SelectVariant::Compact
-                />
-                <Select
-                    value=Signal::derive(move || team_filter.get())
-                    options=team_options
-                    on_change=Callback::new(move |v: String| set_team_filter.set(v))
-                    variant=SelectVariant::Compact
-                />
+            // Filter bar / bulk action toolbar
+            <div class="flex items-center gap-2 px-5 py-3 border-b border-border min-h-[52px]">
+                // Select-all checkbox — visible when notifications exist
+                {move || {
+                    let ids = all_notification_ids.get();
+                    (!ids.is_empty()).then(|| {
+                        view! {
+                            <Checkbox
+                                checked=Signal::derive(move || {
+                                    let sel = selected.get();
+                                    let ids = all_notification_ids.get();
+                                    !ids.is_empty() && sel.len() == ids.len()
+                                })
+                                indeterminate=Signal::derive(move || {
+                                    let sel = selected.get();
+                                    let ids = all_notification_ids.get();
+                                    !sel.is_empty() && sel.len() < ids.len()
+                                })
+                                on_change=Callback::new(move |_checked: bool| {
+                                    let ids = all_notification_ids.get_untracked();
+                                    selected.update(|set| {
+                                        if set.len() == ids.len() && !ids.is_empty() {
+                                            set.clear();
+                                        } else {
+                                            *set = ids.into_iter().collect();
+                                        }
+                                    });
+                                })
+                            />
+                        }
+                    })
+                }}
+
+                {move || {
+                    if has_selection.get() {
+                        let count = selection_count.get();
+                        view! {
+                            <span class="text-sm font-medium text-foreground whitespace-nowrap">
+                                {format!("{count} selected")}
+                            </span>
+                            <Button
+                                variant=ButtonVariant::Ghost
+                                size=ButtonSize::Sm
+                                disabled=Signal::derive(move || bulk_pending.get())
+                                on:click=handle_bulk_mark_read
+                            >
+                                <Icon icon=phosphor_leptos::ENVELOPE_OPEN attr:class="h-4 w-4 mr-1.5" />
+                                "Mark Read"
+                            </Button>
+                            <Button
+                                variant=ButtonVariant::Ghost
+                                size=ButtonSize::Sm
+                                disabled=Signal::derive(move || bulk_pending.get())
+                                on:click=handle_bulk_mark_unread
+                            >
+                                <Icon icon=phosphor_leptos::ENVELOPE attr:class="h-4 w-4 mr-1.5" />
+                                "Mark Unread"
+                            </Button>
+                            <Button
+                                variant=ButtonVariant::GhostDestructive
+                                size=ButtonSize::Sm
+                                disabled=Signal::derive(move || bulk_pending.get())
+                                on:click=handle_bulk_delete
+                            >
+                                <Icon icon=phosphor_leptos::TRASH attr:class="h-4 w-4 mr-1.5" />
+                                "Delete"
+                            </Button>
+                            <Button
+                                variant=ButtonVariant::GhostMuted
+                                size=ButtonSize::Sm
+                                class="ml-auto"
+                                on:click=handle_clear_selection
+                            >
+                                "Cancel"
+                            </Button>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <SearchInput
+                                value=Signal::derive(move || search_text.get())
+                                on_input=Callback::new(move |v: String| set_search_text.set(v))
+                                placeholder="Search by title or identifier..."
+                                class="max-w-xs".to_string()
+                            />
+                            <Select
+                                value=Signal::derive(move || type_filter.get())
+                                options=type_options
+                                on_change=Callback::new(move |v: String| set_type_filter.set(v))
+                                variant=SelectVariant::Compact
+                            />
+                            <Select
+                                value=Signal::derive(move || team_filter.get())
+                                options=team_options
+                                on_change=Callback::new(move |v: String| set_team_filter.set(v))
+                                variant=SelectVariant::Compact
+                            />
+                        }.into_any()
+                    }
+                }}
             </div>
 
             <div class="flex-1 overflow-y-auto">
@@ -217,6 +436,7 @@ pub fn InboxPage() -> impl IntoView {
                                                                 <NotificationRow
                                                                     notification=notification
                                                                     sync_store=sync_store
+                                                                    selected=selected
                                                                     on_read=Callback::new(move |()| {
                                                                         set_refetch_version.update(|v| *v += 1);
                                                                     })
@@ -242,6 +462,19 @@ pub fn InboxPage() -> impl IntoView {
                     }}
                 </Suspense>
             </div>
+
+            <ConfirmDialog
+                open=Signal::derive(move || confirm_delete_open.get())
+                title=Signal::derive(move || {
+                    let count = pending_delete_ids.get().len();
+                    format!("Delete {count} notification{}?", if count == 1 { "" } else { "s" })
+                })
+                message="Deleted notifications cannot be recovered."
+                confirm_text="Delete"
+                destructive=true
+                on_confirm=on_delete_confirmed
+                on_cancel=Callback::new(move |()| confirm_delete_open.set(false))
+            />
         </div>
     }
 }
@@ -280,11 +513,14 @@ fn group_notifications(notifications: &[Notification]) -> GroupedNotifications {
 fn NotificationRow(
     notification: Notification,
     sync_store: Option<SyncStore>,
+    selected: RwSignal<HashSet<String>>,
     on_read: Callback<()>,
 ) -> impl IntoView {
     let nav = use_navigate();
     let is_unread = !notification.read;
     let notification_id = notification.notification_id.clone();
+    let nid_for_checked = notification.notification_id.clone();
+    let nid_for_toggle = notification.notification_id.clone();
     let event_text = notification_event_text(&notification);
     let via_suffix = crate::components::attribution::render_via_suffix(
         notification.action_source,
@@ -356,6 +592,20 @@ fn NotificationRow(
             class="flex items-start gap-3 px-6 py-3 hover:bg-accent transition-colors cursor-pointer"
             on:click=on_click
         >
+            // Per-row checkbox — stopPropagation to prevent row navigation
+            <div class="flex-shrink-0 pt-0.5" on:click=|e: web_sys::MouseEvent| e.stop_propagation()>
+                <Checkbox
+                    checked=Signal::derive(move || selected.get().contains(&nid_for_checked))
+                    on_change=Callback::new(move |_checked: bool| {
+                        selected.update(|set| {
+                            if !set.remove(&nid_for_toggle) {
+                                set.insert(nid_for_toggle.clone());
+                            }
+                        });
+                    })
+                />
+            </div>
+
             <div class="flex-shrink-0 pt-1.5">
                 {if is_unread {
                     view! { <div class="w-2 h-2 rounded-full bg-primary"/> }.into_any()

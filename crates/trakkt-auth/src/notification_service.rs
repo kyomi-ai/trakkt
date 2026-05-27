@@ -44,7 +44,6 @@ struct NotificationRow {
     action_source: String,
     action_source_label: Option<String>,
     created_at: String,
-    deleted_at: Option<String>,
 }
 
 impl NotificationRow {
@@ -121,8 +120,7 @@ pub async fn create_notification(
                 n.actor_id, \
                 u_actor.name AS actor_name, \
                 n.action_source, n.action_source_label, \
-                CAST(n.created_at AS TEXT) AS created_at, \
-                CAST(n.deleted_at AS TEXT) AS deleted_at \
+                CAST(n.created_at AS TEXT) AS created_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
          LEFT JOIN teams t ON t.team_id = i.team_id \
@@ -197,8 +195,7 @@ pub async fn list_notifications(
                 n.actor_id, \
                 u_actor.name AS actor_name, \
                 n.action_source, n.action_source_label, \
-                CAST(n.created_at AS TEXT) AS created_at, \
-                CAST(n.deleted_at AS TEXT) AS deleted_at \
+                CAST(n.created_at AS TEXT) AS created_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
          LEFT JOIN teams t ON t.team_id = i.team_id \
