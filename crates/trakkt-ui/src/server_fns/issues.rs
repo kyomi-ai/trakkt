@@ -412,10 +412,7 @@ pub async fn search_issues(
             status_category: r.status_category,
             priority: r.priority,
             snippet: r.snippet,
-            match_field: match r.match_field.as_str() {
-                "issue" => "description".to_string(),
-                other => other.to_string(),
-            },
+            match_field: r.match_field,
             rank: r.rank,
         })
         .collect())
