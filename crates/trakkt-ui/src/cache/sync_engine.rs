@@ -144,21 +144,50 @@ pub fn start_sync_engine(
             return;
         }
 
-        // Clear the in-memory store so stale entries from IDB hydration
-        // don't persist while the bootstrap stream repopulates.
-        store_state.reset();
-
-        // Clear ALL entity types from IDB before bootstrap — stale entries
-        // (archived issues, removed labels, etc.) won't appear in the new
-        // bootstrap and need to be removed from local cache.
         let wid = wid_state.clone();
         let ws_send = ws_for_state.clone();
         spawn_local(async move {
-            match db::init_cache_db(&wid).await {
-                Ok(cache_db) => {
+            let cache_db = match db::init_cache_db(&wid).await {
+                Ok(db) => Some(db),
+                Err(e) => {
+                    tracing::warn!("sync: failed to open cache db: {e}");
+                    None
+                }
+            };
+
+            let idb_cursor = match cache_db {
+                Some(ref db) => match db::get_last_sync_id(db, &wid).await {
+                    Ok(Some(s)) => match s.parse::<i64>() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!("sync: failed to parse cursor {s:?}: {e}");
+                            0
+                        }
+                    },
+                    Ok(None) => 0,
+                    Err(e) => {
+                        tracing::warn!("sync: failed to read cursor from IDB: {e}");
+                        0
+                    }
+                },
+                None => 0,
+            };
+
+            if idb_cursor > 0 {
+                tracing::info!(idb_cursor, "sync: cursor found — sending sync_delta");
+                if !ws_send.send(serde_json::json!({
+                    "type": "sync_delta",
+                    "last_sync_id": idb_cursor
+                })) {
+                    tracing::warn!("sync: failed to send sync_delta");
+                }
+            } else {
+                store_state.reset();
+
+                if let Some(ref cache_db) = cache_db {
                     for et in ALL_CACHED_ENTITY_TYPES {
                         if let Err(e) =
-                            db::delete_all_of_type(&cache_db, et, &wid).await
+                            db::delete_all_of_type(cache_db, et, &wid).await
                         {
                             tracing::warn!(
                                 entity_type = et,
@@ -167,14 +196,11 @@ pub fn start_sync_engine(
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("bootstrap: failed to open cache db for pre-bootstrap clear: {e}");
-                }
-            }
 
-            web_sys::console::log_1(&"[trakkt-sync] sending sync_bootstrap".into());
-            if !ws_send.send(serde_json::json!({"type": "sync_bootstrap"})) {
-                web_sys::console::warn_1(&"[trakkt-sync] failed to send sync_bootstrap".into());
+                tracing::info!("sync: no cursor — sending sync_bootstrap");
+                if !ws_send.send(serde_json::json!({"type": "sync_bootstrap"})) {
+                    tracing::warn!("sync: failed to send sync_bootstrap");
+                }
             }
         });
     });
