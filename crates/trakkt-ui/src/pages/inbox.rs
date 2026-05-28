@@ -660,16 +660,15 @@ fn NotificationRow(
         ev.stop_propagation();
         menu_open.set(false);
         let nid = nid_mark_read.clone();
-        if let Some(store) = sync_store {
-            if let Some(mut n) = store
+        if let Some(store) = sync_store
+            && let Some(mut n) = store
                 .notifications()
                 .get_untracked()
                 .into_iter()
                 .find(|n| n.notification_id == nid)
-            {
-                n.read = true;
-                store.upsert_notification(n);
-            }
+        {
+            n.read = true;
+            store.upsert_notification(n);
         }
         leptos::task::spawn_local({
             let nid = nid_mark_read.clone();
@@ -687,16 +686,15 @@ fn NotificationRow(
         ev.stop_propagation();
         menu_open.set(false);
         let nid = nid_mark_unread.clone();
-        if let Some(store) = sync_store {
-            if let Some(mut n) = store
+        if let Some(store) = sync_store
+            && let Some(mut n) = store
                 .notifications()
                 .get_untracked()
                 .into_iter()
                 .find(|n| n.notification_id == nid)
-            {
-                n.read = false;
-                store.upsert_notification(n);
-            }
+        {
+            n.read = false;
+            store.upsert_notification(n);
         }
         leptos::task::spawn_local({
             let nid = nid_mark_unread.clone();
