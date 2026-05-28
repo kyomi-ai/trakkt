@@ -30,7 +30,8 @@ use wasm_bindgen::JsCast;
 
 use crate::components::{
     Alert, AlertVariant,
-    Button, ButtonSize, ButtonVariant, ConfirmDialog, EmptyState,
+    Button, ButtonSize, ButtonVariant, Checkbox, ConfirmDialog, EmptyState,
+    IssueStatusBadge, IssueStatusVariant, PriorityIndicator,
     Modal, ModalSize,
     SearchInput, Select, SelectVariant, TeamIcon, INPUT_CLASS,
 };
@@ -42,12 +43,50 @@ use crate::pages::issues::filters::{
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::pages::views::{FilterClause, LegacyViewFilters, ViewFilters};
-use crate::server_fns::issues::{create_issue, list_issues};
+use crate::server_fns::issues::{create_issue, list_issues, search_issues, SearchResultItem};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::{create_view, delete_view, update_view};
 use crate::types::IssueNavState;
 use crate::utils::keyboard::is_input_focused;
 use trakkt_types::models::{Status, Team};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Search snippet rendering
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert search snippet with `**highlighted**` markers into HTML with `<mark>` tags.
+///
+/// HTML-escapes user content character-by-character while preserving the
+/// generated `<mark>` tags, preventing XSS from search result snippets.
+fn render_snippet_html(snippet: &str) -> String {
+    let mut result = String::with_capacity(snippet.len() + 50);
+    let mut in_highlight = false;
+    let mut chars = snippet.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '*' && chars.peek() == Some(&'*') {
+            chars.next();
+            if in_highlight {
+                result.push_str("</mark>");
+            } else {
+                result.push_str("<mark class=\"bg-accent text-accent-foreground rounded px-0.5\">");
+            }
+            in_highlight = !in_highlight;
+        } else {
+            match ch {
+                '<' => result.push_str("&lt;"),
+                '>' => result.push_str("&gt;"),
+                '&' => result.push_str("&amp;"),
+                '"' => result.push_str("&quot;"),
+                _ => result.push(ch),
+            }
+        }
+    }
+    if in_highlight {
+        result.push_str("</mark>");
+    }
+    result
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // localStorage helpers for view mode
@@ -376,6 +415,8 @@ pub(crate) fn IssueListInner(
 
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
+    let debounced_search = RwSignal::new(String::new());
+    let include_archived_search = RwSignal::new(false);
     let filter_clauses = RwSignal::new(Vec::<FilterClause>::new());
 
     // ── Sort state ─────────────────────────────────────────────────────────
@@ -422,6 +463,85 @@ pub(crate) fn IssueListInner(
             .get()
             .into_iter()
             .find(|t| t.key.to_lowercase() == key_lower)
+    });
+
+    // ── Debounced full-text search ─────────────────────────────────────────
+    #[cfg(target_arch = "wasm32")]
+    {
+        let debounce_gen = StoredValue::new(std::cell::Cell::new(0u64));
+        Effect::new(move || {
+            let val = search.get();
+            let generation = debounce_gen.get_value().get().wrapping_add(1);
+            debounce_gen.get_value().set(generation);
+
+            if val.trim().len() < 2 {
+                debounced_search.set(String::new());
+                return;
+            }
+
+            leptos::task::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(300).await;
+                if debounce_gen.get_value().get() == generation {
+                    debounced_search.set(val);
+                }
+            });
+        });
+    }
+
+    let search_resource = Resource::new(
+        move || (
+            debounced_search.get(),
+            resolved_team.get().map(|t| t.team_id.clone()),
+            include_archived_search.get(),
+        ),
+        move |(query, team_id, include_archived)| async move {
+            if query.trim().len() < 2 {
+                return Ok(Vec::new());
+            }
+            search_issues(
+                query,
+                team_id,
+                Some(false),
+                Some(include_archived),
+                Some(true),
+                Some(50),
+            ).await
+        },
+    );
+
+    let is_search_active = Signal::derive(move || debounced_search.get().trim().len() >= 2);
+    let is_searching = Signal::derive(move || {
+        search.get().trim().len() >= 2 && search_resource.get().is_none()
+    });
+    let search_error = RwSignal::new(Option::<String>::None);
+
+    let grouped_search_results = Memo::new(move |_| {
+        if !is_search_active.get() {
+            search_error.set(None);
+            return Vec::new();
+        }
+        let results = match search_resource.get() {
+            Some(Ok(items)) => {
+                search_error.set(None);
+                items
+            }
+            Some(Err(e)) => {
+                search_error.set(Some(format!("Search failed: {e}")));
+                return Vec::new();
+            }
+            None => return Vec::new(),
+        };
+        let mut groups: Vec<(String, Vec<SearchResultItem>)> = Vec::new();
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for item in results {
+            if let Some(&idx) = seen.get(&item.issue_id) {
+                groups[idx].1.push(item);
+            } else {
+                seen.insert(item.issue_id.clone(), groups.len());
+                groups.push((item.issue_id.clone(), vec![item]));
+            }
+        }
+        groups
     });
 
     // ── Custom views (team-scoped or workspace-scoped) ─────────────────
@@ -1445,8 +1565,18 @@ pub(crate) fn IssueListInner(
                         value=Signal::derive(move || search.get())
                         on_input=Callback::new(move |v: String| set_search.set(v))
                         placeholder="Search issues..."
+                        searching=is_searching
                         class="flex-1 max-w-sm"
                     />
+                    <Show when=move || { search.get().trim().len() >= 2 }>
+                        <label class="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none shrink-0">
+                            <Checkbox
+                                checked=Signal::derive(move || include_archived_search.get())
+                                on_change=Callback::new(move |v: bool| include_archived_search.set(v))
+                            />
+                            "Include archived"
+                        </label>
+                    </Show>
                     <FilterBar
                         clauses=filter_clauses
                         team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
@@ -1505,13 +1635,108 @@ pub(crate) fn IssueListInner(
                             />
                         }.into_any()
                     }
+                } else if is_search_active.get() {
+                    view! {
+                        <div class="flex-1 overflow-y-auto">
+                            {move || {
+                                let groups = grouped_search_results.get();
+                                let query = debounced_search.get();
+
+                                if query.trim().len() >= 2 && search_resource.get().is_none() && groups.is_empty() {
+                                    view! {
+                                        <div class="p-8 text-center text-muted-foreground text-sm">
+                                            "Searching..."
+                                        </div>
+                                    }.into_any()
+                                } else if let Some(err) = search_error.get() {
+                                    view! {
+                                        <div class="mx-4 mt-4">
+                                            <Alert variant=AlertVariant::Error>
+                                                {err}
+                                            </Alert>
+                                        </div>
+                                    }.into_any()
+                                } else if groups.is_empty() && query.trim().len() >= 2 {
+                                    view! {
+                                        <div class="p-8 text-center">
+                                            <p class="text-muted-foreground text-sm">
+                                                {format!("No results for \"{query}\"")}
+                                            </p>
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    let total_matches: usize = groups.iter().map(|(_, m)| m.len()).sum();
+                                    view! {
+                                        <div>
+                                            <div class="px-5 py-2 text-xs text-muted-foreground border-b border-border">
+                                                {format!("{} {} found", total_matches, if total_matches == 1 { "result" } else { "results" })}
+                                            </div>
+                                            <div role="list">
+                                                {groups.into_iter().map(|(_, matches)| {
+                                                    let issue_key = format!("{}-{}", matches[0].team_key, matches[0].number);
+                                                    let issue_href = format!("/issues/{issue_key}");
+                                                    let status = IssueStatusVariant::parse(&matches[0].status_category, &matches[0].status_name);
+                                                    let title = matches[0].title.clone();
+                                                    let priority = matches[0].priority;
+
+                                                    let snippet_views = matches.into_iter().map(|m| {
+                                                        let field_label = match m.match_field.as_str() {
+                                                            "title" => "Title",
+                                                            "description" => "Description",
+                                                            "comment" => "Comment",
+                                                            _ => "Match",
+                                                        };
+                                                        let snippet_html = m.snippet.as_deref()
+                                                            .map(|s| render_snippet_html(s))
+                                                            .unwrap_or_default();
+                                                        view! {
+                                                            <div class="flex items-start gap-1.5 text-xs">
+                                                                <span class="shrink-0 px-1 py-0.5 rounded bg-surface-alt text-muted-foreground font-medium">
+                                                                    {field_label}
+                                                                </span>
+                                                                <span
+                                                                    class="text-muted-foreground truncate"
+                                                                    inner_html=snippet_html
+                                                                />
+                                                            </div>
+                                                        }
+                                                    }).collect_view();
+
+                                                    view! {
+                                                        <a
+                                                            href=issue_href
+                                                            class="block px-3 py-2 border-b border-border hover:bg-surface-alt transition-colors cursor-pointer no-underline text-inherit"
+                                                            role="listitem"
+                                                        >
+                                                            <div class="flex items-center gap-2.5">
+                                                                <PriorityIndicator priority=priority/>
+                                                                <IssueStatusBadge status=status/>
+                                                                <span class="font-mono text-xs text-muted-foreground shrink-0">
+                                                                    {issue_key}
+                                                                </span>
+                                                                <span class="text-sm font-medium text-foreground truncate">
+                                                                    {title}
+                                                                </span>
+                                                            </div>
+                                                            <div class="ml-[52px] mt-1 space-y-0.5">
+                                                                {snippet_views}
+                                                            </div>
+                                                        </a>
+                                                    }
+                                                }).collect_view()}
+                                            </div>
+                                        </div>
+                                    }.into_any()
+                                }
+                            }}
+                        </div>
+                    }.into_any()
                 } else {
                     view! {
                         <div class="flex-1 overflow-y-auto">
                             {move || {
                                 let list = sorted_issues.get();
 
-                                // Update keyboard navigation bounds.
                                 issue_count.set(list.len());
                                 issue_identifiers.set(list.iter().map(|i| format!("{}-{}", i.team_key, i.number)).collect());
                                 if let Some(idx) = selected_index.get_untracked()

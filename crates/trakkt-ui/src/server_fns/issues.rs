@@ -357,6 +357,70 @@ pub async fn unarchive_issue(team_key: String, number: i32) -> Result<(), Server
     Ok(())
 }
 
+// ─── Search ───────────────────────────────────────────────────────────────
+
+/// DTO for search results passed between server and client.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SearchResultItem {
+    pub issue_id: String,
+    pub number: i64,
+    pub team_key: String,
+    pub title: String,
+    pub status_name: String,
+    pub status_category: String,
+    pub priority: i32,
+    pub snippet: Option<String>,
+    pub match_field: String,
+    pub rank: f64,
+}
+
+/// Full-text search across issues and comments.
+///
+/// Delegates to `trakkt_auth::search_service::search` which uses tsvector/GIN
+/// on Postgres and LIKE fallback on SQLite.
+#[server(prefix = "/leptos-api")]
+pub async fn search_issues(
+    query: String,
+    team_id: Option<String>,
+    include_closed: Option<bool>,
+    include_archived: Option<bool>,
+    include_comments: Option<bool>,
+    limit: Option<i64>,
+) -> Result<Vec<SearchResultItem>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let params = trakkt_auth::search_service::SearchParams {
+        query,
+        workspace_id: ac.ws_id.clone(),
+        team_id,
+        include_archived: include_archived.unwrap_or(false),
+        include_closed: include_closed.unwrap_or(false),
+        include_comments: include_comments.unwrap_or(true),
+        limit: limit.unwrap_or(50),
+        offset: 0,
+    };
+    let results = trakkt_auth::search_service::search(ac.db(), &params)
+        .await
+        .into_sfn()?;
+    Ok(results
+        .into_iter()
+        .map(|r| SearchResultItem {
+            issue_id: r.issue_id,
+            number: r.number,
+            team_key: r.team_key,
+            title: r.title,
+            status_name: r.status_name,
+            status_category: r.status_category,
+            priority: r.priority,
+            snippet: r.snippet,
+            match_field: match r.match_field.as_str() {
+                "issue" => "description".to_string(),
+                other => other.to_string(),
+            },
+            rank: r.rank,
+        })
+        .collect())
+}
+
 /// Replace all labels on an issue.
 ///
 /// `label_ids` is a comma-separated string of label UUIDs.
