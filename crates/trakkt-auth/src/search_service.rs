@@ -153,7 +153,8 @@ async fn search_postgres(
          i.priority, \
          ts_headline('english', coalesce(i.title, '') || ' ' || coalesce(i.description, ''), query, \
          'MaxWords=35, MinWords=15, StartSel=**, StopSel=**') AS snippet, \
-         'issue' AS match_field, \
+         CASE WHEN to_tsvector('english', coalesce(i.title, '')) @@ query THEN 'title' \
+         ELSE 'description' END AS match_field, \
          ts_rank(i.search_vector, query)::FLOAT8 AS rank \
          FROM issues i \
          JOIN teams t ON t.team_id = i.team_id \
