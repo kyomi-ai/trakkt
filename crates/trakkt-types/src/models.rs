@@ -262,6 +262,7 @@ pub struct Notification {
     pub action_source: ActionSource,
     pub action_source_label: Option<String>,
     pub created_at: String,
+    pub deleted_at: Option<String>,
 }
 
 /// Filter criteria for listing issues.
