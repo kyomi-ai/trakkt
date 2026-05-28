@@ -44,6 +44,7 @@ struct NotificationRow {
     action_source: String,
     action_source_label: Option<String>,
     created_at: String,
+    deleted_at: Option<String>,
 }
 
 impl NotificationRow {
@@ -68,6 +69,7 @@ impl NotificationRow {
                 }),
             action_source_label: self.action_source_label,
             created_at: self.created_at,
+            deleted_at: self.deleted_at,
         }
     }
 }
@@ -120,7 +122,8 @@ pub async fn create_notification(
                 n.actor_id, \
                 u_actor.name AS actor_name, \
                 n.action_source, n.action_source_label, \
-                CAST(n.created_at AS TEXT) AS created_at \
+                CAST(n.created_at AS TEXT) AS created_at, \
+                CAST(n.deleted_at AS TEXT) AS deleted_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
          LEFT JOIN teams t ON t.team_id = i.team_id \
@@ -172,6 +175,7 @@ pub async fn list_notifications(
     db: &DbPool,
     user_id: &str,
     unread_only: bool,
+    deleted_only: bool,
     notification_type: Option<&str>,
     team_key: Option<&str>,
     search: Option<&str>,
@@ -186,6 +190,12 @@ pub async fn list_notifications(
         String::new()
     };
 
+    let deleted_filter = if deleted_only {
+        "AND n.deleted_at IS NOT NULL".to_string()
+    } else {
+        "AND n.deleted_at IS NULL".to_string()
+    };
+
     // $1 = user_id, $2 = notification_type, $3 = team_key, $4 = search pattern
     let sql = format!(
         "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
@@ -195,12 +205,13 @@ pub async fn list_notifications(
                 n.actor_id, \
                 u_actor.name AS actor_name, \
                 n.action_source, n.action_source_label, \
-                CAST(n.created_at AS TEXT) AS created_at \
+                CAST(n.created_at AS TEXT) AS created_at, \
+                CAST(n.deleted_at AS TEXT) AS deleted_at \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
          LEFT JOIN teams t ON t.team_id = i.team_id \
          LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id \
-         WHERE n.user_id = $1 AND n.deleted_at IS NULL {unread_filter} \
+         WHERE n.user_id = $1 {deleted_filter} {unread_filter} \
            AND ($2{cast_text} IS NULL OR n.type = $2) \
            AND ($3{cast_text} IS NULL OR t.key = $3) \
            AND ($4{cast_text} IS NULL OR i.title LIKE $4 ESCAPE '\\' \
@@ -375,4 +386,16 @@ pub async fn bulk_delete_notifications(
         "deleted_at = {now} WHERE user_id = $1 AND deleted_at IS NULL"
     );
     bulk_update_notifications(db, user_id, notification_ids, &clause).await
+}
+
+/// Restore soft-deleted notifications. Only affects the given user's
+/// currently-deleted notifications.
+pub async fn bulk_restore_notifications(
+    db: &DbPool,
+    notification_ids: &[String],
+    user_id: &str,
+) -> trakkt_core::Result<()> {
+    // NULL is dialect-neutral; no sql_compat call needed.
+    let clause = "deleted_at = NULL WHERE user_id = $1 AND deleted_at IS NOT NULL";
+    bulk_update_notifications(db, user_id, notification_ids, clause).await
 }

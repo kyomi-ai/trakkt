@@ -22,13 +22,21 @@ use crate::components::{
 };
 use crate::server_fns::notifications::{
     bulk_delete_notifications, bulk_mark_notifications_read, bulk_mark_notifications_unread,
-    list_notifications, mark_all_notifications_read, mark_notification_read,
+    bulk_restore_notifications, list_notifications, mark_all_notifications_read,
+    mark_notification_read,
 };
 use crate::server_fns::teams::list_teams;
 use crate::types::IssueNavState;
 use crate::utils::relative_time::relative_time;
 use crate::utils::time_group::{classify_time_group, TimeGroup};
 use trakkt_types::models::Notification;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    All,
+    Unread,
+    Deleted,
+}
 
 fn notification_event_text(notification: &Notification) -> String {
     let actor = notification.actor_name.as_deref().unwrap_or("Someone");
@@ -44,7 +52,9 @@ fn notification_event_text(notification: &Notification) -> String {
 
 #[component]
 pub fn InboxPage() -> impl IntoView {
-    let (unread_only, set_unread_only) = signal(false);
+    let (view_mode, set_view_mode) = signal(ViewMode::All);
+    let unread_only = Signal::derive(move || view_mode.get() == ViewMode::Unread);
+    let deleted_only = Signal::derive(move || view_mode.get() == ViewMode::Deleted);
     let (refetch_version, set_refetch_version) = signal(0u32);
 
     // Filter state
@@ -60,7 +70,7 @@ pub fn InboxPage() -> impl IntoView {
 
     // Clear selection when any filter changes
     Effect::new(move |_| {
-        unread_only.get();
+        view_mode.get();
         team_filter.get();
         type_filter.get();
         search_text.get();
@@ -93,16 +103,17 @@ pub fn InboxPage() -> impl IntoView {
     let notifications_resource = Resource::new(
         move || (
             unread_only.get(),
+            deleted_only.get(),
             refetch_version.get(),
             team_filter.get(),
             type_filter.get(),
             search_text.get(),
         ),
-        |(uo, _, tk, tf, search)| async move {
+        |(uo, del, _, tk, tf, search)| async move {
             let team_key = if tk.is_empty() { None } else { Some(tk) };
             let notification_type = if tf.is_empty() { None } else { Some(tf) };
             let search = if search.is_empty() { None } else { Some(search) };
-            list_notifications(uo, notification_type, team_key, search).await
+            list_notifications(uo, Some(del), notification_type, team_key, search).await
         },
     );
 
@@ -233,6 +244,26 @@ pub fn InboxPage() -> impl IntoView {
         });
     });
 
+    let handle_bulk_restore = move |_: web_sys::MouseEvent| {
+        if bulk_pending.get_untracked() {
+            return;
+        }
+        let ids: Vec<String> = selected.get_untracked().into_iter().collect();
+        if ids.is_empty() {
+            return;
+        }
+        bulk_pending.set(true);
+        let csv = ids.join(",");
+        selected.set(HashSet::new());
+        leptos::task::spawn_local(async move {
+            if let Err(e) = bulk_restore_notifications(csv).await {
+                tracing::warn!("Failed to restore notifications: {e}");
+            }
+            bulk_pending.set(false);
+            set_refetch_version.update(|v| *v += 1);
+        });
+    };
+
     let handle_clear_selection = move |_: web_sys::MouseEvent| {
         selected.set(HashSet::new());
     };
@@ -272,16 +303,22 @@ pub fn InboxPage() -> impl IntoView {
 
             <div class="flex items-center gap-1 px-5 py-3 border-b border-border">
                 <button
-                    class=move || if !unread_only.get() { TAB_ACTIVE } else { TAB_INACTIVE }
-                    on:click=move |_| set_unread_only.set(false)
+                    class=move || if view_mode.get() == ViewMode::All { TAB_ACTIVE } else { TAB_INACTIVE }
+                    on:click=move |_| set_view_mode.set(ViewMode::All)
                 >
                     "All"
                 </button>
                 <button
-                    class=move || if unread_only.get() { TAB_ACTIVE } else { TAB_INACTIVE }
-                    on:click=move |_| set_unread_only.set(true)
+                    class=move || if view_mode.get() == ViewMode::Unread { TAB_ACTIVE } else { TAB_INACTIVE }
+                    on:click=move |_| set_view_mode.set(ViewMode::Unread)
                 >
                     "Unread"
+                </button>
+                <button
+                    class=move || if view_mode.get() == ViewMode::Deleted { TAB_ACTIVE } else { TAB_INACTIVE }
+                    on:click=move |_| set_view_mode.set(ViewMode::Deleted)
+                >
+                    "Deleted"
                 </button>
             </div>
 
@@ -321,37 +358,54 @@ pub fn InboxPage() -> impl IntoView {
                 {move || {
                     if has_selection.get() {
                         let count = selection_count.get();
+                        let is_deleted_view = deleted_only.get();
                         view! {
                             <span class="text-sm font-medium text-foreground whitespace-nowrap">
                                 {format!("{count} selected")}
                             </span>
-                            <Button
-                                variant=ButtonVariant::Ghost
-                                size=ButtonSize::Sm
-                                disabled=Signal::derive(move || bulk_pending.get())
-                                on:click=handle_bulk_mark_read
-                            >
-                                <Icon icon=phosphor_leptos::ENVELOPE_OPEN attr:class="h-4 w-4 mr-1.5" />
-                                "Mark Read"
-                            </Button>
-                            <Button
-                                variant=ButtonVariant::Ghost
-                                size=ButtonSize::Sm
-                                disabled=Signal::derive(move || bulk_pending.get())
-                                on:click=handle_bulk_mark_unread
-                            >
-                                <Icon icon=phosphor_leptos::ENVELOPE attr:class="h-4 w-4 mr-1.5" />
-                                "Mark Unread"
-                            </Button>
-                            <Button
-                                variant=ButtonVariant::GhostDestructive
-                                size=ButtonSize::Sm
-                                disabled=Signal::derive(move || bulk_pending.get())
-                                on:click=handle_bulk_delete
-                            >
-                                <Icon icon=phosphor_leptos::TRASH attr:class="h-4 w-4 mr-1.5" />
-                                "Delete"
-                            </Button>
+                            {if is_deleted_view {
+                                view! {
+                                    <Button
+                                        variant=ButtonVariant::Ghost
+                                        size=ButtonSize::Sm
+                                        disabled=Signal::derive(move || bulk_pending.get())
+                                        on:click=handle_bulk_restore
+                                    >
+                                        <Icon icon=phosphor_leptos::ARROW_COUNTER_CLOCKWISE attr:class="h-4 w-4 mr-1.5" />
+                                        "Restore"
+                                    </Button>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <Button
+                                        variant=ButtonVariant::Ghost
+                                        size=ButtonSize::Sm
+                                        disabled=Signal::derive(move || bulk_pending.get())
+                                        on:click=handle_bulk_mark_read
+                                    >
+                                        <Icon icon=phosphor_leptos::ENVELOPE_OPEN attr:class="h-4 w-4 mr-1.5" />
+                                        "Mark Read"
+                                    </Button>
+                                    <Button
+                                        variant=ButtonVariant::Ghost
+                                        size=ButtonSize::Sm
+                                        disabled=Signal::derive(move || bulk_pending.get())
+                                        on:click=handle_bulk_mark_unread
+                                    >
+                                        <Icon icon=phosphor_leptos::ENVELOPE attr:class="h-4 w-4 mr-1.5" />
+                                        "Mark Unread"
+                                    </Button>
+                                    <Button
+                                        variant=ButtonVariant::GhostDestructive
+                                        size=ButtonSize::Sm
+                                        disabled=Signal::derive(move || bulk_pending.get())
+                                        on:click=handle_bulk_delete
+                                    >
+                                        <Icon icon=phosphor_leptos::TRASH attr:class="h-4 w-4 mr-1.5" />
+                                        "Delete"
+                                    </Button>
+                                }.into_any()
+                            }}
                             <Button
                                 variant=ButtonVariant::GhostMuted
                                 size=ButtonSize::Sm
@@ -403,6 +457,13 @@ pub fn InboxPage() -> impl IntoView {
                                                 description="No notifications match this filter. Try adjusting your search or filters."
                                             />
                                         }.into_any()
+                                    } else if deleted_only.get() {
+                                        view! {
+                                            <EmptyState
+                                                title="No deleted notifications"
+                                                description="Notifications you delete will appear here."
+                                            />
+                                        }.into_any()
                                     } else {
                                         view! {
                                             <div class="flex flex-col items-center justify-center py-16 text-muted-foreground">
@@ -437,7 +498,8 @@ pub fn InboxPage() -> impl IntoView {
                                                                     notification=notification
                                                                     sync_store=sync_store
                                                                     selected=selected
-                                                                    on_read=Callback::new(move |()| {
+                                                                    is_deleted_view=deleted_only
+                                                                    on_refetch=Callback::new(move |()| {
                                                                         set_refetch_version.update(|v| *v += 1);
                                                                     })
                                                                 />
@@ -469,7 +531,7 @@ pub fn InboxPage() -> impl IntoView {
                     let count = pending_delete_ids.get().len();
                     format!("Delete {count} notification{}?", if count == 1 { "" } else { "s" })
                 })
-                message="Deleted notifications cannot be recovered."
+                message="Deleted notifications can be restored from the Deleted tab."
                 confirm_text="Delete"
                 destructive=true
                 on_confirm=on_delete_confirmed
@@ -514,13 +576,15 @@ fn NotificationRow(
     notification: Notification,
     sync_store: Option<SyncStore>,
     selected: RwSignal<HashSet<String>>,
-    on_read: Callback<()>,
+    is_deleted_view: Signal<bool>,
+    on_refetch: Callback<()>,
 ) -> impl IntoView {
     let nav = use_navigate();
     let is_unread = !notification.read;
     let notification_id = notification.notification_id.clone();
     let nid_for_checked = notification.notification_id.clone();
     let nid_for_toggle = notification.notification_id.clone();
+    let nid_for_menu = notification.notification_id.clone();
     let event_text = notification_event_text(&notification);
     let via_suffix = crate::components::attribution::render_via_suffix(
         notification.action_source,
@@ -535,6 +599,9 @@ fn NotificationRow(
     let issue_number_for_label = notification.issue_number;
     let team_key_for_click = notification.team_key.clone();
     let issue_number_for_click = notification.issue_number;
+
+    // Per-row action menu state
+    let menu_open = RwSignal::new(false);
 
     let issue_label = Signal::derive(move || {
         // Prefer data from the notification itself
@@ -560,7 +627,7 @@ fn NotificationRow(
             }
             leptos::task::spawn_local(async move {
                 let _ = mark_notification_read(nid).await;
-                on_read.run(());
+                on_refetch.run(());
             });
         }
         let href = {
@@ -587,9 +654,92 @@ fn NotificationRow(
         }
     };
 
+    // ── Per-row action handlers ────────────────────────────────────────
+    let nid_mark_read = nid_for_menu.clone();
+    let on_mark_read = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        menu_open.set(false);
+        let nid = nid_mark_read.clone();
+        if let Some(store) = sync_store
+            && let Some(mut n) = store
+                .notifications()
+                .get_untracked()
+                .into_iter()
+                .find(|n| n.notification_id == nid)
+        {
+            n.read = true;
+            store.upsert_notification(n);
+        }
+        leptos::task::spawn_local({
+            let nid = nid_mark_read.clone();
+            async move {
+                if let Err(e) = bulk_mark_notifications_read(nid).await {
+                    tracing::warn!("Failed to mark notification as read: {e}");
+                }
+                on_refetch.run(());
+            }
+        });
+    };
+
+    let nid_mark_unread = nid_for_menu.clone();
+    let on_mark_unread = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        menu_open.set(false);
+        let nid = nid_mark_unread.clone();
+        if let Some(store) = sync_store
+            && let Some(mut n) = store
+                .notifications()
+                .get_untracked()
+                .into_iter()
+                .find(|n| n.notification_id == nid)
+        {
+            n.read = false;
+            store.upsert_notification(n);
+        }
+        leptos::task::spawn_local({
+            let nid = nid_mark_unread.clone();
+            async move {
+                if let Err(e) = bulk_mark_notifications_unread(nid).await {
+                    tracing::warn!("Failed to mark notification as unread: {e}");
+                }
+                on_refetch.run(());
+            }
+        });
+    };
+
+    let nid_delete = nid_for_menu.clone();
+    let on_delete = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        menu_open.set(false);
+        leptos::task::spawn_local({
+            let nid = nid_delete.clone();
+            async move {
+                if let Err(e) = bulk_delete_notifications(nid).await {
+                    tracing::warn!("Failed to delete notification: {e}");
+                }
+                on_refetch.run(());
+            }
+        });
+    };
+
+    let nid_restore = nid_for_menu.clone();
+    let on_restore = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        menu_open.set(false);
+        leptos::task::spawn_local({
+            let nid = nid_restore.clone();
+            async move {
+                if let Err(e) = bulk_restore_notifications(nid).await {
+                    tracing::warn!("Failed to restore notification: {e}");
+                }
+                on_refetch.run(());
+            }
+        });
+    };
+
     view! {
         <div
-            class="flex items-start gap-3 px-6 py-3 hover:bg-accent transition-colors cursor-pointer"
+            class="group flex items-start gap-3 px-6 py-3 hover:bg-accent transition-colors cursor-pointer"
             on:click=on_click
         >
             // Per-row checkbox — stopPropagation to prevent row navigation
@@ -625,6 +775,99 @@ fn NotificationRow(
                 </div>
                 {(!issue_title.is_empty()).then(|| view! {
                     <p class="text-sm text-muted-foreground truncate mt-0.5">{issue_title}</p>
+                })}
+            </div>
+
+            // Three-dot action menu
+            <div
+                class="relative flex-shrink-0 pt-0.5"
+                on:click=|e: web_sys::MouseEvent| e.stop_propagation()
+                on:keydown=move |e: web_sys::KeyboardEvent| {
+                    if e.key() == "Escape" {
+                        e.stop_propagation();
+                        menu_open.set(false);
+                    }
+                }
+            >
+                <button
+                    class=move || {
+                        if menu_open.get() {
+                            "p-0.5 rounded text-muted-foreground hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        } else {
+                            "p-0.5 rounded text-muted-foreground hover:text-foreground transition-colors opacity-0 group-hover:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        }
+                    }
+                    on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
+                    on:click=move |ev: web_sys::MouseEvent| {
+                        ev.stop_propagation();
+                        menu_open.update(|v| *v = !*v);
+                    }
+                    title="Actions"
+                >
+                    <Icon icon=phosphor_leptos::DOTS_THREE weight=IconWeight::Bold size="14px"/>
+                </button>
+
+                {move || menu_open.get().then(|| {
+                    let is_deleted = is_deleted_view.get();
+                    view! {
+                        // Invisible overlay to close menu on outside click
+                        <div
+                            class="fixed inset-0 z-40"
+                            on:mousedown=move |ev: web_sys::MouseEvent| {
+                                ev.stop_propagation();
+                                menu_open.set(false);
+                            }
+                        />
+                        <div class="absolute right-0 top-full mt-1 min-w-[160px] bg-card border border-border rounded-md shadow-lg py-1 z-50">
+                            {if is_deleted {
+                                view! {
+                                    <button
+                                        class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                        on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
+                                        on:click=on_restore.clone()
+                                    >
+                                        "Restore"
+                                    </button>
+                                }.into_any()
+                            } else {
+                                if is_unread {
+                                    view! {
+                                        <button
+                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
+                                            on:click=on_mark_read.clone()
+                                        >
+                                            "Mark as read"
+                                        </button>
+                                        <button
+                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
+                                            on:click=on_delete.clone()
+                                        >
+                                            "Delete"
+                                        </button>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <button
+                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
+                                            on:click=on_mark_unread.clone()
+                                        >
+                                            "Mark as unread"
+                                        </button>
+                                        <button
+                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
+                                            on:click=on_delete.clone()
+                                        >
+                                            "Delete"
+                                        </button>
+                                    }.into_any()
+                                }
+                            }}
+                        </div>
+                    }
                 })}
             </div>
 

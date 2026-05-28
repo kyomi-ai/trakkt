@@ -21,6 +21,7 @@ use super::{AuthenticatedContext, IntoServerFnError};
 #[server(prefix = "/leptos-api")]
 pub async fn list_notifications(
     unread_only: bool,
+    deleted_only: Option<bool>,
     notification_type: Option<String>,
     team_key: Option<String>,
     search: Option<String>,
@@ -30,6 +31,7 @@ pub async fn list_notifications(
         ac.db(),
         &ac.auth.user_id,
         unread_only,
+        deleted_only.unwrap_or(false),
         notification_type.as_deref(),
         team_key.as_deref(),
         search.as_deref(),
@@ -123,6 +125,19 @@ pub async fn bulk_delete_notifications(notification_ids: String) -> Result<(), S
     let ac = AuthenticatedContext::extract().await?;
     let ids = parse_notification_ids(&notification_ids)?;
     trakkt_auth::notification_service::bulk_delete_notifications(ac.db(), &ids, &ac.auth.user_id)
+        .await
+        .into_sfn()?;
+    Ok(())
+}
+
+/// Bulk restore soft-deleted notifications.
+///
+/// `notification_ids` is a comma-separated string of notification UUIDs.
+#[server(prefix = "/leptos-api")]
+pub async fn bulk_restore_notifications(notification_ids: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let ids = parse_notification_ids(&notification_ids)?;
+    trakkt_auth::notification_service::bulk_restore_notifications(ac.db(), &ids, &ac.auth.user_id)
         .await
         .into_sfn()?;
     Ok(())
