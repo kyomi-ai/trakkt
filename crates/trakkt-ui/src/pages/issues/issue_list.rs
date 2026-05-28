@@ -468,11 +468,11 @@ pub(crate) fn IssueListInner(
     // ── Debounced full-text search ─────────────────────────────────────────
     #[cfg(target_arch = "wasm32")]
     {
-        let debounce_gen = StoredValue::new(std::cell::Cell::new(0u64));
+        let debounce_gen = RwSignal::new(0u64);
         Effect::new(move || {
             let val = search.get();
-            let generation = debounce_gen.get_value().get().wrapping_add(1);
-            debounce_gen.get_value().set(generation);
+            let generation = debounce_gen.get_untracked().wrapping_add(1);
+            debounce_gen.set(generation);
 
             if val.trim().len() < 2 {
                 debounced_search.set(String::new());
@@ -481,7 +481,7 @@ pub(crate) fn IssueListInner(
 
             leptos::task::spawn_local(async move {
                 gloo_timers::future::TimeoutFuture::new(300).await;
-                if debounce_gen.get_value().get() == generation {
+                if debounce_gen.get_untracked() == generation {
                     debounced_search.set(val);
                 }
             });
@@ -1687,7 +1687,7 @@ pub(crate) fn IssueListInner(
                                                             _ => "Match",
                                                         };
                                                         let snippet_html = m.snippet.as_deref()
-                                                            .map(|s| render_snippet_html(s))
+                                                            .map(render_snippet_html)
                                                             .unwrap_or_default();
                                                         view! {
                                                             <div class="flex items-start gap-1.5 text-xs">
