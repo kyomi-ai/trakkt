@@ -148,24 +148,21 @@ fn parse_identifier_number(query: &str) -> Option<(Option<String>, i64)> {
     let trimmed = query.trim();
 
     // Try `{LETTERS}-{DIGITS}` pattern first (case-insensitive).
-    if let Some((prefix, suffix)) = trimmed.split_once('-') {
-        if !prefix.is_empty()
-            && prefix.chars().all(|c| c.is_ascii_alphabetic())
-            && !suffix.is_empty()
-        {
-            if let Ok(n) = suffix.parse::<i64>() {
-                if n > 0 {
-                    return Some((Some(prefix.to_ascii_uppercase()), n));
-                }
-            }
-        }
+    if let Some((prefix, suffix)) = trimmed.split_once('-')
+        && !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_alphabetic())
+        && !suffix.is_empty()
+        && let Ok(n) = suffix.parse::<i64>()
+        && n > 0
+    {
+        return Some((Some(prefix.to_ascii_uppercase()), n));
     }
 
     // Try bare positive number.
-    if let Ok(n) = trimmed.parse::<i64>() {
-        if n > 0 {
-            return Some((None, n));
-        }
+    if let Ok(n) = trimmed.parse::<i64>()
+        && n > 0
+    {
+        return Some((None, n));
     }
 
     None
