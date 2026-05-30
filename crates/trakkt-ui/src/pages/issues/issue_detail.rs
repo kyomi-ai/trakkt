@@ -397,6 +397,7 @@ fn IssueDetailContent(
                     number=number
                     issue_id=initial.get_untracked().issue_id.clone()
                     lightbox_state=lightbox_state
+                    description=Signal::from(description)
                 />
 
                 // ── GitHub activity (PRs, branches, commits linked to this issue) ──
@@ -1689,11 +1690,13 @@ fn DescriptionEditor(
 
                 match upload_file(&data, &name, &content_type, Some(&issue_id)).await {
                     Ok(resp) => {
-                        // Build inline markdown for the uploaded attachment.
+                        // Build block-level markdown for the uploaded attachment.
+                        // Double newline ensures a paragraph break so the parser
+                        // promotes the image to an ImageBlock (with hover delete button).
                         let markdown_snippet = if content_type.starts_with("image/") {
-                            format!("\n![{}]({})\n", name, resp.url)
+                            format!("\n\n![{}]({})\n", name, resp.url)
                         } else {
-                            format!("\n[{}]({})\n", name, resp.url)
+                            format!("\n\n[{}]({})\n", name, resp.url)
                         };
                         // Append the snippet to the current editor content.
                         // This triggers the content sync Effect in TreeWysiwygEditor,
@@ -2723,11 +2726,13 @@ fn NewCommentForm(
 
                 match upload_file(&data, &name, &content_type, Some(&issue_id)).await {
                     Ok(resp) => {
-                        // Build inline markdown for the uploaded attachment.
+                        // Build block-level markdown for the uploaded attachment.
+                        // Double newline ensures a paragraph break so the parser
+                        // promotes the image to an ImageBlock (with hover delete button).
                         let markdown_snippet = if content_type.starts_with("image/") {
-                            format!("\n![{}]({})\n", name, resp.url)
+                            format!("\n\n![{}]({})\n", name, resp.url)
                         } else {
-                            format!("\n[{}]({})\n", name, resp.url)
+                            format!("\n\n[{}]({})\n", name, resp.url)
                         };
                         // Append the snippet to the current comment content.
                         let Some(current) = content.try_get_untracked() else {
@@ -2898,6 +2903,9 @@ fn AttachmentsSection(
     /// The current issue's ID (used for upload auto-linking).
     issue_id: String,
     lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
+    /// Current description markdown — used to filter out attachments that are
+    /// already rendered inline (images/files referenced in the description).
+    description: Signal<String>,
 ) -> impl IntoView {
     let tk = team_key.clone();
     let tk_for_detach = team_key.clone();
@@ -3012,11 +3020,18 @@ fn AttachmentsSection(
 
             <Suspense fallback=|| ()>
                 {move || {
-                    let attachments = match attachments_resource.get() {
+                    let all_attachments = match attachments_resource.get() {
                         Some(Ok(v)) => v,
                         Some(Err(e)) => { tracing::warn!("Failed to load attachments: {e}"); vec![] }
                         None => vec![],
                     };
+                    // Filter out attachments already referenced inline in the description.
+                    // Inline images/files use URLs like `/api/v1/attachments/{id}/download`.
+                    let desc = description.get();
+                    let attachments: Vec<_> = all_attachments
+                        .into_iter()
+                        .filter(|att| !desc.contains(&att.attachment_id))
+                        .collect();
                     let total = attachments.len();
 
                     view! {
