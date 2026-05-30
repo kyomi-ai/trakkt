@@ -27,9 +27,12 @@ const AVAILABLE_SCOPES: &[(&str, &str)] = &[
     ("issues:read", "Read issues"),
     ("issues:write", "Create/update issues"),
     ("comments:write", "Add comments"),
+    ("attachments:read", "Download/list attachments"),
+    ("attachments:write", "Manage issue attachments"),
     ("labels:read", "Read labels"),
     ("labels:write", "Create/update labels"),
     ("teams:read", "Read teams"),
+    ("teams:write", "Update team settings"),
     ("projects:read", "Read projects"),
     ("projects:write", "Create/update projects"),
 ];
