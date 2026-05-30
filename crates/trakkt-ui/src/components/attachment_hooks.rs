@@ -124,11 +124,17 @@ pub fn make_upload_callback(
 }
 
 /// Create the `on_delete_attachment` callback that DELETEs via `/api/v1/attachments/{id}`.
+///
+/// When `attachment_id` is `None` (happens after markdown re-parse loses the attribute),
+/// falls back to extracting the ID from the URL pattern `/api/v1/attachments/{id}/download`.
 pub fn make_delete_callback(
     error_toast: impl Fn(String) + Clone + Send + Sync + 'static,
 ) -> Arc<dyn Fn(DeleteAttachmentRequest) + Send + Sync> {
     Arc::new(move |req: DeleteAttachmentRequest| {
-        if let Some(attachment_id) = req.attachment_id {
+        let attachment_id = req
+            .attachment_id
+            .or_else(|| extract_attachment_id_from_url(&req.src_or_href));
+        if let Some(attachment_id) = attachment_id {
             let error_toast = error_toast.clone();
             leptos::task::spawn_local(async move {
                 if let Err(e) = delete_attachment(&attachment_id).await {
@@ -138,6 +144,16 @@ pub fn make_delete_callback(
             });
         }
     })
+}
+
+/// Extract attachment ID from a download URL like `/api/v1/attachments/{id}/download`.
+fn extract_attachment_id_from_url(url: &str) -> Option<String> {
+    let stripped = url.strip_prefix("/api/v1/attachments/")?;
+    let id = stripped.strip_suffix("/download").unwrap_or(stripped);
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 /// Create the `on_click_attachment` callback.
