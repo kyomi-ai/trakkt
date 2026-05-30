@@ -863,8 +863,8 @@ pub async fn update_issue(
                 for blocked_id in blocked_ids {
                     match get_issue_by_id(db, &blocked_id).await {
                         Ok(Some(blocked_issue)) => {
-                            if let Ok(data) = serde_json::to_value(&blocked_issue) {
-                                if let Err(e) = sync_log_service::write_sync_entry(
+                            if let Ok(data) = serde_json::to_value(&blocked_issue)
+                                && let Err(e) = sync_log_service::write_sync_entry(
                                     db,
                                     entity_types::ISSUE,
                                     &blocked_id,
@@ -873,10 +873,9 @@ pub async fn update_issue(
                                     Some(data),
                                 )
                                 .await
-                                {
-                                    tracing::warn!(error = %e, blocked_id = %blocked_id,
-                                        "Failed to write sync log entry for blocked issue re-broadcast");
-                                }
+                            {
+                                tracing::warn!(error = %e, blocked_id = %blocked_id,
+                                    "Failed to write sync log entry for blocked issue re-broadcast");
                             }
 
                             sync_log_service::broadcast_sync_action(
