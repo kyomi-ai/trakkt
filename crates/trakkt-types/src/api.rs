@@ -6,7 +6,7 @@
 //! (via `schemars::JsonSchema`) and deserialization work identically regardless
 //! of the transport.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue operations
@@ -35,6 +35,42 @@ pub struct ListIssuesApiParams {
     pub search: Option<String>,
     /// Maximum number of issues to return (default: 50, max: 100)
     pub limit: Option<i64>,
+    /// JSON array of composable filter clauses, AND-ed together. Each clause is
+    /// `{"field","operator","values"}`.
+    /// Fields: status, priority, label, project, is_sub_issue, is_parent,
+    /// is_blocked, is_blocking, has_relations.
+    /// Operators: any_of, none_of, all_of, not_any_of, not_all_of.
+    /// Example: `[{"field":"label","operator":"none_of","values":["label-id-1"]}]`
+    pub filters: Option<String>,
+}
+
+/// A single composable filter clause: a `(field, operator, values)` triple.
+///
+/// Used by `list_issues` for post-fetch filtering. Boolean fields (e.g.
+/// `is_sub_issue`) ignore `values` — the operator alone determines the match.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FilterClause {
+    pub field: String,
+    pub operator: String,
+    #[serde(default)]
+    pub values: Vec<String>,
+}
+
+/// Wrapper response for `list_issues` that includes truncation metadata.
+///
+/// When composable filter clauses reduce the result set below the raw DB fetch,
+/// callers need to know whether more results exist beyond the returned page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListIssuesResponse {
+    pub issues: Vec<crate::models::IssueWithDetails>,
+    /// Number of issues that passed all filters within the server's fetch window
+    /// (approximately 5× the requested limit). When `truncated` is true, the true
+    /// total may exceed this count.
+    pub matched_count: usize,
+    /// Number of issues actually returned (after limit).
+    pub returned_count: usize,
+    /// Whether more matching issues exist beyond the returned page.
+    pub truncated: bool,
 }
 
 /// Parameters for getting a single issue by identifier.
