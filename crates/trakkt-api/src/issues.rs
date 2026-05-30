@@ -12,13 +12,94 @@ use serde_json::json;
 use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
 use trakkt_auth::{activity_service, comment_service, issue_service, relation_service, search_service, team_service};
 use trakkt_types::api::{
-    CreateIssueApiParams, DeleteIssueApiParams, GetIssueApiParams, InlineRelation,
-    ListIssuesApiParams, SearchIssuesApiParams, UpdateIssueApiParams,
+    CreateIssueApiParams, DeleteIssueApiParams, FilterClause, GetIssueApiParams, InlineRelation,
+    ListIssuesApiParams, ListIssuesResponse, SearchIssuesApiParams, UpdateIssueApiParams,
 };
-use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate};
+use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate, IssueWithDetails};
 
 use crate::context::{parse_issue_identifier, resolve_issue_key_and_number, resolve_team};
 use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Composable filter clause support
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Multiplier applied to the requested limit when composable filter clauses
+/// are present. Over-fetching from the DB compensates for rows eliminated by
+/// post-fetch filtering, so the final page is likely full.
+const FILTER_PREFETCH_MULTIPLIER: i64 = 5;
+
+/// Known boolean filter fields that ignore `values` — the operator alone
+/// determines the match.
+// Must be kept in sync with ValueKind::Boolean fields in
+// crates/trakkt-ui/src/pages/issues/filters.rs.
+const BOOLEAN_FIELDS: &[&str] = &[
+    "is_sub_issue",
+    "is_parent",
+    "is_blocked",
+    "is_blocking",
+    "has_relations",
+];
+
+/// Apply a single filter clause to an issue, returning `true` if the issue
+/// passes the filter (should be included).
+///
+/// Ported from `crates/trakkt-ui/src/pages/issues/filters.rs` `apply_clause`.
+fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
+    if clause.values.is_empty() && !BOOLEAN_FIELDS.contains(&clause.field.as_str()) {
+        // Non-boolean fields with no values selected — pass everything.
+        return true;
+    }
+
+    match (clause.field.as_str(), clause.operator.as_str()) {
+        ("status", "any_of") => clause.values.contains(&issue.status_id),
+        ("status", "none_of") => !clause.values.contains(&issue.status_id),
+        ("priority", "any_of") => clause.values.contains(&issue.priority.to_string()),
+        ("priority", "none_of") => !clause.values.contains(&issue.priority.to_string()),
+        // Label: all_of — issue must have ALL selected labels.
+        ("label", "all_of") => clause
+            .values
+            .iter()
+            .all(|v| issue.labels.iter().any(|l| l.label_id == *v)),
+        // Label: any_of — issue has at least one of the selected labels.
+        ("label", "any_of") => issue
+            .labels
+            .iter()
+            .any(|l| clause.values.contains(&l.label_id)),
+        // Label: not_any_of / none_of — issue has NONE of the selected labels.
+        // "none_of" is a backward-compat alias from pre-TRA-104 persisted filters.
+        ("label", "not_any_of" | "none_of") => !issue
+            .labels
+            .iter()
+            .any(|l| clause.values.contains(&l.label_id)),
+        // Label: not_all_of — issue does NOT have all values (may have some).
+        ("label", "not_all_of") => !clause
+            .values
+            .iter()
+            .all(|v| issue.labels.iter().any(|l| l.label_id == *v)),
+        ("project", "any_of") => issue
+            .project_id
+            .as_ref()
+            .is_some_and(|pid| clause.values.contains(pid)),
+        ("project", "none_of") => !issue
+            .project_id
+            .as_ref()
+            .is_some_and(|pid| clause.values.contains(pid)),
+        // Boolean relation filters — values are ignored.
+        ("is_sub_issue", "any_of") => issue.parent_identifier.is_some(),
+        ("is_sub_issue", "none_of") => issue.parent_identifier.is_none(),
+        ("is_parent", "any_of") => issue.has_children,
+        ("is_parent", "none_of") => !issue.has_children,
+        ("is_blocked", "any_of") => issue.is_blocked,
+        ("is_blocked", "none_of") => !issue.is_blocked,
+        ("is_blocking", "any_of") => issue.is_blocking,
+        ("is_blocking", "none_of") => !issue.is_blocking,
+        ("has_relations", "any_of") => issue.has_relations,
+        ("has_relations", "none_of") => !issue.has_relations,
+        // Unknown field/operator — pass through (don't block issues).
+        _ => true,
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers
@@ -33,6 +114,23 @@ pub async fn list_issues(
 ) -> ApiResult<serde_json::Value> {
     let limit_raw = params.limit.unwrap_or(50);
     let limit = limit_raw.clamp(1, 100);
+
+    // Parse composable filter clauses from the JSON string, if provided.
+    let clauses: Vec<FilterClause> = match params.filters.as_deref() {
+        Some(s) if !s.is_empty() => serde_json::from_str(s).map_err(|e| {
+            ApiError::BadRequest(format!("Invalid filters JSON: {e}"))
+        })?,
+        _ => Vec::new(),
+    };
+    let has_clauses = !clauses.is_empty();
+
+    // When post-fetch filter clauses are present, fetch more rows from the DB
+    // so that after filtering we still have enough results. Use a multiplier.
+    let db_limit = if has_clauses {
+        limit * FILTER_PREFETCH_MULTIPLIER
+    } else {
+        limit
+    };
 
     let status_id = params.status_id;
     let status_categories: Option<Vec<String>> = params.status_category.map(|s| {
@@ -64,7 +162,7 @@ pub async fn list_issues(
                 .collect()
         }),
         search: params.search,
-        limit: Some(limit),
+        limit: Some(db_limit),
         offset: None,
         include_archived: None,
         only_archived: None,
@@ -78,11 +176,31 @@ pub async fn list_issues(
     )
     .await?;
 
-    let issues =
+    let mut issues =
         issue_service::list_issues(ctx.db, &ctx.workspace_id, team_id.as_deref(), &filters)
             .await?;
 
-    Ok(serde_json::to_value(&issues)?)
+    if has_clauses {
+        // Apply composable filter clauses post-fetch (all AND-ed).
+        issues.retain(|issue| clauses.iter().all(|clause| apply_clause(clause, issue)));
+
+        let total_matched = issues.len();
+        let limit_usize = limit as usize;
+        let truncated = total_matched > limit_usize;
+        issues.truncate(limit_usize);
+        let returned_count = issues.len();
+
+        let response = ListIssuesResponse {
+            issues,
+            matched_count: total_matched,
+            returned_count,
+            truncated,
+        };
+        Ok(serde_json::to_value(&response)?)
+    } else {
+        // No composable clauses — return the flat array for backward compat.
+        Ok(serde_json::to_value(&issues)?)
+    }
 }
 
 /// Get a single issue with details and comments.
@@ -478,7 +596,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_issues",
-            description: "List issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them.",
+            description: "List issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Response shape: `{issues, matched_count, returned_count, truncated}`.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues",
