@@ -171,7 +171,11 @@ const ISSUE_DETAIL_SELECT: &str = "\
            CAST(i.completed_at AS TEXT) AS completed_at, \
            CAST(i.archived_at AS TEXT) AS archived_at, \
            (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.source_issue_id = i.issue_id AND r2.relation_type = 'parent') THEN 1 ELSE 0 END) AS has_children, \
-           (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.target_issue_id = i.issue_id AND r2.relation_type = 'blocks') THEN 1 ELSE 0 END) AS is_blocked, \
+           (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 \
+            JOIN issues blocker ON blocker.issue_id = r2.source_issue_id \
+            JOIN statuses s2 ON s2.status_id = blocker.status_id \
+            WHERE r2.target_issue_id = i.issue_id AND r2.relation_type = 'blocks' \
+            AND s2.category NOT IN ('completed', 'cancelled')) THEN 1 ELSE 0 END) AS is_blocked, \
            (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.source_issue_id = i.issue_id AND r2.relation_type = 'blocks') THEN 1 ELSE 0 END) AS is_blocking, \
            (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.source_issue_id = i.issue_id OR r2.target_issue_id = i.issue_id) THEN 1 ELSE 0 END) AS has_relations \
     FROM issues i \
@@ -859,6 +863,21 @@ pub async fn update_issue(
                 for blocked_id in blocked_ids {
                     match get_issue_by_id(db, &blocked_id).await {
                         Ok(Some(blocked_issue)) => {
+                            if let Ok(data) = serde_json::to_value(&blocked_issue)
+                                && let Err(e) = sync_log_service::write_sync_entry(
+                                    db,
+                                    entity_types::ISSUE,
+                                    &blocked_id,
+                                    workspace_id,
+                                    SyncActionType::Update,
+                                    Some(data),
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, blocked_id = %blocked_id,
+                                    "Failed to write sync log entry for blocked issue re-broadcast");
+                            }
+
                             sync_log_service::broadcast_sync_action(
                                 ws,
                                 workspace_id,
