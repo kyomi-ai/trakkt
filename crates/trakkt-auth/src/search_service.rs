@@ -83,13 +83,24 @@ pub async fn search(
         return Ok(Vec::new());
     }
 
+    let identifier = parse_identifier_number(&params.query);
+
     let rows = if db.is_postgres() {
-        search_postgres(db, params).await?
+        search_postgres(db, params, &identifier).await?
     } else {
-        search_sqlite(db, params).await?
+        search_sqlite(db, params, &identifier).await?
     };
 
-    Ok(rows.into_iter().map(SearchResult::from).collect())
+    // Dedup by issue_id, keeping the entry with the highest rank (identifier
+    // matches have rank 2.0 so they win over tsvector / LIKE matches).
+    let mut seen = std::collections::HashSet::new();
+    let results: Vec<SearchResult> = rows
+        .into_iter()
+        .map(SearchResult::from)
+        .filter(|r| seen.insert(r.issue_id.clone()))
+        .collect();
+
+    Ok(results)
 }
 
 // ─── Shared condition builders ─────────────────────────────────────────────
@@ -126,6 +137,37 @@ fn shared_conditions_sqlite(params: &SearchParams) -> Vec<String> {
     conds
 }
 
+/// Parse an issue identifier from a search query.
+///
+/// Returns `Some((team_key, number))` when the query looks like an identifier:
+/// - `"TRA-216"` → `Some((Some("TRA"), 216))`
+/// - `"tra-216"` → `Some((Some("TRA"), 216))`
+/// - `"216"`     → `Some((None, 216))`
+/// - `"hello"`   → `None`
+fn parse_identifier_number(query: &str) -> Option<(Option<String>, i64)> {
+    let trimmed = query.trim();
+
+    // Try `{LETTERS}-{DIGITS}` pattern first (case-insensitive).
+    if let Some((prefix, suffix)) = trimmed.split_once('-')
+        && !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_alphabetic())
+        && !suffix.is_empty()
+        && let Ok(n) = suffix.parse::<i64>()
+        && n > 0
+    {
+        return Some((Some(prefix.to_ascii_uppercase()), n));
+    }
+
+    // Try bare positive number.
+    if let Ok(n) = trimmed.parse::<i64>()
+        && n > 0
+    {
+        return Some((None, n));
+    }
+
+    None
+}
+
 /// Escape LIKE special characters and wrap with wildcards for SQLite search.
 fn escape_like_pattern(query: &str) -> String {
     let escaped = query
@@ -140,8 +182,16 @@ fn escape_like_pattern(query: &str) -> String {
 async fn search_postgres(
     db: &DbPool,
     params: &SearchParams,
+    identifier: &Option<(Option<String>, i64)>,
 ) -> trakkt_core::Result<Vec<SearchResultRow>> {
-    // $1 = search query text, $2 = workspace_id, $3 = team_id (when present).
+    // Bind positions:
+    //   $1 = search query text
+    //   $2 = workspace_id
+    //   $3 = team_id (when team filter is active)
+    //   $N = identifier number (when identifier detected)
+    //   $N+1 = parsed team_key (when identifier has "KEY-NUM" format)
+
+    let mut next_param = if params.team_id.is_some() { 4 } else { 3 };
 
     let mut issue_conditions = shared_conditions_pg(params);
     issue_conditions.push("i.search_vector @@ query".to_string());
@@ -163,12 +213,43 @@ async fn search_postgres(
          WHERE {issue_where}"
     );
 
-    let sql = if params.include_comments {
+    // Build the identifier UNION arm when the query looks like an identifier.
+    let identifier_sql = if let Some((parsed_key, _number)) = identifier {
+        let number_param = format!("${next_param}");
+        next_param += 1;
+
+        let mut id_conditions = shared_conditions_pg(params);
+        id_conditions.push(format!("i.number = {number_param}"));
+
+        // When the query contained a team key (e.g. "TRA-216"), also match team.
+        if parsed_key.is_some() {
+            let key_param = format!("${next_param}");
+            id_conditions.push(format!("UPPER(t.key) = {key_param}"));
+        }
+
+        let id_where = id_conditions.join(" AND ");
+        Some(format!(
+            "SELECT i.issue_id, CAST(i.number AS BIGINT) AS number, t.key AS team_key, i.title, \
+             s.name AS status_name, s.category AS status_category, \
+             i.priority, \
+             NULL AS snippet, \
+             'identifier' AS match_field, \
+             2.0::FLOAT8 AS rank \
+             FROM issues i \
+             JOIN teams t ON t.team_id = i.team_id \
+             JOIN statuses s ON s.status_id = i.status_id \
+             WHERE {id_where}"
+        ))
+    } else {
+        None
+    };
+
+    let comment_sql = if params.include_comments {
         let mut comment_conditions = shared_conditions_pg(params);
         comment_conditions.push("c.search_vector @@ query".to_string());
         let comment_where = comment_conditions.join(" AND ");
 
-        let comment_sql = format!(
+        Some(format!(
             "SELECT i.issue_id, CAST(i.number AS BIGINT) AS number, t.key AS team_key, i.title, \
              s.name AS status_name, s.category AS status_category, \
              i.priority, \
@@ -182,25 +263,39 @@ async fn search_postgres(
              JOIN statuses s ON s.status_id = i.status_id \
              CROSS JOIN plainto_tsquery('english', $1) query \
              WHERE {comment_where}"
-        );
-
-        format!(
-            "{issue_sql} UNION ALL {comment_sql} ORDER BY rank DESC LIMIT {} OFFSET {}",
-            params.limit, params.offset
-        )
+        ))
     } else {
-        format!(
-            "{issue_sql} ORDER BY rank DESC LIMIT {} OFFSET {}",
-            params.limit, params.offset
-        )
+        None
     };
+
+    let mut parts = Vec::new();
+    if let Some(id_sql) = &identifier_sql {
+        parts.push(id_sql.as_str());
+    }
+    parts.push(&issue_sql);
+    if let Some(c_sql) = &comment_sql {
+        parts.push(c_sql.as_str());
+    }
+
+    let sql = format!(
+        "{} ORDER BY rank DESC LIMIT {} OFFSET {}",
+        parts.join(" UNION ALL "),
+        params.limit,
+        params.offset
+    );
 
     let rows: Vec<SearchResultRow> = trakkt_core::db_with_pool!(db, |p| {
         let mut query = sqlx::query_as::<_, SearchResultRow>(&sql);
         query = query.bind(&params.query);
         query = query.bind(&params.workspace_id);
-        if let Some(ref team_id) = params.team_id {
+        if let Some(team_id) = &params.team_id {
             query = query.bind(team_id);
+        }
+        if let Some((parsed_key, number)) = identifier {
+            query = query.bind(number);
+            if let Some(key) = parsed_key {
+                query = query.bind(key.to_ascii_uppercase());
+            }
         }
         query.fetch_all(p).await
     })?;
@@ -213,10 +308,18 @@ async fn search_postgres(
 async fn search_sqlite(
     db: &DbPool,
     params: &SearchParams,
+    identifier: &Option<(Option<String>, i64)>,
 ) -> trakkt_core::Result<Vec<SearchResultRow>> {
     let pattern = escape_like_pattern(&params.query);
 
-    // $1 = workspace_id, $2 = LIKE pattern, $3 = team_id (when present).
+    // Bind positions:
+    //   $1 = workspace_id
+    //   $2 = LIKE pattern
+    //   $3 = team_id (when team filter is active)
+    //   $N = identifier number (when identifier detected)
+    //   $N+1 = parsed team_key (when identifier has "KEY-NUM" format)
+
+    let mut next_param = if params.team_id.is_some() { 4 } else { 3 };
 
     let mut issue_conditions = shared_conditions_sqlite(params);
     issue_conditions
@@ -239,12 +342,42 @@ async fn search_sqlite(
          WHERE {issue_where}"
     );
 
-    let sql = if params.include_comments {
+    // Build the identifier UNION arm when the query looks like an identifier.
+    let identifier_sql = if let Some((parsed_key, _number)) = identifier {
+        let number_param = format!("${next_param}");
+        next_param += 1;
+
+        let mut id_conditions = shared_conditions_sqlite(params);
+        id_conditions.push(format!("i.number = {number_param}"));
+
+        if parsed_key.is_some() {
+            let key_param = format!("${next_param}");
+            id_conditions.push(format!("UPPER(t.key) = {key_param}"));
+        }
+
+        let id_where = id_conditions.join(" AND ");
+        Some(format!(
+            "SELECT i.issue_id, CAST(i.number AS BIGINT) AS number, t.key AS team_key, i.title, \
+             s.name AS status_name, s.category AS status_category, \
+             i.priority, \
+             NULL AS snippet, \
+             'identifier' AS match_field, \
+             2.0 AS rank \
+             FROM issues i \
+             JOIN teams t ON t.team_id = i.team_id \
+             JOIN statuses s ON s.status_id = i.status_id \
+             WHERE {id_where}"
+        ))
+    } else {
+        None
+    };
+
+    let comment_sql = if params.include_comments {
         let mut comment_conditions = shared_conditions_sqlite(params);
         comment_conditions.push("c.body LIKE $2 ESCAPE '\\'".to_string());
         let comment_where = comment_conditions.join(" AND ");
 
-        let comment_sql = format!(
+        Some(format!(
             "SELECT i.issue_id, CAST(i.number AS BIGINT) AS number, t.key AS team_key, i.title, \
              s.name AS status_name, s.category AS status_category, \
              i.priority, \
@@ -256,25 +389,39 @@ async fn search_sqlite(
              JOIN teams t ON t.team_id = i.team_id \
              JOIN statuses s ON s.status_id = i.status_id \
              WHERE {comment_where}"
-        );
-
-        format!(
-            "{issue_sql} UNION ALL {comment_sql} LIMIT {} OFFSET {}",
-            params.limit, params.offset
-        )
+        ))
     } else {
-        format!(
-            "{issue_sql} LIMIT {} OFFSET {}",
-            params.limit, params.offset
-        )
+        None
     };
+
+    let mut parts = Vec::new();
+    if let Some(id_sql) = &identifier_sql {
+        parts.push(id_sql.as_str());
+    }
+    parts.push(&issue_sql);
+    if let Some(c_sql) = &comment_sql {
+        parts.push(c_sql.as_str());
+    }
+
+    let sql = format!(
+        "{} ORDER BY rank DESC LIMIT {} OFFSET {}",
+        parts.join(" UNION ALL "),
+        params.limit,
+        params.offset
+    );
 
     let rows: Vec<SearchResultRow> = trakkt_core::db_with_pool!(db, |p| {
         let mut query = sqlx::query_as::<_, SearchResultRow>(&sql);
         query = query.bind(&params.workspace_id);
         query = query.bind(&pattern);
-        if let Some(ref team_id) = params.team_id {
+        if let Some(team_id) = &params.team_id {
             query = query.bind(team_id);
+        }
+        if let Some((parsed_key, number)) = identifier {
+            query = query.bind(number);
+            if let Some(key) = parsed_key {
+                query = query.bind(key.to_ascii_uppercase());
+            }
         }
         query.fetch_all(p).await
     })?;
@@ -370,6 +517,73 @@ mod tests {
         params.team_id = Some("team-1".to_string());
         let conds = shared_conditions_sqlite(&params);
         assert!(conds.contains(&"i.team_id = $3".to_string()));
+    }
+
+    #[test]
+    fn parse_identifier_full_key() {
+        assert_eq!(
+            parse_identifier_number("TRA-216"),
+            Some((Some("TRA".to_string()), 216))
+        );
+    }
+
+    #[test]
+    fn parse_identifier_lowercase() {
+        assert_eq!(
+            parse_identifier_number("tra-42"),
+            Some((Some("TRA".to_string()), 42))
+        );
+    }
+
+    #[test]
+    fn parse_identifier_mixed_case() {
+        assert_eq!(
+            parse_identifier_number("Tra-7"),
+            Some((Some("TRA".to_string()), 7))
+        );
+    }
+
+    #[test]
+    fn parse_identifier_bare_number() {
+        assert_eq!(parse_identifier_number("216"), Some((None, 216)));
+    }
+
+    #[test]
+    fn parse_identifier_bare_number_with_whitespace() {
+        assert_eq!(parse_identifier_number("  42  "), Some((None, 42)));
+    }
+
+    #[test]
+    fn parse_identifier_plain_text() {
+        assert_eq!(parse_identifier_number("hello"), None);
+    }
+
+    #[test]
+    fn parse_identifier_partial_number() {
+        // "21" is a bare number, should match as number 21 (not substring)
+        assert_eq!(parse_identifier_number("21"), Some((None, 21)));
+    }
+
+    #[test]
+    fn parse_identifier_empty() {
+        assert_eq!(parse_identifier_number(""), None);
+        assert_eq!(parse_identifier_number("  "), None);
+    }
+
+    #[test]
+    fn parse_identifier_invalid_formats() {
+        // Letters after dash
+        assert_eq!(parse_identifier_number("TRA-abc"), None);
+        // Number before dash
+        assert_eq!(parse_identifier_number("123-456"), None);
+        // Just a dash
+        assert_eq!(parse_identifier_number("-"), None);
+        // Prefix only
+        assert_eq!(parse_identifier_number("TRA-"), None);
+        // Suffix only
+        assert_eq!(parse_identifier_number("-216"), None);
+        // Zero issue number
+        assert_eq!(parse_identifier_number("TRA-0"), None);
     }
 
     #[test]
