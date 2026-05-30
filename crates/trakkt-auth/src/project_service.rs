@@ -138,7 +138,7 @@ const PROJECT_SELECT: &str = "\
            p.lead_id, lead.name AS lead_name, \
            CAST(p.start_date AS TEXT) AS start_date, \
            CAST(p.target_date AS TEXT) AS target_date, \
-           p.sort_order, \
+           CAST(p.sort_order AS DOUBLE PRECISION) AS sort_order, \
            CAST(p.created_at AS TEXT) AS created_at, \
            CAST(p.updated_at AS TEXT) AS updated_at \
     FROM projects p \
