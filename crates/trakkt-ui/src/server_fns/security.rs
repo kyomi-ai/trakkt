@@ -647,7 +647,9 @@ pub async fn create_api_key(
     // Validate scopes against the known set
     const VALID_SCOPES: &[&str] = &[
         "issues:read", "issues:write", "comments:write",
-        "labels:read", "labels:write", "teams:read",
+        "attachments:read", "attachments:write",
+        "labels:read", "labels:write",
+        "teams:read", "teams:write",
         "projects:read", "projects:write",
     ];
     for scope in &scope_list {
