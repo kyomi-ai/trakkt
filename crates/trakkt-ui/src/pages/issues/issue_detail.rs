@@ -339,27 +339,27 @@ fn IssueDetailContent(
             let iid = issue_id.clone();
             let wid = ws_id.clone();
             spawn_local(async move {
-                if let Ok(cache_db) = crate::cache::db::init_cache_db(&wid).await {
-                    if let Ok(entries) = crate::cache::db::read_all(
+                if let Ok(cache_db) = crate::cache::db::init_cache_db(&wid).await
+                    && let Ok(entries) = crate::cache::db::read_all(
                         &cache_db,
                         trakkt_types::sync::entity_types::COMMENT,
                         &wid,
-                    ).await {
-                        let mut filtered: Vec<Comment> = entries.iter()
-                            .filter_map(|(_, json, _)| {
-                                match serde_json::from_str::<Comment>(json) {
-                                    Ok(c) => Some(c),
-                                    Err(e) => {
-                                        tracing::warn!("Failed to deserialize comment from IDB: {e}");
-                                        None
-                                    }
+                    ).await
+                {
+                    let mut filtered: Vec<Comment> = entries.iter()
+                        .filter_map(|(_, json, _)| {
+                            match serde_json::from_str::<Comment>(json) {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    tracing::warn!("Failed to deserialize comment from IDB: {e}");
+                                    None
                                 }
-                            })
-                            .filter(|c| c.issue_id == iid)
-                            .collect();
-                        filtered.sort_by_key(|c| c.created_at);
-                        comments_sig.set(filtered);
-                    }
+                            }
+                        })
+                        .filter(|c| c.issue_id == iid)
+                        .collect();
+                    filtered.sort_by_key(|c| c.created_at);
+                    comments_sig.set(filtered);
                 }
             });
         });
@@ -384,23 +384,23 @@ fn IssueDetailContent(
             let iid = issue_id.clone();
             let wid = ws_id.clone();
             spawn_local(async move {
-                if let Ok(cache_db) = crate::cache::db::init_cache_db(&wid).await {
-                    if let Ok(Some((json, _))) = crate::cache::db::read_one(
+                if let Ok(cache_db) = crate::cache::db::init_cache_db(&wid).await
+                    && let Ok(Some((json, _))) = crate::cache::db::read_one(
                         &cache_db,
                         trakkt_types::sync::entity_types::ISSUE_CONTENT,
                         &iid,
                         &wid,
-                    ).await {
-                        match serde_json::from_str::<serde_json::Value>(&json) {
-                            Ok(content) => {
-                                let desc = content.get("description")
-                                    .and_then(|d| d.as_str())
-                                    .unwrap_or_default();
-                                desc_sig.set(desc.to_owned());
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to parse issue_content from IDB: {e}");
-                            }
+                    ).await
+                {
+                    match serde_json::from_str::<serde_json::Value>(&json) {
+                        Ok(content) => {
+                            let desc = content.get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or_default();
+                            desc_sig.set(desc.to_owned());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse issue_content from IDB: {e}");
                         }
                     }
                 }
