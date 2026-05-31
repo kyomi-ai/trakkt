@@ -474,7 +474,7 @@ pub(crate) fn IssueListInner(
             let generation = debounce_gen.get_untracked().wrapping_add(1);
             debounce_gen.set(generation);
 
-            if val.trim().len() < 2 {
+            if val.trim().is_empty() {
                 debounced_search.set(String::new());
                 return;
             }
@@ -495,7 +495,7 @@ pub(crate) fn IssueListInner(
             include_archived_search.get(),
         ),
         move |(query, team_id, include_archived)| async move {
-            if query.trim().len() < 2 {
+            if query.trim().is_empty() {
                 return Ok(Vec::new());
             }
             search_issues(
@@ -509,9 +509,9 @@ pub(crate) fn IssueListInner(
         },
     );
 
-    let is_search_active = Signal::derive(move || debounced_search.get().trim().len() >= 2);
+    let is_search_active = Signal::derive(move || !debounced_search.get().trim().is_empty());
     let is_searching = Signal::derive(move || {
-        search.get().trim().len() >= 2 && search_resource.get().is_none()
+        !search.get().trim().is_empty() && search_resource.get().is_none()
     });
     let search_error = RwSignal::new(Option::<String>::None);
 
@@ -912,7 +912,6 @@ pub(crate) fn IssueListInner(
     // the dedicated /archived page instead.
     let filtered_issues = Memo::new(move |_| {
         let raw = team_issues.get();
-        let search_val = search.get().to_lowercase();
         let clauses = filter_clauses.get();
 
         raw.into_iter()
@@ -920,18 +919,6 @@ pub(crate) fn IssueListInner(
                 // Exclude archived issues — they have their own dedicated page.
                 if is_archived(issue, ARCHIVE_DAYS) {
                     return false;
-                }
-                // Search filter (not a clause — always visible in toolbar).
-                // Matches against title, full identifier (e.g. "TRA-148"), or number (e.g. "148").
-                if !search_val.is_empty() {
-                    let identifier = format!("{}-{}", issue.team_key, issue.number).to_lowercase();
-                    let number_str = issue.number.to_string();
-                    if !issue.title.to_lowercase().contains(&search_val)
-                        && !identifier.contains(&search_val)
-                        && !number_str.contains(&search_val)
-                    {
-                        return false;
-                    }
                 }
                 // Apply each composable filter clause.
                 for clause in &clauses {
@@ -1568,7 +1555,7 @@ pub(crate) fn IssueListInner(
                         searching=is_searching
                         class="flex-1 max-w-sm"
                     />
-                    <Show when=move || { search.get().trim().len() >= 2 }>
+                    <Show when=move || { !search.get().trim().is_empty() }>
                         <label class="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none shrink-0">
                             <Checkbox
                                 checked=Signal::derive(move || include_archived_search.get())
@@ -1642,7 +1629,7 @@ pub(crate) fn IssueListInner(
                                 let groups = grouped_search_results.get();
                                 let query = debounced_search.get();
 
-                                if query.trim().len() >= 2 && search_resource.get().is_none() && groups.is_empty() {
+                                if !query.trim().is_empty() && search_resource.get().is_none() && groups.is_empty() {
                                     view! {
                                         <div class="p-8 text-center text-muted-foreground text-sm">
                                             "Searching..."
@@ -1656,7 +1643,7 @@ pub(crate) fn IssueListInner(
                                             </Alert>
                                         </div>
                                     }.into_any()
-                                } else if groups.is_empty() && query.trim().len() >= 2 {
+                                } else if groups.is_empty() && !query.trim().is_empty() {
                                     view! {
                                         <div class="p-8 text-center">
                                             <p class="text-muted-foreground text-sm">
