@@ -2210,7 +2210,7 @@ fn IssueTimeline(
             let Some(element) = document.get_element_by_id(target_id) else { return };
 
             // Scroll the comment into view (smooth, centered)
-            let mut opts = web_sys::ScrollIntoViewOptions::new();
+            let opts = web_sys::ScrollIntoViewOptions::new();
             opts.set_behavior(web_sys::ScrollBehavior::Smooth);
             opts.set_block(web_sys::ScrollLogicalPosition::Center);
             element.scroll_into_view_with_scroll_into_view_options(&opts);
