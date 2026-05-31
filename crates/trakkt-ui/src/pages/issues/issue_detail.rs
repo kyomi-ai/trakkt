@@ -2197,10 +2197,7 @@ fn IssueTimeline(
     let location = use_location();
     Effect::new(move || {
         let current_comments = comments.get();
-        if current_comments.is_empty() || scrolled.get_untracked() {
-            return;
-        }
-
+        if !current_comments.is_empty() && !scrolled.get_untracked() {
         #[cfg(target_arch = "wasm32")]
         {
             let hash = location.hash.get_untracked();
@@ -2229,6 +2226,7 @@ fn IssueTimeline(
                 let _ = el_clone.class_list().remove_1("comment-highlight-flash");
             })
             .forget();
+        }
         }
     });
 
