@@ -2189,6 +2189,47 @@ fn IssueTimeline(
     let tk_for_form = team_key.clone();
     let issue_id_for_comment_form = issue_id;
 
+    // ── Scroll to comment on deep-link (e.g. #comment-{id}) ─────────
+    // Watches the comments signal so it fires after async comment data
+    // arrives via SyncStore. Uses a `scrolled` flag to run only once.
+    let scrolled = RwSignal::new(false);
+    #[cfg(target_arch = "wasm32")]
+    let location = use_location();
+    Effect::new(move || {
+        let current_comments = comments.get();
+        if !current_comments.is_empty() && !scrolled.get_untracked() {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let hash = location.hash.get_untracked();
+            if !hash.starts_with("#comment-") {
+                return;
+            }
+            let target_id = &hash[1..]; // strip leading '#'
+            let Some(window) = web_sys::window() else { return };
+            let Some(document) = window.document() else { return };
+            let Some(element) = document.get_element_by_id(target_id) else { return };
+
+            // Scroll the comment into view (smooth, centered)
+            let opts = web_sys::ScrollIntoViewOptions::new();
+            opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+            opts.set_block(web_sys::ScrollLogicalPosition::Center);
+            element.scroll_into_view_with_scroll_into_view_options(&opts);
+
+            // Apply highlight flash animation class
+            let _ = element.class_list().add_1("comment-highlight-flash");
+
+            scrolled.set(true);
+
+            // Remove the highlight class after the animation completes (2s)
+            let el_clone = element.clone();
+            gloo_timers::callback::Timeout::new(2_000, move || {
+                let _ = el_clone.class_list().remove_1("comment-highlight-flash");
+            })
+            .forget();
+        }
+        }
+    });
+
     view! {
         <div>
             // ── Header with filter toggle ─────────────────────────────
@@ -2523,11 +2564,15 @@ fn format_activity_text(activity: &IssueActivity) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A single comment with avatar, author name, timestamp, and body.
+///
+/// Each comment gets an `id="comment-{comment_id}"` attribute for deep-linking
+/// via URL fragment (e.g. `/issues/TRA-111#comment-{id}`).
 #[component]
 fn CommentItem(
     comment: Comment,
     lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
 ) -> impl IntoView {
+    let anchor_id = format!("comment-{}", comment.comment_id);
     let author = comment
         .author_name
         .clone()
@@ -2541,7 +2586,7 @@ fn CommentItem(
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
     view! {
-        <div class="flex gap-3">
+        <div id=anchor_id class="flex gap-3">
             <Avatar name=author.clone() size=AvatarSize::Md/>
             <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2">

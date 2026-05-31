@@ -64,7 +64,7 @@ web-sys = { version = "0.3", features = [
     "AuthenticatorAssertionResponse",
     "CredentialCreationOptions", "CredentialRequestOptions",
     "Clipboard", "History", "HtmlDivElement", "DomRect",
-    "ScrollIntoViewOptions", "ScrollLogicalPosition",
+    "ScrollIntoViewOptions", "ScrollLogicalPosition", "ScrollBehavior",
     "WebSocket", "MessageEvent", "CloseEvent",
     "FormData", "File", "FileList", "Blob", "BlobPropertyBag",
     "Headers", "Request", "RequestInit", "RequestCredentials", "Response",

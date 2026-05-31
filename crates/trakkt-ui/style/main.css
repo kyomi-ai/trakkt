@@ -126,6 +126,19 @@ html {
   to { transform: translateX(0); }
 }
 
+@keyframes comment-highlight-flash {
+  0%   { background-color: var(--color-accent); }
+  100% { background-color: transparent; }
+}
+
+/* Deep-link highlight: applied when navigating to #comment-{id}.
+ * Briefly flashes the comment's background with the accent color,
+ * then fades to transparent over 2 seconds. */
+.comment-highlight-flash {
+  animation: comment-highlight-flash 2s var(--ease-out) forwards;
+  border-radius: var(--radius-md);
+}
+
 /* Animation utility classes */
 .animate-fade-in {
   animation: fade-in var(--duration-normal) var(--ease-out);
