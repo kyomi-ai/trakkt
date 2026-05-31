@@ -1733,29 +1733,67 @@ pub(crate) fn IssueListInner(
                                 }
 
                                 if list.is_empty() {
-                                    let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                    // Distinguish first-run (truly no issues in the team) from
+                                    // filtered view with no matches.
+                                    let has_team_issues = team_issues.get().iter().any(|i| !is_archived(i, ARCHIVE_DAYS));
+
+                                    if has_team_issues {
+                                        // Filtered view — issues exist but none match the current filters.
+                                        let tab = active_tab.get();
+                                        let (title, description) = match tab.as_str() {
+                                            "active" => (
+                                                "No active issues".to_string(),
+                                                "There are no issues with an active status".to_string(),
+                                            ),
+                                            "backlog" => (
+                                                "No backlog issues".to_string(),
+                                                "There are no issues in the backlog".to_string(),
+                                            ),
+                                            _ => (
+                                                "No issues match the current filters".to_string(),
+                                                "Try adjusting or clearing your filters".to_string(),
+                                            ),
+                                        };
+                                        let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                            view! {
+                                                <Icon icon=phosphor_leptos::FUNNEL weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+                                            }.into_any()
+                                        });
                                         view! {
-                                            <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+                                            <div class="p-4 md:p-6">
+                                                <EmptyState
+                                                    icon=empty_icon
+                                                    title=title
+                                                    description=description
+                                                />
+                                            </div>
                                         }.into_any()
-                                    });
-                                    let empty_action: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                    } else {
+                                        // First-run — truly no issues in this team/workspace.
+                                        let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                            view! {
+                                                <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+                                            }.into_any()
+                                        });
+                                        let empty_action: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                            view! {
+                                                <Button on:click=move |_| set_show_new_issue.set(true)>
+                                                    <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                                                    "New Issue"
+                                                </Button>
+                                            }.into_any()
+                                        });
                                         view! {
-                                            <Button on:click=move |_| set_show_new_issue.set(true)>
-                                                <Icon icon=phosphor_leptos::PLUS size="14px"/>
-                                                "New Issue"
-                                            </Button>
+                                            <div class="p-4 md:p-6">
+                                                <EmptyState
+                                                    icon=empty_icon
+                                                    title="No issues yet"
+                                                    description="Create your first issue to get started"
+                                                    action=empty_action
+                                                />
+                                            </div>
                                         }.into_any()
-                                    });
-                                    view! {
-                                        <div class="p-4 md:p-6">
-                                            <EmptyState
-                                                icon=empty_icon
-                                                title="No issues yet"
-                                                description="Create your first issue to get started"
-                                                action=empty_action
-                                            />
-                                        </div>
-                                    }.into_any()
+                                    }
                                 } else {
                                     let rows = list.iter().enumerate().map(|(idx, issue)| {
                                         let archived = is_archived(issue, ARCHIVE_DAYS);
