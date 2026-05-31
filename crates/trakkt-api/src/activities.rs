@@ -56,6 +56,10 @@ pub async fn list_workspace_activities(
         &ctx.workspace_id,
         params.team_key.as_deref(),
         params.action_type.as_deref(),
+        params.actor_id.as_deref(),
+        params.action_source.as_deref(),
+        params.created_after.as_deref(),
+        params.created_before.as_deref(),
         limit,
         offset,
     )

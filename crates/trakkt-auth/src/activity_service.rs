@@ -725,13 +725,27 @@ pub async fn list_workspace_activities(
     workspace_id: &str,
     team_key: Option<&str>,
     action_type: Option<&str>,
+    actor_id: Option<&str>,
+    action_source: Option<&str>,
+    created_after: Option<&str>,
+    created_before: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> trakkt_core::Result<Vec<WorkspaceActivity>> {
     let is_pg = db.is_postgres();
     let cast_text = if is_pg { "::TEXT" } else { "" };
+    let cast_ts = |n: u8| {
+        if is_pg {
+            format!("${n}::TEXT::TIMESTAMPTZ")
+        } else {
+            // Normalize to ISO 8601 matching the stored strftime format
+            format!("strftime('%Y-%m-%dT%H:%M:%SZ', ${n})")
+        }
+    };
 
     // Inline LIMIT/OFFSET per CODING_STANDARDS.md (sanitized i64 values).
+    let cast_after = cast_ts(6);
+    let cast_before = cast_ts(7);
     let sql = format!(
         "SELECT a.activity_id, a.issue_id, a.workspace_id, a.actor_id, \
                 u.name AS actor_name, \
@@ -749,6 +763,10 @@ pub async fn list_workspace_activities(
          WHERE a.workspace_id = $1 \
            AND ($2{cast_text} IS NULL OR t.key = $2) \
            AND ($3{cast_text} IS NULL OR a.action_type = $3) \
+           AND ($4{cast_text} IS NULL OR a.actor_id = $4) \
+           AND ($5{cast_text} IS NULL OR a.action_source = $5) \
+           AND ($6{cast_text} IS NULL OR a.created_at >= {cast_after}) \
+           AND ($7{cast_text} IS NULL OR a.created_at <= {cast_before}) \
          ORDER BY a.created_at DESC \
          LIMIT {limit} OFFSET {offset}"
     );
@@ -759,7 +777,11 @@ pub async fn list_workspace_activities(
         &sql,
         workspace_id,
         team_key,
-        action_type
+        action_type,
+        actor_id,
+        action_source,
+        created_after,
+        created_before
     )?;
     Ok(rows.into_iter().map(WorkspaceActivityRow::into_dto).collect())
 }

@@ -527,6 +527,14 @@ pub struct ListWorkspaceActivitiesApiParams {
     pub team_key: Option<String>,
     /// Filter by action type (e.g. "status_changed", "comment_added")
     pub action_type: Option<String>,
+    /// Filter by actor user ID
+    pub actor_id: Option<String>,
+    /// Filter by action source: "user", "agent", or "api"
+    pub action_source: Option<String>,
+    /// Filter to activities created at or after this ISO 8601 datetime
+    pub created_after: Option<String>,
+    /// Filter to activities created at or before this ISO 8601 datetime
+    pub created_before: Option<String>,
     /// Maximum number of activities to return (default: 50, max: 200)
     pub limit: Option<i64>,
     /// Offset for pagination
