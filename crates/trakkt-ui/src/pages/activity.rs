@@ -3,14 +3,15 @@
 //! Activity feed — chronological workspace-wide activity stream.
 //!
 //! Shows all issue activities across all teams, grouped by time period
-//! (Today, Yesterday, This Week, Older). Supports filtering by team
-//! and activity type, with "Load more" pagination.
+//! (Today, Yesterday, This Week, Older). Supports filtering by team,
+//! activity type, action source, and actor, with "Load more" pagination.
 
 use leptos::prelude::*;
 use phosphor_leptos::{Icon, IconWeight};
 
 use crate::components::{Button, ButtonVariant, Select, SelectVariant, Spinner};
 use crate::server_fns::activities::list_workspace_activities;
+use crate::server_fns::team::list_workspace_members;
 use crate::server_fns::teams::list_teams;
 use crate::utils::relative_time::relative_time;
 use crate::utils::time_group::{classify_time_group, TimeGroup};
@@ -133,6 +134,8 @@ pub fn ActivityPage() -> impl IntoView {
     // Filter state
     let (team_filter, set_team_filter) = signal(String::new());
     let (type_filter, set_type_filter) = signal(String::new());
+    let (source_filter, set_source_filter) = signal(String::new());
+    let (actor_filter, set_actor_filter) = signal(String::new());
 
     // Pagination state
     let loaded_activities: RwSignal<Vec<WorkspaceActivity>> = RwSignal::new(Vec::new());
@@ -156,12 +159,47 @@ pub fn ActivityPage() -> impl IntoView {
     let type_options = Signal::derive(|| {
         vec![
             ("".to_string(), "All types".to_string()),
+            ("created".to_string(), "Created".to_string()),
             ("status_changed".to_string(), "Status changes".to_string()),
-            ("comment_added".to_string(), "Comments".to_string()),
             ("assignee_changed".to_string(), "Assignments".to_string()),
             ("priority_changed".to_string(), "Priority".to_string()),
-            ("label_added".to_string(), "Labels".to_string()),
+            ("comment_added".to_string(), "Comments".to_string()),
+            ("label_added".to_string(), "Labels added".to_string()),
+            ("label_removed".to_string(), "Labels removed".to_string()),
+            ("title_changed".to_string(), "Title changes".to_string()),
+            ("description_changed".to_string(), "Description changes".to_string()),
+            ("estimate_changed".to_string(), "Estimate changes".to_string()),
+            ("due_date_changed".to_string(), "Due date changes".to_string()),
+            ("project_changed".to_string(), "Project changes".to_string()),
+            ("milestone_changed".to_string(), "Milestone changes".to_string()),
+            ("parent_changed".to_string(), "Parent changes".to_string()),
+            ("relation_added".to_string(), "Relations added".to_string()),
+            ("relation_removed".to_string(), "Relations removed".to_string()),
+            ("moved_to_team".to_string(), "Moved to team".to_string()),
         ]
+    });
+
+    let source_options = Signal::derive(|| {
+        vec![
+            ("".to_string(), "All sources".to_string()),
+            ("user".to_string(), "User".to_string()),
+            ("agent".to_string(), "Agent".to_string()),
+            ("api".to_string(), "API".to_string()),
+        ]
+    });
+
+    // Load workspace members for the actor filter dropdown
+    let members_resource = Resource::new(|| (), |_| async move { list_workspace_members().await });
+
+    let actor_options = Signal::derive(move || {
+        let mut opts = vec![("".to_string(), "All members".to_string())];
+        if let Some(Ok(ref members)) = members_resource.get() {
+            for m in members {
+                let display_name = m.name.clone().unwrap_or_else(|| m.email.clone());
+                opts.push((m.user_id.clone(), display_name));
+            }
+        }
+        opts
     });
 
     // Fetch function — loads a page of activities and updates state
@@ -185,8 +223,18 @@ pub fn ActivityPage() -> impl IntoView {
             if tf.is_empty() { None } else { Some(tf) }
         };
 
+        let actor_id = {
+            let af = actor_filter.get_untracked();
+            if af.is_empty() { None } else { Some(af) }
+        };
+
+        let action_source = {
+            let sf = source_filter.get_untracked();
+            if sf.is_empty() { None } else { Some(sf) }
+        };
+
         leptos::task::spawn_local(async move {
-            match list_workspace_activities(team_key, action_type, None, None, None, None, Some(PAGE_SIZE), Some(offset)).await {
+            match list_workspace_activities(team_key, action_type, actor_id, action_source, None, None, Some(PAGE_SIZE), Some(offset)).await {
                 Ok(activities) => {
                     let count = activities.len() as i64;
                     if reset {
@@ -214,10 +262,12 @@ pub fn ActivityPage() -> impl IntoView {
 
     // Re-fetch on filter change (track both signals)
     let fetch_on_filter = fetch_activities;
-    Effect::new(move |prev: Option<(String, String)>| {
+    Effect::new(move |prev: Option<(String, String, String, String)>| {
         let tk = team_filter.get();
         let tf = type_filter.get();
-        let current = (tk.clone(), tf.clone());
+        let sf = source_filter.get();
+        let af = actor_filter.get();
+        let current = (tk.clone(), tf.clone(), sf.clone(), af.clone());
 
         // Skip the first fire — the initial load Effect handles that
         if prev.is_some_and(|prev_val| prev_val != current) {
@@ -248,6 +298,18 @@ pub fn ActivityPage() -> impl IntoView {
                     value=Signal::derive(move || type_filter.get())
                     options=type_options
                     on_change=Callback::new(move |v: String| set_type_filter.set(v))
+                    variant=SelectVariant::Compact
+                />
+                <Select
+                    value=Signal::derive(move || source_filter.get())
+                    options=source_options
+                    on_change=Callback::new(move |v: String| set_source_filter.set(v))
+                    variant=SelectVariant::Compact
+                />
+                <Select
+                    value=Signal::derive(move || actor_filter.get())
+                    options=actor_options
+                    on_change=Callback::new(move |v: String| set_actor_filter.set(v))
                     variant=SelectVariant::Compact
                 />
             </div>
