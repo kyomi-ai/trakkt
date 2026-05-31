@@ -31,7 +31,7 @@ const MAX_CONNECTIONS_PER_USER: usize = 10;
 /// Capacity of the bounded mpsc channel between the WebSocket manager
 /// and each connection's outbound task. If the client can't keep up and
 /// the buffer fills, new messages are dropped (back-pressure).
-const WS_CHANNEL_CAPACITY: usize = 256;
+const WS_CHANNEL_CAPACITY: usize = 8192;
 
 /// Sender half of an mpsc channel — the WS endpoint writes received
 /// `axum::extract::ws::Message` items to this.

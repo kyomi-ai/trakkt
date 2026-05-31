@@ -336,15 +336,14 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                             );
                         }
                         // Write issue_content separately for issues.
-                        if let Some(ref cj) = content_json {
-                            if let Err(e) =
+                        if let Some(ref cj) = content_json
+                            && let Err(e) =
                                 db::upsert(&cache_db, entity_types::ISSUE_CONTENT, &eid, &wid, cj, &ts).await
-                            {
-                                tracing::warn!(
-                                    entity_id = %eid,
-                                    "sync_action: failed to write issue_content to IDB: {e}"
-                                );
-                            }
+                        {
+                            tracing::warn!(
+                                entity_id = %eid,
+                                "sync_action: failed to write issue_content to IDB: {e}"
+                            );
                         }
                     }
                     Err(e) => {
