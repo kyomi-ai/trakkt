@@ -332,6 +332,10 @@ pub fn ActivityPage() -> impl IntoView {
 fn ActivityRow(activity: WorkspaceActivity) -> impl IntoView {
     let icon = activity_icon(&activity.action_type);
     let description = activity_description(&activity);
+    let via_suffix = crate::components::attribution::render_via_suffix(
+        activity.action_source,
+        activity.action_source_label.clone(),
+    );
     let identifier = format!("{}-{}", activity.team_key, activity.issue_number);
     let href = format!("/issues/{}-{}", activity.team_key, activity.issue_number);
     let issue_title = activity.issue_title.clone();
@@ -344,7 +348,7 @@ fn ActivityRow(activity: WorkspaceActivity) -> impl IntoView {
             </div>
             <div class="flex-1 min-w-0">
                 <div class="flex items-baseline gap-2">
-                    <span class="text-sm text-foreground">{description}</span>
+                    <span class="text-sm text-foreground">{description}{via_suffix}</span>
                     <span class="text-xs text-muted-foreground font-mono">{identifier}</span>
                 </div>
                 <p class="text-sm text-muted-foreground truncate mt-0.5">{issue_title}</p>
