@@ -991,7 +991,8 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
 
 .wysiwyg-container .wysiwyg-link:hover,
 .wysiwyg-container a:hover {
-    color: var(--color-primary);
+    color: #0F766E; /* --accent-hover from DESIGN.md — matches .prose-trakkt a:hover */
+    text-decoration: underline;
 }
 
 .kode-toolbar { overflow-y: hidden; }
