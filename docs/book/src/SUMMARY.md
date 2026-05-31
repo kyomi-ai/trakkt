@@ -45,3 +45,5 @@
 - [Overview](self-hosting/README.md)
 - [Docker](self-hosting/docker.md)
 - [Kubernetes](self-hosting/kubernetes.md)
+- [Reverse Proxy](self-hosting/reverse-proxy.md)
+- [Upgrading](self-hosting/upgrading.md)
