@@ -43,6 +43,8 @@ use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
 use crate::types::{IssueNavState, WorkspaceMember};
 use crate::utils::relative_time::{format_datetime, relative_time};
 use trakkt_types::models::{Comment, IssueActivity, IssueWithDetails};
+#[cfg(target_arch = "wasm32")]
+use leptos::task::spawn_local;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared kode theme builder
@@ -320,25 +322,91 @@ fn IssueDetailContent(
         initial.get_untracked()
     });
 
-    // ── Comments: derived from SyncStore (real-time via WebSocket) ────
-    let issue_id_for_comments = initial.get_untracked().issue_id.clone();
-    let comments = Memo::new(move |_| {
-        sync_store.map(|store| {
-            let mut filtered: Vec<Comment> = store.comments().get()
-                .into_iter()
-                .filter(|c| c.issue_id == issue_id_for_comments)
-                .collect();
-            filtered.sort_by_key(|a| a.created_at);
-            filtered
-        }).unwrap_or_default()
-    });
+    // ── Comments: loaded on-demand from IndexedDB (reactive via version counter) ──
+    let comments: RwSignal<Vec<Comment>> = RwSignal::new(Vec::new());
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let issue_id = initial.get_untracked().issue_id.clone();
+        let ws_id = initial.get_untracked().workspace_id.clone();
+        let comments_sig = comments;
+        let cv = sync_store.map(|s| s.comments_version());
+
+        Effect::new(move || {
+            if let Some(cv) = cv {
+                let _ = cv.get();
+            }
+            let iid = issue_id.clone();
+            let wid = ws_id.clone();
+            spawn_local(async move {
+                if let Ok(cache_db) = crate::cache::db::init_cache_db(&wid).await
+                    && let Ok(entries) = crate::cache::db::read_all(
+                        &cache_db,
+                        trakkt_types::sync::entity_types::COMMENT,
+                        &wid,
+                    ).await
+                {
+                    let mut filtered: Vec<Comment> = entries.iter()
+                        .filter_map(|(_, json, _)| {
+                            match serde_json::from_str::<Comment>(json) {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    tracing::warn!("Failed to deserialize comment from IDB: {e}");
+                                    None
+                                }
+                            }
+                        })
+                        .filter(|c| c.issue_id == iid)
+                        .collect();
+                    filtered.sort_by_key(|c| c.created_at);
+                    comments_sig.set(filtered);
+                }
+            });
+        });
+    }
 
     // No-op callback for components that need on_change but don't need parent notification
     let noop = Callback::new(|()| {});
 
     // ── Fine-grained memos: only re-render when the specific field changes ──
     let title = Memo::new(move |_| issue.get().title.clone());
-    let description = Memo::new(move |_| issue.get().description.clone().unwrap_or_default());
+    let description = RwSignal::new(initial.get_untracked().description.clone().unwrap_or_default());
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let issue_id = initial.get_untracked().issue_id.clone();
+        let ws_id = initial.get_untracked().workspace_id.clone();
+        let desc_sig = description;
+        let issue_updated_at = Memo::new(move |_| issue.get().updated_at.clone());
+
+        Effect::new(move || {
+            let _ = issue_updated_at.get();
+            let iid = issue_id.clone();
+            let wid = ws_id.clone();
+            spawn_local(async move {
+                if let Ok(cache_db) = crate::cache::db::init_cache_db(&wid).await
+                    && let Ok(Some((json, _))) = crate::cache::db::read_one(
+                        &cache_db,
+                        trakkt_types::sync::entity_types::ISSUE_CONTENT,
+                        &iid,
+                        &wid,
+                    ).await
+                {
+                    match serde_json::from_str::<serde_json::Value>(&json) {
+                        Ok(content) => {
+                            let desc = content.get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or_default();
+                            desc_sig.set(desc.to_owned());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse issue_content from IDB: {e}");
+                        }
+                    }
+                }
+            });
+        });
+    }
     let parent_identifier = Memo::new(move |_| issue.get().parent_identifier.clone());
     let timestamps = Memo::new(move |_| {
         let i = issue.get();

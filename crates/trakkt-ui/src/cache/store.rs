@@ -15,7 +15,7 @@
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
-use trakkt_types::models::{Comment, Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
+use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
 
 #[cfg(target_arch = "wasm32")]
 use leptos::task::spawn_local;
@@ -38,7 +38,6 @@ struct SyncStoreInner {
     views: ArcRwSignal<Vec<View>>,
     favorites: ArcRwSignal<Vec<Favorite>>,
     notifications: ArcRwSignal<Vec<Notification>>,
-    comments: ArcRwSignal<Vec<Comment>>,
     initialized: ArcRwSignal<bool>,
     /// Version counter bumped when an activity sync action arrives.
     /// Used by the timeline component to trigger a refetch.
@@ -46,6 +45,9 @@ struct SyncStoreInner {
     /// Version counter bumped when an issue_relation sync action arrives.
     /// Used by the relations section to trigger a refetch.
     relations_version: ArcRwSignal<u32>,
+    /// Version counter bumped when a comment sync action arrives.
+    /// Used by the detail page to trigger a re-read from IndexedDB.
+    comments_version: ArcRwSignal<u32>,
     /// Workspace ID for IndexedDB operations.
     ///
     /// Set once after the user context resolves. `remove_*` methods use this
@@ -89,10 +91,10 @@ impl SyncStore {
                 views: ArcRwSignal::new(Vec::new()),
                 favorites: ArcRwSignal::new(Vec::new()),
                 notifications: ArcRwSignal::new(Vec::new()),
-                comments: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
                 activities_version: ArcRwSignal::new(0),
                 relations_version: ArcRwSignal::new(0),
+                comments_version: ArcRwSignal::new(0),
                 workspace_id: ArcRwSignal::new(None),
             })),
         }
@@ -145,12 +147,6 @@ impl SyncStore {
     /// Reactive signal over the current notifications list.
     pub fn notifications(&self) -> Signal<Vec<Notification>> {
         let sig = self.inner.with_value(|inner| inner.notifications.clone());
-        Signal::derive(move || sig.get())
-    }
-
-    /// Reactive signal over the current comments list.
-    pub fn comments(&self) -> Signal<Vec<Comment>> {
-        let sig = self.inner.with_value(|inner| inner.comments.clone());
         Signal::derive(move || sig.get())
     }
 
@@ -214,6 +210,25 @@ impl SyncStore {
         });
     }
 
+    /// Version counter for comments — bumped on each comment sync action.
+    ///
+    /// The issue detail page uses this as a reactive dependency to trigger
+    /// a re-read of comments from IndexedDB.
+    pub fn comments_version(&self) -> Signal<u32> {
+        let sig = self.inner.with_value(|inner| inner.comments_version.clone());
+        Signal::derive(move || sig.get())
+    }
+
+    /// Bump the comments version counter.
+    ///
+    /// Called by the sync engine when a "comment" entity type arrives via
+    /// WebSocket, signaling that the detail page should re-read from IDB.
+    pub fn bump_comments_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.comments_version.update(|v| *v += 1);
+        });
+    }
+
     // ── Bulk setters (bootstrap / hydration) ─────────────────────────────────
 
     /// Replace the entire issue list (called during IDB hydration).
@@ -254,11 +269,6 @@ impl SyncStore {
     /// Replace the entire notifications list (called during IDB hydration).
     pub fn set_notifications(&self, items: Vec<Notification>) {
         self.inner.with_value(|inner| inner.notifications.set(items));
-    }
-
-    /// Replace the entire comments list (called during IDB hydration).
-    pub fn set_comments(&self, items: Vec<Comment>) {
-        self.inner.with_value(|inner| inner.comments.set(items));
     }
 
     // ── Single-item upserts (live sync) ───────────────────────────────────────
@@ -367,19 +377,6 @@ impl SyncStore {
         });
     }
 
-    /// Insert or update a comment by `comment_id`.
-    pub fn upsert_comment(&self, item: Comment) {
-        self.inner.with_value(|inner| {
-            inner.comments.update(|list| {
-                if let Some(existing) = list.iter_mut().find(|c| c.comment_id == item.comment_id) {
-                    *existing = item;
-                } else {
-                    list.push(item);
-                }
-            });
-        });
-    }
-
     /// Spawn an async task to delete an entity from IndexedDB.
     ///
     /// No-op when `workspace_id` has not been set yet (SSR or pre-auth).
@@ -420,6 +417,8 @@ impl SyncStore {
         });
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::ISSUE, issue_id);
+        #[cfg(target_arch = "wasm32")]
+        self.delete_from_idb(entity_types::ISSUE_CONTENT, issue_id);
     }
 
     /// Remove a label by `label_id`.
@@ -499,15 +498,10 @@ impl SyncStore {
         self.delete_from_idb(entity_types::NOTIFICATION, notification_id);
     }
 
-    /// Remove a comment by `comment_id`.
-    pub fn remove_comment(&self, comment_id: &str) {
-        self.inner.with_value(|inner| {
-            inner.comments.update(|list| {
-                list.retain(|c| c.comment_id != comment_id);
-            });
-        });
+    /// Remove a comment by `comment_id` (deletes from IndexedDB).
+    pub fn remove_comment(&self, _comment_id: &str) {
         #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::COMMENT, comment_id);
+        self.delete_from_idb(entity_types::COMMENT, _comment_id);
     }
 
     // ── State transitions ─────────────────────────────────────────────────────
@@ -535,10 +529,10 @@ impl SyncStore {
             inner.views.set(Vec::new());
             inner.favorites.set(Vec::new());
             inner.notifications.set(Vec::new());
-            inner.comments.set(Vec::new());
             inner.initialized.set(false);
             inner.activities_version.set(0);
             inner.relations_version.set(0);
+            inner.comments_version.set(0);
         });
     }
 }

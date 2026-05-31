@@ -29,7 +29,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use trakkt_types::models::{Comment, Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
+use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
 use trakkt_types::sync::{SyncAction, SyncActionType, SyncResponse, entity_types};
 
 use crate::cache::db;
@@ -38,6 +38,7 @@ use crate::cache::websocket::{ConnectionState, WebSocketClient};
 
 const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
     entity_types::ISSUE,
+    entity_types::ISSUE_CONTENT,
     entity_types::LABEL,
     entity_types::STATUS,
     entity_types::TEAM,
@@ -236,7 +237,11 @@ pub async fn hydrate_store_from_db(
     }
 
     if let Ok(entries) = db::read_all(cache_db, entity_types::ISSUE, workspace_id).await {
-        store.set_issues(deser::<IssueWithDetails>(&entries, entity_types::ISSUE));
+        let mut issues = deser::<IssueWithDetails>(&entries, entity_types::ISSUE);
+        for issue in &mut issues {
+            issue.description = None;
+        }
+        store.set_issues(issues);
     }
     if let Ok(entries) = db::read_all(cache_db, entity_types::LABEL, workspace_id).await {
         store.set_labels(deser::<Label>(&entries, entity_types::LABEL));
@@ -259,10 +264,6 @@ pub async fn hydrate_store_from_db(
     if let Ok(entries) = db::read_all(cache_db, entity_types::NOTIFICATION, workspace_id).await {
         store.set_notifications(deser::<Notification>(&entries, entity_types::NOTIFICATION));
     }
-    if let Ok(entries) = db::read_all(cache_db, entity_types::COMMENT, workspace_id).await {
-        store.set_comments(deser::<Comment>(&entries, entity_types::COMMENT));
-    }
-
     store.set_initialized(true);
     if let Ok(Some(cursor)) = db::get_last_sync_id(cache_db, workspace_id).await {
         tracing::debug!(cursor, "hydrated from IDB with cursor — will delta-sync");
@@ -288,8 +289,26 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                 return;
             };
 
+            // For issues: split the description into a separate issue_content
+            // entity in IDB so it is not bulk-loaded during hydration. The
+            // main issue record stored in IDB has its description stripped.
+            let (idb_data, content_json) = if entity_type == entity_types::ISSUE {
+                let mut data = entity_data.clone();
+                let description = data.as_object_mut().and_then(|obj| obj.remove("description"));
+                let content = description.and_then(|d| {
+                    if d.is_null() {
+                        None
+                    } else {
+                        Some(serde_json::json!({"description": d}).to_string())
+                    }
+                });
+                (data, content)
+            } else {
+                (entity_data.clone(), None)
+            };
+
             // Persist to IndexedDB (best-effort async write).
-            let json_str = match serde_json::to_string(entity_data) {
+            let json_str = match serde_json::to_string(&idb_data) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(
@@ -316,6 +335,16 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                                 "sync_action upsert to IDB failed: {e}"
                             );
                         }
+                        // Write issue_content separately for issues.
+                        if let Some(ref cj) = content_json
+                            && let Err(e) =
+                                db::upsert(&cache_db, entity_types::ISSUE_CONTENT, &eid, &wid, cj, &ts).await
+                        {
+                            tracing::warn!(
+                                entity_id = %eid,
+                                "sync_action: failed to write issue_content to IDB: {e}"
+                            );
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("sync_action: failed to open cache db: {e}");
@@ -327,7 +356,10 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
             match entity_type {
                 et if et == entity_types::ISSUE => {
                     match serde_json::from_value::<IssueWithDetails>(entity_data.clone()) {
-                        Ok(item) => store.upsert_issue(item),
+                        Ok(mut item) => {
+                            item.description = None;
+                            store.upsert_issue(item);
+                        }
                         Err(e) => tracing::warn!(
                             entity_type,
                             entity_id,
@@ -406,14 +438,10 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                     }
                 }
                 et if et == entity_types::COMMENT => {
-                    match serde_json::from_value::<Comment>(entity_data.clone()) {
-                        Ok(item) => store.upsert_comment(item),
-                        Err(e) => tracing::warn!(
-                            entity_type,
-                            entity_id,
-                            "sync_action: failed to deserialize comment: {e}"
-                        ),
-                    }
+                    // Comments are not stored in the reactive signal — loaded
+                    // on-demand by the detail page from IndexedDB. Bump the
+                    // version counter so reactive dependencies re-read from IDB.
+                    store.bump_comments_version();
                 }
                 et if et == entity_types::ACTIVITY => {
                     // Activities are not stored in the SyncStore — they are
@@ -445,7 +473,10 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                 et if et == entity_types::VIEW => store.remove_view(entity_id),
                 et if et == entity_types::FAVORITE => store.remove_favorite(entity_id),
                 et if et == entity_types::NOTIFICATION => store.remove_notification(entity_id),
-                et if et == entity_types::COMMENT => store.remove_comment(entity_id),
+                et if et == entity_types::COMMENT => {
+                    store.remove_comment(entity_id);
+                    store.bump_comments_version();
+                }
                 et if et == entity_types::ACTIVITY => store.bump_activities_version(),
                 et if et == entity_types::ISSUE_RELATION => store.bump_relations_version(),
                 other => {
