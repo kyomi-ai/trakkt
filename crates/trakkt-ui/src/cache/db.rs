@@ -63,7 +63,7 @@ const DB_VERSION: u8 = 1;
 ///
 /// Bump this when: fields added/removed from list item structs, server-side
 /// sync queries change shape, entity types added/removed from bootstrap.
-pub const SCHEMA_HASH: &str = "trakkt-2026-05-v2";
+pub const SCHEMA_HASH: &str = "trakkt-2026-06-v3";
 
 /// Handle to the open IndexedDB database.
 ///
@@ -244,6 +244,37 @@ pub async fn read_all(
         .filter_map(|r| r.ok())
         .map(|r| (r.entity_id, r.data, r.updated_at))
         .collect())
+}
+
+/// Read a single entity record by its full key.
+///
+/// Returns `Some((data_json, updated_at))` if the record exists, `None`
+/// otherwise. Used by the detail page to load descriptions and comments
+/// on-demand instead of bulk-loading at hydration time.
+pub async fn read_one(
+    db: &CacheDb,
+    entity_type: &str,
+    entity_id: &str,
+    workspace_id: &str,
+) -> Result<Option<(String, String)>, CacheDbError> {
+    let tx = db
+        .inner
+        .transaction(STORE_ENTITIES)
+        .with_mode(TransactionMode::Readonly)
+        .build()
+        .map_err(CacheDbError::Transaction)?;
+
+    let store = tx.object_store(STORE_ENTITIES).map_err(CacheDbError::Transaction)?;
+
+    let key = entity_key(entity_type, workspace_id, entity_id);
+    let record: Option<EntityRecord> = store
+        .get::<EntityRecord, String, KeyRange<String>>(KeyRange::Only(key))
+        .serde()
+        .map_err(CacheDbError::Serde)?
+        .await
+        .map_err(CacheDbError::Transaction)?;
+
+    Ok(record.map(|r| (r.data, r.updated_at)))
 }
 
 // ── Write operations ──────────────────────────────────────────────────────────

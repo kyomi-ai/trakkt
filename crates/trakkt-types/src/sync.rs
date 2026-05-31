@@ -55,4 +55,5 @@ pub mod entity_types {
     pub const ATTACHMENT: &str = "attachment";
     pub const ISSUE_ATTACHMENT: &str = "issue_attachment";
     pub const ACTIVITY: &str = "activity";
+    pub const ISSUE_CONTENT: &str = "issue_content";
 }
