@@ -186,7 +186,7 @@ pub fn ActivityPage() -> impl IntoView {
         };
 
         leptos::task::spawn_local(async move {
-            match list_workspace_activities(team_key, action_type, Some(PAGE_SIZE), Some(offset)).await {
+            match list_workspace_activities(team_key, action_type, None, None, None, None, Some(PAGE_SIZE), Some(offset)).await {
                 Ok(activities) => {
                     let count = activities.len() as i64;
                     if reset {

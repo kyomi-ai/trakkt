@@ -37,6 +37,10 @@ pub async fn list_issue_activities(
 pub async fn list_workspace_activities(
     team_key: Option<String>,
     action_type: Option<String>,
+    actor_id: Option<String>,
+    action_source: Option<String>,
+    created_after: Option<String>,
+    created_before: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<WorkspaceActivity>, ServerFnError> {
@@ -45,6 +49,10 @@ pub async fn list_workspace_activities(
     let params = trakkt_types::api::ListWorkspaceActivitiesApiParams {
         team_key,
         action_type,
+        actor_id,
+        action_source,
+        created_after,
+        created_before,
         limit,
         offset,
     };
