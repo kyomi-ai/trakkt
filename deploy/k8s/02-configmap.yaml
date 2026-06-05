@@ -38,3 +38,9 @@ data:
 
   # Logging
   rust-log: "info"
+
+  # Attachment storage (S3 via MinIO)
+  attachment-storage: "s3"
+  attachment-s3-endpoint: "http://minio.trakkt.svc.cluster.local:9000"
+  attachment-s3-bucket: "attachments"
+  attachment-s3-region: "us-east-1"
