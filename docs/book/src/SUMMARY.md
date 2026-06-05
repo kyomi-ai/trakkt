@@ -12,6 +12,14 @@
 # User Guide
 
 - [Overview](user-guide/README.md)
+- [Getting Started](user-guide/getting-started.md)
+- [Issues](user-guide/issues.md)
+- [Views](user-guide/views.md)
+- [Projects & Milestones](user-guide/projects.md)
+- [Inbox & Notifications](user-guide/notifications.md)
+- [Keyboard Shortcuts](user-guide/keyboard-shortcuts.md)
+- [Workspace Settings](user-guide/workspace-settings.md)
+- [Team Settings](user-guide/team-settings.md)
 
 # API Reference
 
