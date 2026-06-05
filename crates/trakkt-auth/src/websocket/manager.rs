@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -31,7 +32,7 @@ const MAX_CONNECTIONS_PER_USER: usize = 10;
 /// Capacity of the bounded mpsc channel between the WebSocket manager
 /// and each connection's outbound task. If the client can't keep up and
 /// the buffer fills, new messages are dropped (back-pressure).
-const WS_CHANNEL_CAPACITY: usize = 8192;
+const WS_CHANNEL_CAPACITY: usize = 1024;
 
 /// Sender half of an mpsc channel — the WS endpoint writes received
 /// `axum::extract::ws::Message` items to this.
@@ -416,6 +417,101 @@ impl WebSocketManager {
         {
             conns.retain(|c| !stale_ids.contains(&c.id));
         }
+    }
+
+    /// Deliver a JSON-encoded message to all local WebSocket connections for a user,
+    /// waiting for channel capacity instead of dropping on full buffer.
+    ///
+    /// Uses `.send().await` — blocks until the channel has capacity or a 30-second
+    /// timeout expires. Timed-out or closed connections are treated as stale and
+    /// cleaned up.
+    ///
+    /// Senders are cloned out of the DashMap before awaiting — holding a DashMap
+    /// `Ref` across an await point would deadlock any concurrent connect/disconnect
+    /// on the same shard.
+    async fn deliver_to_local_user_backpressure(&self, user_id: &str, json: &str) {
+        let senders: Vec<(u64, mpsc::Sender<String>)> = {
+            match self.inner.connections.get(user_id) {
+                Some(conns) => conns.value().iter().map(|c| (c.id, c.sender.clone())).collect(),
+                None => return,
+            }
+        };
+
+        let mut stale_ids: Vec<u64> = Vec::new();
+
+        for (id, sender) in &senders {
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                sender.send(json.to_string()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        user_id,
+                        connection_id = id,
+                        error = %e,
+                        "WebSocket backpressure send failed (connection closed)"
+                    );
+                    stale_ids.push(*id);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        user_id,
+                        connection_id = id,
+                        "WebSocket backpressure send timed out after 30s, treating as stale"
+                    );
+                    stale_ids.push(*id);
+                }
+            }
+        }
+
+        // Clean up stale connections.
+        if !stale_ids.is_empty()
+            && let Some(mut conns) = self.inner.connections.get_mut(user_id)
+        {
+            conns.retain(|c| !stale_ids.contains(&c.id));
+        }
+    }
+
+    /// Route a pre-serialized JSON message to a user with backpressure.
+    ///
+    /// Same routing logic as `deliver()` — Redis PUBLISH for multi-replica,
+    /// local delivery for single-instance — but local delivery uses
+    /// `deliver_to_local_user_backpressure` which waits for channel capacity
+    /// instead of dropping messages.
+    ///
+    /// **Multi-replica limitation:** backpressure only applies on the PUBLISH
+    /// side. The receiving pod's Redis subscriber still uses `deliver_to_local_user`
+    /// (`try_send`), so a slow client on a remote pod will see dropped messages
+    /// rather than sender-side blocking. For single-instance deployments (no
+    /// Redis), backpressure is fully end-to-end. Fixing the multi-replica path
+    /// would require changing the Redis subscriber loop, which is out of scope.
+    async fn deliver_backpressure(&self, user_id: &str, json: &str) {
+        if let Some((redis, _)) = &self.inner.redis {
+            let channel = format!("{REDIS_CHANNEL_PREFIX}{user_id}");
+            let mut conn = redis.clone();
+            if let Err(e) = redis::cmd("PUBLISH")
+                .arg(&channel)
+                .arg(json)
+                .query_async::<i64>(&mut conn)
+                .await
+            {
+                tracing::error!("Redis PUBLISH to {channel} failed: {e}");
+            }
+        } else {
+            self.deliver_to_local_user_backpressure(user_id, json).await;
+        }
+    }
+
+    /// Send a pre-serialized JSON string to a user with backpressure.
+    ///
+    /// Used by the sync protocol (bootstrap + delta) where dropping messages
+    /// would break the sync guarantee. Waits for channel capacity instead of
+    /// dropping on full buffer.
+    pub async fn send_to_user_raw_backpressure(&self, user_id: &str, json: &str) {
+        self.deliver_backpressure(user_id, json).await;
     }
 }
 

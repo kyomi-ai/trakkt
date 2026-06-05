@@ -622,7 +622,7 @@ async fn send_sync_response(
             return;
         }
     };
-    manager.send_to_user_raw(user_id, &json).await;
+    manager.send_to_user_raw_backpressure(user_id, &json).await;
 }
 
 // ===========================================================================
