@@ -5,6 +5,7 @@ use phosphor_leptos::{Icon, IconWeight};
 use trakkt_types::models::{EstimateScale, Team, TeamSettings};
 use crate::cache::store::SyncStore;
 use crate::components::{ActionStatus, Button, ButtonSize, ButtonVariant, Card, CardContent, CardDescription, CardHeader, CardTitle, ConfirmDialog, Select, SelectVariant, Skeleton, Switch, TeamIcon, TeamIconPicker, INPUT_CLASS};
+use crate::pages::settings::team_labels::TeamLabelsPage;
 use crate::components::popover::{Placement, Popover};
 use crate::server_fns::teams::update_team_settings;
 
@@ -57,6 +58,7 @@ fn TeamSettingsBody(team: Memo<Option<Team>>) -> impl IntoView {
                 <div class="space-y-6">
                     <TeamGeneralCard team=t.clone()/>
                     <TeamEstimateCard team=t.clone()/>
+                    <TeamLabelsPage team_id=t.team_id.clone()/>
                     <TeamDangerZone team_id=t.team_id.clone() team_name=t.name.clone()/>
                 </div>
             })}

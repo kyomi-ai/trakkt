@@ -214,11 +214,12 @@ async fn add_comment_handler(
 async fn list_labels_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(params): Query<trakkt_types::api::ListLabelsApiParams>,
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "labels:read")?;
     let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage, state.github_client.as_deref(), Some(&*state.encryption_key), &state.config.frontend_url, auth.action_source, auth.action_source_label);
-    let result = labels::list_labels(&ctx, trakkt_types::api::ListLabelsApiParams {}).await?;
+    let result = labels::list_labels(&ctx, params).await?;
     Ok(Json(result))
 }
 

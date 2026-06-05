@@ -18,14 +18,30 @@ use crate::{ApiCtx, ApiOperation, ApiResult};
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// List all labels in the workspace, ordered alphabetically by name.
+/// List labels in the workspace, ordered alphabetically by name.
+///
+/// When `team_id` or `team_key` is provided, returns workspace-level labels
+/// plus labels scoped to that team. Otherwise returns all labels.
 ///
 /// Ported from `tool_list_labels` in `routes/mcp.rs`.
 pub async fn list_labels(
     ctx: &ApiCtx<'_>,
-    _params: ListLabelsApiParams,
+    params: ListLabelsApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let labels = label_service::list_labels(ctx.db, &ctx.workspace_id).await?;
+    let team_id = resolve_team(
+        ctx.db,
+        &ctx.workspace_id,
+        params.team_key.as_deref(),
+        params.team_id.as_deref(),
+    )
+    .await?;
+
+    let labels = match team_id {
+        Some(ref tid) => {
+            label_service::list_labels_for_team(ctx.db, &ctx.workspace_id, tid).await?
+        }
+        None => label_service::list_labels(ctx.db, &ctx.workspace_id).await?,
+    };
     Ok(serde_json::to_value(&labels)?)
 }
 
@@ -67,7 +83,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_labels",
-            description: "List all labels in the workspace, ordered alphabetically by name.",
+            description: "List labels in the workspace. Optionally filter by team_key or team_id to get workspace-level + team-scoped labels.",
             scope: "labels:read",
             rest_method: Method::GET,
             rest_path: "/labels",

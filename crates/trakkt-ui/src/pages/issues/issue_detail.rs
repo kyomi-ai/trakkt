@@ -1518,33 +1518,52 @@ fn LabelPicker(
                                             <div class="px-3 py-2 text-sm text-muted-foreground">"No labels. Create one in Settings → Labels."</div>
                                         }.into_any()
                                     } else {
-                                        let items = labels.clone();
-                                        view! {
-                                            <div>
-                                                {items.into_iter().map(|label| {
-                                                    let label_for_click = label.clone();
-                                                    let label_id = label.label_id.clone();
-                                                    let is_selected = move || current_ids.get().contains(&label_id);
-                                                    view! {
-                                                        <button
-                                                            class="w-full text-left px-3 py-1.5 text-sm hover:bg-muted transition-colors flex items-center gap-2"
-                                                            on:click=move |_| toggle_label(label_for_click.clone())
-                                                        >
-                                                            <span
-                                                                class="w-3 h-3 rounded-sm shrink-0"
-                                                                style=format!("background-color: {}", label.color)
-                                                            />
-                                                            <span class="flex-1">{label.name.clone()}</span>
-                                                            {move || if is_selected() {
-                                                                view! { <span class="text-primary text-xs">"✓"</span> }.into_any()
-                                                            } else {
-                                                                ().into_any()
-                                                            }}
-                                                        </button>
-                                                    }
-                                                }).collect_view()}
-                                            </div>
-                                        }.into_any()
+                                        let team_labels: Vec<_> = labels.iter().filter(|l| l.team_id.is_some()).cloned().collect();
+                                        let workspace_labels: Vec<_> = labels.iter().filter(|l| l.team_id.is_none()).cloned().collect();
+                                        let has_team_labels = !team_labels.is_empty();
+
+                                        let render_item = |label: trakkt_types::models::Label| {
+                                            let label_for_click = label.clone();
+                                            let label_id = label.label_id.clone();
+                                            let is_selected = move || current_ids.get().contains(&label_id);
+                                            view! {
+                                                <button
+                                                    class="w-full text-left px-3 py-1.5 text-sm hover:bg-muted transition-colors flex items-center gap-2"
+                                                    on:click=move |_| toggle_label(label_for_click.clone())
+                                                >
+                                                    <span
+                                                        class="w-3 h-3 rounded-sm shrink-0"
+                                                        style=format!("background-color: {}", label.color)
+                                                    />
+                                                    <span class="flex-1">{label.name.clone()}</span>
+                                                    {move || if is_selected() {
+                                                        view! { <span class="text-primary text-xs">"✓"</span> }.into_any()
+                                                    } else {
+                                                        ().into_any()
+                                                    }}
+                                                </button>
+                                            }
+                                        };
+
+                                        if has_team_labels {
+                                            let team_items = team_labels.into_iter().map(render_item).collect_view();
+                                            let ws_items = workspace_labels.into_iter().map(render_item).collect_view();
+                                            view! {
+                                                <div>
+                                                    <div class="px-2 py-1 text-xs text-muted-foreground font-medium">"Team"</div>
+                                                    {team_items}
+                                                    <div class="px-2 py-1 text-xs text-muted-foreground font-medium mt-1">"Workspace"</div>
+                                                    {ws_items}
+                                                </div>
+                                            }.into_any()
+                                        } else {
+                                            let items = labels.clone();
+                                            view! {
+                                                <div>
+                                                    {items.into_iter().map(render_item).collect_view()}
+                                                </div>
+                                            }.into_any()
+                                        }
                                     }
                                 },
                                 Err(_) => view! {
