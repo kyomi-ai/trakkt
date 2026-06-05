@@ -42,6 +42,18 @@ kubectl apply -f 11-redis.yaml
 echo "⏳ Waiting for Redis to be ready..."
 kubectl wait --for=condition=ready pod -l app=redis -n trakkt --timeout=300s
 
+# Deploy MinIO (attachment storage)
+echo "📦 Deploying MinIO..."
+kubectl apply -f 12-minio.yaml
+
+# Wait for MinIO to be ready
+echo "⏳ Waiting for MinIO to be ready..."
+kubectl wait --for=condition=ready pod -l app=minio -n trakkt --timeout=300s
+
+# Wait for bucket initialization
+echo "⏳ Waiting for bucket initialization..."
+kubectl wait --for=condition=complete job/minio-create-bucket -n trakkt --timeout=300s
+
 # Deploy trakkt
 echo "🎯 Deploying trakkt..."
 kubectl apply -f 20-trakkt.yaml

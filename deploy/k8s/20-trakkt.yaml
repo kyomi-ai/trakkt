@@ -155,6 +155,38 @@ spec:
                   name: trakkt-config
                   key: smtp-from-name
 
+            # Attachment storage (S3 via MinIO)
+            - name: ATTACHMENT_STORAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: attachment-storage
+            - name: ATTACHMENT_S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: attachment-s3-endpoint
+            - name: ATTACHMENT_S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: attachment-s3-bucket
+            - name: ATTACHMENT_S3_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: attachment-s3-region
+            - name: ATTACHMENT_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: attachment-s3-access-key
+            - name: ATTACHMENT_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: attachment-s3-secret-key
+
             - name: TRUNK_DIST_DIR
               value: "/app/dist"
 
@@ -185,8 +217,6 @@ spec:
               cpu: "1000m"
 
           volumeMounts:
-            - name: attachments
-              mountPath: /app/data/attachments
             - name: tmp
               mountPath: /tmp
 
@@ -200,7 +230,5 @@ spec:
                 - ALL
 
       volumes:
-        - name: attachments
-          emptyDir: {}
         - name: tmp
           emptyDir: {}
