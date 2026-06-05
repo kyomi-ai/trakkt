@@ -1427,7 +1427,9 @@ fn LabelPicker(
     current_labels: Memo<Vec<trakkt_types::models::Label>>,
     on_change: Callback<()>,
 ) -> impl IntoView {
-    let (show_picker, set_show_picker) = signal(false);
+    let (label_open, set_label_open) = signal(false);
+    let (label_search, set_label_search) = signal(String::new());
+    let label_trigger_ref = NodeRef::<leptos::html::Div>::new();
     let initial = current_labels.get_untracked();
     let current_ids = RwSignal::new(
         initial.iter().map(|l| l.label_id.clone()).collect::<Vec<_>>()
@@ -1473,9 +1475,9 @@ fn LabelPicker(
     };
 
     view! {
-        <div class="relative">
+        <div>
             <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Labels"</div>
-            <div class="flex flex-wrap items-center gap-1">
+            <div node_ref=label_trigger_ref class="flex flex-wrap items-center gap-1">
                 {move || {
                     let labels = current_display.get();
                     if labels.is_empty() {
@@ -1499,81 +1501,83 @@ fn LabelPicker(
                 }}
                 <button
                     class="w-5 h-5 rounded flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition-colors text-xs"
-                    on:click=move |_| set_show_picker.update(|v| *v = !*v)
+                    on:click=move |_| set_label_open.update(|v| *v = !*v)
                     title="Edit labels"
                 >
                     "+"
                 </button>
             </div>
+            <DropdownMenu
+                trigger_ref=label_trigger_ref
+                open=Signal::derive(move || label_open.get())
+                on_close=Callback::new(move |()| { set_label_open.set(false); set_label_search.set(String::new()); })
+                search_placeholder="Filter labels..."
+                on_search=Callback::new(move |text: String| set_label_search.set(text))
+            >
+                {move || {
+                    let search = label_search.get().to_lowercase();
+                    match all_labels.get() {
+                        Some(Ok(labels)) => {
+                            if labels.is_empty() {
+                                view! {
+                                    <div class="px-3 py-2 text-sm text-muted-foreground">"No labels. Create one in Settings → Labels."</div>
+                                }.into_any()
+                            } else {
+                                let filtered: Vec<_> = labels.iter()
+                                    .filter(|l| search.is_empty() || l.name.to_lowercase().contains(&search))
+                                    .cloned()
+                                    .collect();
+                                let team_labels: Vec<_> = filtered.iter().filter(|l| l.team_id.is_some()).cloned().collect();
+                                let workspace_labels: Vec<_> = filtered.iter().filter(|l| l.team_id.is_none()).cloned().collect();
+                                let has_team_labels = !team_labels.is_empty();
 
-            // Dropdown picker
-            <Show when=move || show_picker.get()>
-                <div class="absolute top-full left-0 mt-1 z-50 bg-popover border border-border rounded-lg shadow-lg py-1 min-w-[200px]">
-                    <Suspense fallback=|| view! { <div class="px-3 py-2 text-sm text-muted-foreground">"Loading..."</div> }>
-                        {move || all_labels.get().map(|result| {
-                            match result {
-                                Ok(labels) => {
-                                    if labels.is_empty() {
-                                        view! {
-                                            <div class="px-3 py-2 text-sm text-muted-foreground">"No labels. Create one in Settings → Labels."</div>
-                                        }.into_any()
-                                    } else {
-                                        let team_labels: Vec<_> = labels.iter().filter(|l| l.team_id.is_some()).cloned().collect();
-                                        let workspace_labels: Vec<_> = labels.iter().filter(|l| l.team_id.is_none()).cloned().collect();
-                                        let has_team_labels = !team_labels.is_empty();
-
-                                        let render_item = |label: trakkt_types::models::Label| {
-                                            let label_for_click = label.clone();
-                                            let label_id = label.label_id.clone();
-                                            let is_selected = move || current_ids.get().contains(&label_id);
-                                            view! {
-                                                <button
-                                                    class="w-full text-left px-3 py-1.5 text-sm hover:bg-muted transition-colors flex items-center gap-2"
-                                                    on:click=move |_| toggle_label(label_for_click.clone())
-                                                >
+                                let render_item = |label: trakkt_types::models::Label| {
+                                    let label_for_click = label.clone();
+                                    let label_id = label.label_id.clone();
+                                    let color = label.color.clone();
+                                    view! {
+                                        <DropdownItem
+                                            label=label.name.clone()
+                                            selected=Signal::derive(move || current_ids.get().contains(&label_id))
+                                            on_select=Callback::new(move |()| toggle_label(label_for_click.clone()))
+                                            icon=Arc::new(move || {
+                                                let c = color.clone();
+                                                view! {
                                                     <span
-                                                        class="w-3 h-3 rounded-sm shrink-0"
-                                                        style=format!("background-color: {}", label.color)
+                                                        class="inline-block w-2.5 h-2.5 rounded-sm shrink-0"
+                                                        style=format!("background-color: {c}")
                                                     />
-                                                    <span class="flex-1">{label.name.clone()}</span>
-                                                    {move || if is_selected() {
-                                                        view! { <span class="text-primary text-xs">"✓"</span> }.into_any()
-                                                    } else {
-                                                        ().into_any()
-                                                    }}
-                                                </button>
-                                            }
-                                        };
-
-                                        if has_team_labels {
-                                            let team_items = team_labels.into_iter().map(render_item).collect_view();
-                                            let ws_items = workspace_labels.into_iter().map(render_item).collect_view();
-                                            view! {
-                                                <div>
-                                                    <div class="px-2 py-1 text-xs text-muted-foreground font-medium">"Team"</div>
-                                                    {team_items}
-                                                    <div class="px-2 py-1 text-xs text-muted-foreground font-medium mt-1">"Workspace"</div>
-                                                    {ws_items}
-                                                </div>
-                                            }.into_any()
-                                        } else {
-                                            let items = labels.clone();
-                                            view! {
-                                                <div>
-                                                    {items.into_iter().map(render_item).collect_view()}
-                                                </div>
-                                            }.into_any()
-                                        }
+                                                }.into_any()
+                                            }) as ChildrenFn
+                                        />
                                     }
-                                },
-                                Err(_) => view! {
-                                    <div class="px-3 py-2 text-sm text-destructive-foreground">"Failed to load labels"</div>
-                                }.into_any(),
+                                };
+
+                                if has_team_labels {
+                                    let team_items = team_labels.into_iter().map(render_item).collect_view();
+                                    let ws_items = workspace_labels.into_iter().map(render_item).collect_view();
+                                    view! {
+                                        <div>
+                                            <div class="px-2 py-1 text-xs text-muted-foreground font-medium">"Team"</div>
+                                            {team_items}
+                                            <div class="px-2 py-1 text-xs text-muted-foreground font-medium mt-1">"Workspace"</div>
+                                            {ws_items}
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    filtered.into_iter().map(render_item).collect_view().into_any()
+                                }
                             }
-                        })}
-                    </Suspense>
-                </div>
-            </Show>
+                        },
+                        Some(Err(_)) => view! {
+                            <div class="px-3 py-2 text-sm text-destructive-foreground">"Failed to load labels"</div>
+                        }.into_any(),
+                        None => view! {
+                            <div class="px-3 py-2 text-sm text-muted-foreground">"Loading..."</div>
+                        }.into_any(),
+                    }
+                }}
+            </DropdownMenu>
         </div>
     }
 }
