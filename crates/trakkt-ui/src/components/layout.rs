@@ -13,7 +13,7 @@ use phosphor_leptos::{Icon, IconWeight};
 use std::collections::HashMap;
 use crate::cache::store::SyncStore;
 use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon};
-use crate::components::{Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, FeedbackModal, Spinner, TeamCreationModal, TeamIcon};
+use crate::components::{Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, FeedbackModal, ProjectCreationModal, Spinner, TeamCreationModal, TeamIcon};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
@@ -291,6 +291,8 @@ fn Sidebar(
 
                 <SidebarWorkspaceSection/>
 
+                <SidebarProjectsSection/>
+
                 <SidebarTeamsSection/>
             </nav>
 
@@ -452,6 +454,118 @@ fn WorkspaceSwitcher(set_user_menu_open: WriteSignal<bool>) -> impl IntoView {
     }
 }
 
+/// Section header for "Projects" with dynamic project list from SyncStore.
+///
+/// Lists all workspace projects as `SidebarEntityItem` entries with a "+"
+/// button to create new projects. The section expand/collapse state is
+/// persisted to localStorage under `trakkt:sidebar:projects`.
+#[component]
+fn SidebarProjectsSection() -> impl IntoView {
+    let store = use_context::<SyncStore>();
+    let (show_create, set_show_create) = signal(false);
+
+    // ── Expand/collapse state persisted to localStorage ──────────────────
+    let initial_expanded: bool = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::window()
+                .and_then(|w| w.local_storage().ok().flatten())
+                .and_then(|storage| storage.get_item("trakkt:sidebar:projects").ok().flatten())
+                .map(|v| v == "true")
+                .unwrap_or(true)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            true
+        }
+    };
+    let (expanded, set_expanded) = signal(initial_expanded);
+
+    let persist_expanded = move |value: bool| {
+        set_expanded.set(value);
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(storage) = web_sys::window()
+                .and_then(|w| w.local_storage().ok().flatten())
+                && let Err(e) = storage.set_item("trakkt:sidebar:projects", if value { "true" } else { "false" })
+            {
+                tracing::warn!("Failed to persist sidebar projects state to localStorage: {e:?}");
+            }
+        }
+    };
+
+    view! {
+        {move || {
+            let Some(store) = store else { return view! { <span/> }.into_any() };
+
+            // Show skeleton placeholders while the sync store is hydrating.
+            if !store.initialized().get() {
+                return view! {
+                    <div class="px-3 pt-4 pb-1">
+                        <span class="text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
+                            "Projects"
+                        </span>
+                    </div>
+                    <div class="space-y-1 px-2">
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse"/>
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse w-3/4"/>
+                    </div>
+                }.into_any();
+            }
+
+            let projects = store.projects().get();
+
+            view! {
+                <div class="group flex items-center justify-between px-3 pt-4 pb-1">
+                    <button
+                        class="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded"
+                        on:click=move |_| persist_expanded(!expanded.get_untracked())
+                    >
+                        <Icon
+                            icon=phosphor_leptos::CARET_DOWN
+                            weight=IconWeight::Bold
+                            size="10px"
+                            attr:class=move || {
+                                if expanded.get() {
+                                    "transition-transform duration-150"
+                                } else {
+                                    "transition-transform duration-150 -rotate-90"
+                                }
+                            }
+                        />
+                        "Projects"
+                    </button>
+                    <button
+                        class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors duration-200 opacity-0 group-hover:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        on:click=move |_| set_show_create.set(true)
+                        title="Create a project"
+                    >
+                        <Icon icon=phosphor_leptos::PLUS weight=IconWeight::Bold size="12px"/>
+                    </button>
+                </div>
+
+                <ProjectCreationModal
+                    show=Signal::derive(move || show_create.get())
+                    on_close=Callback::new(move |()| set_show_create.set(false))
+                />
+
+                {expanded.get().then(|| view! {
+                    <div class="space-y-0.5">
+                        {projects.into_iter().map(|project| {
+                            let fav_id = project.project_id.clone();
+                            let href = format!("/projects/{}", project.project_id);
+                            let name = project.name.clone();
+                            view! {
+                                <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type="project" favorite_id=fav_id/>
+                            }
+                        }).collect_view()}
+                    </div>
+                })}
+            }.into_any()
+        }}
+    }
+}
+
 /// Section header for "Teams" with dynamic team list from SyncStore.
 /// Teams are collapsible and the section includes create/join actions.
 #[component]
@@ -513,12 +627,10 @@ fn SidebarTeamsSection() -> impl IntoView {
     }
 }
 
-/// Section for "Workspace" — shows preset views (Issues, Active, Backlog),
-/// user-saved workspace-scoped views, and pinned projects.
+/// Section for "Workspace" — shows preset views (Issues, Active, Backlog)
+/// and user-saved workspace-scoped views.
 ///
-/// Replaces the old SidebarFavoritesSection and SidebarProjectsSection.
 /// Workspace-scoped views are those with `team_id == None`.
-/// Pinned projects come from favorites with `target_type == "project"`.
 #[component]
 fn SidebarWorkspaceSection() -> impl IntoView {
     let store = use_context::<SyncStore>();
@@ -580,17 +692,6 @@ fn SidebarWorkspaceSection() -> impl IntoView {
                 .collect();
             workspace_views.sort_by_key(|v| v.position);
 
-            // Pinned projects — favorites where target_type == "project".
-            let favorites = store.favorites().get();
-            let projects = store.projects().get();
-            let pinned_projects: Vec<_> = favorites
-                .iter()
-                .filter(|f| f.target_type == "project")
-                .filter_map(|f| {
-                    projects.iter().find(|p| p.project_id == f.target_id).cloned()
-                })
-                .collect();
-
             view! {
                 <SidebarSectionHeader label="Workspace"/>
                 <div class="space-y-0.5">
@@ -629,16 +730,6 @@ fn SidebarWorkspaceSection() -> impl IntoView {
                         let name = v.name.clone();
                         view! {
                             <SidebarEntityItem href=href name=name icon=phosphor_leptos::FUNNEL/>
-                        }
-                    }).collect_view()}
-
-                    // Pinned projects
-                    {pinned_projects.into_iter().map(|project| {
-                        let fav_id = project.project_id.clone();
-                        let href = format!("/projects/{}", project.project_id);
-                        let name = project.name.clone();
-                        view! {
-                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type="project" favorite_id=fav_id/>
                         }
                     }).collect_view()}
                 </div>

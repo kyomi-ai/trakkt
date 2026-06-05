@@ -13,7 +13,7 @@ use std::sync::Arc;
 use leptos::prelude::*;
 use phosphor_leptos::Icon;
 
-use crate::components::{Alert, AlertVariant, EmptyState, StatusBadge};
+use crate::components::{Alert, AlertVariant, Button, ButtonVariant, EmptyState, ProjectCreationModal, StatusBadge};
 use crate::server_fns::projects::list_projects;
 use crate::utils::date::format_date;
 use crate::utils::project::{status_label, status_variant};
@@ -25,6 +25,9 @@ use crate::utils::project::{status_label, status_variant};
 /// Main project list page — displays all projects in the workspace.
 #[component]
 pub fn ProjectListPage() -> impl IntoView {
+    // ── Create-project modal ──────────────────────────────────────────────
+    let (show_create, set_show_create) = signal(false);
+
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
@@ -68,7 +71,18 @@ pub fn ProjectListPage() -> impl IntoView {
                     </span>
                     <h1 class="text-sm font-semibold text-foreground">"Projects"</h1>
                 </div>
+                <Button
+                    variant=ButtonVariant::Default
+                    on:click=move |_| set_show_create.set(true)
+                >
+                    "New Project"
+                </Button>
             </div>
+
+            <ProjectCreationModal
+                show=Signal::derive(move || show_create.get())
+                on_close=Callback::new(move |()| set_show_create.set(false))
+            />
 
             // ── Error alert ─────────────────────────────────────────────────
             <Show when=move || error_msg.get().is_some()>
