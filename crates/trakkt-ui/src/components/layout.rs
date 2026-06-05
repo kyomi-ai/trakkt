@@ -487,10 +487,9 @@ fn SidebarProjectsSection() -> impl IntoView {
         {
             if let Some(storage) = web_sys::window()
                 .and_then(|w| w.local_storage().ok().flatten())
+                && let Err(e) = storage.set_item("trakkt:sidebar:projects", if value { "true" } else { "false" })
             {
-                if let Err(e) = storage.set_item("trakkt:sidebar:projects", if value { "true" } else { "false" }) {
-                    tracing::warn!("Failed to persist sidebar projects state to localStorage: {e:?}");
-                }
+                tracing::warn!("Failed to persist sidebar projects state to localStorage: {e:?}");
             }
         }
     };
