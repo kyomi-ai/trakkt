@@ -1,56 +1,26 @@
 # User Guide
 
-Trakkt is an issue tracker designed around speed and keyboard-first interaction. This guide covers the core concepts.
+Trakkt is an issue tracker built for speed and keyboard-first interaction. Whether you are managing a solo project or coordinating across multiple teams, Trakkt gives you the tools to plan, track, and ship work without getting in your way.
 
-## Issues
+This guide walks through every feature you will encounter day to day.
 
-Issues are the primary unit of work. Each issue belongs to a team and has:
+## Chapters
 
-- **Identifier** -- a team-scoped key like `TRA-35`, formed from the team prefix and a sequential number.
-- **Title** -- a short summary of the work.
-- **Description** -- rich markdown content with full formatting support.
-- **Status** -- workflow state: Backlog, Todo, In Progress, Done, or Cancelled.
-- **Priority** -- urgency level: None, Low, Medium, High, or Urgent.
-- **Assignee** -- the team member responsible for the issue.
-- **Labels** -- user-defined tags for categorization (workspace-wide or team-scoped).
-- **Project and milestone** -- optional grouping for roadmap planning.
-- **Relations** -- links between issues: blocks/blocked-by, parent/child, duplicate, and relates-to.
+- **[Getting Started](getting-started.md)** -- Create a workspace, invite your team, and file your first issue.
+- **[Issues](issues.md)** -- Statuses, priorities, labels, estimates, relations, comments, attachments, and more.
+- **[Views](views.md)** -- List view, board view, sorting, filtering, and saved views.
+- **[Projects & Milestones](projects.md)** -- Group work into projects, set milestones, and track progress.
+- **[Inbox & Notifications](notifications.md)** -- Stay on top of changes with the inbox and the My Issues page.
+- **[Keyboard Shortcuts](keyboard-shortcuts.md)** -- Navigate and act without reaching for the mouse.
+- **[Workspace Settings](workspace-settings.md)** -- Manage members, teams, and workspace-level defaults.
+- **[Team Settings](team-settings.md)** -- Configure team keys, estimation scales, auto-archive, and more.
 
-## Teams
+## Core concepts
 
-Teams are organizational units within a workspace. Each team has a short key (e.g. `TRA`, `ENG`) that prefixes its issue identifiers. Teams can have their own:
+Before diving in, here are the building blocks you will see throughout Trakkt:
 
-- Custom statuses and workflow stages
-- Estimation scales
-- Auto-archive settings
-- Scoped labels
-
-## Projects and Milestones
-
-Projects group related work across teams. Each project contains milestones that track progress toward specific goals. Issues can be assigned to a milestone to indicate which release or deadline they target.
-
-## Labels
-
-Labels are colored tags for categorizing issues. They can be workspace-wide (available to all teams) or scoped to a specific team. Use them for things like `bug`, `feature`, `docs`, or any taxonomy that makes sense for your workflow.
-
-## Views
-
-Trakkt supports multiple ways to view your issues:
-
-- **List view** -- a table with sortable columns, inline status/priority changes, and filtering.
-- **Board view** -- a Kanban board grouped by status, with drag-and-drop between columns.
-
-Both views update in real-time via WebSocket sync.
-
-## Keyboard Shortcuts
-
-Trakkt is keyboard-first. Key shortcuts include:
-
-- `j` / `k` -- navigate up/down in issue lists
-- `Enter` -- open the selected issue
-- `Cmd+K` / `Ctrl+K` -- open the command palette
-- Single-key shortcuts for changing status and priority inline
-
-## Workspaces
-
-A workspace is the top-level container. In SaaS mode, each workspace is an isolated tenant with its own teams, issues, and members. Workspace features include invites, roles (owner, admin, member), and ownership transfer.
+- **Workspace** -- The top-level container. Everything -- teams, issues, projects, members -- lives inside a workspace.
+- **Team** -- An organizational unit within a workspace. Each team has a short key (like `ENG` or `OPS`) that prefixes its issue identifiers. Teams can have their own statuses, estimation scales, and labels.
+- **Issue** -- The primary unit of work. Every issue belongs to a team and is identified by a key like `ENG-42`.
+- **Project** -- A grouping of related work that can span multiple teams. Projects contain milestones to mark key checkpoints.
+- **View** -- A saved combination of filters, sort order, and display mode (list or board) that you can share with your workspace.
