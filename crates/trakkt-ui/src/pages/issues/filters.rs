@@ -576,10 +576,11 @@ pub fn LabelFilterDropdown(
     // Use SyncStore for labels when available (real-time), fall back to server.
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
-    // Fetch labels dynamically from the server.
+    // Fetch labels dynamically from the server, passing team_id when available
+    // so the server returns only workspace-level + team-scoped labels.
     let labels_resource = Resource::new(
-        || (),
-        move |_| async move { list_labels(None).await },
+        move || team_id.and_then(|s| s.get()),
+        move |tid| async move { list_labels(tid).await },
     );
 
     // Resolved labels — prefer SyncStore, fall back to server resource.
@@ -611,6 +612,8 @@ pub fn LabelFilterDropdown(
         };
 
         // Filter by team when a team_id signal is provided and has a value.
+        // The SyncStore contains ALL labels, so client-side filtering is still
+        // needed even though the server resource is already team-scoped.
         if let Some(team_id_signal) = team_id
             && let Some(ref tid) = team_id_signal.get()
         {
@@ -686,38 +689,60 @@ pub fn LabelFilterDropdown(
                 selected=Signal::derive(move || value.get().is_empty())
                 on_select=Callback::new(move |()| { on_change.run(Vec::new()); })
             />
-            {move || labels.get().into_iter().map(|label| {
-                let label_id = label.label_id.clone();
-                let label_id_check = label.label_id.clone();
-                let label_name = label.name.clone();
-                let label_color = label.color.clone();
-                view! {
-                    <DropdownItem
-                        label=label_name
-                        selected=Signal::derive(move || value.get().contains(&label_id_check))
-                        on_select=Callback::new({
-                            let id = label_id.clone();
-                            move |()| {
-                                let mut current = value.get_untracked();
-                                if let Some(pos) = current.iter().position(|s| s == &id) {
-                                    current.remove(pos);
-                                } else {
-                                    current.push(id.clone());
+            {move || {
+                let all = labels.get();
+                let team_labels: Vec<_> = all.iter().filter(|l| l.team_id.is_some()).cloned().collect();
+                let workspace_labels: Vec<_> = all.iter().filter(|l| l.team_id.is_none()).cloned().collect();
+                let has_team_labels = !team_labels.is_empty();
+
+                let render_item = |label: trakkt_types::models::Label| {
+                    let label_id = label.label_id.clone();
+                    let label_id_check = label.label_id.clone();
+                    let label_name = label.name.clone();
+                    let label_color = label.color.clone();
+                    view! {
+                        <DropdownItem
+                            label=label_name
+                            selected=Signal::derive(move || value.get().contains(&label_id_check))
+                            on_select=Callback::new({
+                                let id = label_id.clone();
+                                move |()| {
+                                    let mut current = value.get_untracked();
+                                    if let Some(pos) = current.iter().position(|s| s == &id) {
+                                        current.remove(pos);
+                                    } else {
+                                        current.push(id.clone());
+                                    }
+                                    on_change.run(current);
                                 }
-                                on_change.run(current);
-                            }
-                        })
-                        icon=Arc::new(move || {
-                            view! {
-                                <span
-                                    class="inline-block w-2.5 h-2.5 rounded-full shrink-0"
-                                    style=format!("background-color: {}", label_color)
-                                />
-                            }.into_any()
-                        }) as ChildrenFn
-                    />
+                            })
+                            icon=Arc::new(move || {
+                                view! {
+                                    <span
+                                        class="inline-block w-2.5 h-2.5 rounded-full shrink-0"
+                                        style=format!("background-color: {}", label_color)
+                                    />
+                                }.into_any()
+                            }) as ChildrenFn
+                        />
+                    }
+                };
+
+                if has_team_labels {
+                    // Show grouped: team labels first, then workspace labels.
+                    let team_items = team_labels.into_iter().map(render_item).collect_view();
+                    let workspace_items = workspace_labels.into_iter().map(render_item).collect_view();
+                    view! {
+                        <div class="px-2 py-1 text-xs text-muted-foreground font-medium">"Team"</div>
+                        {team_items}
+                        <div class="px-2 py-1 text-xs text-muted-foreground font-medium mt-1">"Workspace"</div>
+                        {workspace_items}
+                    }.into_any()
+                } else {
+                    // No team labels — flat list, no visual change from current.
+                    all.into_iter().map(render_item).collect_view().into_any()
                 }
-            }).collect_view()}
+            }}
         </DropdownMenu>
     }
 }
@@ -1615,9 +1640,11 @@ fn LabelValuePicker(
 ) -> impl IntoView {
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
+    // Fetch labels from server, passing team_id when available so the server
+    // returns only workspace-level + team-scoped labels.
     let labels_resource = Resource::new(
-        || (),
-        move |_| async move { list_labels(None).await },
+        move || team_id.get(),
+        move |tid| async move { list_labels(tid).await },
     );
 
     let options = Memo::new(move |_| {
@@ -1646,6 +1673,7 @@ fn LabelValuePicker(
             }
         };
 
+        // SyncStore contains ALL labels — still need client-side filtering.
         let filtered = if let Some(ref tid) = team_id.get() {
             all.into_iter()
                 .filter(|l| l.team_id.is_none() || l.team_id.as_deref() == Some(tid.as_str()))

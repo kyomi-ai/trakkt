@@ -227,9 +227,18 @@ pub struct AddCommentApiParams {
 // Label operations
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parameters for listing all labels in the workspace.
+/// Parameters for listing labels in the workspace.
+///
+/// When `team_id` or `team_key` is provided, returns workspace-level labels
+/// (team_id IS NULL) plus labels scoped to that team. When neither is
+/// provided, returns all labels in the workspace (current behaviour).
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
-pub struct ListLabelsApiParams {}
+pub struct ListLabelsApiParams {
+    /// Filter by team ID — returns workspace-level + team-scoped labels
+    pub team_id: Option<String>,
+    /// Filter by team key (e.g. 'TRA') — resolved to team_id server-side
+    pub team_key: Option<String>,
+}
 
 /// Parameters for creating a new label.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
