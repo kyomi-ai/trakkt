@@ -245,18 +245,63 @@ fn handle_initialize(id: Option<Value>, _params: Option<Value>) -> JsonRpcRespon
     }))
 }
 
+/// Rewrite a schemars-generated JSON Schema into the OpenAI function-calling
+/// subset that most models' native tool-calling reliably accepts. Some models
+/// (e.g. MiMo, Qwen-class) cannot bind a tool whose parameter schema uses
+/// draft-2020-12 constructs and silently fall back to emitting the call as
+/// `<function=...><parameter=...>` text — which arrives at the server with no
+/// arguments.
+///
+/// Normalizations applied recursively:
+/// - flatten nullable unions: `"type": ["string", "null"]` -> `"type": "string"`
+/// - drop the `$schema` dialect declaration
+/// - drop non-standard `format` hints (e.g. `int64`) that strict validators reject
+fn sanitize_schema_for_tool_calling(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("format");
+            if let Some(type_val) = map.get_mut("type") {
+                if let Some(arr) = type_val.as_array() {
+                    if let Some(non_null) = arr.iter().find(|t| t.as_str() != Some("null")).cloned()
+                    {
+                        *type_val = non_null;
+                    }
+                }
+            }
+            for child in map.values_mut() {
+                sanitize_schema_for_tool_calling(child);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                sanitize_schema_for_tool_calling(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
     let mut tools = Vec::new();
 
     for op in trakkt_api::all_operations() {
         let schema = (op.json_schema)();
-        let schema_value = match serde_json::to_value(&schema) {
+        let mut schema_value = match serde_json::to_value(&schema) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(tool = %op.name, error = %e, "failed to serialize tool schema");
                 continue;
             }
         };
+        // EXPERIMENT (get_issue only): advertise an OpenAI-function-calling
+        // compatible schema for this single tool, to test whether the
+        // nullable-union param types are what make MiMo/OpenCode fall back to
+        // text tool calls. If get_issue now calls natively while other Trakkt
+        // tools still emit `<function=...>` text, the schema dialect is the cause.
+        if op.name == "get_issue" {
+            sanitize_schema_for_tool_calling(&mut schema_value);
+        }
         tools.push(json!({
             "name": op.name,
             "description": op.description,
