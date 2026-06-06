@@ -289,6 +289,16 @@ fn ProjectDetailContent(
     let issue_count = issues.len();
     let pid = StoredValue::new(project.project_id.clone());
 
+    // Milestones signal — reactive via server_milestones Resource, falls back
+    // to the initial snapshot when the Resource hasn't resolved yet.
+    let initial_milestones = StoredValue::new(milestones.clone());
+    let milestones_signal: Signal<Vec<ProjectMilestone>> = Signal::derive(move || {
+        match server_milestones.get() {
+            Some(Ok(v)) => v,
+            _ => initial_milestones.get_value(),
+        }
+    });
+
     // Hoist use_navigate to component construction time (not inside closures).
     let nav_create_view = use_navigate();
 
@@ -699,7 +709,7 @@ fn ProjectDetailContent(
                 "list" => {
                     let pid_signal = Signal::derive(move || project_id.get());
                     view! {
-                        <ProjectListView project_id=pid_signal/>
+                        <ProjectListView project_id=pid_signal milestones=milestones_signal/>
                     }.into_any()
                 }
                 _ => {

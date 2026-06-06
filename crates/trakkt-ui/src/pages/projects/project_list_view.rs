@@ -23,7 +23,7 @@ use crate::pages::issues::filters::{
 };
 use crate::types::IssueNavState;
 use crate::utils::date::format_short_date;
-use trakkt_types::models::IssueWithDetails;
+use trakkt_types::models::{IssueWithDetails, ProjectMilestone};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Group-by options
@@ -37,6 +37,7 @@ enum GroupBy {
     Assignee,
     Priority,
     Label,
+    Milestone,
     Team,
 }
 
@@ -48,22 +49,27 @@ impl GroupBy {
             Self::Assignee => "Assignee",
             Self::Priority => "Priority",
             Self::Label => "Label",
+            Self::Milestone => "Milestone",
             Self::Team => "Team",
         }
     }
 
-    const ALL: [GroupBy; 6] = [
+    const ALL: [GroupBy; 7] = [
         Self::None,
         Self::StatusCategory,
         Self::Assignee,
         Self::Priority,
         Self::Label,
+        Self::Milestone,
         Self::Team,
     ];
 }
 
 /// Extract a group key from an issue for the given grouping.
-fn group_key(issue: &IssueWithDetails, group_by: GroupBy) -> String {
+///
+/// When grouping by milestone, `milestones` is used to look up the milestone
+/// name by ID. For other groupings, the slice is unused.
+fn group_key(issue: &IssueWithDetails, group_by: GroupBy, milestones: &[ProjectMilestone]) -> String {
     match group_by {
         GroupBy::None => String::new(),
         GroupBy::StatusCategory => issue.status_category.clone(),
@@ -85,6 +91,16 @@ fn group_key(issue: &IssueWithDetails, group_by: GroupBy) -> String {
                 // Group by first label (issues with multiple labels appear
                 // once, under their first label).
                 issue.labels[0].name.clone()
+            }
+        }
+        GroupBy::Milestone => {
+            match &issue.milestone_id {
+                Some(mid) => milestones
+                    .iter()
+                    .find(|ms| ms.milestone_id == *mid)
+                    .map(|ms| ms.name.clone())
+                    .unwrap_or_else(|| "No milestone".to_string()),
+                None => "No milestone".to_string(),
             }
         }
         GroupBy::Team => issue.team_key.clone(),
@@ -132,9 +148,12 @@ fn priority_order(label: &str) -> u8 {
 /// Build grouped issue lists from a flat list.
 ///
 /// Returns `(group_label, issues)` pairs in a logical order for the group type.
+/// The `milestones` slice is passed through to `group_key()` for milestone
+/// grouping; for other groupings it is unused.
 fn build_groups(
     issues: Vec<IssueWithDetails>,
     group_by: GroupBy,
+    milestones: &[ProjectMilestone],
 ) -> Vec<(String, Vec<IssueWithDetails>)> {
     if group_by == GroupBy::None {
         return vec![(String::new(), issues)];
@@ -143,7 +162,7 @@ fn build_groups(
     // Collect into an ordered map preserving insertion order.
     let mut groups: Vec<(String, Vec<IssueWithDetails>)> = Vec::new();
     for issue in issues {
-        let key = group_key(&issue, group_by);
+        let key = group_key(&issue, group_by, milestones);
         if let Some(existing) = groups.iter_mut().find(|(k, _)| *k == key) {
             existing.1.push(issue);
         } else {
@@ -157,6 +176,22 @@ fn build_groups(
             status_category_order(a).cmp(&status_category_order(b))
         }
         GroupBy::Priority => priority_order(a).cmp(&priority_order(b)),
+        GroupBy::Milestone => {
+            // Named milestones first (in their milestone sort_order),
+            // "No milestone" always last.
+            let order = |name: &str| -> (u8, i32) {
+                if name == "No milestone" {
+                    return (1, 0);
+                }
+                let idx = milestones
+                    .iter()
+                    .position(|ms| ms.name == name)
+                    .map(|i| milestones[i].sort_order)
+                    .unwrap_or(i32::MAX);
+                (0, idx)
+            };
+            order(a).cmp(&order(b))
+        }
         _ => a.to_lowercase().cmp(&b.to_lowercase()),
     });
 
@@ -172,6 +207,9 @@ fn build_groups(
 pub fn ProjectListView(
     /// The project ID to filter issues by.
     project_id: Signal<String>,
+    /// Project milestones — used for milestone grouping.
+    #[prop(into)]
+    milestones: Signal<Vec<ProjectMilestone>>,
 ) -> impl IntoView {
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
@@ -291,7 +329,8 @@ pub fn ProjectListView(
                         }.into_any();
                     }
 
-                    let groups = build_groups(issues, current_group_by);
+                    let ms = milestones.get();
+                    let groups = build_groups(issues, current_group_by, &ms);
 
                     if current_group_by == GroupBy::None {
                         // Flat list — no group headers.

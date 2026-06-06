@@ -25,7 +25,7 @@ use crate::components::{
     TeamKeyBadge,
 };
 use crate::components::toast::toast_error;
-use crate::pages::issues::filters::{LabelFilterDropdown, PriorityFilterDropdown};
+use crate::pages::issues::filters::{AssigneeFilterDropdown, LabelFilterDropdown, PriorityFilterDropdown};
 use crate::server_fns::issues::update_issue;
 use crate::types::IssueNavState;
 use trakkt_types::models::IssueWithDetails;
@@ -181,13 +181,15 @@ pub fn ProjectBoardContent(
     let (search, set_search) = signal(String::new());
     let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
     let (label_filter, set_label_filter) = signal(Vec::<String>::new());
+    let (assignee_filter, set_assignee_filter) = signal(Vec::<String>::new());
 
-    // Filtered issues: search + priority + label applied before grouping.
+    // Filtered issues: search + priority + label + assignee applied before grouping.
     let filtered_issues = Memo::new(move |_| {
         let raw = project_issues.get();
         let search_val = search.get().to_lowercase();
         let priority_val = priority_filter.get();
         let label_val = label_filter.get();
+        let assignee_val = assignee_filter.get();
 
         raw.into_iter()
             .filter(|issue| {
@@ -201,6 +203,12 @@ pub fn ProjectBoardContent(
                     let has_match = issue.labels.iter().any(|l| label_val.contains(&l.label_id));
                     if !has_match {
                         return false;
+                    }
+                }
+                if !assignee_val.is_empty() {
+                    match &issue.assignee_id {
+                        Some(aid) if assignee_val.contains(aid) => {}
+                        _ => return false,
                     }
                 }
                 if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
@@ -311,6 +319,10 @@ pub fn ProjectBoardContent(
                 <LabelFilterDropdown
                     value=label_filter
                     on_change=Callback::new(move |v: Vec<String>| set_label_filter.set(v))
+                />
+                <AssigneeFilterDropdown
+                    value=assignee_filter
+                    on_change=Callback::new(move |v: Vec<String>| set_assignee_filter.set(v))
                 />
                 <ProjectBoardDisplayOptions
                     hidden=hidden_categories
