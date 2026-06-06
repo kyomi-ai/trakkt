@@ -22,6 +22,8 @@ use crate::components::{
     PriorityIndicator, LabelBadge, Select, SelectVariant,
     TeamKeyBadge, ToggleButton,
 };
+use crate::pages::projects::project_board::ProjectBoardContent;
+use crate::pages::projects::project_list_view::ProjectListView;
 use crate::server_fns::projects::{
     get_project, get_project_progress, list_milestones,
     create_milestone, update_milestone, delete_milestone,
@@ -38,6 +40,26 @@ use trakkt_types::models::{IssueWithDetails, Project, ProjectMilestone, ProjectP
 // Project Detail Page
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Parse the `view` query parameter from the URL search string.
+///
+/// Returns "overview", "board", or "list". Defaults to "overview" when absent.
+fn parse_view_param(search: &str) -> String {
+    for pair in search.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = pair.split_once('=')
+            && key == "view"
+        {
+            return match value {
+                "board" | "list" => value.to_string(),
+                _ => "overview".to_string(),
+            };
+        }
+    }
+    "overview".to_string()
+}
+
 /// Full project detail page — metadata + filtered issue list.
 #[component]
 pub fn ProjectDetailPage() -> impl IntoView {
@@ -47,6 +69,13 @@ pub fn ProjectDetailPage() -> impl IntoView {
             .get()
             .get("id")
             .unwrap_or_default()
+    });
+
+    // Read view mode from URL query parameter.
+    let location = use_location();
+    let active_view = Memo::new(move |_| {
+        let search = location.search.get();
+        parse_view_param(&search)
     });
 
     // ── Data source: SyncStore (real-time) with server function fallback ───
@@ -202,6 +231,8 @@ pub fn ProjectDetailPage() -> impl IntoView {
                                     server_milestones=server_milestones
                                     updates=updates
                                     server_updates=server_updates
+                                    active_view=active_view
+                                    project_id=project_id
                                 />
                             }.into_any()
                         }
@@ -248,6 +279,12 @@ fn ProjectDetailContent(
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
     updates: Vec<ProjectUpdate>,
     server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
+    /// The currently active view tab: "overview", "board", or "list".
+    #[prop(into)]
+    active_view: Memo<String>,
+    /// The project ID (reactive memo).
+    #[prop(into)]
+    project_id: Memo<String>,
 ) -> impl IntoView {
     let issue_count = issues.len();
     let pid = StoredValue::new(project.project_id.clone());
@@ -383,6 +420,7 @@ fn ProjectDetailContent(
     };
 
     view! {
+        <div>
         <div class="max-w-[860px] mx-auto w-full">
             // ── Project name (click-to-edit) ─────────────────────────────
             <Show
@@ -588,11 +626,33 @@ fn ProjectDetailContent(
             // ── Divider ───────────────────────────────────────────────────
             <div class="border-t border-border my-6"></div>
 
-            // ── Issues section ────────────────────────────────────────────
+            // ── View tabs ────────────────────────────────────────────────
             <div class="flex items-center justify-between mb-4">
-                <h2 class="text-sm font-medium text-foreground">
-                    {format!("Issues ({issue_count})")}
-                </h2>
+                <div class="flex items-center gap-1">
+                    <ProjectViewTab
+                        label="Overview"
+                        value="overview"
+                        active=active_view
+                        project_id=pid
+                    />
+                    <ProjectViewTab
+                        label="Board"
+                        value="board"
+                        active=active_view
+                        project_id=pid
+                    />
+                    <ProjectViewTab
+                        label="List"
+                        value="list"
+                        active=active_view
+                        project_id=pid
+                    />
+
+                    // Issue count badge
+                    <span class="text-xs text-muted-foreground ml-2">
+                        {format!("{issue_count}")}
+                    </span>
+                </div>
                 <Button
                     variant=ButtonVariant::Ghost
                     size=ButtonSize::Sm
@@ -622,96 +682,200 @@ fn ProjectDetailContent(
                     "Create View"
                 </Button>
             </div>
+        </div>
 
-            {if issues.is_empty() {
-                let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+        // ── View content ─────────────────────────────────────────────────
+        // Board and list views break out of the max-w container to use full
+        // width. Overview stays within the 860px constraint.
+        {move || {
+            let view = active_view.get();
+            match view.as_str() {
+                "board" => {
+                    let pid_signal = Signal::derive(move || project_id.get());
                     view! {
-                        <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+                        <ProjectBoardContent project_id=pid_signal/>
                     }.into_any()
-                });
-                view! {
-                    <EmptyState
-                        icon=empty_icon
-                        title="No issues in this project"
-                        description="Assign issues to this project to track them here."
-                    />
-                }.into_any()
-            } else if milestones.is_empty() {
-                // No milestones — flat list, no grouping.
-                let rows = issues.iter().map(|issue| {
-                    view! { <ProjectIssueRow issue=issue.clone()/> }
-                }).collect_view();
-                view! {
+                }
+                "list" => {
+                    let pid_signal = Signal::derive(move || project_id.get());
+                    view! {
+                        <ProjectListView project_id=pid_signal/>
+                    }.into_any()
+                }
+                _ => {
+                    // Overview: milestone-grouped issue list.
+                    view! {
+                        <div class="max-w-[860px] mx-auto w-full">
+                            <ProjectOverviewIssues
+                                issues=issues.clone()
+                                milestones=milestones.clone()
+                            />
+                        </div>
+                    }.into_any()
+                }
+            }
+        }}
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// View Tab Button
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single tab button in the project detail view switcher.
+///
+/// Renders as a pill-style toggle button. Active tab gets a highlighted background.
+/// Navigates via query parameter: `/projects/:id?view=board`.
+#[component]
+fn ProjectViewTab(
+    /// Display label (e.g. "Board").
+    label: &'static str,
+    /// Query param value (e.g. "board").
+    value: &'static str,
+    /// The currently active view.
+    #[prop(into)]
+    active: Memo<String>,
+    /// Stored project ID for building the URL.
+    project_id: StoredValue<String>,
+) -> impl IntoView {
+    let nav = use_navigate();
+    let is_active = move || {
+        active.get() == value
+    };
+
+    let variant = Signal::derive(move || {
+        if is_active() { ButtonVariant::PillActive } else { ButtonVariant::Pill }
+    });
+
+    view! {
+        <ToggleButton
+            variant=variant
+            size=ButtonSize::Xs
+            on:click={
+                let nav = nav.clone();
+                move |_| {
+                    if is_active() {
+                        return;
+                    }
+                    let pid = project_id.get_value();
+                    let url = if value == "overview" {
+                        format!("/projects/{pid}")
+                    } else {
+                        format!("/projects/{pid}?view={value}")
+                    };
+                    nav(&url, NavigateOptions {
+                        resolve: false,
+                        ..Default::default()
+                    });
+                }
+            }
+        >
+            {label}
+        </ToggleButton>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Overview Issues (extracted from ProjectDetailContent)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The milestone-grouped issue list shown in the overview tab.
+///
+/// Extracted into its own component so the view-switching logic in
+/// `ProjectDetailContent` stays clean.
+#[component]
+fn ProjectOverviewIssues(
+    issues: Vec<IssueWithDetails>,
+    milestones: Vec<ProjectMilestone>,
+) -> impl IntoView {
+    if issues.is_empty() {
+        let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+            view! {
+                <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+            }.into_any()
+        });
+        view! {
+            <EmptyState
+                icon=empty_icon
+                title="No issues in this project"
+                description="Assign issues to this project to track them here."
+            />
+        }.into_any()
+    } else if milestones.is_empty() {
+        // No milestones — flat list, no grouping.
+        let rows = issues.iter().map(|issue| {
+            view! { <ProjectIssueRow issue=issue.clone()/> }
+        }).collect_view();
+        view! {
+            <div role="list">
+                {rows}
+            </div>
+        }.into_any()
+    } else {
+        // Group issues by milestone.
+        let mut groups: Vec<(Option<&str>, &str, Vec<&IssueWithDetails>)> = Vec::new();
+
+        for ms in &milestones {
+            let group_issues: Vec<&IssueWithDetails> = issues
+                .iter()
+                .filter(|i| i.milestone_id.as_deref() == Some(ms.milestone_id.as_str()))
+                .collect();
+            if !group_issues.is_empty() {
+                groups.push((Some(ms.milestone_id.as_str()), ms.name.as_str(), group_issues));
+            }
+        }
+
+        // Collect issues with no milestone AND issues whose milestone_id
+        // doesn't match any known milestone (orphaned) into one group.
+        let known_ids: Vec<&str> = milestones.iter().map(|ms| ms.milestone_id.as_str()).collect();
+        let no_milestone: Vec<&IssueWithDetails> = issues
+            .iter()
+            .filter(|i| match &i.milestone_id {
+                None => true,
+                Some(mid) => !known_ids.contains(&mid.as_str()),
+            })
+            .collect();
+        if !no_milestone.is_empty() {
+            groups.push((None, "No milestone", no_milestone));
+        }
+
+        let group_views = groups.iter().map(|(_ms_id, label, group_issues)| {
+            let total = group_issues.len();
+            let done = group_issues.iter().filter(|i| {
+                i.status_category == "completed" || i.status_category == "cancelled"
+            }).count();
+            let status_text = format!("{done}/{total} done");
+
+            let is_no_milestone = *label == "No milestone";
+            let header_class = if is_no_milestone {
+                "text-sm font-medium text-muted-foreground"
+            } else {
+                "text-sm font-medium text-foreground"
+            };
+
+            let rows = group_issues.iter().map(|issue| {
+                view! { <ProjectIssueRow issue=(*issue).clone()/> }
+            }).collect_view();
+
+            view! {
+                <div class="mb-6">
+                    <div class="flex items-center justify-between border-b border-border pb-2 mb-1">
+                        <span class=header_class>{label.to_string()}</span>
+                        <span class="text-xs text-muted-foreground">{status_text}</span>
+                    </div>
                     <div role="list">
                         {rows}
                     </div>
-                }.into_any()
-            } else {
-                // Group issues by milestone.
-                let mut groups: Vec<(Option<&str>, &str, Vec<&IssueWithDetails>)> = Vec::new();
+                </div>
+            }
+        }).collect_view();
 
-                for ms in &milestones {
-                    let group_issues: Vec<&IssueWithDetails> = issues
-                        .iter()
-                        .filter(|i| i.milestone_id.as_deref() == Some(ms.milestone_id.as_str()))
-                        .collect();
-                    if !group_issues.is_empty() {
-                        groups.push((Some(ms.milestone_id.as_str()), ms.name.as_str(), group_issues));
-                    }
-                }
-
-                // Collect issues with no milestone AND issues whose milestone_id
-                // doesn't match any known milestone (orphaned) into one group.
-                let known_ids: Vec<&str> = milestones.iter().map(|ms| ms.milestone_id.as_str()).collect();
-                let no_milestone: Vec<&IssueWithDetails> = issues
-                    .iter()
-                    .filter(|i| match &i.milestone_id {
-                        None => true,
-                        Some(mid) => !known_ids.contains(&mid.as_str()),
-                    })
-                    .collect();
-                if !no_milestone.is_empty() {
-                    groups.push((None, "No milestone", no_milestone));
-                }
-
-                let group_views = groups.iter().map(|(_ms_id, label, group_issues)| {
-                    let total = group_issues.len();
-                    let done = group_issues.iter().filter(|i| {
-                        i.status_category == "completed" || i.status_category == "cancelled"
-                    }).count();
-                    let status_text = format!("{done}/{total} done");
-
-                    let is_no_milestone = *label == "No milestone";
-                    let header_class = if is_no_milestone {
-                        "text-sm font-medium text-muted-foreground"
-                    } else {
-                        "text-sm font-medium text-foreground"
-                    };
-
-                    let rows = group_issues.iter().map(|issue| {
-                        view! { <ProjectIssueRow issue=(*issue).clone()/> }
-                    }).collect_view();
-
-                    view! {
-                        <div class="mb-6">
-                            <div class="flex items-center justify-between border-b border-border pb-2 mb-1">
-                                <span class=header_class>{label.to_string()}</span>
-                                <span class="text-xs text-muted-foreground">{status_text}</span>
-                            </div>
-                            <div role="list">
-                                {rows}
-                            </div>
-                        </div>
-                    }
-                }).collect_view();
-
-                view! {
-                    <div>
-                        {group_views}
-                    </div>
-                }.into_any()
-            }}
-        </div>
+        view! {
+            <div>
+                {group_views}
+            </div>
+        }.into_any()
     }
 }
 
