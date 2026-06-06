@@ -294,14 +294,14 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                 continue;
             }
         };
-        // EXPERIMENT (get_issue only): advertise an OpenAI-function-calling
-        // compatible schema for this single tool, to test whether the
-        // nullable-union param types are what make MiMo/OpenCode fall back to
-        // text tool calls. If get_issue now calls natively while other Trakkt
-        // tools still emit `<function=...>` text, the schema dialect is the cause.
-        if op.name == "get_issue" {
-            sanitize_schema_for_tool_calling(&mut schema_value);
-        }
+        // Normalize every tool's schema to the OpenAI function-calling subset.
+        // schemars emits draft-2020-12 constructs (nullable unions, `$schema`,
+        // `int64` formats) that some models' tool-calling layers can't bind —
+        // they silently fall back to emitting the call as `<function=...>` text,
+        // which reaches the server with no arguments. Verified against
+        // MiMo-V2.5-Pro via OpenRouter/OpenCode: with the raw schema the model
+        // emits unparseable text; with the sanitized schema it calls natively.
+        sanitize_schema_for_tool_calling(&mut schema_value);
         tools.push(json!({
             "name": op.name,
             "description": op.description,
@@ -451,4 +451,65 @@ async fn dispatch_registry_tool(
     })?;
 
     serde_json::to_string_pretty(&result).map_err(trakkt_core::Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_flattens_nullable_unions_and_strips_dialect() {
+        // Mirrors what schemars emits for a params struct with Option<T> fields.
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "GetIssueApiParams",
+            "type": "object",
+            "properties": {
+                "issue_identifier": { "type": ["string", "null"] },
+                "issue_number": { "type": ["integer", "null"], "format": "int64" },
+                "team_key": { "type": ["null", "string"] },
+                "body": { "type": "string" }
+            },
+            "required": ["body"]
+        });
+
+        sanitize_schema_for_tool_calling(&mut schema);
+
+        // Dialect declaration dropped.
+        assert!(schema.get("$schema").is_none());
+        let props = &schema["properties"];
+        // Nullable unions flattened to the non-null type (order-independent).
+        assert_eq!(props["issue_identifier"]["type"], json!("string"));
+        assert_eq!(props["issue_number"]["type"], json!("integer"));
+        assert_eq!(props["team_key"]["type"], json!("string"));
+        // Non-standard format hint dropped.
+        assert!(props["issue_number"].get("format").is_none());
+        // Plain required string untouched; required array preserved.
+        assert_eq!(props["body"]["type"], json!("string"));
+        assert_eq!(schema["required"], json!(["body"]));
+    }
+
+    #[test]
+    fn sanitize_recurses_into_nested_schemas() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": ["array", "null"],
+                    "items": {
+                        "type": "object",
+                        "properties": { "value": { "type": ["string", "null"] } }
+                    }
+                }
+            }
+        });
+
+        sanitize_schema_for_tool_calling(&mut schema);
+
+        assert_eq!(schema["properties"]["filters"]["type"], json!("array"));
+        assert_eq!(
+            schema["properties"]["filters"]["items"]["properties"]["value"]["type"],
+            json!("string")
+        );
+    }
 }
