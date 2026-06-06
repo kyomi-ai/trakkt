@@ -20,7 +20,7 @@ use leptos::prelude::*;
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Button, ButtonSize, ButtonVariant, Checkbox,
+    Avatar, Button, ButtonSize, ButtonVariant, Checkbox,
     DropdownItem, DropdownMenu, DropdownTrigger, IssueStatusBadge, IssueStatusVariant,
     PriorityIndicator,
 };
@@ -28,6 +28,7 @@ use crate::pages::views::FilterClause;
 use crate::server_fns::labels::list_labels;
 use crate::server_fns::projects::list_projects;
 use crate::server_fns::statuses::list_statuses;
+use crate::server_fns::team::list_workspace_members;
 use trakkt_types::models::IssueWithDetails;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -743,6 +744,123 @@ pub fn LabelFilterDropdown(
                     all.into_iter().map(render_item).collect_view().into_any()
                 }
             }}
+        </DropdownMenu>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Assignee Filter Dropdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dropdown filter for issue assignees.
+///
+/// Loads workspace members via `list_workspace_members()` server function.
+/// Multi-select: issues are matched by `assignee_id`.
+#[component]
+pub fn AssigneeFilterDropdown(
+    #[prop(into)] value: Signal<Vec<String>>,
+    on_change: Callback<Vec<String>>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Fetch workspace members from the server.
+    let members_resource = Resource::new(
+        || (),
+        move |_| async move { list_workspace_members().await },
+    );
+
+    // Resolved members list.
+    let members = Memo::new(move |_| {
+        match members_resource.get() {
+            Some(Ok(items)) => items,
+            Some(Err(e)) => {
+                tracing::warn!("Failed to load members for filter dropdown: {e}");
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    });
+
+    // Display name for the current selection (multi-select).
+    // 0 selected -> None (shows "All assignees" default label)
+    // 1 selected -> look up name from loaded members
+    // 2+ selected -> "Assignee (N)"
+    let display = Memo::new(move |_| {
+        let v = value.get();
+        match v.len() {
+            0 => None,
+            1 => {
+                let id = &v[0];
+                members
+                    .get()
+                    .iter()
+                    .find(|m| &m.user_id == id)
+                    .map(|m| {
+                        m.name.clone().unwrap_or_else(|| m.email.clone())
+                    })
+            }
+            n => Some(format!("Assignee ({n})")),
+        }
+    });
+
+    view! {
+        <div node_ref=trigger_ref>
+            <DropdownTrigger
+                label="All assignees"
+                value=Signal::derive(move || display.get())
+                icon=Arc::new(move || {
+                    let v = value.get();
+                    if v.len() == 1 {
+                        let name: Option<String> = members.get().iter()
+                            .find(|m| m.user_id == v[0])
+                            .and_then(|m| m.name.clone());
+                        view! { <Avatar name=name.unwrap_or_default()/> }.into_any()
+                    } else {
+                        view! { <span/> }.into_any()
+                    }
+                }) as ChildrenFn
+                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
+            />
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+        >
+            <DropdownItem
+                label="All assignees"
+                selected=Signal::derive(move || value.get().is_empty())
+                on_select=Callback::new(move |()| { on_change.run(Vec::new()); })
+            />
+            {move || members.get().into_iter().map(|member| {
+                let user_id = member.user_id.clone();
+                let user_id_check = member.user_id.clone();
+                let display_name = member.name.clone().unwrap_or_else(|| member.email.clone());
+                let avatar_name = member.name.clone();
+                view! {
+                    <DropdownItem
+                        label=display_name
+                        selected=Signal::derive(move || value.get().contains(&user_id_check))
+                        on_select=Callback::new({
+                            let id = user_id.clone();
+                            move |()| {
+                                let mut current = value.get_untracked();
+                                if let Some(pos) = current.iter().position(|s| s == &id) {
+                                    current.remove(pos);
+                                } else {
+                                    current.push(id.clone());
+                                }
+                                on_change.run(current);
+                            }
+                        })
+                        icon=Arc::new(move || {
+                            let n = avatar_name.clone().unwrap_or_default();
+                            view! { <Avatar name=n/> }.into_any()
+                        }) as ChildrenFn
+                    />
+                }
+            }).collect_view()}
         </DropdownMenu>
     }
 }
