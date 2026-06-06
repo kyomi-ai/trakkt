@@ -261,13 +261,13 @@ fn sanitize_schema_for_tool_calling(value: &mut Value) {
         Value::Object(map) => {
             map.remove("$schema");
             map.remove("format");
-            if let Some(type_val) = map.get_mut("type") {
-                if let Some(arr) = type_val.as_array() {
-                    if let Some(non_null) = arr.iter().find(|t| t.as_str() != Some("null")).cloned()
-                    {
-                        *type_val = non_null;
-                    }
-                }
+            // Flatten nullable unions: `"type": ["string", "null"]` -> `"string"`.
+            let flattened = map
+                .get("type")
+                .and_then(Value::as_array)
+                .and_then(|types| types.iter().find(|t| t.as_str() != Some("null")).cloned());
+            if let Some(non_null) = flattened {
+                map.insert("type".to_string(), non_null);
             }
             for child in map.values_mut() {
                 sanitize_schema_for_tool_calling(child);
