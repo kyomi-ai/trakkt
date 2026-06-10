@@ -657,6 +657,10 @@ fn SidebarWorkspaceSection() -> impl IntoView {
     let archived_active = Signal::derive(move || {
         path.get() == "/archived"
     });
+    let starred_active = Signal::derive(move || {
+        path.get() == "/workspace"
+            && search.get().split('&').any(|p| p == "view=starred")
+    });
 
     view! {
         {move || {
@@ -680,7 +684,7 @@ fn SidebarWorkspaceSection() -> impl IntoView {
 
             // Workspace-scoped views (team_id is None), excluding any whose
             // name collides with the hardcoded preset views above.
-            const PRESET_NAMES: &[&str] = &["Issues", "Active", "Backlog"];
+            const PRESET_NAMES: &[&str] = &["Issues", "Active", "Backlog", "Starred"];
             let mut workspace_views: Vec<trakkt_types::models::View> = store
                 .views()
                 .get()
@@ -722,6 +726,13 @@ fn SidebarWorkspaceSection() -> impl IntoView {
                         is_active=archived_active
                     >
                         <Icon icon=phosphor_leptos::ARCHIVE weight=IconWeight::Light size="14px"/>
+                    </SidebarWorkspacePresetItem>
+                    <SidebarWorkspacePresetItem
+                        href="/workspace?view=starred"
+                        label="Starred"
+                        is_active=starred_active
+                    >
+                        <Icon icon=phosphor_leptos::STAR weight=IconWeight::Light size="14px"/>
                     </SidebarWorkspacePresetItem>
 
                     // User-saved workspace views

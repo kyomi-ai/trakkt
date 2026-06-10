@@ -44,6 +44,7 @@ use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
 use crate::pages::views::{FilterClause, LegacyViewFilters, ViewFilters};
 use crate::server_fns::issues::{create_issue, list_issues, search_issues, SearchResultItem};
+use crate::server_fns::stars::list_starred_issue_ids;
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::{create_view, delete_view, update_view};
 use crate::types::IssueNavState;
@@ -488,6 +489,41 @@ pub(crate) fn IssueListInner(
         });
     }
 
+    // ── Starred issue IDs ───────────────────────────────────────────────
+    // Fetches starred issue IDs when the active tab is "starred". The
+    // version counter allows re-fetching after star/unstar toggles.
+    let starred_version = RwSignal::new(0u32);
+    let starred_resource = Resource::new(
+        move || (active_tab.get(), starred_version.get()),
+        move |(tab, _)| async move {
+            if tab == "starred" {
+                match list_starred_issue_ids().await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to fetch starred issue IDs");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        },
+    );
+
+    // When starred IDs arrive and we're on the "starred" tab, update filters.
+    Effect::new(move |_| {
+        let tab = active_tab.get();
+        if tab != "starred" {
+            return;
+        }
+        let Some(ids) = starred_resource.get() else { return };
+        filter_clauses.set(vec![FilterClause {
+            field: "issue_id".to_string(),
+            operator: "any_of".to_string(),
+            values: ids,
+        }]);
+    });
+
     let search_resource = Resource::new(
         move || (
             debounced_search.get(),
@@ -547,7 +583,7 @@ pub(crate) fn IssueListInner(
     // ── Custom views (team-scoped or workspace-scoped) ─────────────────
     // Exclude views whose names collide with the hardcoded preset tabs
     // (Issues, Active, Backlog) to prevent duplicates.
-    const PRESET_TAB_NAMES: &[&str] = &["Issues", "Active", "Backlog"];
+    const PRESET_TAB_NAMES: &[&str] = &["Issues", "Active", "Backlog", "Starred"];
     let custom_views = Memo::new(move |_| {
         let Some(store) = sync_store else { return Vec::new() };
         let team = resolved_team.get();
@@ -700,6 +736,23 @@ pub(crate) fn IssueListInner(
                             values: status_ids,
                         }]);
                     }
+                }
+                "starred" => {
+                    set_active_tab.set("starred".to_string());
+                    // Clear filters immediately to avoid flashing previous tab's
+                    // results. The starred_resource Effect will repopulate once
+                    // the starred IDs arrive.
+                    filter_clauses.set(if parsed.filters.is_empty() {
+                        vec![FilterClause {
+                            field: "issue_id".to_string(),
+                            operator: "any_of".to_string(),
+                            values: Vec::new(),
+                        }]
+                    } else {
+                        parsed.filters
+                    });
+                    // Bump version to trigger a fresh fetch of starred IDs.
+                    starred_version.set(starred_version.get_untracked().wrapping_add(1));
                 }
                 view_str if view_str.starts_with("view:") => {
                     let view_id = &view_str[5..];

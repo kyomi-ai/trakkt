@@ -39,6 +39,7 @@ use crate::server_fns::projects::list_milestones;
 use crate::server_fns::relations::{add_relation, list_issue_relations, remove_relation};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::team::list_workspace_members;
+use crate::server_fns::stars::{is_starred, star_issue, unstar_issue};
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
 use crate::types::{IssueNavState, WorkspaceMember};
 use crate::utils::github::github_author_login_from_metadata;
@@ -1329,6 +1330,9 @@ fn MetadataSidebar(
             // ── Watch toggle ──────────────────────────────────────────────
             <WatchToggle team_key=stored_tk.get_value() number=stored_number/>
 
+            // ── Star toggle ──────────────────────────────────────────────
+            <StarToggle team_key=stored_tk.get_value() number=stored_number/>
+
             // ── Team ──────────────────────────────────────────────────────
             <div>
                 <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Team"</div>
@@ -1404,6 +1408,79 @@ fn WatchToggle(team_key: String, number: i32) -> impl IntoView {
                     {move || {
                         let w = watching_resource.get().and_then(|r| r.ok()).unwrap_or(false);
                         if w { "Watching" } else { "Watch" }
+                    }}
+                </span>
+            </button>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Star Toggle
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Star icon button that toggles star/unstar state for an issue.
+#[component]
+fn StarToggle(team_key: String, number: i32) -> impl IntoView {
+    let tk = team_key.clone();
+    let (version, set_version) = signal(0u32);
+    let starred_resource = Resource::new(
+        move || (tk.clone(), number, version.get()),
+        move |(tk, num, _)| async move { is_starred(tk, num).await },
+    );
+
+    let (loading, set_loading) = signal(false);
+
+    let toggle = move |_| {
+        if loading.get_untracked() {
+            return;
+        }
+        let currently_starred = starred_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or(false);
+
+        set_loading.set(true);
+        let tk = team_key.clone();
+        leptos::task::spawn_local(async move {
+            let result = if currently_starred {
+                unstar_issue(tk, number).await
+            } else {
+                star_issue(tk, number).await
+            };
+            if let Err(e) = result {
+                tracing::warn!("Failed to toggle star: {e}");
+            }
+            // Guard: component may have been destroyed while the future was in flight.
+            let _ = set_loading.try_set(false);
+            let _ = set_version.try_update(|v| *v += 1);
+        });
+    };
+
+    view! {
+        <div>
+            <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Star"</div>
+            <button
+                class="flex items-center gap-1.5 px-2 py-1 rounded text-sm text-muted-foreground hover:text-foreground hover:bg-surface-alt transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                on:click=toggle
+                disabled=move || loading.get()
+                title=move || {
+                    let s = starred_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                    if s { "Unstar this issue" } else { "Star this issue" }
+                }
+            >
+                {move || {
+                    let s = starred_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                    if s {
+                        view! { <span class="text-warning-foreground"><Icon icon=phosphor_leptos::STAR weight=phosphor_leptos::IconWeight::Fill size="16px"/></span> }.into_any()
+                    } else {
+                        view! { <Icon icon=phosphor_leptos::STAR weight=phosphor_leptos::IconWeight::Light size="16px"/> }.into_any()
+                    }
+                }}
+                <span class="text-xs">
+                    {move || {
+                        let s = starred_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                        if s { "Starred" } else { "Star" }
                     }}
                 </span>
             </button>

@@ -622,3 +622,23 @@ pub struct ListUnreleasedIssuesApiParams {
     /// Filter by team key (e.g. 'TRA')
     pub team_key: Option<String>,
 }
+
+// ─── Star operations ─────────────────────────────────────────────────────────
+
+/// Parameters for starring an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct StarIssueApiParams {
+    /// The issue ID to star (e.g. 'iss_abc123')
+    pub issue_id: String,
+}
+
+/// Parameters for unstarring an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct UnstarIssueApiParams {
+    /// The issue ID to unstar (e.g. 'iss_abc123')
+    pub issue_id: String,
+}
+
+/// Parameters for listing starred issues (no params needed — scoped to current user/workspace).
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListStarredIssuesApiParams {}

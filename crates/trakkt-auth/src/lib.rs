@@ -32,6 +32,7 @@ pub mod redis_ops;
 pub mod search_service;
 pub mod security_service;
 pub mod session;
+pub mod star_service;
 pub mod status_service;
 pub mod stripe_service;
 pub mod sync_log_service;
