@@ -578,3 +578,45 @@ pub struct LookupBranchApiParams {
     /// Branch name (exact match)
     pub branch: String,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Release operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing releases in the workspace.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListReleasesApiParams {
+    /// Filter by team key (e.g. 'TRA')
+    pub team_key: Option<String>,
+}
+
+/// Parameters for getting a single release by ID.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct GetReleaseApiParams {
+    /// The release ID
+    pub release_id: String,
+}
+
+/// Parameters for creating a new release.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct CreateReleaseApiParams {
+    /// Team key this release belongs to (e.g. 'TRA')
+    pub team_key: String,
+    /// Git tag name (e.g. 'v2026.05.20.1')
+    pub tag_name: String,
+    /// Previous tag (for commit range context)
+    pub previous_tag: Option<String>,
+    /// Optional human-readable title
+    pub title: Option<String>,
+    /// Release notes / changelog markdown
+    pub notes: Option<String>,
+    /// List of full commit SHAs included in this release. Used to auto-link issues via github_links.
+    pub commit_shas: Vec<String>,
+}
+
+/// Parameters for listing unreleased issues (completed but not yet shipped).
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListUnreleasedIssuesApiParams {
+    /// Filter by team key (e.g. 'TRA')
+    pub team_key: Option<String>,
+}

@@ -79,6 +79,7 @@ pub struct Issue {
     pub updated_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    pub released_at: Option<String>,
 }
 
 /// Issue with joined details: team key, assignee/creator names, and labels.
@@ -113,6 +114,7 @@ pub struct IssueWithDetails {
     pub updated_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    pub released_at: Option<String>,
     pub archived_at: Option<String>,
     /// Whether this issue has any child issues (via `issue_relations` parent type).
     pub has_children: bool,
@@ -577,4 +579,45 @@ pub struct Feedback {
     pub resolved_at: Option<String>,
     pub resolution_notes: Option<String>,
     pub resolved_by: Option<String>,
+}
+
+/// A release — a tagged set of issues shipped together.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Release {
+    pub release_id: String,
+    pub workspace_id: String,
+    pub team_key: String,
+    pub tag_name: String,
+    pub previous_tag: Option<String>,
+    pub title: Option<String>,
+    pub notes: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    pub issue_count: i64,
+}
+
+/// A release with its full list of linked issues.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseWithIssues {
+    pub release_id: String,
+    pub workspace_id: String,
+    pub team_key: String,
+    pub tag_name: String,
+    pub previous_tag: Option<String>,
+    pub title: Option<String>,
+    pub notes: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    pub issues: Vec<ReleaseIssue>,
+}
+
+/// A lightweight issue reference within a release.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseIssue {
+    pub issue_id: String,
+    pub team_key: String,
+    pub number: i32,
+    pub title: String,
+    pub status_name: String,
+    pub status_category: String,
 }
