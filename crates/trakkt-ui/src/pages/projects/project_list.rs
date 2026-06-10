@@ -13,7 +13,7 @@ use std::sync::Arc;
 use leptos::prelude::*;
 use phosphor_leptos::Icon;
 
-use crate::components::{Alert, AlertVariant, Button, ButtonVariant, EmptyState, ProjectCreationModal, StatusBadge};
+use crate::components::{Alert, AlertVariant, Button, ButtonVariant, EmptyState, ProjectCreationModal, SearchInput, StatusBadge};
 use crate::server_fns::projects::list_projects;
 use crate::utils::date::format_date;
 use crate::utils::project::{status_label, status_variant};
@@ -27,6 +27,9 @@ use crate::utils::project::{status_label, status_variant};
 pub fn ProjectListPage() -> impl IntoView {
     // ── Create-project modal ──────────────────────────────────────────────
     let (show_create, set_show_create) = signal(false);
+
+    // ── Search state ─────────────────────────────────────────────────────
+    let (search_text, set_search_text) = signal(String::new());
 
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
@@ -84,6 +87,16 @@ pub fn ProjectListPage() -> impl IntoView {
                 on_close=Callback::new(move |()| set_show_create.set(false))
             />
 
+            // ── Search bar ─────────────────────────────────────────────────
+            <div class="px-5 py-2 border-b border-border shrink-0">
+                <SearchInput
+                    value=Signal::derive(move || search_text.get())
+                    on_input=Callback::new(move |v: String| set_search_text.set(v))
+                    placeholder="Search projects..."
+                    class="max-w-sm".to_string()
+                />
+            </div>
+
             // ── Error alert ─────────────────────────────────────────────────
             <Show when=move || error_msg.get().is_some()>
                 <div class="mx-4 mt-4">
@@ -96,9 +109,24 @@ pub fn ProjectListPage() -> impl IntoView {
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto">
                 {move || {
-                    let list = projects.get();
+                    let all = projects.get();
+                    let search = search_text.get().to_lowercase();
+                    let list: Vec<_> = all.iter().filter(|p| {
+                        search.is_empty() || p.name.to_lowercase().contains(&search)
+                    }).cloned().collect();
 
                     if list.is_empty() {
+                        let (title, description) = if all.is_empty() {
+                            (
+                                "No projects yet",
+                                "Projects are cross-team initiatives that group related issues together.",
+                            )
+                        } else {
+                            (
+                                "No matching projects",
+                                "Try a different search term.",
+                            )
+                        };
                         let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
                             view! {
                                 <Icon icon=phosphor_leptos::FOLDER weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
@@ -108,8 +136,8 @@ pub fn ProjectListPage() -> impl IntoView {
                             <div class="p-4 md:p-6">
                                 <EmptyState
                                     icon=empty_icon
-                                    title="No projects yet"
-                                    description="Projects are cross-team initiatives that group related issues together."
+                                    title=title
+                                    description=description
                                 />
                             </div>
                         }.into_any()
