@@ -22,8 +22,8 @@ use crate::components::{
 };
 use crate::server_fns::notifications::{
     bulk_delete_notifications, bulk_mark_notifications_read, bulk_mark_notifications_unread,
-    bulk_restore_notifications, list_notifications, mark_all_notifications_read,
-    mark_notification_read,
+    bulk_restore_notifications, count_notifications, list_notifications,
+    mark_all_notifications_read, mark_notification_read,
 };
 use crate::server_fns::teams::list_teams;
 use crate::types::IssueNavState;
@@ -62,19 +62,24 @@ pub fn InboxPage() -> impl IntoView {
     let (type_filter, set_type_filter) = signal(String::new());
     let (search_text, set_search_text) = signal(String::new());
 
+    // Pagination state
+    let page = RwSignal::new(0i64);
+    const PAGE_SIZE: i64 = 20;
+
     // Selection state for bulk actions
     let selected = RwSignal::new(HashSet::<String>::new());
     let bulk_pending = RwSignal::new(false);
     let confirm_delete_open = RwSignal::new(false);
     let pending_delete_ids = RwSignal::new(Vec::<String>::new());
 
-    // Clear selection when any filter changes
+    // Clear selection and reset page when any filter changes
     Effect::new(move |_| {
         view_mode.get();
         team_filter.get();
         type_filter.get();
         search_text.get();
         selected.set(HashSet::new());
+        page.set(0);
     });
 
     // Load teams for the team filter dropdown
@@ -108,14 +113,57 @@ pub fn InboxPage() -> impl IntoView {
             team_filter.get(),
             type_filter.get(),
             search_text.get(),
+            page.get(),
+        ),
+        move |(uo, del, _, tk, tf, search, pg)| async move {
+            let team_key = if tk.is_empty() { None } else { Some(tk) };
+            let notification_type = if tf.is_empty() { None } else { Some(tf) };
+            let search = if search.is_empty() { None } else { Some(search) };
+            list_notifications(
+                uo,
+                Some(del),
+                notification_type,
+                team_key,
+                search,
+                Some(PAGE_SIZE),
+                Some(pg * PAGE_SIZE),
+            )
+            .await
+        },
+    );
+
+    let count_resource = Resource::new(
+        move || (
+            unread_only.get(),
+            deleted_only.get(),
+            refetch_version.get(),
+            team_filter.get(),
+            type_filter.get(),
+            search_text.get(),
         ),
         |(uo, del, _, tk, tf, search)| async move {
             let team_key = if tk.is_empty() { None } else { Some(tk) };
             let notification_type = if tf.is_empty() { None } else { Some(tf) };
             let search = if search.is_empty() { None } else { Some(search) };
-            list_notifications(uo, Some(del), notification_type, team_key, search).await
+            count_notifications(uo, Some(del), notification_type, team_key, search).await
         },
     );
+
+    let total_count = Signal::derive(move || {
+        count_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    });
+
+    let total_pages = Signal::derive(move || {
+        let total = total_count.get();
+        if total == 0 {
+            1
+        } else {
+            (total + PAGE_SIZE - 1) / PAGE_SIZE
+        }
+    });
 
     let sync_store = use_context::<SyncStore>();
 
@@ -524,6 +572,45 @@ pub fn InboxPage() -> impl IntoView {
                     }}
                 </Suspense>
             </div>
+
+            // Pagination controls
+            {move || {
+                let total = total_count.get();
+                let current_page = page.get();
+                let pages = total_pages.get();
+                (total > 0).then(|| {
+                    let start = current_page * PAGE_SIZE + 1;
+                    let end = ((current_page + 1) * PAGE_SIZE).min(total);
+                    view! {
+                        <div class="flex items-center justify-between px-5 py-3 border-t border-border shrink-0">
+                            <span class="text-xs text-muted-foreground">
+                                {format!("Showing {start}-{end} of {total}")}
+                            </span>
+                            <div class="flex items-center gap-2">
+                                <Button
+                                    variant=ButtonVariant::Ghost
+                                    size=ButtonSize::Sm
+                                    disabled=Signal::derive(move || page.get() == 0)
+                                    on:click=move |_| page.set(page.get_untracked() - 1)
+                                >
+                                    "Previous"
+                                </Button>
+                                <span class="text-xs text-muted-foreground">
+                                    {move || format!("Page {} of {}", current_page + 1, pages)}
+                                </span>
+                                <Button
+                                    variant=ButtonVariant::Ghost
+                                    size=ButtonSize::Sm
+                                    disabled=Signal::derive(move || page.get() >= total_pages.get() - 1)
+                                    on:click=move |_| page.set(page.get_untracked() + 1)
+                                >
+                                    "Next"
+                                </Button>
+                            </div>
+                        </div>
+                    }
+                })
+            }}
 
             <ConfirmDialog
                 open=Signal::derive(move || confirm_delete_open.get())

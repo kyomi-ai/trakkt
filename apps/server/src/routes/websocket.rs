@@ -387,7 +387,7 @@ async fn handle_sync_bootstrap(
             vec![]
         });
 
-    let notifications = trakkt_auth::notification_service::list_notifications(db, user_id, false, false, None, None, None)
+    let notifications = trakkt_auth::notification_service::list_notifications(db, user_id, false, false, None, None, None, trakkt_auth::notification_service::DEFAULT_NOTIFICATION_LIMIT, 0)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(user_id, workspace_id, error = %e, "list_notifications failed during bootstrap");
