@@ -18,6 +18,7 @@
 //! board views. The preference is persisted to localStorage per team (or
 //! globally for the workspace-level page).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use leptos::prelude::*;
@@ -37,8 +38,8 @@ use crate::components::{
 };
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{
-    apply_clause, parse_sort_field, sort_field_to_str, sort_issues, FilterBar, SortDirection,
-    SortDropdown, SortField,
+    apply_clause, group_issues, parse_sort_field, sort_field_to_str, sort_issues, FilterBar,
+    GroupDropdown, GroupField, SortDirection, SortDropdown, SortField,
 };
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, resolve_archive_days};
@@ -90,36 +91,36 @@ fn render_snippet_html(snippet: &str) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// localStorage helpers for view mode
+// localStorage helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Read the saved view mode from localStorage.
+/// Read a string value from localStorage by key.
 #[cfg(target_arch = "wasm32")]
-fn read_view_mode(key: &str) -> Option<String> {
+fn ls_read(key: &str) -> Option<String> {
     let storage = web_sys::window()?.local_storage().ok()??;
     storage.get_item(key).ok()?
 }
 
-/// Write the view mode to localStorage.
+/// Write a string value to localStorage by key.
 #[cfg(target_arch = "wasm32")]
-fn write_view_mode(key: &str, mode: &str) {
+fn ls_write(key: &str, value: &str) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.set_item(key, mode);
+        let _ = storage.set_item(key, value);
     }
 }
 
-/// Build the localStorage key for the view mode.
-fn view_mode_storage_key(team_key: &Option<Signal<String>>) -> String {
+/// Build a team-scoped localStorage key with the given prefix.
+fn ls_scoped_key(prefix: &str, team_key: &Option<Signal<String>>) -> String {
     match team_key {
         Some(sig) => {
             let key = sig.get_untracked();
             if key.is_empty() {
-                "trakkt-view-mode-global".to_string()
+                format!("{prefix}-global")
             } else {
-                format!("trakkt-view-mode-{key}")
+                format!("{prefix}-{key}")
             }
         }
-        None => "trakkt-view-mode-global".to_string(),
+        None => format!("{prefix}-global"),
     }
 }
 
@@ -294,6 +295,7 @@ fn apply_view_filters_from_store(
     filter_clauses: &RwSignal<Vec<FilterClause>>,
     set_sort_field: &WriteSignal<SortField>,
     set_sort_direction: &WriteSignal<SortDirection>,
+    set_group_by: &WriteSignal<GroupField>,
 ) {
     let Some(store) = sync_store else { return };
     let view = store
@@ -331,6 +333,13 @@ fn apply_view_filters_from_store(
                         .and_then(SortDirection::parse)
                         .unwrap_or(SortDirection::Asc),
                 );
+                set_group_by.set(
+                    filters
+                        .group_by
+                        .as_deref()
+                        .map(GroupField::parse)
+                        .unwrap_or(GroupField::None),
+                );
             }
             Err(e) => tracing::warn!("Failed to parse view filters: {e}"),
         }
@@ -353,6 +362,8 @@ fn apply_view_filters_from_store(
                         .and_then(SortDirection::parse)
                         .unwrap_or(SortDirection::Asc),
                 );
+                // Legacy views have no group_by; reset to None.
+                set_group_by.set(GroupField::None);
             }
             Err(e) => tracing::warn!("Failed to parse legacy view filters: {e}"),
         }
@@ -397,10 +408,10 @@ pub(crate) fn IssueListInner(
     initial_view_id: Option<Signal<String>>,
 ) -> impl IntoView {
     // ── View mode state ────────────────────────────────────────────────────
-    let storage_key = view_mode_storage_key(&team_key);
+    let storage_key = ls_scoped_key("trakkt-view-mode", &team_key);
     let initial_mode = {
         #[cfg(target_arch = "wasm32")]
-        { read_view_mode(&storage_key).unwrap_or_else(|| "list".to_string()) }
+        { ls_read(&storage_key).unwrap_or_else(|| "list".to_string()) }
         #[cfg(not(target_arch = "wasm32"))]
         { "list".to_string() }
     };
@@ -409,7 +420,7 @@ pub(crate) fn IssueListInner(
     Effect::new(move |_| {
         let mode = view_mode.get();
         #[cfg(target_arch = "wasm32")]
-        write_view_mode(&storage_key_for_effect, &mode);
+        ls_write(&storage_key_for_effect, &mode);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = (&storage_key_for_effect, &mode);
     });
@@ -423,6 +434,29 @@ pub(crate) fn IssueListInner(
     // ── Sort state ─────────────────────────────────────────────────────────
     let (sort_field, set_sort_field) = signal(SortField::Priority);
     let (sort_direction, set_sort_direction) = signal(SortDirection::Asc);
+
+    // ── Group-by state ────────────────────────────────────────────────────
+    let group_by_key = ls_scoped_key("trakkt-group-by", &team_key);
+    let initial_group_by = {
+        #[cfg(target_arch = "wasm32")]
+        { ls_read(&group_by_key).map(|s| GroupField::parse(&s)).unwrap_or(GroupField::None) }
+        #[cfg(not(target_arch = "wasm32"))]
+        { GroupField::None }
+    };
+    let (group_by, set_group_by) = signal(initial_group_by);
+    let group_by_key_for_effect = group_by_key.clone();
+    Effect::new(move |_| {
+        let field = group_by.get();
+        #[cfg(target_arch = "wasm32")]
+        ls_write(&group_by_key_for_effect, field.as_str());
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (&group_by_key_for_effect, &field);
+    });
+
+    // ── Group collapse state (hoisted to avoid recreation on re-render) ──
+    // Maps group_key → collapsed boolean. Initialized lazily from localStorage
+    // when a group key is first encountered during rendering.
+    let group_collapse_state: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
 
     // ── Active tab state (team-scoped pages only) ─────────────────────────
     // Values: "issues", "active", "backlog", "view:{view_id}"
@@ -767,6 +801,7 @@ pub(crate) fn IssueListInner(
                             &filter_clauses,
                             &set_sort_field,
                             &set_sort_direction,
+                            &set_group_by,
                         );
                     }
                 }
@@ -829,6 +864,7 @@ pub(crate) fn IssueListInner(
                         &filter_clauses,
                         &set_sort_field,
                         &set_sort_direction,
+                        &set_group_by,
                     );
                     set_active_tab.set(format!("view:{vid}"));
                     skip_url_update.set(false);
@@ -1453,6 +1489,11 @@ pub(crate) fn IssueListInner(
                                                         .and_then(SortDirection::parse)
                                                         .unwrap_or(SortDirection::Asc)
                                                 );
+                                                set_group_by.set(
+                                                    filters.group_by.as_deref()
+                                                        .map(GroupField::parse)
+                                                        .unwrap_or(GroupField::None)
+                                                );
                                             }
                                             Err(e) => tracing::warn!("Failed to parse view filters: {e}"),
                                         }
@@ -1471,6 +1512,8 @@ pub(crate) fn IssueListInner(
                                                         .and_then(SortDirection::parse)
                                                         .unwrap_or(SortDirection::Asc)
                                                 );
+                                                // Legacy views have no group_by; reset to None.
+                                                set_group_by.set(GroupField::None);
                                             }
                                             Err(e) => tracing::warn!("Failed to parse legacy view filters: {e}"),
                                         }
@@ -1637,6 +1680,16 @@ pub(crate) fn IssueListInner(
                             set_sort_direction.set(d);
                         })
                     />
+                    // Group-by dropdown — only shown for workspace-scoped views
+                    // (grouping by team only makes sense when viewing issues across teams).
+                    <Show when=move || resolved_team.get().is_none()>
+                        <GroupDropdown
+                            field=Signal::derive(move || group_by.get())
+                            on_change=Callback::new(move |f: GroupField| {
+                                set_group_by.set(f);
+                            })
+                        />
+                    </Show>
                     // "Save view" — always visible, disabled when no filters active
                     <Button
                         variant=ButtonVariant::Ghost
@@ -1861,15 +1914,91 @@ pub(crate) fn IssueListInner(
                                         }.into_any()
                                     }
                                 } else {
-                                    let rows = list.iter().enumerate().map(|(idx, issue)| {
-                                        let archived = ad > 0 && is_archived(issue, ad);
-                                        view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index archived=archived/> }
-                                    }).collect_view();
-                                    view! {
-                                        <div role="list">
-                                            {rows}
-                                        </div>
-                                    }.into_any()
+                                    let current_group_by = group_by.get();
+                                    // Only apply grouping when workspace-scoped (not on team pages).
+                                    let effective_group = if resolved_team.get().is_some() {
+                                        GroupField::None
+                                    } else {
+                                        current_group_by
+                                    };
+
+                                    if effective_group == GroupField::None {
+                                        // Flat list — no grouping.
+                                        let rows = list.iter().enumerate().map(|(idx, issue)| {
+                                            let archived = ad > 0 && is_archived(issue, ad);
+                                            view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index archived=archived/> }
+                                        }).collect_view();
+                                        view! {
+                                            <div role="list">
+                                                {rows}
+                                            </div>
+                                        }.into_any()
+                                    } else {
+                                        // Build team_names map for display labels.
+                                        let team_names: HashMap<String, String> = sync_store
+                                            .map(|s| s.teams().get_untracked().into_iter().map(|t| (t.key.clone(), t.name.clone())).collect())
+                                            .unwrap_or_default();
+
+                                        // Grouped rendering — collapsible sections per group.
+                                        let groups = group_issues(&list, effective_group, &team_names);
+                                        let mut global_offset = 0usize;
+                                        let group_views = groups.into_iter().map(|(group_key, label, group_issues_ref)| {
+                                            let count = group_issues_ref.len();
+                                            let offset = global_offset;
+
+                                            // Lazily initialize collapse state from localStorage
+                                            // on first encounter of this group key.
+                                            if !group_collapse_state.with_untracked(|m| m.contains_key(&group_key)) {
+                                                let storage_key = format!("trakkt-group-collapsed-{}", group_key);
+                                                #[cfg(target_arch = "wasm32")]
+                                                let initial = ls_read(&storage_key).map(|v| v == "true").unwrap_or(false);
+                                                #[cfg(not(target_arch = "wasm32"))]
+                                                let initial = { let _ = &storage_key; false };
+                                                group_collapse_state.update(|m| { m.insert(group_key.clone(), initial); });
+                                            }
+
+                                            let collapsed_signal = Signal::derive({
+                                                let key = group_key.clone();
+                                                move || group_collapse_state.with(|m| *m.get(&key).unwrap_or(&false))
+                                            });
+
+                                            let on_toggle = Callback::new({
+                                                let key = group_key.clone();
+                                                move |()| {
+                                                    group_collapse_state.update(|m| {
+                                                        let v = m.entry(key.clone()).or_insert(false);
+                                                        *v = !*v;
+                                                        #[cfg(target_arch = "wasm32")]
+                                                        ls_write(&format!("trakkt-group-collapsed-{}", key), if *v { "true" } else { "false" });
+                                                    });
+                                                }
+                                            });
+
+                                            global_offset += count;
+
+                                            let issue_rows = group_issues_ref.iter().enumerate().map(|(idx, issue)| {
+                                                let archived = ad > 0 && is_archived(issue, ad);
+                                                view! { <IssueRow issue=(*issue).clone() index=offset+idx selected_index=selected_index archived=archived/> }
+                                            }).collect_view();
+
+                                            view! {
+                                                <GroupCollapsibleSection
+                                                    title=label
+                                                    count=count
+                                                    collapsed=collapsed_signal
+                                                    on_toggle=on_toggle
+                                                >
+                                                    {issue_rows}
+                                                </GroupCollapsibleSection>
+                                            }
+                                        }).collect_view();
+
+                                        view! {
+                                            <div role="list">
+                                                {group_views}
+                                            </div>
+                                        }.into_any()
+                                    }
                                 }
                             }}
                         </div>
@@ -1895,6 +2024,7 @@ pub(crate) fn IssueListInner(
             view_mode=Signal::derive(move || view_mode.get())
             sort_field=Signal::derive(move || sort_field.get())
             sort_direction=Signal::derive(move || sort_direction.get())
+            group_by=Signal::derive(move || group_by.get())
         />
 
         // ── Delete View confirmation dialog ────────────────────────────────
@@ -1908,6 +2038,49 @@ pub(crate) fn IssueListInner(
             })
             on_cancel=Callback::new(move |()| set_confirm_delete_view_id.set(None))
         />
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group Collapsible Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A collapsible section for grouped issue lists. Renders a header with team
+/// name, issue count badge, and a chevron toggle.
+///
+/// Modeled after the `CollapsibleSection` in `my_issues.rs` (lines 599-623)
+/// but accepts a `String` title for dynamic group labels.
+///
+/// Uses `Signal<bool>` + `Callback<()>` instead of `ReadSignal`/`WriteSignal`
+/// so the caller can back the state with a shared `RwSignal<HashMap>` — avoiding
+/// per-group signal/effect creation inside reactive closures.
+#[component]
+fn GroupCollapsibleSection(
+    title: String,
+    count: usize,
+    #[prop(into)]
+    collapsed: Signal<bool>,
+    on_toggle: Callback<()>,
+    children: Children,
+) -> impl IntoView {
+    view! {
+        <div class="border-b border-border">
+            <button
+                class="w-full px-5 py-2 flex items-center gap-2 text-sm font-medium text-foreground hover:bg-surface-alt transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                on:click=move |_| on_toggle.run(())
+            >
+                <span class="text-muted-foreground transition-transform" class:rotate-90=move || !collapsed.get()>
+                    <Icon icon=phosphor_leptos::CARET_RIGHT size="14px"/>
+                </span>
+                <span>{title}</span>
+                <span class="text-xs text-muted-foreground bg-surface-alt rounded-full px-1.5 py-0.5 min-w-[20px] text-center">
+                    {count}
+                </span>
+            </button>
+            <div class="overflow-hidden" class:hidden=move || collapsed.get()>
+                {children()}
+            </div>
+        </div>
     }
 }
 
@@ -2150,6 +2323,9 @@ pub(crate) fn SaveViewModal(
     /// Current sort direction.
     #[prop(optional, into)]
     sort_direction: Option<Signal<SortDirection>>,
+    /// Current group-by field.
+    #[prop(optional, into)]
+    group_by: Option<Signal<GroupField>>,
 ) -> impl IntoView {
     let (name, set_name) = signal(String::new());
     let (submitting, set_submitting) = signal(false);
@@ -2173,10 +2349,14 @@ pub(crate) fn SaveViewModal(
         let team_id_val = team_id.get_untracked().unwrap_or_default();
 
         // Serialize using the new ViewFilters format.
+        let group_by_val = group_by.map(|s| s.get_untracked());
         let filters = ViewFilters {
             clauses: filter_clauses.get_untracked(),
             sort_field: sort_field.map(|s| sort_field_to_str(s.get_untracked()).to_string()),
             sort_direction: sort_direction.map(|s| s.get_untracked().as_str().to_string()),
+            group_by: group_by_val
+                .filter(|g| *g != GroupField::None)
+                .map(|g| g.as_str().to_string()),
         };
         let filters_str = match serde_json::to_string(&filters) {
             Ok(s) => s,
@@ -2189,6 +2369,7 @@ pub(crate) fn SaveViewModal(
 
         let display_options = serde_json::json!({
             "view_type": view_mode.get_untracked(),
+            "group_by": group_by_val.map(|g| g.as_str()).unwrap_or("none"),
         });
         let display_str = display_options.to_string();
 
