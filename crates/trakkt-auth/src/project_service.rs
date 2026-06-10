@@ -18,9 +18,6 @@ use crate::websocket::WebSocketManager;
 
 /// Internal row type for deserialising `projects` query results.
 ///
-/// `sort_order` is stored as REAL in the database. sqlx reads
-/// it as `String` via CAST and parse to f64 in `into_dto()` to avoid sqlx
-/// type mismatch between backends.
 #[derive(sqlx::FromRow)]
 struct ProjectRow {
     project_id: String,
@@ -138,7 +135,7 @@ const PROJECT_SELECT: &str = "\
            p.lead_id, lead.name AS lead_name, \
            CAST(p.start_date AS TEXT) AS start_date, \
            CAST(p.target_date AS TEXT) AS target_date, \
-           CAST(p.sort_order AS DOUBLE PRECISION) AS sort_order, \
+           p.sort_order, \
            CAST(p.created_at AS TEXT) AS created_at, \
            CAST(p.updated_at AS TEXT) AS updated_at \
     FROM projects p \
