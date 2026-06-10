@@ -46,6 +46,13 @@ fn notification_event_text(notification: &Notification) -> String {
         "status_changed" => "Status changed".to_string(),
         "assigned" => "You were assigned".to_string(),
         "priority_changed" => "Priority changed".to_string(),
+        "label_changed" => format!("{actor} changed labels"),
+        "due_date_changed" => format!("{actor} changed the due date"),
+        "estimate_changed" => format!("{actor} changed the estimate"),
+        "milestone_changed" => format!("{actor} changed the milestone"),
+        "project_changed" => format!("{actor} changed the project"),
+        "team_changed" => format!("{actor} moved this issue"),
+        "relation_added" => format!("{actor} added a relation"),
         _ => format!("{actor} updated"),
     }
 }
@@ -102,6 +109,13 @@ pub fn InboxPage() -> impl IntoView {
             ("status_changed".to_string(), "Status changes".to_string()),
             ("assigned".to_string(), "Assignments".to_string()),
             ("priority_changed".to_string(), "Priority changes".to_string()),
+            ("label_changed".to_string(), "Label changes".to_string()),
+            ("due_date_changed".to_string(), "Due date changes".to_string()),
+            ("estimate_changed".to_string(), "Estimate changes".to_string()),
+            ("milestone_changed".to_string(), "Milestone changes".to_string()),
+            ("project_changed".to_string(), "Project changes".to_string()),
+            ("team_changed".to_string(), "Team changes".to_string()),
+            ("relation_added".to_string(), "Relations".to_string()),
         ]
     });
 

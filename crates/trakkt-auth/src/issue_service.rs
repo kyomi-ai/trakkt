@@ -930,6 +930,21 @@ pub async fn update_issue(
         if updates.priority.is_some() {
             types_to_notify.push(crate::notification_service::TYPE_PRIORITY_CHANGED);
         }
+        if matches!(updates.due_date, Some(Some(_))) {
+            types_to_notify.push(crate::notification_service::TYPE_DUE_DATE_CHANGED);
+        }
+        if matches!(updates.estimate, Some(Some(_))) {
+            types_to_notify.push(crate::notification_service::TYPE_ESTIMATE_CHANGED);
+        }
+        if matches!(updates.milestone_id, Some(Some(_))) {
+            types_to_notify.push(crate::notification_service::TYPE_MILESTONE_CHANGED);
+        }
+        if matches!(updates.project_id, Some(Some(_))) {
+            types_to_notify.push(crate::notification_service::TYPE_PROJECT_CHANGED);
+        }
+        if updates.team_id.is_some() {
+            types_to_notify.push(crate::notification_service::TYPE_TEAM_CHANGED);
+        }
 
         if !types_to_notify.is_empty() {
             match crate::watcher_service::list_watchers_of_issue(db, &issue_id).await {
@@ -967,7 +982,28 @@ pub async fn update_issue(
                                     crate::notification_service::TYPE_PRIORITY_CHANGED => {
                                         p.notify_priority_changes
                                     }
-                                    _ => true,
+                                    crate::notification_service::TYPE_DUE_DATE_CHANGED => {
+                                        p.notify_due_date_changes
+                                    }
+                                    crate::notification_service::TYPE_ESTIMATE_CHANGED => {
+                                        p.notify_estimate_changes
+                                    }
+                                    crate::notification_service::TYPE_MILESTONE_CHANGED => {
+                                        p.notify_milestone_changes
+                                    }
+                                    crate::notification_service::TYPE_PROJECT_CHANGED => {
+                                        p.notify_project_changes
+                                    }
+                                    crate::notification_service::TYPE_TEAM_CHANGED => {
+                                        p.notify_team_changes
+                                    }
+                                    other => {
+                                        tracing::warn!(
+                                            notification_type = %other,
+                                            "Unhandled notification type in preference check — defaulting to notify"
+                                        );
+                                        true
+                                    }
                                 });
                             if !type_enabled {
                                 continue;
@@ -1087,6 +1123,9 @@ pub async fn set_issue_labels(
     db: &DbPool,
     issue_id: &str,
     label_ids: &[String],
+    actor_user_id: Option<&str>,
+    action_source: ActionSource,
+    action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // Remove existing labels.
@@ -1141,6 +1180,58 @@ pub async fn set_issue_labels(
             serde_json::to_value(&full_issue).ok(),
         )
         .await;
+    }
+
+    // ── Notification trigger for label changes (best-effort) ──────────
+    if let Some(actor_id) = actor_user_id {
+        match crate::watcher_service::list_watchers_of_issue(db, issue_id).await {
+            Ok(watchers) => {
+                let prefs_map = match crate::notification_service::batch_get_preferences(
+                    db, &watchers, &ws_id,
+                )
+                .await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to fetch notification preferences for label change");
+                        std::collections::HashMap::new()
+                    }
+                };
+
+                for watcher_id in &watchers {
+                    if crate::notification_service::should_suppress_self_notification(
+                        watcher_id, actor_id, action_source, &prefs_map,
+                    ) {
+                        continue;
+                    }
+
+                    let type_enabled = prefs_map
+                        .get(watcher_id.as_str())
+                        .is_none_or(|p| p.notify_label_changes);
+                    if !type_enabled {
+                        continue;
+                    }
+
+                    if let Err(e) = crate::notification_service::create_notification(
+                        db,
+                        &ws_id,
+                        watcher_id,
+                        issue_id,
+                        crate::notification_service::TYPE_LABEL_CHANGED,
+                        Some(actor_id),
+                        action_source,
+                        action_source_label,
+                        ws_manager,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "Failed to create label_changed notification");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, issue_id = %issue_id, "Failed to list watchers for label change notification");
+            }
+        }
     }
 
     Ok(())
