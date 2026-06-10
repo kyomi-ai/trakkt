@@ -112,7 +112,19 @@ pub fn ApiKeyManager() -> impl IntoView {
         // If a token was just created, refresh the list
         if created_token.get_untracked().is_some() {
             loading.set(true);
-            keys_resource.refetch();
+            error.set(None);
+            leptos::task::spawn_local(async move {
+                match list_api_keys().await {
+                    Ok(data) => {
+                        keys.set(data);
+                        loading.set(false);
+                    }
+                    Err(e) => {
+                        error.set(Some(format!("Failed to reload API keys: {e}")));
+                        loading.set(false);
+                    }
+                }
+            });
         }
     });
 
@@ -194,7 +206,16 @@ pub fn ApiKeyManager() -> impl IntoView {
             match revoke_api_key(token_id).await {
                 Ok(_) => {
                     loading.set(true);
-                    keys_resource.refetch();
+                    match list_api_keys().await {
+                        Ok(data) => {
+                            keys.set(data);
+                            loading.set(false);
+                        }
+                        Err(e) => {
+                            error.set(Some(format!("Failed to reload API keys: {e}")));
+                            loading.set(false);
+                        }
+                    }
                 }
                 Err(e) => {
                     error.set(Some(format!("Failed to revoke API key: {e}")));
