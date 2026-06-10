@@ -9,7 +9,7 @@
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use trakkt_types::enums::ActionSource;
-use trakkt_types::models::Notification;
+use trakkt_types::models::{Notification, NotificationPreferences};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
@@ -398,4 +398,273 @@ pub async fn bulk_restore_notifications(
     // NULL is dialect-neutral; no sql_compat call needed.
     let clause = "deleted_at = NULL WHERE user_id = $1 AND deleted_at IS NOT NULL";
     bulk_update_notifications(db, user_id, notification_ids, clause).await
+}
+
+// ─── Notification Preferences ─────────────────────────────────────────────
+
+/// Internal row type for deserialising notification preferences queries.
+#[derive(sqlx::FromRow)]
+struct NotificationPreferencesRow {
+    preference_id: String,
+    user_id: String,
+    workspace_id: String,
+    notify_status_changes: bool,
+    notify_comments: bool,
+    notify_assignments: bool,
+    notify_priority_changes: bool,
+    notify_own_agent_actions: bool,
+    notify_own_api_actions: bool,
+    delivery_channel: String,
+}
+
+impl NotificationPreferencesRow {
+    fn into_dto(self) -> NotificationPreferences {
+        NotificationPreferences {
+            preference_id: self.preference_id,
+            user_id: self.user_id,
+            workspace_id: self.workspace_id,
+            notify_status_changes: self.notify_status_changes,
+            notify_comments: self.notify_comments,
+            notify_assignments: self.notify_assignments,
+            notify_priority_changes: self.notify_priority_changes,
+            notify_own_agent_actions: self.notify_own_agent_actions,
+            notify_own_api_actions: self.notify_own_api_actions,
+            delivery_channel: self.delivery_channel,
+        }
+    }
+}
+
+/// Get notification preferences for a user in a workspace.
+///
+/// Uses an upsert (INSERT ... ON CONFLICT DO NOTHING / INSERT OR IGNORE)
+/// to atomically create a default row if none exists, avoiding a TOCTOU race
+/// between the existence check and the insert.
+pub async fn get_or_default_preferences(
+    db: &DbPool,
+    user_id: &str,
+    workspace_id: &str,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<NotificationPreferences> {
+    let preference_id = uuid::Uuid::new_v4().to_string();
+    let is_pg = db.is_postgres();
+    let now = sql_compat::now(is_pg);
+    let bt = sql_compat::bool_true(is_pg);
+    let bf = sql_compat::bool_false(is_pg);
+
+    // Upsert: insert with defaults if not exists, ignore if already present.
+    let insert_prefix = if is_pg { "INSERT INTO" } else { "INSERT OR IGNORE INTO" };
+    let conflict_clause = if is_pg { "ON CONFLICT (user_id, workspace_id) DO NOTHING" } else { "" };
+
+    let sql = format!(
+        "{insert_prefix} notification_preferences \
+            (preference_id, user_id, workspace_id, \
+             notify_status_changes, notify_comments, notify_assignments, \
+             notify_priority_changes, notify_own_agent_actions, notify_own_api_actions, \
+             delivery_channel, created_at, updated_at) \
+         VALUES ($1, $2, $3, {bt}, {bt}, {bt}, {bt}, {bf}, {bf}, $4, {now}, {now}) \
+         {conflict_clause}"
+    );
+    let result = trakkt_core::db_execute!(
+        db,
+        &sql,
+        &preference_id,
+        user_id,
+        workspace_id,
+        "in_app"
+    )?;
+
+    // If a row was actually inserted, write sync log + broadcast.
+    if result.rows_affected() > 0 {
+        let prefs = NotificationPreferences {
+            preference_id: preference_id.clone(),
+            user_id: user_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            notify_status_changes: true,
+            notify_comments: true,
+            notify_assignments: true,
+            notify_priority_changes: true,
+            notify_own_agent_actions: false,
+            notify_own_api_actions: false,
+            delivery_channel: "in_app".to_string(),
+        };
+
+        if let Err(e) = sync_log_service::write_sync_entry(
+            db,
+            entity_types::NOTIFICATION_PREFERENCES,
+            &preference_id,
+            workspace_id,
+            SyncActionType::Insert,
+            serde_json::to_value(&prefs).ok(),
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "Failed to write sync log for notification preferences create");
+        }
+
+        if let Some(ws) = ws_manager {
+            sync_log_service::broadcast_sync_action(
+                ws,
+                workspace_id,
+                entity_types::NOTIFICATION_PREFERENCES,
+                &preference_id,
+                SyncActionType::Insert,
+                serde_json::to_value(&prefs).ok(),
+            )
+            .await;
+        }
+    }
+
+    // Always fetch the current state (whether we just inserted or it already existed).
+    let row = trakkt_core::db_fetch_optional!(
+        db,
+        NotificationPreferencesRow,
+        "SELECT preference_id, user_id, workspace_id, \
+                notify_status_changes, notify_comments, notify_assignments, \
+                notify_priority_changes, notify_own_agent_actions, notify_own_api_actions, \
+                delivery_channel \
+         FROM notification_preferences \
+         WHERE user_id = $1 AND workspace_id = $2",
+        user_id,
+        workspace_id
+    )?;
+
+    match row {
+        Some(r) => Ok(r.into_dto()),
+        None => Err(trakkt_core::Error::NotFound("Notification preferences".into())),
+    }
+}
+
+/// Update a single boolean preference field.
+///
+/// The field name is validated against a fixed allow-list to prevent SQL
+/// injection. Returns the updated preferences.
+pub async fn update_preference(
+    db: &DbPool,
+    user_id: &str,
+    workspace_id: &str,
+    field: &str,
+    value: bool,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<NotificationPreferences> {
+    let column = match field {
+        "notify_status_changes" => "notify_status_changes",
+        "notify_comments" => "notify_comments",
+        "notify_assignments" => "notify_assignments",
+        "notify_priority_changes" => "notify_priority_changes",
+        "notify_own_agent_actions" => "notify_own_agent_actions",
+        "notify_own_api_actions" => "notify_own_api_actions",
+        _ => {
+            return Err(trakkt_core::Error::BadRequest(format!(
+                "Unknown preference field: {field}"
+            )));
+        }
+    };
+
+    // Ensure the row exists (inserts defaults if missing).
+    let _prefs = get_or_default_preferences(db, user_id, workspace_id, ws_manager).await?;
+
+    let is_pg = db.is_postgres();
+    let now = sql_compat::now(is_pg);
+    let bool_val = if value {
+        sql_compat::bool_true(is_pg)
+    } else {
+        sql_compat::bool_false(is_pg)
+    };
+
+    let sql = format!(
+        "UPDATE notification_preferences SET {column} = {bool_val}, updated_at = {now} \
+         WHERE user_id = $1 AND workspace_id = $2"
+    );
+    trakkt_core::db_execute!(db, &sql, user_id, workspace_id)?;
+
+    // Re-fetch the updated preferences.
+    let updated = get_or_default_preferences(db, user_id, workspace_id, ws_manager).await?;
+
+    // Sync log + broadcast for the update (best-effort).
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::NOTIFICATION_PREFERENCES,
+        &updated.preference_id,
+        workspace_id,
+        SyncActionType::Update,
+        serde_json::to_value(&updated).ok(),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "Failed to write sync log for notification preferences update");
+    }
+
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::NOTIFICATION_PREFERENCES,
+            &updated.preference_id,
+            SyncActionType::Update,
+            serde_json::to_value(&updated).ok(),
+        )
+        .await;
+    }
+
+    Ok(updated)
+}
+
+/// Batch-fetch notification preferences for multiple users in a workspace.
+///
+/// Returns a map keyed by `user_id`. Users without a preferences row are
+/// simply absent from the map — callers should treat missing entries as
+/// "all defaults enabled".
+pub async fn batch_get_preferences(
+    db: &DbPool,
+    user_ids: &[String],
+    workspace_id: &str,
+) -> trakkt_core::Result<std::collections::HashMap<String, NotificationPreferences>> {
+    if user_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let (in_clause, _) = trakkt_core::db::in_clause_placeholders(user_ids.len(), 2);
+    let sql = format!(
+        "SELECT preference_id, user_id, workspace_id, \
+                notify_status_changes, notify_comments, notify_assignments, \
+                notify_priority_changes, notify_own_agent_actions, notify_own_api_actions, \
+                delivery_channel \
+         FROM notification_preferences \
+         WHERE workspace_id = $1 AND user_id IN {in_clause}"
+    );
+
+    let rows: Vec<NotificationPreferencesRow> = trakkt_core::db_with_pool!(db, |pool| {
+        let mut query = sqlx::query_as::<_, NotificationPreferencesRow>(&sql)
+            .bind(workspace_id);
+        for uid in user_ids {
+            query = query.bind(uid);
+        }
+        query.fetch_all(pool).await
+    })?;
+
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let uid = row.user_id.clone();
+        map.insert(uid, row.into_dto());
+    }
+    Ok(map)
+}
+
+/// Returns `true` if the notification should be suppressed for this watcher
+/// because they are the actor and their preferences say to skip self-notify.
+pub fn should_suppress_self_notification(
+    watcher_id: &str,
+    actor_id: &str,
+    action_source: ActionSource,
+    prefs_map: &std::collections::HashMap<String, NotificationPreferences>,
+) -> bool {
+    if watcher_id != actor_id {
+        return false;
+    }
+    match action_source {
+        ActionSource::User => true,
+        ActionSource::Agent => !prefs_map.get(watcher_id).is_some_and(|p| p.notify_own_agent_actions),
+        ActionSource::Api => !prefs_map.get(watcher_id).is_some_and(|p| p.notify_own_api_actions),
+        ActionSource::Github => false,
+    }
 }

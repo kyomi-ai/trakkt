@@ -6,7 +6,7 @@
 //! call service, return.
 
 use leptos::prelude::*;
-use trakkt_types::models::Notification;
+use trakkt_types::models::{Notification, NotificationPreferences};
 
 // Helpers — delegate to shared extractors in parent module
 #[cfg(feature = "ssr")]
@@ -141,4 +141,41 @@ pub async fn bulk_restore_notifications(notification_ids: String) -> Result<(), 
         .await
         .into_sfn()?;
     Ok(())
+}
+
+// ─── Notification Preferences ─────────────────────────────────────────────
+
+/// Get notification preferences for the current user in the active workspace.
+#[server(prefix = "/leptos-api")]
+pub async fn get_notification_preferences() -> Result<NotificationPreferences, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let prefs = trakkt_auth::notification_service::get_or_default_preferences(
+        ac.db(),
+        &ac.auth.user_id,
+        &ac.ws_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(prefs)
+}
+
+/// Update a single notification preference field.
+#[server(prefix = "/leptos-api")]
+pub async fn update_notification_preference(
+    field: String,
+    value: bool,
+) -> Result<NotificationPreferences, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let prefs = trakkt_auth::notification_service::update_preference(
+        ac.db(),
+        &ac.auth.user_id,
+        &ac.ws_id,
+        &field,
+        value,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(prefs)
 }

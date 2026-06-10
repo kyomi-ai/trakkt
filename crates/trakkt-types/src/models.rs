@@ -265,6 +265,24 @@ pub struct Notification {
     pub deleted_at: Option<String>,
 }
 
+/// User-level notification preferences for a workspace.
+///
+/// Controls which event types generate notifications and whether
+/// self-initiated agent/API actions should notify the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotificationPreferences {
+    pub preference_id: String,
+    pub user_id: String,
+    pub workspace_id: String,
+    pub notify_status_changes: bool,
+    pub notify_comments: bool,
+    pub notify_assignments: bool,
+    pub notify_priority_changes: bool,
+    pub notify_own_agent_actions: bool,
+    pub notify_own_api_actions: bool,
+    pub delivery_channel: String,
+}
+
 /// Filter criteria for listing issues.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IssueFilters {
