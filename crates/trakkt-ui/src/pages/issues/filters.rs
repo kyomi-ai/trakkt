@@ -222,6 +222,143 @@ pub fn sort_field_to_str(field: SortField) -> &'static str {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Group enums and helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Field to group the issue list by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupField {
+    None,
+    Team,
+}
+
+impl GroupField {
+    /// Human-readable label for the dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Team => "Team",
+        }
+    }
+
+    /// Serialize to a stable string for persistence.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Team => "team",
+        }
+    }
+
+    /// Parse from a string, defaulting to `None` for unrecognized input.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "team" => Self::Team,
+            _ => Self::None,
+        }
+    }
+
+    /// All variants in display order.
+    pub const ALL: [GroupField; 2] = [Self::None, Self::Team];
+}
+
+/// Group a slice of issues by the given field.
+///
+/// Returns a vec of `(group_key, group_label, issues_in_group)` tuples.
+/// - `group_key` is a stable identifier used for localStorage persistence keys.
+/// - `group_label` is the human-readable display name.
+///
+/// When `GroupField::None`, returns a single group containing all issues.
+/// When `GroupField::Team`, groups by `team_key`, sorted alphabetically.
+/// The `team_names` map resolves team keys to display names (e.g. "TRA" -> "Trakkt").
+pub fn group_issues<'a>(
+    issues: &'a [IssueWithDetails],
+    field: GroupField,
+    team_names: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String, Vec<&'a IssueWithDetails>)> {
+    match field {
+        GroupField::None => {
+            vec![("all".to_string(), "All Issues".to_string(), issues.iter().collect())]
+        }
+        GroupField::Team => {
+            let mut groups: std::collections::BTreeMap<&str, Vec<&'a IssueWithDetails>> =
+                std::collections::BTreeMap::new();
+            for issue in issues {
+                groups.entry(&issue.team_key).or_default().push(issue);
+            }
+            groups
+                .into_iter()
+                .map(|(key, issues)| {
+                    let label = team_names
+                        .get(key)
+                        .cloned()
+                        .unwrap_or_else(|| key.to_string());
+                    (key.to_string(), label, issues)
+                })
+                .collect()
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group Dropdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dropdown for selecting the group-by field.
+///
+/// Clicking an option calls `on_change` with the new field. The active field
+/// shows a checkmark; the trigger shows the current grouping label.
+#[component]
+pub fn GroupDropdown(
+    /// Current group field.
+    #[prop(into)]
+    field: Signal<GroupField>,
+    /// Called when the user changes the group field.
+    on_change: Callback<GroupField>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Display: "Group: Team" or just the default label.
+    let display = Memo::new(move |_| {
+        let f = field.get();
+        match f {
+            GroupField::None => None,
+            _ => Some(f.label().to_string()),
+        }
+    });
+
+    view! {
+        <div node_ref=trigger_ref>
+            <DropdownTrigger
+                label="Group"
+                value=Signal::derive(move || display.get())
+                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
+            />
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+        >
+            {GroupField::ALL.iter().map(|group_field| {
+                let gf = *group_field;
+                let label = gf.label().to_string();
+                view! {
+                    <DropdownItem
+                        label=label
+                        selected=Signal::derive(move || field.get() == gf)
+                        on_select=Callback::new(move |()| {
+                            on_change.run(gf);
+                            set_open.set(false);
+                        })
+                    />
+                }
+            }).collect_view()}
+        </DropdownMenu>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Status Filter Dropdown
 // ─────────────────────────────────────────────────────────────────────────────
 
