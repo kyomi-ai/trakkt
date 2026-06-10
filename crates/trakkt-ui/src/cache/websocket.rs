@@ -137,11 +137,17 @@ impl WebSocketClient {
     ///
     /// Closes the existing connection and opens a new one with the provided
     /// credentials. The `on_message` callback is preserved across reconnects.
+    ///
+    /// Any pending auto-reconnect timeout is cancelled to prevent duplicate
+    /// connections racing against this explicit reconnect.
     pub fn reconnect(&self, user_id: &str, workspace_id: &str, token: &str) {
         let state = self.inner.with_value(|handle| handle.state.clone());
         let conn_state = self.connection_state.clone();
 
         // Close existing connection without triggering auto-reconnect.
+        // Cancel any pending reconnect timeout to prevent it from racing
+        // against this explicit reconnect (the root cause of cross-browser
+        // sync getting stuck).
         {
             let mut s = state.borrow_mut();
             if let Some(ref ws) = s.ws {
@@ -154,6 +160,7 @@ impl WebSocketClient {
             s._closures.clear();
             s.connecting = false;
             s.reconnect_attempts = 0;
+            s.reconnect_timeout = None;
         }
 
         do_connect(state, conn_state, user_id, workspace_id, token);
@@ -183,30 +190,44 @@ fn build_ws_url(user_id: &str, workspace_id: &str, token: &str) -> Result<String
     ))
 }
 
+/// Create a `WebSocketClient` handle without connecting.
+///
+/// The returned client can be used with [`connect_client`] to establish the
+/// actual WebSocket connection. This two-step creation allows registering the
+/// sync engine and providing context before the connection is opened.
+pub fn new_client() -> WebSocketClient {
+    let connection_state = ArcRwSignal::new(ConnectionState::Disconnected);
+    let state = Rc::new(RefCell::new(WsState::new()));
+
+    WebSocketClient {
+        inner: StoredValue::new(SendWrapper::new(WsHandle {
+            state: state.clone(),
+        })),
+        connection_state,
+    }
+}
+
+/// Connect a previously created `WebSocketClient` to the server.
+///
+/// Wires up event handlers for open, message, error, and close. On close,
+/// schedules automatic reconnection with exponential backoff unless
+/// `disconnect()` was called intentionally.
+pub fn connect_client(client: &WebSocketClient, user_id: &str, workspace_id: &str, token: &str) {
+    let state = client.inner.with_value(|handle| handle.state.clone());
+    let conn_state = client.connection_state.clone();
+
+    web_sys::console::log_1(&format!("[trakkt-sync] connect_client({user_id}, {workspace_id})").into());
+    do_connect(state, conn_state, user_id, workspace_id, token);
+}
+
 /// Connect to the WebSocket server and return a client handle.
 ///
 /// Wires up event handlers for open, message, error, and close. On close,
 /// schedules automatic reconnection with exponential backoff unless
 /// `disconnect()` was called intentionally.
 pub fn connect(user_id: &str, workspace_id: &str, token: &str) -> WebSocketClient {
-    web_sys::console::log_1(&format!("[trakkt-sync] connect({user_id}, {workspace_id})").into());
-    let connection_state = ArcRwSignal::new(ConnectionState::Disconnected);
-    let state = Rc::new(RefCell::new(WsState::new()));
-
-    let client = WebSocketClient {
-        inner: StoredValue::new(SendWrapper::new(WsHandle {
-            state: state.clone(),
-        })),
-        connection_state: connection_state.clone(),
-    };
-
-    let uid = user_id.to_owned();
-    let wid = workspace_id.to_owned();
-    let tok = token.to_owned();
-
-    web_sys::console::log_1(&"[trakkt-sync] calling do_connect".into());
-    do_connect(state, connection_state, &uid, &wid, &tok);
-
+    let client = new_client();
+    connect_client(&client, user_id, workspace_id, token);
     client
 }
 
