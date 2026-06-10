@@ -29,12 +29,14 @@ use crate::server_fns::projects::{
     create_milestone, update_milestone, delete_milestone,
     list_project_updates, create_project_update,
     update_project,
+    list_project_members, add_project_member, remove_project_member,
 };
 use crate::server_fns::issues::list_issues;
 use crate::server_fns::team::list_workspace_members;
 use crate::types::IssueNavState;
 use crate::utils::date::{format_date, format_short_date};
-use trakkt_types::models::{IssueWithDetails, Project, ProjectMilestone, ProjectProgress, ProjectUpdate};
+use crate::types::WorkspaceMember;
+use trakkt_types::models::{IssueWithDetails, Project, ProjectMember, ProjectMilestone, ProjectProgress, ProjectUpdate};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Project Detail Page
@@ -108,6 +110,11 @@ pub fn ProjectDetailPage() -> impl IntoView {
     let server_updates = Resource::new(
         move || project_id.get(),
         move |id| async move { list_project_updates(id).await },
+    );
+
+    let server_members = Resource::new(
+        move || project_id.get(),
+        move |id| async move { list_project_members(id).await },
     );
 
     // Resolve the project from SyncStore or server function.
@@ -222,6 +229,14 @@ pub fn ProjectDetailPage() -> impl IntoView {
                                 }
                                 None => Vec::new(),
                             };
+                            let members = match server_members.get() {
+                                Some(Ok(v)) => v,
+                                Some(Err(e)) => {
+                                    leptos::logging::warn!("Failed to load project members: {e}");
+                                    Vec::new()
+                                }
+                                None => Vec::new(),
+                            };
                             view! {
                                 <ProjectDetailContent
                                     project=project
@@ -231,6 +246,8 @@ pub fn ProjectDetailPage() -> impl IntoView {
                                     server_milestones=server_milestones
                                     updates=updates
                                     server_updates=server_updates
+                                    members=members
+                                    server_members=server_members
                                     active_view=active_view
                                     project_id=project_id
                                 />
@@ -279,6 +296,8 @@ fn ProjectDetailContent(
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
     updates: Vec<ProjectUpdate>,
     server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
+    members: Vec<ProjectMember>,
+    server_members: Resource<Result<Vec<ProjectMember>, ServerFnError>>,
     /// The currently active view tab: "overview", "board", or "list".
     #[prop(into)]
     active_view: Memo<String>,
@@ -631,6 +650,14 @@ fn ProjectDetailContent(
                 project_id=project.project_id.clone()
                 updates=updates
                 server_updates=server_updates
+            />
+
+            // ── Members ──────────────────────────────────────────────────
+            <ProjectMembersSection
+                project_id=project.project_id.clone()
+                members=members
+                server_members=server_members
+                workspace_members=members_resource
             />
 
             // ── Divider ───────────────────────────────────────────────────
@@ -1262,6 +1289,257 @@ fn PostUpdateForm(
                 </Button>
             </div>
         </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Project Members Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Project members section — lists project members with role display,
+/// inline add-member flow, and remove-member with confirmation.
+///
+/// Follows the same section pattern as `MilestoneSection` and
+/// `HealthUpdateSection`: heading + list + add button/form.
+#[component]
+fn ProjectMembersSection(
+    project_id: String,
+    members: Vec<ProjectMember>,
+    server_members: Resource<Result<Vec<ProjectMember>, ServerFnError>>,
+    workspace_members: Resource<Result<Vec<WorkspaceMember>, ServerFnError>>,
+) -> impl IntoView {
+    // ── State signals ──────────────────────────────────────────────────────
+    let adding_member: RwSignal<bool> = RwSignal::new(false);
+    let removing_member_id: RwSignal<Option<String>> = RwSignal::new(None);
+
+    let has_members = !members.is_empty();
+    let pid = StoredValue::new(project_id.clone());
+    let initial_members = StoredValue::new(members);
+
+    // Refetch callback used after mutations.
+    let refetch = move || server_members.refetch();
+
+    // ── Resolve workspace member display name by user_id ──────────────────
+    let resolve_name = move |user_id: &str| -> String {
+        match workspace_members.get() {
+            Some(Ok(ws_members)) => {
+                ws_members
+                    .iter()
+                    .find(|m| m.user_id == user_id)
+                    .map(|m| m.name.clone().unwrap_or_else(|| m.email.clone()))
+                    .unwrap_or_else(|| user_id.to_string())
+            }
+            _ => user_id.to_string(),
+        }
+    };
+
+    // ── Delete confirmation ────────────────────────────────────────────────
+    let delete_dialog_open = Signal::derive(move || removing_member_id.get().is_some());
+
+    let on_confirm_remove = {
+        Callback::new(move |()| {
+            if let Some(uid) = removing_member_id.get_untracked() {
+                removing_member_id.set(None);
+                let project_id = pid.get_value();
+                leptos::task::spawn_local(async move {
+                    if let Err(e) = remove_project_member(project_id, uid).await {
+                        leptos::logging::warn!("Failed to remove project member: {e}");
+                    }
+                    refetch();
+                });
+            }
+        })
+    };
+
+    let on_cancel_remove = Callback::new(move |()| {
+        removing_member_id.set(None);
+    });
+
+    // ── Role change handler ───────────────────────────────────────────────
+    // Since there is no update_role endpoint, changing a role requires
+    // removing and re-adding the member with the new role.
+    let on_role_change = move |user_id: String, new_role: String| {
+        let project_id = pid.get_value();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = remove_project_member(project_id.clone(), user_id.clone()).await {
+                leptos::logging::warn!("Failed to remove member for role change: {e}");
+                return;
+            }
+            if let Err(e) = add_project_member(project_id, user_id, new_role).await {
+                leptos::logging::warn!("Failed to re-add member with new role: {e}");
+            }
+            refetch();
+        });
+    };
+
+    // ── Add member handler ────────────────────────────────────────────────
+    let add_member_value: RwSignal<String> = RwSignal::new(String::new());
+
+    // Options for the add-member Select: workspace members not already in
+    // the project.
+    let add_member_options = Signal::derive(move || {
+        let current_members: Vec<String> = match server_members.get() {
+            Some(Ok(pm)) => pm.iter().map(|m| m.user_id.clone()).collect(),
+            _ => initial_members.get_value().iter().map(|m| m.user_id.clone()).collect(),
+        };
+        let mut opts = vec![("".to_string(), "Select a member...".to_string())];
+        if let Some(Ok(ws_members)) = workspace_members.get() {
+            for m in ws_members {
+                if !current_members.contains(&m.user_id) {
+                    let label = m.name.unwrap_or_else(|| m.email.clone());
+                    opts.push((m.user_id, label));
+                }
+            }
+        }
+        opts
+    });
+
+    let on_add_member_select = Callback::new(move |selected_user_id: String| {
+        if selected_user_id.is_empty() {
+            return;
+        }
+        add_member_value.set(String::new());
+        adding_member.set(false);
+        let project_id = pid.get_value();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = add_project_member(project_id, selected_user_id, "member".to_string()).await {
+                leptos::logging::warn!("Failed to add project member: {e}");
+            }
+            refetch();
+        });
+    });
+
+    // ── Role options for the per-row Select ───────────────────────────────
+    let role_options: Signal<Vec<(String, String)>> = Signal::derive(|| vec![
+        ("member".to_string(), "Member".to_string()),
+        ("lead".to_string(), "Lead".to_string()),
+    ]);
+
+    let members_for_view = initial_members.get_value();
+
+    view! {
+        <div class="mt-6">
+            <h3 class="text-sm font-medium text-foreground mb-3">"Members"</h3>
+
+            // ── Member rows ──────────────────────────────────────────────
+            {if has_members {
+                Some(view! {
+                    <div class="flex flex-col">
+                        {members_for_view.iter().map(|member| {
+                            let uid_remove = member.user_id.clone();
+                            let uid_role = member.user_id.clone();
+                            let member_name = resolve_name(&member.user_id);
+                            let role_value = RwSignal::new(member.role.clone());
+
+                            view! {
+                                <div class="flex items-center gap-2 py-1.5 border-b border-border group">
+                                    // Member name
+                                    <span class="text-sm text-foreground flex-1 truncate">
+                                        {member_name}
+                                    </span>
+
+                                    // Role selector
+                                    <div class="w-28">
+                                        <Select
+                                            value=Signal::derive(move || role_value.get())
+                                            options=role_options
+                                            on_change={
+                                                Callback::new(move |new_role: String| {
+                                                    let old_role = role_value.get_untracked();
+                                                    if new_role == old_role {
+                                                        return;
+                                                    }
+                                                    on_role_change(uid_role.clone(), new_role);
+                                                })
+                                            }
+                                            variant=SelectVariant::Form
+                                        />
+                                    </div>
+
+                                    // Remove button
+                                    <span class="opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                                        <Button
+                                            variant=ButtonVariant::GhostMuted
+                                            size=ButtonSize::IconXs
+                                            aria_label="Remove member"
+                                            on:click=move |_| {
+                                                removing_member_id.set(Some(uid_remove.clone()));
+                                            }
+                                        >
+                                            <Icon icon=phosphor_leptos::X size="14px"/>
+                                        </Button>
+                                    </span>
+                                </div>
+                            }
+                        }).collect_view()}
+                    </div>
+                })
+            } else {
+                None
+            }}
+
+            // ── Empty state ──────────────────────────────────────────────
+            {if !has_members {
+                Some(view! {
+                    <p class="text-sm text-muted-foreground/60 italic">"No members added yet"</p>
+                })
+            } else {
+                None
+            }}
+
+            // ── Add member form / button ─────────────────────────────────
+            <Show
+                when=move || adding_member.get()
+                fallback=move || {
+                    view! {
+                        <div class={if has_members { "mt-2" } else { "mt-1" }}>
+                            <Button
+                                variant=ButtonVariant::GhostMuted
+                                size=ButtonSize::Sm
+                                on:click=move |_| adding_member.set(true)
+                            >
+                                <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                                "Add member"
+                            </Button>
+                        </div>
+                    }
+                }
+            >
+                <div class="mt-2 flex items-center gap-2">
+                    <div class="w-56">
+                        <Select
+                            value=Signal::derive(move || add_member_value.get())
+                            options=add_member_options
+                            on_change=on_add_member_select
+                            variant=SelectVariant::Form
+                            placeholder="Select a member..."
+                            search_placeholder="Search members..."
+                        />
+                    </div>
+                    <Button
+                        variant=ButtonVariant::GhostMuted
+                        size=ButtonSize::Sm
+                        on:click=move |_| {
+                            add_member_value.set(String::new());
+                            adding_member.set(false);
+                        }
+                    >
+                        "Cancel"
+                    </Button>
+                </div>
+            </Show>
+        </div>
+
+        // ── Remove confirmation dialog ──────────────────────────────────
+        <ConfirmDialog
+            open=delete_dialog_open
+            title="Remove member?"
+            message="This will remove the member from this project."
+            confirm_text="Remove"
+            destructive=true
+            on_confirm=on_confirm_remove
+            on_cancel=on_cancel_remove
+        />
     }
 }
 
