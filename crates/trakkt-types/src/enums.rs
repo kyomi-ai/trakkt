@@ -103,13 +103,15 @@ impl std::fmt::Display for Priority {
 /// How a user-attributable action was initiated.
 ///
 /// Tracks whether an action came from a browser session (`User`), an automated
-/// agent such as MCP or OAuth (`Agent`), or a bare API token (`Api`).
+/// agent such as MCP or OAuth (`Agent`), a bare API token (`Api`), or a GitHub
+/// webhook event such as a commit or pull request (`Github`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ActionSource {
     User,
     Agent,
     Api,
+    Github,
 }
 
 impl ActionSource {
@@ -118,6 +120,7 @@ impl ActionSource {
             Self::User => "user",
             Self::Agent => "agent",
             Self::Api => "api",
+            Self::Github => "github",
         }
     }
 }
@@ -136,6 +139,7 @@ impl std::str::FromStr for ActionSource {
             "user" => Ok(Self::User),
             "agent" => Ok(Self::Agent),
             "api" => Ok(Self::Api),
+            "github" => Ok(Self::Github),
             other => Err(format!("unknown action source: {other}")),
         }
     }

@@ -8,7 +8,10 @@
 
 use std::collections::HashSet;
 
+use trakkt_auth::activity_service::ActivityRecorder;
+use trakkt_auth::websocket::WebSocketManager;
 use trakkt_core::DbPool;
+use trakkt_types::enums::ActionSource;
 
 use crate::patterns::{self, IssueRef};
 use crate::schema::{self, CreateLinkParams, GitHubInstallation};
@@ -27,6 +30,7 @@ pub async fn process_pull_request(
     installation: &GitHubInstallation,
     action: &str,
     payload: &serde_json::Value,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let pr = match payload.get("pull_request") {
         Some(pr) => pr,
@@ -72,6 +76,7 @@ pub async fn process_pull_request(
     };
 
     let author = pr.pointer("/user/login").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let base_branch = pr.pointer("/base/ref").and_then(|v| v.as_str()).map(|s| s.to_string());
     // GitHub omits these fields or sets them to null for some event types — false is the correct default.
     let merged = pr.get("merged").and_then(|v| v.as_bool()).unwrap_or(false);
     let draft = pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -169,6 +174,45 @@ pub async fn process_pull_request(
         }
     }
 
+    // ── Record PR activities (best-effort) ────────────────────────────────
+
+    if let Some(activity_type) = pr_activity_type(action, merged) {
+        // PR payloads carry no author email, so we cannot resolve a Trakkt
+        // user; the author login is surfaced via metadata instead.
+        let meta = serde_json::json!({
+            "pr_number": pr_number,
+            "pr_title": title,
+            "state": pr_state,
+            "author_login": author,
+            "url": html_url,
+            "base_branch": base_branch,
+        });
+
+        let recorder = ActivityRecorder::new_with_optional_actor(
+            db,
+            &installation.workspace_id,
+            None,
+            ActionSource::Github,
+            Some("GitHub".to_string()),
+            ws_manager,
+        );
+
+        let mut recorded: HashSet<&str> = HashSet::new();
+        for issue_id in &valid_issue_ids {
+            if !recorded.insert(issue_id.as_str()) {
+                continue;
+            }
+            if let Err(e) = recorder.record(issue_id, activity_type, Some(&meta)).await {
+                tracing::warn!(
+                    error = %e,
+                    issue_id = %issue_id,
+                    activity_type = %activity_type,
+                    "Failed to record pull_request activity"
+                );
+            }
+        }
+    }
+
     tracing::info!(
         pr_number = pr_number,
         repo = %repo,
@@ -192,6 +236,7 @@ pub async fn process_push(
     db: &DbPool,
     installation: &GitHubInstallation,
     payload: &serde_json::Value,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // ── Extract branch name ───────────────────────────────────────────────
 
@@ -221,6 +266,7 @@ pub async fn process_push(
     let branch_refs = patterns::extract_issue_refs(&branch_name);
     let branch_url = format!("https://github.com/{repo}/tree/{branch_name}");
     let mut total_branch_links: usize = 0;
+    let mut branch_issue_ids: Vec<String> = Vec::new();
 
     for issue_ref in &branch_refs {
         if let Some(issue) =
@@ -246,6 +292,50 @@ pub async fn process_push(
             )
             .await?;
             total_branch_links += 1;
+            branch_issue_ids.push(issue.issue_id);
+        }
+    }
+
+    // ── Record branch_created activities (best-effort) ────────────────────
+    //
+    // Only when this push actually created the branch (`created == true`).
+    if payload.get("created").and_then(|v| v.as_bool()).unwrap_or(false)
+        && !branch_issue_ids.is_empty()
+    {
+        // The pusher (GitHub actor) login — no email is available, so the
+        // actor stays unresolved and the login is surfaced via metadata.
+        let pusher_login = payload
+            .pointer("/sender/login")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let meta = serde_json::json!({
+            "branch": branch_name,
+            "url": branch_url,
+            "author_login": pusher_login,
+        });
+
+        let recorder = ActivityRecorder::new_with_optional_actor(
+            db,
+            &installation.workspace_id,
+            None,
+            ActionSource::Github,
+            Some("GitHub".to_string()),
+            ws_manager,
+        );
+
+        let mut recorded: HashSet<&str> = HashSet::new();
+        for issue_id in &branch_issue_ids {
+            if !recorded.insert(issue_id.as_str()) {
+                continue;
+            }
+            if let Err(e) = recorder.record(issue_id, "branch_created", Some(&meta)).await {
+                tracing::warn!(
+                    error = %e,
+                    issue_id = %issue_id,
+                    "Failed to record branch_created activity"
+                );
+            }
         }
     }
 
@@ -260,6 +350,9 @@ pub async fn process_push(
     };
 
     let mut total_commit_links: usize = 0;
+    // (issue_id, commit) pairs in push order, used to aggregate one
+    // `commit_pushed` activity per issue after the link loop.
+    let mut issue_commits: Vec<(String, CommitInfo)> = Vec::new();
 
     for commit in commits {
         let message = match commit.get("message").and_then(|v| v.as_str()) {
@@ -279,6 +372,10 @@ pub async fn process_push(
 
         let author_login = commit
             .pointer("/author/username")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let author_email = commit
+            .pointer("/author/email")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
@@ -314,7 +411,49 @@ pub async fn process_push(
                 .await?;
 
                 total_commit_links += 1;
+                issue_commits.push((
+                    issue.issue_id,
+                    CommitInfo {
+                        sha: sha.clone(),
+                        message: commit_title.to_string(),
+                        url: url.clone(),
+                        author_login: author_login.clone(),
+                        author_email: author_email.clone(),
+                    },
+                ));
             }
+        }
+    }
+
+    // ── Record commit_pushed activities (best-effort, one per issue) ──────
+
+    let grouped = group_commit_activities(issue_commits);
+    for (issue_id, agg) in grouped {
+        let actor = resolve_author_actor(db, agg.head.author_email.as_deref()).await;
+        let meta = serde_json::json!({
+            "commit_sha": agg.head.sha,
+            "commit_message": agg.head.message,
+            "branch": branch_name,
+            "author_login": agg.head.author_login,
+            "url": agg.head.url,
+            "commit_count": agg.count,
+        });
+
+        let recorder = ActivityRecorder::new_with_optional_actor(
+            db,
+            &installation.workspace_id,
+            actor.as_deref(),
+            ActionSource::Github,
+            Some("GitHub".to_string()),
+            ws_manager,
+        );
+
+        if let Err(e) = recorder.record(&issue_id, "commit_pushed", Some(&meta)).await {
+            tracing::warn!(
+                error = %e,
+                issue_id = %issue_id,
+                "Failed to record commit_pushed activity"
+            );
         }
     }
 
@@ -333,6 +472,77 @@ pub async fn process_push(
 // ===========================================================================
 // Helpers
 // ===========================================================================
+
+/// Per-commit fields needed to record a `commit_pushed` activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitInfo {
+    sha: String,
+    /// First line of the commit message.
+    message: String,
+    url: String,
+    author_login: Option<String>,
+    author_email: Option<String>,
+}
+
+/// Aggregated commit activity for a single issue: a count plus the head
+/// (last-pushed) commit, which represents the group in the activity feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitActivityAgg {
+    count: usize,
+    head: CommitInfo,
+}
+
+/// Group `(issue_id, commit)` pairs into one aggregate per issue.
+///
+/// Within each issue the commits are visited in push order, so the last one
+/// seen becomes the `head` and the total is the `count`. Issues are returned
+/// sorted by id for deterministic output (and testability).
+fn group_commit_activities(
+    issue_commits: Vec<(String, CommitInfo)>,
+) -> Vec<(String, CommitActivityAgg)> {
+    use std::collections::BTreeMap;
+
+    let mut grouped: BTreeMap<String, CommitActivityAgg> = BTreeMap::new();
+    for (issue_id, commit) in issue_commits {
+        grouped
+            .entry(issue_id)
+            .and_modify(|agg| {
+                agg.count += 1;
+                agg.head = commit.clone();
+            })
+            .or_insert(CommitActivityAgg {
+                count: 1,
+                head: commit,
+            });
+    }
+    grouped.into_iter().collect()
+}
+
+/// Map a pull_request action + merged flag to an activity type, if any.
+///
+/// Returns `None` for actions that should not produce an activity entry
+/// (e.g. `synchronize`, `edited`, `converted_to_draft`).
+fn pr_activity_type(action: &str, merged: bool) -> Option<&'static str> {
+    match action {
+        "opened" | "ready_for_review" | "reopened" => Some("pr_opened"),
+        "closed" if merged => Some("pr_merged"),
+        "closed" => Some("pr_closed"),
+        _ => None,
+    }
+}
+
+/// Resolve a GitHub author email to a Trakkt user id, if one matches.
+async fn resolve_author_actor(db: &DbPool, email: Option<&str>) -> Option<String> {
+    let email = email?;
+    match trakkt_auth::user_service::get_user_by_email(db, email).await {
+        Ok(Some(u)) => Some(u.user_id),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to resolve GitHub author email to user");
+            None
+        }
+    }
+}
 
 /// Determine the PR state string from the webhook action and PR flags.
 fn determine_pr_state(action: &str, merged: bool, draft: bool) -> String {
@@ -451,5 +661,106 @@ mod tests {
             determine_pr_state("converted_to_draft", false, true),
             "draft"
         );
+    }
+
+    // ── pr_activity_type ──────────────────────────────────────────────────
+
+    #[test]
+    fn pr_activity_opened() {
+        assert_eq!(pr_activity_type("opened", false), Some("pr_opened"));
+    }
+
+    #[test]
+    fn pr_activity_ready_for_review() {
+        assert_eq!(pr_activity_type("ready_for_review", false), Some("pr_opened"));
+    }
+
+    #[test]
+    fn pr_activity_reopened() {
+        assert_eq!(pr_activity_type("reopened", false), Some("pr_opened"));
+    }
+
+    #[test]
+    fn pr_activity_closed_merged() {
+        assert_eq!(pr_activity_type("closed", true), Some("pr_merged"));
+    }
+
+    #[test]
+    fn pr_activity_closed_not_merged() {
+        assert_eq!(pr_activity_type("closed", false), Some("pr_closed"));
+    }
+
+    #[test]
+    fn pr_activity_synchronize_is_none() {
+        assert_eq!(pr_activity_type("synchronize", false), None);
+    }
+
+    #[test]
+    fn pr_activity_edited_is_none() {
+        assert_eq!(pr_activity_type("edited", false), None);
+    }
+
+    #[test]
+    fn pr_activity_converted_to_draft_is_none() {
+        assert_eq!(pr_activity_type("converted_to_draft", false), None);
+    }
+
+    // ── group_commit_activities ───────────────────────────────────────────
+
+    fn commit(sha: &str) -> CommitInfo {
+        CommitInfo {
+            sha: sha.to_string(),
+            message: format!("message for {sha}"),
+            url: format!("https://github.com/o/r/commit/{sha}"),
+            author_login: Some("octocat".to_string()),
+            author_email: Some("octocat@example.com".to_string()),
+        }
+    }
+
+    #[test]
+    fn group_commits_single() {
+        let grouped = group_commit_activities(vec![("ISS-1".to_string(), commit("aaa"))]);
+        assert_eq!(grouped.len(), 1);
+        let (issue_id, agg) = &grouped[0];
+        assert_eq!(issue_id, "ISS-1");
+        assert_eq!(agg.count, 1);
+        assert_eq!(agg.head.sha, "aaa");
+    }
+
+    #[test]
+    fn group_commits_multiple_same_issue_uses_head() {
+        let grouped = group_commit_activities(vec![
+            ("ISS-1".to_string(), commit("aaa")),
+            ("ISS-1".to_string(), commit("bbb")),
+            ("ISS-1".to_string(), commit("ccc")),
+        ]);
+        assert_eq!(grouped.len(), 1);
+        let (_, agg) = &grouped[0];
+        assert_eq!(agg.count, 3);
+        // Head is the last commit pushed for the issue.
+        assert_eq!(agg.head.sha, "ccc");
+    }
+
+    #[test]
+    fn group_commits_across_issues() {
+        let grouped = group_commit_activities(vec![
+            ("ISS-2".to_string(), commit("aaa")),
+            ("ISS-1".to_string(), commit("bbb")),
+            ("ISS-2".to_string(), commit("ccc")),
+        ]);
+        // Sorted by issue id for determinism.
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0, "ISS-1");
+        assert_eq!(grouped[0].1.count, 1);
+        assert_eq!(grouped[0].1.head.sha, "bbb");
+        assert_eq!(grouped[1].0, "ISS-2");
+        assert_eq!(grouped[1].1.count, 2);
+        assert_eq!(grouped[1].1.head.sha, "ccc");
+    }
+
+    #[test]
+    fn group_commits_empty() {
+        let grouped = group_commit_activities(vec![]);
+        assert!(grouped.is_empty());
     }
 }
