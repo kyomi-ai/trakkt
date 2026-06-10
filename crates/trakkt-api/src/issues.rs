@@ -224,8 +224,13 @@ pub async fn get_issue(
     let activities = activity_service::list_issue_activities(ctx.db, &issue.issue_id).await?;
     let relations = relation_service::list_relations_for_issue(ctx.db, &issue.issue_id, &ctx.workspace_id).await?;
 
+    let mut issue_value = serde_json::to_value(&issue)?;
+    if let serde_json::Value::Object(ref mut map) = issue_value {
+        map.insert("key".to_string(), serde_json::Value::String(format!("{}-{}", issue.team_key, issue.number)));
+    }
+
     let result = json!({
-        "issue": issue,
+        "issue": issue_value,
         "comments": comments,
         "activities": activities,
         "relations": relations
@@ -289,20 +294,20 @@ pub async fn create_issue(
     ctx: &ApiCtx<'_>,
     params: CreateIssueApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let resolved_team_id = match resolve_team(
-        ctx.db,
-        &ctx.workspace_id,
-        params.team_key.as_deref(),
-        params.team_id.as_deref(),
-    )
-    .await?
-    {
-        Some(id) => id,
-        None => {
-            let default_team =
-                team_service::get_default_team(ctx.db, &ctx.workspace_id).await?;
-            default_team.team_id
-        }
+    let (resolved_team_id, resolved_team_key) = if let Some(ref key) = params.team_key {
+        let team = team_service::get_team_by_key(ctx.db, &ctx.workspace_id, key)
+            .await?
+            .ok_or_else(|| ApiError::BadRequest(format!("No team found with key '{key}'")))?;
+        (team.team_id, team.key)
+    } else if let Some(ref id) = params.team_id {
+        let team = team_service::get_team(ctx.db, id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("team {id} not found")))?;
+        (team.team_id, team.key)
+    } else {
+        let default_team =
+            team_service::get_default_team(ctx.db, &ctx.workspace_id).await?;
+        (default_team.team_id, default_team.key)
     };
 
     let label_ids: Vec<String> = params.labels.unwrap_or_default();
@@ -365,6 +370,7 @@ pub async fn create_issue(
 
     let mut response = serde_json::to_value(&issue)?;
     if let serde_json::Value::Object(ref mut map) = response {
+        map.insert("key".to_string(), serde_json::Value::String(format!("{}-{}", resolved_team_key, issue.number)));
         if !relations_created.is_empty() {
             map.insert("relations_created".to_string(), serde_json::Value::Array(relations_created));
         }
@@ -525,7 +531,11 @@ pub async fn update_issue(
         );
     }
 
-    Ok(serde_json::to_value(&updated)?)
+    let mut response = serde_json::to_value(&updated)?;
+    if let serde_json::Value::Object(ref mut map) = response {
+        map.insert("key".to_string(), serde_json::Value::String(format!("{}-{}", updated.team_key, updated.number)));
+    }
+    Ok(response)
 }
 
 /// Permanently delete an issue.
