@@ -25,6 +25,8 @@ pub async fn list_notifications(
     notification_type: Option<String>,
     team_key: Option<String>,
     search: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 ) -> Result<Vec<Notification>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let notifications = trakkt_auth::notification_service::list_notifications(
@@ -35,10 +37,36 @@ pub async fn list_notifications(
         notification_type.as_deref(),
         team_key.as_deref(),
         search.as_deref(),
+        limit.unwrap_or(trakkt_auth::notification_service::DEFAULT_NOTIFICATION_LIMIT),
+        offset.unwrap_or(0),
     )
     .await
     .into_sfn()?;
     Ok(notifications)
+}
+
+/// Count notifications matching the given filters (for pagination).
+#[server(prefix = "/leptos-api")]
+pub async fn count_notifications(
+    unread_only: bool,
+    deleted_only: Option<bool>,
+    notification_type: Option<String>,
+    team_key: Option<String>,
+    search: Option<String>,
+) -> Result<i64, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let count = trakkt_auth::notification_service::count_notifications(
+        ac.db(),
+        &ac.auth.user_id,
+        unread_only,
+        deleted_only.unwrap_or(false),
+        notification_type.as_deref(),
+        team_key.as_deref(),
+        search.as_deref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(count)
 }
 
 /// Count unread notifications for the current user.

@@ -15,7 +15,7 @@ use trakkt_types::sync::{SyncActionType, entity_types};
 use crate::sync_log_service;
 use crate::websocket::WebSocketManager;
 
-const DEFAULT_NOTIFICATION_LIMIT: i64 = 50;
+pub const DEFAULT_NOTIFICATION_LIMIT: i64 = 50;
 
 pub const TYPE_COMMENTED: &str = "commented";
 pub const TYPE_STATUS_CHANGED: &str = "status_changed";
@@ -179,6 +179,8 @@ pub async fn list_notifications(
     notification_type: Option<&str>,
     team_key: Option<&str>,
     search: Option<&str>,
+    limit: i64,
+    offset: i64,
 ) -> trakkt_core::Result<Vec<Notification>> {
     let is_pg = db.is_postgres();
     let cast_text = if is_pg { "::TEXT" } else { "" };
@@ -217,7 +219,7 @@ pub async fn list_notifications(
            AND ($4{cast_text} IS NULL OR i.title LIKE $4 ESCAPE '\\' \
                 OR (t.key || '-' || CAST(i.number AS TEXT)) LIKE $4 ESCAPE '\\') \
          ORDER BY n.created_at DESC \
-         LIMIT {DEFAULT_NOTIFICATION_LIMIT}"
+         LIMIT {limit} OFFSET {offset}"
     );
 
     // Prepare the search term with wildcards, escaping LIKE special chars.
@@ -239,6 +241,69 @@ pub async fn list_notifications(
         search_pattern.as_deref()
     )?;
     Ok(rows.into_iter().map(NotificationRow::into_dto).collect())
+}
+
+/// Count notifications matching the given filters.
+///
+/// Uses the same WHERE conditions as `list_notifications` but returns
+/// only the total count. Useful for pagination.
+pub async fn count_notifications(
+    db: &DbPool,
+    user_id: &str,
+    unread_only: bool,
+    deleted_only: bool,
+    notification_type: Option<&str>,
+    team_key: Option<&str>,
+    search: Option<&str>,
+) -> trakkt_core::Result<i64> {
+    let is_pg = db.is_postgres();
+    let cast_text = if is_pg { "::TEXT" } else { "" };
+
+    let unread_filter = if unread_only {
+        let bf = sql_compat::bool_false(is_pg);
+        format!("AND n.read = {bf}")
+    } else {
+        String::new()
+    };
+
+    let deleted_filter = if deleted_only {
+        "AND n.deleted_at IS NOT NULL".to_string()
+    } else {
+        "AND n.deleted_at IS NULL".to_string()
+    };
+
+    // $1 = user_id, $2 = notification_type, $3 = team_key, $4 = search pattern
+    let sql = format!(
+        "SELECT COUNT(*) \
+         FROM notifications n \
+         LEFT JOIN issues i ON i.issue_id = n.issue_id \
+         LEFT JOIN teams t ON t.team_id = i.team_id \
+         WHERE n.user_id = $1 {deleted_filter} {unread_filter} \
+           AND ($2{cast_text} IS NULL OR n.type = $2) \
+           AND ($3{cast_text} IS NULL OR t.key = $3) \
+           AND ($4{cast_text} IS NULL OR i.title LIKE $4 ESCAPE '\\' \
+                OR (t.key || '-' || CAST(i.number AS TEXT)) LIKE $4 ESCAPE '\\')"
+    );
+
+    // Prepare the search term with wildcards, escaping LIKE special chars.
+    let search_pattern = search.map(|s| {
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        format!("%{escaped}%")
+    });
+
+    let count: i64 = trakkt_core::db_fetch_scalar!(
+        db,
+        i64,
+        &sql,
+        user_id,
+        notification_type,
+        team_key,
+        search_pattern.as_deref()
+    )?;
+    Ok(count)
 }
 
 /// Mark a single notification as read. Verifies the user owns it.
