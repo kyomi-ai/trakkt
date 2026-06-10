@@ -30,6 +30,9 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 - Service errors propagate as `trakkt_core::Error` variants.
 - Server function errors convert via `IntoServerFnError` trait.
 
+### Double-Option (Clearable Fields)
+- `IssueUpdate` uses double-Option for clearable fields (`Option<Option<T>>`). `Some(None)` means "clear the field" (set to NULL), not "set the field". When checking if a field was set to a value, use `matches!(field, Some(Some(_)))`, not `.is_some()` — the latter fires on field-clear too.
+
 ### No Banned Patterns
 - No `#[allow(dead_code)]`, `#[allow(unused_variables)]`, `#[allow(unused_imports)]`
 - No `closure.forget()` on persistent listeners
@@ -45,6 +48,9 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 
 ### Layout
 - Never put `overflow-x-auto` on containers that have absolutely-positioned dropdown children — the overflow clipping hides the dropdown. Use `flex-wrap` or move the dropdown to a portal.
+
+### Reactive Primitives
+- Never create `signal()`, `RwSignal::new()`, or `Effect::new()` inside reactive rendering closures (`move || { ... }`). They reset on every re-render and leak. Hoist all reactive primitives to component setup level (outside the view closure).
 
 ### SSR / Hydration
 - Never use `Resource::new()` inside `#[cfg(target_arch = "wasm32")]` blocks (desyncs hydration IDs).
