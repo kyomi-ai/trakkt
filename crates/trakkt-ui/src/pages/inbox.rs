@@ -700,6 +700,8 @@ fn NotificationRow(
     let issue_number_for_label = notification.issue_number;
     let team_key_for_click = notification.team_key.clone();
     let issue_number_for_click = notification.issue_number;
+    let context_id_for_click = notification.context_id.clone();
+    let notification_type_for_click = notification.notification_type.clone();
 
     // Per-row action menu state
     let menu_open = RwSignal::new(false);
@@ -731,17 +733,35 @@ fn NotificationRow(
                 on_refetch.run(());
             });
         }
+        // Build the comment fragment suffix for "commented" notifications with a context_id.
+        let fragment = if notification_type_for_click == "commented" {
+            context_id_for_click.as_deref().map(|cid| format!("#comment-{cid}"))
+        } else {
+            None
+        };
         let href = {
             // Prefer data from the notification itself
             let from_notification = team_key_for_click.as_ref().and_then(|tk| {
-                issue_number_for_click.map(|num| format!("/issues/{tk}-{num}"))
+                issue_number_for_click.map(|num| {
+                    let base = format!("/issues/{tk}-{num}");
+                    match &fragment {
+                        Some(frag) => format!("{base}{frag}"),
+                        None => base,
+                    }
+                })
             });
             from_notification.or_else(|| {
                 sync_store.and_then(|store| {
                     store.issues().get_untracked()
                         .iter()
                         .find(|i| i.issue_id == issue_id_for_lookup)
-                        .map(|issue| format!("/issues/{}-{}", issue.team_key, issue.number))
+                        .map(|issue| {
+                            let base = format!("/issues/{}-{}", issue.team_key, issue.number);
+                            match &fragment {
+                                Some(frag) => format!("{base}{frag}"),
+                                None => base,
+                            }
+                        })
                 })
             })
         };

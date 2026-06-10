@@ -447,6 +447,7 @@ pub async fn create_relation(
                         issue_id,
                         crate::notification_service::TYPE_RELATION_ADDED,
                         Some(actor_id),
+                        None,
                         action_source,
                         action_source_label,
                         ws_manager,

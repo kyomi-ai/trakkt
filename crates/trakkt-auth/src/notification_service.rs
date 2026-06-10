@@ -52,6 +52,7 @@ struct NotificationRow {
     action_source_label: Option<String>,
     created_at: String,
     deleted_at: Option<String>,
+    context_id: Option<String>,
 }
 
 impl NotificationRow {
@@ -77,6 +78,7 @@ impl NotificationRow {
             action_source_label: self.action_source_label,
             created_at: self.created_at,
             deleted_at: self.deleted_at,
+            context_id: self.context_id,
         }
     }
 }
@@ -91,6 +93,7 @@ pub async fn create_notification(
     issue_id: &str,
     notification_type: &str,
     actor_id: Option<&str>,
+    context_id: Option<&str>,
     action_source: ActionSource,
     action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
@@ -102,8 +105,8 @@ pub async fn create_notification(
 
     let sql = format!(
         "INSERT INTO notifications \
-            (notification_id, workspace_id, user_id, issue_id, type, actor_id, action_source, action_source_label, read, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {bf}, {now})",
+            (notification_id, workspace_id, user_id, issue_id, type, actor_id, context_id, action_source, action_source_label, read, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, {bf}, {now})",
         bf = sql_compat::bool_false(is_pg),
     );
     trakkt_core::db_execute!(
@@ -115,6 +118,7 @@ pub async fn create_notification(
         issue_id,
         notification_type,
         actor_id,
+        context_id,
         action_source_str,
         action_source_label
     )?;
@@ -130,7 +134,8 @@ pub async fn create_notification(
                 u_actor.name AS actor_name, \
                 n.action_source, n.action_source_label, \
                 CAST(n.created_at AS TEXT) AS created_at, \
-                CAST(n.deleted_at AS TEXT) AS deleted_at \
+                CAST(n.deleted_at AS TEXT) AS deleted_at, \
+                n.context_id \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
          LEFT JOIN teams t ON t.team_id = i.team_id \
@@ -215,7 +220,8 @@ pub async fn list_notifications(
                 u_actor.name AS actor_name, \
                 n.action_source, n.action_source_label, \
                 CAST(n.created_at AS TEXT) AS created_at, \
-                CAST(n.deleted_at AS TEXT) AS deleted_at \
+                CAST(n.deleted_at AS TEXT) AS deleted_at, \
+                n.context_id \
          FROM notifications n \
          LEFT JOIN issues i ON i.issue_id = n.issue_id \
          LEFT JOIN teams t ON t.team_id = i.team_id \
