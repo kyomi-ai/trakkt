@@ -51,6 +51,7 @@ pub mod entity_types {
     pub const PROJECT_MILESTONE: &str = "project_milestone";
     pub const VIEW: &str = "view";
     pub const FAVORITE: &str = "favorite";
+    pub const RELEASE: &str = "release";
     pub const ISSUE_RELATION: &str = "issue_relation";
     pub const ATTACHMENT: &str = "attachment";
     pub const ISSUE_ATTACHMENT: &str = "issue_attachment";

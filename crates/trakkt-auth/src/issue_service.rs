@@ -40,6 +40,7 @@ struct IssueRow {
     updated_at: String,
     started_at: Option<String>,
     completed_at: Option<String>,
+    released_at: Option<String>,
 }
 
 impl IssueRow {
@@ -64,6 +65,7 @@ impl IssueRow {
             updated_at: self.updated_at,
             started_at: self.started_at,
             completed_at: self.completed_at,
+            released_at: self.released_at,
         }
     }
 }
@@ -98,6 +100,7 @@ struct IssueDetailRow {
     updated_at: String,
     started_at: Option<String>,
     completed_at: Option<String>,
+    released_at: Option<String>,
     archived_at: Option<String>,
     has_children: i32,
     is_blocked: i32,
@@ -135,6 +138,7 @@ impl IssueDetailRow {
             updated_at: self.updated_at,
             started_at: self.started_at,
             completed_at: self.completed_at,
+            released_at: self.released_at,
             archived_at: self.archived_at,
             has_children: self.has_children != 0,
             is_blocked: self.is_blocked != 0,
@@ -169,6 +173,7 @@ const ISSUE_DETAIL_SELECT: &str = "\
            CAST(i.updated_at AS TEXT) AS updated_at, \
            CAST(i.started_at AS TEXT) AS started_at, \
            CAST(i.completed_at AS TEXT) AS completed_at, \
+           CAST(i.released_at AS TEXT) AS released_at, \
            CAST(i.archived_at AS TEXT) AS archived_at, \
            (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 WHERE r2.source_issue_id = i.issue_id AND r2.relation_type = 'parent') THEN 1 ELSE 0 END) AS has_children, \
            (SELECT CASE WHEN EXISTS (SELECT 1 FROM issue_relations r2 \
@@ -354,7 +359,8 @@ pub async fn create_issue(
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at, \
                 CAST(started_at AS TEXT) AS started_at, \
-                CAST(completed_at AS TEXT) AS completed_at \
+                CAST(completed_at AS TEXT) AS completed_at, \
+                CAST(released_at AS TEXT) AS released_at \
          FROM issues WHERE issue_id = $1",
         &issue_id
     )?;
@@ -818,7 +824,8 @@ pub async fn update_issue(
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at, \
                 CAST(started_at AS TEXT) AS started_at, \
-                CAST(completed_at AS TEXT) AS completed_at \
+                CAST(completed_at AS TEXT) AS completed_at, \
+                CAST(released_at AS TEXT) AS released_at \
          FROM issues WHERE issue_id = $1",
         &issue_id
     )?;
@@ -971,7 +978,8 @@ pub async fn delete_issue(
                     CAST(i.created_at AS TEXT) AS created_at, \
                     CAST(i.updated_at AS TEXT) AS updated_at, \
                     CAST(i.started_at AS TEXT) AS started_at, \
-                    CAST(i.completed_at AS TEXT) AS completed_at \
+                    CAST(i.completed_at AS TEXT) AS completed_at, \
+                    CAST(i.released_at AS TEXT) AS released_at \
              FROM issues i \
              JOIN teams t ON t.team_id = i.team_id \
              WHERE i.workspace_id = $1 AND t.key = $2 AND i.number = $3"

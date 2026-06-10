@@ -19,6 +19,7 @@ pub mod milestones;
 pub mod openapi;
 pub mod projects;
 pub mod relations;
+pub mod releases;
 pub mod statuses;
 pub mod teams;
 
@@ -254,6 +255,7 @@ pub fn all_operations() -> Vec<ApiOperation> {
     ops.extend(activities::operations());
     ops.extend(github_links::operations());
     ops.extend(issue_attachments::operations());
+    ops.extend(releases::operations());
     ops
 }
 
@@ -405,8 +407,14 @@ mod tests {
         assert!(names.contains(&"attach_to_issue"));
         assert!(names.contains(&"detach_from_issue"));
 
-        // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 2 + 3 + 3 = 36
-        assert_eq!(ops.len(), 36, "expected 36 total operations");
+        // Release operations (4)
+        assert!(names.contains(&"list_releases"));
+        assert!(names.contains(&"get_release"));
+        assert!(names.contains(&"create_release"));
+        assert!(names.contains(&"list_unreleased_issues"));
+
+        // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 2 + 3 + 3 + 4 = 40
+        assert_eq!(ops.len(), 40, "expected 40 total operations");
     }
 
     #[test]
