@@ -279,6 +279,8 @@ async fn process_inline_relation(
         target_id,
         &relation_type,
         Some(&ctx.user_id),
+        ctx.action_source,
+        ctx.action_source_label.as_deref(),
         ctx.ws_manager,
     )
     .await
@@ -341,6 +343,8 @@ pub async fn create_issue(
             &issue.issue_id,
             parent_id,
             Some(&ctx.user_id),
+            ctx.action_source,
+            ctx.action_source_label.as_deref(),
             ctx.ws_manager,
         )
         .await?;
@@ -471,6 +475,8 @@ pub async fn update_issue(
                     &issue.issue_id,
                     parent_id,
                     Some(&ctx.user_id),
+                    ctx.action_source,
+                    ctx.action_source_label.as_deref(),
                     ctx.ws_manager,
                 )
                 .await?;
@@ -484,6 +490,9 @@ pub async fn update_issue(
             ctx.db,
             &issue.issue_id,
             label_ids,
+            Some(&ctx.user_id),
+            ctx.action_source,
+            ctx.action_source_label.as_deref(),
             ctx.ws_manager,
         )
         .await?;

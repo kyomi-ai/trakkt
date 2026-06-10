@@ -238,6 +238,8 @@ pub async fn create_relation(
     target_issue_id: &str,
     relation_type: &str,
     created_by: Option<&str>,
+    action_source: trakkt_types::enums::ActionSource,
+    action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<IssueRelation> {
     // Self-relation check.
@@ -374,6 +376,88 @@ pub async fn create_relation(
             serde_json::to_value(&relation).ok(),
         )
         .await;
+    }
+
+    // ── Notification trigger for relation_added (best-effort) ────────
+    if let Some(actor_id) = created_by {
+        // Gather watchers from both source and target issues.
+        let source_watchers = crate::watcher_service::list_watchers_of_issue(db, source_issue_id).await;
+        let target_watchers = crate::watcher_service::list_watchers_of_issue(db, target_issue_id).await;
+
+        let mut all_watcher_ids = std::collections::HashSet::new();
+        if let Ok(ref ids) = source_watchers {
+            for id in ids {
+                all_watcher_ids.insert(id.clone());
+            }
+        } else if let Err(ref e) = source_watchers {
+            tracing::warn!(error = %e, "Failed to list watchers for source issue in relation notification");
+        }
+        if let Ok(ref ids) = target_watchers {
+            for id in ids {
+                all_watcher_ids.insert(id.clone());
+            }
+        } else if let Err(ref e) = target_watchers {
+            tracing::warn!(error = %e, "Failed to list watchers for target issue in relation notification");
+        }
+
+        if !all_watcher_ids.is_empty() {
+            let all_watcher_vec: Vec<String> = all_watcher_ids.iter().cloned().collect();
+            let prefs_map = match crate::notification_service::batch_get_preferences(
+                db, &all_watcher_vec, workspace_id,
+            )
+            .await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to fetch notification preferences for relation notification");
+                    std::collections::HashMap::new()
+                }
+            };
+
+            // Notify watchers of both issues about the relation.
+            // Source issue watchers get notified on the source issue,
+            // target issue watchers get notified on the target issue.
+            // Build (issue_id, watcher_ids) pairs to iterate.
+            let mut notify_pairs: Vec<(&str, &[String])> = Vec::new();
+            if let Ok(ref ids) = source_watchers {
+                notify_pairs.push((source_issue_id, ids));
+            }
+            if let Ok(ref ids) = target_watchers {
+                notify_pairs.push((target_issue_id, ids));
+            }
+
+            for (issue_id, watcher_ids) in notify_pairs {
+                for watcher_id in watcher_ids {
+                    if crate::notification_service::should_suppress_self_notification(
+                        watcher_id, actor_id, action_source, &prefs_map,
+                    ) {
+                        continue;
+                    }
+
+                    let type_enabled = prefs_map
+                        .get(watcher_id.as_str())
+                        .is_none_or(|p| p.notify_relation_changes);
+                    if !type_enabled {
+                        continue;
+                    }
+
+                    if let Err(e) = crate::notification_service::create_notification(
+                        db,
+                        workspace_id,
+                        watcher_id,
+                        issue_id,
+                        crate::notification_service::TYPE_RELATION_ADDED,
+                        Some(actor_id),
+                        action_source,
+                        action_source_label,
+                        ws_manager,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "Failed to create relation_added notification");
+                    }
+                }
+            }
+        }
     }
 
     Ok(relation)
@@ -517,6 +601,8 @@ pub async fn set_parent(
     child_issue_id: &str,
     parent_issue_id: &str,
     created_by: Option<&str>,
+    action_source: trakkt_types::enums::ActionSource,
+    action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<IssueRelation> {
     // Clear any existing parent first (idempotent).
@@ -530,6 +616,8 @@ pub async fn set_parent(
         child_issue_id,
         "parent",
         created_by,
+        action_source,
+        action_source_label,
         ws_manager,
     )
     .await

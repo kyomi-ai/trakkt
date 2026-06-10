@@ -21,6 +21,13 @@ pub const TYPE_COMMENTED: &str = "commented";
 pub const TYPE_STATUS_CHANGED: &str = "status_changed";
 pub const TYPE_ASSIGNED: &str = "assigned";
 pub const TYPE_PRIORITY_CHANGED: &str = "priority_changed";
+pub const TYPE_LABEL_CHANGED: &str = "label_changed";
+pub const TYPE_DUE_DATE_CHANGED: &str = "due_date_changed";
+pub const TYPE_ESTIMATE_CHANGED: &str = "estimate_changed";
+pub const TYPE_MILESTONE_CHANGED: &str = "milestone_changed";
+pub const TYPE_PROJECT_CHANGED: &str = "project_changed";
+pub const TYPE_TEAM_CHANGED: &str = "team_changed";
+pub const TYPE_RELATION_ADDED: &str = "relation_added";
 
 // ─── Row type ────────────────────────────────────────────────────────────────
 
@@ -477,6 +484,13 @@ struct NotificationPreferencesRow {
     notify_comments: bool,
     notify_assignments: bool,
     notify_priority_changes: bool,
+    notify_label_changes: bool,
+    notify_due_date_changes: bool,
+    notify_estimate_changes: bool,
+    notify_milestone_changes: bool,
+    notify_project_changes: bool,
+    notify_team_changes: bool,
+    notify_relation_changes: bool,
     notify_own_agent_actions: bool,
     notify_own_api_actions: bool,
     delivery_channel: String,
@@ -492,6 +506,13 @@ impl NotificationPreferencesRow {
             notify_comments: self.notify_comments,
             notify_assignments: self.notify_assignments,
             notify_priority_changes: self.notify_priority_changes,
+            notify_label_changes: self.notify_label_changes,
+            notify_due_date_changes: self.notify_due_date_changes,
+            notify_estimate_changes: self.notify_estimate_changes,
+            notify_milestone_changes: self.notify_milestone_changes,
+            notify_project_changes: self.notify_project_changes,
+            notify_team_changes: self.notify_team_changes,
+            notify_relation_changes: self.notify_relation_changes,
             notify_own_agent_actions: self.notify_own_agent_actions,
             notify_own_api_actions: self.notify_own_api_actions,
             delivery_channel: self.delivery_channel,
@@ -524,9 +545,13 @@ pub async fn get_or_default_preferences(
         "{insert_prefix} notification_preferences \
             (preference_id, user_id, workspace_id, \
              notify_status_changes, notify_comments, notify_assignments, \
-             notify_priority_changes, notify_own_agent_actions, notify_own_api_actions, \
+             notify_priority_changes, \
+             notify_label_changes, notify_due_date_changes, notify_estimate_changes, \
+             notify_milestone_changes, notify_project_changes, notify_team_changes, \
+             notify_relation_changes, \
+             notify_own_agent_actions, notify_own_api_actions, \
              delivery_channel, created_at, updated_at) \
-         VALUES ($1, $2, $3, {bt}, {bt}, {bt}, {bt}, {bf}, {bf}, $4, {now}, {now}) \
+         VALUES ($1, $2, $3, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bf}, {bf}, $4, {now}, {now}) \
          {conflict_clause}"
     );
     let result = trakkt_core::db_execute!(
@@ -548,6 +573,13 @@ pub async fn get_or_default_preferences(
             notify_comments: true,
             notify_assignments: true,
             notify_priority_changes: true,
+            notify_label_changes: true,
+            notify_due_date_changes: true,
+            notify_estimate_changes: true,
+            notify_milestone_changes: true,
+            notify_project_changes: true,
+            notify_team_changes: true,
+            notify_relation_changes: true,
             notify_own_agent_actions: false,
             notify_own_api_actions: false,
             delivery_channel: "in_app".to_string(),
@@ -585,7 +617,11 @@ pub async fn get_or_default_preferences(
         NotificationPreferencesRow,
         "SELECT preference_id, user_id, workspace_id, \
                 notify_status_changes, notify_comments, notify_assignments, \
-                notify_priority_changes, notify_own_agent_actions, notify_own_api_actions, \
+                notify_priority_changes, \
+                notify_label_changes, notify_due_date_changes, notify_estimate_changes, \
+                notify_milestone_changes, notify_project_changes, notify_team_changes, \
+                notify_relation_changes, \
+                notify_own_agent_actions, notify_own_api_actions, \
                 delivery_channel \
          FROM notification_preferences \
          WHERE user_id = $1 AND workspace_id = $2",
@@ -616,6 +652,13 @@ pub async fn update_preference(
         "notify_comments" => "notify_comments",
         "notify_assignments" => "notify_assignments",
         "notify_priority_changes" => "notify_priority_changes",
+        "notify_label_changes" => "notify_label_changes",
+        "notify_due_date_changes" => "notify_due_date_changes",
+        "notify_estimate_changes" => "notify_estimate_changes",
+        "notify_milestone_changes" => "notify_milestone_changes",
+        "notify_project_changes" => "notify_project_changes",
+        "notify_team_changes" => "notify_team_changes",
+        "notify_relation_changes" => "notify_relation_changes",
         "notify_own_agent_actions" => "notify_own_agent_actions",
         "notify_own_api_actions" => "notify_own_api_actions",
         _ => {
@@ -692,7 +735,11 @@ pub async fn batch_get_preferences(
     let sql = format!(
         "SELECT preference_id, user_id, workspace_id, \
                 notify_status_changes, notify_comments, notify_assignments, \
-                notify_priority_changes, notify_own_agent_actions, notify_own_api_actions, \
+                notify_priority_changes, \
+                notify_label_changes, notify_due_date_changes, notify_estimate_changes, \
+                notify_milestone_changes, notify_project_changes, notify_team_changes, \
+                notify_relation_changes, \
+                notify_own_agent_actions, notify_own_api_actions, \
                 delivery_channel \
          FROM notification_preferences \
          WHERE workspace_id = $1 AND user_id IN {in_clause}"

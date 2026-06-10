@@ -435,8 +435,16 @@ pub async fn set_issue_labels(
 
     let parsed_label_ids = parse_label_ids(&label_ids);
 
-    trakkt_auth::issue_service::set_issue_labels(ac.db(), &issue_id, &parsed_label_ids, ac.ctx.ws_manager.as_ref())
-        .await
-        .into_sfn()?;
+    trakkt_auth::issue_service::set_issue_labels(
+        ac.db(),
+        &issue_id,
+        &parsed_label_ids,
+        Some(&ac.auth.user_id),
+        trakkt_types::enums::ActionSource::User,
+        None,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }

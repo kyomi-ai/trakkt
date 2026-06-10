@@ -115,6 +115,48 @@ fn EventTypesCard(prefs: NotificationPreferences) -> impl IntoView {
                         description="When an issue's priority is updated"
                         initial=prefs.notify_priority_changes
                     />
+                    <PreferenceToggle
+                        field="notify_label_changes"
+                        label="Label changes"
+                        description="When labels are added or removed from an issue"
+                        initial=prefs.notify_label_changes
+                    />
+                    <PreferenceToggle
+                        field="notify_due_date_changes"
+                        label="Due date changes"
+                        description="When an issue's due date is set, changed, or cleared"
+                        initial=prefs.notify_due_date_changes
+                    />
+                    <PreferenceToggle
+                        field="notify_estimate_changes"
+                        label="Estimate changes"
+                        description="When an issue's estimate is changed"
+                        initial=prefs.notify_estimate_changes
+                    />
+                    <PreferenceToggle
+                        field="notify_milestone_changes"
+                        label="Milestone changes"
+                        description="When an issue's milestone is set, changed, or cleared"
+                        initial=prefs.notify_milestone_changes
+                    />
+                    <PreferenceToggle
+                        field="notify_project_changes"
+                        label="Project changes"
+                        description="When an issue's project is set, changed, or cleared"
+                        initial=prefs.notify_project_changes
+                    />
+                    <PreferenceToggle
+                        field="notify_team_changes"
+                        label="Team changes"
+                        description="When an issue is moved between teams"
+                        initial=prefs.notify_team_changes
+                    />
+                    <PreferenceToggle
+                        field="notify_relation_changes"
+                        label="Relation changes"
+                        description="When a relation is added to an issue"
+                        initial=prefs.notify_relation_changes
+                    />
                 </div>
             </CardContent>
         </Card>
