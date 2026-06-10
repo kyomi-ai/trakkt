@@ -32,7 +32,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::{Avatar, Button, ButtonSize, ButtonVariant, Checkbox, IssueStatusBadge, IssueStatusVariant, LabelBadge, PriorityIndicator, SearchInput, Skeleton};
 use crate::pages::issues::filters::{LabelFilterDropdown, PriorityFilterDropdown, ProjectFilterDropdown};
-use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
+use crate::pages::issues::{is_archived, resolve_archive_days};
 use crate::server_fns::issues::{update_issue, set_issue_sort_order};
 use crate::types::IssueNavState;
 use trakkt_types::models::{IssueWithDetails, Status};
@@ -186,6 +186,21 @@ pub fn BoardContent(
     let (label_filter, set_label_filter) = signal(Vec::<String>::new());
     let (project_filter, set_project_filter) = signal(Vec::<String>::new());
 
+    // Resolve archive days from team settings via SyncStore.
+    let board_team_key = team_key.clone();
+    let resolved_archive_days = Memo::new(move |_| {
+        let key = board_team_key.as_deref();
+        let team = key.and_then(|k| {
+            let k_lower = k.to_lowercase();
+            sync_store.and_then(|s| {
+                s.teams().get().into_iter().find(|t| t.key.to_lowercase() == k_lower)
+            })
+        });
+        // TODO: pass workspace-level default_auto_archive_days once workspace
+        // settings are part of the SyncStore bootstrap.
+        resolve_archive_days(team.as_ref(), None)
+    });
+
     // Client-side filtered issues: archive + search + priority + label + project
     // applied before grouping. Archived issues are excluded — they have their
     // own dedicated page.
@@ -195,11 +210,12 @@ pub fn BoardContent(
         let priority_val = priority_filter.get();
         let label_val = label_filter.get();
         let project_val = project_filter.get();
+        let archive_days = resolved_archive_days.get();
 
         raw.into_iter()
             .filter(|issue| {
                 // Exclude archived issues — they have their own dedicated page.
-                if is_archived(issue, ARCHIVE_DAYS) {
+                if archive_days > 0 && is_archived(issue, archive_days) {
                     return false;
                 }
                 if !priority_val.is_empty() {
@@ -233,10 +249,13 @@ pub fn BoardContent(
     // Count of archived issues per status (for showing "N archived" in columns).
     let archived_counts_by_status = Memo::new(move |_| {
         let raw = issues.get();
+        let archive_days = resolved_archive_days.get();
         let mut counts = std::collections::HashMap::<String, usize>::new();
-        for issue in &raw {
-            if is_archived(issue, ARCHIVE_DAYS) {
-                *counts.entry(issue.status_id.clone()).or_default() += 1;
+        if archive_days > 0 {
+            for issue in &raw {
+                if is_archived(issue, archive_days) {
+                    *counts.entry(issue.status_id.clone()).or_default() += 1;
+                }
             }
         }
         counts

@@ -41,7 +41,7 @@ use crate::pages::issues::filters::{
     SortDropdown, SortField,
 };
 use crate::pages::issues::issue_row::IssueRow;
-use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
+use crate::pages::issues::{is_archived, resolve_archive_days};
 use crate::pages::views::{FilterClause, LegacyViewFilters, ViewFilters};
 use crate::server_fns::issues::{create_issue, list_issues, search_issues, SearchResultItem};
 use crate::server_fns::statuses::list_statuses;
@@ -913,11 +913,15 @@ pub(crate) fn IssueListInner(
     let filtered_issues = Memo::new(move |_| {
         let raw = team_issues.get();
         let clauses = filter_clauses.get();
+        let team = resolved_team.get();
+        // TODO: pass workspace-level default_auto_archive_days once workspace
+        // settings are part of the SyncStore bootstrap.
+        let archive_days = resolve_archive_days(team.as_ref(), None);
 
         raw.into_iter()
             .filter(|issue| {
                 // Exclude archived issues — they have their own dedicated page.
-                if is_archived(issue, ARCHIVE_DAYS) {
+                if archive_days > 0 && is_archived(issue, archive_days) {
                     return false;
                 }
                 // Apply each composable filter clause.
@@ -1171,7 +1175,11 @@ pub(crate) fn IssueListInner(
     // Total = all non-archived issues in scope (team or workspace).
     // Filtered = issues after search + filter clauses (what's displayed).
     let total_count = Memo::new(move |_| {
-        team_issues.get().iter().filter(|i| !is_archived(i, ARCHIVE_DAYS)).count()
+        let team = resolved_team.get();
+        // TODO: pass workspace-level default_auto_archive_days once workspace
+        // settings are part of the SyncStore bootstrap.
+        let archive_days = resolve_archive_days(team.as_ref(), None);
+        team_issues.get().iter().filter(|i| archive_days == 0 || !is_archived(i, archive_days)).count()
     });
     let filtered_count = Memo::new(move |_| filtered_issues.get().len());
 
@@ -1732,10 +1740,15 @@ pub(crate) fn IssueListInner(
                                     set_selected_index.set(if list.is_empty() { None } else { Some(list.len() - 1) });
                                 }
 
+                                let team_ref = resolved_team.get();
+                                // TODO: pass workspace-level default_auto_archive_days once workspace
+                                // settings are part of the SyncStore bootstrap.
+                                let ad = resolve_archive_days(team_ref.as_ref(), None);
+
                                 if list.is_empty() {
                                     // Distinguish first-run (truly no issues in the team) from
                                     // filtered view with no matches.
-                                    let has_team_issues = team_issues.get().iter().any(|i| !is_archived(i, ARCHIVE_DAYS));
+                                    let has_team_issues = team_issues.get().iter().any(|i| ad == 0 || !is_archived(i, ad));
 
                                     if has_team_issues {
                                         // Filtered view — issues exist but none match the current filters.
@@ -1796,7 +1809,7 @@ pub(crate) fn IssueListInner(
                                     }
                                 } else {
                                     let rows = list.iter().enumerate().map(|(idx, issue)| {
-                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        let archived = ad > 0 && is_archived(issue, ad);
                                         view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index archived=archived/> }
                                     }).collect_view();
                                     view! {

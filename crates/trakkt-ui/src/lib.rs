@@ -101,6 +101,7 @@ pub fn register_server_functions() {
     use server_fns::workspace::*;
     register_explicit::<GetWorkspaceSettings>();
     register_explicit::<UpdateWorkspaceName>();
+    register_explicit::<UpdateWorkspaceAutoArchive>();
 
     // Issues
     use server_fns::issues::*;

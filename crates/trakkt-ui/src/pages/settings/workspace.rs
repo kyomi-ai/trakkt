@@ -11,8 +11,8 @@ use trakkt_types::models::Team;
 
 use crate::components::{
     ActionStatus, Badge, BadgeVariant, Button, ButtonSize, ButtonVariant, Card, CardContent,
-    CardDescription, CardHeader, CardTitle, EmptyState, Skeleton, TeamCreationModal, TeamIcon,
-    INPUT_CLASS,
+    CardDescription, CardHeader, CardTitle, EmptyState, Select, SelectVariant, Skeleton,
+    TeamCreationModal, TeamIcon, INPUT_CLASS,
 };
 use crate::server_fns::teams::{
     get_workspace_default_team_id, list_all_teams, set_workspace_default_team,
@@ -62,7 +62,8 @@ pub fn WorkspacePage() -> impl IntoView {
                         Ok(data) => {
                             view! {
                                 <div class="space-y-6">
-                                    <WorkspaceNameCard data=data/>
+                                    <WorkspaceNameCard data=data.clone()/>
+                                    <WorkspaceArchiveCard data=data/>
                                     <TeamsSection/>
                                 </div>
                             }.into_any()
@@ -125,6 +126,98 @@ fn WorkspaceNameCard(data: WorkspaceSettingsData) -> impl IntoView {
                     on:input=move |ev| set_name.set(event_target_value(&ev))
                     on:blur=on_blur
                 />
+            </CardContent>
+        </Card>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Workspace Auto-Archive Card
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build dropdown options for workspace-level auto-archive duration.
+///
+/// Simpler than the team-level dropdown — no "Workspace default" option since
+/// this IS the workspace default.
+fn workspace_archive_options() -> Vec<(String, String)> {
+    vec![
+        ("".to_string(), "Not set".to_string()),
+        ("0".to_string(), "Never".to_string()),
+        ("7".to_string(), "7 days".to_string()),
+        ("14".to_string(), "14 days".to_string()),
+        ("30".to_string(), "30 days".to_string()),
+        ("60".to_string(), "60 days".to_string()),
+        ("90".to_string(), "90 days".to_string()),
+    ]
+}
+
+#[component]
+fn WorkspaceArchiveCard(data: WorkspaceSettingsData) -> impl IntoView {
+    // Map Option<u32> → select value string:
+    // None → "" (not set), Some(0) → "0" (never), Some(N) → "N"
+    let initial_value = match data.default_auto_archive_days {
+        None => String::new(),
+        Some(d) => d.to_string(),
+    };
+    let (archive_value, set_archive_value) = signal(initial_value);
+
+    let save_action = Action::new(|days: &Option<u32>| {
+        let days = *days;
+        async move { update_workspace_auto_archive(days).await }
+    });
+
+    let on_archive_change = move |val: String| {
+        set_archive_value.set(val.clone());
+        let days = if val.is_empty() {
+            None
+        } else {
+            match val.parse::<u32>() {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    tracing::warn!(error = %e, value = %val, "Failed to parse workspace archive days value");
+                    None
+                }
+            }
+        };
+        save_action.dispatch(days);
+    };
+
+    let options = workspace_archive_options();
+    let options_signal = Signal::derive(move || options.clone());
+
+    view! {
+        <Card>
+            <CardHeader>
+                <div class="flex items-center justify-between">
+                    <div>
+                        <CardTitle>"Auto-archive"</CardTitle>
+                        <CardDescription>
+                            "Default auto-archive duration for all teams. Individual teams can override this setting."
+                        </CardDescription>
+                    </div>
+                    <ActionStatus action=save_action/>
+                </div>
+            </CardHeader>
+            <CardContent>
+                <div class="space-y-4">
+                    <div class="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <label class="text-sm font-medium text-foreground sm:w-48 flex-shrink-0">
+                            "Archive after"
+                        </label>
+                        <div class="flex-1 max-w-sm">
+                            <Select
+                                value=archive_value
+                                options=options_signal
+                                on_change=Callback::new(on_archive_change)
+                                variant=SelectVariant::Form
+                                placeholder="Not set"
+                            />
+                        </div>
+                    </div>
+                    <p class="text-xs text-muted-foreground">
+                        "When not set, the system default of 30 days is used. Teams can override this with their own setting."
+                    </p>
+                </div>
             </CardContent>
         </Card>
     }

@@ -57,6 +57,7 @@ fn TeamSettingsBody(team: Memo<Option<Team>>) -> impl IntoView {
             {move || team.get().map(|t| view! {
                 <div class="space-y-6">
                     <TeamGeneralCard team=t.clone()/>
+                    <TeamArchiveCard team=t.clone()/>
                     <TeamEstimateCard team=t.clone()/>
                     <TeamLabelsPage team_id=t.team_id.clone()/>
                     <TeamDangerZone team_id=t.team_id.clone() team_name=t.name.clone()/>
@@ -180,6 +181,130 @@ fn TeamDangerZone(team_id: String, team_name: String) -> impl IntoView {
                 on_cancel=Callback::new(move |()| set_show_delete_confirm.set(false))
             />
         }}
+    }
+}
+
+// ─── Team auto-archive settings card ─────────────────────────────────────
+
+/// Build the dropdown options for auto-archive duration selection.
+///
+/// Returns `(value, label)` pairs for the `Select`. The first option is
+/// "Workspace default" (value `""`), followed by "Never" and day-based options.
+fn archive_days_options() -> Vec<(String, String)> {
+    vec![
+        ("".to_string(), "Workspace default".to_string()),
+        ("0".to_string(), "Never".to_string()),
+        ("7".to_string(), "7 days".to_string()),
+        ("14".to_string(), "14 days".to_string()),
+        ("30".to_string(), "30 days".to_string()),
+        ("60".to_string(), "60 days".to_string()),
+        ("90".to_string(), "90 days".to_string()),
+    ]
+}
+
+/// Per-team card for configuring auto-archive duration.
+///
+/// Changes auto-save immediately by calling the `update_team_settings`
+/// server function on every change. An `ActionStatus` indicator shows
+/// saving/saved/error state next to the card title.
+#[component]
+fn TeamArchiveCard(team: Team) -> impl IntoView {
+    let settings = team.settings.clone().unwrap_or_default();
+    let team_id = team.team_id.clone();
+
+    // Map Option<u32> → select value string:
+    // None → "" (workspace default), Some(0) → "0" (never), Some(N) → "N"
+    let initial_value = match settings.auto_archive_days {
+        None => String::new(),
+        Some(d) => d.to_string(),
+    };
+    let (archive_value, set_archive_value) = signal(initial_value);
+
+    // Preserve the estimate settings from the original so we don't clobber
+    // them when saving archive changes.
+    let estimate_scale = settings.estimate_scale.clone();
+    let estimate_allow_zero = settings.estimate_allow_zero;
+    let estimate_extended = settings.estimate_extended;
+    let estimate_count_unestimated = settings.estimate_count_unestimated;
+
+    // Save action — sends the full TeamSettings JSON to the server
+    let save_action = Action::new({
+        let team_id = team_id.clone();
+        move |settings_json: &String| {
+            let team_id = team_id.clone();
+            let json = settings_json.clone();
+            async move { update_team_settings(team_id, json).await }
+        }
+    });
+
+    // Event handler: parse the select value back to Option<u32> and save
+    let on_archive_change = move |val: String| {
+        set_archive_value.set(val.clone());
+        let auto_archive_days = if val.is_empty() {
+            None
+        } else {
+            match val.parse::<u32>() {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    tracing::warn!(error = %e, value = %val, "Failed to parse archive days value");
+                    None
+                }
+            }
+        };
+        let ts = TeamSettings {
+            auto_archive_days,
+            estimate_scale: estimate_scale.clone(),
+            estimate_allow_zero,
+            estimate_extended,
+            estimate_count_unestimated,
+        };
+        match serde_json::to_string(&ts) {
+            Ok(json) => {
+                save_action.dispatch(json);
+            }
+            Err(e) => tracing::warn!("Failed to serialize TeamSettings: {e}"),
+        }
+    };
+
+    // Static options (constructed once, shared via Signal)
+    let options = archive_days_options();
+    let options_signal = Signal::derive(move || options.clone());
+
+    view! {
+        <Card>
+            <CardHeader>
+                <div class="flex items-center justify-between">
+                    <div>
+                        <CardTitle>"Auto-archive"</CardTitle>
+                        <CardDescription>
+                            "Automatically archive completed and cancelled issues after a set period. Archived issues are hidden from the default list."
+                        </CardDescription>
+                    </div>
+                    <ActionStatus action=save_action/>
+                </div>
+            </CardHeader>
+            <CardContent>
+                <div class="space-y-4">
+                    <div class="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <label class="text-sm font-medium text-foreground sm:w-48 flex-shrink-0">
+                            "Archive after"
+                        </label>
+                        <div class="flex-1 max-w-sm">
+                            <Select
+                                value=archive_value
+                                options=options_signal
+                                on_change=Callback::new(on_archive_change)
+                                variant=SelectVariant::Form
+                                placeholder="Workspace default"
+                            />
+                        </div>
+                    </div>
+                    <p class="text-xs text-muted-foreground">
+                        "When set to \u{2018}Workspace default\u{2019}, the workspace-level setting will be used."
+                    </p>
+                </div>
+            </CardContent>
+        </Card>
     }
 }
 
