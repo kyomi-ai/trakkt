@@ -1207,6 +1207,10 @@ pub fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
         ("is_blocking", "none_of") => !issue.is_blocking,
         ("has_relations", "any_of") => issue.has_relations,
         ("has_relations", "none_of") => !issue.has_relations,
+        // Issue ID set filter — used by the "Starred" view to restrict to
+        // a specific set of issue IDs fetched from the server.
+        ("issue_id", "any_of") => clause.values.contains(&issue.issue_id),
+        ("issue_id", "none_of") => !clause.values.contains(&issue.issue_id),
         // Unknown field/operator — pass through (don't block issues).
         _ => true,
     }
