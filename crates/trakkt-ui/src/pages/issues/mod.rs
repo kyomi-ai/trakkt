@@ -8,10 +8,16 @@ pub mod issue_row;
 pub mod my_issues;
 pub mod workspace_view;
 
-use trakkt_types::models::IssueWithDetails;
+use trakkt_types::models::{IssueWithDetails, Team};
 
 /// Default number of days after which completed/cancelled issues are considered archived.
-pub const ARCHIVE_DAYS: u32 = 30;
+///
+/// Used as a fallback when neither team nor workspace settings specify
+/// an auto-archive duration. Resolution order:
+/// 1. Team's own `auto_archive_days` (if `Some` and > 0)
+/// 2. Workspace-level `default_auto_archive_days` (if `Some` and > 0)
+/// 3. This constant
+pub const DEFAULT_ARCHIVE_DAYS: u32 = 30;
 
 /// Returns `true` if an issue should be considered "archived" — i.e. it has a
 /// completed or cancelled status category and its `updated_at` timestamp is
@@ -37,4 +43,32 @@ pub fn is_archived(issue: &IssueWithDetails, archive_days: u32) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn is_archived(_issue: &IssueWithDetails, _archive_days: u32) -> bool {
     false
+}
+
+/// Resolve the effective archive-days using a three-tier cascade:
+///
+/// 1. **Team setting** — `team.settings.auto_archive_days`:
+///    `Some(0)` means archiving is explicitly disabled for this team,
+///    `Some(N)` where N > 0 is an explicit per-team override.
+/// 2. **Workspace default** — `workspace_default`:
+///    The workspace-level `default_auto_archive_days` setting, if configured
+///    and > 0.
+/// 3. **Compile-time fallback** — [`DEFAULT_ARCHIVE_DAYS`] (30 days).
+///
+/// Returns `0` when archiving is disabled (issues should not be filtered).
+pub fn resolve_archive_days(team: Option<&Team>, workspace_default: Option<u32>) -> u32 {
+    // Step 1: team explicit setting (Some(0) = disabled, Some(N) = N days)
+    if let Some(team) = team
+        && let Some(days) = team.settings.as_ref().and_then(|s| s.auto_archive_days)
+    {
+        return days;
+    }
+    // Step 2: workspace default
+    if let Some(days) = workspace_default
+        && days > 0
+    {
+        return days;
+    }
+    // Step 3: compile-time fallback
+    DEFAULT_ARCHIVE_DAYS
 }

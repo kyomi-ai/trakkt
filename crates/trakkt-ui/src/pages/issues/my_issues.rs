@@ -33,7 +33,7 @@ use crate::pages::issues::filters::{
 };
 use crate::pages::issues::issue_list::SaveViewModal;
 use crate::pages::issues::issue_row::IssueRow;
-use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
+use crate::pages::issues::{is_archived, resolve_archive_days};
 use crate::pages::views::FilterClause;
 use crate::server_fns::context::UserContext;
 use crate::server_fns::issues::list_issues;
@@ -126,10 +126,16 @@ pub fn MyIssuesPage() -> impl IntoView {
         }
     });
 
+    // ── Archive days (workspace-scoped, no team context on My Issues) ────
+    // My Issues shows issues across all teams so team is always None.
+    // TODO: pass workspace-level default_auto_archive_days once workspace
+    // settings are part of the SyncStore bootstrap.
+    let archive_days = resolve_archive_days(None, None);
+
     // ── Filter helper (closure over search/status/priority signals) ────────
     let passes_filters = move |issue: &IssueWithDetails| -> bool {
         // Exclude archived issues — they have their own dedicated page.
-        if is_archived(issue, ARCHIVE_DAYS) {
+        if archive_days > 0 && is_archived(issue, archive_days) {
             return false;
         }
 
@@ -313,7 +319,7 @@ pub fn MyIssuesPage() -> impl IntoView {
 
         let mut seen = HashSet::new();
         for i in &issues {
-            if is_archived(i, ARCHIVE_DAYS) {
+            if archive_days > 0 && is_archived(i, archive_days) {
                 continue;
             }
             if i.assignee_id.as_ref() == Some(&uid)
@@ -480,7 +486,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                             >
                                 {if !assigned_collapsed.get() {
                                     assigned.iter().enumerate().map(|(idx, issue)| {
-                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        let archived = archive_days > 0 && is_archived(issue, archive_days);
                                         view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
@@ -507,7 +513,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                             >
                                 {if !created_collapsed.get() {
                                     created.iter().enumerate().map(|(idx, issue)| {
-                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        let archived = archive_days > 0 && is_archived(issue, archive_days);
                                         view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
@@ -531,7 +537,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                             >
                                 {if !watching_collapsed.get() {
                                     watching.iter().enumerate().map(|(idx, issue)| {
-                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        let archived = archive_days > 0 && is_archived(issue, archive_days);
                                         view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
