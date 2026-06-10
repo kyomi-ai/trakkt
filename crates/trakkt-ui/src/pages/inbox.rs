@@ -923,7 +923,7 @@ fn NotificationRow(
                             {if is_deleted {
                                 view! {
                                     <button
-                                        class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                        class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                         on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                         on:click=on_restore.clone()
                                     >
@@ -934,14 +934,14 @@ fn NotificationRow(
                                 if is_unread {
                                     view! {
                                         <button
-                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                             on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                             on:click=on_mark_read.clone()
                                         >
                                             "Mark as read"
                                         </button>
                                         <button
-                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                             on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                             on:click=on_delete.clone()
                                         >
@@ -951,14 +951,14 @@ fn NotificationRow(
                                 } else {
                                     view! {
                                         <button
-                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                             on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                             on:click=on_mark_unread.clone()
                                         >
                                             "Mark as unread"
                                         </button>
                                         <button
-                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                             on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                             on:click=on_delete.clone()
                                         >

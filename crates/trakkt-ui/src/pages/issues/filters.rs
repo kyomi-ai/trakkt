@@ -1691,7 +1691,7 @@ fn StatusValuePicker(
             let variant = IssueStatusVariant::parse(&status.category, &status.name);
             view! {
                 <div
-                    class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
+                    class="flex items-center gap-2 cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
                 >
                     <Checkbox
                         checked=Signal::derive(move || selected_values.get().contains(&status_id_for_check))
@@ -1744,7 +1744,7 @@ fn PriorityValuePicker(
             let priority_val = *priority_val;
             view! {
                 <div
-                    class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
+                    class="flex items-center gap-2 cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
                 >
                     <Checkbox
                         checked=Signal::derive(move || selected_values.get().contains(&key_for_check))
@@ -1864,7 +1864,7 @@ fn DynamicSelectPicker(
             let value_for_toggle = value_id.clone();
             view! {
                 <div
-                    class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
+                    class="flex items-center gap-2 cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
                 >
                     <Checkbox
                         checked=Signal::derive(move || selected.get().contains(&value_for_check))
