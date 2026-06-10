@@ -580,11 +580,11 @@ pub async fn search_issues(
         include_closed: params.include_closed.unwrap_or(false),
         include_comments: params.include_comments.unwrap_or(true),
         limit,
-        offset: 0,
+        offset: params.offset.unwrap_or(0).max(0),
     };
 
-    let results = search_service::search(ctx.db, &search_params).await?;
-    Ok(serde_json::to_value(&results)?)
+    let response = search_service::search(ctx.db, &search_params).await?;
+    Ok(serde_json::to_value(&response)?)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -612,7 +612,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "search_issues",
-            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns results ranked by relevance with snippet context showing where the match was found. By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.",
+            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total}` where results are ranked by relevance with snippet context, and total is the full match count for pagination. Supports `offset` for pagination. By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues/search",
