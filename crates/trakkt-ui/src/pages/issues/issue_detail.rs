@@ -41,6 +41,7 @@ use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::team::list_workspace_members;
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
 use crate::types::{IssueNavState, WorkspaceMember};
+use crate::utils::github::github_author_login_from_metadata;
 use crate::utils::relative_time::{format_datetime, relative_time};
 use trakkt_types::models::{Comment, IssueActivity, IssueWithDetails};
 #[cfg(target_arch = "wasm32")]
@@ -2426,8 +2427,7 @@ fn IssueTimeline(
                                 }.into_any()
                             }
                             TimelineEntry::Activity(activity) => {
-                                let name = activity.actor_name.clone()
-                                    .unwrap_or_else(|| "Someone".to_string());
+                                let name = activity_actor_display(&activity);
                                 view! {
                                     <ActivityEntry
                                         activity=activity
@@ -2477,6 +2477,21 @@ fn ActivityEntry(
     }
 }
 
+/// Determine the display name for an activity's actor.
+///
+/// Prefers the resolved Trakkt user name. For GitHub-sourced activities (which
+/// frequently have no matching Trakkt user) it falls back to the `author_login`
+/// stored in the activity metadata, rendered as `@login`. Finally falls back to
+/// `"Someone"`.
+fn activity_actor_display(activity: &IssueActivity) -> String {
+    if let Some(name) = activity.actor_name.clone() {
+        return name;
+    }
+
+    github_author_login_from_metadata(activity.metadata.as_deref())
+        .unwrap_or_else(|| "Someone".to_string())
+}
+
 /// Map activity action_type to a phosphor icon view.
 fn activity_icon(action_type: &str) -> leptos::prelude::AnyView {
     match action_type {
@@ -2494,6 +2509,11 @@ fn activity_icon(action_type: &str) -> leptos::prelude::AnyView {
         "parent_changed" => view! { <Icon icon=phosphor_leptos::TREE_STRUCTURE size="14px"/> }.into_any(),
         "moved_to_team" => view! { <Icon icon=phosphor_leptos::ARROWS_LEFT_RIGHT size="14px"/> }.into_any(),
         "estimate_changed" => view! { <Icon icon=phosphor_leptos::GAUGE size="14px"/> }.into_any(),
+        "commit_pushed" => view! { <Icon icon=phosphor_leptos::GIT_COMMIT size="14px"/> }.into_any(),
+        "pr_opened" => view! { <Icon icon=phosphor_leptos::GIT_PULL_REQUEST size="14px"/> }.into_any(),
+        "pr_merged" => view! { <Icon icon=phosphor_leptos::GIT_MERGE size="14px"/> }.into_any(),
+        "pr_closed" => view! { <Icon icon=phosphor_leptos::GIT_PULL_REQUEST size="14px"/> }.into_any(),
+        "branch_created" => view! { <Icon icon=phosphor_leptos::GIT_BRANCH size="14px"/> }.into_any(),
         _ => view! { <Icon icon=phosphor_leptos::CLOCK_COUNTER_CLOCKWISE size="14px"/> }.into_any(),
     }
 }
@@ -2575,11 +2595,149 @@ fn format_activity_description(activity: &IssueActivity) -> leptos::prelude::Any
             }
             view! { <span>"removed a relation"</span> }.into_any()
         }
+        "commit_pushed" | "pr_opened" | "pr_merged" | "pr_closed" | "branch_created" => {
+            format_github_activity_description(activity)
+        }
         _ => {
             let text = format_activity_text(activity);
             auto_link_view(&text)
         }
     }
+}
+
+/// CSS classes for an external GitHub link rendered inside an activity row.
+const GITHUB_ACTIVITY_LINK_CLASS: &str = "text-accent-foreground hover:underline font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm";
+
+/// Render the description for a GitHub-sourced activity (commit/PR/branch).
+///
+/// Parses the activity metadata to build a compact, single-line description
+/// with a clickable external link to GitHub. Falls back to a plain message
+/// (and a warning) when metadata is missing or malformed.
+fn format_github_activity_description(activity: &IssueActivity) -> leptos::prelude::AnyView {
+    let meta = match activity.metadata {
+        Some(ref meta_str) => match serde_json::from_str::<serde_json::Value>(meta_str) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!(error = %e, action_type = %activity.action_type, "Failed to parse GitHub activity metadata");
+                return github_activity_fallback(&activity.action_type);
+            }
+        },
+        None => {
+            tracing::warn!(action_type = %activity.action_type, "GitHub activity missing metadata");
+            return github_activity_fallback(&activity.action_type);
+        }
+    };
+
+    let url = meta.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    match activity.action_type.as_str() {
+        "commit_pushed" => {
+            // commit_count is a reasonable-to-default field; a single commit is
+            // the sensible fallback when it is absent.
+            let commit_count = meta.get("commit_count").and_then(|v| v.as_i64()).unwrap_or(1);
+
+            // commit_sha provides the anchor text; an empty sha would render a
+            // broken empty link, so a missing/empty sha forces the plain-text
+            // fallback below alongside a missing url.
+            let short_sha = meta
+                .get("commit_sha")
+                .and_then(|v| v.as_str())
+                .filter(|sha| !sha.is_empty())
+                .map(|sha| sha[..7.min(sha.len())].to_string());
+
+            let commit_message = meta
+                .get("commit_message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let branch = meta.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            match (url, short_sha) {
+                (Some(url), Some(short_sha)) if commit_count > 1 => view! {
+                    <span>
+                        {format!("pushed {commit_count} commits to {branch} \u{2014} ")}
+                        <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{short_sha}</a>
+                        {format!(" {commit_message}")}
+                    </span>
+                }
+                .into_any(),
+                (Some(url), Some(short_sha)) => view! {
+                    <span>
+                        "pushed commit "
+                        <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{short_sha}</a>
+                        {format!(" {commit_message}")}
+                    </span>
+                }
+                .into_any(),
+                _ => {
+                    tracing::warn!("commit_pushed activity missing url or commit_sha");
+                    github_activity_fallback("commit_pushed")
+                }
+            }
+        }
+        "pr_opened" | "pr_merged" | "pr_closed" => {
+            let pr_number = meta.get("pr_number").and_then(|v| v.as_i64());
+            let pr_title = meta
+                .get("pr_title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let verb = match activity.action_type.as_str() {
+                "pr_opened" => "opened",
+                "pr_merged" => "merged",
+                _ => "closed",
+            };
+            match (url, pr_number) {
+                (Some(url), Some(pr_number)) => {
+                    let link_text = format!("#{pr_number}: {pr_title}");
+                    view! {
+                        <span>
+                            {format!("{verb} PR ")}
+                            <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{link_text}</a>
+                        </span>
+                    }
+                    .into_any()
+                }
+                _ => {
+                    tracing::warn!(action_type = %activity.action_type, "PR activity missing url or pr_number");
+                    github_activity_fallback(&activity.action_type)
+                }
+            }
+        }
+        "branch_created" => {
+            let branch = meta.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            match url {
+                Some(url) => view! {
+                    <span>
+                        "created branch "
+                        <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{branch}</a>
+                    </span>
+                }
+                .into_any(),
+                None => {
+                    tracing::warn!("branch_created activity missing url");
+                    github_activity_fallback("branch_created")
+                }
+            }
+        }
+        other => {
+            tracing::warn!(action_type = %other, "Unexpected GitHub activity type");
+            github_activity_fallback(other)
+        }
+    }
+}
+
+/// Plain-text fallback description for a GitHub activity with bad metadata.
+fn github_activity_fallback(action_type: &str) -> leptos::prelude::AnyView {
+    let text = match action_type {
+        "commit_pushed" => "pushed a commit",
+        "pr_opened" => "opened a pull request",
+        "pr_merged" => "merged a pull request",
+        "pr_closed" => "closed a pull request",
+        "branch_created" => "created a branch",
+        _ => "performed a GitHub action",
+    };
+    view! { <span>{text}</span> }.into_any()
 }
 
 /// Build the plain-text description for non-relation activity types.

@@ -32,7 +32,7 @@ struct IssueActivityRow {
     activity_id: String,
     issue_id: String,
     workspace_id: String,
-    actor_id: String,
+    actor_id: Option<String>,
     actor_name: Option<String>,
     action_type: String,
     field: Option<String>,
@@ -179,14 +179,14 @@ pub struct FieldChangeParams<'a> {
 pub struct ActivityRecorder<'a> {
     db: &'a DbPool,
     workspace_id: &'a str,
-    actor_id: &'a str,
+    actor_id: Option<&'a str>,
     action_source: ActionSource,
     action_source_label: Option<String>,
     ws_manager: Option<&'a WebSocketManager>,
 }
 
 impl<'a> ActivityRecorder<'a> {
-    /// Create a new recorder bound to a workspace and actor.
+    /// Create a new recorder bound to a workspace and a known actor.
     ///
     /// The optional `ws_manager` enables real-time WebSocket broadcast of
     /// activity events. Pass `None` in tests or contexts without a live
@@ -195,6 +195,29 @@ impl<'a> ActivityRecorder<'a> {
         db: &'a DbPool,
         workspace_id: &'a str,
         actor_id: &'a str,
+        action_source: ActionSource,
+        action_source_label: Option<String>,
+        ws_manager: Option<&'a WebSocketManager>,
+    ) -> Self {
+        Self {
+            db,
+            workspace_id,
+            actor_id: Some(actor_id),
+            action_source,
+            action_source_label,
+            ws_manager,
+        }
+    }
+
+    /// Create a new recorder where the actor may be unknown.
+    ///
+    /// Used for activities sourced from external systems (e.g. GitHub webhook
+    /// commits and pull requests) where the author frequently has no matching
+    /// Trakkt user. A `None` actor results in a NULL `actor_id` column.
+    pub fn new_with_optional_actor(
+        db: &'a DbPool,
+        workspace_id: &'a str,
+        actor_id: Option<&'a str>,
         action_source: ActionSource,
         action_source_label: Option<String>,
         ws_manager: Option<&'a WebSocketManager>,
@@ -672,7 +695,7 @@ struct WorkspaceActivityRow {
     activity_id: String,
     issue_id: String,
     workspace_id: String,
-    actor_id: String,
+    actor_id: Option<String>,
     actor_name: Option<String>,
     action_type: String,
     field: Option<String>,

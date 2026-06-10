@@ -13,6 +13,7 @@ use crate::components::{Button, ButtonVariant, Select, SelectVariant, Spinner};
 use crate::server_fns::activities::list_workspace_activities;
 use crate::server_fns::team::list_workspace_members;
 use crate::server_fns::teams::list_teams;
+use crate::utils::github::github_author_login_from_metadata;
 use crate::utils::relative_time::relative_time;
 use crate::utils::time_group::{classify_time_group, TimeGroup};
 use trakkt_types::models::WorkspaceActivity;
@@ -40,6 +41,10 @@ fn activity_icon(action_type: &str) -> AnyView {
         "parent_changed" => view! { <Icon icon=phosphor_leptos::TREE_STRUCTURE size="16px" attr:class="text-muted-foreground"/> }.into_any(),
         "moved_to_team" => view! { <Icon icon=phosphor_leptos::ARROWS_LEFT_RIGHT size="16px" attr:class="text-muted-foreground"/> }.into_any(),
         "estimate_changed" => view! { <Icon icon=phosphor_leptos::GAUGE size="16px" attr:class="text-muted-foreground"/> }.into_any(),
+        "commit_pushed" => view! { <Icon icon=phosphor_leptos::GIT_COMMIT size="16px" attr:class="text-muted-foreground"/> }.into_any(),
+        "pr_opened" | "pr_closed" => view! { <Icon icon=phosphor_leptos::GIT_PULL_REQUEST size="16px" attr:class="text-muted-foreground"/> }.into_any(),
+        "pr_merged" => view! { <Icon icon=phosphor_leptos::GIT_MERGE size="16px" attr:class="text-muted-foreground"/> }.into_any(),
+        "branch_created" => view! { <Icon icon=phosphor_leptos::GIT_BRANCH size="16px" attr:class="text-muted-foreground"/> }.into_any(),
         _ => view! { <Icon icon=phosphor_leptos::LIGHTNING size="16px" attr:class="text-muted-foreground"/> }.into_any(),
     }
 }
@@ -89,8 +94,26 @@ fn activity_description(a: &WorkspaceActivity) -> String {
         "project_changed" => format!("{actor} moved to a different project"),
         "milestone_changed" => format!("{actor} changed the milestone"),
         "parent_changed" => format!("{actor} changed the parent issue"),
+        "commit_pushed" => github_activity_description(a, "pushed a commit"),
+        "pr_opened" => github_activity_description(a, "opened a pull request"),
+        "pr_merged" => github_activity_description(a, "merged a pull request"),
+        "pr_closed" => github_activity_description(a, "closed a pull request"),
+        "branch_created" => github_activity_description(a, "created a branch"),
         _ => format!("{actor} updated the issue"),
     }
+}
+
+/// Description for a GitHub-sourced activity in the workspace feed.
+///
+/// Prefers the resolved Trakkt user name, falling back to the `author_login`
+/// from metadata (`@login`), then `"Someone"`.
+fn github_activity_description(a: &WorkspaceActivity, verb: &str) -> String {
+    let actor = match a.actor_name.as_deref() {
+        Some(name) => name.to_string(),
+        None => github_author_login_from_metadata(a.metadata.as_deref())
+            .unwrap_or_else(|| "Someone".to_string()),
+    };
+    format!("{actor} {verb}")
 }
 
 const PAGE_SIZE: i64 = 50;
@@ -176,6 +199,11 @@ pub fn ActivityPage() -> impl IntoView {
             ("relation_added".to_string(), "Relations added".to_string()),
             ("relation_removed".to_string(), "Relations removed".to_string()),
             ("moved_to_team".to_string(), "Moved to team".to_string()),
+            ("commit_pushed".to_string(), "Commits".to_string()),
+            ("pr_opened".to_string(), "PRs opened".to_string()),
+            ("pr_merged".to_string(), "PRs merged".to_string()),
+            ("pr_closed".to_string(), "PRs closed".to_string()),
+            ("branch_created".to_string(), "Branches created".to_string()),
         ]
     });
 
@@ -185,6 +213,7 @@ pub fn ActivityPage() -> impl IntoView {
             ("user".to_string(), "User".to_string()),
             ("agent".to_string(), "Agent".to_string()),
             ("api".to_string(), "API".to_string()),
+            ("github".to_string(), "GitHub".to_string()),
         ]
     });
 
