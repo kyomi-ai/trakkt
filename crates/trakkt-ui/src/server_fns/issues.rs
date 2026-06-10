@@ -398,10 +398,11 @@ pub async fn search_issues(
         limit: limit.unwrap_or(50),
         offset: 0,
     };
-    let results = trakkt_auth::search_service::search(ac.db(), &params)
+    let response = trakkt_auth::search_service::search(ac.db(), &params)
         .await
         .into_sfn()?;
-    Ok(results
+    Ok(response
+        .results
         .into_iter()
         .map(|r| SearchResultItem {
             issue_id: r.issue_id,

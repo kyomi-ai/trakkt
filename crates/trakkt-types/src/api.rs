@@ -202,6 +202,8 @@ pub struct SearchIssuesApiParams {
     pub include_comments: Option<bool>,
     /// Max results (default: 20, max: 100)
     pub limit: Option<i64>,
+    /// Offset for pagination (default: 0)
+    pub offset: Option<i64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -39,6 +39,13 @@ pub struct SearchResult {
     pub rank: f64,
 }
 
+/// Search response with total count for pagination.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchResponse {
+    pub results: Vec<SearchResult>,
+    pub total: i64,
+}
+
 impl From<SearchResultRow> for SearchResult {
     fn from(row: SearchResultRow) -> Self {
         Self {
@@ -75,32 +82,62 @@ pub struct SearchParams {
 /// On Postgres, uses `tsvector @@ plainto_tsquery` with `ts_rank` for ranked
 /// results and `ts_headline` for snippet context. On SQLite, falls back to
 /// `LIKE '%query%'` without ranking or snippets.
+///
+/// Returns a [`SearchResponse`] containing the paginated results and the total
+/// number of matching items (before offset/limit are applied). Pagination is
+/// performed in Rust so that `total` reflects the true match count. The SQL
+/// queries are run with a high cap (1000 rows) and no offset; deduplication
+/// and slicing happen after.
 pub async fn search(
     db: &DbPool,
     params: &SearchParams,
-) -> trakkt_core::Result<Vec<SearchResult>> {
+) -> trakkt_core::Result<SearchResponse> {
     if params.query.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok(SearchResponse {
+            results: Vec::new(),
+            total: 0,
+        });
     }
 
     let identifier = parse_identifier_number(&params.query);
 
+    // Fetch all matching rows (up to a reasonable cap) so we can report the
+    // true total count. SQL LIMIT/OFFSET are bypassed here; pagination is
+    // applied in Rust below.
+    let uncapped_params = SearchParams {
+        query: params.query.clone(),
+        workspace_id: params.workspace_id.clone(),
+        team_id: params.team_id.clone(),
+        include_archived: params.include_archived,
+        include_closed: params.include_closed,
+        include_comments: params.include_comments,
+        limit: 1000,
+        offset: 0,
+    };
+
     let rows = if db.is_postgres() {
-        search_postgres(db, params, &identifier).await?
+        search_postgres(db, &uncapped_params, &identifier).await?
     } else {
-        search_sqlite(db, params, &identifier).await?
+        search_sqlite(db, &uncapped_params, &identifier).await?
     };
 
     // Dedup by issue_id, keeping the entry with the highest rank (identifier
     // matches have rank 2.0 so they win over tsvector / LIKE matches).
     let mut seen = std::collections::HashSet::new();
-    let results: Vec<SearchResult> = rows
+    let all_results: Vec<SearchResult> = rows
         .into_iter()
         .map(SearchResult::from)
         .filter(|r| seen.insert(r.issue_id.clone()))
         .collect();
 
-    Ok(results)
+    let total = all_results.len() as i64;
+
+    // Apply pagination in Rust.
+    let offset = params.offset as usize;
+    let limit = params.limit as usize;
+    let results = all_results.into_iter().skip(offset).take(limit).collect();
+
+    Ok(SearchResponse { results, total })
 }
 
 // ─── Shared condition builders ─────────────────────────────────────────────
