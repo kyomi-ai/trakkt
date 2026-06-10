@@ -265,6 +265,9 @@ pub struct Notification {
     pub action_source_label: Option<String>,
     pub created_at: String,
     pub deleted_at: Option<String>,
+    /// Optional context ID for deep-linking (e.g. comment_id for "commented" notifications).
+    #[serde(default)]
+    pub context_id: Option<String>,
 }
 
 /// User-level notification preferences for a workspace.

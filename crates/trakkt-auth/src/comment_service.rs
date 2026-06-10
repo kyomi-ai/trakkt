@@ -189,6 +189,7 @@ pub async fn create_comment(
                         issue_id,
                         crate::notification_service::TYPE_COMMENTED,
                         Some(user_id),
+                        Some(&comment_id),
                         action_source,
                         action_source_label,
                         ws_manager,
