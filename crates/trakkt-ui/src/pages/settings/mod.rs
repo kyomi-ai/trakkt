@@ -3,6 +3,7 @@
 pub mod billing;
 pub mod integrations;
 pub mod labels;
+pub mod notifications;
 pub mod profile;
 pub mod security;
 pub mod settings_shell;

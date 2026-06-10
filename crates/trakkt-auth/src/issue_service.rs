@@ -927,15 +927,59 @@ pub async fn update_issue(
         if !types_to_notify.is_empty() {
             match crate::watcher_service::list_watchers_of_issue(db, &issue_id).await {
                 Ok(watchers) => {
+                    let prefs_map = match crate::notification_service::batch_get_preferences(
+                        db, &watchers, workspace_id,
+                    )
+                    .await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to fetch notification preferences, using defaults");
+                            std::collections::HashMap::new()
+                        }
+                    };
+
                     for notification_type in types_to_notify {
                         for watcher_id in &watchers {
-                            if watcher_id == actor_id && action_source == ActionSource::User {
+                            // Self-exclusion check with preference awareness
+                            if crate::notification_service::should_suppress_self_notification(
+                                watcher_id, actor_id, action_source, &prefs_map,
+                            ) {
                                 continue;
                             }
-                            if let Err(e) = crate::notification_service::create_notification(
-                                db, workspace_id, watcher_id, &issue_id, notification_type, Some(actor_id),
-                                action_source, action_source_label, ws_manager,
-                            ).await {
+
+                            // Event type preference check
+                            let type_enabled = prefs_map
+                                .get(watcher_id.as_str())
+                                .is_none_or(|p| match notification_type {
+                                    crate::notification_service::TYPE_STATUS_CHANGED => {
+                                        p.notify_status_changes
+                                    }
+                                    crate::notification_service::TYPE_ASSIGNED => {
+                                        p.notify_assignments
+                                    }
+                                    crate::notification_service::TYPE_PRIORITY_CHANGED => {
+                                        p.notify_priority_changes
+                                    }
+                                    _ => true,
+                                });
+                            if !type_enabled {
+                                continue;
+                            }
+
+                            if let Err(e) =
+                                crate::notification_service::create_notification(
+                                    db,
+                                    workspace_id,
+                                    watcher_id,
+                                    &issue_id,
+                                    notification_type,
+                                    Some(actor_id),
+                                    action_source,
+                                    action_source_label,
+                                    ws_manager,
+                                )
+                                .await
+                            {
                                 tracing::warn!(error = %e, "Failed to create notification");
                             }
                         }

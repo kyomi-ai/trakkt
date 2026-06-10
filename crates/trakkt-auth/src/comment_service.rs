@@ -155,15 +155,46 @@ pub async fn create_comment(
     if let Ok(ws_id) = &resolved_workspace_id {
         match crate::watcher_service::list_watchers_of_issue(db, issue_id).await {
             Ok(watchers) => {
+                let prefs_map = match crate::notification_service::batch_get_preferences(
+                    db, &watchers, ws_id,
+                )
+                .await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to fetch notification preferences, using defaults");
+                        std::collections::HashMap::new()
+                    }
+                };
+
                 for watcher_id in &watchers {
-                    if *watcher_id == user_id && action_source == ActionSource::User {
+                    // Self-exclusion check with preference awareness
+                    if crate::notification_service::should_suppress_self_notification(
+                        watcher_id, user_id, action_source, &prefs_map,
+                    ) {
                         continue;
                     }
+
+                    // Event type preference check
+                    let type_enabled = prefs_map
+                        .get(watcher_id.as_str())
+                        .is_none_or(|p| p.notify_comments);
+                    if !type_enabled {
+                        continue;
+                    }
+
                     if let Err(e) = crate::notification_service::create_notification(
-                        db, ws_id, watcher_id, issue_id,
-                        crate::notification_service::TYPE_COMMENTED, Some(user_id),
-                        action_source, action_source_label, ws_manager,
-                    ).await {
+                        db,
+                        ws_id,
+                        watcher_id,
+                        issue_id,
+                        crate::notification_service::TYPE_COMMENTED,
+                        Some(user_id),
+                        action_source,
+                        action_source_label,
+                        ws_manager,
+                    )
+                    .await
+                    {
                         tracing::warn!(error = %e, "Failed to create comment notification");
                     }
                 }
