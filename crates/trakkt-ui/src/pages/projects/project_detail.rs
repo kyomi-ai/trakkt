@@ -17,7 +17,8 @@ use leptos_router::NavigateOptions;
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Button, ButtonSize, ButtonVariant, ConfirmDialog, DatePicker, EmptyState,
+    Button, ButtonSize, ButtonVariant, Card, CardContent, CardDescription,
+    CardHeader, CardTitle, ConfirmDialog, DatePicker, EmptyState,
     IssueStatusBadge, IssueStatusVariant, INPUT_CLASS,
     PriorityIndicator, LabelBadge, Select, SelectVariant,
     TeamKeyBadge, ToggleButton,
@@ -25,6 +26,7 @@ use crate::components::{
 use crate::pages::projects::project_board::ProjectBoardContent;
 use crate::pages::projects::project_list_view::ProjectListView;
 use crate::server_fns::projects::{
+    archive_project, delete_project,
     get_project, get_project_progress, list_milestones,
     create_milestone, update_milestone, delete_milestone,
     list_project_updates, create_project_update,
@@ -54,7 +56,7 @@ fn parse_view_param(search: &str) -> String {
             && key == "view"
         {
             return match value {
-                "board" | "list" => value.to_string(),
+                "board" | "list" | "settings" => value.to_string(),
                 _ => "overview".to_string(),
             };
         }
@@ -684,6 +686,12 @@ fn ProjectDetailContent(
                         active=active_view
                         project_id=pid
                     />
+                    <ProjectViewTab
+                        label="Settings"
+                        value="settings"
+                        active=active_view
+                        project_id=pid
+                    />
 
                     // Issue count badge
                     <span class="text-xs text-muted-foreground ml-2">
@@ -737,6 +745,15 @@ fn ProjectDetailContent(
                     let pid_signal = Signal::derive(move || project_id.get());
                     view! {
                         <ProjectListView project_id=pid_signal milestones=milestones_signal/>
+                    }.into_any()
+                }
+                "settings" => {
+                    view! {
+                        <div class="max-w-[860px] mx-auto w-full">
+                            <ProjectSettingsContent
+                                project=project.clone()
+                            />
+                        </div>
                     }.into_any()
                 }
                 _ => {
@@ -1925,6 +1942,162 @@ fn ProjectIssueRow(issue: IssueWithDetails) -> impl IntoView {
                 {format_short_date(&issue.created_at)}
             </span>
         </a>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Project Settings Content
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Settings tab content for a project — archive/unarchive and delete.
+///
+/// Layout follows the same Card pattern used in `team_settings.rs`.
+#[component]
+fn ProjectSettingsContent(
+    project: Project,
+) -> impl IntoView {
+    let project_id = StoredValue::new(project.project_id.clone());
+    let project_name = StoredValue::new(project.name.clone());
+    let is_archived = RwSignal::new(project.archived_at.is_some());
+
+    let nav = use_navigate();
+    let store = use_context::<crate::cache::store::SyncStore>();
+
+    // ── Archive handler ────────────────────────────────────────────────────
+    let on_archive_toggle = move |_| {
+        let pid = project_id.get_value();
+        let currently_archived = is_archived.get_untracked();
+        let archive = !currently_archived;
+        is_archived.set(archive);
+        leptos::task::spawn_local(async move {
+            if let Err(e) = archive_project(pid, archive).await {
+                tracing::warn!(error = %e, "Failed to archive/unarchive project");
+                is_archived.set(!archive);
+            }
+        });
+    };
+
+    // ── Delete confirmation ────────────────────────────────────────────────
+    let (show_delete_confirm, set_show_delete_confirm) = signal(false);
+
+    let confirm_message = format!(
+        "Are you sure you want to delete \"{}\"? Issues linked to this project will be \
+         unlinked. This action cannot be undone.",
+        project_name.get_value(),
+    );
+
+    let on_confirm_delete = {
+        let nav = nav.clone();
+        Callback::new(move |()| {
+            set_show_delete_confirm.set(false);
+            let pid = project_id.get_value();
+            let nav = nav.clone();
+            leptos::task::spawn_local(async move {
+                match delete_project(pid.clone()).await {
+                    Ok(()) => {
+                        if let Some(store) = store {
+                            store.remove_project(&pid);
+                        }
+                        nav("/projects", Default::default());
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to delete project");
+                    }
+                }
+            });
+        })
+    };
+
+    let on_cancel_delete = Callback::new(move |()| {
+        set_show_delete_confirm.set(false);
+    });
+
+    view! {
+        <div class="space-y-6">
+            // ── Archive card ───────────────────────────────────────────────
+            <Card>
+                <CardHeader>
+                    <CardTitle>"Archive project"</CardTitle>
+                    <CardDescription>
+                        "Archived projects are hidden from the project list and sidebar. \
+                         You can unarchive a project at any time."
+                    </CardDescription>
+                </CardHeader>
+                <CardContent>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm font-medium text-foreground">
+                                {move || if is_archived.get() {
+                                    "This project is archived"
+                                } else {
+                                    "Archive this project"
+                                }}
+                            </p>
+                            <p class="text-xs text-muted-foreground">
+                                {move || if is_archived.get() {
+                                    "Unarchive to restore the project to the active list."
+                                } else {
+                                    "Archived projects remain accessible via the filter toggle."
+                                }}
+                            </p>
+                        </div>
+                        <Button
+                            variant={if project.archived_at.is_some() {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Default
+                            }}
+                            on:click=on_archive_toggle
+                        >
+                            {move || if is_archived.get() {
+                                "Unarchive"
+                            } else {
+                                "Archive"
+                            }}
+                        </Button>
+                    </div>
+                </CardContent>
+            </Card>
+
+            // ── Danger Zone card ───────────────────────────────────────────
+            <Card>
+                <CardHeader>
+                    <CardTitle>
+                        <span class="text-error-foreground">"Danger Zone"</span>
+                    </CardTitle>
+                    <CardDescription>
+                        "Destructive actions that cannot be undone."
+                    </CardDescription>
+                </CardHeader>
+                <CardContent>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm font-medium text-foreground">"Delete this project"</p>
+                            <p class="text-xs text-muted-foreground">
+                                "Permanently delete this project. Issues will be unlinked but not deleted."
+                            </p>
+                        </div>
+                        <Button
+                            variant=ButtonVariant::Destructive
+                            on:click=move |_| set_show_delete_confirm.set(true)
+                        >
+                            "Delete project"
+                        </Button>
+                    </div>
+                </CardContent>
+            </Card>
+        </div>
+
+        // ── Delete confirmation dialog ─────────────────────────────────────
+        <ConfirmDialog
+            open=Signal::derive(move || show_delete_confirm.get())
+            title="Delete project?"
+            message=confirm_message
+            confirm_text="Delete"
+            destructive=true
+            on_confirm=on_confirm_delete
+            on_cancel=on_cancel_delete
+        />
     }
 }
 

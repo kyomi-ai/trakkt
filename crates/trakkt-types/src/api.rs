@@ -381,6 +381,8 @@ pub struct UpdateProjectApiParams {
     pub start_date: Option<Option<String>>,
     /// Target date in ISO 8601 format, or null to clear
     pub target_date: Option<Option<String>>,
+    /// Archive timestamp, or null to unarchive
+    pub archived_at: Option<Option<String>>,
 }
 
 /// Parameters for deleting a project.

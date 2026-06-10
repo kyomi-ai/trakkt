@@ -513,7 +513,10 @@ fn SidebarProjectsSection() -> impl IntoView {
                 }.into_any();
             }
 
-            let projects = store.projects().get();
+            let projects: Vec<_> = store.projects().get()
+                .into_iter()
+                .filter(|p| p.archived_at.is_none())
+                .collect();
 
             view! {
                 <div class="group flex items-center justify-between px-3 pt-4 pb-1">

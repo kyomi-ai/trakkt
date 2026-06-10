@@ -97,9 +97,45 @@ pub async fn update_project(
         lead_id: opt_clear(lead_id),
         start_date: opt_clear(start_date),
         target_date: opt_clear(target_date),
+        archived_at: None,
     };
     let result = trakkt_api::projects::update_project(&ctx, params).await.into_sfn()?;
     serde_json::from_value(result).into_sfn()
+}
+
+/// Archive or unarchive a project.
+///
+/// When `archive` is `true`, sets `archived_at` to the current timestamp.
+/// When `false`, clears `archived_at` (unarchive).
+#[server(prefix = "/leptos-api")]
+pub async fn archive_project(
+    project_id: String,
+    archive: bool,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let ctx = ac.api_ctx();
+
+    let archived_at_value = if archive {
+        Some(Some(chrono::Utc::now().to_rfc3339()))
+    } else {
+        Some(None)
+    };
+    let update_params = trakkt_types::api::UpdateProjectApiParams {
+        project_id: Some(project_id),
+        name: None,
+        description: None,
+        icon: None,
+        color: None,
+        status: None,
+        lead_id: None,
+        start_date: None,
+        target_date: None,
+        archived_at: archived_at_value,
+    };
+    trakkt_api::projects::update_project(&ctx, update_params)
+        .await
+        .into_sfn()?;
+    Ok(())
 }
 
 /// Delete a project by its ID.

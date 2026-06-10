@@ -34,6 +34,7 @@ struct ProjectRow {
     sort_order: f64,
     created_at: String,
     updated_at: String,
+    archived_at: Option<String>,
 }
 
 impl ProjectRow {
@@ -53,6 +54,7 @@ impl ProjectRow {
             target_date: self.target_date,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            archived_at: self.archived_at,
         }
     }
 }
@@ -137,7 +139,8 @@ const PROJECT_SELECT: &str = "\
            CAST(p.target_date AS TEXT) AS target_date, \
            p.sort_order, \
            CAST(p.created_at AS TEXT) AS created_at, \
-           CAST(p.updated_at AS TEXT) AS updated_at \
+           CAST(p.updated_at AS TEXT) AS updated_at, \
+           CAST(p.archived_at AS TEXT) AS archived_at \
     FROM projects p \
     LEFT JOIN users lead ON lead.user_id = p.lead_id";
 
@@ -290,6 +293,9 @@ pub struct UpdateProjectParams<'a> {
     pub lead_id: Option<Option<&'a str>>,
     pub start_date: Option<Option<&'a str>>,
     pub target_date: Option<Option<&'a str>>,
+    /// Archive/unarchive: `None` = no change, `Some(None)` = unarchive (clear),
+    /// `Some(Some(timestamp))` = archive (set timestamp).
+    pub archived_at: Option<Option<&'a str>>,
 }
 
 /// Update a project.
@@ -341,6 +347,11 @@ pub async fn update_project(
         set_parts.push(format!("target_date = {cast}"));
         param_idx += 1;
     }
+    if params.archived_at.is_some() {
+        let cast = sql_compat::cast_to_timestamptz(is_pg, &format!("${param_idx}"));
+        set_parts.push(format!("archived_at = {cast}"));
+        param_idx += 1;
+    }
 
     // Always update updated_at.
     set_parts.push(format!("updated_at = {now}"));
@@ -376,6 +387,9 @@ pub async fn update_project(
             query = query.bind(v);
         }
         if let Some(v) = params.target_date {
+            query = query.bind(v);
+        }
+        if let Some(v) = params.archived_at {
             query = query.bind(v);
         }
 

@@ -1,0 +1,1 @@
+ALTER TABLE projects ADD COLUMN archived_at TEXT DEFAULT NULL;
