@@ -158,6 +158,7 @@ pub struct Project {
     pub sort_order: f64,
     pub created_at: String,
     pub updated_at: String,
+    pub archived_at: Option<String>,
 }
 
 /// A member of a project with a specific role.

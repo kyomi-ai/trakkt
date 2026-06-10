@@ -64,6 +64,16 @@ pub fn cast_to_date(is_pg: bool, param: &str) -> String {
     }
 }
 
+/// Timestamptz type cast.
+/// Postgres: `$1::timestamptz`, SQLite: `$1` (timestamps stored as TEXT)
+pub fn cast_to_timestamptz(is_pg: bool, param: &str) -> String {
+    if is_pg {
+        format!("{param}::timestamptz")
+    } else {
+        param.to_string()
+    }
+}
+
 /// JSON type cast.
 /// Postgres: `$1::json`, SQLite: `$1` (JSON stored as TEXT)
 pub fn cast_to_json(is_pg: bool, param: &str) -> String {

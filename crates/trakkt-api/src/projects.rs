@@ -116,6 +116,7 @@ pub async fn update_project(
         lead_id: params.lead_id.as_ref().map(|opt| opt.as_deref()),
         start_date: params.start_date.as_ref().map(|opt| opt.as_deref()),
         target_date: params.target_date.as_ref().map(|opt| opt.as_deref()),
+        archived_at: params.archived_at.as_ref().map(|opt| opt.as_deref()),
     };
 
     let project =
