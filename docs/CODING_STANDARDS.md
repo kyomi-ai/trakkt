@@ -24,6 +24,9 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 - Use `#[server(prefix = "/leptos-api")]` for all server functions.
 - Return typed Rust enums (not HTTP status codes). UI pattern-matches on variants.
 
+### Concurrent Inserts
+- All INSERT statements for user-scoped or entity-scoped records must use `ON CONFLICT DO NOTHING` (Postgres) or `INSERT OR IGNORE` (SQLite). Check-then-insert patterns without ON CONFLICT are race conditions — concurrent requests can hit a UNIQUE constraint violation between the check and the insert. This applies to favorites, watchers, preferences, release_issues, and any table with a composite PK or UNIQUE constraint.
+
 ### Error Handling
 - Never silently discard errors with `let _ =`. At minimum, log with `tracing::warn!`.
 - Never use `unwrap_or_default()` on serialization or deserialization (JSON parse, `to_value`, filter decode, etc.) — use `match` and log the error with `tracing::warn!`.
