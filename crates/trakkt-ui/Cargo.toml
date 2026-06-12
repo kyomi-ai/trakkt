@@ -93,6 +93,12 @@ regex = { workspace = true }
 # URL encoding/decoding (for persisting filters in query params)
 percent-encoding = { workspace = true }
 
+# VTE escape sequence parser (terminal emulator)
+vte = "0.13"
+
+# Terminal protocol types
+trakkt-connect-protocol = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 
