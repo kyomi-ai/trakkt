@@ -208,8 +208,8 @@ pub async fn create_team(
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team create");
     }
 
-    if params.creator_id.is_some() {
-        if let Err(e) = sync_log_service::write_sync_entry(
+    if params.creator_id.is_some()
+        && let Err(e) = sync_log_service::write_sync_entry(
             db,
             entity_types::TEAM,
             &team_id,
@@ -218,9 +218,8 @@ pub async fn create_team(
             None,
         )
         .await
-        {
-            tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team member add");
-        }
+    {
+        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team member add");
     }
 
     // Re-fetch to get the DB-assigned created_at.
