@@ -8,6 +8,7 @@ members = [
     "crates/trakkt-connect-protocol",
     "crates/trakkt-ui",
     "apps/server",
+    "apps/trakkt-connect",
     "tools/gen-api-docs",
 ]
 resolver = "3"
