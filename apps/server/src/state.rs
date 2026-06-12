@@ -4,6 +4,7 @@
 
 use axum::extract::FromRef;
 use trakkt_auth::attachment_storage::AttachmentStorage;
+use trakkt_auth::connect_manager::ConnectManager;
 use trakkt_auth::mcp_session_manager::MCPSessionManager;
 use trakkt_auth::middleware::AuthState;
 use trakkt_auth::stripe_service::StripeService;
@@ -20,6 +21,7 @@ pub struct AppState {
     pub encryption_key: std::sync::Arc<[u8; 32]>,
     pub webauthn: std::sync::Arc<Webauthn>,
     pub ws_manager: WebSocketManager,
+    pub connect_manager: ConnectManager,
     pub mcp_sessions: MCPSessionManager,
     pub attachment_storage: std::sync::Arc<dyn AttachmentStorage>,
     pub stripe: Option<StripeService>,
