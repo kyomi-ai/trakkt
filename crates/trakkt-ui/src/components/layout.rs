@@ -288,6 +288,7 @@ fn Sidebar(
                 <SidebarInboxNavItem/>
                 <SidebarNavItem href="/activity" icon=phosphor_leptos::LIGHTNING label="Activity"/>
                 <SidebarNavItem href="/my-issues" icon=phosphor_leptos::LIST_CHECKS label="My Issues"/>
+                <SidebarNavItem href="/connect" icon=phosphor_leptos::TERMINAL label="Connect"/>
 
                 <SidebarWorkspaceSection/>
 

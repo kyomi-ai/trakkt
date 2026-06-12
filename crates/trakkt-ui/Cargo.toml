@@ -68,6 +68,8 @@ web-sys = { version = "0.3", features = [
     "WebSocket", "MessageEvent", "CloseEvent",
     "FormData", "File", "FileList", "Blob", "BlobPropertyBag",
     "Headers", "Request", "RequestInit", "RequestCredentials", "Response",
+    "ResizeObserver", "ResizeObserverEntry", "ResizeObserverSize",
+    "ClipboardEvent", "DataTransfer",
 ] }
 
 # Timers for WASM
