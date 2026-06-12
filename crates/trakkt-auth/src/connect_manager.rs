@@ -237,10 +237,10 @@ impl ConnectManager {
             }
         }
 
-        if !stale_ids.is_empty() {
-            if let Some(mut browsers) = self.inner.browsers.get_mut(session_id) {
-                browsers.retain(|b| !stale_ids.contains(&b.connection_id));
-            }
+        if !stale_ids.is_empty()
+            && let Some(mut browsers) = self.inner.browsers.get_mut(session_id)
+        {
+            browsers.retain(|b| !stale_ids.contains(&b.connection_id));
         }
     }
 

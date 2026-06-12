@@ -542,10 +542,10 @@ fn handle_browser_message(
                 }
             };
 
-            if let Some(sender) = connect_mgr.get_agent_sender(&agent_id) {
-                if let Err(e) = sender.try_send(json) {
-                    tracing::warn!(agent_id, error = %e, "Failed to send ListSessions to agent");
-                }
+            if let Some(sender) = connect_mgr.get_agent_sender(&agent_id)
+                && let Err(e) = sender.try_send(json)
+            {
+                tracing::warn!(agent_id, error = %e, "Failed to send ListSessions to agent");
             }
         }
 
