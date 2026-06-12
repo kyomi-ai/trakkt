@@ -444,10 +444,10 @@ pub fn ConnectPage() -> impl IntoView {
         connect_fn();
 
         // ── Cleanup on unmount ──────────────────────────────────────────────
-        let ws_for_cleanup = ws_handle.clone();
-        let closures_for_cleanup = ws_closures.clone();
-        let intentional_for_cleanup = intentional_close.clone();
-        let timeout_for_cleanup = reconnect_timeout.clone();
+        let ws_for_cleanup = SendWrapper::new(ws_handle.clone());
+        let closures_for_cleanup = SendWrapper::new(ws_closures.clone());
+        let intentional_for_cleanup = SendWrapper::new(intentional_close.clone());
+        let timeout_for_cleanup = SendWrapper::new(reconnect_timeout.clone());
         on_cleanup(move || {
             *intentional_for_cleanup.borrow_mut() = true;
             *timeout_for_cleanup.borrow_mut() = None;
@@ -524,11 +524,10 @@ pub fn ConnectPage() -> impl IntoView {
         });
 
         // ── Attach keyboard + paste to terminal container ───────────────────
-        let keydown_closure = SendWrapper::new(keydown_handler);
-        let paste_closure = SendWrapper::new(paste_handler);
-
-        let keydown_for_cleanup = keydown_closure.clone();
-        let paste_for_cleanup = paste_closure.clone();
+        // Pattern from layout.rs: wrap closures in SendWrapper, register
+        // cleanup inside the Effect so both closures stay in the same scope.
+        let keydown_wrapper = SendWrapper::new(keydown_handler);
+        let paste_wrapper = SendWrapper::new(paste_handler);
 
         Effect::new(move |_| {
             let Some(el) = terminal_ref.get() else {
@@ -538,26 +537,22 @@ pub fn ConnectPage() -> impl IntoView {
 
             let _ = el.add_event_listener_with_callback(
                 "keydown",
-                keydown_closure.as_ref().unchecked_ref(),
+                keydown_wrapper.as_ref().unchecked_ref(),
             );
             let _ = el.add_event_listener_with_callback(
                 "paste",
-                paste_closure.as_ref().unchecked_ref(),
+                paste_wrapper.as_ref().unchecked_ref(),
             );
-        });
 
-        on_cleanup(move || {
-            if let Some(el) = terminal_ref.get() {
-                let el: &web_sys::HtmlElement = &el;
-                let _ = el.remove_event_listener_with_callback(
-                    "keydown",
-                    keydown_for_cleanup.as_ref().unchecked_ref(),
-                );
-                let _ = el.remove_event_listener_with_callback(
-                    "paste",
-                    paste_for_cleanup.as_ref().unchecked_ref(),
-                );
-            }
+            let kd = SendWrapper::new(keydown_wrapper.as_ref().unchecked_ref::<js_sys::Function>().clone());
+            let pa = SendWrapper::new(paste_wrapper.as_ref().unchecked_ref::<js_sys::Function>().clone());
+            on_cleanup(move || {
+                if let Some(el) = terminal_ref.get() {
+                    let el: &web_sys::HtmlElement = &el;
+                    let _ = el.remove_event_listener_with_callback("keydown", &kd);
+                    let _ = el.remove_event_listener_with_callback("paste", &pa);
+                }
+            });
         });
 
         // ── ResizeObserver ──────────────────────────────────────────────────
@@ -631,7 +626,7 @@ pub fn ConnectPage() -> impl IntoView {
             }
         });
 
-        let observer_for_cleanup = observer_handle.clone();
+        let observer_for_cleanup = SendWrapper::new(observer_handle.clone());
         on_cleanup(move || {
             if let Some(obs) = observer_for_cleanup.borrow_mut().take() {
                 obs.disconnect();
@@ -639,11 +634,11 @@ pub fn ConnectPage() -> impl IntoView {
         });
 
         // ── Tab callbacks ───────────────────────────────────────────────────
-        let send_for_new = send_msg.clone();
-        let grids_for_new = session_grids.clone();
-        let cols_for_new = current_cols.clone();
-        let rows_for_new = current_rows.clone();
-        let sync_for_new = sync_grid.clone();
+        let send_for_new = SendWrapper::new(send_msg.clone());
+        let grids_for_new = SendWrapper::new(session_grids.clone());
+        let cols_for_new = SendWrapper::new(current_cols.clone());
+        let rows_for_new = SendWrapper::new(current_rows.clone());
+        let sync_for_new = SendWrapper::new(sync_grid.clone());
 
         let on_new_session = Callback::new(move |()| {
             let cols = *cols_for_new.borrow();
@@ -689,9 +684,9 @@ pub fn ConnectPage() -> impl IntoView {
             }
         });
 
-        let send_for_close = send_msg.clone();
-        let grids_for_close = session_grids.clone();
-        let sync_for_close = sync_grid.clone();
+        let send_for_close = SendWrapper::new(send_msg.clone());
+        let grids_for_close = SendWrapper::new(session_grids.clone());
+        let sync_for_close = SendWrapper::new(sync_grid.clone());
 
         let on_close_session = Callback::new(move |session_id: String| {
             // Send kill.
@@ -716,7 +711,7 @@ pub fn ConnectPage() -> impl IntoView {
             }
         });
 
-        let sync_for_select = sync_grid.clone();
+        let sync_for_select = SendWrapper::new(sync_grid.clone());
         let on_select_session = Callback::new(move |session_id: String| {
             active_session.set(Some(session_id.clone()));
             sync_for_select(&session_id, grid_signal);
