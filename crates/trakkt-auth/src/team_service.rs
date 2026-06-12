@@ -98,6 +98,9 @@ pub struct CreateTeamParams<'a> {
 /// Create a new team in a workspace.
 ///
 /// If `params.creator_id` is provided, the creator is automatically added as a `lead` member.
+///
+/// The team INSERT and member INSERT are wrapped in a transaction so a partial
+/// failure cannot leave an orphaned team row with no creator membership.
 pub async fn create_team(
     db: &DbPool,
     params: &CreateTeamParams<'_>,
@@ -117,12 +120,81 @@ pub async fn create_team(
     let now = sql_compat::now(is_pg);
     let team_id = uuid::Uuid::new_v4().to_string();
 
-    let sql = format!(
+    let insert_team_sql = format!(
         "INSERT INTO teams (team_id, workspace_id, name, key, description, icon, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, {now})"
     );
-    trakkt_core::db_execute!(db, &sql, &team_id, params.workspace_id, params.name, params.key, params.description, params.icon)?;
 
+    let insert_member_sql = if is_pg {
+        format!(
+            "INSERT INTO team_members (team_id, user_id, role, created_at) \
+             VALUES ($1, $2, $3, {now}) \
+             ON CONFLICT DO NOTHING"
+        )
+    } else {
+        format!(
+            "INSERT OR IGNORE INTO team_members (team_id, user_id, role, created_at) \
+             VALUES ($1, $2, $3, {now})"
+        )
+    };
+
+    // Run both inserts in a single transaction so we never get an orphaned team
+    // without its creator membership.
+    match db {
+        DbPool::Postgres(pg) => {
+            let mut tx = pg.begin().await.map_err(|e| {
+                trakkt_core::Error::Internal(format!("failed to begin transaction: {e}"))
+            })?;
+            sqlx::query(&insert_team_sql)
+                .bind(&team_id)
+                .bind(params.workspace_id)
+                .bind(params.name)
+                .bind(params.key)
+                .bind(params.description)
+                .bind(params.icon)
+                .execute(&mut *tx)
+                .await?;
+            if let Some(uid) = params.creator_id {
+                sqlx::query(&insert_member_sql)
+                    .bind(&team_id)
+                    .bind(uid)
+                    .bind("lead")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await.map_err(|e| {
+                trakkt_core::Error::Internal(format!("failed to commit transaction: {e}"))
+            })?;
+        }
+        DbPool::Sqlite(sq) => {
+            let mut tx = sq.begin().await.map_err(|e| {
+                trakkt_core::Error::Internal(format!("failed to begin transaction: {e}"))
+            })?;
+            sqlx::query(&insert_team_sql)
+                .bind(&team_id)
+                .bind(params.workspace_id)
+                .bind(params.name)
+                .bind(params.key)
+                .bind(params.description)
+                .bind(params.icon)
+                .execute(&mut *tx)
+                .await?;
+            if let Some(uid) = params.creator_id {
+                sqlx::query(&insert_member_sql)
+                    .bind(&team_id)
+                    .bind(uid)
+                    .bind("lead")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await.map_err(|e| {
+                trakkt_core::Error::Internal(format!("failed to commit transaction: {e}"))
+            })?;
+        }
+    }
+
+    // Sync log + broadcast happen after commit — these are best-effort and
+    // should not roll back an otherwise-successful team creation.
     if let Err(e) = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
@@ -136,9 +208,18 @@ pub async fn create_team(
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team create");
     }
 
-    // Auto-add creator as lead member if provided.
-    if let Some(uid) = params.creator_id {
-        add_team_member(db, &team_id, uid, "lead", params.workspace_id).await?;
+    if params.creator_id.is_some()
+        && let Err(e) = sync_log_service::write_sync_entry(
+            db,
+            entity_types::TEAM,
+            &team_id,
+            params.workspace_id,
+            SyncActionType::Update,
+            None,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team member add");
     }
 
     // Re-fetch to get the DB-assigned created_at.
