@@ -1,0 +1,15 @@
+[package]
+name = "trakkt-connect-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Wire protocol types for Trakkt Connect (terminal session relay)"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/kyomi-ai/trakkt"
+homepage = "https://trakkt.app"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
