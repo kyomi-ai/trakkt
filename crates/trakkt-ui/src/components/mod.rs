@@ -38,6 +38,7 @@ pub mod team_creation_modal;
 pub mod team_icon;
 pub mod team_icon_picker;
 pub mod team_key_badge;
+pub mod terminal;
 pub mod theme;
 pub mod toast;
 pub mod tooltip;

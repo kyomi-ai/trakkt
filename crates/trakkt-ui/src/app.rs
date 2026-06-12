@@ -22,6 +22,7 @@ use crate::pages::auth::{
 };
 use crate::pages::accept_ownership::AcceptOwnershipPage;
 use crate::pages::activity::ActivityPage;
+use crate::pages::connect::ConnectPage;
 use crate::pages::inbox::InboxPage;
 use crate::pages::issues::archived::{ArchivedIssuesForTeam, ArchivedIssuesPage};
 use crate::pages::issues::issue_detail::IssueDetailPage;
@@ -120,6 +121,9 @@ pub fn App() -> impl IntoView {
 
                     // My Issues — cross-team view of issues assigned to the current user
                     <Route path=path!("/my-issues") view=MyIssuesPage/>
+
+                    // Connect — browser-based terminal sessions
+                    <Route path=path!("/connect") view=ConnectPage/>
 
                     // Archived issues — workspace-wide
                     <Route path=path!("/archived") view=ArchivedIssuesPage/>

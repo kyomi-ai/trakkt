@@ -68,6 +68,8 @@ web-sys = { version = "0.3", features = [
     "WebSocket", "MessageEvent", "CloseEvent",
     "FormData", "File", "FileList", "Blob", "BlobPropertyBag",
     "Headers", "Request", "RequestInit", "RequestCredentials", "Response",
+    "ResizeObserver", "ResizeObserverEntry", "ResizeObserverSize",
+    "ClipboardEvent", "DataTransfer",
 ] }
 
 # Timers for WASM
@@ -92,6 +94,12 @@ regex = { workspace = true }
 
 # URL encoding/decoding (for persisting filters in query params)
 percent-encoding = { workspace = true }
+
+# VTE escape sequence parser (terminal emulator)
+vte = "0.13"
+
+# Terminal protocol types
+trakkt-connect-protocol = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

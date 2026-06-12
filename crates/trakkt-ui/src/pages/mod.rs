@@ -4,6 +4,7 @@ pub mod accept_ownership;
 pub mod activity;
 pub mod auth;
 pub mod board;
+pub mod connect;
 pub mod github_callback;
 pub mod inbox;
 pub mod issues;
