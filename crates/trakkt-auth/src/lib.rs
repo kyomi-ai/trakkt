@@ -9,6 +9,7 @@ pub mod attachment_storage;
 pub mod auth_service;
 pub mod billing_service;
 pub mod comment_service;
+pub mod connect_manager;
 pub mod cookies;
 pub mod email_service;
 pub mod favorite_service;

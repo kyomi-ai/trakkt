@@ -89,6 +89,9 @@ async fn serve() {
     let ws_redis = redis.as_ref().map(|pool| (pool.clone(), redis_url.clone().expect("redis pool implies url")));
     let ws_manager = trakkt_auth::websocket::WebSocketManager::new(ws_redis, db.clone());
 
+    // Connect manager (terminal session relay)
+    let connect_manager = trakkt_auth::connect_manager::ConnectManager::new();
+
     // MCP session manager
     let mcp_sessions = trakkt_auth::mcp_session_manager::MCPSessionManager::new(kv.clone());
 
@@ -120,6 +123,7 @@ async fn serve() {
         encryption_key: Arc::new(encryption_key),
         webauthn: Arc::new(webauthn),
         ws_manager,
+        connect_manager,
         mcp_sessions,
         attachment_storage: Arc::from(attachment_storage),
         stripe,
