@@ -133,10 +133,11 @@ pub fn Layout() -> impl IntoView {
                 }
             });
 
-            // 2. Connect WebSocket — start with empty token (connects immediately
-            //    so provide_context works in the reactive scope). Then fetch a
-            //    JWT asynchronously and reconnect with it for multi-user mode.
-            let ws_client = websocket::connect(&user_id, &workspace_id, "");
+            // 2. Create WebSocket client handle (no connection yet).
+            //    Register the sync engine and provide context immediately so
+            //    child components can access them. The actual connection is
+            //    established after fetching the JWT token.
+            let ws_client = websocket::new_client();
 
             sync_engine::start_sync_engine(&ws_client, &sync_store, &workspace_id);
 
@@ -147,14 +148,17 @@ pub fn Layout() -> impl IntoView {
                 websocket::disconnect(&ws_for_cleanup);
             });
 
-            // Fetch JWT and reconnect with auth (multi-user mode only).
-            let ws_for_reconnect = ws_client;
-            let uid_reconnect = user_id.clone();
-            let wid_reconnect = workspace_id.clone();
+            // Fetch JWT and connect (single connection, no empty-token race).
+            // Falls back to empty token for personal mode (no JWT required).
+            let ws_for_connect = ws_client;
+            let uid_connect = user_id.clone();
+            let wid_connect = workspace_id.clone();
             leptos::task::spawn_local(async move {
-                if let Ok(token) = crate::server_fns::auth::get_ws_token().await && !token.is_empty() {
-                    ws_for_reconnect.reconnect(&uid_reconnect, &wid_reconnect, &token);
-                }
+                let token = crate::server_fns::auth::get_ws_token().await
+                    .ok()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_default();
+                websocket::connect_client(&ws_for_connect, &uid_connect, &wid_connect, &token);
             });
         });
     }
