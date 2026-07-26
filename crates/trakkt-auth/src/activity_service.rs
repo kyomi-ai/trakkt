@@ -496,7 +496,7 @@ impl<'a> ActivityRecorder<'a> {
             trakkt_core::db_execute!(self.db, &update_sql, &row.activity_id)?;
 
             // Sync log — best-effort, log on failure.
-            if let Err(e) = sync_log_service::write_sync_entry(
+            let sync_id = sync_log_service::write_sync_entry(
                 self.db,
                 entity_types::ACTIVITY,
                 &row.activity_id,
@@ -505,13 +505,14 @@ impl<'a> ActivityRecorder<'a> {
                 None,
             )
             .await
-            {
+            .unwrap_or_else(|e| {
                 tracing::warn!(
                     error = %e,
                     activity_id = %row.activity_id,
                     "Failed to write sync log entry for coalesced activity"
                 );
-            }
+                0
+            });
 
             // Broadcast via WebSocket — best-effort.
             if let Some(ws) = self.ws_manager {
@@ -522,6 +523,7 @@ impl<'a> ActivityRecorder<'a> {
                     &row.activity_id,
                     SyncActionType::Update,
                     None,
+                    sync_id,
                 )
                 .await;
             }
@@ -581,7 +583,7 @@ impl<'a> ActivityRecorder<'a> {
         )?;
 
         // Sync log entry — best-effort, log on failure.
-        if let Err(e) = sync_log_service::write_sync_entry(
+        let sync_id = sync_log_service::write_sync_entry(
             self.db,
             entity_types::ACTIVITY,
             &activity_id,
@@ -590,13 +592,14 @@ impl<'a> ActivityRecorder<'a> {
             None,
         )
         .await
-        {
+        .unwrap_or_else(|e| {
             tracing::warn!(
                 error = %e,
                 activity_id = %activity_id,
                 "Failed to write sync log entry for activity"
             );
-        }
+            0
+        });
 
         // Broadcast to workspace via WebSocket — best-effort.
         if let Some(ws) = self.ws_manager {
@@ -607,6 +610,7 @@ impl<'a> ActivityRecorder<'a> {
                 &activity_id,
                 SyncActionType::Insert,
                 None,
+                sync_id,
             )
             .await;
         }

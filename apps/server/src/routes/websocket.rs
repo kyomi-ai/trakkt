@@ -15,7 +15,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
-use trakkt_auth::websocket::manager::{ConnectionHandle, WsSender};
+use trakkt_auth::websocket::manager::{CatchUpFlag, CatchUpGuard, ConnectionHandle, WsSender};
 use trakkt_auth::{jwt, user_service};
 
 use crate::state::AppState;
@@ -86,6 +86,8 @@ async fn handle_authenticated_ws(
         id: connection_id,
         rx: mut manager_rx,
         tx: conn_tx,
+        kill,
+        catching_up,
     } = match state.ws_manager.connect(&user_id) {
         Ok(handle) => handle,
         Err(_) => {
@@ -105,7 +107,7 @@ async fn handle_authenticated_ws(
     // Outbound task: forwards messages from WebSocketManager + periodic pings.
     // Pings every 45s keep the connection alive through reverse proxies.
     let user_id_for_send = user_id.clone();
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(45));
         ping_interval.tick().await; // consume the immediate first tick
 
@@ -136,13 +138,11 @@ async fn handle_authenticated_ws(
     let db_clone = state.db.clone();
     let user_id_for_recv = user_id.clone();
     let workspace_id_for_recv = workspace_id.clone();
-    // `conn_tx` is moved into this task and must not outlive it. The outbound
-    // task ends when `manager_rx.recv()` returns `None`, which only happens once
-    // every sender is dropped — the manager's clone goes on `disconnect()` below,
-    // and this one goes when this task returns. A clone kept alive anywhere with
-    // a longer lifetime would keep the channel open and leak the outbound task,
-    // because the `tokio::select!` below detaches the loser rather than aborting it.
-    let recv_task = tokio::spawn(async move {
+    // `conn_tx` is moved into this task and lives as long as it does, so the
+    // outbound channel stays open for the connection's whole lifetime. That is
+    // why closing this socket takes the explicit `kill` signal plus the aborts
+    // below — neither `disconnect()` nor a dropped sender can end it.
+    let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 ws::Message::Text(text) => {
@@ -151,6 +151,7 @@ async fn handle_authenticated_ws(
                         &user_id_for_recv,
                         &workspace_id_for_recv,
                         &conn_tx,
+                        &catching_up,
                         &db_clone,
                     )
                     .await;
@@ -163,11 +164,34 @@ async fn handle_authenticated_ws(
         tracing::debug!("WS recv task ended for user {user_id_for_recv}");
     });
 
-    // Wait for either side to finish.
+    // Wait for either side to finish, or for the manager to kill this
+    // connection because it stopped draining its outbound buffer.
+    // Select on `&mut` so both handles survive the select: a dropped
+    // `JoinHandle` detaches its task instead of stopping it, which would leave
+    // the socket open after the loser is discarded.
     tokio::select! {
-        _ = send_task => {}
-        _ = recv_task => {}
+        _ = &mut send_task => {}
+        _ = &mut recv_task => {}
+        _ = kill.notified() => {
+            tracing::warn!(
+                user_id = %user_id,
+                connection_id,
+                "WebSocket terminated by manager: client was not draining its sync stream"
+            );
+        }
     }
+
+    // Stop both halves. Aborting drops the socket sink and stream, which is
+    // what actually closes the connection; aborting a task that already
+    // finished is a no-op.
+    //
+    // Trade-off: on a normal client-initiated close this pre-empts the outbound
+    // task's courtesy close frame. The client is already gone in that path, and
+    // trakkt-ui branches on its own `intentional_close` flag rather than the
+    // close code, so nothing observes the difference today — but close-code
+    // aware tooling would, hence this note.
+    send_task.abort();
+    recv_task.abort();
 
     // Cleanup.
     state.ws_manager.disconnect(&user_id, connection_id);
@@ -294,6 +318,7 @@ async fn handle_client_message(
     user_id: &str,
     workspace_id: &str,
     conn_tx: &WsSender,
+    catching_up: &CatchUpFlag,
     db: &trakkt_core::DbPool,
 ) {
     let msg: serde_json::Value = match serde_json::from_str(text) {
@@ -308,14 +333,14 @@ async fn handle_client_message(
 
     match msg_type {
         "sync_bootstrap" => {
-            handle_sync_bootstrap(conn_tx, db, user_id, workspace_id).await;
+            handle_sync_bootstrap(conn_tx, catching_up, db, user_id, workspace_id).await;
         }
         "sync_delta" => {
             let last_sync_id = msg
                 .get("last_sync_id")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            handle_sync_delta(conn_tx, db, user_id, workspace_id, last_sync_id).await;
+            handle_sync_delta(conn_tx, catching_up, db, user_id, workspace_id, last_sync_id).await;
         }
         _ => {
             tracing::debug!(user_id, msg_type, "Received unknown client message type");
@@ -337,12 +362,18 @@ async fn handle_client_message(
 /// received the entities it covers.
 async fn handle_sync_bootstrap(
     conn_tx: &WsSender,
+    catching_up: &CatchUpFlag,
     db: &trakkt_core::DbPool,
     user_id: &str,
     workspace_id: &str,
 ) {
     use trakkt_types::models::IssueFilters;
     use trakkt_types::sync::entity_types;
+
+    // Held for the whole handler, so a live edit arriving while this stream
+    // saturates the outbound channel drops its frame instead of killing a
+    // connection that is mid-load. Dropped on every return below.
+    let _catching_up = CatchUpGuard::new(catching_up);
 
     tracing::debug!(user_id, workspace_id, "Handling sync_bootstrap");
 
@@ -494,12 +525,18 @@ async fn handle_sync_bootstrap(
 /// so the client falls back to a full bootstrap.
 async fn handle_sync_delta(
     conn_tx: &WsSender,
+    catching_up: &CatchUpFlag,
     db: &trakkt_core::DbPool,
     user_id: &str,
     workspace_id: &str,
     last_sync_id: i64,
 ) {
     use trakkt_types::sync::SyncResponse;
+
+    // Same exemption as bootstrap: a long delta stream is catch-up traffic, not
+    // a slow client. Dropped on every return below, including the SyncReset
+    // early exits and the abort on a failed send.
+    let _catching_up = CatchUpGuard::new(catching_up);
 
     tracing::debug!(user_id, workspace_id, last_sync_id, "Handling sync_delta");
 
@@ -678,6 +715,9 @@ async fn close_with_code(socket: ws::WebSocket, code: u16, reason: &str) {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     use tokio::sync::mpsc;
     use trakkt_types::sync::{entity_types, SyncActionType, SyncResponse};
 
@@ -795,6 +835,128 @@ mod tests {
 
         assert!(!send_sync_response(&conn_tx, SyncResponse::SyncComplete { last_sync_id: 7 }).await);
         assert!(!send_sync_response(&conn_tx, SyncResponse::SyncReset).await);
+    }
+
+    /// A workspace with `count` sync_log entries to stream back.
+    async fn db_with_sync_entries(workspace_id: &str, count: usize) -> trakkt_core::DbPool {
+        let db = trakkt_core::DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+
+        for i in 0..count {
+            trakkt_auth::sync_log_service::write_sync_entry(
+                &db,
+                entity_types::ISSUE,
+                &format!("iss_{i}"),
+                workspace_id,
+                SyncActionType::Update,
+                None,
+            )
+            .await
+            .expect("write sync entry");
+        }
+
+        db
+    }
+
+    /// Wait for a connection to be flagged as catching up. Fails the test
+    /// rather than hanging if the handler never sets it.
+    async fn wait_until_flagged(flag: &CatchUpFlag) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !flag.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection was never flagged as catching up");
+    }
+
+    /// Bootstrap is the stream that provoked this exemption in the first place
+    /// — an unpaginated workspace load — so its flag has to hold for the whole
+    /// handler, not just around the sends.
+    #[tokio::test]
+    async fn sync_bootstrap_flags_the_connection_for_the_whole_stream() {
+        let db = trakkt_core::DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+        let catching_up: CatchUpFlag = Arc::new(AtomicBool::new(false));
+        let (conn_tx, mut conn_rx) = mpsc::channel::<String>(1);
+        // Occupy the only slot so the handler cannot finish before we look.
+        conn_tx.try_send("occupied".to_string()).expect("prefill");
+
+        let flag = Arc::clone(&catching_up);
+        let stream = tokio::spawn(async move {
+            handle_sync_bootstrap(&conn_tx, &flag, &db, "usr_1", "ws_empty").await;
+        });
+
+        wait_until_flagged(&catching_up).await;
+
+        // Make room so the bootstrap can finish.
+        assert_eq!(conn_rx.recv().await.as_deref(), Some("occupied"));
+        stream.await.expect("bootstrap task");
+
+        assert!(
+            !catching_up.load(Ordering::Acquire),
+            "the exemption must not outlive the bootstrap"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_delta_clears_the_catch_up_flag_when_the_stream_finishes() {
+        let workspace_id = "ws_catch_up";
+        let db = db_with_sync_entries(workspace_id, 3).await;
+        let catching_up: CatchUpFlag = Arc::new(AtomicBool::new(false));
+        let (conn_tx, mut conn_rx) = mpsc::channel::<String>(16);
+
+        handle_sync_delta(&conn_tx, &catching_up, &db, "usr_1", workspace_id, 0).await;
+
+        assert!(
+            !catching_up.load(Ordering::Acquire),
+            "the catch-up exemption must not outlive the stream"
+        );
+
+        // Three actions then the watermark — i.e. the stream really ran.
+        for _ in 0..3 {
+            let frame = conn_rx.recv().await.expect("SyncAction frame");
+            assert!(matches!(parse_frame(&frame), SyncResponse::SyncAction(_)));
+        }
+        let complete = conn_rx.recv().await.expect("SyncComplete frame");
+        assert!(matches!(
+            parse_frame(&complete),
+            SyncResponse::SyncComplete { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_delta_clears_the_catch_up_flag_when_the_stream_aborts_early() {
+        let workspace_id = "ws_catch_up_abort";
+        let db = db_with_sync_entries(workspace_id, 5).await;
+        let catching_up: CatchUpFlag = Arc::new(AtomicBool::new(false));
+        // Capacity 1 keeps the handler blocked on a send it cannot complete
+        // until the receiver goes away, which is the abort path under test.
+        let (conn_tx, mut conn_rx) = mpsc::channel::<String>(1);
+
+        let flag = Arc::clone(&catching_up);
+        let stream = tokio::spawn(async move {
+            handle_sync_delta(&conn_tx, &flag, &db, "usr_1", workspace_id, 0).await;
+        });
+
+        // Receiving a frame proves the stream started, so the flag is set and
+        // stays set until the handler returns — and it cannot return yet,
+        // because four more entries do not fit in a one-slot channel.
+        conn_rx.recv().await.expect("first SyncAction frame");
+        assert!(
+            catching_up.load(Ordering::Acquire),
+            "a connection being caught up must be flagged for the whole stream"
+        );
+
+        drop(conn_rx);
+        stream.await.expect("stream task");
+
+        assert!(
+            !catching_up.load(Ordering::Acquire),
+            "aborting mid-stream must still clear the catch-up exemption"
+        );
     }
 
     #[test]

@@ -119,7 +119,7 @@ pub async fn add_favorite(
     let favorite = row.into_dto();
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::FAVORITE,
         &favorite.favorite_id,
@@ -128,9 +128,10 @@ pub async fn add_favorite(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, favorite_id = %favorite.favorite_id, "Failed to write sync log entry for favorite add");
-    }
+        0
+    });
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -141,6 +142,7 @@ pub async fn add_favorite(
             &favorite.favorite_id,
             SyncActionType::Insert,
             serde_json::to_value(&favorite).ok(),
+            sync_id,
         )
         .await;
     }
@@ -194,7 +196,7 @@ pub async fn remove_favorite(
     }
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::FAVORITE,
         &id_row.favorite_id,
@@ -203,9 +205,10 @@ pub async fn remove_favorite(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, favorite_id = %id_row.favorite_id, "Failed to write sync log entry for favorite remove");
-    }
+        0
+    });
 
     // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
@@ -216,6 +219,7 @@ pub async fn remove_favorite(
             &id_row.favorite_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }

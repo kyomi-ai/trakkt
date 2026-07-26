@@ -64,7 +64,7 @@ pub async fn create_label(
     trakkt_core::db_execute!(db, &sql, &label_id, workspace_id, team_id, name, color)?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::LABEL,
         &label_id,
@@ -73,9 +73,10 @@ pub async fn create_label(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label create");
-    }
+        0
+    });
 
     // Re-fetch to get the DB-assigned created_at.
     let row = trakkt_core::db_fetch_one!(
@@ -97,6 +98,7 @@ pub async fn create_label(
             &label_id,
             SyncActionType::Insert,
             serde_json::to_value(&label).ok(),
+            sync_id,
         )
         .await;
     }
@@ -194,7 +196,7 @@ pub async fn update_label(
     let label = row.into_dto();
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::LABEL,
         label_id,
@@ -203,9 +205,10 @@ pub async fn update_label(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label update");
-    }
+        0
+    });
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -216,6 +219,7 @@ pub async fn update_label(
             label_id,
             SyncActionType::Update,
             serde_json::to_value(&label).ok(),
+            sync_id,
         )
         .await;
     }
@@ -252,7 +256,7 @@ pub async fn delete_label(
     )?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::LABEL,
         label_id,
@@ -261,9 +265,10 @@ pub async fn delete_label(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label delete");
-    }
+        0
+    });
 
     // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
@@ -274,6 +279,7 @@ pub async fn delete_label(
             label_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }

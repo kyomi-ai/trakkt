@@ -201,7 +201,7 @@ pub async fn create_view(
     )?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::VIEW,
         &view_id,
@@ -210,9 +210,10 @@ pub async fn create_view(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, view_id = %view_id, "Failed to write sync log entry for view create");
-    }
+        0
+    });
 
     // Re-fetch to get DB-assigned timestamps.
     let sql = format!("{VIEW_SELECT} WHERE view_id = $1");
@@ -233,6 +234,7 @@ pub async fn create_view(
             &view_id,
             SyncActionType::Insert,
             serde_json::to_value(&view).ok(),
+            sync_id,
         )
         .await;
     }
@@ -375,7 +377,7 @@ pub async fn update_view(
     let view = row.into_dto();
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::VIEW,
         params.view_id,
@@ -384,9 +386,10 @@ pub async fn update_view(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, view_id = %params.view_id, "Failed to write sync log entry for view update");
-    }
+        0
+    });
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -397,6 +400,7 @@ pub async fn update_view(
             params.view_id,
             SyncActionType::Update,
             serde_json::to_value(&view).ok(),
+            sync_id,
         )
         .await;
     }
@@ -424,7 +428,7 @@ pub async fn delete_view(
     }
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::VIEW,
         view_id,
@@ -433,9 +437,10 @@ pub async fn delete_view(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, view_id = %view_id, "Failed to write sync log entry for view delete");
-    }
+        0
+    });
 
     // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
@@ -446,6 +451,7 @@ pub async fn delete_view(
             view_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }

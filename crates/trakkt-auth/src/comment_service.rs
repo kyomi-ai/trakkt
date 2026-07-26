@@ -117,7 +117,7 @@ pub async fn create_comment(
     // Sync log + broadcast — best-effort.
     match &resolved_workspace_id {
         Ok(workspace_id) => {
-            if let Err(e) = sync_log_service::write_sync_entry(
+            let sync_id = sync_log_service::write_sync_entry(
                 db,
                 entity_types::COMMENT,
                 &comment_id,
@@ -126,9 +126,10 @@ pub async fn create_comment(
                 serde_json::to_value(&comment).ok(),
             )
             .await
-            {
+            .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment create");
-            }
+                0
+            });
             if let Some(ws) = ws_manager {
                 sync_log_service::broadcast_sync_action(
                     ws,
@@ -137,6 +138,7 @@ pub async fn create_comment(
                     &comment_id,
                     SyncActionType::Insert,
                     serde_json::to_value(&comment).ok(),
+                    sync_id,
                 )
                 .await;
             }
@@ -313,7 +315,7 @@ pub async fn update_comment(
     // Sync log + broadcast — best-effort.
     match get_workspace_for_issue(db, &comment.issue_id).await {
         Ok(workspace_id) => {
-            if let Err(e) = sync_log_service::write_sync_entry(
+            let sync_id = sync_log_service::write_sync_entry(
                 db,
                 entity_types::COMMENT,
                 comment_id,
@@ -322,9 +324,10 @@ pub async fn update_comment(
                 serde_json::to_value(&comment).ok(),
             )
             .await
-            {
+            .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment update");
-            }
+                0
+            });
             if let Some(ws) = ws_manager {
                 sync_log_service::broadcast_sync_action(
                     ws,
@@ -333,6 +336,7 @@ pub async fn update_comment(
                     comment_id,
                     SyncActionType::Update,
                     serde_json::to_value(&comment).ok(),
+                    sync_id,
                 )
                 .await;
             }
@@ -386,7 +390,7 @@ pub async fn delete_comment(
     // Sync log + broadcast — best-effort.
     match get_workspace_for_issue(db, &comment.issue_id).await {
         Ok(workspace_id) => {
-            if let Err(e) = sync_log_service::write_sync_entry(
+            let sync_id = sync_log_service::write_sync_entry(
                 db,
                 entity_types::COMMENT,
                 comment_id,
@@ -395,9 +399,10 @@ pub async fn delete_comment(
                 None,
             )
             .await
-            {
+            .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment delete");
-            }
+                0
+            });
             if let Some(ws) = ws_manager {
                 sync_log_service::broadcast_sync_action(
                     ws,
@@ -406,6 +411,7 @@ pub async fn delete_comment(
                     comment_id,
                     SyncActionType::Delete,
                     None,
+                    sync_id,
                 )
                 .await;
             }

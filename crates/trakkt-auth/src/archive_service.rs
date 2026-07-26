@@ -85,7 +85,7 @@ pub async fn run_archive_sweep(
         for (idx, issue) in issues.iter().enumerate() {
             db_execute!(db, &update_sql, &issue.issue_id)?;
 
-            if let Err(e) = sync_log_service::write_sync_entry(
+            let sync_id = sync_log_service::write_sync_entry(
                 db,
                 entity_types::ISSUE,
                 &issue.issue_id,
@@ -94,13 +94,14 @@ pub async fn run_archive_sweep(
                 None,
             )
             .await
-            {
+            .unwrap_or_else(|e| {
                 tracing::warn!(
                     error = %e,
                     issue_id = %issue.issue_id,
                     "Failed to write sync log entry for archive"
                 );
-            }
+                0
+            });
 
             sync_log_service::broadcast_sync_action(
                 ws_manager,
@@ -109,6 +110,7 @@ pub async fn run_archive_sweep(
                 &issue.issue_id,
                 SyncActionType::Delete,
                 None,
+                sync_id,
             )
             .await;
 
