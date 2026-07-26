@@ -210,6 +210,21 @@ pub fn connect(user_id: &str, workspace_id: &str, token: &str) -> WebSocketClien
     client
 }
 
+/// Build a client handle that is not connected to anything.
+///
+/// Follower tabs do not open a WebSocket — the leader tab holds the only one —
+/// but pages still resolve `WebSocketClient` from context, so they get a handle
+/// that reports `Disconnected` and drops anything sent through it. If this tab
+/// is later promoted to leader it provides a real, connected handle instead.
+pub fn disconnected() -> WebSocketClient {
+    WebSocketClient {
+        inner: StoredValue::new(SendWrapper::new(WsHandle {
+            state: Rc::new(RefCell::new(WsState::new())),
+        })),
+        connection_state: ArcRwSignal::new(ConnectionState::Disconnected),
+    }
+}
+
 /// Intentionally disconnect the WebSocket.
 ///
 /// Nulls event handlers before closing to prevent spurious reconnect

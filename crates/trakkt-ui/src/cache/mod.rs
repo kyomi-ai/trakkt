@@ -25,6 +25,19 @@ pub mod store;
 /// tested natively, while only the IndexedDB-backed sink is `wasm32`-only.
 pub mod idb_writer;
 
+/// The two halves of applying one `SyncAction`: the in-memory store update
+/// every tab performs, and the cache writes only the leader tab performs.
+///
+/// Not target-gated: both halves are pure Rust over the store and the writer
+/// queue, so which entity type bumps which version counter is tested natively.
+pub mod apply;
+
+/// Cross-tab leader election and the leader→follower broadcast channel.
+///
+/// Not target-gated: the wire format is pure Rust and tested natively, while
+/// the Web Locks and `BroadcastChannel` bindings are `wasm32`-only.
+pub mod tab_leader;
+
 #[cfg(target_arch = "wasm32")]
 pub mod db;
 

@@ -69,6 +69,14 @@ pub enum IdbOp {
     SetSchemaHash,
     /// Resolve the paired receiver once every earlier op has been processed.
     Flush(oneshot::Sender<()>),
+    /// Run a callback once every earlier op has been processed.
+    ///
+    /// The synchronous sibling of [`IdbOp::Flush`]: same ordering guarantee,
+    /// but without a task to park on a oneshot. The sync engine publishes each
+    /// applied action to the other tabs from here, so a follower can never be
+    /// told about data the shared cache does not hold yet — and so broadcasts
+    /// reach followers in the same order the cache took them.
+    Notify(Box<dyn FnOnce()>),
 }
 
 // ── Sink ────────────────────────────────────────────────────────────────────
@@ -241,6 +249,7 @@ pub async fn run_writer<S: IdbSink>(sink: S, mut ops: mpsc::UnboundedReceiver<Id
                     tracing::warn!("idb writer: flush waiter dropped before acknowledgement");
                 }
             }
+            IdbOp::Notify(callback) => callback(),
         }
     }
 }
@@ -503,6 +512,7 @@ mod wasm_tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::cell::RefCell;
+    use std::rc::Rc;
 
     use futures::executor::block_on;
 
@@ -512,7 +522,7 @@ mod tests {
     /// specific entity ids.
     #[derive(Default)]
     struct RecordingSink {
-        calls: RefCell<Vec<String>>,
+        calls: Rc<RefCell<Vec<String>>>,
         fail_entities: Vec<String>,
         fail_delete_all: bool,
     }
@@ -531,6 +541,12 @@ mod tests {
 
         fn calls(&self) -> Vec<String> {
             self.calls.borrow().clone()
+        }
+
+        /// Share the call log with a notifier so it can read what had already
+        /// been written at the instant it fired.
+        fn calls_handle(&self) -> Rc<RefCell<Vec<String>>> {
+            Rc::clone(&self.calls)
         }
     }
 
@@ -792,6 +808,58 @@ mod tests {
             seen,
             vec!["upsert:issue:a", "upsert:issue:b", "upsert:issue:c"],
             "flush must not resolve before every op queued ahead of it ran"
+        );
+    }
+
+    #[test]
+    fn notify_runs_only_after_the_ops_queued_before_it() {
+        let sink = RecordingSink::default();
+        let seen_at_notify: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let (writer, rx) = channel();
+        writer.enqueue(upsert("a"));
+        writer.enqueue(upsert("b"));
+        {
+            // The notifier observes the sink at the moment it fires.
+            let recorded = Rc::clone(&seen_at_notify);
+            let observed = sink.calls_handle();
+            writer.enqueue(IdbOp::Notify(Box::new(move || {
+                *recorded.borrow_mut() = observed.borrow().clone();
+            })));
+        }
+        writer.enqueue(upsert("c"));
+        drop(writer);
+
+        block_on(run_writer(&sink, rx));
+
+        assert_eq!(
+            *seen_at_notify.borrow(),
+            vec!["upsert:issue:a", "upsert:issue:b"],
+            "a broadcast must not go out before the writes it describes have committed"
+        );
+        assert_eq!(
+            sink.calls(),
+            vec!["upsert:issue:a", "upsert:issue:b", "upsert:issue:c"],
+            "the notifier must not disturb the op stream around it"
+        );
+    }
+
+    #[test]
+    fn notifiers_fire_in_queue_order() {
+        let order: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut ops: Vec<IdbOp> = Vec::new();
+        for i in 0..5u8 {
+            ops.push(upsert(&format!("issue-{i}")));
+            let order = Rc::clone(&order);
+            ops.push(IdbOp::Notify(Box::new(move || order.borrow_mut().push(i))));
+        }
+
+        drain(RecordingSink::default(), ops);
+
+        assert_eq!(
+            *order.borrow(),
+            vec![0, 1, 2, 3, 4],
+            "followers must receive actions in the order the cache took them"
         );
     }
 

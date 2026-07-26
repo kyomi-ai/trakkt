@@ -77,70 +77,154 @@ pub fn Layout() -> impl IntoView {
     });
 
     // ── Sync engine wiring (WASM only) ────────────────────────────────────
-    // Once auth is confirmed and user context is available:
-    // 1. Hydrate the store from IndexedDB for instant UI
-    // 2. Connect the WebSocket
-    // 3. Start the sync engine to keep data current
+    // Every tab of a browser shares one IndexedDB cache, so only one of them —
+    // the tab holding the sync leadership lock — may run a sync engine against
+    // it. Two tabs writing entities and the shared cursor concurrently is what
+    // let a throttled tab's stale writes land on top of a live tab's newer
+    // ones. See `cache::tab_leader`.
+    //
+    // Every tab:      set workspace, hydrate from IndexedDB, subscribe to the
+    //                 leader's broadcast, request leadership.
+    // The leader tab: additionally connect the WebSocket and start the engine —
+    //                 immediately if it wins the lock, or later on promotion
+    //                 when the previous leader's tab closes.
     #[cfg(target_arch = "wasm32")]
     {
-        use crate::cache::websocket;
         use crate::cache::sync_engine;
+        use crate::cache::tab_leader::{self, Leadership, SyncBroadcast};
+        use crate::cache::websocket;
         use crate::server_fns::context::UserContext;
 
         let user_ctx = expect_context::<LocalResource<Result<UserContext, ServerFnError>>>();
 
-        // Track whether we've already started the sync engine to avoid
-        // re-connecting on every reactive re-fire.
+        // Track what has already been done so neither half re-runs when the
+        // effect re-fires (it re-fires on promotion, by design).
         let sync_started = std::rc::Rc::new(std::cell::Cell::new(false));
+        let leader_started = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        // Set once the leadership lock is granted. A plain signal is all the
+        // promotion machinery needs: the grant callback sets it, this effect
+        // re-runs and starts the engine — no polling, and the work happens
+        // under the reactive owner rather than inside a bare JS callback.
+        let is_leader = RwSignal::new(false);
+
+        // Non-Send browser handles that must outlive the effect run that
+        // created them. Hoisted to component setup so they are created once.
+        let broadcast: StoredValue<send_wrapper::SendWrapper<Option<SyncBroadcast>>> =
+            StoredValue::new(send_wrapper::SendWrapper::new(None));
+        let leadership: StoredValue<send_wrapper::SendWrapper<Option<tab_leader::LeadershipRequest>>> =
+            StoredValue::new(send_wrapper::SendWrapper::new(None));
 
         Effect::new(move |_| {
-            web_sys::console::log_1(&"[trakkt-sync] Effect fired, checking user_ctx".into());
+            // Re-runs when leadership is granted; both halves below are guarded.
+            let leader_now = is_leader.get();
+
             // Wait for user context to resolve successfully.
             let Some(Ok(ctx)) = user_ctx.get() else {
-                web_sys::console::log_1(&"[trakkt-sync] user_ctx not ready yet".into());
                 return;
             };
-
-            if sync_started.get() {
-                web_sys::console::log_1(&"[trakkt-sync] already started, skipping".into());
-                return;
-            }
-            sync_started.set(true);
 
             let user_id = ctx.user_id.clone();
             let workspace_id = ctx
                 .workspace_id
                 .clone()
                 .unwrap_or_else(|| "workspace-local".to_string());
-            web_sys::console::log_1(&format!("[trakkt-sync] starting sync for {user_id} / {workspace_id}").into());
-            sync_store.set_workspace_id(workspace_id.clone());
 
-            // 1. Hydrate from IDB (instant cached data)
-            let wid_hydrate = workspace_id.clone();
-            leptos::task::spawn_local(async move {
-                match crate::cache::db::init_cache_db(&wid_hydrate).await {
-                    Ok(cache_db) => {
-                        sync_engine::hydrate_store_from_db(&cache_db, &wid_hydrate, &sync_store)
-                            .await;
+            // ── Every tab ───────────────────────────────────────────────────
+            if !sync_started.get() {
+                sync_started.set(true);
+                sync_store.set_workspace_id(workspace_id.clone());
+
+                // 1. Hydrate from IDB (instant cached data)
+                let wid_hydrate = workspace_id.clone();
+                leptos::task::spawn_local(async move {
+                    match crate::cache::db::init_cache_db(&wid_hydrate).await {
+                        Ok(cache_db) => {
+                            sync_engine::hydrate_store_from_db(&cache_db, &wid_hydrate, &sync_store)
+                                .await;
+                        }
+                        Err(e) => {
+                            web_sys::console::warn_1(&format!("Failed to open IDB: {e}").into());
+                            // Mark initialized even on IDB failure — an empty store is
+                            // valid state (the sync engine bootstrap will populate it).
+                            // Without this, the sidebar stays in skeleton state forever.
+                            sync_store.set_initialized(true);
+                        }
                     }
-                    Err(e) => {
-                        web_sys::console::warn_1(&format!("Failed to open IDB: {e}").into());
-                        // Mark initialized even on IDB failure — an empty store is
-                        // valid state (the sync engine bootstrap will populate it).
-                        // Without this, the sidebar stays in skeleton state forever.
-                        sync_store.set_initialized(true);
+                });
+
+                // 2. Subscribe to the leader's broadcast. A follower's entire
+                //    live-update path runs through here; the leader opens the
+                //    same channel to publish on (it never receives its own
+                //    messages back).
+                match SyncBroadcast::open(&workspace_id) {
+                    Ok(channel) => {
+                        channel.set_on_message(move |message| {
+                            crate::cache::apply::apply_broadcast_to_memory(&sync_store, &message);
+                        });
+                        *broadcast.write_value() =
+                            send_wrapper::SendWrapper::new(Some(channel));
+                    }
+                    Err(e) => tracing::warn!(
+                        "sync: no BroadcastChannel ({e:?}) — this tab will not see the \
+                         leader's updates until it reloads"
+                    ),
+                }
+
+                // 3. Until this tab is the leader it has no WebSocket, but
+                //    pages still resolve the client from context.
+                provide_context(websocket::disconnected());
+
+                // 4. Stand for election. The callback fires immediately if no
+                //    other tab holds the lock, or when the leader's tab closes.
+                match tab_leader::acquire_leadership(&workspace_id, move || {
+                    is_leader.set(true);
+                }) {
+                    Leadership::Requested(request) => {
+                        *leadership.write_value() =
+                            send_wrapper::SendWrapper::new(Some(request));
+                    }
+                    Leadership::Unsupported => {
+                        // Documented capability fallback: a browser with no Web
+                        // Locks cannot elect anyone, so every tab syncs as it
+                        // did before this change.
+                        tracing::info!(
+                            "sync: no Web Locks in this browser — running without a tab \
+                             leader, as every tab did previously"
+                        );
+                        is_leader.set(true);
                     }
                 }
-            });
+            }
 
-            // 2. Connect WebSocket — start with empty token (connects immediately
-            //    so provide_context works in the reactive scope). Then fetch a
-            //    JWT asynchronously and reconnect with it for multi-user mode.
+            // ── Leader tab only ─────────────────────────────────────────────
+            if !leader_now || leader_started.get() {
+                return;
+            }
+            leader_started.set(true);
+            tracing::info!(%workspace_id, "sync: this tab is the sync leader");
+
+            // Connect WebSocket — start with empty token (connects immediately
+            // so provide_context works in the reactive scope). Then fetch a
+            // JWT asynchronously and reconnect with it for multi-user mode.
             let ws_client = websocket::connect(&user_id, &workspace_id, "");
 
-            sync_engine::start_sync_engine(&ws_client, &sync_store, &workspace_id);
+            sync_engine::start_sync_engine(
+                &ws_client,
+                &sync_store,
+                &workspace_id,
+                broadcast.with_value(|channel| (**channel).clone()),
+            );
 
             let ws_for_cleanup = ws_client.clone();
+            // Replaces the disconnected handle provided above — but only for
+            // consumers created after this point. Leptos context is a
+            // setup-time snapshot, not a reactive value, so a page already
+            // mounted when this tab is promoted keeps the disconnected handle.
+            // Nothing reads `WebSocketClient` from context today (the sync
+            // engine is handed it directly), so this costs nothing now. A page
+            // that starts reading it — a connection indicator, say — needs the
+            // handle wrapped in a signal instead.
             provide_context(ws_client.clone());
 
             on_cleanup(move || {
