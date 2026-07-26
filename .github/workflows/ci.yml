@@ -2,10 +2,11 @@
 # Trakkt — CI (Pull Request Checks)
 # =============================================================================
 # Runs on every PR to main, including new pushes to existing PRs.
-# Three jobs:
+# Four jobs:
 #   1. lint-suppression — blocks new #[allow(...)] and = "allow" in Cargo.toml
-#   2. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
-#   3. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
+#   2. migration-consistency — blocks duplicate/diverging migration versions
+#   3. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
+#   4. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
 # =============================================================================
 
 name: CI
@@ -42,6 +43,22 @@ jobs:
             exit 1
           fi
           echo "✅ No new lint suppressions."
+
+  # ---------------------------------------------------------------------------
+  # Fast check: migration versions are unique and matched across both dialects
+  #
+  # A duplicate version prefix passes on a fresh CI database and fails at boot on
+  # a database that has already applied one of the pair — i.e. production. PR #244
+  # took prod down exactly this way. Same script developers run locally.
+  # ---------------------------------------------------------------------------
+  migration-consistency:
+    name: Migration Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check migration versions
+        run: scripts/check-migrations.sh
 
   # ---------------------------------------------------------------------------
   # Slow check: cargo clippy (compiles + lints the entire workspace)
