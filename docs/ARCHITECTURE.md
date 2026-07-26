@@ -299,7 +299,7 @@ Streamable HTTP transport at `/mcp`, served by the same Axum binary.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `list_issues` | `status?`, `priority?`, `assignee?`, `label?`, `search?`, `limit?` | Issue list |
+| `list_issues` | `status?`, `priority?`, `assignee?`, `label?`, `search?`, `limit?` | Lean issue rows (no description) |
 | `get_issue` | `issue_number` | Issue detail + comments |
 | `create_issue` | `title`, `description?`, `priority?`, `labels?[]`, `assignee?`, `due_date?` | Created issue |
 | `update_issue` | `issue_number`, `title?`, `description?`, `status?`, `priority?`, `assignee?`, `labels?[]`, `due_date?` | Updated issue |

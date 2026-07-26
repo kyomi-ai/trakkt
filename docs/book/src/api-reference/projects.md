@@ -128,6 +128,7 @@ Update fields on an existing project. Only provided fields are changed.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `archived_at` | string (nullable) | No | Archive timestamp, or null to unarchive |
 | `color` | string (nullable) | No | New hex color code |
 | `description` | string (nullable) | No | New markdown description |
 | `icon` | string (nullable) | No | New icon identifier |

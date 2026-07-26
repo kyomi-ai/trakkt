@@ -12,7 +12,11 @@ List activity entries across all teams in the workspace, ordered by most recent 
 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
+| `action_source` | query | string (nullable) | No | Filter by action source: "user", "agent", or "api" |
 | `action_type` | query | string (nullable) | No | Filter by action type (e.g. "status_changed", "comment_added") |
+| `actor_id` | query | string (nullable) | No | Filter by actor user ID |
+| `created_after` | query | string (nullable) | No | Filter to activities created at or after this ISO 8601 datetime |
+| `created_before` | query | string (nullable) | No | Filter to activities created at or before this ISO 8601 datetime |
 | `limit` | query | integer (int64) (nullable) | No | Maximum number of activities to return (default: 50, max: 200) |
 | `offset` | query | integer (int64) (nullable) | No | Offset for pagination |
 | `team_key` | query | string (nullable) | No | Filter by team key (e.g. "TRA") |
