@@ -122,6 +122,7 @@ pub async fn create_comment(
                 entity_types::COMMENT,
                 &comment_id,
                 workspace_id,
+                None,
                 SyncActionType::Insert,
                 serde_json::to_value(&comment).ok(),
             )
@@ -320,6 +321,7 @@ pub async fn update_comment(
                 entity_types::COMMENT,
                 comment_id,
                 &workspace_id,
+                None,
                 SyncActionType::Update,
                 serde_json::to_value(&comment).ok(),
             )
@@ -395,6 +397,7 @@ pub async fn delete_comment(
                 entity_types::COMMENT,
                 comment_id,
                 &workspace_id,
+                None,
                 SyncActionType::Delete,
                 None,
             )

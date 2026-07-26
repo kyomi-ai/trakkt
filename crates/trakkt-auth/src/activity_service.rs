@@ -501,6 +501,7 @@ impl<'a> ActivityRecorder<'a> {
                 entity_types::ACTIVITY,
                 &row.activity_id,
                 self.workspace_id,
+                None,
                 SyncActionType::Update,
                 None,
             )
@@ -588,6 +589,7 @@ impl<'a> ActivityRecorder<'a> {
             entity_types::ACTIVITY,
             &activity_id,
             self.workspace_id,
+            None,
             SyncActionType::Insert,
             None,
         )

@@ -145,11 +145,16 @@ pub async fn create_notification(
     )?;
     let notification_data = notification.map(|r| r.into_dto());
 
+    // A notification belongs to its recipient alone — the payload carries the
+    // issue title, the actor's name and the read state. Scope the sync row to
+    // `user_id` so delta sync never replays it to other workspace members, and
+    // deliver the live frame to that user only.
     let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::NOTIFICATION,
         &notification_id,
         workspace_id,
+        Some(user_id),
         SyncActionType::Insert,
         notification_data.as_ref().and_then(|n| serde_json::to_value(n).ok()),
     )
@@ -159,10 +164,11 @@ pub async fn create_notification(
         0
     });
 
-    // WebSocket broadcast with full entity data.
+    // WebSocket delivery with full entity data — recipient only.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
+        sync_log_service::send_sync_action_to_user(
             ws,
+            user_id,
             workspace_id,
             entity_types::NOTIFICATION,
             &notification_id,
@@ -593,11 +599,14 @@ pub async fn get_or_default_preferences(
             delivery_channel: "in_app".to_string(),
         };
 
+        // Preferences are one user's settings (the table is keyed
+        // UNIQUE(user_id, workspace_id)) — scope the row and the frame to them.
         let sync_id = sync_log_service::write_sync_entry(
             db,
             entity_types::NOTIFICATION_PREFERENCES,
             &preference_id,
             workspace_id,
+            Some(user_id),
             SyncActionType::Insert,
             serde_json::to_value(&prefs).ok(),
         )
@@ -608,8 +617,9 @@ pub async fn get_or_default_preferences(
         });
 
         if let Some(ws) = ws_manager {
-            sync_log_service::broadcast_sync_action(
+            sync_log_service::send_sync_action_to_user(
                 ws,
+                user_id,
                 workspace_id,
                 entity_types::NOTIFICATION_PREFERENCES,
                 &preference_id,
@@ -704,6 +714,7 @@ pub async fn update_preference(
         entity_types::NOTIFICATION_PREFERENCES,
         &updated.preference_id,
         workspace_id,
+        Some(user_id),
         SyncActionType::Update,
         serde_json::to_value(&updated).ok(),
     )
@@ -714,8 +725,9 @@ pub async fn update_preference(
     });
 
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
+        sync_log_service::send_sync_action_to_user(
             ws,
+            user_id,
             workspace_id,
             entity_types::NOTIFICATION_PREFERENCES,
             &updated.preference_id,

@@ -203,6 +203,7 @@ pub async fn create_team(
         entity_types::TEAM,
         &team_id,
         params.workspace_id,
+        None,
         SyncActionType::Insert,
         None,
     )
@@ -218,6 +219,7 @@ pub async fn create_team(
             entity_types::TEAM,
             &team_id,
             params.workspace_id,
+            None,
             SyncActionType::Update,
             None,
         )
@@ -498,6 +500,7 @@ pub async fn update_team(
         entity_types::TEAM,
         team_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -574,6 +577,7 @@ pub async fn update_team_icon(
         entity_types::TEAM,
         team_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -646,6 +650,7 @@ pub async fn upload_team_icon(
         entity_types::TEAM,
         team_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -742,6 +747,7 @@ pub async fn delete_team_icon(
         entity_types::TEAM,
         team_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -899,6 +905,7 @@ pub async fn delete_team(
                 entity_types::ISSUE,
                 &row.issue_id,
                 workspace_id,
+                None,
                 SyncActionType::Update,
                 None,
             )
@@ -950,6 +957,7 @@ pub async fn delete_team(
         entity_types::TEAM,
         team_id,
         workspace_id,
+        None,
         SyncActionType::Delete,
         None,
     )
@@ -1034,6 +1042,7 @@ pub async fn add_team_member(
         entity_types::TEAM,
         team_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -1064,6 +1073,7 @@ pub async fn remove_team_member(
         entity_types::TEAM,
         team_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -1096,6 +1106,7 @@ pub async fn update_team_member_role(
         entity_types::TEAM,
         team_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -1171,6 +1182,7 @@ pub async fn update_team_settings(
             entity_types::TEAM,
             team_id,
             workspace_id,
+            None,
             SyncActionType::Update,
             team_data.clone(),
         )

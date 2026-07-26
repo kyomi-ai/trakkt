@@ -156,6 +156,7 @@ pub async fn update_workspace_name(
             entity_types::WORKSPACE_SETTINGS,
             workspace_id,
             workspace_id,
+            None,
             SyncActionType::Update,
             snapshot,
         )
@@ -204,6 +205,7 @@ pub async fn update_workspace_settings(
             entity_types::WORKSPACE_SETTINGS,
             workspace_id,
             workspace_id,
+            None,
             SyncActionType::Update,
             snapshot,
         )

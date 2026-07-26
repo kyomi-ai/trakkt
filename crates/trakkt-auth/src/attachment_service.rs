@@ -147,6 +147,7 @@ pub async fn create_attachment(
         entity_types::ATTACHMENT,
         &attachment_id,
         workspace_id,
+        None,
         SyncActionType::Insert,
         None,
     )
@@ -254,6 +255,7 @@ pub async fn delete_attachment(
         entity_types::ATTACHMENT,
         attachment_id,
         workspace_id,
+        None,
         SyncActionType::Delete,
         None,
     )
@@ -329,6 +331,7 @@ pub async fn attach_to_issue(
         entity_types::ISSUE_ATTACHMENT,
         &entity_id,
         workspace_id,
+        None,
         SyncActionType::Insert,
         None,
     )
@@ -389,6 +392,7 @@ pub async fn detach_from_issue(
         entity_types::ISSUE_ATTACHMENT,
         &entity_id,
         workspace_id,
+        None,
         SyncActionType::Delete,
         None,
     )
