@@ -65,6 +65,9 @@ const DB_VERSION: u8 = 1;
 /// sync queries change shape, entity types added/removed from bootstrap.
 pub const SCHEMA_HASH: &str = "trakkt-2026-06-v3";
 
+/// Key under which [`SCHEMA_HASH`] is stored in the `_meta` object store.
+pub const SCHEMA_HASH_KEY: &str = "schemaHash";
+
 /// Handle to the open IndexedDB database.
 ///
 /// All cache operations take `&CacheDb` and are async.  Open one handle per
@@ -125,7 +128,7 @@ pub async fn init_cache_db(_workspace_id: &str) -> Result<CacheDb, CacheDbError>
 
     // Check schema hash — mismatch means cached data was written by a
     // different code version and may not deserialize. Wipe everything.
-    let needs_wipe = match get_meta_raw(&cache_db.inner, "schemaHash").await {
+    let needs_wipe = match get_meta_raw(&cache_db.inner, SCHEMA_HASH_KEY).await {
         Some(stored) => stored != SCHEMA_HASH,
         None => false,
     };

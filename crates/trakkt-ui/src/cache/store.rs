@@ -406,99 +406,153 @@ impl SyncStore {
         });
     }
 
-    // ── Single-item removes (delete sync) ────────────────────────────────────
+    // ── Single-item removes, memory only (sync engine) ───────────────────────
+    //
+    // The sync engine must not let the store spawn its own IndexedDB delete:
+    // that write would race the sync cursor, which is exactly the durability
+    // hole the FIFO writer queue exists to close. It calls these memory-only
+    // variants and enqueues the matching deletes on the writer queue itself, so
+    // they stay ordered with every other cache write.
+    //
+    // UI-initiated deletes keep using the `remove_*` methods below, which pair
+    // the memory removal with the IndexedDB delete exactly as before.
 
-    /// Remove an issue by `issue_id`.
-    pub fn remove_issue(&self, issue_id: &str) {
+    /// Remove an issue from the in-memory list only.
+    pub fn remove_issue_in_memory(&self, issue_id: &str) {
         self.inner.with_value(|inner| {
             inner.issues.update(|list| {
                 list.retain(|i| i.issue_id != issue_id);
             });
         });
+    }
+
+    /// Remove a label from the in-memory list only.
+    pub fn remove_label_in_memory(&self, label_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.labels.update(|list| {
+                list.retain(|l| l.label_id != label_id);
+            });
+        });
+    }
+
+    /// Remove a status from the in-memory list only.
+    pub fn remove_status_in_memory(&self, status_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.statuses.update(|list| {
+                list.retain(|s| s.status_id != status_id);
+            });
+        });
+    }
+
+    /// Remove a team from the in-memory list only.
+    pub fn remove_team_in_memory(&self, team_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.teams.update(|list| {
+                list.retain(|t| t.team_id != team_id);
+            });
+        });
+    }
+
+    /// Remove a project from the in-memory list only.
+    pub fn remove_project_in_memory(&self, project_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.projects.update(|list| {
+                list.retain(|p| p.project_id != project_id);
+            });
+        });
+    }
+
+    /// Remove a view from the in-memory list only.
+    pub fn remove_view_in_memory(&self, view_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.views.update(|list| {
+                list.retain(|v| v.view_id != view_id);
+            });
+        });
+    }
+
+    /// Remove a favorite from the in-memory list only.
+    pub fn remove_favorite_in_memory(&self, favorite_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.favorites.update(|list| {
+                list.retain(|f| f.favorite_id != favorite_id);
+            });
+        });
+    }
+
+    /// Remove a notification from the in-memory list only.
+    pub fn remove_notification_in_memory(&self, notification_id: &str) {
+        self.inner.with_value(|inner| {
+            inner.notifications.update(|list| {
+                list.retain(|n| n.notification_id != notification_id);
+            });
+        });
+    }
+
+    // ── Single-item removes (UI-initiated deletes) ───────────────────────────
+
+    /// Remove an issue by `issue_id`, and from IndexedDB.
+    pub fn remove_issue(&self, issue_id: &str) {
+        self.remove_issue_in_memory(issue_id);
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::ISSUE, issue_id);
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::ISSUE_CONTENT, issue_id);
     }
 
-    /// Remove a label by `label_id`.
+    /// Remove a label by `label_id`, and from IndexedDB.
     pub fn remove_label(&self, label_id: &str) {
-        self.inner.with_value(|inner| {
-            inner.labels.update(|list| {
-                list.retain(|l| l.label_id != label_id);
-            });
-        });
+        self.remove_label_in_memory(label_id);
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::LABEL, label_id);
     }
 
-    /// Remove a status by `status_id`.
+    /// Remove a status by `status_id`, and from IndexedDB.
     pub fn remove_status(&self, status_id: &str) {
-        self.inner.with_value(|inner| {
-            inner.statuses.update(|list| {
-                list.retain(|s| s.status_id != status_id);
-            });
-        });
+        self.remove_status_in_memory(status_id);
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::STATUS, status_id);
     }
 
-    /// Remove a team by `team_id`.
+    /// Remove a team by `team_id`, and from IndexedDB.
     pub fn remove_team(&self, team_id: &str) {
-        self.inner.with_value(|inner| {
-            inner.teams.update(|list| {
-                list.retain(|t| t.team_id != team_id);
-            });
-        });
+        self.remove_team_in_memory(team_id);
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::TEAM, team_id);
     }
 
-    /// Remove a project by `project_id`.
+    /// Remove a project by `project_id`, and from IndexedDB.
     pub fn remove_project(&self, project_id: &str) {
-        self.inner.with_value(|inner| {
-            inner.projects.update(|list| {
-                list.retain(|p| p.project_id != project_id);
-            });
-        });
+        self.remove_project_in_memory(project_id);
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::PROJECT, project_id);
     }
 
-    /// Remove a view by `view_id`.
+    /// Remove a view by `view_id`, and from IndexedDB.
     pub fn remove_view(&self, view_id: &str) {
-        self.inner.with_value(|inner| {
-            inner.views.update(|list| {
-                list.retain(|v| v.view_id != view_id);
-            });
-        });
+        self.remove_view_in_memory(view_id);
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::VIEW, view_id);
     }
 
-    /// Remove a favorite by `favorite_id`.
+    /// Remove a favorite by `favorite_id`, and from IndexedDB.
     pub fn remove_favorite(&self, favorite_id: &str) {
-        self.inner.with_value(|inner| {
-            inner.favorites.update(|list| {
-                list.retain(|f| f.favorite_id != favorite_id);
-            });
-        });
+        self.remove_favorite_in_memory(favorite_id);
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::FAVORITE, favorite_id);
     }
 
-    /// Remove a notification by `notification_id`.
+    /// Remove a notification by `notification_id`, and from IndexedDB.
     pub fn remove_notification(&self, notification_id: &str) {
-        self.inner.with_value(|inner| {
-            inner.notifications.update(|list| {
-                list.retain(|n| n.notification_id != notification_id);
-            });
-        });
+        self.remove_notification_in_memory(notification_id);
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::NOTIFICATION, notification_id);
     }
 
     /// Remove a comment by `comment_id` (deletes from IndexedDB).
+    ///
+    /// Comments are not held in memory — the detail page reads them from
+    /// IndexedDB on demand.
     pub fn remove_comment(&self, _comment_id: &str) {
         #[cfg(target_arch = "wasm32")]
         self.delete_from_idb(entity_types::COMMENT, _comment_id);

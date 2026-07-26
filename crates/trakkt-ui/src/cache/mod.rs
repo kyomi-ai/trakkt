@@ -19,6 +19,12 @@
 
 pub mod store;
 
+/// Single FIFO writer that orders every cache write against the sync cursor.
+///
+/// Not target-gated: the queue and its ordering rules are pure Rust and unit
+/// tested natively, while only the IndexedDB-backed sink is `wasm32`-only.
+pub mod idb_writer;
+
 #[cfg(target_arch = "wasm32")]
 pub mod db;
 
