@@ -133,6 +133,28 @@ impl WebSocketClient {
         });
     }
 
+    /// Open the socket on a handle built by [`disconnected`].
+    ///
+    /// Construction and dialing are separate so the leader tab can publish the
+    /// handle into the reactive scope synchronously — pages resolve
+    /// `WebSocketClient` from context at setup time — while the socket itself
+    /// stays closed until the local cache has finished hydrating the store. A
+    /// socket that does not exist cannot deliver a sync action that hydration
+    /// would then wipe. See [`crate::cache::hydration_gate`].
+    ///
+    /// Dialing a handle that is already connecting or open is a no-op; use
+    /// [`WebSocketClient::reconnect`] to replace a live connection.
+    pub fn dial(&self, user_id: &str, workspace_id: &str, token: &str) {
+        let state = self.inner.with_value(|handle| handle.state.clone());
+        do_connect(
+            state,
+            self.connection_state.clone(),
+            user_id,
+            workspace_id,
+            token,
+        );
+    }
+
     /// Reconnect with a new token (e.g., after fetching a JWT asynchronously).
     ///
     /// Closes the existing connection and opens a new one with the provided
@@ -183,39 +205,17 @@ fn build_ws_url(user_id: &str, workspace_id: &str, token: &str) -> Result<String
     ))
 }
 
-/// Connect to the WebSocket server and return a client handle.
+/// Build a client handle with no socket behind it.
 ///
-/// Wires up event handlers for open, message, error, and close. On close,
-/// schedules automatic reconnection with exponential backoff unless
-/// `disconnect()` was called intentionally.
-pub fn connect(user_id: &str, workspace_id: &str, token: &str) -> WebSocketClient {
-    web_sys::console::log_1(&format!("[trakkt-sync] connect({user_id}, {workspace_id})").into());
-    let connection_state = ArcRwSignal::new(ConnectionState::Disconnected);
-    let state = Rc::new(RefCell::new(WsState::new()));
-
-    let client = WebSocketClient {
-        inner: StoredValue::new(SendWrapper::new(WsHandle {
-            state: state.clone(),
-        })),
-        connection_state: connection_state.clone(),
-    };
-
-    let uid = user_id.to_owned();
-    let wid = workspace_id.to_owned();
-    let tok = token.to_owned();
-
-    web_sys::console::log_1(&"[trakkt-sync] calling do_connect".into());
-    do_connect(state, connection_state, &uid, &wid, &tok);
-
-    client
-}
-
-/// Build a client handle that is not connected to anything.
+/// This is the only constructor: every tab creates its handle here and publishes
+/// it into the reactive scope immediately, because pages resolve
+/// `WebSocketClient` from context at setup time. A handle reports `Disconnected`
+/// and drops anything sent through it until someone calls
+/// [`WebSocketClient::dial`] on it, which only the leader tab does, and only
+/// once the store has been hydrated.
 ///
-/// Follower tabs do not open a WebSocket — the leader tab holds the only one —
-/// but pages still resolve `WebSocketClient` from context, so they get a handle
-/// that reports `Disconnected` and drops anything sent through it. If this tab
-/// is later promoted to leader it provides a real, connected handle instead.
+/// Follower tabs never dial at all — the leader holds the workspace's single
+/// socket and republishes what it applies over the broadcast channel.
 pub fn disconnected() -> WebSocketClient {
     WebSocketClient {
         inner: StoredValue::new(SendWrapper::new(WsHandle {

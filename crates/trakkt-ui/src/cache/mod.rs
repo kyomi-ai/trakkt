@@ -32,6 +32,14 @@ pub mod idb_writer;
 /// queue, so which entity type bumps which version counter is tested natively.
 pub mod apply;
 
+/// The one-shot latch that keeps the leader tab's WebSocket dial behind
+/// hydration, so no sync action can be applied to a store that is about to be
+/// bulk-replaced.
+///
+/// Not target-gated: the latch is pure Rust and unit tested natively, while the
+/// two halves it orders are `wasm32`-only.
+pub mod hydration_gate;
+
 /// Cross-tab leader election and the leader→follower broadcast channel.
 ///
 /// Not target-gated: the wire format is pure Rust and tested natively, while

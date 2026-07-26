@@ -15,6 +15,17 @@
 //!    irrecoverably stale (e.g. cursor too old). The engine nukes IndexedDB,
 //!    resets the reactive store, and re-bootstraps.
 //!
+//! ## Startup ordering
+//!
+//! Hydration bulk-replaces the store's lists while the sync stream applies
+//! individual actions to them, so the two must not overlap: a delta action
+//! applied during hydration is wiped by the `set_*` that lands after it, and the
+//! cursor has already moved past it. [`hydrate_then_open_gate`] and
+//! [`dial_when_hydrated`] are the two halves of that ordering — the socket is
+//! not dialed until hydration has finished, so there is no window in which a
+//! message could arrive early and nothing to buffer. See
+//! [`crate::cache::hydration_gate`].
+//!
 //! ## Reconnect handling
 //!
 //! The engine watches `WebSocketClient::connection_state` and re-sends the
@@ -35,6 +46,8 @@
 //! This module is `wasm32`-only. All async tasks use `spawn_local` (single-
 //! threaded WASM event loop).
 
+use std::future::Future;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -43,6 +56,7 @@ use trakkt_types::sync::{SyncAction, SyncResponse, entity_types};
 
 use crate::cache::apply::{apply_action_to_memory, enqueue_cache_writes};
 use crate::cache::db;
+use crate::cache::hydration_gate::HydrationGate;
 use crate::cache::idb_writer::{self, CacheDbSink, IdbOp, IdbWriter};
 use crate::cache::store::SyncStore;
 use crate::cache::tab_leader::{SyncBroadcast, SyncBroadcastMessage};
@@ -244,6 +258,64 @@ pub fn start_sync_engine(
     });
 }
 
+// ── Startup ordering ────────────────────────────────────────────────────────
+
+/// Open the leader tab's WebSocket, but not before hydration has finished.
+///
+/// This is the ordering the sync client depends on. Hydration replaces whole
+/// store lists at once; the sync stream mutates individual entries in them. If
+/// the socket were already open, a bootstrap or delta action could be applied
+/// and then wiped by a hydration `set_*` landing a moment later, with the cursor
+/// already advanced past it — the action is gone until the entity changes again
+/// or the page is reloaded. Delaying the dial removes the window entirely: there
+/// is no socket to deliver anything early, so there is nothing to buffer.
+///
+/// The token is fetched concurrently with hydration rather than after it: it is
+/// a network round trip that touches nothing the store owns, so overlapping it
+/// keeps startup at the cost of the slower half instead of the sum. Dialing with
+/// a token in hand is also what avoids the connect-with-nothing, get-closed,
+/// reconnect-with-a-JWT churn on every multi-user page load.
+///
+/// Both startup orderings land here correctly: a tab that wins leadership in the
+/// same pass that started hydration parks until the gate opens, and a follower
+/// promoted long after hydration finished finds it already open.
+pub async fn dial_when_hydrated(
+    gate: HydrationGate,
+    ws: WebSocketClient,
+    user_id: String,
+    workspace_id: String,
+    token: impl Future<Output = String>,
+) {
+    let ((), token) = futures::future::join(gate.opened(), token).await;
+    ws.dial(&user_id, &workspace_id, &token);
+}
+
+/// Hydrate the store from the local cache, then open `gate`.
+///
+/// Runs on every tab, leader or not, and starts immediately — cached data still
+/// reaches the screen without waiting for the network. The gate is what the
+/// leader's dial waits on, so it must open on every path out of here: a cache
+/// that cannot be opened leaves an empty store, which is a perfectly valid state
+/// to start syncing from, while a gate left closed would strand the tab with no
+/// socket at all.
+pub async fn hydrate_then_open_gate(workspace_id: String, store: SyncStore, gate: HydrationGate) {
+    match db::init_cache_db(&workspace_id).await {
+        Ok(cache_db) => {
+            hydrate_store_from_db(&cache_db, &workspace_id, &store).await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "sync: cache database unavailable — hydrating nothing and starting from an \
+                 empty store: {e}"
+            );
+            // Pages waiting on `initialized` would otherwise sit in their
+            // skeleton state forever.
+            store.set_initialized(true);
+        }
+    }
+    gate.open();
+}
+
 // ── Hydration ───────────────────────────────────────────────────────────────
 
 /// Read all entity types from IndexedDB and populate the store.
@@ -348,4 +420,206 @@ fn apply_sync_action(
         SyncBroadcastMessage::Action(action.clone()),
     );
     apply_action_to_memory(store, action);
+}
+
+// ── Startup ordering tests (wasm32) ─────────────────────────────────────────
+
+/// Tests of the startup ordering against real IndexedDB and a real
+/// `WebSocket`, run in a browser.
+///
+/// Run with:
+/// `wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate`
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use std::task::{Context, Poll};
+
+    use gloo_timers::future::TimeoutFuture;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use crate::cache::websocket;
+
+    use super::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Number of cached labels each hydration test seeds. Large enough that
+    /// hydration takes several turns of the event loop, which is the window the
+    /// gate exists to close.
+    const SEEDED_LABELS: usize = 200;
+
+    fn label(i: usize, workspace_id: &str) -> Label {
+        Label {
+            label_id: format!("label-{i}"),
+            workspace_id: workspace_id.to_owned(),
+            team_id: None,
+            name: format!("label {i}"),
+            color: "#0D9488".to_owned(),
+            created_at: "2026-07-26T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// Seed `SEEDED_LABELS` cached labels so hydration has real work to do.
+    async fn seed_labels(workspace_id: &str) {
+        let cache_db = match db::init_cache_db(workspace_id).await {
+            Ok(cache_db) => cache_db,
+            Err(e) => panic!("failed to open cache db: {e}"),
+        };
+        for i in 0..SEEDED_LABELS {
+            let item = label(i, workspace_id);
+            let json = match serde_json::to_string(&item) {
+                Ok(json) => json,
+                Err(e) => panic!("failed to serialise seed label: {e}"),
+            };
+            if let Err(e) = db::upsert(
+                &cache_db,
+                entity_types::LABEL,
+                &item.label_id,
+                workspace_id,
+                &json,
+                &item.created_at,
+            )
+            .await
+            {
+                panic!("failed to seed label {i}: {e}");
+            }
+        }
+    }
+
+    /// Hand control back to the microtask queue. Wakers scheduled by the gate
+    /// run as microtasks, so this observes the dial at the earliest instant it
+    /// could possibly happen — before any network I/O could move the connection
+    /// state on from `Connecting`.
+    async fn microtask() {
+        let resolved = js_sys::Promise::resolve(&wasm_bindgen::JsValue::NULL);
+        if let Err(e) = wasm_bindgen_futures::JsFuture::from(resolved).await {
+            panic!("microtask checkpoint failed: {e:?}");
+        }
+    }
+
+    /// The property the whole ticket rests on: whatever waits on the gate does
+    /// not resume until hydration has actually landed in the store.
+    #[wasm_bindgen_test]
+    async fn the_gate_opens_only_once_the_store_is_hydrated() {
+        let owner = Owner::new();
+        owner.set();
+
+        let wid = "ws-gate-hydration";
+        seed_labels(wid).await;
+
+        let store = SyncStore::new();
+        let gate = HydrationGate::new();
+
+        assert!(
+            !gate.is_open(),
+            "the gate must start closed, before any hydration has run"
+        );
+
+        // What the leader's dial sees at the moment the gate releases it.
+        let waiter = {
+            let gate = gate.clone();
+            async move {
+                gate.opened().await;
+                (
+                    store.labels().get_untracked().len(),
+                    store.initialized().get_untracked(),
+                )
+            }
+        };
+
+        let ((), (labels_at_release, initialized_at_release)) = futures::future::join(
+            hydrate_then_open_gate(wid.to_owned(), store, gate.clone()),
+            waiter,
+        )
+        .await;
+
+        assert_eq!(
+            labels_at_release, SEEDED_LABELS,
+            "the gate released the dial while the store was still being hydrated — \
+             a sync action applied now would be wiped by hydration's bulk set_*"
+        );
+        assert!(initialized_at_release);
+        assert!(gate.is_open());
+    }
+
+    /// Hydration-then-promotion: a follower that hydrated long ago and only
+    /// later takes the leadership lock must not park on an edge it already
+    /// missed.
+    #[wasm_bindgen_test]
+    async fn a_tab_promoted_after_hydration_is_released_immediately() {
+        let owner = Owner::new();
+        owner.set();
+
+        let wid = "ws-gate-promotion";
+        seed_labels(wid).await;
+
+        let store = SyncStore::new();
+        let gate = HydrationGate::new();
+
+        hydrate_then_open_gate(wid.to_owned(), store, gate.clone()).await;
+
+        assert!(gate.is_open());
+
+        // Resolves on its first poll — no second turn of the event loop, and no
+        // edge to miss.
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = Box::pin(gate.opened());
+        assert_eq!(
+            waiter.as_mut().poll(&mut cx),
+            Poll::Ready(()),
+            "a promoted follower parked on a gate that had already opened"
+        );
+        assert_eq!(store.labels().get_untracked().len(), SEEDED_LABELS);
+    }
+
+    /// The dial half, against a real `WebSocketClient`: no socket is opened
+    /// while hydration is outstanding, and one is opened as soon as it is not.
+    #[wasm_bindgen_test]
+    async fn the_socket_is_not_dialed_until_the_gate_opens() {
+        let owner = Owner::new();
+        owner.set();
+
+        let gate = HydrationGate::new();
+        let ws = websocket::disconnected();
+        assert_eq!(
+            ws.connection_state.get_untracked(),
+            websocket::ConnectionState::Disconnected
+        );
+
+        // The test harness does not boot the Leptos runtime, so its global
+        // executor is unset. `leptos::task::spawn_local` on wasm *is*
+        // `wasm_bindgen_futures::spawn_local` (see `any_spawner`'s
+        // `init_wasm_bindgen`), so scheduling here matches production exactly.
+        wasm_bindgen_futures::spawn_local(dial_when_hydrated(
+            gate.clone(),
+            ws.clone(),
+            "user-gate-test".to_owned(),
+            "ws-gate-dial".to_owned(),
+            // Already resolved: even the fastest possible token fetch must not
+            // be enough to let the dial past the gate.
+            std::future::ready(String::new()),
+        ));
+
+        // Far longer than the dial task needs to run if it were going to.
+        TimeoutFuture::new(50).await;
+        assert_eq!(
+            ws.connection_state.get_untracked(),
+            websocket::ConnectionState::Disconnected,
+            "the socket was dialed while hydration was still outstanding"
+        );
+
+        gate.open();
+        microtask().await;
+        microtask().await;
+
+        assert_eq!(
+            ws.connection_state.get_untracked(),
+            websocket::ConnectionState::Connecting,
+            "the socket must be dialed as soon as hydration completes"
+        );
+
+        // Stop the backoff loop this test's doomed connection would otherwise
+        // leave running.
+        websocket::disconnect(&ws);
+    }
 }

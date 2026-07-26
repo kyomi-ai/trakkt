@@ -85,17 +85,46 @@ pub fn Layout() -> impl IntoView {
     //
     // Every tab:      set workspace, hydrate from IndexedDB, subscribe to the
     //                 leader's broadcast, request leadership.
-    // The leader tab: additionally connect the WebSocket and start the engine —
+    // The leader tab: additionally start the engine and dial the WebSocket —
     //                 immediately if it wins the lock, or later on promotion
     //                 when the previous leader's tab closes.
+    //
+    // The dial waits on `hydration_gate`. Hydration replaces whole store lists
+    // at once, so a sync action applied while it is still in flight gets wiped
+    // by the `set_*` that lands after it — and the cursor has already moved
+    // past, so nothing re-delivers it. Not opening the socket until hydration
+    // has finished removes the window rather than papering over it.
     #[cfg(target_arch = "wasm32")]
     {
+        use crate::cache::hydration_gate::HydrationGate;
         use crate::cache::sync_engine;
         use crate::cache::tab_leader::{self, Leadership, SyncBroadcast};
         use crate::cache::websocket;
         use crate::server_fns::context::UserContext;
 
         let user_ctx = expect_context::<LocalResource<Result<UserContext, ServerFnError>>>();
+
+        // The WebSocket handle is built here, at component setup, and dialed
+        // later — only by the leader, and only once hydration has finished.
+        // Building it up front is what lets `provide_context` run synchronously
+        // in the reactive scope, where pages resolving `WebSocketClient` can
+        // actually see it: context is a setup-time snapshot, so a handle
+        // provided from inside the effect below would be invisible to every
+        // page. One handle for the tab's whole life also means a page mounted
+        // before this tab is promoted observes the real `connection_state`
+        // afterwards, instead of holding a stale disconnected handle.
+        let ws_client = websocket::disconnected();
+        provide_context(ws_client.clone());
+        {
+            let ws_for_cleanup = ws_client.clone();
+            on_cleanup(move || websocket::disconnect(&ws_for_cleanup));
+        }
+
+        // Latch that hydration opens and the dial waits on. Lives at setup
+        // because the two halves can run in different executions of the effect
+        // below: a promoted follower hydrated long ago, while the first tab
+        // hydrates and takes leadership in a single pass.
+        let hydration_gate = HydrationGate::new();
 
         // Track what has already been done so neither half re-runs when the
         // effect re-fires (it re-fires on promotion, by design).
@@ -135,23 +164,13 @@ pub fn Layout() -> impl IntoView {
                 sync_started.set(true);
                 sync_store.set_workspace_id(workspace_id.clone());
 
-                // 1. Hydrate from IDB (instant cached data)
-                let wid_hydrate = workspace_id.clone();
-                leptos::task::spawn_local(async move {
-                    match crate::cache::db::init_cache_db(&wid_hydrate).await {
-                        Ok(cache_db) => {
-                            sync_engine::hydrate_store_from_db(&cache_db, &wid_hydrate, &sync_store)
-                                .await;
-                        }
-                        Err(e) => {
-                            web_sys::console::warn_1(&format!("Failed to open IDB: {e}").into());
-                            // Mark initialized even on IDB failure — an empty store is
-                            // valid state (the sync engine bootstrap will populate it).
-                            // Without this, the sidebar stays in skeleton state forever.
-                            sync_store.set_initialized(true);
-                        }
-                    }
-                });
+                // 1. Hydrate from IDB (instant cached data), then open the gate
+                //    the leader's dial is waiting on.
+                leptos::task::spawn_local(sync_engine::hydrate_then_open_gate(
+                    workspace_id.clone(),
+                    sync_store,
+                    hydration_gate.clone(),
+                ));
 
                 // 2. Subscribe to the leader's broadcast. A follower's entire
                 //    live-update path runs through here; the leader opens the
@@ -171,11 +190,7 @@ pub fn Layout() -> impl IntoView {
                     ),
                 }
 
-                // 3. Until this tab is the leader it has no WebSocket, but
-                //    pages still resolve the client from context.
-                provide_context(websocket::disconnected());
-
-                // 4. Stand for election. The callback fires immediately if no
+                // 3. Stand for election. The callback fires immediately if no
                 //    other tab holds the lock, or when the leader's tab closes.
                 match tab_leader::acquire_leadership(&workspace_id, move || {
                     is_leader.set(true);
@@ -204,11 +219,10 @@ pub fn Layout() -> impl IntoView {
             leader_started.set(true);
             tracing::info!(%workspace_id, "sync: this tab is the sync leader");
 
-            // Connect WebSocket — start with empty token (connects immediately
-            // so provide_context works in the reactive scope). Then fetch a
-            // JWT asynchronously and reconnect with it for multi-user mode.
-            let ws_client = websocket::connect(&user_id, &workspace_id, "");
-
+            // Registering the message callback and the connection-state watcher
+            // before the socket exists is safe — and required: the dial below
+            // happens on a later turn of the event loop, so the engine is
+            // listening well before the first byte can arrive.
             sync_engine::start_sync_engine(
                 &ws_client,
                 &sync_store,
@@ -216,30 +230,40 @@ pub fn Layout() -> impl IntoView {
                 broadcast.with_value(|channel| (**channel).clone()),
             );
 
-            let ws_for_cleanup = ws_client.clone();
-            // Replaces the disconnected handle provided above — but only for
-            // consumers created after this point. Leptos context is a
-            // setup-time snapshot, not a reactive value, so a page already
-            // mounted when this tab is promoted keeps the disconnected handle.
-            // Nothing reads `WebSocketClient` from context today (the sync
-            // engine is handed it directly), so this costs nothing now. A page
-            // that starts reading it — a connection indicator, say — needs the
-            // handle wrapped in a signal instead.
-            provide_context(ws_client.clone());
-
-            on_cleanup(move || {
-                websocket::disconnect(&ws_for_cleanup);
-            });
-
-            // Fetch JWT and reconnect with auth (multi-user mode only).
-            let ws_for_reconnect = ws_client;
-            let uid_reconnect = user_id.clone();
-            let wid_reconnect = workspace_id.clone();
-            leptos::task::spawn_local(async move {
-                if let Ok(token) = crate::server_fns::auth::get_ws_token().await && !token.is_empty() {
-                    ws_for_reconnect.reconnect(&uid_reconnect, &wid_reconnect, &token);
-                }
-            });
+            // Dial once hydration is done, with a token already in hand.
+            //
+            // The token is a JWT in both deployment modes: personal mode issues
+            // one like any other (the server bypasses auth for the WebSocket, so
+            // it is simply ignored there), multi-user mode requires it. Fetching
+            // it *before* the first dial is what removes the old
+            // connect-with-nothing → 4001 close → reconnect-with-a-JWT churn on
+            // every multi-user page load.
+            //
+            // If the token cannot be fetched we still dial. In personal mode the
+            // connection succeeds regardless; in multi-user mode the server
+            // closes it, which is precisely the event that drives the existing
+            // backoff loop — and that loop re-fetches the token on every
+            // attempt. Refusing to dial would instead leave the tab with no
+            // socket and no path back to one.
+            leptos::task::spawn_local(sync_engine::dial_when_hydrated(
+                hydration_gate.clone(),
+                ws_client.clone(),
+                user_id,
+                workspace_id,
+                async {
+                    match crate::server_fns::auth::get_ws_token().await {
+                        Ok(token) => token,
+                        Err(e) => {
+                            tracing::warn!(
+                                "sync: could not fetch a WebSocket token — dialing without one; \
+                                 an unauthenticated close will trigger the reconnect loop, which \
+                                 fetches a fresh token per attempt: {e}"
+                            );
+                            String::new()
+                        }
+                    }
+                },
+            ));
         });
     }
 
