@@ -243,6 +243,7 @@ pub async fn create_project(
         entity_types::PROJECT,
         &project_id,
         params.workspace_id,
+        None,
         SyncActionType::Insert,
         None,
     )
@@ -422,6 +423,7 @@ pub async fn update_project(
         entity_types::PROJECT,
         params.project_id,
         &project.workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -482,6 +484,7 @@ pub async fn delete_project(
         entity_types::PROJECT,
         project_id,
         &project.workspace_id,
+        None,
         SyncActionType::Delete,
         None,
     )
@@ -551,6 +554,7 @@ pub async fn add_project_member(
         entity_types::PROJECT,
         project_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -594,6 +598,7 @@ pub async fn remove_project_member(
         entity_types::PROJECT,
         project_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -688,6 +693,7 @@ pub async fn create_milestone(
         entity_types::PROJECT_MILESTONE,
         &milestone_id,
         workspace_id,
+        None,
         SyncActionType::Insert,
         None,
     )
@@ -802,6 +808,7 @@ pub async fn update_milestone(
         entity_types::PROJECT_MILESTONE,
         milestone_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -865,6 +872,7 @@ pub async fn delete_milestone(
         entity_types::PROJECT_MILESTONE,
         milestone_id,
         workspace_id,
+        None,
         SyncActionType::Delete,
         None,
     )
@@ -945,6 +953,7 @@ pub async fn create_project_update(
         entity_types::PROJECT,
         project_id,
         workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )

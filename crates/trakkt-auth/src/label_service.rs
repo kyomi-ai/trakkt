@@ -69,6 +69,7 @@ pub async fn create_label(
         entity_types::LABEL,
         &label_id,
         workspace_id,
+        None,
         SyncActionType::Insert,
         None,
     )
@@ -201,6 +202,7 @@ pub async fn update_label(
         entity_types::LABEL,
         label_id,
         &label.workspace_id,
+        None,
         SyncActionType::Update,
         None,
     )
@@ -261,6 +263,7 @@ pub async fn delete_label(
         entity_types::LABEL,
         label_id,
         &label.workspace_id,
+        None,
         SyncActionType::Delete,
         None,
     )

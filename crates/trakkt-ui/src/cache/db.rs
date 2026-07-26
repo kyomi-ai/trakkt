@@ -63,7 +63,13 @@ const DB_VERSION: u8 = 1;
 ///
 /// Bump this when: fields added/removed from list item structs, server-side
 /// sync queries change shape, entity types added/removed from bootstrap.
-pub const SCHEMA_HASH: &str = "trakkt-2026-06-v3";
+/// `v4` (TRA-9920): delta sync used to replay every workspace member's
+/// notifications, favorites and personal views to everyone. Caches written
+/// before the fix already hold those foreign rows, and the server-side filter
+/// only stops new ones arriving — it cannot retract what a client already
+/// stored. Bumping the hash wipes the cache and forces a re-bootstrap, which is
+/// the only thing that evicts them.
+pub const SCHEMA_HASH: &str = "trakkt-2026-07-v4";
 
 /// Key under which [`SCHEMA_HASH`] is stored in the `_meta` object store.
 pub const SCHEMA_HASH_KEY: &str = "schemaHash";

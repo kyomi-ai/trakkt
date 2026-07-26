@@ -357,6 +357,7 @@ pub async fn create_relation(
         entity_types::ISSUE_RELATION,
         &relation.relation_id,
         workspace_id,
+        None,
         SyncActionType::Insert,
         None,
     )
@@ -494,6 +495,7 @@ pub async fn delete_relation(
         entity_types::ISSUE_RELATION,
         relation_id,
         workspace_id,
+        None,
         SyncActionType::Delete,
         None,
     )

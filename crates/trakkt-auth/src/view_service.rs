@@ -69,6 +69,69 @@ const VIEW_SELECT: &str = "\
            CAST(updated_at AS TEXT) AS updated_at \
     FROM views";
 
+// ─── Sync visibility ────────────────────────────────────────────────────────
+
+/// Who a view's sync rows are addressed to.
+///
+/// `None` = workspace-visible, `Some(user_id)` = that user only. Derived from
+/// the WHERE clause of [`list_views`], which is also the `sync_bootstrap`
+/// query: `workspace_id = $1 AND (created_by = $2 OR is_shared = TRUE)`. So a
+/// shared view is exposed to every member and an unshared one only to its
+/// creator, and the sync log has to scope rows the same way — otherwise the
+/// entity set a client ends up with depends on whether it bootstrapped or
+/// delta-synced.
+///
+/// Note this reads the view's *current* `is_shared`: un-sharing a view makes
+/// subsequent rows owner-only, which is the safe direction. Members who already
+/// cached it while it was shared keep their stale copy until their next
+/// bootstrap — un-sharing does not retroactively evict it.
+fn view_visibility(view: &View) -> Option<&str> {
+    if view.is_shared {
+        None
+    } else {
+        Some(view.created_by.as_str())
+    }
+}
+
+/// Deliver a view's live sync frame to whoever [`view_visibility`] allows.
+async fn deliver_view_action(
+    ws: &WebSocketManager,
+    visibility: Option<&str>,
+    workspace_id: &str,
+    view_id: &str,
+    action: SyncActionType,
+    data: Option<serde_json::Value>,
+    sync_id: i64,
+) {
+    match visibility {
+        Some(owner_user_id) => {
+            sync_log_service::send_sync_action_to_user(
+                ws,
+                owner_user_id,
+                workspace_id,
+                entity_types::VIEW,
+                view_id,
+                action,
+                data,
+                sync_id,
+            )
+            .await;
+        }
+        None => {
+            sync_log_service::broadcast_sync_action(
+                ws,
+                workspace_id,
+                entity_types::VIEW,
+                view_id,
+                action,
+                data,
+                sync_id,
+            )
+            .await;
+        }
+    }
+}
+
 // ─── View CRUD ──────────────────────────────────────────────────────────────
 
 /// List views visible to a user: their own views plus shared views in the workspace.
@@ -200,12 +263,25 @@ pub async fn create_view(
         params.team_id
     )?;
 
+    // Re-fetch to get DB-assigned timestamps. Done before the sync log write so
+    // the entry can be scoped from the view's persisted `is_shared`.
+    let sql = format!("{VIEW_SELECT} WHERE view_id = $1");
+    let row = trakkt_core::db_fetch_one!(
+        db,
+        ViewRow,
+        &sql,
+        &view_id
+    )?;
+    let view = row.into_dto();
+    let visibility = view_visibility(&view);
+
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::VIEW,
         &view_id,
         params.workspace_id,
+        visibility,
         SyncActionType::Insert,
         None,
     )
@@ -215,22 +291,12 @@ pub async fn create_view(
         0
     });
 
-    // Re-fetch to get DB-assigned timestamps.
-    let sql = format!("{VIEW_SELECT} WHERE view_id = $1");
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        ViewRow,
-        &sql,
-        &view_id
-    )?;
-    let view = row.into_dto();
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
+    // WebSocket delivery — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
+        deliver_view_action(
             ws,
+            visibility,
             params.workspace_id,
-            entity_types::VIEW,
             &view_id,
             SyncActionType::Insert,
             serde_json::to_value(&view).ok(),
@@ -375,6 +441,7 @@ pub async fn update_view(
         params.view_id
     )?;
     let view = row.into_dto();
+    let visibility = view_visibility(&view);
 
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
@@ -382,6 +449,7 @@ pub async fn update_view(
         entity_types::VIEW,
         params.view_id,
         &view.workspace_id,
+        visibility,
         SyncActionType::Update,
         None,
     )
@@ -391,12 +459,12 @@ pub async fn update_view(
         0
     });
 
-    // WebSocket broadcast — send full entity data as SyncResponse.
+    // WebSocket delivery — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
+        deliver_view_action(
             ws,
+            visibility,
             &view.workspace_id,
-            entity_types::VIEW,
             params.view_id,
             SyncActionType::Update,
             serde_json::to_value(&view).ok(),
@@ -415,6 +483,16 @@ pub async fn delete_view(
     workspace_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
+    // Read the view before deleting it: once the row is gone there is no way to
+    // tell whether the delete was for a shared view (workspace-visible) or a
+    // personal one (owner only), and the sync entry has to carry that scope.
+    let Some(view) = get_view(db, view_id).await? else {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "view {view_id} not found"
+        )));
+    };
+    let visibility = view_visibility(&view);
+
     let result = trakkt_core::db_execute!(
         db,
         "DELETE FROM views WHERE view_id = $1",
@@ -433,6 +511,7 @@ pub async fn delete_view(
         entity_types::VIEW,
         view_id,
         workspace_id,
+        visibility,
         SyncActionType::Delete,
         None,
     )
@@ -442,12 +521,12 @@ pub async fn delete_view(
         0
     });
 
-    // WebSocket broadcast — delete has no entity data.
+    // WebSocket delivery — delete has no entity data.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
+        deliver_view_action(
             ws,
+            visibility,
             workspace_id,
-            entity_types::VIEW,
             view_id,
             SyncActionType::Delete,
             None,

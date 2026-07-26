@@ -90,6 +90,7 @@ pub async fn run_archive_sweep(
                 entity_types::ISSUE,
                 &issue.issue_id,
                 &team.workspace_id,
+                None,
                 SyncActionType::Delete,
                 None,
             )

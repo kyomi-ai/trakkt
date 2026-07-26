@@ -118,12 +118,14 @@ pub async fn add_favorite(
     )?;
     let favorite = row.into_dto();
 
-    // Sync log — best-effort.
+    // Sync log — best-effort. A favorite is private to the user who pinned it
+    // (`list_favorites` filters on `user_id`), so scope the row to them.
     let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::FAVORITE,
         &favorite.favorite_id,
         workspace_id,
+        Some(user_id),
         SyncActionType::Insert,
         None,
     )
@@ -133,10 +135,11 @@ pub async fn add_favorite(
         0
     });
 
-    // WebSocket broadcast — send full entity data as SyncResponse.
+    // WebSocket delivery — full entity data, owner only.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
+        sync_log_service::send_sync_action_to_user(
             ws,
+            user_id,
             workspace_id,
             entity_types::FAVORITE,
             &favorite.favorite_id,
@@ -195,12 +198,14 @@ pub async fn remove_favorite(
         return Ok(());
     }
 
-    // Sync log — best-effort.
+    // Sync log — best-effort. Scoped to the owner, matching the insert: only
+    // that user's cache ever held the favorite, so only they need the delete.
     let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::FAVORITE,
         &id_row.favorite_id,
         workspace_id,
+        Some(user_id),
         SyncActionType::Delete,
         None,
     )
@@ -210,10 +215,11 @@ pub async fn remove_favorite(
         0
     });
 
-    // WebSocket broadcast — delete has no entity data.
+    // WebSocket delivery — delete has no entity data, owner only.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
+        sync_log_service::send_sync_action_to_user(
             ws,
+            user_id,
             workspace_id,
             entity_types::FAVORITE,
             &id_row.favorite_id,

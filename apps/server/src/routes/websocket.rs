@@ -570,11 +570,20 @@ async fn handle_sync_delta(
         }
     }
 
-    // 2. Fetch all entries since last_sync_id (capped at 10,000 rows).
-    let entries =
-        trakkt_auth::sync_log_service::get_entries_since(db, workspace_id, last_sync_id, 10_000)
-            .await
-            .unwrap_or_default();
+    // 2. Fetch the entries since last_sync_id that this user may see (capped at
+    //    10,000 rows). Passing the authenticated user_id is what keeps per-user
+    //    rows — notifications, favorites, preferences, personal views — out of
+    //    other members' streams, and makes the delta dataset match what
+    //    `handle_sync_bootstrap` would have given the same user.
+    let entries = trakkt_auth::sync_log_service::get_entries_since(
+        db,
+        workspace_id,
+        user_id,
+        last_sync_id,
+        10_000,
+    )
+    .await
+    .unwrap_or_default();
 
     // 3. Stream each entry as a SyncAction message. Stop at the first failed
     //    send — the remaining entries have nowhere to go, and skipping the
@@ -849,6 +858,7 @@ mod tests {
                 entity_types::ISSUE,
                 &format!("iss_{i}"),
                 workspace_id,
+                None,
                 SyncActionType::Update,
                 None,
             )

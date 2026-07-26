@@ -160,6 +160,7 @@ pub async fn create_status(
         entity_types::STATUS,
         &status_id,
         params.workspace_id,
+        None,
         SyncActionType::Insert,
         None,
     )

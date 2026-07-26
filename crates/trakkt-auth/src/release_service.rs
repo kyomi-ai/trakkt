@@ -189,6 +189,7 @@ pub async fn create_release(
                 entity_types::ISSUE,
                 issue_id,
                 workspace_id,
+                None,
                 SyncActionType::Update,
                 None,
             )
@@ -222,6 +223,7 @@ pub async fn create_release(
         entity_types::RELEASE,
         &release_id,
         workspace_id,
+        None,
         SyncActionType::Insert,
         None,
     )
