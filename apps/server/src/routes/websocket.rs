@@ -391,7 +391,18 @@ async fn handle_sync_bootstrap(
 
     tracing::debug!(user_id, workspace_id, "Handling sync_bootstrap");
 
-    // 1. Fetch all non-archived issues (archived issues are excluded from bootstrap).
+    // 1. Read the sync watermark before any of the data it will be handed out
+    //    alongside. The cursor handed to a client must never exceed the data
+    //    actually streamed; a too-low watermark only causes harmless idempotent
+    //    re-delivery on the next delta. Reading it last would invert that: a
+    //    mutation committing after the entity queries but before the watermark
+    //    read is covered by the cursor yet missing from the stream, so it is
+    //    below every future delta's floor and the client never sees it again.
+    let latest_sync_id = trakkt_auth::sync_log_service::get_latest_sync_id(db, workspace_id)
+        .await
+        .unwrap_or(0);
+
+    // 2. Fetch all non-archived issues (archived issues are excluded from bootstrap).
     let issues = trakkt_auth::issue_service::list_issues(
         db,
         workspace_id,
@@ -407,7 +418,7 @@ async fn handle_sync_bootstrap(
         vec![]
     });
 
-    // 2. Fetch all labels.
+    // 3. Fetch all labels.
     let labels = trakkt_auth::label_service::list_labels(db, workspace_id)
         .await
         .unwrap_or_else(|e| {
@@ -415,7 +426,7 @@ async fn handle_sync_bootstrap(
             vec![]
         });
 
-    // 3. Fetch statuses, teams, and projects.
+    // 4. Fetch statuses, teams, and projects.
     let statuses = trakkt_auth::status_service::list_statuses(db, workspace_id, None)
         .await
         .unwrap_or_else(|e| {
@@ -477,12 +488,6 @@ async fn handle_sync_bootstrap(
     let ws_settings = trakkt_auth::workspace_service::get_workspace_settings_for_sync(db, workspace_id)
         .await;
 
-    // 4. Get the current sync watermark.
-    let latest_sync_id =
-        trakkt_auth::sync_log_service::get_latest_sync_id(db, workspace_id)
-            .await
-            .unwrap_or(0);
-
     // 5. Stream each entity as a SyncAction with action=Insert.
     //
     // Each batch is serialized only when its turn comes and the stream stops at
@@ -520,7 +525,7 @@ async fn handle_sync_bootstrap(
         stream_batch!(entity_types::WORKSPACE_SETTINGS, "workspace_id", vec![ws_settings_val]);
     }
 
-    // 6. Signal completion with the current sync watermark.
+    // 6. Signal completion with the watermark read back in step 1.
     send_sync_response(
         conn_tx,
         trakkt_types::sync::SyncResponse::SyncComplete {
@@ -1016,16 +1021,20 @@ mod tests {
         db
     }
 
-    /// Wait for a connection to be flagged as catching up. Fails the test
-    /// rather than hanging if the handler never sets it.
-    async fn wait_until_flagged(flag: &CatchUpFlag) {
+    /// Wait for a spawned task to raise `flag`. Fails the test rather than
+    /// hanging if it never does; `what` names the milestone in that failure.
+    ///
+    /// On the current-thread runtime these tests run on, a task that raises its
+    /// flag and then awaits gets there in a single poll, so observing the flag
+    /// from here also proves the task is parked on whatever it awaited next.
+    async fn wait_until_flagged(flag: &CatchUpFlag, what: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !flag.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("connection was never flagged as catching up");
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
     }
 
     /// Bootstrap is the stream that provoked this exemption in the first place
@@ -1046,7 +1055,7 @@ mod tests {
             handle_sync_bootstrap(&conn_tx, &flag, &db, "usr_1", "ws_empty").await;
         });
 
-        wait_until_flagged(&catching_up).await;
+        wait_until_flagged(&catching_up, "the bootstrap to flag the connection").await;
 
         // Make room so the bootstrap can finish.
         assert_eq!(conn_rx.recv().await.as_deref(), Some("occupied"));
@@ -1055,6 +1064,116 @@ mod tests {
         assert!(
             !catching_up.load(Ordering::Acquire),
             "the exemption must not outlive the bootstrap"
+        );
+    }
+
+    /// A bootstrap's watermark and its entity reads are separate queries over no
+    /// shared snapshot, so a mutation can always commit between them. Which side
+    /// of the watermark read it lands on decides whether it is recoverable:
+    /// reading the watermark first leaves the mutation above the cursor, so the
+    /// client's first delta re-delivers it; reading it last buries the mutation
+    /// under a cursor that never carried it, below the floor of every future
+    /// delta.
+    ///
+    /// The interleave is forced, not raced. The SQLite pool holds exactly one
+    /// connection and hands it out fairly, so its waiter queue works as a baton:
+    /// parking the bootstrap on it, queueing the mutation behind it, then
+    /// releasing makes the mutation commit in the gap that opens after the
+    /// bootstrap's very first query. That first query is the watermark read —
+    /// and the point of the test is that when it is not, this fails.
+    #[tokio::test]
+    async fn sync_bootstrap_watermark_stays_below_a_mutation_that_commits_mid_bootstrap() {
+        const WORKSPACE: &str = "ws_bootstrap_watermark";
+        const USER: &str = "usr_1";
+
+        let db = db_with_sync_entries(WORKSPACE, 3).await;
+        let head_before = trakkt_auth::sync_log_service::get_latest_sync_id(&db, WORKSPACE)
+            .await
+            .expect("latest sync_id");
+
+        let trakkt_core::DbPool::Sqlite(pool) = db.clone() else {
+            panic!("db_with_sync_entries builds an in-memory SQLite pool");
+        };
+        // Holding the pool's only connection parks every query issued from here
+        // on in the waiter queue, in the order the tasks arrive.
+        let baton = pool.acquire().await.expect("the pool's only connection");
+
+        // Capacity one, pre-filled: the bootstrap cannot deliver even its first
+        // frame — let alone return — until this test makes room. That is what
+        // makes the assertion below ("still in flight") mean something.
+        let (conn_tx, mut conn_rx) = mpsc::channel::<String>(1);
+        conn_tx.try_send("occupied".to_string()).expect("prefill");
+
+        let catching_up: CatchUpFlag = Arc::new(AtomicBool::new(false));
+        let bootstrap = tokio::spawn({
+            let db = db.clone();
+            let flag = Arc::clone(&catching_up);
+            async move {
+                handle_sync_bootstrap(&conn_tx, &flag, &db, USER, WORKSPACE).await;
+            }
+        });
+        wait_until_flagged(&catching_up, "the bootstrap to reach its first query").await;
+
+        let queued: CatchUpFlag = Arc::new(AtomicBool::new(false));
+        let mutation = tokio::spawn({
+            let db = db.clone();
+            let queued = Arc::clone(&queued);
+            async move {
+                queued.store(true, Ordering::Release);
+                trakkt_auth::sync_log_service::write_sync_entry(
+                    &db,
+                    entity_types::ISSUE,
+                    "iss_mid_bootstrap",
+                    WORKSPACE,
+                    None,
+                    SyncActionType::Update,
+                    None,
+                )
+                .await
+                .expect("write the mid-bootstrap sync entry")
+            }
+        });
+        wait_until_flagged(&queued, "the mutation to queue behind the bootstrap").await;
+
+        // Hand the baton on. The bootstrap runs one query and releases; the
+        // mutation, next in line, commits before the bootstrap's second.
+        drop(baton);
+        let mutation_sync_id = mutation.await.expect("mutation task");
+
+        assert!(
+            mutation_sync_id > head_before,
+            "the mutation must extend the log past {head_before}, got {mutation_sync_id}"
+        );
+        assert!(
+            !bootstrap.is_finished(),
+            "the mutation must commit while the bootstrap is still in flight"
+        );
+
+        // Drain, which is also what lets the bootstrap run to completion.
+        assert_eq!(conn_rx.recv().await.as_deref(), Some("occupied"));
+        let mut frames = Vec::new();
+        while let Some(frame) = conn_rx.recv().await {
+            frames.push(parse_frame(&frame));
+        }
+        bootstrap.await.expect("bootstrap task");
+
+        let watermark = match frames.last().expect("a trailing frame") {
+            SyncResponse::SyncComplete { last_sync_id } => *last_sync_id,
+            other => panic!("expected a trailing SyncComplete, got {other:?}"),
+        };
+        assert!(
+            watermark < mutation_sync_id,
+            "watermark {watermark} covers sync_id {mutation_sync_id}, which the bootstrap \
+             never streamed -- no delta can reach it again"
+        );
+
+        // And the criterion that watermark exists to serve: resuming from it
+        // hands the client the mutation it missed.
+        let delivered = streamed_sync_ids(&collect_delta_frames(db, WORKSPACE, watermark).await);
+        assert!(
+            delivered.contains(&mutation_sync_id),
+            "the first delta from {watermark} must deliver sync_id {mutation_sync_id}, \
+             but streamed {delivered:?}"
         );
     }
 

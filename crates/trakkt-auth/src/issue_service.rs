@@ -7,6 +7,7 @@
 //! supports dynamic filtering, label assignment, and full CRUD with sync log
 //! integration.
 
+use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use trakkt_types::enums::ActionSource;
@@ -190,7 +191,55 @@ const ISSUE_DETAIL_SELECT: &str = "\
     JOIN users creator ON creator.user_id = i.creator_id \
     LEFT JOIN projects p ON p.project_id = i.project_id";
 
+/// Base SELECT for a bare `issues` row, keyed by `issue_id` as `$1`.
+const ISSUE_ROW_BY_ID_SELECT: &str = "\
+    SELECT issue_id, workspace_id, team_id, number, title, description, \
+           status_id, priority, assignee_id, creator_id, \
+           SUBSTR(CAST(due_date AS TEXT), 1, 10) AS due_date, \
+           project_id, milestone_id, estimate, sort_order, \
+           CAST(created_at AS TEXT) AS created_at, \
+           CAST(updated_at AS TEXT) AS updated_at, \
+           CAST(started_at AS TEXT) AS started_at, \
+           CAST(completed_at AS TEXT) AS completed_at, \
+           CAST(released_at AS TEXT) AS released_at \
+    FROM issues WHERE issue_id = $1";
+
+/// Base SELECT for an issue's labels. Callers append the `il.issue_id`
+/// predicate — `IN (…)` for the batch form, `= $1` for the single-issue form —
+/// followed by the ordering.
+const ISSUE_LABELS_SELECT: &str = "\
+    SELECT il.issue_id, l.label_id, l.workspace_id, l.team_id, l.name, l.color, \
+           CAST(l.created_at AS TEXT) AS created_at \
+    FROM labels l \
+    JOIN issue_labels il ON l.label_id = il.label_id \
+    WHERE il.issue_id";
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Row type for the label join query. Includes the issue_id for grouping.
+#[derive(sqlx::FromRow)]
+struct IssueLabelRow {
+    issue_id: String,
+    label_id: String,
+    workspace_id: String,
+    team_id: Option<String>,
+    name: String,
+    color: String,
+    created_at: String,
+}
+
+impl IssueLabelRow {
+    fn into_dto(self) -> Label {
+        Label {
+            label_id: self.label_id,
+            workspace_id: self.workspace_id,
+            team_id: self.team_id,
+            name: self.name,
+            color: self.color,
+            created_at: self.created_at,
+        }
+    }
+}
 
 /// Fetch labels for a list of issue IDs in a single query (avoids N+1).
 ///
@@ -206,26 +255,7 @@ async fn fetch_labels_for_issues(
     // Build IN clause with numbered placeholders.
     let (in_clause, _) = trakkt_core::db::in_clause_placeholders(issue_ids.len(), 1);
 
-    /// Row type for the label join query. Includes the issue_id for grouping.
-    #[derive(sqlx::FromRow)]
-    struct IssueLabelRow {
-        issue_id: String,
-        label_id: String,
-        workspace_id: String,
-        team_id: Option<String>,
-        name: String,
-        color: String,
-        created_at: String,
-    }
-
-    let sql = format!(
-        "SELECT il.issue_id, l.label_id, l.workspace_id, l.team_id, l.name, l.color, \
-                CAST(l.created_at AS TEXT) AS created_at \
-         FROM labels l \
-         JOIN issue_labels il ON l.label_id = il.label_id \
-         WHERE il.issue_id IN {in_clause} \
-         ORDER BY l.name ASC"
-    );
+    let sql = format!("{ISSUE_LABELS_SELECT} IN {in_clause} ORDER BY l.name ASC");
 
     // We need to bind each issue_id individually. Since the macro expands binds
     // at compile time, we use db_with_pool! and build the query manually.
@@ -241,16 +271,39 @@ async fn fetch_labels_for_issues(
         std::collections::HashMap::new();
     for row in rows {
         let issue_id = row.issue_id.clone();
-        map.entry(issue_id).or_default().push(Label {
-            label_id: row.label_id,
-            workspace_id: row.workspace_id,
-            team_id: row.team_id,
-            name: row.name,
-            color: row.color,
-            created_at: row.created_at,
-        });
+        map.entry(issue_id).or_default().push(row.into_dto());
     }
     Ok(map)
+}
+
+/// Fetch one issue's labels on an open transaction.
+///
+/// Single-issue counterpart of [`fetch_labels_for_issues`] — the payload path
+/// only ever needs one issue, and while a transaction is open the pool is
+/// unreachable (see [`DbTx`]).
+async fn fetch_labels_for_issue_tx(
+    tx: &mut DbTx,
+    issue_id: &str,
+) -> trakkt_core::Result<Vec<Label>> {
+    let sql = format!("{ISSUE_LABELS_SELECT} = $1 ORDER BY l.name ASC");
+    let rows: Vec<IssueLabelRow> =
+        trakkt_core::tx_fetch_all!(&mut *tx, IssueLabelRow, &sql, issue_id)?;
+    Ok(rows.into_iter().map(IssueLabelRow::into_dto).collect())
+}
+
+/// Serialise an issue into its sync payload.
+///
+/// A payload that cannot be serialised is logged and dropped: the sync entry is
+/// still written, so the change keeps its place in the sequence.
+fn issue_payload_value(issue: &IssueWithDetails) -> Option<serde_json::Value> {
+    match serde_json::to_value(issue) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(error = %e, issue_id = %issue.issue_id,
+                "Failed to serialize issue for sync payload");
+            None
+        }
+    }
 }
 
 // ─── Service functions ──────────────────────────────────────────────────────
@@ -259,6 +312,10 @@ async fn fetch_labels_for_issues(
 ///
 /// The issue `number` is auto-incremented per team. Labels are attached
 /// via the `issue_labels` junction table.
+///
+/// The inserts and the `sync_log` entry that replays them commit as one
+/// transaction: an issue can never exist without the sync row that makes it
+/// visible to delta sync.
 pub async fn create_issue(
     db: &DbPool,
     params: &CreateIssueParams,
@@ -268,7 +325,8 @@ pub async fn create_issue(
     let now = sql_compat::now(is_pg);
     let issue_id = uuid::Uuid::new_v4().to_string();
 
-    // Look up the default status for this workspace.
+    // Look up the default status for this workspace. This runs on the pool, so
+    // it has to happen before the transaction opens.
     let default_status = crate::status_service::get_default_status(db, &params.workspace_id).await?;
 
     // Atomic number generation: the subquery computes the next number inside the
@@ -286,8 +344,10 @@ pub async fn create_issue(
                  (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = $3), \
                  $4, $5, $6, $7, $8, $9, {due_date_cast}, $11, $12, {estimate_cast}, {now}, {now}, NULL, NULL)"
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &issue_id,
         &params.workspace_id,
@@ -306,8 +366,8 @@ pub async fn create_issue(
 
     // Attach labels.
     for label_id in &params.label_ids {
-        trakkt_core::db_execute!(
-            db,
+        trakkt_core::tx_execute!(
+            &mut tx,
             "INSERT INTO issue_labels (issue_id, label_id) VALUES ($1, $2)",
             &issue_id,
             label_id
@@ -317,11 +377,10 @@ pub async fn create_issue(
     // Read the issue back with its details before the sync log write: both the
     // stored entry and the live frame carry the full issue, and the client
     // cannot apply either without it.
-    let payload = issue_sync_payload(db, &issue_id).await?;
+    let payload = issue_sync_payload_tx(&mut tx, &issue_id).await?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    let sync_id = sync_log_service::write_sync_entry_in_tx(
+        &mut tx,
         entity_types::ISSUE,
         &issue_id,
         &params.workspace_id,
@@ -329,11 +388,16 @@ pub async fn create_issue(
         SyncActionType::Insert,
         payload.clone(),
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for issue create");
-        0
-    });
+    .await?;
+
+    // Read back the DB-assigned number and timestamps while still inside the
+    // transaction — the row is not visible outside it until the commit.
+    let row = trakkt_core::tx_fetch_one!(&mut tx, IssueRow, ISSUE_ROW_BY_ID_SELECT, &issue_id)?;
+
+    tx.commit().await?;
+
+    // Everything below reaches for the pool or the socket, so it has to follow
+    // the commit.
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -354,22 +418,6 @@ pub async fn create_issue(
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to auto-watch issue for creator");
     }
 
-    // Re-fetch to get DB-assigned timestamps.
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        IssueRow,
-        "SELECT issue_id, workspace_id, team_id, number, title, description, \
-                status_id, priority, assignee_id, creator_id, \
-                SUBSTR(CAST(due_date AS TEXT), 1, 10) AS due_date, \
-                project_id, milestone_id, estimate, sort_order, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at, \
-                CAST(started_at AS TEXT) AS started_at, \
-                CAST(completed_at AS TEXT) AS completed_at, \
-                CAST(released_at AS TEXT) AS released_at \
-         FROM issues WHERE issue_id = $1",
-        &issue_id
-    )?;
     Ok(row.into_dto())
 }
 
@@ -419,7 +467,44 @@ pub(crate) async fn issue_sync_payload(
     let issue = get_issue_by_id(db, issue_id)
         .await?
         .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue {issue_id} not found")))?;
-    Ok(serde_json::to_value(&issue).ok())
+    Ok(issue_payload_value(&issue))
+}
+
+/// Read an issue by its UUID on an open transaction.
+///
+/// Transaction-scoped [`get_issue_by_id`]. A mutation's payload has to be read
+/// through the same transaction that made it — the new state is not visible on
+/// the pool until the commit, and on SQLite the pool is not reachable at all
+/// while the transaction is open.
+async fn get_issue_by_id_tx(
+    tx: &mut DbTx,
+    issue_id: &str,
+) -> trakkt_core::Result<Option<IssueWithDetails>> {
+    let sql = format!("{ISSUE_DETAIL_SELECT} WHERE i.issue_id = $1");
+    let row: Option<IssueDetailRow> =
+        trakkt_core::tx_fetch_optional!(&mut *tx, IssueDetailRow, &sql, issue_id)?;
+
+    match row {
+        Some(r) => {
+            let labels = fetch_labels_for_issue_tx(tx, &r.issue_id).await?;
+            Ok(Some(r.into_dto(labels)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Build the sync payload for a change made on an open transaction.
+///
+/// Transaction-scoped [`issue_sync_payload`], with the same contract: callers
+/// have already established that the issue exists, so a missing row is an error.
+async fn issue_sync_payload_tx(
+    tx: &mut DbTx,
+    issue_id: &str,
+) -> trakkt_core::Result<Option<serde_json::Value>> {
+    let issue = get_issue_by_id_tx(tx, issue_id)
+        .await?
+        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue {issue_id} not found")))?;
+    Ok(issue_payload_value(&issue))
 }
 
 /// Get a single issue by team key + number (e.g. "ENG-42"), with full details.
@@ -635,6 +720,10 @@ pub async fn list_issues(
 ///
 /// Only fields present in `updates` are changed. `updated_at` is always set.
 /// When `team_id` changes, the issue is renumbered in the target team.
+///
+/// The UPDATE and every `sync_log` entry it produces — this issue's, plus one
+/// per issue whose derived `is_blocked` flag changed with it — commit as one
+/// transaction. Notifications and the live broadcast follow the commit.
 pub async fn update_issue(
     db: &DbPool,
     workspace_id: &str,
@@ -668,6 +757,16 @@ pub async fn update_issue(
             "issue {team_key}-{number} not found in workspace {workspace_id}"
         ))
     })?;
+
+    // A status change flips the derived `is_blocked` flag on every issue this
+    // one blocks, so those issues need sync entries in the same commit. The
+    // relation lookup runs on the pool, so it has to happen before the
+    // transaction opens — safe, because this update never touches relations.
+    let blocked_issue_ids: Vec<String> = if updates.status_id.is_some() {
+        crate::relation_service::find_blocked_issue_ids(db, &issue_id).await?
+    } else {
+        Vec::new()
+    };
 
     // Dynamic SET clause — params are numbered sequentially starting at $1.
     let mut set_parts: Vec<String> = Vec::new();
@@ -789,9 +888,11 @@ pub async fn update_issue(
         "UPDATE issues SET {set_clause} WHERE issue_id = ${id_idx}"
     );
 
+    let mut tx = db.begin().await?;
+
     // Bind dynamically. Map to rows_affected() inside the closure so both
-    // pool arms return the same type (u64).
-    let affected: u64 = trakkt_core::db_with_pool!(db, |p| {
+    // backend arms return the same type (u64).
+    let affected: u64 = trakkt_core::tx_with!(&mut tx, |e| {
         let mut query = sqlx::query(&sql);
 
         if let Some(ref v) = updates.title {
@@ -831,40 +932,26 @@ pub async fn update_issue(
 
         query = query.bind(&issue_id);
 
-        query.execute(p).await.map(|r| r.rows_affected())
+        query.execute(e).await.map(|r| r.rows_affected())
     })?;
 
     if affected == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "issue {team_key}-{number} not found in workspace {workspace_id}"
         )));
     }
 
     // Re-fetch the updated issue by UUID (number may have changed on team reassignment).
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        IssueRow,
-        "SELECT issue_id, workspace_id, team_id, number, title, description, \
-                status_id, priority, assignee_id, creator_id, \
-                SUBSTR(CAST(due_date AS TEXT), 1, 10) AS due_date, \
-                project_id, milestone_id, estimate, sort_order, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at, \
-                CAST(started_at AS TEXT) AS started_at, \
-                CAST(completed_at AS TEXT) AS completed_at, \
-                CAST(released_at AS TEXT) AS released_at \
-         FROM issues WHERE issue_id = $1",
-        &issue_id
-    )?;
+    let row = trakkt_core::tx_fetch_one!(&mut tx, IssueRow, ISSUE_ROW_BY_ID_SELECT, &issue_id)?;
     let issue = row.into_dto();
 
     // Built before the sync log write so the stored entry and the live frame
     // carry the same full issue; without it the client skips both.
-    let payload = issue_sync_payload(db, &issue.issue_id).await?;
+    let payload = issue_sync_payload_tx(&mut tx, &issue.issue_id).await?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    let sync_id = sync_log_service::write_sync_entry_in_tx(
+        &mut tx,
         entity_types::ISSUE,
         &issue.issue_id,
         workspace_id,
@@ -872,11 +959,38 @@ pub async fn update_issue(
         SyncActionType::Update,
         payload.clone(),
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, issue_id = %issue.issue_id, "Failed to write sync log entry for issue update");
-        0
-    });
+    .await?;
+
+    // Issues this one blocks: their `is_blocked` flag is computed at query time
+    // from this issue's status, so it has just changed for them too. Their sync
+    // entries belong to this commit — reading them through the transaction is
+    // also what makes them reflect the new status.
+    let mut blocked_frames: Vec<(String, Option<serde_json::Value>, i64)> =
+        Vec::with_capacity(blocked_issue_ids.len());
+    for blocked_id in blocked_issue_ids {
+        // A relation may point at an issue that has since been deleted; there
+        // is nothing to report for it.
+        let Some(blocked_issue) = get_issue_by_id_tx(&mut tx, &blocked_id).await? else {
+            continue;
+        };
+        let data = issue_payload_value(&blocked_issue);
+        let blocked_sync_id = sync_log_service::write_sync_entry_in_tx(
+            &mut tx,
+            entity_types::ISSUE,
+            &blocked_id,
+            workspace_id,
+            None,
+            SyncActionType::Update,
+            data.clone(),
+        )
+        .await?;
+        blocked_frames.push((blocked_id, data, blocked_sync_id));
+    }
+
+    tx.commit().await?;
+
+    // Everything below reaches for the pool or the socket, so it has to follow
+    // the commit.
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -890,69 +1004,18 @@ pub async fn update_issue(
             sync_id,
         )
         .await;
-    }
 
-    // When status changes, re-broadcast all issues this one is blocking.
-    // Their is_blocked flag may have changed (computed at query time via SQL EXISTS).
-    if updates.status_id.is_some()
-        && let Some(ws) = ws_manager
-    {
-        match crate::relation_service::find_blocked_issue_ids(db, &issue.issue_id).await {
-            Ok(blocked_ids) => {
-                for blocked_id in blocked_ids {
-                    match get_issue_by_id(db, &blocked_id).await {
-                        Ok(Some(blocked_issue)) => {
-                            let data = match serde_json::to_value(&blocked_issue) {
-                                Ok(value) => Some(value),
-                                Err(e) => {
-                                    tracing::warn!(error = %e, blocked_id = %blocked_id,
-                                        "Failed to serialize blocked issue for re-broadcast");
-                                    None
-                                }
-                            };
-
-                            let sync_id = match data.clone() {
-                                Some(value) => sync_log_service::write_sync_entry(
-                                    db,
-                                    entity_types::ISSUE,
-                                    &blocked_id,
-                                    workspace_id,
-                                    None,
-                                    SyncActionType::Update,
-                                    Some(value),
-                                )
-                                .await
-                                .unwrap_or_else(|e| {
-                                    tracing::warn!(error = %e, blocked_id = %blocked_id,
-                                        "Failed to write sync log entry for blocked issue re-broadcast");
-                                    0
-                                }),
-                                None => 0,
-                            };
-
-                            sync_log_service::broadcast_sync_action(
-                                ws,
-                                workspace_id,
-                                entity_types::ISSUE,
-                                &blocked_id,
-                                SyncActionType::Update,
-                                data,
-                                sync_id,
-                            )
-                            .await;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, blocked_id = %blocked_id,
-                                "Failed to re-fetch blocked issue for re-broadcast");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, issue_id = %issue.issue_id,
-                    "Failed to find blocked issues for re-broadcast after status change");
-            }
+        for (blocked_id, data, blocked_sync_id) in blocked_frames {
+            sync_log_service::broadcast_sync_action(
+                ws,
+                workspace_id,
+                entity_types::ISSUE,
+                &blocked_id,
+                SyncActionType::Update,
+                data,
+                blocked_sync_id,
+            )
+            .await;
         }
     }
 
@@ -1088,6 +1151,9 @@ pub async fn update_issue(
 /// Delete an issue by team key + number (e.g. "ENG-42").
 ///
 /// Cascading deletes remove associated issue_labels, comments, and watchers.
+///
+/// The DELETE and its `sync_log` entry commit as one transaction, so a deleted
+/// issue is always accompanied by the row that tells clients to drop it.
 pub async fn delete_issue(
     db: &DbPool,
     workspace_id: &str,
@@ -1095,28 +1161,29 @@ pub async fn delete_issue(
     number: i32,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    // Fetch the issue_id first for the sync log entry.
-    let issue_row: Option<IssueRow> = trakkt_core::db_with_pool!(db, |p| {
-        sqlx::query_as::<_, IssueRow>(
-            "SELECT i.issue_id, i.workspace_id, i.team_id, i.number, i.title, i.description, \
-                    i.status_id, i.priority, i.assignee_id, i.creator_id, \
-                    SUBSTR(CAST(i.due_date AS TEXT), 1, 10) AS due_date, \
-                    i.project_id, i.milestone_id, i.estimate, i.sort_order, \
-                    CAST(i.created_at AS TEXT) AS created_at, \
-                    CAST(i.updated_at AS TEXT) AS updated_at, \
-                    CAST(i.started_at AS TEXT) AS started_at, \
-                    CAST(i.completed_at AS TEXT) AS completed_at, \
-                    CAST(i.released_at AS TEXT) AS released_at \
-             FROM issues i \
-             JOIN teams t ON t.team_id = i.team_id \
-             WHERE i.workspace_id = $1 AND t.key = $2 AND i.number = $3"
-        )
-        .bind(workspace_id)
-        .bind(team_key)
-        .bind(number)
-        .fetch_optional(p)
-        .await
-    })?;
+    let mut tx = db.begin().await?;
+
+    // Resolve the issue_id inside the transaction so the row cannot disappear
+    // between the lookup and the DELETE.
+    let issue_row: Option<IssueRow> = trakkt_core::tx_fetch_optional!(
+        &mut tx,
+        IssueRow,
+        "SELECT i.issue_id, i.workspace_id, i.team_id, i.number, i.title, i.description, \
+                i.status_id, i.priority, i.assignee_id, i.creator_id, \
+                SUBSTR(CAST(i.due_date AS TEXT), 1, 10) AS due_date, \
+                i.project_id, i.milestone_id, i.estimate, i.sort_order, \
+                CAST(i.created_at AS TEXT) AS created_at, \
+                CAST(i.updated_at AS TEXT) AS updated_at, \
+                CAST(i.started_at AS TEXT) AS started_at, \
+                CAST(i.completed_at AS TEXT) AS completed_at, \
+                CAST(i.released_at AS TEXT) AS released_at \
+         FROM issues i \
+         JOIN teams t ON t.team_id = i.team_id \
+         WHERE i.workspace_id = $1 AND t.key = $2 AND i.number = $3",
+        workspace_id,
+        team_key,
+        number
+    )?;
 
     let issue_row = issue_row.ok_or_else(|| {
         trakkt_core::Error::NotFound(format!(
@@ -1126,15 +1193,14 @@ pub async fn delete_issue(
 
     let issue_id = issue_row.issue_id.clone();
 
-    trakkt_core::db_execute!(
-        db,
+    trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM issues WHERE issue_id = $1",
         &issue_id
     )?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    let sync_id = sync_log_service::write_sync_entry_in_tx(
+        &mut tx,
         entity_types::ISSUE,
         &issue_id,
         workspace_id,
@@ -1142,11 +1208,9 @@ pub async fn delete_issue(
         SyncActionType::Delete,
         None,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for issue delete");
-        0
-    });
+    .await?;
+
+    tx.commit().await?;
 
     // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
@@ -1167,8 +1231,10 @@ pub async fn delete_issue(
 
 /// Replace all labels on an issue.
 ///
-/// Deletes existing label associations and inserts the new set.
-/// TODO: wrap delete+insert in a transaction (Slice 9 — sync engine).
+/// Deletes existing label associations and inserts the new set. The delete, the
+/// inserts and the `sync_log` entry that carries the new label set commit as one
+/// transaction — a partial relabelling is never observable, and never
+/// unreported.
 pub async fn set_issue_labels(
     db: &DbPool,
     issue_id: &str,
@@ -1178,17 +1244,19 @@ pub async fn set_issue_labels(
     action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
+    let mut tx = db.begin().await?;
+
     // Remove existing labels.
-    trakkt_core::db_execute!(
-        db,
+    trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM issue_labels WHERE issue_id = $1",
         issue_id
     )?;
 
     // Insert new labels.
     for label_id in label_ids {
-        trakkt_core::db_execute!(
-            db,
+        trakkt_core::tx_execute!(
+            &mut tx,
             "INSERT INTO issue_labels (issue_id, label_id) VALUES ($1, $2)",
             issue_id,
             label_id
@@ -1196,8 +1264,8 @@ pub async fn set_issue_labels(
     }
 
     // Determine workspace_id for the sync log.
-    let ws_id: String = trakkt_core::db_fetch_scalar!(
-        db,
+    let ws_id: String = trakkt_core::tx_fetch_scalar!(
+        &mut tx,
         String,
         "SELECT workspace_id FROM issues WHERE issue_id = $1",
         issue_id
@@ -1205,11 +1273,10 @@ pub async fn set_issue_labels(
 
     // Read the issue back with its new labels before the sync log write — the
     // relabelling is only visible to the client through this payload.
-    let payload = issue_sync_payload(db, issue_id).await?;
+    let payload = issue_sync_payload_tx(&mut tx, issue_id).await?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    let sync_id = sync_log_service::write_sync_entry_in_tx(
+        &mut tx,
         entity_types::ISSUE,
         issue_id,
         &ws_id,
@@ -1217,11 +1284,12 @@ pub async fn set_issue_labels(
         SyncActionType::Update,
         payload.clone(),
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for label update");
-        0
-    });
+    .await?;
+
+    tx.commit().await?;
+
+    // Everything below reaches for the pool or the socket, so it has to follow
+    // the commit.
 
     // WebSocket broadcast — send full entity data with updated labels.
     if let Some(ws) = ws_manager {
@@ -1295,8 +1363,8 @@ pub async fn set_issue_labels(
 
 /// Set the sort order for an issue (used by board drag-to-reorder).
 ///
-/// Updates only `sort_order` and `updated_at`. Logs to sync_log and broadcasts
-/// the updated issue over WebSocket.
+/// Updates only `sort_order` and `updated_at`. The UPDATE and its `sync_log`
+/// entry commit as one transaction; the broadcast follows the commit.
 pub async fn set_sort_order(
     db: &DbPool,
     workspace_id: &str,
@@ -1307,8 +1375,10 @@ pub async fn set_sort_order(
 ) -> trakkt_core::Result<()> {
     let now = sql_compat::now(db.is_postgres());
 
+    let mut tx = db.begin().await?;
+
     // Resolve issue_id first — needed for the UPDATE and sync log/broadcast.
-    let issue_id: String = trakkt_core::db_with_pool!(db, |p| {
+    let issue_id: String = trakkt_core::tx_with!(&mut tx, |e| {
         sqlx::query_scalar::<_, String>(
             "SELECT i.issue_id FROM issues i \
              JOIN teams t ON t.team_id = i.team_id \
@@ -1317,7 +1387,7 @@ pub async fn set_sort_order(
         .bind(workspace_id)
         .bind(team_key)
         .bind(issue_number)
-        .fetch_optional(p)
+        .fetch_optional(e)
         .await
     })?
     .ok_or_else(|| {
@@ -1331,22 +1401,14 @@ pub async fn set_sort_order(
         "UPDATE issues SET sort_order = $1, archived_at = NULL, updated_at = {now} WHERE issue_id = $2"
     );
 
-    trakkt_core::db_with_pool!(db, |p| {
-        sqlx::query(&sql)
-            .bind(sort_order)
-            .bind(&issue_id)
-            .execute(p)
-            .await
-            .map(|_| ())
-    })?;
+    trakkt_core::tx_execute!(&mut tx, &sql, sort_order, &issue_id)?;
 
     // Built before the sync log write — the new sort_order only reaches the
     // client through this payload.
-    let payload = issue_sync_payload(db, &issue_id).await?;
+    let payload = issue_sync_payload_tx(&mut tx, &issue_id).await?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    let sync_id = sync_log_service::write_sync_entry_in_tx(
+        &mut tx,
         entity_types::ISSUE,
         &issue_id,
         workspace_id,
@@ -1354,11 +1416,9 @@ pub async fn set_sort_order(
         SyncActionType::Update,
         payload.clone(),
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for sort_order update");
-        0
-    });
+    .await?;
+
+    tx.commit().await?;
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
