@@ -14,7 +14,7 @@
 //! - `data` is stored as JSONB on Postgres and TEXT on SQLite
 
 use trakkt_core::sql_compat;
-use trakkt_core::{db_execute, db_fetch_all, db_fetch_scalar, DbPool, MessageType, WebSocketMessage};
+use trakkt_core::{db_execute, db_fetch_all, db_fetch_scalar, DbPool};
 use trakkt_types::sync::{SyncAction, SyncActionType};
 
 use crate::websocket::WebSocketManager;
@@ -332,30 +332,6 @@ pub async fn prune_old_entries(
 
 // ─── Broadcast helper ────────────────────────────────────────────────────────
 
-/// Broadcast a sync notification to all connected workspace members via WebSocket.
-///
-/// Broadcast a notification that an entity changed. Clients receiving this
-/// should perform a delta sync to fetch the actual data.
-///
-/// Used by entity services that don't yet send full SyncResponse data
-/// (team, comment, notification).
-pub async fn broadcast_sync_notify(
-    ws_manager: &WebSocketManager,
-    entity_type: &str,
-    workspace_id: &str,
-) {
-    let message = WebSocketMessage::new(MessageType::SyncAction).with_data(
-        serde_json::json!({
-            "entity_type": entity_type,
-            "workspace_id": workspace_id,
-        }),
-    );
-
-    ws_manager
-        .broadcast_to_workspace(workspace_id, message, None)
-        .await;
-}
-
 /// Broadcast a `SyncResponse::SyncAction` with the full entity data to all
 /// connected clients in the workspace.
 ///
@@ -460,6 +436,7 @@ fn sync_action_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trakkt_types::models::{Project, Status};
     use trakkt_types::sync::{entity_types, SyncResponse};
 
     /// A single-instance manager over a workspace with one member.
@@ -1207,6 +1184,323 @@ mod tests {
             ],
             "backfill must scope notifications, favorites, preferences and personal \
              views to their owner, and leave shared views and workspace entities NULL"
+        );
+    }
+
+    // ─── Status / project frames and payloads (TRA-9929) ─────────────────────
+    //
+    // These changes have to survive both halves of the protocol: the live frame
+    // has to be a shape the client can parse, and the `sync_log` row it pairs
+    // with has to carry a payload the client can apply on reconnect. Each test
+    // drives the real service against the real manager and reads the frame back
+    // off a connection channel.
+
+    /// A second workspace member watching over a live connection, with the
+    /// connect heartbeat already drained.
+    async fn watching_member(db: &DbPool) -> (WebSocketManager, crate::websocket::manager::ConnectionHandle) {
+        let manager = WebSocketManager::new(None, db.clone());
+        let mut conn = manager.connect(USER_B).expect("B connects");
+        conn.rx.recv().await.expect("connect heartbeat");
+        (manager, conn)
+    }
+
+    /// The next frame on a connection, parsed the way the client parses it.
+    ///
+    /// Going through `SyncResponse` is the point of the test: it is the exact
+    /// call `cache/websocket.rs` makes, and it is where the old envelope frame
+    /// failed.
+    async fn next_sync_action(conn: &mut crate::websocket::manager::ConnectionHandle) -> SyncAction {
+        let frame = conn.rx.recv().await.expect("a broadcast frame");
+        match serde_json::from_str::<SyncResponse>(&frame).unwrap_or_else(|e| {
+            panic!("frame did not parse as a SyncResponse: {e}\nframe: {frame}")
+        }) {
+            SyncResponse::SyncAction(action) => action,
+            other => panic!("expected a sync_action frame, got {other:?}"),
+        }
+    }
+
+    /// Assert the shape every live insert/update frame must have, and return
+    /// its payload.
+    fn payload_of(action: &SyncAction, entity_type: &str, entity_id: &str) -> serde_json::Value {
+        assert_eq!(action.entity_type, entity_type);
+        assert_eq!(action.entity_id, entity_id);
+        assert!(
+            action.sync_id > 0,
+            "the frame must carry the sync_log id of its own row so a client that \
+             missed it can spot the gap, got {}",
+            action.sync_id
+        );
+        action.data.clone().unwrap_or_else(|| {
+            panic!("an insert/update frame with no payload is skipped by the client: {action:?}")
+        })
+    }
+
+    async fn create_test_status(db: &DbPool, ws: Option<&WebSocketManager>) -> Status {
+        crate::status_service::create_status(
+            db,
+            &crate::status_service::CreateStatusParams {
+                workspace_id: WS,
+                team_id: Some("team_vis"),
+                name: "Blocked",
+                category: "started",
+                position: 7,
+                color: Some("#0D9488"),
+            },
+            ws,
+        )
+        .await
+        .expect("create status")
+    }
+
+    async fn create_test_project(db: &DbPool, ws: Option<&WebSocketManager>) -> Project {
+        crate::project_service::create_project(
+            db,
+            &crate::project_service::CreateProjectParams {
+                workspace_id: WS,
+                name: "Apollo",
+                description: None,
+                icon: None,
+                color: None,
+                lead_id: None,
+                start_date: None,
+                target_date: None,
+            },
+            ws,
+        )
+        .await
+        .expect("create project")
+    }
+
+    #[tokio::test]
+    async fn status_create_frame_carries_the_new_status() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+
+        let status = create_test_status(&db, Some(&manager)).await;
+
+        let action = next_sync_action(&mut conn).await;
+        assert!(matches!(action.action, SyncActionType::Insert));
+        let data = payload_of(&action, entity_types::STATUS, &status.status_id);
+
+        let received: Status =
+            serde_json::from_value(data).expect("payload deserializes into a Status");
+        assert_eq!(
+            received, status,
+            "the frame must carry the same row the caller got back"
+        );
+        assert!(
+            !received.created_at.is_empty(),
+            "the payload is built after the re-fetch, so the DB-assigned \
+             created_at has to be in it"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_create_frame_carries_the_new_project() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+
+        let project = create_test_project(&db, Some(&manager)).await;
+
+        let action = next_sync_action(&mut conn).await;
+        assert!(matches!(action.action, SyncActionType::Insert));
+        let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
+
+        let received: Project =
+            serde_json::from_value(data).expect("payload deserializes into a Project");
+        assert_eq!(received, project);
+        assert!(
+            !received.created_at.is_empty() && !received.updated_at.is_empty(),
+            "the DB-assigned timestamps have to be in the payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_update_frame_carries_the_updated_project() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+        let project = create_test_project(&db, Some(&manager)).await;
+        next_sync_action(&mut conn).await; // the create frame
+
+        let updated = crate::project_service::update_project(
+            &db,
+            &crate::project_service::UpdateProjectParams {
+                project_id: &project.project_id,
+                name: Some("Apollo II"),
+                description: None,
+                icon: None,
+                color: None,
+                status: None,
+                lead_id: None,
+                start_date: None,
+                target_date: None,
+                archived_at: None,
+            },
+            Some(&manager),
+        )
+        .await
+        .expect("update project");
+
+        let action = next_sync_action(&mut conn).await;
+        assert!(matches!(action.action, SyncActionType::Update));
+        let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
+
+        let received: Project =
+            serde_json::from_value(data).expect("payload deserializes into a Project");
+        assert_eq!(received, updated);
+        assert_eq!(
+            received.name, "Apollo II",
+            "the frame must carry the new value, not the row as it was before"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_member_add_frame_carries_the_parent_project() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+        let project = create_test_project(&db, Some(&manager)).await;
+        next_sync_action(&mut conn).await; // the create frame
+
+        crate::project_service::add_project_member(
+            &db,
+            &project.project_id,
+            USER_B,
+            "member",
+            WS,
+            Some(&manager),
+        )
+        .await
+        .expect("add member");
+
+        let action = next_sync_action(&mut conn).await;
+        assert!(matches!(action.action, SyncActionType::Update));
+        let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
+
+        // `project_members` is not a synced entity type, so the change is
+        // reported as an update to the parent project and carries the project
+        // row — which the membership change itself does not alter.
+        let received: Project =
+            serde_json::from_value(data).expect("payload deserializes into a Project");
+        assert_eq!(received, project);
+    }
+
+    #[tokio::test]
+    async fn project_member_remove_frame_carries_the_parent_project() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+        let project = create_test_project(&db, Some(&manager)).await;
+        next_sync_action(&mut conn).await; // the create frame
+
+        crate::project_service::add_project_member(
+            &db,
+            &project.project_id,
+            USER_B,
+            "member",
+            WS,
+            Some(&manager),
+        )
+        .await
+        .expect("add member");
+        next_sync_action(&mut conn).await; // the member-add frame
+
+        crate::project_service::remove_project_member(
+            &db,
+            &project.project_id,
+            USER_B,
+            WS,
+            Some(&manager),
+        )
+        .await
+        .expect("remove member");
+
+        let action = next_sync_action(&mut conn).await;
+        assert!(matches!(action.action, SyncActionType::Update));
+        let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
+
+        let received: Project =
+            serde_json::from_value(data).expect("payload deserializes into a Project");
+        assert_eq!(received, project);
+    }
+
+    /// The durable half: what a client that was offline for all of it gets on
+    /// reconnect. Run with no `ws_manager` at all, so nothing here can be
+    /// satisfied by the live frame.
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_status_and_project_write() {
+        let db = two_user_workspace().await;
+
+        let status = create_test_status(&db, None).await;
+        let project = create_test_project(&db, None).await;
+        crate::project_service::add_project_member(
+            &db,
+            &project.project_id,
+            USER_B,
+            "member",
+            WS,
+            None,
+        )
+        .await
+        .expect("add member");
+        crate::project_service::remove_project_member(&db, &project.project_id, USER_B, WS, None)
+            .await
+            .expect("remove member");
+        crate::project_service::create_project_update(
+            &db,
+            &project.project_id,
+            USER_A,
+            "on_track",
+            Some("Shipping this week"),
+            None,
+            WS,
+        )
+        .await
+        .expect("post a project update");
+
+        let entries = get_entries_since(&db, WS, USER_B, 0, 10_000)
+            .await
+            .expect("B's delta");
+
+        let mut statuses = 0;
+        let mut projects = 0;
+        for entry in &entries {
+            let entity_type = entry.entity_type.as_str();
+            if entity_type != entity_types::STATUS && entity_type != entity_types::PROJECT {
+                continue;
+            }
+            assert!(
+                matches!(
+                    entry.action,
+                    SyncActionType::Insert | SyncActionType::Update
+                ),
+                "unexpected action in this delta: {entry:?}"
+            );
+
+            let data = entry.data.clone().unwrap_or_else(|| {
+                panic!(
+                    "delta row {} has no payload — the client skips insert/update rows \
+                     without one, so the change never arrives on reconnect either: {entry:?}",
+                    entry.sync_id
+                )
+            });
+
+            if entity_type == entity_types::STATUS {
+                let received: Status = serde_json::from_value(data)
+                    .expect("status delta row deserializes into a Status");
+                assert_eq!(received, status);
+                statuses += 1;
+            } else {
+                let received: Project = serde_json::from_value(data)
+                    .expect("project delta row deserializes into a Project");
+                assert_eq!(received.project_id, project.project_id);
+                projects += 1;
+            }
+        }
+
+        assert_eq!(statuses, 1, "one status create");
+        assert_eq!(
+            projects, 4,
+            "one project create plus three updates: member add, member remove, \
+             and the posted project update"
         );
     }
 }
