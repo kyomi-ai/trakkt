@@ -50,6 +50,20 @@ The app runs at `http://localhost:3100` by default.
 cargo test --workspace
 ```
 
+### Adding a Migration
+
+Every schema change needs two files with the **same filename** — one in
+`apps/server/migrations/` (PostgreSQL) and one in `apps/server/migrations-sqlite/`
+(SQLite). sqlx keys applied migrations by the numeric version prefix, so a version
+reused by two files, or present in only one directory, breaks startup on a database
+that has already applied part of the pair. Check before you push:
+
+```bash
+scripts/check-migrations.sh
+```
+
+CI runs the same script and fails the build on any mismatch.
+
 ### E2E Tests
 
 ```bash
