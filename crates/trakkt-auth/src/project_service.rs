@@ -192,6 +192,24 @@ pub async fn get_project(
     Ok(row.map(ProjectRow::into_dto))
 }
 
+/// Build the sync payload for a change to one of a project's satellite tables
+/// (`project_members`, `project_updates`).
+///
+/// Neither is a synced entity type of its own, so those changes are reported as
+/// an update to the parent project and have to carry the project row — the
+/// shape the client's PROJECT arm deserializes. An entry with no payload is
+/// skipped outright by the client, on the live frame and on delta alike, so a
+/// project that cannot be read is an error rather than a payload-less write.
+async fn project_sync_payload(
+    db: &DbPool,
+    project_id: &str,
+) -> trakkt_core::Result<Option<serde_json::Value>> {
+    let project = get_project(db, project_id).await?.ok_or_else(|| {
+        trakkt_core::Error::NotFound(format!("project {project_id} not found"))
+    })?;
+    Ok(serde_json::to_value(&project).ok())
+}
+
 /// Parameters for creating a new project.
 pub struct CreateProjectParams<'a> {
     pub workspace_id: &'a str,
@@ -237,23 +255,9 @@ pub async fn create_project(
         params.target_date
     )?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
-        entity_types::PROJECT,
-        &project_id,
-        params.workspace_id,
-        None,
-        SyncActionType::Insert,
-        None,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for project create");
-        0
-    });
-
-    // Re-fetch to get DB-assigned timestamps.
+    // Re-fetch to get DB-assigned timestamps. This has to happen before the sync
+    // log write: both the stored entry and the live frame carry the full
+    // project, and the client cannot apply either without it.
     let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1");
     let row = trakkt_core::db_fetch_one!(
         db,
@@ -262,6 +266,23 @@ pub async fn create_project(
         &project_id
     )?;
     let project = row.into_dto();
+    let payload = serde_json::to_value(&project).ok();
+
+    // Sync log — best-effort.
+    let sync_id = sync_log_service::write_sync_entry(
+        db,
+        entity_types::PROJECT,
+        &project_id,
+        params.workspace_id,
+        None,
+        SyncActionType::Insert,
+        payload.clone(),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for project create");
+        0
+    });
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -271,7 +292,7 @@ pub async fn create_project(
             entity_types::PROJECT,
             &project_id,
             SyncActionType::Insert,
-            serde_json::to_value(&project).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -416,6 +437,7 @@ pub async fn update_project(
         params.project_id
     )?;
     let project = row.into_dto();
+    let payload = serde_json::to_value(&project).ok();
 
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
@@ -425,7 +447,7 @@ pub async fn update_project(
         &project.workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
@@ -441,7 +463,7 @@ pub async fn update_project(
             entity_types::PROJECT,
             params.project_id,
             SyncActionType::Update,
-            serde_json::to_value(&project).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -542,6 +564,10 @@ pub async fn add_project_member(
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
 
+    // Resolved before the insert so a missing project is a clean NotFound
+    // instead of a write with nothing to report.
+    let payload = project_sync_payload(db, project_id).await?;
+
     let sql = format!(
         "INSERT INTO project_members (project_id, user_id, role, created_at) \
          VALUES ($1, $2, $3, {now})"
@@ -549,23 +575,33 @@ pub async fn add_project_member(
     trakkt_core::db_execute!(db, &sql, project_id, user_id, role)?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT,
         project_id,
         workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for member add");
-    }
+        0
+    });
 
-    // WebSocket broadcast — notify that the project changed.
+    // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::PROJECT, workspace_id).await;
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::PROJECT,
+            project_id,
+            SyncActionType::Update,
+            payload,
+            sync_id,
+        )
+        .await;
     }
 
     Ok(())
@@ -592,24 +628,36 @@ pub async fn remove_project_member(
         )));
     }
 
+    let payload = project_sync_payload(db, project_id).await?;
+
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT,
         project_id,
         workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for member remove");
-    }
+        0
+    });
 
-    // WebSocket broadcast — notify that the project changed.
+    // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::PROJECT, workspace_id).await;
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::PROJECT,
+            project_id,
+            SyncActionType::Update,
+            payload,
+            sync_id,
+        )
+        .await;
     }
 
     Ok(())
@@ -947,19 +995,36 @@ pub async fn create_project_update(
         body
     )?;
 
+    let payload = project_sync_payload(db, project_id).await?;
+
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT,
         project_id,
         workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for project update");
+        0
+    });
+
+    // WebSocket broadcast — send full entity data as SyncResponse.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_types::PROJECT,
+            project_id,
+            SyncActionType::Update,
+            payload,
+            sync_id,
+        )
+        .await;
     }
 
     // Re-fetch to get DB-assigned timestamp.
@@ -970,14 +1035,7 @@ pub async fn create_project_update(
         &sql,
         &update_id
     )?;
-    let update = row.into_dto();
-
-    // WebSocket broadcast — notify that the project changed.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::PROJECT, workspace_id).await;
-    }
-
-    Ok(update)
+    Ok(row.into_dto())
 }
 
 /// Compute project progress from issue status categories.

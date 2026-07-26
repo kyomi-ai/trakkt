@@ -154,27 +154,9 @@ pub async fn create_status(
         params.color
     )?;
 
-    // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::STATUS,
-        &status_id,
-        params.workspace_id,
-        None,
-        SyncActionType::Insert,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, status_id = %status_id, "Failed to write sync log entry for status create");
-    }
-
-    // WebSocket broadcast — best-effort.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_notify(ws, entity_types::STATUS, params.workspace_id).await;
-    }
-
-    // Re-fetch to get the DB-assigned created_at.
+    // Re-fetch to get the DB-assigned created_at. This has to happen before the
+    // sync log write: both the stored entry and the live frame carry the full
+    // status, and the client cannot apply either without it.
     let row = trakkt_core::db_fetch_one!(
         db,
         StatusRow,
@@ -183,7 +165,40 @@ pub async fn create_status(
          FROM statuses WHERE status_id = $1",
         &status_id
     )?;
-    Ok(row.into_dto())
+    let status = row.into_dto();
+    let payload = serde_json::to_value(&status).ok();
+
+    // Sync log — best-effort.
+    let sync_id = sync_log_service::write_sync_entry(
+        db,
+        entity_types::STATUS,
+        &status_id,
+        params.workspace_id,
+        None,
+        SyncActionType::Insert,
+        payload.clone(),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, status_id = %status_id, "Failed to write sync log entry for status create");
+        0
+    });
+
+    // WebSocket broadcast — send full entity data as SyncResponse.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            params.workspace_id,
+            entity_types::STATUS,
+            &status_id,
+            SyncActionType::Insert,
+            payload,
+            sync_id,
+        )
+        .await;
+    }
+
+    Ok(status)
 }
 
 /// Get the first status in a given category for a workspace.
