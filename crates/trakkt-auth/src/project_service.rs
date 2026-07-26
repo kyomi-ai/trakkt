@@ -238,7 +238,7 @@ pub async fn create_project(
     )?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT,
         &project_id,
@@ -247,9 +247,10 @@ pub async fn create_project(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for project create");
-    }
+        0
+    });
 
     // Re-fetch to get DB-assigned timestamps.
     let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1");
@@ -270,6 +271,7 @@ pub async fn create_project(
             &project_id,
             SyncActionType::Insert,
             serde_json::to_value(&project).ok(),
+            sync_id,
         )
         .await;
     }
@@ -415,7 +417,7 @@ pub async fn update_project(
     let project = row.into_dto();
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT,
         params.project_id,
@@ -424,9 +426,10 @@ pub async fn update_project(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, project_id = %params.project_id, "Failed to write sync log entry for project update");
-    }
+        0
+    });
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -437,6 +440,7 @@ pub async fn update_project(
             params.project_id,
             SyncActionType::Update,
             serde_json::to_value(&project).ok(),
+            sync_id,
         )
         .await;
     }
@@ -473,7 +477,7 @@ pub async fn delete_project(
     )?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT,
         project_id,
@@ -482,9 +486,10 @@ pub async fn delete_project(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for project delete");
-    }
+        0
+    });
 
     // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
@@ -495,6 +500,7 @@ pub async fn delete_project(
             project_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }
@@ -677,7 +683,7 @@ pub async fn create_milestone(
     )?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT_MILESTONE,
         &milestone_id,
@@ -686,9 +692,10 @@ pub async fn create_milestone(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone create");
-    }
+        0
+    });
 
     // Re-fetch to get DB-assigned timestamp.
     let sql = format!("{MILESTONE_SELECT} WHERE milestone_id = $1");
@@ -709,6 +716,7 @@ pub async fn create_milestone(
             &milestone_id,
             SyncActionType::Insert,
             serde_json::to_value(&milestone).ok(),
+            sync_id,
         )
         .await;
     }
@@ -789,7 +797,7 @@ pub async fn update_milestone(
     }
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT_MILESTONE,
         milestone_id,
@@ -798,9 +806,10 @@ pub async fn update_milestone(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone update");
-    }
+        0
+    });
 
     // Re-fetch the updated milestone.
     let sql = format!("{MILESTONE_SELECT} WHERE milestone_id = $1");
@@ -821,6 +830,7 @@ pub async fn update_milestone(
             milestone_id,
             SyncActionType::Update,
             serde_json::to_value(&milestone).ok(),
+            sync_id,
         )
         .await;
     }
@@ -850,7 +860,7 @@ pub async fn delete_milestone(
     }
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::PROJECT_MILESTONE,
         milestone_id,
@@ -859,9 +869,10 @@ pub async fn delete_milestone(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone delete");
-    }
+        0
+    });
 
     // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
@@ -872,6 +883,7 @@ pub async fn delete_milestone(
             milestone_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }

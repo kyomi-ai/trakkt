@@ -184,7 +184,7 @@ pub async fn create_release(
         // Write sync_log + broadcast for each affected issue so clients see
         // the released_at update in real time.
         for issue_id in issue_ids {
-            if let Err(e) = sync_log_service::write_sync_entry(
+            let sync_id = sync_log_service::write_sync_entry(
                 db,
                 entity_types::ISSUE,
                 issue_id,
@@ -193,9 +193,10 @@ pub async fn create_release(
                 None,
             )
             .await
-            {
+            .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log for issue released_at");
-            }
+                0
+            });
 
             if let Some(ws) = ws_manager
                 && let Ok(Some(full_issue)) =
@@ -208,6 +209,7 @@ pub async fn create_release(
                     issue_id,
                     SyncActionType::Update,
                     serde_json::to_value(&full_issue).ok(),
+                    sync_id,
                 )
                 .await;
             }
@@ -215,7 +217,7 @@ pub async fn create_release(
     }
 
     // Sync log for the release entity — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::RELEASE,
         &release_id,
@@ -224,9 +226,10 @@ pub async fn create_release(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, release_id = %release_id, "Failed to write sync log entry for release create");
-    }
+        0
+    });
 
     // Re-fetch to get DB-assigned timestamps and issue count.
     let sql = format!(
@@ -249,6 +252,7 @@ pub async fn create_release(
             &release_id,
             SyncActionType::Insert,
             serde_json::to_value(&release).ok(),
+            sync_id,
         )
         .await;
     }

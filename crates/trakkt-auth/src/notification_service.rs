@@ -145,7 +145,7 @@ pub async fn create_notification(
     )?;
     let notification_data = notification.map(|r| r.into_dto());
 
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::NOTIFICATION,
         &notification_id,
@@ -154,9 +154,10 @@ pub async fn create_notification(
         notification_data.as_ref().and_then(|n| serde_json::to_value(n).ok()),
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, notification_id = %notification_id, "Failed to write sync log entry for notification create");
-    }
+        0
+    });
 
     // WebSocket broadcast with full entity data.
     if let Some(ws) = ws_manager {
@@ -167,6 +168,7 @@ pub async fn create_notification(
             &notification_id,
             SyncActionType::Insert,
             notification_data.and_then(|n| serde_json::to_value(&n).ok()),
+            sync_id,
         )
         .await;
     }
@@ -591,7 +593,7 @@ pub async fn get_or_default_preferences(
             delivery_channel: "in_app".to_string(),
         };
 
-        if let Err(e) = sync_log_service::write_sync_entry(
+        let sync_id = sync_log_service::write_sync_entry(
             db,
             entity_types::NOTIFICATION_PREFERENCES,
             &preference_id,
@@ -600,9 +602,10 @@ pub async fn get_or_default_preferences(
             serde_json::to_value(&prefs).ok(),
         )
         .await
-        {
+        .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "Failed to write sync log for notification preferences create");
-        }
+            0
+        });
 
         if let Some(ws) = ws_manager {
             sync_log_service::broadcast_sync_action(
@@ -612,6 +615,7 @@ pub async fn get_or_default_preferences(
                 &preference_id,
                 SyncActionType::Insert,
                 serde_json::to_value(&prefs).ok(),
+                sync_id,
             )
             .await;
         }
@@ -695,7 +699,7 @@ pub async fn update_preference(
     let updated = get_or_default_preferences(db, user_id, workspace_id, ws_manager).await?;
 
     // Sync log + broadcast for the update (best-effort).
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::NOTIFICATION_PREFERENCES,
         &updated.preference_id,
@@ -704,9 +708,10 @@ pub async fn update_preference(
         serde_json::to_value(&updated).ok(),
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "Failed to write sync log for notification preferences update");
-    }
+        0
+    });
 
     if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
@@ -716,6 +721,7 @@ pub async fn update_preference(
             &updated.preference_id,
             SyncActionType::Update,
             serde_json::to_value(&updated).ok(),
+            sync_id,
         )
         .await;
     }

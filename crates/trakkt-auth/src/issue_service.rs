@@ -315,7 +315,7 @@ pub async fn create_issue(
     }
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ISSUE,
         &issue_id,
@@ -324,9 +324,10 @@ pub async fn create_issue(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for issue create");
-    }
+        0
+    });
 
     // WebSocket broadcast — fetch full entity data and send as SyncResponse.
     if let Some(ws) = ws_manager
@@ -339,6 +340,7 @@ pub async fn create_issue(
             &issue_id,
             SyncActionType::Insert,
             serde_json::to_value(&full_issue).ok(),
+            sync_id,
         )
         .await;
     }
@@ -832,7 +834,7 @@ pub async fn update_issue(
     let issue = row.into_dto();
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ISSUE,
         &issue.issue_id,
@@ -841,9 +843,10 @@ pub async fn update_issue(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, issue_id = %issue.issue_id, "Failed to write sync log entry for issue update");
-    }
+        0
+    });
 
     // WebSocket broadcast — fetch full entity data and send as SyncResponse.
     if let Some(ws) = ws_manager
@@ -856,6 +859,7 @@ pub async fn update_issue(
             &issue.issue_id,
             SyncActionType::Update,
             serde_json::to_value(&full_issue).ok(),
+            sync_id,
         )
         .await;
     }
@@ -870,20 +874,32 @@ pub async fn update_issue(
                 for blocked_id in blocked_ids {
                     match get_issue_by_id(db, &blocked_id).await {
                         Ok(Some(blocked_issue)) => {
-                            if let Ok(data) = serde_json::to_value(&blocked_issue)
-                                && let Err(e) = sync_log_service::write_sync_entry(
+                            let data = match serde_json::to_value(&blocked_issue) {
+                                Ok(value) => Some(value),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, blocked_id = %blocked_id,
+                                        "Failed to serialize blocked issue for re-broadcast");
+                                    None
+                                }
+                            };
+
+                            let sync_id = match data.clone() {
+                                Some(value) => sync_log_service::write_sync_entry(
                                     db,
                                     entity_types::ISSUE,
                                     &blocked_id,
                                     workspace_id,
                                     SyncActionType::Update,
-                                    Some(data),
+                                    Some(value),
                                 )
                                 .await
-                            {
-                                tracing::warn!(error = %e, blocked_id = %blocked_id,
-                                    "Failed to write sync log entry for blocked issue re-broadcast");
-                            }
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!(error = %e, blocked_id = %blocked_id,
+                                        "Failed to write sync log entry for blocked issue re-broadcast");
+                                    0
+                                }),
+                                None => 0,
+                            };
 
                             sync_log_service::broadcast_sync_action(
                                 ws,
@@ -891,7 +907,8 @@ pub async fn update_issue(
                                 entity_types::ISSUE,
                                 &blocked_id,
                                 SyncActionType::Update,
-                                serde_json::to_value(&blocked_issue).ok(),
+                                data,
+                                sync_id,
                             )
                             .await;
                         }
@@ -1087,7 +1104,7 @@ pub async fn delete_issue(
     )?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ISSUE,
         &issue_id,
@@ -1096,9 +1113,10 @@ pub async fn delete_issue(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for issue delete");
-    }
+        0
+    });
 
     // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
@@ -1109,6 +1127,7 @@ pub async fn delete_issue(
             &issue_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }
@@ -1155,7 +1174,7 @@ pub async fn set_issue_labels(
     )?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ISSUE,
         issue_id,
@@ -1164,9 +1183,10 @@ pub async fn set_issue_labels(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for label update");
-    }
+        0
+    });
 
     // WebSocket broadcast — fetch full entity data with updated labels.
     if let Some(ws) = ws_manager
@@ -1179,6 +1199,7 @@ pub async fn set_issue_labels(
             issue_id,
             SyncActionType::Update,
             serde_json::to_value(&full_issue).ok(),
+            sync_id,
         )
         .await;
     }
@@ -1287,7 +1308,7 @@ pub async fn set_sort_order(
     })?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ISSUE,
         &issue_id,
@@ -1296,9 +1317,10 @@ pub async fn set_sort_order(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log entry for sort_order update");
-    }
+        0
+    });
 
     // WebSocket broadcast — fetch full entity data and send as SyncResponse.
     if let Some(ws) = ws_manager
@@ -1311,6 +1333,7 @@ pub async fn set_sort_order(
             &issue_id,
             SyncActionType::Update,
             serde_json::to_value(&full_issue).ok(),
+            sync_id,
         )
         .await;
     }

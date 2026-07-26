@@ -195,7 +195,10 @@ pub async fn create_team(
 
     // Sync log + broadcast happen after commit — these are best-effort and
     // should not roll back an otherwise-successful team creation.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    // The broadcast below carries the Insert entry's sync_id: it is the Insert
+    // frame, and a client that spots the gap re-fetches from there, which also
+    // picks up the member-add Update entry written just after it.
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
         &team_id,
@@ -204,9 +207,10 @@ pub async fn create_team(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team create");
-    }
+        0
+    });
 
     if params.creator_id.is_some()
         && let Err(e) = sync_log_service::write_sync_entry(
@@ -245,6 +249,7 @@ pub async fn create_team(
             &team_id,
             SyncActionType::Insert,
             serde_json::to_value(&team).ok(),
+            sync_id,
         )
         .await;
     }
@@ -488,7 +493,7 @@ pub async fn update_team(
         )));
     }
 
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
         team_id,
@@ -497,9 +502,10 @@ pub async fn update_team(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team update");
-    }
+        0
+    });
 
     let row = trakkt_core::db_fetch_one!(
         db,
@@ -522,6 +528,7 @@ pub async fn update_team(
             team_id,
             SyncActionType::Update,
             serde_json::to_value(&team).ok(),
+            sync_id,
         )
         .await;
     }
@@ -562,7 +569,7 @@ pub async fn update_team_icon(
         )));
     }
 
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
         team_id,
@@ -571,9 +578,10 @@ pub async fn update_team_icon(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon update");
-    }
+        0
+    });
 
     let row = trakkt_core::db_fetch_one!(
         db,
@@ -596,6 +604,7 @@ pub async fn update_team_icon(
             team_id,
             SyncActionType::Update,
             serde_json::to_value(&team).ok(),
+            sync_id,
         )
         .await;
     }
@@ -632,7 +641,7 @@ pub async fn upload_team_icon(
         )));
     }
 
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
         team_id,
@@ -641,9 +650,10 @@ pub async fn upload_team_icon(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon upload");
-    }
+        0
+    });
 
     let row = trakkt_core::db_fetch_one!(
         db,
@@ -666,6 +676,7 @@ pub async fn upload_team_icon(
             team_id,
             SyncActionType::Update,
             serde_json::to_value(&team).ok(),
+            sync_id,
         )
         .await;
     }
@@ -726,7 +737,7 @@ pub async fn delete_team_icon(
         )));
     }
 
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
         team_id,
@@ -735,9 +746,10 @@ pub async fn delete_team_icon(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon delete");
-    }
+        0
+    });
 
     let row = trakkt_core::db_fetch_one!(
         db,
@@ -760,6 +772,7 @@ pub async fn delete_team_icon(
             team_id,
             SyncActionType::Update,
             serde_json::to_value(&team).ok(),
+            sync_id,
         )
         .await;
     }
@@ -881,7 +894,7 @@ pub async fn delete_team(
             trakkt_core::db_execute!(db, &sql, target_team_id, &row.issue_id, &default_status.status_id)?;
 
             // Sync log for each moved issue — best-effort.
-            if let Err(e) = sync_log_service::write_sync_entry(
+            let sync_id = sync_log_service::write_sync_entry(
                 db,
                 entity_types::ISSUE,
                 &row.issue_id,
@@ -890,9 +903,10 @@ pub async fn delete_team(
                 None,
             )
             .await
-            {
+            .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, issue_id = %row.issue_id, "Failed to write sync log for issue reassignment");
-            }
+                0
+            });
 
             // Broadcast issue update
             if let Some(ws) = ws_manager {
@@ -903,6 +917,7 @@ pub async fn delete_team(
                     &row.issue_id,
                     SyncActionType::Update,
                     None,
+                    sync_id,
                 )
                 .await;
             }
@@ -930,7 +945,7 @@ pub async fn delete_team(
     }
 
     // 7. Sync log for team delete — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
         team_id,
@@ -939,9 +954,10 @@ pub async fn delete_team(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team delete");
-    }
+        0
+    });
 
     // Delete the team (cascades team_members, team-scoped labels, team-scoped statuses)
     trakkt_core::db_execute!(
@@ -959,6 +975,7 @@ pub async fn delete_team(
             team_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }
@@ -1149,7 +1166,7 @@ pub async fn update_team_settings(
             }
         };
 
-        if let Err(e) = sync_log_service::write_sync_entry(
+        let sync_id = sync_log_service::write_sync_entry(
             db,
             entity_types::TEAM,
             team_id,
@@ -1158,9 +1175,10 @@ pub async fn update_team_settings(
             team_data.clone(),
         )
         .await
-        {
+        .unwrap_or_else(|e| {
             tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team settings update");
-        }
+            0
+        });
 
         if let Some(ws) = ws_manager {
             sync_log_service::broadcast_sync_action(
@@ -1170,6 +1188,7 @@ pub async fn update_team_settings(
                 team_id,
                 SyncActionType::Update,
                 team_data,
+                sync_id,
             )
             .await;
         }

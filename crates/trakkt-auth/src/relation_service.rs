@@ -352,7 +352,7 @@ pub async fn create_relation(
     let relation = row.into_dto();
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ISSUE_RELATION,
         &relation.relation_id,
@@ -361,9 +361,10 @@ pub async fn create_relation(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, relation_id = %relation.relation_id, "Failed to write sync log for relation create");
-    }
+        0
+    });
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -374,6 +375,7 @@ pub async fn create_relation(
             &relation.relation_id,
             SyncActionType::Insert,
             serde_json::to_value(&relation).ok(),
+            sync_id,
         )
         .await;
     }
@@ -487,7 +489,7 @@ pub async fn delete_relation(
     }
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ISSUE_RELATION,
         relation_id,
@@ -496,9 +498,10 @@ pub async fn delete_relation(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, relation_id = %relation_id, "Failed to write sync log for relation delete");
-    }
+        0
+    });
 
     // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
@@ -509,6 +512,7 @@ pub async fn delete_relation(
             relation_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }

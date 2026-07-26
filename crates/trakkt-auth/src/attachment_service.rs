@@ -142,7 +142,7 @@ pub async fn create_attachment(
     )?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ATTACHMENT,
         &attachment_id,
@@ -151,9 +151,10 @@ pub async fn create_attachment(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, attachment_id = %attachment_id, "Failed to write sync log entry for attachment create");
-    }
+        0
+    });
 
     // Re-fetch to get the DB-assigned created_at.
     let row = trakkt_core::db_fetch_one!(
@@ -175,6 +176,7 @@ pub async fn create_attachment(
             &attachment_id,
             SyncActionType::Insert,
             serde_json::to_value(&attachment).ok(),
+            sync_id,
         )
         .await;
     }
@@ -247,7 +249,7 @@ pub async fn delete_attachment(
     )?;
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ATTACHMENT,
         attachment_id,
@@ -256,9 +258,10 @@ pub async fn delete_attachment(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, attachment_id = %attachment_id, "Failed to write sync log entry for attachment delete");
-    }
+        0
+    });
 
     // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
@@ -269,6 +272,7 @@ pub async fn delete_attachment(
             attachment_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }
@@ -320,7 +324,7 @@ pub async fn attach_to_issue(
     let entity_id = format!("{issue_id}:{attachment_id}");
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ISSUE_ATTACHMENT,
         &entity_id,
@@ -329,9 +333,10 @@ pub async fn attach_to_issue(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, %entity_id, "Failed to write sync log entry for issue attachment link");
-    }
+        0
+    });
 
     // WebSocket broadcast.
     if let Some(ws) = ws_manager {
@@ -342,6 +347,7 @@ pub async fn attach_to_issue(
             &entity_id,
             SyncActionType::Insert,
             None,
+            sync_id,
         )
         .await;
     }
@@ -378,7 +384,7 @@ pub async fn detach_from_issue(
     let entity_id = format!("{issue_id}:{attachment_id}");
 
     // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
+    let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::ISSUE_ATTACHMENT,
         &entity_id,
@@ -387,9 +393,10 @@ pub async fn detach_from_issue(
         None,
     )
     .await
-    {
+    .unwrap_or_else(|e| {
         tracing::warn!(error = %e, %entity_id, "Failed to write sync log entry for issue attachment unlink");
-    }
+        0
+    });
 
     // WebSocket broadcast.
     if let Some(ws) = ws_manager {
@@ -400,6 +407,7 @@ pub async fn detach_from_issue(
             &entity_id,
             SyncActionType::Delete,
             None,
+            sync_id,
         )
         .await;
     }

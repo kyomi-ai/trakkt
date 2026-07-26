@@ -315,6 +315,12 @@ pub async fn broadcast_sync_notify(
 /// This sends the exact same format as bootstrap/delta sync, so the client's
 /// `onmessage` handler can deserialize and apply it directly to the SyncStore.
 ///
+/// `sync_id` must be the id returned by the [`write_sync_entry`] call that
+/// recorded this same change, so a client that misses the live frame can spot
+/// the gap in the sequence and re-fetch it. Pass `0` when that write failed —
+/// `0` is never a real `sync_log` id and means "no sequence information for
+/// this frame".
+///
 /// Best-effort: failures are logged but never propagated.
 pub async fn broadcast_sync_action(
     ws_manager: &WebSocketManager,
@@ -323,11 +329,12 @@ pub async fn broadcast_sync_action(
     entity_id: &str,
     action: SyncActionType,
     data: Option<serde_json::Value>,
+    sync_id: i64,
 ) {
     use trakkt_types::sync::SyncResponse;
 
     let sync_action = SyncAction {
-        sync_id: 0,
+        sync_id,
         entity_type: entity_type.to_string(),
         entity_id: entity_id.to_string(),
         workspace_id: workspace_id.to_string(),
@@ -353,6 +360,94 @@ pub async fn broadcast_sync_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trakkt_types::sync::{entity_types, SyncResponse};
+
+    /// A single-instance manager over a workspace with one member.
+    /// `broadcast_raw_to_workspace` resolves recipients from `workspace_users`,
+    /// so the rows have to exist for the frame to be delivered anywhere.
+    async fn broadcast_fixture(user_id: &str, workspace_id: &str) -> WebSocketManager {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+
+        db_execute!(
+            &db,
+            "INSERT INTO users (user_id, email) VALUES ($1, $2)",
+            user_id,
+            format!("{user_id}@example.test")
+        )
+        .expect("insert user");
+        db_execute!(
+            &db,
+            "INSERT INTO workspaces (workspace_id, owner_user_id) VALUES ($1, $2)",
+            workspace_id,
+            user_id
+        )
+        .expect("insert workspace");
+        db_execute!(
+            &db,
+            "INSERT INTO workspace_users (workspace_id, user_id) VALUES ($1, $2)",
+            workspace_id,
+            user_id
+        )
+        .expect("insert workspace membership");
+
+        WebSocketManager::new(None, db)
+    }
+
+    /// Broadcast one action and return the `SyncAction` the client actually
+    /// received off the wire.
+    async fn broadcast_and_receive(sync_id: i64) -> SyncAction {
+        let user_id = "usr_sync_id_probe";
+        let workspace_id = "ws_sync_id_probe";
+        let manager = broadcast_fixture(user_id, workspace_id).await;
+
+        let mut conn = manager.connect(user_id).expect("connection");
+        // Discard the connect heartbeat.
+        conn.rx.recv().await.expect("heartbeat frame");
+
+        broadcast_sync_action(
+            &manager,
+            workspace_id,
+            entity_types::ISSUE,
+            "iss_probe",
+            SyncActionType::Update,
+            None,
+            sync_id,
+        )
+        .await;
+
+        let frame = conn.rx.recv().await.expect("broadcast frame");
+        match serde_json::from_str::<SyncResponse>(&frame)
+            .expect("broadcast frame is a SyncResponse")
+        {
+            SyncResponse::SyncAction(action) => action,
+            other => panic!("expected a sync_action frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_carries_the_supplied_sync_id() {
+        let action = broadcast_and_receive(4242).await;
+
+        assert_eq!(
+            action.sync_id, 4242,
+            "the live frame must carry the sync_log id of the change it reports"
+        );
+        assert_eq!(action.entity_type, entity_types::ISSUE);
+        assert_eq!(action.entity_id, "iss_probe");
+        assert_eq!(action.workspace_id, "ws_sync_id_probe");
+    }
+
+    #[tokio::test]
+    async fn broadcast_carries_zero_when_the_sync_entry_was_not_written() {
+        let action = broadcast_and_receive(0).await;
+
+        assert_eq!(
+            action.sync_id, 0,
+            "0 means the change has no sequence information"
+        );
+    }
 
     #[test]
     fn test_action_type_to_str_roundtrip() {
