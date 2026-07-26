@@ -59,6 +59,19 @@ impl TeamRow {
     }
 }
 
+/// Base SELECT for single-team reads.
+///
+/// `member_count` is not computed here — only the list queries join
+/// `team_members` to count it. Every single-team read has always reported 0,
+/// and the sync payloads built from these reads carry that same 0.
+const TEAM_SELECT: &str = "\
+    SELECT team_id, workspace_id, name, key, description, icon, \
+           icon_type, icon_name, icon_color, \
+           CAST(0 AS BIGINT) AS member_count, \
+           CAST(settings AS TEXT) AS settings, \
+           CAST(created_at AS TEXT) AS created_at \
+    FROM teams";
+
 /// Internal row type for deserialising `team_members` JOIN query results.
 #[derive(sqlx::FromRow)]
 struct TeamMemberRow {
@@ -193,6 +206,14 @@ pub async fn create_team(
         }
     }
 
+    // Re-fetch to get the DB-assigned created_at. This has to happen before the
+    // sync log writes: both stored entries and the live frame carry the full
+    // team, and the client cannot apply any of them without it.
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1");
+    let row = trakkt_core::db_fetch_one!(db, TeamRow, &sql, &team_id)?;
+    let team = row.into_dto();
+    let payload = serde_json::to_value(&team).ok();
+
     // Sync log + broadcast happen after commit — these are best-effort and
     // should not roll back an otherwise-successful team creation.
     // The broadcast below carries the Insert entry's sync_id: it is the Insert
@@ -205,7 +226,7 @@ pub async fn create_team(
         params.workspace_id,
         None,
         SyncActionType::Insert,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
@@ -221,26 +242,12 @@ pub async fn create_team(
             params.workspace_id,
             None,
             SyncActionType::Update,
-            None,
+            payload.clone(),
         )
         .await
     {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team member add");
     }
-
-    // Re-fetch to get the DB-assigned created_at.
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                CAST(settings AS TEXT) AS settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        &team_id
-    )?;
-    let team = row.into_dto();
 
     // WebSocket broadcast — send full entity data so clients update immediately.
     if let Some(ws) = ws_manager {
@@ -250,7 +257,7 @@ pub async fn create_team(
             entity_types::TEAM,
             &team_id,
             SyncActionType::Insert,
-            serde_json::to_value(&team).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -347,17 +354,8 @@ pub async fn get_team(
     db: &DbPool,
     team_id: &str,
 ) -> trakkt_core::Result<Option<Team>> {
-    let row = trakkt_core::db_fetch_optional!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                CAST(settings AS TEXT) AS settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1");
+    let row = trakkt_core::db_fetch_optional!(db, TeamRow, &sql, team_id)?;
     Ok(row.map(TeamRow::into_dto))
 }
 
@@ -367,18 +365,8 @@ pub async fn get_team_by_key(
     workspace_id: &str,
     key: &str,
 ) -> trakkt_core::Result<Option<Team>> {
-    let row = trakkt_core::db_fetch_optional!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                CAST(settings AS TEXT) AS settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE workspace_id = $1 AND key = $2",
-        workspace_id,
-        key
-    )?;
+    let sql = format!("{TEAM_SELECT} WHERE workspace_id = $1 AND key = $2");
+    let row = trakkt_core::db_fetch_optional!(db, TeamRow, &sql, workspace_id, key)?;
     Ok(row.map(TeamRow::into_dto))
 }
 
@@ -389,17 +377,8 @@ pub async fn get_default_team(
     db: &DbPool,
     workspace_id: &str,
 ) -> trakkt_core::Result<Team> {
-    let row = trakkt_core::db_fetch_optional!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                CAST(settings AS TEXT) AS settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1",
-        workspace_id
-    )?;
+    let sql = format!("{TEAM_SELECT} WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1");
+    let row = trakkt_core::db_fetch_optional!(db, TeamRow, &sql, workspace_id)?;
     match row {
         Some(r) => Ok(r.into_dto()),
         None => Err(trakkt_core::Error::NotFound(format!(
@@ -495,6 +474,13 @@ pub async fn update_team(
         )));
     }
 
+    // Read the updated row before the sync log write: both the stored entry and
+    // the live frame carry the full team, and the client skips either without it.
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1");
+    let row = trakkt_core::db_fetch_one!(db, TeamRow, &sql, team_id)?;
+    let team = row.into_dto();
+    let payload = serde_json::to_value(&team).ok();
+
     let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
@@ -502,26 +488,13 @@ pub async fn update_team(
         workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team update");
         0
     });
-
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                CAST(settings AS TEXT) AS settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
-    let team = row.into_dto();
 
     if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
@@ -530,7 +503,7 @@ pub async fn update_team(
             entity_types::TEAM,
             team_id,
             SyncActionType::Update,
-            serde_json::to_value(&team).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -572,6 +545,12 @@ pub async fn update_team_icon(
         )));
     }
 
+    // Read the updated row before the sync log write — see `update_team`.
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1");
+    let row = trakkt_core::db_fetch_one!(db, TeamRow, &sql, team_id)?;
+    let team = row.into_dto();
+    let payload = serde_json::to_value(&team).ok();
+
     let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
@@ -579,26 +558,13 @@ pub async fn update_team_icon(
         workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon update");
         0
     });
-
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                CAST(settings AS TEXT) AS settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
-    let team = row.into_dto();
 
     if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
@@ -607,7 +573,7 @@ pub async fn update_team_icon(
             entity_types::TEAM,
             team_id,
             SyncActionType::Update,
-            serde_json::to_value(&team).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -645,6 +611,12 @@ pub async fn upload_team_icon(
         )));
     }
 
+    // Read the updated row before the sync log write — see `update_team`.
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1");
+    let row = trakkt_core::db_fetch_one!(db, TeamRow, &sql, team_id)?;
+    let team = row.into_dto();
+    let payload = serde_json::to_value(&team).ok();
+
     let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
@@ -652,26 +624,13 @@ pub async fn upload_team_icon(
         workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon upload");
         0
     });
-
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                CAST(settings AS TEXT) AS settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
-    let team = row.into_dto();
 
     if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
@@ -680,7 +639,7 @@ pub async fn upload_team_icon(
             entity_types::TEAM,
             team_id,
             SyncActionType::Update,
-            serde_json::to_value(&team).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -742,6 +701,12 @@ pub async fn delete_team_icon(
         )));
     }
 
+    // Read the updated row before the sync log write — see `update_team`.
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1");
+    let row = trakkt_core::db_fetch_one!(db, TeamRow, &sql, team_id)?;
+    let team = row.into_dto();
+    let payload = serde_json::to_value(&team).ok();
+
     let sync_id = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
@@ -749,26 +714,13 @@ pub async fn delete_team_icon(
         workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon delete");
         0
     });
-
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                CAST(settings AS TEXT) AS settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
-    let team = row.into_dto();
 
     if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
@@ -777,7 +729,7 @@ pub async fn delete_team_icon(
             entity_types::TEAM,
             team_id,
             SyncActionType::Update,
-            serde_json::to_value(&team).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -899,6 +851,11 @@ pub async fn delete_team(
             );
             trakkt_core::db_execute!(db, &sql, target_team_id, &row.issue_id, &default_status.status_id)?;
 
+            // Read the issue back before the sync log write. The reassignment
+            // changed its team, number and status, and none of that reaches a
+            // client without the payload — on the live frame or on delta.
+            let payload = crate::issue_service::issue_sync_payload(db, &row.issue_id).await?;
+
             // Sync log for each moved issue — best-effort.
             let sync_id = sync_log_service::write_sync_entry(
                 db,
@@ -907,7 +864,7 @@ pub async fn delete_team(
                 workspace_id,
                 None,
                 SyncActionType::Update,
-                None,
+                payload.clone(),
             )
             .await
             .unwrap_or_else(|e| {
@@ -923,7 +880,7 @@ pub async fn delete_team(
                     entity_types::ISSUE,
                     &row.issue_id,
                     SyncActionType::Update,
-                    None,
+                    payload,
                     sync_id,
                 )
                 .await;
@@ -1012,6 +969,70 @@ pub async fn list_team_members(
     Ok(rows.into_iter().map(TeamMemberRow::into_dto).collect())
 }
 
+/// Record a team membership change on the sync log.
+///
+/// `team_members` is not a synced entity type of its own, so a membership change
+/// is reported as an update to the parent team and has to carry the team row —
+/// the shape the client's TEAM arm deserializes. An entry with no payload is
+/// skipped outright by the client on both the live and the delta path, so if the
+/// team cannot be read there is nothing worth writing.
+///
+/// `team_id` reaches these functions straight from the caller, so a team that is
+/// already gone simply leaves nothing to report. That matches the no-op the
+/// membership write itself performed and is not promoted to an error, which is
+/// why this returns nothing: like the sync write it replaces, it is best-effort.
+///
+/// In practice only the remove and role-update paths can reach that branch: an
+/// insert against a missing team fails on the `team_members.team_id` foreign key
+/// long before it gets here.
+///
+/// Note the payload cannot express *what* changed. `Team` carries no member
+/// list, and its `member_count` is reported as 0 by every single-team read. A
+/// client applying this entry learns that the team changed, not how — the same
+/// gap TRA-9940 records for project members.
+async fn write_membership_sync_entry(
+    db: &DbPool,
+    team_id: &str,
+    user_id: &str,
+    workspace_id: &str,
+    operation: &str,
+) {
+    let team = match get_team(db, team_id).await {
+        Ok(Some(team)) => team,
+        Ok(None) => {
+            tracing::warn!(
+                team_id, user_id, operation,
+                "Team not found — no sync log entry written for membership change"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e, team_id, user_id, operation,
+                "Failed to read team — no sync log entry written for membership change"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = sync_log_service::write_sync_entry(
+        db,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        None,
+        SyncActionType::Update,
+        serde_json::to_value(&team).ok(),
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %e, team_id, user_id, operation,
+            "Failed to write sync log for team membership change"
+        );
+    }
+}
+
 /// Add a user to a team. No-op if the user is already a member.
 pub async fn add_team_member(
     db: &DbPool,
@@ -1037,19 +1058,7 @@ pub async fn add_team_member(
     };
     trakkt_core::db_execute!(db, &sql, team_id, user_id, role)?;
 
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        None,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to write sync log for team member add");
-    }
+    write_membership_sync_entry(db, team_id, user_id, workspace_id, "member add").await;
 
     Ok(())
 }
@@ -1068,19 +1077,7 @@ pub async fn remove_team_member(
         user_id
     )?;
 
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        None,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to write sync log for team member remove");
-    }
+    write_membership_sync_entry(db, team_id, user_id, workspace_id, "member remove").await;
 
     Ok(())
 }
@@ -1101,19 +1098,7 @@ pub async fn update_team_member_role(
         user_id
     )?;
 
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        None,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to write sync log for team member role update");
-    }
+    write_membership_sync_entry(db, team_id, user_id, workspace_id, "member role update").await;
 
     Ok(())
 }

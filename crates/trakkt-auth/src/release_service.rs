@@ -184,6 +184,25 @@ pub async fn create_release(
         // Write sync_log + broadcast for each affected issue so clients see
         // the released_at update in real time.
         for issue_id in issue_ids {
+            // Read the issue back before the sync log write so the stored entry
+            // carries the new `released_at`; without a payload the client skips
+            // the row on reconnect and the stamp never arrives.
+            //
+            // Unlike the issue service's own write sites, `issue_ids` comes from
+            // the caller, so an id may have been deleted since it was resolved.
+            // That must not abort a release whose rows are already committed —
+            // there is simply no entity left to report, so the entry is skipped.
+            let Some(full_issue) =
+                crate::issue_service::get_issue_by_id(db, issue_id).await?
+            else {
+                tracing::warn!(
+                    issue_id = %issue_id,
+                    "Issue disappeared before its released_at could be synced -- skipping"
+                );
+                continue;
+            };
+            let payload = serde_json::to_value(&full_issue).ok();
+
             let sync_id = sync_log_service::write_sync_entry(
                 db,
                 entity_types::ISSUE,
@@ -191,7 +210,7 @@ pub async fn create_release(
                 workspace_id,
                 None,
                 SyncActionType::Update,
-                None,
+                payload.clone(),
             )
             .await
             .unwrap_or_else(|e| {
@@ -199,17 +218,14 @@ pub async fn create_release(
                 0
             });
 
-            if let Some(ws) = ws_manager
-                && let Ok(Some(full_issue)) =
-                    crate::issue_service::get_issue_by_id(db, issue_id).await
-            {
+            if let Some(ws) = ws_manager {
                 sync_log_service::broadcast_sync_action(
                     ws,
                     workspace_id,
                     entity_types::ISSUE,
                     issue_id,
                     SyncActionType::Update,
-                    serde_json::to_value(&full_issue).ok(),
+                    payload,
                     sync_id,
                 )
                 .await;

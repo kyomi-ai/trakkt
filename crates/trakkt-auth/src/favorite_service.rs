@@ -117,6 +117,7 @@ pub async fn add_favorite(
         target_id
     )?;
     let favorite = row.into_dto();
+    let payload = serde_json::to_value(&favorite).ok();
 
     // Sync log — best-effort. A favorite is private to the user who pinned it
     // (`list_favorites` filters on `user_id`), so scope the row to them.
@@ -127,7 +128,7 @@ pub async fn add_favorite(
         workspace_id,
         Some(user_id),
         SyncActionType::Insert,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
@@ -144,7 +145,7 @@ pub async fn add_favorite(
             entity_types::FAVORITE,
             &favorite.favorite_id,
             SyncActionType::Insert,
-            serde_json::to_value(&favorite).ok(),
+            payload,
             sync_id,
         )
         .await;

@@ -314,6 +314,11 @@ pub async fn create_issue(
         )?;
     }
 
+    // Read the issue back with its details before the sync log write: both the
+    // stored entry and the live frame carry the full issue, and the client
+    // cannot apply either without it.
+    let payload = issue_sync_payload(db, &issue_id).await?;
+
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
         db,
@@ -322,7 +327,7 @@ pub async fn create_issue(
         &params.workspace_id,
         None,
         SyncActionType::Insert,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
@@ -330,17 +335,15 @@ pub async fn create_issue(
         0
     });
 
-    // WebSocket broadcast — fetch full entity data and send as SyncResponse.
-    if let Some(ws) = ws_manager
-        && let Ok(Some(full_issue)) = get_issue_by_id(db, &issue_id).await
-    {
+    // WebSocket broadcast — send full entity data as SyncResponse.
+    if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
             ws,
             &params.workspace_id,
             entity_types::ISSUE,
             &issue_id,
             SyncActionType::Insert,
-            serde_json::to_value(&full_issue).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -396,6 +399,27 @@ pub async fn get_issue_by_id(
         }
         None => Ok(None),
     }
+}
+
+/// Build the sync payload for a change to `issue_id`.
+///
+/// The client's ISSUE arm deserializes an `IssueWithDetails`, so the payload has
+/// to be the joined detail row — the bare `issues` row is missing `team_key`,
+/// the status fields and the labels, and would fail to deserialize. An entry
+/// with no payload is skipped outright by the client, on the live frame and on
+/// delta alike, so an issue that cannot be read is an error rather than a
+/// payload-less write.
+///
+/// Callers must have already established that the issue exists; every call site
+/// either just inserted it or just updated it under a `rows_affected` check.
+pub(crate) async fn issue_sync_payload(
+    db: &DbPool,
+    issue_id: &str,
+) -> trakkt_core::Result<Option<serde_json::Value>> {
+    let issue = get_issue_by_id(db, issue_id)
+        .await?
+        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue {issue_id} not found")))?;
+    Ok(serde_json::to_value(&issue).ok())
 }
 
 /// Get a single issue by team key + number (e.g. "ENG-42"), with full details.
@@ -834,6 +858,10 @@ pub async fn update_issue(
     )?;
     let issue = row.into_dto();
 
+    // Built before the sync log write so the stored entry and the live frame
+    // carry the same full issue; without it the client skips both.
+    let payload = issue_sync_payload(db, &issue.issue_id).await?;
+
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
         db,
@@ -842,7 +870,7 @@ pub async fn update_issue(
         workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
@@ -850,17 +878,15 @@ pub async fn update_issue(
         0
     });
 
-    // WebSocket broadcast — fetch full entity data and send as SyncResponse.
-    if let Some(ws) = ws_manager
-        && let Ok(Some(full_issue)) = get_issue_by_id(db, &issue.issue_id).await
-    {
+    // WebSocket broadcast — send full entity data as SyncResponse.
+    if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
             ws,
             workspace_id,
             entity_types::ISSUE,
             &issue.issue_id,
             SyncActionType::Update,
-            serde_json::to_value(&full_issue).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -1177,6 +1203,10 @@ pub async fn set_issue_labels(
         issue_id
     )?;
 
+    // Read the issue back with its new labels before the sync log write — the
+    // relabelling is only visible to the client through this payload.
+    let payload = issue_sync_payload(db, issue_id).await?;
+
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
         db,
@@ -1185,7 +1215,7 @@ pub async fn set_issue_labels(
         &ws_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
@@ -1193,17 +1223,15 @@ pub async fn set_issue_labels(
         0
     });
 
-    // WebSocket broadcast — fetch full entity data with updated labels.
-    if let Some(ws) = ws_manager
-        && let Ok(Some(full_issue)) = get_issue_by_id(db, issue_id).await
-    {
+    // WebSocket broadcast — send full entity data with updated labels.
+    if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
             ws,
             &ws_id,
             entity_types::ISSUE,
             issue_id,
             SyncActionType::Update,
-            serde_json::to_value(&full_issue).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -1312,6 +1340,10 @@ pub async fn set_sort_order(
             .map(|_| ())
     })?;
 
+    // Built before the sync log write — the new sort_order only reaches the
+    // client through this payload.
+    let payload = issue_sync_payload(db, &issue_id).await?;
+
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
         db,
@@ -1320,7 +1352,7 @@ pub async fn set_sort_order(
         workspace_id,
         None,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
@@ -1328,17 +1360,15 @@ pub async fn set_sort_order(
         0
     });
 
-    // WebSocket broadcast — fetch full entity data and send as SyncResponse.
-    if let Some(ws) = ws_manager
-        && let Ok(Some(full_issue)) = get_issue_by_id(db, &issue_id).await
-    {
+    // WebSocket broadcast — send full entity data as SyncResponse.
+    if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
             ws,
             workspace_id,
             entity_types::ISSUE,
             &issue_id,
             SyncActionType::Update,
-            serde_json::to_value(&full_issue).ok(),
+            payload,
             sync_id,
         )
         .await;
