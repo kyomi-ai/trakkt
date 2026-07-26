@@ -436,7 +436,9 @@ fn sync_action_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trakkt_types::models::{Project, Status};
+    use trakkt_types::models::{
+        Favorite, IssueWithDetails, Label, Project, Status, Team, View,
+    };
     use trakkt_types::sync::{entity_types, SyncResponse};
 
     /// A single-instance manager over a workspace with one member.
@@ -1501,6 +1503,453 @@ mod tests {
             projects, 4,
             "one project create plus three updates: member add, member remove, \
              and the posted project update"
+        );
+    }
+    // ─── Delta payloads for the remaining services (TRA-9939) ────────────────
+    //
+    // Every test below runs with **no `ws_manager` at all**. That is the point:
+    // these paths already broadcast a full payload on the live frame, so a test
+    // holding a connection would pass while the stored `sync_log` row stayed
+    // empty. Reading the delta back is the only way to prove what a client that
+    // missed the broadcast actually receives on reconnect.
+
+    /// Every Insert/Update entry of `entity_type` in `user_id`'s delta-from-zero
+    /// stream, deserialized into the model type the client uses for it.
+    ///
+    /// Panics on the first row with no payload: the client skips a data-less
+    /// insert or update outright (`cache/apply.rs:47-53`), so such a row is a
+    /// change that never arrives on reconnect. Deserializing rather than just
+    /// checking for presence is what catches a payload of the wrong shape — a
+    /// bare `Issue` where the client expects an `IssueWithDetails`, say.
+    async fn delta_payloads<T: serde::de::DeserializeOwned>(
+        db: &DbPool,
+        user_id: &str,
+        entity_type: &str,
+    ) -> Vec<T> {
+        get_entries_since(db, WS, user_id, 0, 10_000)
+            .await
+            .expect("delta entries")
+            .into_iter()
+            .filter(|e| e.entity_type == entity_type)
+            .filter(|e| !matches!(e.action, SyncActionType::Delete))
+            .map(|entry| {
+                let data = entry.data.clone().unwrap_or_else(|| {
+                    panic!(
+                        "delta row {} ({} {:?}) has no payload — the client skips \
+                         insert/update rows without one, so the change never \
+                         arrives on reconnect either: {entry:?}",
+                        entry.sync_id, entry.entity_type, entry.action
+                    )
+                });
+                serde_json::from_value(data).unwrap_or_else(|e| {
+                    panic!(
+                        "delta row {} does not deserialize into the model the \
+                         client applies for {}: {e} — {entry:?}",
+                        entry.sync_id, entry.entity_type
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// `create_issue` and `delete_team` both resolve a workspace-scoped backlog
+    /// status; the fixture's only status is team-scoped.
+    async fn add_workspace_backlog_status(db: &DbPool) {
+        db_execute!(
+            db,
+            "INSERT INTO statuses (status_id, workspace_id, team_id, name, category, position) \
+             VALUES ($1, $2, NULL, $3, $4, $5)",
+            "sts_ws_backlog",
+            WS,
+            "Backlog",
+            "backlog",
+            0_i32
+        )
+        .expect("insert workspace-scoped backlog status");
+    }
+
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_label_write() {
+        let db = two_user_workspace().await;
+
+        let created = crate::label_service::create_label(
+            &db, WS, "Bug", "#DC2626", Some("team_vis"), None,
+        )
+        .await
+        .expect("create label");
+        let updated =
+            crate::label_service::update_label(&db, &created.label_id, "Defect", "#B91C1C", None)
+                .await
+                .expect("update label");
+
+        let payloads: Vec<Label> = delta_payloads(&db, USER_B, entity_types::LABEL).await;
+
+        assert_eq!(payloads.len(), 2, "one label create plus one label update");
+        assert_eq!(payloads[0], created);
+        assert!(
+            !payloads[0].created_at.is_empty(),
+            "the payload is built from the re-fetch, so the DB-assigned \
+             created_at has to be in it"
+        );
+        assert_eq!(payloads[1], updated);
+        assert_eq!(
+            payloads[1].name, "Defect",
+            "the update row must carry the new value, not the row as it was before"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_view_write() {
+        let db = two_user_workspace().await;
+
+        let created = crate::view_service::create_view(
+            &db,
+            &crate::view_service::CreateViewParams {
+                workspace_id: WS,
+                user_id: USER_A,
+                name: "My work",
+                icon: None,
+                filters: "{}",
+                display_options: "{}",
+                is_shared: true,
+                team_id: Some("team_vis"),
+                position: 3,
+            },
+            None,
+        )
+        .await
+        .expect("create view");
+
+        let updated = crate::view_service::update_view(
+            &db,
+            &crate::view_service::UpdateViewParams {
+                view_id: &created.view_id,
+                name: Some("Everyone's work"),
+                icon: None,
+                filters: None,
+                display_options: None,
+                is_shared: None,
+                sort_order: None,
+                team_id: None,
+                position: None,
+            },
+            None,
+        )
+        .await
+        .expect("update view");
+
+        let payloads: Vec<View> = delta_payloads(&db, USER_A, entity_types::VIEW).await;
+
+        assert_eq!(payloads.len(), 2, "one view create plus one view update");
+        assert_eq!(payloads[0], created);
+        assert!(
+            !payloads[0].created_at.is_empty() && !payloads[0].updated_at.is_empty(),
+            "the DB-assigned timestamps have to be in the payload"
+        );
+        assert_eq!(payloads[1], updated);
+        assert_eq!(payloads[1].name, "Everyone's work");
+    }
+
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_favorite_write() {
+        let db = two_user_workspace().await;
+
+        let favorite =
+            crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
+                .await
+                .expect("A favorites the issue");
+
+        // A favorite is scoped to its owner, so it is A's delta that carries it.
+        let payloads: Vec<Favorite> = delta_payloads(&db, USER_A, entity_types::FAVORITE).await;
+
+        assert_eq!(payloads.len(), 1, "one favorite add");
+        assert_eq!(payloads[0], favorite);
+        assert_eq!(payloads[0].user_id, USER_A);
+    }
+
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_issue_write() {
+        let db = two_user_workspace().await;
+        add_workspace_backlog_status(&db).await;
+
+        let label = crate::label_service::create_label(
+            &db, WS, "Bug", "#DC2626", Some("team_vis"), None,
+        )
+        .await
+        .expect("create label");
+
+        let created = crate::issue_service::create_issue(
+            &db,
+            &trakkt_types::models::CreateIssueParams {
+                workspace_id: WS.to_string(),
+                team_id: "team_vis".to_string(),
+                creator_id: USER_A.to_string(),
+                title: "Sync me".to_string(),
+                description: None,
+                priority: 2,
+                assignee_id: None,
+                due_date: None,
+                label_ids: Vec::new(),
+                project_id: None,
+                milestone_id: None,
+                estimate: None,
+            },
+            None,
+        )
+        .await
+        .expect("create issue");
+
+        crate::issue_service::update_issue(
+            &db,
+            WS,
+            "VIS",
+            created.number,
+            &trakkt_types::models::IssueUpdate {
+                title: Some("Sync me properly".to_string()),
+                ..Default::default()
+            },
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("update issue");
+
+        crate::issue_service::set_issue_labels(
+            &db,
+            &created.issue_id,
+            std::slice::from_ref(&label.label_id),
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("set issue labels");
+
+        crate::issue_service::set_sort_order(&db, WS, "VIS", created.number, 12.5, None)
+            .await
+            .expect("set sort order");
+
+        let payloads: Vec<IssueWithDetails> =
+            delta_payloads(&db, USER_B, entity_types::ISSUE).await;
+
+        assert_eq!(
+            payloads.len(),
+            4,
+            "one issue create plus three updates: title, labels and sort order"
+        );
+        for payload in &payloads {
+            assert_eq!(payload.issue_id, created.issue_id);
+            assert_eq!(
+                payload.team_key, "VIS",
+                "the client deserializes an IssueWithDetails, so the joined \
+                 team_key has to be in every payload"
+            );
+            assert!(!payload.created_at.is_empty());
+        }
+        assert_eq!(payloads[0].title, "Sync me");
+        assert_eq!(
+            payloads[1].title, "Sync me properly",
+            "the update row must carry the new title"
+        );
+        assert_eq!(
+            payloads[2].labels,
+            vec![label],
+            "the relabelling only reaches a client through this payload"
+        );
+        assert_eq!(
+            payloads[3].sort_order,
+            Some(12.5),
+            "the new sort order only reaches a client through this payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_release_write() {
+        let db = two_user_workspace().await;
+
+        let release = crate::release_service::create_release(
+            &db,
+            WS,
+            "VIS",
+            "v1.0.0",
+            None,
+            Some("First cut"),
+            None,
+            &["iss_vis".to_string()],
+            USER_A,
+            None,
+        )
+        .await
+        .expect("create release");
+        assert_eq!(release.tag_name, "v1.0.0");
+
+        let payloads: Vec<IssueWithDetails> =
+            delta_payloads(&db, USER_B, entity_types::ISSUE).await;
+
+        assert_eq!(payloads.len(), 1, "one issue stamped with released_at");
+        assert_eq!(payloads[0].issue_id, "iss_vis");
+        assert!(
+            payloads[0].released_at.is_some(),
+            "the payload is read back after the stamp, so it has to carry the \
+             released_at the release just wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_team_write() {
+        let db = two_user_workspace().await;
+        add_workspace_backlog_status(&db).await;
+
+        let team = crate::team_service::create_team(
+            &db,
+            &crate::team_service::CreateTeamParams {
+                workspace_id: WS,
+                name: "Syncing",
+                key: "SYNC",
+                description: None,
+                icon: None,
+                creator_id: Some(USER_A),
+            },
+            None,
+        )
+        .await
+        .expect("create team");
+
+        let renamed = crate::team_service::update_team(
+            &db,
+            &team.team_id,
+            WS,
+            Some("Syncing Well".to_string()),
+            None,
+            None,
+        )
+        .await
+        .expect("update team");
+
+        crate::team_service::update_team_icon(
+            &db,
+            &team.team_id,
+            WS,
+            Some("preset"),
+            Some("rocket"),
+            Some("#0D9488"),
+            None,
+        )
+        .await
+        .expect("update team icon");
+        crate::team_service::upload_team_icon(&db, &team.team_id, WS, b"png-bytes", "image/png", None)
+            .await
+            .expect("upload team icon");
+        crate::team_service::delete_team_icon(&db, &team.team_id, WS, None)
+            .await
+            .expect("delete team icon");
+
+        crate::team_service::add_team_member(&db, &team.team_id, USER_B, "member", WS)
+            .await
+            .expect("add team member");
+        crate::team_service::update_team_member_role(&db, &team.team_id, USER_B, "lead", WS)
+            .await
+            .expect("update team member role");
+        crate::team_service::remove_team_member(&db, &team.team_id, USER_B, WS)
+            .await
+            .expect("remove team member");
+
+        let payloads: Vec<Team> = delta_payloads(&db, USER_B, entity_types::TEAM).await;
+
+        assert_eq!(
+            payloads.len(),
+            9,
+            "a create writes both an Insert and the creator's member-add Update, \
+             then one Update each for rename, icon set, icon upload, icon clear, \
+             member add, member role change and member remove"
+        );
+        for payload in &payloads {
+            assert_eq!(payload.team_id, team.team_id);
+            assert!(
+                !payload.created_at.is_empty(),
+                "the payload is built from the re-fetch, so the DB-assigned \
+                 created_at has to be in it"
+            );
+        }
+        assert_eq!(payloads[0], team, "the Insert carries the team as created");
+        assert_eq!(payloads[2], renamed);
+        assert_eq!(
+            payloads[2].name, "Syncing Well",
+            "the rename row must carry the new name"
+        );
+        assert_eq!(payloads[3].icon_name.as_deref(), Some("rocket"));
+        assert_eq!(payloads[4].icon_type.as_deref(), Some("custom"));
+        assert_eq!(
+            payloads[5].icon_type, None,
+            "clearing the icon must be visible in the payload"
+        );
+    }
+
+    /// `delete_team` reassigns the deleted team's issues, and reports each one
+    /// as an ISSUE update. The reassignment changes the issue's team, number and
+    /// status, none of which reaches a client without a payload.
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_issues_moved_by_a_team_delete() {
+        let db = two_user_workspace().await;
+        add_workspace_backlog_status(&db).await;
+
+        let doomed = crate::team_service::create_team(
+            &db,
+            &crate::team_service::CreateTeamParams {
+                workspace_id: WS,
+                name: "Doomed",
+                key: "DOOM",
+                description: None,
+                icon: None,
+                creator_id: Some(USER_A),
+            },
+            None,
+        )
+        .await
+        .expect("create team");
+
+        let issue = crate::issue_service::create_issue(
+            &db,
+            &trakkt_types::models::CreateIssueParams {
+                workspace_id: WS.to_string(),
+                team_id: doomed.team_id.clone(),
+                creator_id: USER_A.to_string(),
+                title: "Moves teams".to_string(),
+                description: None,
+                priority: 2,
+                assignee_id: None,
+                due_date: None,
+                label_ids: Vec::new(),
+                project_id: None,
+                milestone_id: None,
+                estimate: None,
+            },
+            None,
+        )
+        .await
+        .expect("create issue on the doomed team");
+
+        crate::team_service::delete_team(&db, &doomed.team_id, WS, Some("team_vis"), None, None)
+            .await
+            .expect("delete team, reassigning its issues");
+
+        let payloads: Vec<IssueWithDetails> =
+            delta_payloads(&db, USER_B, entity_types::ISSUE).await;
+
+        assert_eq!(
+            payloads.len(),
+            2,
+            "the issue's own create, then the update reporting its reassignment"
+        );
+        assert_eq!(payloads[0].team_key, "DOOM");
+        assert_eq!(payloads[1].issue_id, issue.issue_id);
+        assert_eq!(
+            payloads[1].team_key, "VIS",
+            "the reassignment row must carry the issue's new team, which is the \
+             whole change being reported"
         );
     }
 }

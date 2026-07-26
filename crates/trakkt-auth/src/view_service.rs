@@ -274,6 +274,7 @@ pub async fn create_view(
     )?;
     let view = row.into_dto();
     let visibility = view_visibility(&view);
+    let payload = serde_json::to_value(&view).ok();
 
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
@@ -283,7 +284,7 @@ pub async fn create_view(
         params.workspace_id,
         visibility,
         SyncActionType::Insert,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
@@ -299,7 +300,7 @@ pub async fn create_view(
             params.workspace_id,
             &view_id,
             SyncActionType::Insert,
-            serde_json::to_value(&view).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -442,6 +443,7 @@ pub async fn update_view(
     )?;
     let view = row.into_dto();
     let visibility = view_visibility(&view);
+    let payload = serde_json::to_value(&view).ok();
 
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
@@ -451,7 +453,7 @@ pub async fn update_view(
         &view.workspace_id,
         visibility,
         SyncActionType::Update,
-        None,
+        payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
@@ -467,7 +469,7 @@ pub async fn update_view(
             &view.workspace_id,
             params.view_id,
             SyncActionType::Update,
-            serde_json::to_value(&view).ok(),
+            payload,
             sync_id,
         )
         .await;
