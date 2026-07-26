@@ -21,6 +21,15 @@
 //! appropriate request on every transition to `Connected`. The on_message
 //! callback survives reconnects, so there is no need to re-register it.
 //!
+//! ## Cache durability
+//!
+//! Every write to the persistent cache — entity upserts, deletes, cache clears,
+//! the sync cursor and the schema hash — goes through the engine's single
+//! [`idb_writer`] queue. The cursor is a claim that the cache holds everything
+//! up to that sync id, so it must never commit ahead of the entity writes it
+//! covers; FIFO ordering through one writer task is what guarantees that. See
+//! [`crate::cache::idb_writer`] for the full rationale.
+//!
 //! ## Thread safety / `!Send` types
 //!
 //! This module is `wasm32`-only. All async tasks use `spawn_local` (single-
@@ -33,6 +42,7 @@ use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Proj
 use trakkt_types::sync::{SyncAction, SyncActionType, SyncResponse, entity_types};
 
 use crate::cache::db;
+use crate::cache::idb_writer::{self, CacheDbSink, IdbOp, IdbWriter};
 use crate::cache::store::SyncStore;
 use crate::cache::websocket::{ConnectionState, WebSocketClient};
 
@@ -65,67 +75,66 @@ pub fn start_sync_engine(
     store: &SyncStore,
     workspace_id: &str,
 ) {
+    // ── Spawn the single cache writer ───────────────────────────────────────
+    //
+    // One task, one database handle, one ordered queue. Nothing else in the
+    // engine writes to IndexedDB, so the cursor can never overtake the entity
+    // writes it claims to cover.
+    let (writer, ops) = idb_writer::channel();
+    {
+        let wid = workspace_id.to_owned();
+        spawn_local(async move {
+            let sink = match db::init_cache_db(&wid).await {
+                Ok(cache_db) => CacheDbSink::open(cache_db, wid),
+                Err(e) => {
+                    tracing::warn!(
+                        "sync: failed to open cache db — every cache write this session will \
+                         report failure and the cursor will not advance: {e}"
+                    );
+                    CacheDbSink::Unavailable
+                }
+            };
+            idb_writer::run_writer(sink, ops).await;
+        });
+    }
+
     // ── Register message handler ────────────────────────────────────────────
     let store_msg = *store;
-    let wid_msg = workspace_id.to_owned();
+    let writer_msg = writer.clone();
     let ws_for_msg = ws.clone();
     ws.set_on_message(move |msg: SyncResponse| {
         match msg {
             SyncResponse::SyncAction(action) => {
-                apply_sync_action(&store_msg, &wid_msg, &action);
+                apply_sync_action(&store_msg, &writer_msg, &action);
             }
             SyncResponse::SyncComplete { last_sync_id } => {
-                let wid = wid_msg.clone();
-                let store_complete = store_msg;
-                spawn_local(async move {
-                    match db::init_cache_db(&wid).await {
-                        Ok(cache_db) => {
-                            if let Err(e) =
-                                db::set_last_sync_id(&cache_db, &wid, &last_sync_id.to_string())
-                                    .await
-                            {
-                                tracing::warn!("sync_complete: failed to persist cursor: {e}");
-                            }
-                            if let Err(e) = db::set_meta(&cache_db, "schemaHash", db::SCHEMA_HASH).await {
-                                tracing::warn!("sync_complete: failed to persist schema hash: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("sync_complete: failed to open cache db: {e}");
-                        }
-                    }
-                    store_complete.set_initialized(true);
-                    tracing::info!(last_sync_id, "sync_complete: store initialized");
+                // Queued behind every entity write of this stream, so it only
+                // commits once they have.
+                writer_msg.enqueue(IdbOp::SetCursor {
+                    cursor: last_sync_id.to_string(),
                 });
+                writer_msg.enqueue(IdbOp::SetSchemaHash);
+                store_msg.set_initialized(true);
+                tracing::info!(last_sync_id, "sync_complete: store initialized");
             }
             SyncResponse::SyncReset => {
                 tracing::info!("sync_reset: nuking local cache and re-bootstrapping");
                 store_msg.reset();
-                let wid = wid_msg.clone();
+                for et in ALL_CACHED_ENTITY_TYPES {
+                    writer_msg.enqueue(IdbOp::DeleteAllOfType {
+                        entity_type: (*et).to_owned(),
+                    });
+                }
+                writer_msg.enqueue(IdbOp::SetCursor {
+                    cursor: "0".to_owned(),
+                });
+
+                let writer_reset = writer_msg.clone();
                 let ws_for_reset = ws_for_msg.clone();
                 spawn_local(async move {
-                    match db::init_cache_db(&wid).await {
-                        Ok(cache_db) => {
-                            for et in ALL_CACHED_ENTITY_TYPES {
-                                if let Err(e) =
-                                    db::delete_all_of_type(&cache_db, et, &wid).await
-                                {
-                                    tracing::warn!(
-                                        entity_type = et,
-                                        "sync_reset: delete_all_of_type failed: {e}"
-                                    );
-                                }
-                            }
-                            if let Err(e) =
-                                db::set_last_sync_id(&cache_db, &wid, "0").await
-                            {
-                                tracing::warn!("sync_reset: failed to reset cursor: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("sync_reset: failed to open cache db: {e}");
-                        }
-                    }
+                    // The bootstrap request must not go out until the cache is
+                    // actually empty and the cursor rewound.
+                    writer_reset.flush().await;
                     if !ws_for_reset.send(serde_json::json!({"type": "sync_bootstrap"})) {
                         tracing::warn!("sync_reset: failed to send bootstrap request");
                     }
@@ -138,6 +147,7 @@ pub fn start_sync_engine(
     let ws_for_state = ws.clone();
     let wid_state = workspace_id.to_owned();
     let store_state = *store;
+    let writer_state = writer;
 
     Effect::new(move |_| {
         let state = ws_for_state.connection_state.get();
@@ -147,6 +157,7 @@ pub fn start_sync_engine(
 
         let wid = wid_state.clone();
         let ws_send = ws_for_state.clone();
+        let writer_connect = writer_state.clone();
         spawn_local(async move {
             let cache_db = match db::init_cache_db(&wid).await {
                 Ok(db) => Some(db),
@@ -185,18 +196,14 @@ pub fn start_sync_engine(
             } else {
                 store_state.reset();
 
-                if let Some(ref cache_db) = cache_db {
-                    for et in ALL_CACHED_ENTITY_TYPES {
-                        if let Err(e) =
-                            db::delete_all_of_type(cache_db, et, &wid).await
-                        {
-                            tracing::warn!(
-                                entity_type = et,
-                                "bootstrap: failed to clear entity cache: {e}"
-                            );
-                        }
-                    }
+                for et in ALL_CACHED_ENTITY_TYPES {
+                    writer_connect.enqueue(IdbOp::DeleteAllOfType {
+                        entity_type: (*et).to_owned(),
+                    });
                 }
+                // The clears must complete before the server starts streaming,
+                // or a clear could land on top of freshly bootstrapped rows.
+                writer_connect.flush().await;
 
                 tracing::info!("sync: no cursor — sending sync_bootstrap");
                 if !ws_send.send(serde_json::json!({"type": "sync_bootstrap"})) {
@@ -272,8 +279,20 @@ pub async fn hydrate_store_from_db(
 
 // ── Internal helpers ────────────────────────────────────────────────────────
 
-/// Apply a single `SyncAction` to the reactive store and IndexedDB.
-fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction) {
+/// Queue the removal of one cached entity record.
+fn enqueue_delete(writer: &IdbWriter, entity_type: &str, entity_id: &str) {
+    writer.enqueue(IdbOp::Delete {
+        entity_type: entity_type.to_owned(),
+        entity_id: entity_id.to_owned(),
+    });
+}
+
+/// Apply a single `SyncAction` to the reactive store, and queue the matching
+/// cache write on the FIFO writer.
+///
+/// The in-memory store is updated synchronously (the UI must react
+/// immediately); persistence is ordered behind every earlier queued op.
+fn apply_sync_action(store: &SyncStore, writer: &IdbWriter, action: &SyncAction) {
     let entity_type = action.entity_type.as_str();
     let entity_id = &action.entity_id;
 
@@ -307,7 +326,7 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                 (entity_data.clone(), None)
             };
 
-            // Persist to IndexedDB (best-effort async write).
+            // Queue the persistent write behind everything already streamed.
             let json_str = match serde_json::to_string(&idb_data) {
                 Ok(s) => s,
                 Err(e) => {
@@ -319,38 +338,22 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
                     return;
                 }
             };
-            let et = entity_type.to_owned();
-            let eid = entity_id.clone();
-            let wid = workspace_id.to_owned();
-            let ts = action.timestamp.clone();
-            spawn_local(async move {
-                match db::init_cache_db(&wid).await {
-                    Ok(cache_db) => {
-                        if let Err(e) =
-                            db::upsert(&cache_db, &et, &eid, &wid, &json_str, &ts).await
-                        {
-                            tracing::warn!(
-                                entity_type = %et,
-                                entity_id = %eid,
-                                "sync_action upsert to IDB failed: {e}"
-                            );
-                        }
-                        // Write issue_content separately for issues.
-                        if let Some(ref cj) = content_json
-                            && let Err(e) =
-                                db::upsert(&cache_db, entity_types::ISSUE_CONTENT, &eid, &wid, cj, &ts).await
-                        {
-                            tracing::warn!(
-                                entity_id = %eid,
-                                "sync_action: failed to write issue_content to IDB: {e}"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("sync_action: failed to open cache db: {e}");
-                    }
-                }
+            writer.enqueue(IdbOp::Upsert {
+                entity_type: entity_type.to_owned(),
+                entity_id: entity_id.clone(),
+                json: json_str,
+                ts: action.timestamp.clone(),
             });
+            // Issue descriptions are stored as a separate entity so hydration
+            // does not bulk-load them.
+            if let Some(content) = content_json {
+                writer.enqueue(IdbOp::Upsert {
+                    entity_type: entity_types::ISSUE_CONTENT.to_owned(),
+                    entity_id: entity_id.clone(),
+                    json: content,
+                    ts: action.timestamp.clone(),
+                });
+            }
 
             // Update the reactive store.
             match entity_type {
@@ -463,18 +466,48 @@ fn apply_sync_action(store: &SyncStore, workspace_id: &str, action: &SyncAction)
             }
         }
         SyncActionType::Delete => {
-            // Remove from the reactive store (also handles IDB deletion).
+            // Remove from the reactive store in memory only, then queue the
+            // matching cache delete so it stays ordered against the cursor.
+            // Entity types with no cached rows (activity, issue_relation) only
+            // bump their version counter, exactly as before.
             match entity_type {
-                et if et == entity_types::ISSUE => store.remove_issue(entity_id),
-                et if et == entity_types::LABEL => store.remove_label(entity_id),
-                et if et == entity_types::STATUS => store.remove_status(entity_id),
-                et if et == entity_types::TEAM => store.remove_team(entity_id),
-                et if et == entity_types::PROJECT => store.remove_project(entity_id),
-                et if et == entity_types::VIEW => store.remove_view(entity_id),
-                et if et == entity_types::FAVORITE => store.remove_favorite(entity_id),
-                et if et == entity_types::NOTIFICATION => store.remove_notification(entity_id),
+                et if et == entity_types::ISSUE => {
+                    store.remove_issue_in_memory(entity_id);
+                    enqueue_delete(writer, entity_types::ISSUE, entity_id);
+                    enqueue_delete(writer, entity_types::ISSUE_CONTENT, entity_id);
+                }
+                et if et == entity_types::LABEL => {
+                    store.remove_label_in_memory(entity_id);
+                    enqueue_delete(writer, entity_types::LABEL, entity_id);
+                }
+                et if et == entity_types::STATUS => {
+                    store.remove_status_in_memory(entity_id);
+                    enqueue_delete(writer, entity_types::STATUS, entity_id);
+                }
+                et if et == entity_types::TEAM => {
+                    store.remove_team_in_memory(entity_id);
+                    enqueue_delete(writer, entity_types::TEAM, entity_id);
+                }
+                et if et == entity_types::PROJECT => {
+                    store.remove_project_in_memory(entity_id);
+                    enqueue_delete(writer, entity_types::PROJECT, entity_id);
+                }
+                et if et == entity_types::VIEW => {
+                    store.remove_view_in_memory(entity_id);
+                    enqueue_delete(writer, entity_types::VIEW, entity_id);
+                }
+                et if et == entity_types::FAVORITE => {
+                    store.remove_favorite_in_memory(entity_id);
+                    enqueue_delete(writer, entity_types::FAVORITE, entity_id);
+                }
+                et if et == entity_types::NOTIFICATION => {
+                    store.remove_notification_in_memory(entity_id);
+                    enqueue_delete(writer, entity_types::NOTIFICATION, entity_id);
+                }
                 et if et == entity_types::COMMENT => {
-                    store.remove_comment(entity_id);
+                    // Comments live only in IndexedDB — the detail page reads
+                    // them on demand and re-reads when the version bumps.
+                    enqueue_delete(writer, entity_types::COMMENT, entity_id);
                     store.bump_comments_version();
                 }
                 et if et == entity_types::ACTIVITY => store.bump_activities_version(),

@@ -73,6 +73,9 @@ web-sys = { version = "0.3", features = [
 # Timers for WASM
 gloo-timers = { version = "0.3", features = ["futures"] }
 
+# Channels for the single-writer IndexedDB queue (cache/idb_writer.rs)
+futures = { workspace = true }
+
 # SendWrapper for non-Send JS values in Leptos reactive closures
 send_wrapper = "0.6"
 
@@ -110,7 +113,15 @@ webauthn-rs = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
-[dev-dependencies]
+# Server-side test dependencies. Target-gated because `cargo build --tests`
+# for wasm32 (wasm-pack test) would otherwise try to compile these native-only
+# crates — sqlx, tokio and getrandom do not build for wasm32-unknown-unknown.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 trakkt-core = { workspace = true, features = ["test-helpers"] }
 trakkt-auth = { workspace = true }
 tokio = { workspace = true }
+
+# Browser-hosted tests for the IndexedDB writer.
+# Run: wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
