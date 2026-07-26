@@ -66,6 +66,11 @@ web-sys = { version = "0.3", features = [
     "Clipboard", "History", "HtmlDivElement", "DomRect",
     "ScrollIntoViewOptions", "ScrollLogicalPosition", "ScrollBehavior",
     "WebSocket", "MessageEvent", "CloseEvent",
+    # Cross-tab sync coordination (cache/tab_leader.rs). The Web Locks half of
+    # that module is hand-bound, not listed here: web-sys puts Lock/LockManager
+    # behind --cfg=web_sys_unstable_apis, which cannot be enabled workspace-wide
+    # without breaking the kode-leptos dependency. See cache/tab_leader.rs.
+    "BroadcastChannel",
     "FormData", "File", "FileList", "Blob", "BlobPropertyBag",
     "Headers", "Request", "RequestInit", "RequestCredentials", "Response",
 ] }

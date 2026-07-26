@@ -39,11 +39,13 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
-use trakkt_types::sync::{SyncAction, SyncActionType, SyncResponse, entity_types};
+use trakkt_types::sync::{SyncAction, SyncResponse, entity_types};
 
+use crate::cache::apply::{apply_action_to_memory, enqueue_cache_writes};
 use crate::cache::db;
 use crate::cache::idb_writer::{self, CacheDbSink, IdbOp, IdbWriter};
 use crate::cache::store::SyncStore;
+use crate::cache::tab_leader::{SyncBroadcast, SyncBroadcastMessage};
 use crate::cache::websocket::{ConnectionState, WebSocketClient};
 
 const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
@@ -70,10 +72,17 @@ const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
 /// `sync_action`, `sync_complete`, and `sync_reset` messages. Watches the
 /// connection state signal to send bootstrap or delta requests on every
 /// connect/reconnect.
+///
+/// **Leader tabs only.** This is the only place the shared cache is written, so
+/// calling it from a tab that does not hold the leadership lock is exactly the
+/// multi-writer race the lock exists to prevent. `broadcast` is the channel the
+/// leader republishes applied actions on so follower tabs can update their own
+/// in-memory stores; it is `None` when the browser has no `BroadcastChannel`.
 pub fn start_sync_engine(
     ws: &WebSocketClient,
     store: &SyncStore,
     workspace_id: &str,
+    broadcast: Option<SyncBroadcast>,
 ) {
     // ── Spawn the single cache writer ───────────────────────────────────────
     //
@@ -102,10 +111,11 @@ pub fn start_sync_engine(
     let store_msg = *store;
     let writer_msg = writer.clone();
     let ws_for_msg = ws.clone();
+    let broadcast_msg = broadcast.clone();
     ws.set_on_message(move |msg: SyncResponse| {
         match msg {
             SyncResponse::SyncAction(action) => {
-                apply_sync_action(&store_msg, &writer_msg, &action);
+                apply_sync_action(&store_msg, &writer_msg, &broadcast_msg, &action);
             }
             SyncResponse::SyncComplete { last_sync_id } => {
                 // Queued behind every entity write of this stream, so it only
@@ -114,6 +124,11 @@ pub fn start_sync_engine(
                     cursor: last_sync_id.to_string(),
                 });
                 writer_msg.enqueue(IdbOp::SetSchemaHash);
+                broadcast_after_commit(
+                    &writer_msg,
+                    &broadcast_msg,
+                    SyncBroadcastMessage::Complete { last_sync_id },
+                );
                 store_msg.set_initialized(true);
                 tracing::info!(last_sync_id, "sync_complete: store initialized");
             }
@@ -128,6 +143,11 @@ pub fn start_sync_engine(
                 writer_msg.enqueue(IdbOp::SetCursor {
                     cursor: "0".to_owned(),
                 });
+                // Ordered with everything else on the queue: a marker posted
+                // eagerly could overtake action broadcasts still waiting on
+                // their writes, and followers would rebuild state the leader
+                // had already thrown away.
+                broadcast_after_commit(&writer_msg, &broadcast_msg, SyncBroadcastMessage::Reset);
 
                 let writer_reset = writer_msg.clone();
                 let ws_for_reset = ws_for_msg.clone();
@@ -148,6 +168,7 @@ pub fn start_sync_engine(
     let wid_state = workspace_id.to_owned();
     let store_state = *store;
     let writer_state = writer;
+    let broadcast_state = broadcast;
 
     Effect::new(move |_| {
         let state = ws_for_state.connection_state.get();
@@ -158,6 +179,7 @@ pub fn start_sync_engine(
         let wid = wid_state.clone();
         let ws_send = ws_for_state.clone();
         let writer_connect = writer_state.clone();
+        let broadcast_connect = broadcast_state.clone();
         spawn_local(async move {
             let cache_db = match db::init_cache_db(&wid).await {
                 Ok(db) => Some(db),
@@ -201,6 +223,14 @@ pub fn start_sync_engine(
                         entity_type: (*et).to_owned(),
                     });
                 }
+                // Same wipe-and-re-bootstrap as sync_reset, so followers must
+                // clear their memory here too or they keep entities this tab
+                // just dropped.
+                broadcast_after_commit(
+                    &writer_connect,
+                    &broadcast_connect,
+                    SyncBroadcastMessage::Reset,
+                );
                 // The clears must complete before the server starts streaming,
                 // or a clear could land on top of freshly bootstrapped rows.
                 writer_connect.flush().await;
@@ -279,246 +309,43 @@ pub async fn hydrate_store_from_db(
 
 // ── Internal helpers ────────────────────────────────────────────────────────
 
-/// Queue the removal of one cached entity record.
-fn enqueue_delete(writer: &IdbWriter, entity_type: &str, entity_id: &str) {
-    writer.enqueue(IdbOp::Delete {
-        entity_type: entity_type.to_owned(),
-        entity_id: entity_id.to_owned(),
-    });
+/// Publish `message` to the follower tabs once every op queued before it has
+/// been processed.
+///
+/// Ordering is the whole point. Followers apply what they are told without
+/// consulting IndexedDB, so telling them about an action before its cache write
+/// has committed would let a follower render — and a promoted follower trust —
+/// state the shared cache does not hold. Riding the writer queue also means
+/// followers see actions in exactly the order the cache took them.
+fn broadcast_after_commit(
+    writer: &IdbWriter,
+    broadcast: &Option<SyncBroadcast>,
+    message: SyncBroadcastMessage,
+) {
+    let Some(channel) = broadcast.clone() else {
+        return;
+    };
+    writer.enqueue(IdbOp::Notify(Box::new(move || channel.post(&message))));
 }
 
-/// Apply a single `SyncAction` to the reactive store, and queue the matching
-/// cache write on the FIFO writer.
+/// Apply a single `SyncAction` as the leader tab: queue the cache write, tell
+/// the follower tabs once it has committed, and update the reactive store.
 ///
 /// The in-memory store is updated synchronously (the UI must react
 /// immediately); persistence is ordered behind every earlier queued op.
-fn apply_sync_action(store: &SyncStore, writer: &IdbWriter, action: &SyncAction) {
-    let entity_type = action.entity_type.as_str();
-    let entity_id = &action.entity_id;
-
-    match action.action {
-        SyncActionType::Insert | SyncActionType::Update => {
-            let Some(ref entity_data) = action.data else {
-                tracing::warn!(
-                    action = ?action.action,
-                    entity_type,
-                    entity_id,
-                    "sync_action insert/update: missing data field — skipping"
-                );
-                return;
-            };
-
-            // For issues: split the description into a separate issue_content
-            // entity in IDB so it is not bulk-loaded during hydration. The
-            // main issue record stored in IDB has its description stripped.
-            let (idb_data, content_json) = if entity_type == entity_types::ISSUE {
-                let mut data = entity_data.clone();
-                let description = data.as_object_mut().and_then(|obj| obj.remove("description"));
-                let content = description.and_then(|d| {
-                    if d.is_null() {
-                        None
-                    } else {
-                        Some(serde_json::json!({"description": d}).to_string())
-                    }
-                });
-                (data, content)
-            } else {
-                (entity_data.clone(), None)
-            };
-
-            // Queue the persistent write behind everything already streamed.
-            let json_str = match serde_json::to_string(&idb_data) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        entity_type,
-                        entity_id,
-                        "sync_action: failed to re-serialize entity data: {e}"
-                    );
-                    return;
-                }
-            };
-            writer.enqueue(IdbOp::Upsert {
-                entity_type: entity_type.to_owned(),
-                entity_id: entity_id.clone(),
-                json: json_str,
-                ts: action.timestamp.clone(),
-            });
-            // Issue descriptions are stored as a separate entity so hydration
-            // does not bulk-load them.
-            if let Some(content) = content_json {
-                writer.enqueue(IdbOp::Upsert {
-                    entity_type: entity_types::ISSUE_CONTENT.to_owned(),
-                    entity_id: entity_id.clone(),
-                    json: content,
-                    ts: action.timestamp.clone(),
-                });
-            }
-
-            // Update the reactive store.
-            match entity_type {
-                et if et == entity_types::ISSUE => {
-                    match serde_json::from_value::<IssueWithDetails>(entity_data.clone()) {
-                        Ok(mut item) => {
-                            item.description = None;
-                            store.upsert_issue(item);
-                        }
-                        Err(e) => tracing::warn!(
-                            entity_type,
-                            entity_id,
-                            "sync_action: failed to deserialize issue: {e}"
-                        ),
-                    }
-                }
-                et if et == entity_types::LABEL => {
-                    match serde_json::from_value::<Label>(entity_data.clone()) {
-                        Ok(item) => store.upsert_label(item),
-                        Err(e) => tracing::warn!(
-                            entity_type,
-                            entity_id,
-                            "sync_action: failed to deserialize label: {e}"
-                        ),
-                    }
-                }
-                et if et == entity_types::STATUS => {
-                    match serde_json::from_value::<Status>(entity_data.clone()) {
-                        Ok(item) => store.upsert_status(item),
-                        Err(e) => tracing::warn!(
-                            entity_type,
-                            entity_id,
-                            "sync_action: failed to deserialize status: {e}"
-                        ),
-                    }
-                }
-                et if et == entity_types::TEAM => {
-                    match serde_json::from_value::<Team>(entity_data.clone()) {
-                        Ok(item) => store.upsert_team(item),
-                        Err(e) => tracing::warn!(
-                            entity_type,
-                            entity_id,
-                            "sync_action: failed to deserialize team: {e}"
-                        ),
-                    }
-                }
-                et if et == entity_types::PROJECT => {
-                    match serde_json::from_value::<Project>(entity_data.clone()) {
-                        Ok(item) => store.upsert_project(item),
-                        Err(e) => tracing::warn!(
-                            entity_type,
-                            entity_id,
-                            "sync_action: failed to deserialize project: {e}"
-                        ),
-                    }
-                }
-                et if et == entity_types::VIEW => {
-                    match serde_json::from_value::<View>(entity_data.clone()) {
-                        Ok(item) => store.upsert_view(item),
-                        Err(e) => tracing::warn!(
-                            entity_type,
-                            entity_id,
-                            "sync_action: failed to deserialize view: {e}"
-                        ),
-                    }
-                }
-                et if et == entity_types::FAVORITE => {
-                    match serde_json::from_value::<Favorite>(entity_data.clone()) {
-                        Ok(item) => store.upsert_favorite(item),
-                        Err(e) => tracing::warn!(
-                            entity_type,
-                            entity_id,
-                            "sync_action: failed to deserialize favorite: {e}"
-                        ),
-                    }
-                }
-                et if et == entity_types::NOTIFICATION => {
-                    match serde_json::from_value::<Notification>(entity_data.clone()) {
-                        Ok(item) => store.upsert_notification(item),
-                        Err(e) => tracing::warn!(
-                            entity_type,
-                            entity_id,
-                            "sync_action: failed to deserialize notification: {e}"
-                        ),
-                    }
-                }
-                et if et == entity_types::COMMENT => {
-                    // Comments are not stored in the reactive signal — loaded
-                    // on-demand by the detail page from IndexedDB. Bump the
-                    // version counter so reactive dependencies re-read from IDB.
-                    store.bump_comments_version();
-                }
-                et if et == entity_types::ACTIVITY => {
-                    // Activities are not stored in the SyncStore — they are
-                    // fetched on-demand by the timeline component. Bump the
-                    // version counter so reactive dependencies refetch.
-                    store.bump_activities_version();
-                }
-                et if et == entity_types::ISSUE_RELATION => {
-                    // Relations are fetched on-demand by the relations section.
-                    // Bump the version counter so reactive dependencies refetch.
-                    store.bump_relations_version();
-                }
-                other => {
-                    tracing::debug!(
-                        entity_type = other,
-                        "sync_action: unhandled entity type — ignoring"
-                    );
-                }
-            }
-        }
-        SyncActionType::Delete => {
-            // Remove from the reactive store in memory only, then queue the
-            // matching cache delete so it stays ordered against the cursor.
-            // Entity types with no cached rows (activity, issue_relation) only
-            // bump their version counter, exactly as before.
-            match entity_type {
-                et if et == entity_types::ISSUE => {
-                    store.remove_issue_in_memory(entity_id);
-                    enqueue_delete(writer, entity_types::ISSUE, entity_id);
-                    enqueue_delete(writer, entity_types::ISSUE_CONTENT, entity_id);
-                }
-                et if et == entity_types::LABEL => {
-                    store.remove_label_in_memory(entity_id);
-                    enqueue_delete(writer, entity_types::LABEL, entity_id);
-                }
-                et if et == entity_types::STATUS => {
-                    store.remove_status_in_memory(entity_id);
-                    enqueue_delete(writer, entity_types::STATUS, entity_id);
-                }
-                et if et == entity_types::TEAM => {
-                    store.remove_team_in_memory(entity_id);
-                    enqueue_delete(writer, entity_types::TEAM, entity_id);
-                }
-                et if et == entity_types::PROJECT => {
-                    store.remove_project_in_memory(entity_id);
-                    enqueue_delete(writer, entity_types::PROJECT, entity_id);
-                }
-                et if et == entity_types::VIEW => {
-                    store.remove_view_in_memory(entity_id);
-                    enqueue_delete(writer, entity_types::VIEW, entity_id);
-                }
-                et if et == entity_types::FAVORITE => {
-                    store.remove_favorite_in_memory(entity_id);
-                    enqueue_delete(writer, entity_types::FAVORITE, entity_id);
-                }
-                et if et == entity_types::NOTIFICATION => {
-                    store.remove_notification_in_memory(entity_id);
-                    enqueue_delete(writer, entity_types::NOTIFICATION, entity_id);
-                }
-                et if et == entity_types::COMMENT => {
-                    // Comments live only in IndexedDB — the detail page reads
-                    // them on demand and re-reads when the version bumps.
-                    enqueue_delete(writer, entity_types::COMMENT, entity_id);
-                    store.bump_comments_version();
-                }
-                et if et == entity_types::ACTIVITY => store.bump_activities_version(),
-                et if et == entity_types::ISSUE_RELATION => store.bump_relations_version(),
-                other => {
-                    tracing::debug!(
-                        entity_type = other,
-                        "sync_action delete: unhandled entity type — ignoring"
-                    );
-                }
-            }
-        }
-    }
+fn apply_sync_action(
+    store: &SyncStore,
+    writer: &IdbWriter,
+    broadcast: &Option<SyncBroadcast>,
+    action: &SyncAction,
+) {
+    // Queue the cache writes first so the broadcast that describes this action
+    // is ordered behind them rather than racing them.
+    enqueue_cache_writes(writer, action);
+    broadcast_after_commit(
+        writer,
+        broadcast,
+        SyncBroadcastMessage::Action(action.clone()),
+    );
+    apply_action_to_memory(store, action);
 }
