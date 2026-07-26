@@ -33,6 +33,7 @@
 - [Issues](api-reference/issues.md)
 - [Labels](api-reference/labels.md)
 - [Milestones](api-reference/milestones.md)
+- [Other](api-reference/other.md)
 - [Projects](api-reference/projects.md)
 - [Relations](api-reference/relations.md)
 - [Statuses](api-reference/statuses.md)

@@ -13,7 +13,8 @@ use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
 use trakkt_auth::{activity_service, comment_service, issue_service, relation_service, search_service, team_service};
 use trakkt_types::api::{
     CreateIssueApiParams, DeleteIssueApiParams, FilterClause, GetIssueApiParams, InlineRelation,
-    ListIssuesApiParams, ListIssuesResponse, SearchIssuesApiParams, UpdateIssueApiParams,
+    IssueListRow, ListIssuesApiParams, ListIssuesResponse, SearchIssuesApiParams,
+    UpdateIssueApiParams,
 };
 use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate, IssueWithDetails};
 
@@ -107,6 +108,12 @@ fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
 
 /// List issues with optional filters.
 ///
+/// Returns lean [`IssueListRow`]s, never full issue records: `description`,
+/// comments, and activities are projected away at this boundary so that listing
+/// a mature queue stays small. Callers that need an issue's content call
+/// [`get_issue`]. The projection happens *after* [`apply_clause`] filtering, so
+/// no filterable field is lost.
+///
 /// Ported from `tool_list_issues` in `routes/mcp.rs`.
 pub async fn list_issues(
     ctx: &ApiCtx<'_>,
@@ -188,10 +195,14 @@ pub async fn list_issues(
         let limit_usize = limit as usize;
         let truncated = total_matched > limit_usize;
         issues.truncate(limit_usize);
-        let returned_count = issues.len();
+
+        // Project to lean rows only after filtering, so clauses keep access to
+        // every field of the full issue.
+        let rows: Vec<IssueListRow> = issues.into_iter().map(IssueListRow::from).collect();
+        let returned_count = rows.len();
 
         let response = ListIssuesResponse {
-            issues,
+            issues: rows,
             matched_count: total_matched,
             returned_count,
             truncated,
@@ -199,7 +210,8 @@ pub async fn list_issues(
         Ok(serde_json::to_value(&response)?)
     } else {
         // No composable clauses — return the flat array for backward compat.
-        Ok(serde_json::to_value(&issues)?)
+        let rows: Vec<IssueListRow> = issues.into_iter().map(IssueListRow::from).collect();
+        Ok(serde_json::to_value(&rows)?)
     }
 }
 
@@ -615,7 +627,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_issues",
-            description: "List issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Response shape: `{issues, matched_count, returned_count, truncated}`.",
+            description: "Find issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Response shape: `{issues, matched_count, returned_count, truncated}`. Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `status_id`, `status_name`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues",
@@ -647,7 +659,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "get_issue",
-            description: "Get a single issue by its team-scoped identifier (e.g. 'TRA-35'), including full details (description, labels, assignee, creator), all comments, activity log, and relations.",
+            description: "Read a single issue in full by its team-scoped identifier (e.g. 'TRA-35'). This is the way to get an issue's content: it returns the complete record (description, labels, assignee, creator), all comments, the activity log, and relations. list_issues returns lean rows without descriptions, so the normal pattern is to list first, then call get_issue for each ticket you actually need to read.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues/{identifier}",
@@ -710,4 +722,256 @@ pub fn operations() -> Vec<ApiOperation> {
             binary_output: None,
         },
     ]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trakkt_core::DbPool;
+
+    /// A description the size of a real Trakkt spec ticket (~4 KB).
+    fn spec_sized_description() -> String {
+        "## Context\nThis ticket describes, at length, exactly what has to change and why. "
+            .repeat(50)
+    }
+
+    /// An in-memory workspace with `count` spec-sized issues on the default
+    /// team, plus one label applied to the first issue.
+    ///
+    /// Returns the pool and the workspace/user ids an [`ApiCtx`] needs.
+    async fn seeded_workspace(count: i32) -> (DbPool, String, String) {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+
+        let user = trakkt_auth::user_service::create_user(
+            &db,
+            "lister@example.test",
+            Some("Lister"),
+            true,
+        )
+        .await
+        .expect("create user");
+
+        let workspace_id = trakkt_auth::user_service::create_workspace_for_user(
+            &db,
+            &user.user_id,
+            Some("Lister"),
+            "lister@example.test",
+            None,
+        )
+        .await
+        .expect("create workspace");
+
+        let team = trakkt_auth::team_service::get_default_team(&db, &workspace_id)
+            .await
+            .expect("default team");
+
+        let label = trakkt_auth::label_service::create_label(
+            &db,
+            &workspace_id,
+            "agent-ready",
+            "#0D9488",
+            Some(&team.team_id),
+            None,
+        )
+        .await
+        .expect("create label");
+
+        let description = spec_sized_description();
+        for n in 1..=count {
+            let params = CreateIssueParams {
+                workspace_id: workspace_id.clone(),
+                team_id: team.team_id.clone(),
+                creator_id: user.user_id.clone(),
+                title: format!("Seeded issue {n}"),
+                description: Some(description.clone()),
+                priority: 2,
+                assignee_id: None,
+                due_date: None,
+                label_ids: vec![label.label_id.clone()],
+                project_id: None,
+                milestone_id: None,
+                estimate: None,
+            };
+            issue_service::create_issue(&db, &params, None)
+                .await
+                .expect("create issue");
+        }
+
+        (db, workspace_id, user.user_id)
+    }
+
+    fn list_params(filters: Option<&str>) -> ListIssuesApiParams {
+        ListIssuesApiParams {
+            team_key: None,
+            team_id: None,
+            status_id: None,
+            status_category: None,
+            include_closed: None,
+            priority: None,
+            assignee: None,
+            label: None,
+            search: None,
+            limit: Some(50),
+            filters: filters.map(str::to_string),
+        }
+    }
+
+    /// Assert every row in `rows` is a lean row: no heavy fields, a `TEAM-123`
+    /// key, and labels reduced to id and name.
+    fn assert_rows_are_lean(rows: &[serde_json::Value]) {
+        assert!(!rows.is_empty(), "fixture should return rows");
+        for row in rows {
+            let object = row.as_object().expect("row should be a JSON object");
+            for forbidden in ["description", "comments", "activities"] {
+                assert!(
+                    !object.contains_key(forbidden),
+                    "list_issues row must never carry `{forbidden}`; got keys {:?}",
+                    object.keys().collect::<Vec<_>>()
+                );
+            }
+            let key = row["key"].as_str().expect("row should carry a key");
+            assert_eq!(
+                key,
+                format!("TRK-{}", row["number"].as_i64().expect("row number")),
+                "key should be TEAM-NUMBER"
+            );
+            for label in row["labels"].as_array().expect("labels array") {
+                let label_object = label.as_object().expect("label should be an object");
+                assert_eq!(
+                    label_object.keys().map(String::as_str).collect::<Vec<_>>(),
+                    vec!["label_id", "name"],
+                    "labels should carry id and name only"
+                );
+            }
+        }
+    }
+
+    /// The no-clauses path returns a flat array of lean rows.
+    #[tokio::test]
+    async fn flat_array_path_returns_lean_rows() {
+        let (db, workspace_id, user_id) = seeded_workspace(3).await;
+        let ctx = ApiCtx::from_leptos(
+            workspace_id,
+            user_id,
+            &db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        );
+
+        let value = list_issues(&ctx, list_params(None))
+            .await
+            .expect("list_issues should succeed");
+
+        let rows = value.as_array().expect("no-clauses path returns an array");
+        assert_eq!(rows.len(), 3);
+        assert_rows_are_lean(rows);
+    }
+
+    /// The envelope path (filter clauses present) returns lean rows too, and
+    /// filtering still sees the full issue — the clause below matches on a
+    /// field that lean rows do not expose.
+    #[tokio::test]
+    async fn envelope_path_returns_lean_rows_and_still_filters_on_full_issue() {
+        let (db, workspace_id, user_id) = seeded_workspace(3).await;
+        let ctx = ApiCtx::from_leptos(
+            workspace_id,
+            user_id,
+            &db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        );
+
+        let value = list_issues(
+            &ctx,
+            list_params(Some(
+                r#"[{"field":"is_sub_issue","operator":"none_of","values":[]}]"#,
+            )),
+        )
+        .await
+        .expect("list_issues should succeed");
+
+        assert_eq!(value["matched_count"], 3);
+        assert_eq!(value["returned_count"], 3);
+        assert_eq!(value["truncated"], false);
+        let rows = value["issues"].as_array().expect("envelope carries issues");
+        assert_eq!(rows.len(), 3);
+        assert_rows_are_lean(rows);
+    }
+
+    /// TRA-9915: a full page of spec-sized issues used to serialize to ~226 KB
+    /// and overflow the caller's tool-result cap.
+    ///
+    /// Measured on this fixture: 249,535 bytes for the full issues the service
+    /// returns vs 13,126 bytes for the lean response. The 25 KB ceiling leaves
+    /// room for longer titles and more labels while still failing loudly if a
+    /// description-sized field ever creeps back onto a row.
+    #[tokio::test]
+    async fn full_page_response_stays_small() {
+        const PAGE_SIZE: i32 = 48;
+        const MAX_RESPONSE_BYTES: usize = 25_000;
+
+        let (db, workspace_id, user_id) = seeded_workspace(PAGE_SIZE).await;
+        let ctx = ApiCtx::from_leptos(
+            workspace_id.clone(),
+            user_id.clone(),
+            &db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        );
+
+        let value = list_issues(&ctx, list_params(None))
+            .await
+            .expect("list_issues should succeed");
+        let response_bytes = serde_json::to_string(&value)
+            .expect("response should serialize")
+            .len();
+
+        // What the same page used to cost, straight off the service layer.
+        let full_issues = issue_service::list_issues(
+            &db,
+            &workspace_id,
+            None,
+            &IssueFilters {
+                status_id: None,
+                status_categories: None,
+                exclude_status_categories: Some(vec![
+                    "completed".to_string(),
+                    "cancelled".to_string(),
+                ]),
+                priority: None,
+                assignee_id: None,
+                creator_id: None,
+                label_ids: None,
+                search: None,
+                limit: Some(50),
+                offset: None,
+                include_archived: None,
+                only_archived: None,
+            },
+        )
+        .await
+        .expect("service list should succeed");
+        let full_bytes = serde_json::to_string(&full_issues)
+            .expect("full issues should serialize")
+            .len();
+
+        assert_eq!(value.as_array().expect("array").len(), PAGE_SIZE as usize);
+        assert!(
+            response_bytes < MAX_RESPONSE_BYTES,
+            "a {PAGE_SIZE}-issue page must serialize under {MAX_RESPONSE_BYTES} bytes; \
+             got {response_bytes} bytes lean vs {full_bytes} bytes for the full issues"
+        );
+    }
 }

@@ -5500,6 +5500,7 @@ dependencies = [
  "schemars",
  "serde_json",
  "sqlx",
+ "tokio",
  "tracing",
  "trakkt-auth",
  "trakkt-core",
