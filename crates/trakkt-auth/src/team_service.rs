@@ -359,6 +359,27 @@ pub async fn get_team(
     Ok(row.map(TeamRow::into_dto))
 }
 
+/// Get a team by ID, requiring it to belong to `workspace_id`.
+///
+/// Use this wherever the `team_id` came from the caller. [`get_team`] looks up
+/// a team id across every workspace, so on its own it cannot tell a team the
+/// caller owns from one they merely named — the caller has to compare
+/// `workspace_id` afterwards, and forgetting to is silent.
+///
+/// A team in another workspace is reported as `NotFound`, not `Forbidden`: the
+/// caller cannot see that workspace, and an error distinguishing "wrong
+/// workspace" from "no such team" turns any team id into an existence oracle.
+pub async fn get_team_in_workspace(
+    db: &DbPool,
+    team_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<Team> {
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1 AND workspace_id = $2");
+    let row = trakkt_core::db_fetch_optional!(db, TeamRow, &sql, team_id, workspace_id)?;
+    row.map(TeamRow::into_dto)
+        .ok_or_else(|| trakkt_core::Error::NotFound(format!("team {team_id} not found")))
+}
+
 /// Get a team by its unique workspace + key combination.
 pub async fn get_team_by_key(
     db: &DbPool,
@@ -974,17 +995,10 @@ pub async fn list_team_members(
 /// `team_members` is not a synced entity type of its own, so a membership change
 /// is reported as an update to the parent team and has to carry the team row —
 /// the shape the client's TEAM arm deserializes. An entry with no payload is
-/// skipped outright by the client on both the live and the delta path, so if the
-/// team cannot be read there is nothing worth writing.
+/// skipped outright by the client on both the live and the delta path.
 ///
-/// `team_id` reaches these functions straight from the caller, so a team that is
-/// already gone simply leaves nothing to report. That matches the no-op the
-/// membership write itself performed and is not promoted to an error, which is
-/// why this returns nothing: like the sync write it replaces, it is best-effort.
-///
-/// In practice only the remove and role-update paths can reach that branch: an
-/// insert against a missing team fails on the `team_members.team_id` foreign key
-/// long before it gets here.
+/// The team is resolved by the caller before it mutates anything, so it is
+/// passed in rather than read again here.
 ///
 /// Note the payload cannot express *what* changed. `Team` carries no member
 /// list, and its `member_count` is reported as 0 by every single-team read. A
@@ -992,48 +1006,39 @@ pub async fn list_team_members(
 /// gap TRA-9940 records for project members.
 async fn write_membership_sync_entry(
     db: &DbPool,
-    team_id: &str,
+    team: &Team,
     user_id: &str,
-    workspace_id: &str,
     operation: &str,
 ) {
-    let team = match get_team(db, team_id).await {
-        Ok(Some(team)) => team,
-        Ok(None) => {
-            tracing::warn!(
-                team_id, user_id, operation,
-                "Team not found — no sync log entry written for membership change"
-            );
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e, team_id, user_id, operation,
-                "Failed to read team — no sync log entry written for membership change"
-            );
-            return;
-        }
-    };
-
     if let Err(e) = sync_log_service::write_sync_entry(
         db,
         entity_types::TEAM,
-        team_id,
-        workspace_id,
+        &team.team_id,
+        &team.workspace_id,
         None,
         SyncActionType::Update,
-        serde_json::to_value(&team).ok(),
+        serde_json::to_value(team).ok(),
     )
     .await
     {
         tracing::warn!(
-            error = %e, team_id, user_id, operation,
+            error = %e, team_id = %team.team_id, user_id, operation,
             "Failed to write sync log for team membership change"
         );
     }
 }
 
+// `team_members` has no `workspace_id` column of its own — the only thing tying
+// a membership row to a workspace is the `teams` row it points at. So each of
+// the three mutations below resolves the team within `workspace_id` first and
+// mutates nothing if that lookup fails. Filtering the statement alone would not
+// do: a caller-supplied `team_id` names a row in *some* workspace, and without
+// the resolve there is nothing in the statement to compare it against.
+
 /// Add a user to a team. No-op if the user is already a member.
+///
+/// The team must belong to `workspace_id`; if it does not, this is `NotFound`
+/// and nothing is written.
 pub async fn add_team_member(
     db: &DbPool,
     team_id: &str,
@@ -1041,6 +1046,8 @@ pub async fn add_team_member(
     role: &str,
     workspace_id: &str,
 ) -> trakkt_core::Result<()> {
+    let team = get_team_in_workspace(db, team_id, workspace_id).await?;
+
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
 
@@ -1058,18 +1065,23 @@ pub async fn add_team_member(
     };
     trakkt_core::db_execute!(db, &sql, team_id, user_id, role)?;
 
-    write_membership_sync_entry(db, team_id, user_id, workspace_id, "member add").await;
+    write_membership_sync_entry(db, &team, user_id, "member add").await;
 
     Ok(())
 }
 
 /// Remove a user from a team.
+///
+/// The team must belong to `workspace_id`; if it does not, this is `NotFound`
+/// and nothing is deleted. Removing a user who is not a member remains a no-op.
 pub async fn remove_team_member(
     db: &DbPool,
     team_id: &str,
     user_id: &str,
     workspace_id: &str,
 ) -> trakkt_core::Result<()> {
+    let team = get_team_in_workspace(db, team_id, workspace_id).await?;
+
     trakkt_core::db_execute!(
         db,
         "DELETE FROM team_members WHERE team_id = $1 AND user_id = $2",
@@ -1077,12 +1089,15 @@ pub async fn remove_team_member(
         user_id
     )?;
 
-    write_membership_sync_entry(db, team_id, user_id, workspace_id, "member remove").await;
+    write_membership_sync_entry(db, &team, user_id, "member remove").await;
 
     Ok(())
 }
 
 /// Update a team member's role.
+///
+/// The team must belong to `workspace_id`; if it does not, this is `NotFound`
+/// and no role is changed.
 pub async fn update_team_member_role(
     db: &DbPool,
     team_id: &str,
@@ -1090,6 +1105,8 @@ pub async fn update_team_member_role(
     role: &str,
     workspace_id: &str,
 ) -> trakkt_core::Result<()> {
+    let team = get_team_in_workspace(db, team_id, workspace_id).await?;
+
     trakkt_core::db_execute!(
         db,
         "UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id = $3",
@@ -1098,7 +1115,7 @@ pub async fn update_team_member_role(
         user_id
     )?;
 
-    write_membership_sync_entry(db, team_id, user_id, workspace_id, "member role update").await;
+    write_membership_sync_entry(db, &team, user_id, "member role update").await;
 
     Ok(())
 }
@@ -1270,4 +1287,260 @@ pub async fn get_team_archive_days(
     }
 
     Ok(None)
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trakkt_core::db_execute;
+
+    const WS_A: &str = "ws_alpha";
+    const WS_B: &str = "ws_beta";
+    const USER_A: &str = "usr_alpha";
+    const USER_B: &str = "usr_beta";
+    const TEAM_A: &str = "team_alpha";
+    const TEAM_B: &str = "team_beta";
+
+    /// Two separate workspaces, one team and one member each.
+    ///
+    /// `USER_A` belongs to workspace A only, and is the attacker in the
+    /// cross-workspace cases below: `TEAM_B` is a team they can name but must
+    /// not be able to touch. `USER_B` is seeded into `TEAM_B` so the remove and
+    /// role-update cases have a real membership row to try to disturb.
+    async fn two_workspaces() -> DbPool {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+
+        for user_id in [USER_A, USER_B] {
+            db_execute!(
+                &db,
+                "INSERT INTO users (user_id, email, name) VALUES ($1, $2, $3)",
+                user_id,
+                format!("{user_id}@example.test"),
+                user_id
+            )
+            .expect("insert user");
+        }
+
+        for (ws, owner) in [(WS_A, USER_A), (WS_B, USER_B)] {
+            db_execute!(
+                &db,
+                "INSERT INTO workspaces (workspace_id, owner_user_id) VALUES ($1, $2)",
+                ws,
+                owner
+            )
+            .expect("insert workspace");
+            db_execute!(
+                &db,
+                "INSERT INTO workspace_users (workspace_id, user_id) VALUES ($1, $2)",
+                ws,
+                owner
+            )
+            .expect("insert workspace membership");
+        }
+
+        db_execute!(
+            &db,
+            "INSERT INTO teams (team_id, workspace_id, name, key) VALUES ($1, $2, $3, $4)",
+            TEAM_A,
+            WS_A,
+            "Alpha",
+            "ALP"
+        )
+        .expect("insert team A");
+        db_execute!(
+            &db,
+            "INSERT INTO teams (team_id, workspace_id, name, key) VALUES ($1, $2, $3, $4)",
+            TEAM_B,
+            WS_B,
+            "Beta",
+            "BET"
+        )
+        .expect("insert team B");
+
+        db_execute!(
+            &db,
+            "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)",
+            TEAM_B,
+            USER_B,
+            "member"
+        )
+        .expect("seed the existing membership in workspace B");
+
+        db
+    }
+
+    /// Number of `team_members` rows for a team. Read straight from the table:
+    /// the whole point is not to take the mutation's return value for it.
+    async fn member_count(db: &DbPool, team_id: &str) -> i64 {
+        trakkt_core::db_fetch_scalar!(
+            db,
+            i64,
+            "SELECT COUNT(*) FROM team_members WHERE team_id = $1",
+            team_id
+        )
+        .expect("count team members")
+    }
+
+    async fn member_role(db: &DbPool, team_id: &str, user_id: &str) -> Option<String> {
+        #[derive(sqlx::FromRow)]
+        struct RoleRow {
+            role: Option<String>,
+        }
+        let row = trakkt_core::db_fetch_optional!(
+            db,
+            RoleRow,
+            "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2",
+            team_id,
+            user_id
+        )
+        .expect("read member role");
+        row.and_then(|r| r.role)
+    }
+
+    async fn sync_rows_for_workspace(db: &DbPool, workspace_id: &str) -> i64 {
+        trakkt_core::db_fetch_scalar!(
+            db,
+            i64,
+            "SELECT COUNT(*) FROM sync_log WHERE workspace_id = $1",
+            workspace_id
+        )
+        .expect("count sync log rows")
+    }
+
+    #[tokio::test]
+    async fn add_team_member_refuses_a_team_in_another_workspace() {
+        let db = two_workspaces().await;
+        let before = member_count(&db, TEAM_B).await;
+
+        let result = add_team_member(&db, TEAM_B, USER_A, "member", WS_A).await;
+
+        assert!(
+            matches!(result, Err(trakkt_core::Error::NotFound(_))),
+            "a team id from another workspace must be indistinguishable from a \
+             team id that does not exist, got {result:?}"
+        );
+        assert_eq!(
+            member_count(&db, TEAM_B).await,
+            before,
+            "the foreign team's membership must be untouched"
+        );
+        assert_eq!(
+            member_role(&db, TEAM_B, USER_A).await,
+            None,
+            "the caller must not have inserted themselves into the foreign team"
+        );
+        assert_eq!(
+            sync_rows_for_workspace(&db, WS_B).await,
+            0,
+            "no sync_log row may be written into a workspace the caller cannot see"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_team_member_refuses_a_team_in_another_workspace() {
+        let db = two_workspaces().await;
+
+        let result = remove_team_member(&db, TEAM_B, USER_B, WS_A).await;
+
+        assert!(
+            matches!(result, Err(trakkt_core::Error::NotFound(_))),
+            "expected NotFound, got {result:?}"
+        );
+        assert_eq!(
+            member_count(&db, TEAM_B).await,
+            1,
+            "the seeded membership in the other workspace must survive"
+        );
+        assert_eq!(
+            member_role(&db, TEAM_B, USER_B).await.as_deref(),
+            Some("member"),
+            "the seeded membership must survive intact"
+        );
+        assert_eq!(sync_rows_for_workspace(&db, WS_B).await, 0);
+    }
+
+    #[tokio::test]
+    async fn update_team_member_role_refuses_a_team_in_another_workspace() {
+        let db = two_workspaces().await;
+
+        let result = update_team_member_role(&db, TEAM_B, USER_B, "lead", WS_A).await;
+
+        assert!(
+            matches!(result, Err(trakkt_core::Error::NotFound(_))),
+            "expected NotFound, got {result:?}"
+        );
+        assert_eq!(
+            member_role(&db, TEAM_B, USER_B).await.as_deref(),
+            Some("member"),
+            "the role in the other workspace must be unchanged"
+        );
+        assert_eq!(sync_rows_for_workspace(&db, WS_B).await, 0);
+    }
+
+    #[tokio::test]
+    async fn membership_mutations_still_work_within_the_workspace() {
+        let db = two_workspaces().await;
+        assert_eq!(member_count(&db, TEAM_A).await, 0);
+
+        add_team_member(&db, TEAM_A, USER_A, "member", WS_A)
+            .await
+            .expect("adding a member to a team in the caller's own workspace");
+        assert_eq!(member_count(&db, TEAM_A).await, 1);
+        assert_eq!(member_role(&db, TEAM_A, USER_A).await.as_deref(), Some("member"));
+
+        update_team_member_role(&db, TEAM_A, USER_A, "lead", WS_A)
+            .await
+            .expect("promoting a member of a team in the caller's own workspace");
+        assert_eq!(member_role(&db, TEAM_A, USER_A).await.as_deref(), Some("lead"));
+
+        remove_team_member(&db, TEAM_A, USER_A, WS_A)
+            .await
+            .expect("removing a member of a team in the caller's own workspace");
+        assert_eq!(member_count(&db, TEAM_A).await, 0);
+
+        assert_eq!(
+            sync_rows_for_workspace(&db, WS_A).await,
+            3,
+            "each of the three membership changes reports itself as a team update"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_team_member_is_idempotent_within_the_workspace() {
+        let db = two_workspaces().await;
+
+        for _ in 0..2 {
+            add_team_member(&db, TEAM_A, USER_A, "member", WS_A)
+                .await
+                .expect("re-adding an existing member stays a no-op, not an error");
+        }
+        assert_eq!(member_count(&db, TEAM_A).await, 1);
+    }
+
+    #[tokio::test]
+    async fn get_team_in_workspace_hides_a_team_from_another_workspace() {
+        let db = two_workspaces().await;
+
+        assert!(
+            get_team(&db, TEAM_B).await.expect("unscoped read").is_some(),
+            "the team really does exist — the scoped read below has to be what hides it"
+        );
+        assert!(
+            matches!(
+                get_team_in_workspace(&db, TEAM_B, WS_A).await,
+                Err(trakkt_core::Error::NotFound(_))
+            ),
+            "a team in another workspace must read as missing"
+        );
+
+        let team = get_team_in_workspace(&db, TEAM_A, WS_A)
+            .await
+            .expect("a team in the caller's own workspace resolves");
+        assert_eq!(team.team_id, TEAM_A);
+        assert_eq!(team.workspace_id, WS_A);
+    }
 }

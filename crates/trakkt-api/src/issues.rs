@@ -314,9 +314,10 @@ pub async fn create_issue(
             .ok_or_else(|| ApiError::BadRequest(format!("No team found with key '{key}'")))?;
         (team.team_id, team.key)
     } else if let Some(ref id) = params.team_id {
-        let team = team_service::get_team(ctx.db, id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("team {id} not found")))?;
+        // Scoped to the caller's workspace: an unscoped lookup would let a
+        // caller file an issue against another workspace's team, and leak that
+        // team's key back in the issue identifier.
+        let team = team_service::get_team_in_workspace(ctx.db, id, &ctx.workspace_id).await?;
         (team.team_id, team.key)
     } else {
         let default_team =
