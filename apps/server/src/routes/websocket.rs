@@ -15,6 +15,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
+use trakkt_auth::websocket::manager::{ConnectionHandle, WsSender};
 use trakkt_auth::{jwt, user_service};
 
 use crate::state::AppState;
@@ -81,8 +82,12 @@ async fn handle_authenticated_ws(
     };
 
     // Register with WebSocketManager (heartbeat sent automatically).
-    let (connection_id, mut manager_rx) = match state.ws_manager.connect(&user_id) {
-        Ok(conn) => conn,
+    let ConnectionHandle {
+        id: connection_id,
+        rx: mut manager_rx,
+        tx: conn_tx,
+    } = match state.ws_manager.connect(&user_id) {
+        Ok(handle) => handle,
         Err(_) => {
             close_with_code(socket, CLOSE_TOO_MANY_CONNECTIONS, "Too many connections").await;
             return;
@@ -128,10 +133,15 @@ async fn handle_authenticated_ws(
         tracing::debug!("WS send task ended for user {user_id_for_send}");
     });
 
-    let manager_clone = state.ws_manager.clone();
     let db_clone = state.db.clone();
     let user_id_for_recv = user_id.clone();
     let workspace_id_for_recv = workspace_id.clone();
+    // `conn_tx` is moved into this task and must not outlive it. The outbound
+    // task ends when `manager_rx.recv()` returns `None`, which only happens once
+    // every sender is dropped — the manager's clone goes on `disconnect()` below,
+    // and this one goes when this task returns. A clone kept alive anywhere with
+    // a longer lifetime would keep the channel open and leak the outbound task,
+    // because the `tokio::select!` below detaches the loser rather than aborting it.
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
@@ -140,7 +150,7 @@ async fn handle_authenticated_ws(
                         &text,
                         &user_id_for_recv,
                         &workspace_id_for_recv,
-                        &manager_clone,
+                        &conn_tx,
                         &db_clone,
                     )
                     .await;
@@ -274,11 +284,16 @@ fn extract_user_id_from_path(path: &str) -> &str {
 }
 
 /// Handle a client->server message on the authenticated WebSocket.
+///
+/// `conn_tx` addresses the connection that sent `text`. Every response belongs
+/// to that connection alone — routing sync responses to the user would deliver
+/// one browser's bootstrap stream (and its watermark) to the user's other
+/// browsers, which would then skip changes they never received.
 async fn handle_client_message(
     text: &str,
     user_id: &str,
     workspace_id: &str,
-    manager: &trakkt_auth::websocket::WebSocketManager,
+    conn_tx: &WsSender,
     db: &trakkt_core::DbPool,
 ) {
     let msg: serde_json::Value = match serde_json::from_str(text) {
@@ -293,14 +308,14 @@ async fn handle_client_message(
 
     match msg_type {
         "sync_bootstrap" => {
-            handle_sync_bootstrap(manager, db, user_id, workspace_id).await;
+            handle_sync_bootstrap(conn_tx, db, user_id, workspace_id).await;
         }
         "sync_delta" => {
             let last_sync_id = msg
                 .get("last_sync_id")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            handle_sync_delta(manager, db, user_id, workspace_id, last_sync_id).await;
+            handle_sync_delta(conn_tx, db, user_id, workspace_id, last_sync_id).await;
         }
         _ => {
             tracing::debug!(user_id, msg_type, "Received unknown client message type");
@@ -316,8 +331,12 @@ async fn handle_client_message(
 /// with `action = Insert`, then closes with a `SyncComplete` carrying the
 /// current `latest_sync_id`. Clients should store this ID and use `sync_delta`
 /// for subsequent reconnects.
+///
+/// The whole stream goes to `conn_tx` — the connection that asked for it — so
+/// the `SyncComplete` watermark is only ever adopted by the client that
+/// received the entities it covers.
 async fn handle_sync_bootstrap(
-    manager: &trakkt_auth::websocket::WebSocketManager,
+    conn_tx: &WsSender,
     db: &trakkt_core::DbPool,
     user_id: &str,
     workspace_id: &str,
@@ -420,75 +439,45 @@ async fn handle_sync_bootstrap(
             .unwrap_or(0);
 
     // 5. Stream each entity as a SyncAction with action=Insert.
-    let issue_values: Vec<serde_json::Value> = issues
-        .iter()
-        .filter_map(|i| serde_json::to_value(i).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::ISSUE, "issue_id", issue_values).await;
+    //
+    // Each batch is serialized only when its turn comes and the stream stops at
+    // the first failed send: once the socket is gone there is nothing to gain
+    // from serializing and queueing the remaining batches. Bailing out also
+    // skips the `SyncComplete` below, so a client that dropped mid-bootstrap
+    // never records a watermark for entities it did not receive.
+    macro_rules! stream_batch {
+        ($entity_type:expr, $id_field:expr, $values:expr) => {
+            if !stream_entities(conn_tx, workspace_id, $entity_type, $id_field, $values).await {
+                tracing::debug!(
+                    user_id,
+                    workspace_id,
+                    entity_type = $entity_type,
+                    "sync_bootstrap aborted: connection closed"
+                );
+                return;
+            }
+        };
+    }
 
-    let label_values: Vec<serde_json::Value> = labels
-        .iter()
-        .filter_map(|l| serde_json::to_value(l).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::LABEL, "label_id", label_values).await;
-
-    let status_values: Vec<serde_json::Value> = statuses
-        .iter()
-        .filter_map(|s| serde_json::to_value(s).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::STATUS, "status_id", status_values).await;
-
-    let team_values: Vec<serde_json::Value> = teams
-        .iter()
-        .filter_map(|t| serde_json::to_value(t).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::TEAM, "team_id", team_values).await;
-
-    let project_values: Vec<serde_json::Value> = projects
-        .iter()
-        .filter_map(|p| serde_json::to_value(p).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::PROJECT, "project_id", project_values).await;
-
-    let view_values: Vec<serde_json::Value> = views
-        .iter()
-        .filter_map(|v| serde_json::to_value(v).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::VIEW, "view_id", view_values).await;
-
-    let favorite_values: Vec<serde_json::Value> = favorites
-        .iter()
-        .filter_map(|f| serde_json::to_value(f).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::FAVORITE, "favorite_id", favorite_values).await;
-
-    let notification_values: Vec<serde_json::Value> = notifications
-        .iter()
-        .filter_map(|n| serde_json::to_value(n).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::NOTIFICATION, "notification_id", notification_values).await;
-
-    let comment_values: Vec<serde_json::Value> = comments
-        .iter()
-        .filter_map(|c| serde_json::to_value(c).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::COMMENT, "comment_id", comment_values).await;
-
-    let milestone_values: Vec<serde_json::Value> = milestones
-        .iter()
-        .filter_map(|m| serde_json::to_value(m).ok())
-        .collect();
-    stream_entities(manager, user_id, workspace_id, entity_types::PROJECT_MILESTONE, "milestone_id", milestone_values).await;
+    stream_batch!(entity_types::ISSUE, "issue_id", to_sync_values(&issues));
+    stream_batch!(entity_types::LABEL, "label_id", to_sync_values(&labels));
+    stream_batch!(entity_types::STATUS, "status_id", to_sync_values(&statuses));
+    stream_batch!(entity_types::TEAM, "team_id", to_sync_values(&teams));
+    stream_batch!(entity_types::PROJECT, "project_id", to_sync_values(&projects));
+    stream_batch!(entity_types::VIEW, "view_id", to_sync_values(&views));
+    stream_batch!(entity_types::FAVORITE, "favorite_id", to_sync_values(&favorites));
+    stream_batch!(entity_types::NOTIFICATION, "notification_id", to_sync_values(&notifications));
+    stream_batch!(entity_types::COMMENT, "comment_id", to_sync_values(&comments));
+    stream_batch!(entity_types::PROJECT_MILESTONE, "milestone_id", to_sync_values(&milestones));
 
     // Workspace settings is a single entity (not a list).
     if let Some(ws_settings_val) = ws_settings {
-        stream_entities(manager, user_id, workspace_id, entity_types::WORKSPACE_SETTINGS, "workspace_id", vec![ws_settings_val]).await;
+        stream_batch!(entity_types::WORKSPACE_SETTINGS, "workspace_id", vec![ws_settings_val]);
     }
 
     // 6. Signal completion with the current sync watermark.
     send_sync_response(
-        manager,
-        user_id,
+        conn_tx,
         trakkt_types::sync::SyncResponse::SyncComplete {
             last_sync_id: latest_sync_id,
         },
@@ -504,7 +493,7 @@ async fn handle_sync_bootstrap(
 /// requested `sync_id` is no longer in the log (pruned), sends `SyncReset`
 /// so the client falls back to a full bootstrap.
 async fn handle_sync_delta(
-    manager: &trakkt_auth::websocket::WebSocketManager,
+    conn_tx: &WsSender,
     db: &trakkt_core::DbPool,
     user_id: &str,
     workspace_id: &str,
@@ -527,7 +516,7 @@ async fn handle_sync_delta(
                     last_sync_id,
                     "sync_id pruned -- sending SyncReset"
                 );
-                send_sync_response(manager, user_id, SyncResponse::SyncReset).await;
+                send_sync_response(conn_tx, SyncResponse::SyncReset).await;
                 return;
             }
             Err(e) => {
@@ -538,7 +527,7 @@ async fn handle_sync_delta(
                     error = %e,
                     "DB error checking sync_id availability -- sending SyncReset"
                 );
-                send_sync_response(manager, user_id, SyncResponse::SyncReset).await;
+                send_sync_response(conn_tx, SyncResponse::SyncReset).await;
                 return;
             }
         }
@@ -550,16 +539,25 @@ async fn handle_sync_delta(
             .await
             .unwrap_or_default();
 
-    // 3. Stream each entry as a SyncAction message.
+    // 3. Stream each entry as a SyncAction message. Stop at the first failed
+    //    send — the remaining entries have nowhere to go, and skipping the
+    //    `SyncComplete` below keeps the client's stored watermark honest.
     for entry in &entries {
-        send_sync_response(manager, user_id, SyncResponse::SyncAction(entry.clone())).await;
+        if !send_sync_response(conn_tx, SyncResponse::SyncAction(entry.clone())).await {
+            tracing::debug!(
+                user_id,
+                workspace_id,
+                sync_id = entry.sync_id,
+                "sync_delta aborted: connection closed"
+            );
+            return;
+        }
     }
 
     // 4. Send SyncComplete with the latest sync_id we streamed.
     let latest_id = entries.last().map(|e| e.sync_id).unwrap_or(last_sync_id);
     send_sync_response(
-        manager,
-        user_id,
+        conn_tx,
         SyncResponse::SyncComplete {
             last_sync_id: latest_id,
         },
@@ -569,19 +567,43 @@ async fn handle_sync_delta(
     tracing::debug!(user_id, workspace_id, latest_id, "sync_delta complete");
 }
 
+/// Serialize a batch of entities for streaming.
+///
+/// An entity that cannot be serialized cannot be put on the wire at all, so it
+/// is logged and dropped rather than aborting the bootstrap.
+fn to_sync_values<T: serde::Serialize>(items: &[T]) -> Vec<serde_json::Value> {
+    items
+        .iter()
+        .filter_map(|item| match serde_json::to_value(item) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::warn!(
+                    entity = std::any::type_name::<T>(),
+                    error = %e,
+                    "Failed to serialize entity for bootstrap, skipping"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// Stream a batch of entities as individual `SyncAction(Insert)` messages.
 ///
 /// Used by `handle_sync_bootstrap` to avoid copy-pasting the same loop for
 /// each entity type. `id_field` is the JSON key that holds the entity's
 /// primary key (e.g. `"issue_id"`, `"label_id"`).
+///
+/// Returns `false` as soon as a frame cannot be delivered, leaving the rest of
+/// `items` unsent — the caller must abandon the stream rather than keep
+/// serializing into a closed channel.
 async fn stream_entities(
-    manager: &trakkt_auth::websocket::WebSocketManager,
-    user_id: &str,
+    conn_tx: &WsSender,
     workspace_id: &str,
     entity_type: &str,
     id_field: &str,
     items: Vec<serde_json::Value>,
-) {
+) -> bool {
     use trakkt_types::sync::{SyncAction, SyncActionType, SyncResponse};
 
     for item in items {
@@ -605,24 +627,37 @@ async fn stream_entities(
             data: Some(item),
             timestamp,
         };
-        send_sync_response(manager, user_id, SyncResponse::SyncAction(action)).await;
+        if !send_sync_response(conn_tx, SyncResponse::SyncAction(action)).await {
+            return false;
+        }
     }
+
+    true
 }
 
-/// Send a `SyncResponse` to a specific user over WebSocket.
+/// Send a `SyncResponse` to the connection that requested it.
+///
+/// Writes straight to that connection's outbound channel with `.send().await`:
+/// real backpressure (never dropped on a full buffer), and no fan-out to the
+/// user's other connections. The requesting socket is by definition local to
+/// this pod, so this never needs the user-routing or Redis layers.
+///
+/// Returns `false` when nothing was delivered — either the receiver is gone
+/// (connection dead) or the response could not be serialized. Callers stop
+/// streaming on `false`; a partial stream that still ended in `SyncComplete`
+/// would hand the client a watermark covering data it never got.
 async fn send_sync_response(
-    manager: &trakkt_auth::websocket::WebSocketManager,
-    user_id: &str,
+    conn_tx: &WsSender,
     response: trakkt_types::sync::SyncResponse,
-) {
+) -> bool {
     let json = match serde_json::to_string(&response) {
         Ok(j) => j,
         Err(e) => {
             tracing::warn!("Failed to serialize SyncResponse: {e}");
-            return;
+            return false;
         }
     };
-    manager.send_to_user_raw_backpressure(user_id, &json).await;
+    conn_tx.send(json).await.is_ok()
 }
 
 // ===========================================================================
@@ -642,6 +677,125 @@ async fn close_with_code(socket: ws::WebSocket, code: u16, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tokio::sync::mpsc;
+    use trakkt_types::sync::{entity_types, SyncActionType, SyncResponse};
+
+    /// Minimal issue-shaped JSON — `stream_entities` only reads the id field
+    /// and the timestamp, so no DB round-trip is needed.
+    fn issue_value(issue_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "issue_id": issue_id,
+            "title": "streamed issue",
+            "updated_at": "2026-07-26T12:00:00Z",
+        })
+    }
+
+    fn parse_frame(frame: &str) -> SyncResponse {
+        serde_json::from_str(frame).expect("frame deserializes as a SyncResponse")
+    }
+
+    #[tokio::test]
+    async fn stream_entities_writes_one_frame_per_item_in_order() {
+        let (conn_tx, mut conn_rx) = mpsc::channel::<String>(16);
+        let items = vec![
+            issue_value("iss_1"),
+            issue_value("iss_2"),
+            issue_value("iss_3"),
+        ];
+
+        assert!(
+            stream_entities(&conn_tx, "ws_1", entity_types::ISSUE, "issue_id", items).await,
+            "streaming to a live connection must report success"
+        );
+        drop(conn_tx);
+
+        let mut streamed_ids = Vec::new();
+        while let Some(frame) = conn_rx.recv().await {
+            match parse_frame(&frame) {
+                SyncResponse::SyncAction(action) => {
+                    assert_eq!(action.entity_type, entity_types::ISSUE);
+                    assert_eq!(action.workspace_id, "ws_1");
+                    assert!(matches!(action.action, SyncActionType::Insert));
+                    streamed_ids.push(action.entity_id);
+                }
+                other => panic!("expected SyncAction, got {other:?}"),
+            }
+        }
+
+        assert_eq!(streamed_ids, vec!["iss_1", "iss_2", "iss_3"]);
+    }
+
+    #[tokio::test]
+    async fn stream_entities_stops_early_when_the_connection_dies() {
+        // Capacity 1 means the stream can never run ahead of the receiver by
+        // more than one frame, so closing the channel after the first frame
+        // lands squarely in the middle of the batch.
+        let (conn_tx, mut conn_rx) = mpsc::channel::<String>(1);
+        let items: Vec<serde_json::Value> = (0..50)
+            .map(|i| issue_value(&format!("iss_{i}")))
+            .collect();
+        let item_count = items.len();
+
+        let streamer = tokio::spawn(async move {
+            stream_entities(&conn_tx, "ws_1", entity_types::ISSUE, "issue_id", items).await
+        });
+
+        // Receiving the first frame proves the stream is under way; closing then
+        // fails every subsequent send.
+        let first = conn_rx.recv().await.expect("first frame");
+        match parse_frame(&first) {
+            SyncResponse::SyncAction(action) => assert_eq!(action.entity_id, "iss_0"),
+            other => panic!("expected SyncAction, got {other:?}"),
+        }
+        conn_rx.close();
+
+        assert!(
+            !streamer.await.expect("stream task completes"),
+            "a dead connection must be reported to the caller"
+        );
+
+        let mut delivered = 1;
+        while conn_rx.recv().await.is_some() {
+            delivered += 1;
+        }
+        assert!(
+            delivered < item_count,
+            "stream must abandon the batch, but delivered all {item_count} items"
+        );
+        // Capacity 1 bounds the in-flight frames: the first frame, plus at most
+        // one that was buffered before the close took effect.
+        assert!(
+            delivered <= 2,
+            "expected the stream to stop within one frame of the close, delivered {delivered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_sync_response_delivers_and_round_trips() {
+        let (conn_tx, mut conn_rx) = mpsc::channel::<String>(4);
+
+        assert!(send_sync_response(&conn_tx, SyncResponse::SyncComplete { last_sync_id: 42 }).await);
+        assert!(send_sync_response(&conn_tx, SyncResponse::SyncReset).await);
+
+        let complete = conn_rx.recv().await.expect("SyncComplete frame");
+        match parse_frame(&complete) {
+            SyncResponse::SyncComplete { last_sync_id } => assert_eq!(last_sync_id, 42),
+            other => panic!("expected SyncComplete, got {other:?}"),
+        }
+
+        let reset = conn_rx.recv().await.expect("SyncReset frame");
+        assert!(matches!(parse_frame(&reset), SyncResponse::SyncReset));
+    }
+
+    #[tokio::test]
+    async fn send_sync_response_reports_failure_when_the_receiver_is_gone() {
+        let (conn_tx, conn_rx) = mpsc::channel::<String>(4);
+        drop(conn_rx);
+
+        assert!(!send_sync_response(&conn_tx, SyncResponse::SyncComplete { last_sync_id: 7 }).await);
+        assert!(!send_sync_response(&conn_tx, SyncResponse::SyncReset).await);
+    }
 
     #[test]
     fn extract_user_id_plain() {

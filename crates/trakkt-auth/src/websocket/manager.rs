@@ -17,7 +17,6 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -60,6 +59,21 @@ impl Hash for TrackedConnection {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
+}
+
+/// Everything a caller needs to drive one registered WebSocket connection.
+///
+/// `rx` feeds the connection's outbound socket task. `tx` addresses *this*
+/// connection alone — request/response traffic (sync bootstrap, delta,
+/// complete, reset) must use it so a response is never fanned out to the
+/// user's other connections, which would corrupt their sync watermarks.
+pub struct ConnectionHandle {
+    /// Unique ID of this connection, required to `disconnect()` it later.
+    pub id: u64,
+    /// Receiving end of the connection's outbound queue.
+    pub rx: mpsc::Receiver<String>,
+    /// Sending end of the connection's outbound queue.
+    pub tx: WsSender,
 }
 
 /// Redis pub/sub channel prefix for user messages.
@@ -108,12 +122,13 @@ impl WebSocketManager {
 
     /// Register a new WebSocket connection for a user.
     ///
-    /// Returns `Ok((connection_id, Receiver))` on success, or `Err(())` if the
-    /// user has reached `MAX_CONNECTIONS_PER_USER`. The caller should forward
-    /// items from the receiver to the actual WebSocket sink.
+    /// Returns a [`ConnectionHandle`] on success, or `Err` if the user has
+    /// reached `MAX_CONNECTIONS_PER_USER`. The caller should forward items from
+    /// `handle.rx` to the actual WebSocket sink, and use `handle.tx` to address
+    /// this connection alone.
     ///
     /// Starts a Redis subscriber if this is the first connection for the user.
-    pub fn connect(&self, user_id: &str) -> Result<(u64, mpsc::Receiver<String>), String> {
+    pub fn connect(&self, user_id: &str) -> Result<ConnectionHandle, String> {
         // Prune stale connections before checking the limit.
         // A connection is stale when its mpsc sender is closed (the outbound
         // task dropped the receiver — e.g., after a server restart killed the
@@ -150,7 +165,7 @@ impl WebSocketManager {
 
         let conn = TrackedConnection {
             id: conn_id,
-            sender: tx,
+            sender: tx.clone(),
         };
 
         // Add to local connections.
@@ -171,7 +186,11 @@ impl WebSocketManager {
             self.deliver_to_local_user(user_id, &json);
         }
 
-        Ok((conn_id, rx))
+        Ok(ConnectionHandle {
+            id: conn_id,
+            rx,
+            tx,
+        })
     }
 
     /// Unregister a WebSocket connection.
@@ -418,101 +437,6 @@ impl WebSocketManager {
             conns.retain(|c| !stale_ids.contains(&c.id));
         }
     }
-
-    /// Deliver a JSON-encoded message to all local WebSocket connections for a user,
-    /// waiting for channel capacity instead of dropping on full buffer.
-    ///
-    /// Uses `.send().await` — blocks until the channel has capacity or a 30-second
-    /// timeout expires. Timed-out or closed connections are treated as stale and
-    /// cleaned up.
-    ///
-    /// Senders are cloned out of the DashMap before awaiting — holding a DashMap
-    /// `Ref` across an await point would deadlock any concurrent connect/disconnect
-    /// on the same shard.
-    async fn deliver_to_local_user_backpressure(&self, user_id: &str, json: &str) {
-        let senders: Vec<(u64, mpsc::Sender<String>)> = {
-            match self.inner.connections.get(user_id) {
-                Some(conns) => conns.value().iter().map(|c| (c.id, c.sender.clone())).collect(),
-                None => return,
-            }
-        };
-
-        let mut stale_ids: Vec<u64> = Vec::new();
-
-        for (id, sender) in &senders {
-            match tokio::time::timeout(
-                Duration::from_secs(30),
-                sender.send(json.to_string()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        user_id,
-                        connection_id = id,
-                        error = %e,
-                        "WebSocket backpressure send failed (connection closed)"
-                    );
-                    stale_ids.push(*id);
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        user_id,
-                        connection_id = id,
-                        "WebSocket backpressure send timed out after 30s, treating as stale"
-                    );
-                    stale_ids.push(*id);
-                }
-            }
-        }
-
-        // Clean up stale connections.
-        if !stale_ids.is_empty()
-            && let Some(mut conns) = self.inner.connections.get_mut(user_id)
-        {
-            conns.retain(|c| !stale_ids.contains(&c.id));
-        }
-    }
-
-    /// Route a pre-serialized JSON message to a user with backpressure.
-    ///
-    /// Same routing logic as `deliver()` — Redis PUBLISH for multi-replica,
-    /// local delivery for single-instance — but local delivery uses
-    /// `deliver_to_local_user_backpressure` which waits for channel capacity
-    /// instead of dropping messages.
-    ///
-    /// **Multi-replica limitation:** backpressure only applies on the PUBLISH
-    /// side. The receiving pod's Redis subscriber still uses `deliver_to_local_user`
-    /// (`try_send`), so a slow client on a remote pod will see dropped messages
-    /// rather than sender-side blocking. For single-instance deployments (no
-    /// Redis), backpressure is fully end-to-end. Fixing the multi-replica path
-    /// would require changing the Redis subscriber loop, which is out of scope.
-    async fn deliver_backpressure(&self, user_id: &str, json: &str) {
-        if let Some((redis, _)) = &self.inner.redis {
-            let channel = format!("{REDIS_CHANNEL_PREFIX}{user_id}");
-            let mut conn = redis.clone();
-            if let Err(e) = redis::cmd("PUBLISH")
-                .arg(&channel)
-                .arg(json)
-                .query_async::<i64>(&mut conn)
-                .await
-            {
-                tracing::error!("Redis PUBLISH to {channel} failed: {e}");
-            }
-        } else {
-            self.deliver_to_local_user_backpressure(user_id, json).await;
-        }
-    }
-
-    /// Send a pre-serialized JSON string to a user with backpressure.
-    ///
-    /// Used by the sync protocol (bootstrap + delta) where dropping messages
-    /// would break the sync guarantee. Waits for channel capacity instead of
-    /// dropping on full buffer.
-    pub async fn send_to_user_raw_backpressure(&self, user_id: &str, json: &str) {
-        self.deliver_backpressure(user_id, json).await;
-    }
 }
 
 impl std::fmt::Debug for WebSocketManager {
@@ -521,5 +445,80 @@ impl std::fmt::Debug for WebSocketManager {
             .field("local_users", &self.inner.connections.len())
             .field("local_connections", &self.local_connection_count())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Single-instance manager (no Redis) backed by a throwaway in-memory DB.
+    /// None of the paths exercised here run a query; the pool only satisfies
+    /// `WebSocketManager::new`.
+    async fn test_manager() -> WebSocketManager {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+        WebSocketManager::new(None, db)
+    }
+
+    /// `connect()` heartbeats every local connection of the user, so a receiver
+    /// starts with one frame per connect that happened after it registered.
+    /// Drain them so the assertions below only observe test traffic.
+    async fn drain_heartbeats(rx: &mut mpsc::Receiver<String>, expected: usize) {
+        for _ in 0..expected {
+            let frame = rx.recv().await.expect("heartbeat frame");
+            let parsed: WebSocketMessage =
+                serde_json::from_str(&frame).expect("heartbeat frame is a WebSocketMessage");
+            assert!(
+                matches!(parsed.msg_type, trakkt_core::MessageType::Heartbeat),
+                "expected heartbeat, got {frame}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_sender_addresses_only_its_own_connection() {
+        let manager = test_manager().await;
+        let user_id = "usr_two_browsers";
+
+        let mut first = manager.connect(user_id).expect("first connection");
+        let mut second = manager.connect(user_id).expect("second connection");
+
+        // `first` saw its own connect heartbeat plus the one `second` triggered.
+        drain_heartbeats(&mut first.rx, 2).await;
+        drain_heartbeats(&mut second.rx, 1).await;
+
+        first
+            .tx
+            .send("bootstrap-for-first".to_string())
+            .await
+            .expect("send to the first connection");
+
+        assert_eq!(
+            first.rx.recv().await.as_deref(),
+            Some("bootstrap-for-first")
+        );
+        assert!(
+            matches!(second.rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the second connection must not observe the first connection's sync traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_broadcast_still_reaches_every_connection_of_the_user() {
+        let manager = test_manager().await;
+        let user_id = "usr_two_browsers";
+
+        let mut first = manager.connect(user_id).expect("first connection");
+        let mut second = manager.connect(user_id).expect("second connection");
+
+        drain_heartbeats(&mut first.rx, 2).await;
+        drain_heartbeats(&mut second.rx, 1).await;
+
+        manager.deliver_to_local_user(user_id, "workspace-broadcast");
+
+        assert_eq!(first.rx.recv().await.as_deref(), Some("workspace-broadcast"));
+        assert_eq!(second.rx.recv().await.as_deref(), Some("workspace-broadcast"));
     }
 }
