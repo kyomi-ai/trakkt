@@ -4,7 +4,7 @@
 //! the configured archive threshold and marks them archived.
 
 use trakkt_core::sql_compat;
-use trakkt_core::{db_execute, db_fetch_all, DbPool};
+use trakkt_core::{db_fetch_all, DbPool};
 use trakkt_types::sync::{entity_types, SyncActionType};
 
 use crate::sync_log_service;
@@ -37,6 +37,30 @@ struct IssueIdRow {
 /// remove it from their local store.
 ///
 /// Returns the total number of issues archived.
+///
+/// # One transaction per issue
+///
+/// The unit that has to be atomic is one issue: its `archived_at` stamp and the
+/// Delete entry telling clients to drop it. An issue archived with no entry
+/// disappears from the server and stays on every client forever, so those two
+/// commit together.
+///
+/// The sweep as a whole is deliberately *not* one transaction, which is the
+/// opposite call from `release_service::create_release` and for the opposite
+/// reason. A release is one fact whose parts mean nothing apart; a sweep is a
+/// batch of independent decisions about unrelated issues in unrelated
+/// workspaces. Nothing about archiving issue A depends on issue B, so one
+/// unreadable row undoing an hour of archiving across every workspace would
+/// destroy work for no correctness gain. Wrapping the sweep would also hold a
+/// write transaction — on SQLite, the process's only connection — open across
+/// the whole run, blocking every request the server is serving, and would make
+/// the yield below actively harmful rather than merely pointless.
+///
+/// Partial progress is safe here because the selection predicate is
+/// `archived_at IS NULL`: whatever this run did not reach is simply found again
+/// by the next one. So a failure aborts the sweep and is returned to the caller
+/// — nothing is swallowed — while the issues already archived stay archived,
+/// each with its own entry.
 pub async fn run_archive_sweep(
     db: &DbPool,
     ws_manager: &WebSocketManager,
@@ -83,40 +107,32 @@ pub async fn run_archive_sweep(
 
         // Process in chunks of 100, yielding between chunks.
         for (idx, issue) in issues.iter().enumerate() {
-            db_execute!(db, &update_sql, &issue.issue_id)?;
+            // One issue, one transaction: the stamp and the entry that reports
+            // it, and nothing else. `commit_and_deliver` takes it by value, so
+            // the broadcast — which reads `workspace_users` off the pool the
+            // transaction is holding — cannot run before the commit.
+            let mut tx = db.begin().await?;
 
-            let sync_id = sync_log_service::write_sync_entry(
-                db,
+            trakkt_core::tx_execute!(&mut tx, &update_sql, &issue.issue_id)?;
+
+            sync_log_service::commit_and_deliver(
+                tx,
                 entity_types::ISSUE,
                 &issue.issue_id,
                 &team.workspace_id,
-                None,
+                sync_log_service::SyncAudience::Workspace,
                 SyncActionType::Delete,
                 None,
+                Some(ws_manager),
             )
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    issue_id = %issue.issue_id,
-                    "Failed to write sync log entry for archive"
-                );
-                0
-            });
-
-            sync_log_service::broadcast_sync_action(
-                ws_manager,
-                &team.workspace_id,
-                entity_types::ISSUE,
-                &issue.issue_id,
-                SyncActionType::Delete,
-                None,
-                sync_id,
-            )
-            .await;
+            .await?;
 
             total_archived += 1;
 
+            // Outside the transaction by construction: the yield is between
+            // issues, and holding the SQLite connection across an await that
+            // hands control to the rest of the server is the deadlock this
+            // whole ordering exists to avoid.
             if (idx + 1) % 100 == 0 {
                 tokio::task::yield_now().await;
             }

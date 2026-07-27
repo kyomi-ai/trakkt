@@ -621,6 +621,11 @@ impl<'a> SyncAudience<'a> {
 /// handing it over — the new state is not visible on the pool until the commit,
 /// and on SQLite the pool is not reachable at all while the transaction is open.
 ///
+/// One entry per transaction. A mutation that writes several — a loop stamping
+/// N issues, plus a row describing the batch as a whole — has N deliveries
+/// against one commit and wants [`SyncBatch`], which this function is a
+/// one-entry case of.
+///
 /// Not every commit-then-deliver helper belongs here.
 /// `team_service::commit_team_update` reads the same way at a glance but is a
 /// different function: it does its own transaction-scoped read-back of the team,
@@ -638,53 +643,166 @@ pub(crate) async fn commit_and_deliver(
     payload: Option<serde_json::Value>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    let sync_id = write_sync_entry_in_tx(
-        &mut tx,
-        entity_type,
-        entity_id,
-        workspace_id,
-        audience.visibility_user_id(),
-        action.clone(),
-        payload.clone(),
-    )
-    .await?;
+    let mut batch = SyncBatch::new();
+    batch
+        .record(
+            &mut tx,
+            entity_type,
+            entity_id,
+            workspace_id,
+            audience,
+            action,
+            payload,
+        )
+        .await?;
+    batch.commit_and_deliver(tx, ws_manager).await
+}
 
-    tx.commit().await?;
+/// The sync entries a transaction has written, held undelivered until it
+/// commits.
+///
+/// [`commit_and_deliver`] is the whole story for a mutation that writes one
+/// entry: it owns the transaction, so delivering before the commit is not
+/// something its caller can express. A mutation that writes *several* cannot use
+/// it — a release stamps one ISSUE entry per issue inside a loop and one RELEASE
+/// entry after it, which is N deliveries against a single commit.
+///
+/// Written by hand, that shape breaks the ordering rule almost by default: the
+/// obvious place to put the delivery is beside the write, inside the loop, and a
+/// delivery there runs while the transaction is still open. That is not a style
+/// slip. [`broadcast_sync_action`] resolves its recipients with a `db_fetch_all!`
+/// on the pool, and the SQLite pool is pinned to one connection which the
+/// transaction is holding — so the first iteration deadlocks and the sweep never
+/// returns (see [`DbTx`]).
+///
+/// So the two halves are kept apart by the type. [`SyncBatch::record`] is the
+/// only way to add an entry and it takes a `&mut DbTx` and no
+/// [`WebSocketManager`] — inside the loop, where the mistake lives, there is
+/// nothing to deliver *with*. [`SyncBatch::commit_and_deliver`] is the only way
+/// to deliver and it takes the transaction by value, so it cannot run before the
+/// commit it performs itself.
+pub(crate) struct SyncBatch<'a> {
+    entries: Vec<RecordedEntry<'a>>,
+}
 
-    // Delivery mirrors the column written above — the same `audience` drives
-    // both, so the live frame can never reach an audience the persisted row
-    // would not.
-    if let Some(ws) = ws_manager {
-        match audience {
-            SyncAudience::Workspace => {
-                broadcast_sync_action(
-                    ws,
-                    workspace_id,
-                    entity_type,
-                    entity_id,
-                    action,
-                    payload,
-                    sync_id,
-                )
-                .await;
-            }
-            SyncAudience::User(user_id) => {
-                send_sync_action_to_user(
-                    ws,
-                    user_id,
-                    workspace_id,
-                    entity_type,
-                    entity_id,
-                    action,
-                    payload,
-                    sync_id,
-                )
-                .await;
-            }
+/// One `sync_log` row already written on the transaction, plus everything its
+/// delivery needs once the commit makes it real.
+struct RecordedEntry<'a> {
+    entity_type: String,
+    entity_id: String,
+    workspace_id: String,
+    audience: SyncAudience<'a>,
+    action: SyncActionType,
+    payload: Option<serde_json::Value>,
+    sync_id: i64,
+}
+
+impl<'a> SyncBatch<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
         }
     }
 
-    Ok(())
+    /// Write one `sync_log` entry on `tx` and hold its delivery until the
+    /// commit.
+    ///
+    /// The entry lands in the caller's transaction, so it unwinds with the
+    /// mutation it describes — including the entries earlier iterations already
+    /// wrote and the database already accepted. A failure here is returned, not
+    /// logged: an entity change with no row to replay it is invisible to every
+    /// future delta, so the change must not survive either.
+    ///
+    /// `audience` carries the same meaning it has on [`commit_and_deliver`], and
+    /// for the same reason: it decides the `visibility_user_id` column here and
+    /// the delivery call later, so the persisted row and the live frame cannot
+    /// address different people (see [`SyncAudience`]).
+    pub(crate) async fn record(
+        &mut self,
+        tx: &mut DbTx,
+        entity_type: &str,
+        entity_id: &str,
+        workspace_id: &str,
+        audience: SyncAudience<'a>,
+        action: SyncActionType,
+        payload: Option<serde_json::Value>,
+    ) -> trakkt_core::Result<()> {
+        let sync_id = write_sync_entry_in_tx(
+            tx,
+            entity_type,
+            entity_id,
+            workspace_id,
+            audience.visibility_user_id(),
+            action.clone(),
+            payload.clone(),
+        )
+        .await?;
+
+        self.entries.push(RecordedEntry {
+            entity_type: entity_type.to_string(),
+            entity_id: entity_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            audience,
+            action,
+            payload,
+            sync_id,
+        });
+
+        Ok(())
+    }
+
+    /// Commit `tx`, then deliver every recorded entry in the order it was
+    /// written.
+    ///
+    /// Nothing is delivered if the commit fails: the rows the frames describe do
+    /// not exist, and each `sync_id` held above would address a row that was
+    /// rolled back.
+    pub(crate) async fn commit_and_deliver(
+        self,
+        tx: DbTx,
+        ws_manager: Option<&WebSocketManager>,
+    ) -> trakkt_core::Result<()> {
+        tx.commit().await?;
+
+        let Some(ws) = ws_manager else {
+            return Ok(());
+        };
+
+        for entry in self.entries {
+            // Delivery mirrors the column written by `record` — the same
+            // `audience` drives both, so the live frame can never reach an
+            // audience the persisted row would not.
+            match entry.audience {
+                SyncAudience::Workspace => {
+                    broadcast_sync_action(
+                        ws,
+                        &entry.workspace_id,
+                        &entry.entity_type,
+                        &entry.entity_id,
+                        entry.action,
+                        entry.payload,
+                        entry.sync_id,
+                    )
+                    .await;
+                }
+                SyncAudience::User(user_id) => {
+                    send_sync_action_to_user(
+                        ws,
+                        user_id,
+                        &entry.workspace_id,
+                        &entry.entity_type,
+                        &entry.entity_id,
+                        entry.action,
+                        entry.payload,
+                        entry.sync_id,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -2586,6 +2704,45 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'sync_log insert rejected'); END"
         );
         db_execute!(db, &sql).expect("install scoped sync_log rejection trigger");
+    }
+
+    /// Reject `sync_log` INSERTs for one entity *type* only.
+    ///
+    /// The entity-id narrowing above needs the id up front, which rules it out
+    /// for a row the service invents: `create_release` mints its own UUID. The
+    /// type is known, and here it is the axis under test anyway — the RELEASE
+    /// entry is the last write of a transaction that has already had N ISSUE
+    /// entries accepted, and rejecting it is what proves they unwind with it.
+    async fn reject_sync_log_inserts_for_entity_type(db: &DbPool, entity_type: &str) {
+        let sql = format!(
+            "CREATE TRIGGER reject_sync_log_for_entity_type BEFORE INSERT ON sync_log \
+             WHEN NEW.entity_type = '{entity_type}' \
+             BEGIN SELECT RAISE(ABORT, 'sync_log insert rejected'); END"
+        );
+        db_execute!(db, &sql).expect("install entity-type sync_log rejection trigger");
+    }
+
+    /// Accept the first `sync_log` INSERT and reject every one after it.
+    ///
+    /// For a loop whose iteration order is not fixed by the caller.
+    /// `run_archive_sweep` selects its issues with no `ORDER BY`, so a trigger
+    /// naming one issue would land on the first iteration or the second
+    /// depending on the query plan, and the test would prove different things on
+    /// different days. Counting rows instead puts the failure on a later
+    /// iteration whichever issue that turns out to be.
+    ///
+    /// The `WHEN` clause sees uncommitted rows written by the same transaction,
+    /// because it evaluates on that transaction's own connection — so this
+    /// rejects the second entry of one multi-entry transaction just as it
+    /// rejects the second of several single-entry ones.
+    async fn reject_sync_log_inserts_after_the_first(db: &DbPool) {
+        db_execute!(
+            db,
+            "CREATE TRIGGER reject_sync_log_after_first BEFORE INSERT ON sync_log \
+             WHEN (SELECT COUNT(*) FROM sync_log) >= 1 \
+             BEGIN SELECT RAISE(ABORT, 'sync_log insert rejected'); END"
+        )
+        .expect("install after-the-first sync_log rejection trigger");
     }
 
     async fn count_scalar(db: &DbPool, sql: &str, bind: &str) -> i64 {
@@ -5391,4 +5548,657 @@ mod tests {
             "a shared view must still broadcast to every member"
         );
     }
+
+    // ─── Loop-shaped mutations (TRA-9951) ────────────────────────────────────
+    //
+    // `create_release` and `run_archive_sweep` both write a sync entry inside a
+    // loop, and they take opposite transaction boundaries on purpose: the
+    // release is one transaction for the whole loop, the sweep is one per
+    // iteration. Each pair of tests below pins the boundary its function chose,
+    // so swapping them silently is not possible.
+
+    /// A second eligible issue, so the loops below have a first iteration and a
+    /// later one. Issue numbers are workspace-unique, hence `2`.
+    async fn seed_second_issue(db: &DbPool) {
+        db_execute!(
+            db,
+            "INSERT INTO issues \
+                (issue_id, workspace_id, team_id, number, title, creator_id, status_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "iss_second",
+            WS,
+            "team_vis",
+            2_i32,
+            "The later iteration",
+            USER_A,
+            "sts_vis"
+        )
+        .expect("insert the second issue");
+    }
+
+    /// Everything `create_release` writes, read straight from the tables.
+    ///
+    /// Every field is an ordered `Vec` of the rows themselves. A count would
+    /// pass just as happily on a release that came back with the wrong issues,
+    /// or on a `released_at` stamp left behind by a rolled-back loop.
+    #[derive(Debug, PartialEq)]
+    struct ReleaseFootprint {
+        releases: Vec<(String, String)>,
+        release_issues: Vec<(String, String)>,
+        released_at: Vec<(String, Option<String>)>,
+        sync_entries: Vec<(String, String, String)>,
+    }
+
+    async fn release_footprint(db: &DbPool) -> ReleaseFootprint {
+        #[derive(sqlx::FromRow)]
+        struct ReleaseIdRow {
+            release_id: String,
+            tag_name: String,
+        }
+        #[derive(sqlx::FromRow)]
+        struct ReleaseIssueIdRow {
+            release_id: String,
+            issue_id: String,
+        }
+        #[derive(sqlx::FromRow)]
+        struct ReleasedAtRow {
+            issue_id: String,
+            released_at: Option<String>,
+        }
+
+        let releases: Vec<ReleaseIdRow> = db_fetch_all!(
+            db,
+            ReleaseIdRow,
+            "SELECT release_id, tag_name FROM releases ORDER BY release_id"
+        )
+        .expect("read releases back");
+
+        let release_issues: Vec<ReleaseIssueIdRow> = db_fetch_all!(
+            db,
+            ReleaseIssueIdRow,
+            "SELECT release_id, issue_id FROM release_issues \
+             ORDER BY release_id, issue_id"
+        )
+        .expect("read release_issues back");
+
+        let released_at: Vec<ReleasedAtRow> = db_fetch_all!(
+            db,
+            ReleasedAtRow,
+            "SELECT issue_id, CAST(released_at AS TEXT) AS released_at FROM issues \
+             ORDER BY issue_id"
+        )
+        .expect("read released_at back");
+
+        ReleaseFootprint {
+            releases: releases
+                .into_iter()
+                .map(|r| (r.release_id, r.tag_name))
+                .collect(),
+            release_issues: release_issues
+                .into_iter()
+                .map(|r| (r.release_id, r.issue_id))
+                .collect(),
+            released_at: released_at
+                .into_iter()
+                .map(|r| (r.issue_id, r.released_at))
+                .collect(),
+            sync_entries: sync_entries(db).await,
+        }
+    }
+
+    /// Every `sync_log` row as `(entity_type, entity_id, action)`, in write
+    /// order.
+    async fn sync_entries(db: &DbPool) -> Vec<(String, String, String)> {
+        #[derive(sqlx::FromRow)]
+        struct EntryRow {
+            entity_type: String,
+            entity_id: String,
+            action: String,
+        }
+
+        let rows: Vec<EntryRow> = db_fetch_all!(
+            db,
+            EntryRow,
+            "SELECT entity_type, entity_id, action FROM sync_log ORDER BY sync_id"
+        )
+        .expect("read sync_log back");
+
+        rows.into_iter()
+            .map(|r| (r.entity_type, r.entity_id, r.action))
+            .collect()
+    }
+
+    /// The release's own entry is the last write in the transaction — after the
+    /// `releases` row, the `release_issues` rows, the `released_at` stamps and
+    /// one accepted ISSUE entry per issue. Rejecting it proves the whole loop
+    /// unwinds behind it, which is the all-or-nothing boundary `create_release`
+    /// chose.
+    ///
+    /// The trigger is narrowed to the RELEASE entity type deliberately. A
+    /// blanket one aborts on the first ISSUE entry, and this test would pass
+    /// without the release entry ever being written.
+    #[tokio::test]
+    async fn release_create_rolls_back_when_the_release_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+        let before = release_footprint(&db).await;
+        assert_eq!(
+            before.sync_entries,
+            Vec::new(),
+            "precondition: the fixture writes its rows directly, so any entry \
+             below came from the release"
+        );
+
+        reject_sync_log_inserts_for_entity_type(&db, entity_types::RELEASE).await;
+
+        let err = crate::release_service::create_release(
+            &db,
+            WS,
+            "VIS",
+            "v1.0.0",
+            None,
+            Some("Never shipped"),
+            None,
+            &["iss_vis".to_string(), "iss_second".to_string()],
+            USER_A,
+            None,
+        )
+        .await
+        .expect_err("a release whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        let after = release_footprint(&db).await;
+        assert_eq!(
+            after.releases, before.releases,
+            "a release with no sync_log row never reaches another client, so \
+             the `releases` row must be rolled back"
+        );
+        assert_eq!(
+            after.release_issues, before.release_issues,
+            "the release is gone, so nothing may still claim to belong to it"
+        );
+        assert_eq!(
+            after.released_at, before.released_at,
+            "`unreleased_issues` filters on `released_at IS NULL`, so a stamp \
+             surviving a failed release quietly withholds both issues from the \
+             next one"
+        );
+        assert_eq!(
+            after.sync_entries, before.sync_entries,
+            "both ISSUE entries were written and accepted before the release \
+             entry failed, so they are the proof of the rollback: they must not \
+             be left committed on their own"
+        );
+        assert_eq!(after, before, "nothing may be left half-applied");
+    }
+
+    /// The failure on a *later* iteration: the second issue's entry, with the
+    /// first issue's stamp and entry already accepted. Rejecting the first would
+    /// prove only that the loop is inside a transaction; rejecting the second
+    /// proves the transaction spans the whole loop.
+    #[tokio::test]
+    async fn release_create_rolls_back_when_a_later_issues_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+        let before = release_footprint(&db).await;
+
+        reject_sync_log_inserts_for_entity(&db, "iss_second").await;
+
+        let err = crate::release_service::create_release(
+            &db,
+            WS,
+            "VIS",
+            "v1.0.0",
+            None,
+            Some("Never shipped"),
+            None,
+            &["iss_vis".to_string(), "iss_second".to_string()],
+            USER_A,
+            None,
+        )
+        .await
+        .expect_err("a release whose later sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        let after = release_footprint(&db).await;
+        assert_eq!(
+            after.released_at, before.released_at,
+            "the first issue was stamped and its entry accepted before the \
+             second one failed — a per-iteration boundary would leave that \
+             stamp committed, and this release never happened"
+        );
+        assert_eq!(
+            after.sync_entries, before.sync_entries,
+            "the first issue's entry must unwind with the iteration that failed"
+        );
+        assert_eq!(after, before, "nothing may be left half-applied");
+    }
+
+    /// An issue deleted concurrently, staged as a real trigger on the
+    /// `release_issues` insert: by the time the loop reaches it, the row is gone
+    /// and its `release_issues` row has gone with it through `ON DELETE
+    /// CASCADE` — exactly the state another connection's delete would leave.
+    ///
+    /// This must stay a skip. A vanished row is not a failed sync write, and
+    /// making every failure fatal is precisely how the two get folded together.
+    ///
+    /// The skip is the `NotFound` arm of the payload read, so this test covers
+    /// that arm directly. Its complement is
+    /// [`release_create_fails_when_an_issues_payload_cannot_be_read`]: matching
+    /// on an error variant is only safe while the *other* variants still
+    /// propagate, and one test without the other would pass on a bare
+    /// `if let Err(_) = … { continue }` that swallows real database failures.
+    #[tokio::test]
+    async fn release_create_skips_an_issue_that_vanished_mid_loop() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+
+        db_execute!(
+            &db,
+            "CREATE TRIGGER vanish_second_issue AFTER INSERT ON release_issues \
+             WHEN NEW.issue_id = 'iss_second' \
+             BEGIN DELETE FROM issues WHERE issue_id = 'iss_second'; END"
+        )
+        .expect("install the concurrent-delete trigger");
+
+        let release = crate::release_service::create_release(
+            &db,
+            WS,
+            "VIS",
+            "v1.0.0",
+            None,
+            Some("Shipped anyway"),
+            None,
+            &["iss_vis".to_string(), "iss_second".to_string()],
+            USER_A,
+            None,
+        )
+        .await
+        .expect("an issue that vanished mid-loop must be skipped, not fatal");
+
+        assert_eq!(
+            release.issue_count, 1,
+            "the vanished issue took its release_issues row with it, so the \
+             release ships with the one that survived"
+        );
+
+        let after = release_footprint(&db).await;
+        assert_eq!(
+            after.releases,
+            vec![(release.release_id.clone(), "v1.0.0".to_string())],
+            "the release itself must be committed"
+        );
+        assert_eq!(
+            after.release_issues,
+            vec![(release.release_id.clone(), "iss_vis".to_string())]
+        );
+        assert_eq!(
+            after
+                .released_at
+                .iter()
+                .map(|(id, at)| (id.as_str(), at.is_some()))
+                .collect::<Vec<_>>(),
+            vec![("iss_vis", true)],
+            "the surviving issue is still stamped — skipping one entry must not \
+             cost the others their release"
+        );
+        assert_eq!(
+            after.sync_entries,
+            vec![
+                (
+                    entity_types::ISSUE.to_string(),
+                    "iss_vis".to_string(),
+                    "update".to_string()
+                ),
+                (
+                    entity_types::RELEASE.to_string(),
+                    release.release_id.clone(),
+                    "insert".to_string()
+                ),
+            ],
+            "exactly one ISSUE entry and the RELEASE entry: no entry for an \
+             entity that no longer exists, and none missing for one that does"
+        );
+    }
+
+    /// A payload read that genuinely fails must abort the release, not be
+    /// skipped as a vanished issue.
+    ///
+    /// The failure is real and comes from the schema: with `issue_labels` gone,
+    /// the labels query inside `issue_sync_payload_tx` fails against the actual
+    /// database, which is the same class of error a broken read would produce in
+    /// production. It surfaces as `Error::Sqlx`, never `Error::NotFound` — and
+    /// that distinction is the entire safety of matching on the variant.
+    ///
+    /// Note what this rules out. The issue itself is present and healthy, so a
+    /// "does the row exist" check would pass and hand the failure straight to
+    /// the loop; only the treatment of the error decides the outcome here.
+    #[tokio::test]
+    async fn release_create_fails_when_an_issues_payload_cannot_be_read() {
+        let db = two_user_workspace().await;
+        let before = release_footprint(&db).await;
+
+        db_execute!(&db, "DROP TABLE issue_labels").expect("drop issue_labels");
+
+        let err = crate::release_service::create_release(
+            &db,
+            WS,
+            "VIS",
+            "v1.0.0",
+            None,
+            Some("Never shipped"),
+            None,
+            &["iss_vis".to_string()],
+            USER_A,
+            None,
+        )
+        .await
+        .expect_err("a release whose issue payload cannot be read must fail");
+
+        assert!(
+            !matches!(err, trakkt_core::Error::NotFound(_)),
+            "the read failed, the row did not vanish — if this arrives as \
+             NotFound the two events are indistinguishable and the skip below \
+             would swallow a broken database; got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("issue_labels"),
+            "the caller must see the real read failure; got: {err}"
+        );
+
+        let after = release_footprint(&db).await;
+        assert_eq!(
+            after.releases, before.releases,
+            "an issue whose payload could not be read leaves a client unable to \
+             apply the stamp, so the release must not be committed without it"
+        );
+        assert_eq!(
+            after.released_at, before.released_at,
+            "and the stamp itself must be rolled back"
+        );
+        assert_eq!(
+            after.sync_entries, before.sync_entries,
+            "no entry may survive a release that did not happen"
+        );
+    }
+
+    /// The N+1 shape, delivered: one ISSUE frame per issue plus the RELEASE
+    /// frame, all of them after the single commit.
+    ///
+    /// The count is the point. `create_release` writes N+1 entries in one
+    /// transaction, and the tempting place to deliver each one is beside the
+    /// write that produced it — inside the loop, with the transaction still
+    /// open. `broadcast_sync_action` resolves its recipients with a query on the
+    /// pool, which the transaction is holding on SQLite, so a delivery there
+    /// does not fail: it blocks forever on the first issue. This test completing
+    /// at all is what says the deliveries are on the other side of the commit.
+    #[tokio::test]
+    async fn release_create_delivers_every_frame_after_the_commit() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+        let manager = WebSocketManager::new(None, db.clone());
+
+        let mut conn = manager.connect(USER_B).expect("B connects");
+        conn.rx.recv().await.expect("B's connect heartbeat");
+
+        let release = crate::release_service::create_release(
+            &db,
+            WS,
+            "VIS",
+            "v1.0.0",
+            None,
+            Some("Shipped"),
+            None,
+            &["iss_vis".to_string(), "iss_second".to_string()],
+            USER_A,
+            Some(&manager),
+        )
+        .await
+        .expect("create release");
+
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            let action = next_sync_action(&mut conn).await;
+            assert!(
+                action.sync_id > 0,
+                "every frame has to carry the id of its committed row so a \
+                 client that missed it can spot the gap: {action:?}"
+            );
+            actions.push(action);
+        }
+        let frames: Vec<(String, String)> = actions
+            .iter()
+            .map(|a| (a.entity_type.clone(), a.entity_id.clone()))
+            .collect();
+
+        assert_eq!(
+            frames,
+            vec![
+                (entity_types::ISSUE.to_string(), "iss_vis".to_string()),
+                (entity_types::ISSUE.to_string(), "iss_second".to_string()),
+                (
+                    entity_types::RELEASE.to_string(),
+                    release.release_id.clone()
+                ),
+            ],
+            "one ISSUE frame per issue, then the RELEASE frame — the same N+1 \
+             the transaction wrote, in the same order"
+        );
+        assert!(
+            conn.rx.try_recv().is_err(),
+            "and nothing beyond them"
+        );
+
+        // The RELEASE frame and the RELEASE row share one payload, so asserting
+        // it here asserts it for the delta replay too. A payload-less insert is
+        // dropped outright by the client, which would leave a reconnecting
+        // member with no release at all.
+        let delivered: trakkt_types::models::Release = serde_json::from_value(
+            payload_of(&actions[2], entity_types::RELEASE, &release.release_id),
+        )
+        .expect("the RELEASE frame carries a Release");
+        assert_eq!(
+            delivered, release,
+            "the frame must carry the release the caller was handed, issue \
+             count and DB-assigned timestamp included"
+        );
+
+        assert_eq!(
+            sync_entries(&db).await,
+            vec![
+                (
+                    entity_types::ISSUE.to_string(),
+                    "iss_vis".to_string(),
+                    "update".to_string()
+                ),
+                (
+                    entity_types::ISSUE.to_string(),
+                    "iss_second".to_string(),
+                    "update".to_string()
+                ),
+                (
+                    entity_types::RELEASE.to_string(),
+                    release.release_id.clone(),
+                    "insert".to_string()
+                ),
+            ],
+            "the delivered frames and the persisted rows are the same N+1 — a \
+             frame with no row behind it is invisible to the next reconnect"
+        );
+    }
+
+    /// An issue eligible for the sweep: completed, and last touched long enough
+    /// ago that `auto_archive_days` has passed.
+    async fn seed_archivable_issue(db: &DbPool, issue_id: &str, number: i32) {
+        db_execute!(
+            db,
+            "INSERT INTO issues \
+                (issue_id, workspace_id, team_id, number, title, creator_id, \
+                 status_id, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            issue_id,
+            WS,
+            "team_vis",
+            number,
+            format!("Archivable {issue_id}"),
+            USER_A,
+            "sts_done",
+            "2020-01-01T00:00:00Z"
+        )
+        .expect("insert an archivable issue");
+    }
+
+    /// A completed status and a team that archives after a day — the two
+    /// preconditions `run_archive_sweep` selects on.
+    async fn enable_archiving(db: &DbPool) {
+        db_execute!(
+            db,
+            "INSERT INTO statuses (status_id, workspace_id, team_id, name, category) \
+             VALUES ($1, $2, $3, $4, $5)",
+            "sts_done",
+            WS,
+            "team_vis",
+            "Done",
+            "completed"
+        )
+        .expect("insert the completed status");
+
+        db_execute!(
+            db,
+            "UPDATE teams SET settings = $1 WHERE team_id = $2",
+            r#"{"auto_archive_days":1}"#,
+            "team_vis"
+        )
+        .expect("switch auto-archiving on for the team");
+    }
+
+    /// `archived_at` per issue, in a stable order.
+    async fn archived_flags(db: &DbPool) -> Vec<(String, bool)> {
+        #[derive(sqlx::FromRow)]
+        struct ArchivedRow {
+            issue_id: String,
+            archived_at: Option<String>,
+        }
+
+        let rows: Vec<ArchivedRow> = db_fetch_all!(
+            db,
+            ArchivedRow,
+            "SELECT issue_id, CAST(archived_at AS TEXT) AS archived_at FROM issues \
+             ORDER BY issue_id"
+        )
+        .expect("read archived_at back");
+
+        rows.into_iter()
+            .map(|r| (r.issue_id, r.archived_at.is_some()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn archive_sweep_rolls_back_the_issue_whose_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        enable_archiving(&db).await;
+        seed_archivable_issue(&db, "iss_arch_a", 2).await;
+        let manager = WebSocketManager::new(None, db.clone());
+
+        let before = archived_flags(&db).await;
+        assert_eq!(
+            before,
+            vec![
+                ("iss_arch_a".to_string(), false),
+                ("iss_vis".to_string(), false),
+            ],
+            "precondition: nothing is archived yet"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::archive_service::run_archive_sweep(&db, &manager)
+            .await
+            .expect_err("a sweep whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            archived_flags(&db).await,
+            before,
+            "an issue archived with no sync_log row vanishes from the server and \
+             stays on every client forever, so the stamp must be rolled back"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            Vec::new(),
+            "and nothing may be left in sync_log either"
+        );
+    }
+
+    /// The sweep's opposite boundary, on the same shape of failure. Where the
+    /// release unwinds its whole loop, the sweep keeps what it already
+    /// committed: an archived issue is an independent decision, and one bad row
+    /// must not cost an hour of them.
+    ///
+    /// The trigger rejects the second entry rather than a named issue, because
+    /// the sweep's SELECT has no `ORDER BY` — the assertions below hold whichever
+    /// issue the query plan happens to hand back first.
+    #[tokio::test]
+    async fn archive_sweep_keeps_earlier_issues_archived_when_a_later_one_fails() {
+        let db = two_user_workspace().await;
+        enable_archiving(&db).await;
+        seed_archivable_issue(&db, "iss_arch_a", 2).await;
+        seed_archivable_issue(&db, "iss_arch_b", 3).await;
+        let manager = WebSocketManager::new(None, db.clone());
+
+        reject_sync_log_inserts_after_the_first(&db).await;
+
+        let err = crate::archive_service::run_archive_sweep(&db, &manager)
+            .await
+            .expect_err("a sweep whose later sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        let archived: Vec<String> = archived_flags(&db)
+            .await
+            .into_iter()
+            .filter(|(_, is_archived)| *is_archived)
+            .map(|(issue_id, _)| issue_id)
+            .collect();
+        assert_eq!(
+            archived.len(),
+            1,
+            "exactly the one issue the sweep reached before the failure stays \
+             archived — a whole-sweep transaction would leave none, and a \
+             swallowed failure would leave two; got {archived:?}"
+        );
+
+        let entries = sync_entries(&db).await;
+        assert_eq!(
+            entries,
+            vec![(
+                entity_types::ISSUE.to_string(),
+                archived[0].clone(),
+                "delete".to_string()
+            )],
+            "the surviving stamp keeps its own entry, and the rejected issue \
+             left neither — each row is still atomic with the entry that \
+             reports it"
+        );
+    }
+
 }

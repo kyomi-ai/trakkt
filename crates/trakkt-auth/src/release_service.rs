@@ -116,7 +116,28 @@ const RELEASE_HEADER_SELECT: &str = "\
 /// For each issue ID:
 /// - Inserts into `release_issues`
 /// - Sets `released_at = now()` on issues that haven't been released yet
-/// - Writes a sync log entry and broadcasts via WebSocket
+/// - Records an ISSUE sync entry so clients see the stamp
+///
+/// # One transaction for the whole release
+///
+/// Everything above is a single transaction: the `releases` row, every
+/// `release_issues` row, every `released_at` stamp, the N ISSUE entries and the
+/// one RELEASE entry that reports the release itself.
+///
+/// This is deliberately all-or-nothing rather than per-issue. A release is one
+/// fact about one moment, not a batch of independent jobs — the parts do not
+/// mean anything apart. Committing the release without its issue stamps
+/// publishes a release whose issues still read as unreleased, and it is
+/// unrepairable from the outside: `unreleased_issues` filters on `released_at IS
+/// NULL`, so those issues are silently offered up for the *next* release while
+/// already sitting in this one. Committing some stamps without the release row
+/// is worse still — issues marked released by a release nobody can open. There
+/// is no partial result here worth keeping, and the caller's remedy is the same
+/// in every case: create the release again.
+///
+/// So a failed sync entry, on the first issue or the last, unwinds the whole
+/// thing. Contrast `archive_service::run_archive_sweep`, which is genuinely a
+/// batch of independent jobs and takes the opposite boundary.
 pub async fn create_release(
     db: &DbPool,
     workspace_id: &str,
@@ -129,9 +150,14 @@ pub async fn create_release(
     created_by: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Release> {
-    let is_pg = db.is_postgres();
-    let now = sql_compat::now(is_pg);
     let release_id = uuid::Uuid::new_v4().to_string();
+
+    let mut tx = db.begin().await?;
+
+    // Dialect comes from the transaction, not the pool: nothing between here
+    // and the commit should have to reach for `db` at all (see `DbTx`).
+    let is_pg = tx.is_postgres();
+    let now = sql_compat::now(is_pg);
 
     // Insert the release record.
     let sql = format!(
@@ -140,8 +166,8 @@ pub async fn create_release(
              title, notes, created_by, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {now})"
     );
-    trakkt_core::db_execute!(
-        db,
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &release_id,
         workspace_id,
@@ -155,14 +181,20 @@ pub async fn create_release(
 
     // Insert into release_issues for each linked issue.
     for issue_id in issue_ids {
-        trakkt_core::db_execute!(
-            db,
+        trakkt_core::tx_execute!(
+            &mut tx,
             "INSERT INTO release_issues (release_id, issue_id) VALUES ($1, $2) \
              ON CONFLICT (release_id, issue_id) DO NOTHING",
             &release_id,
             issue_id
         )?;
     }
+
+    // Every sync entry below is held here until the commit. Delivering one
+    // inside the loop would broadcast a `sync_id` that may still be rolled back,
+    // and would read `workspace_users` off the pool while this transaction holds
+    // the SQLite connection — a deadlock on the first issue, not a style slip.
+    let mut batch = sync_log_service::SyncBatch::new();
 
     // Stamp released_at on issues that haven't been released yet.
     if !issue_ids.is_empty() {
@@ -173,107 +205,99 @@ pub async fn create_release(
              WHERE issue_id IN {in_clause} AND released_at IS NULL"
         );
 
-        trakkt_core::db_with_pool!(db, |p| {
+        trakkt_core::tx_with!(&mut tx, |e| {
             let mut query = sqlx::query(&sql);
             for id in issue_ids {
                 query = query.bind(id);
             }
-            query.execute(p).await.map(|r| r.rows_affected())
+            query.execute(e).await.map(|r| r.rows_affected())
         })?;
 
-        // Write sync_log + broadcast for each affected issue so clients see
-        // the released_at update in real time.
+        // One ISSUE entry per issue so clients see the released_at update.
         for issue_id in issue_ids {
-            // Read the issue back before the sync log write so the stored entry
+            // Read the issue back before the entry is written so the stored row
             // carries the new `released_at`; without a payload the client skips
-            // the row on reconnect and the stamp never arrives.
+            // the row on reconnect and the stamp never arrives. The read runs on
+            // the transaction: the stamp is not visible anywhere else yet, and
+            // on SQLite the pool is not reachable while it is open.
             //
             // Unlike the issue service's own write sites, `issue_ids` comes from
             // the caller, so an id may have been deleted since it was resolved.
-            // That must not abort a release whose rows are already committed —
-            // there is simply no entity left to report, so the entry is skipped.
-            let Some(full_issue) =
-                crate::issue_service::get_issue_by_id(db, issue_id).await?
-            else {
-                tracing::warn!(
-                    issue_id = %issue_id,
-                    "Issue disappeared before its released_at could be synced -- skipping"
-                );
-                continue;
+            // A row that is not there is not a failure: there is no entity left
+            // to report, the UPDATE above simply matched nothing, and the rest
+            // of the release is unaffected — so the entry is skipped. That has
+            // to stay a different outcome from a sync entry that cannot be
+            // written, which aborts the whole release.
+            //
+            // The two are told apart by the error variant rather than by asking
+            // first. A separate existence check would be two round trips with a
+            // gap between them, and under Postgres READ COMMITTED a delete
+            // committing in that gap passes the check and then fails the read —
+            // turning the vanished row back into the aborted release the check
+            // existed to prevent. One query has no such window.
+            //
+            // `NotFound` means the row was absent and nothing else:
+            // `issue_sync_payload_tx` constructs it at exactly one place, on
+            // `get_issue_by_id_tx` returning `Ok(None)` from a `fetch_optional`.
+            // Every failure in that call tree — the detail SELECT, the labels
+            // SELECT — arrives as `Error::Sqlx` through the `#[from]` conversion,
+            // so a read that broke can never be mistaken for a row that went
+            // away, and is returned.
+            let payload = match crate::issue_service::issue_sync_payload_tx(&mut tx, issue_id)
+                .await
+            {
+                Ok(payload) => payload,
+                Err(trakkt_core::Error::NotFound(_)) => {
+                    tracing::warn!(
+                        issue_id = %issue_id,
+                        "Issue disappeared before its released_at could be synced -- skipping"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
-            let payload = serde_json::to_value(&full_issue).ok();
 
-            let sync_id = sync_log_service::write_sync_entry(
-                db,
-                entity_types::ISSUE,
-                issue_id,
-                workspace_id,
-                None,
-                SyncActionType::Update,
-                payload.clone(),
-            )
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, issue_id = %issue_id, "Failed to write sync log for issue released_at");
-                0
-            });
-
-            if let Some(ws) = ws_manager {
-                sync_log_service::broadcast_sync_action(
-                    ws,
-                    workspace_id,
+            batch
+                .record(
+                    &mut tx,
                     entity_types::ISSUE,
                     issue_id,
+                    workspace_id,
+                    sync_log_service::SyncAudience::Workspace,
                     SyncActionType::Update,
                     payload,
-                    sync_id,
                 )
-                .await;
-            }
+                .await?;
         }
     }
 
-    // Sync log for the release entity — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
-        entity_types::RELEASE,
-        &release_id,
-        workspace_id,
-        None,
-        SyncActionType::Insert,
-        None,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, release_id = %release_id, "Failed to write sync log entry for release create");
-        0
-    });
-
-    // Re-fetch to get DB-assigned timestamps and issue count.
-    let sql = format!(
-        "{RELEASE_LIST_SELECT} WHERE r.release_id = $1"
-    );
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        ReleaseRow,
-        &sql,
-        &release_id
-    )?;
+    // Re-fetch to get DB-assigned timestamps and issue count. On the
+    // transaction: the release and its `release_issues` rows are not visible on
+    // the pool yet, so a pool read would find no release at all.
+    let sql = format!("{RELEASE_LIST_SELECT} WHERE r.release_id = $1");
+    let row = trakkt_core::tx_fetch_one!(&mut tx, ReleaseRow, &sql, &release_id)?;
     let release = row.into_dto();
 
-    // WebSocket broadcast — send full release entity data.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
+    // The RELEASE entry last, after every row it describes. It carries the
+    // release the caller is about to receive: the same value drives the stored
+    // row and the live frame, and a payload-less insert is dropped outright by
+    // the client, so an entry without one would leave reconnecting clients with
+    // no release at all.
+    let payload = sync_log_service::sync_payload(&release, entity_types::RELEASE, &release_id);
+
+    batch
+        .record(
+            &mut tx,
             entity_types::RELEASE,
             &release_id,
+            workspace_id,
+            sync_log_service::SyncAudience::Workspace,
             SyncActionType::Insert,
-            serde_json::to_value(&release).ok(),
-            sync_id,
+            payload,
         )
-        .await;
-    }
+        .await?;
+
+    batch.commit_and_deliver(tx, ws_manager).await?;
 
     Ok(release)
 }

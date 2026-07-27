@@ -281,6 +281,13 @@ async fn fetch_labels_for_issues(
 /// Single-issue counterpart of [`fetch_labels_for_issues`] — the payload path
 /// only ever needs one issue, and while a transaction is open the pool is
 /// unreachable (see [`DbTx`]).
+///
+/// An issue with no labels is `Ok(vec![])`, and must stay that way: this runs
+/// inside [`issue_sync_payload_tx`], which promises its callers that `NotFound`
+/// means the issue itself is gone. Reporting "this issue has no labels" — or any
+/// other condition — as `NotFound` from here would reach
+/// [`crate::release_service::create_release`] as a vanished issue and silently
+/// drop it from the release.
 async fn fetch_labels_for_issue_tx(
     tx: &mut DbTx,
     issue_id: &str,
@@ -455,6 +462,13 @@ pub async fn get_issue_by_id(
 /// through the same transaction that made it — the new state is not visible on
 /// the pool until the commit, and on SQLite the pool is not reachable at all
 /// while the transaction is open.
+///
+/// The `Option` in the return type is load-bearing and must stay one: this
+/// `Ok(None)` is the sole source of the `NotFound` that
+/// [`issue_sync_payload_tx`] promises its callers, and it is what keeps
+/// "the row is absent" separable from "the read failed". Turning a missing row
+/// into an error here — or letting a read failure come back as `Ok(None)` —
+/// collapses that distinction for every caller of it.
 async fn get_issue_by_id_tx(
     tx: &mut DbTx,
     issue_id: &str,
@@ -481,8 +495,32 @@ async fn get_issue_by_id_tx(
 /// delta alike, so an issue that cannot be read is an error rather than a
 /// payload-less write.
 ///
-/// Callers must have already established that the issue exists; every call site
-/// either just inserted it or just updated it under a `rows_affected` check.
+/// # `NotFound` means the row is absent, and nothing else
+///
+/// This is a guarantee callers are entitled to rely on, not an accident of the
+/// current implementation. [`trakkt_core::Error::NotFound`] is constructed at
+/// exactly one place below — the `ok_or_else` on a `fetch_optional` that came
+/// back empty. Every other failure in this call tree
+/// ([`get_issue_by_id_tx`]'s detail SELECT, [`fetch_labels_for_issue_tx`]'s
+/// label SELECT) is a `sqlx::Error` converted to
+/// [`trakkt_core::Error::Sqlx`] by `#[from]`, and the two row-to-DTO
+/// conversions are infallible.
+///
+/// So a caller may match on `NotFound` to mean "the issue is gone" and let
+/// every other variant propagate.
+/// [`crate::release_service::create_release`] does exactly that: its issue ids
+/// come from outside, so one may have been deleted since it was resolved, and
+/// it skips that issue while still aborting the whole release on a read that
+/// actually failed. **Do not add a second `NotFound` construction to this
+/// function or to anything it calls.** It would not fail a type check or a test
+/// here; it would quietly turn a broken read into a silently skipped issue in a
+/// release, which is the one distinction that call site is built on.
+///
+/// (This replaces an earlier "callers must have already established that the
+/// issue exists" note. That was true of the original call sites, which had all
+/// just inserted or updated the row, but pre-checking is no longer required —
+/// and for a caller racing a concurrent delete it was never sufficient, since
+/// the check and the read are two statements with a gap between them.)
 ///
 /// Visible to the crate because `team_service::delete_team` reassigns issues
 /// inside its own transaction: a pool-based read would see the pre-reassignment
