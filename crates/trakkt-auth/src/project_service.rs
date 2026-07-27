@@ -144,6 +144,12 @@ const PROJECT_SELECT: &str = "\
     FROM projects p \
     LEFT JOIN users lead ON lead.user_id = p.lead_id";
 
+/// Base SELECT for project member queries.
+const PROJECT_MEMBER_SELECT: &str = "\
+    SELECT project_id, user_id, role, \
+           CAST(created_at AS TEXT) AS created_at \
+    FROM project_members";
+
 /// Base SELECT for milestone queries.
 const MILESTONE_SELECT: &str = "\
     SELECT milestone_id, project_id, name, description, \
@@ -192,22 +198,44 @@ pub async fn get_project(
     Ok(row.map(ProjectRow::into_dto))
 }
 
-/// Build the sync payload for a change to one of a project's satellite tables
-/// (`project_members`, `project_updates`).
+/// Build the sync payload for an insert or update of `entity_type`.
 ///
-/// Neither is a synced entity type of its own, so those changes are reported as
-/// an update to the parent project and have to carry the project row — the
-/// shape the client's PROJECT arm deserializes. An entry with no payload is
-/// skipped outright by the client, on the live frame and on delta alike, so a
-/// project that cannot be read is an error rather than a payload-less write.
-async fn project_sync_payload(
-    db: &DbPool,
-    project_id: &str,
-) -> trakkt_core::Result<Option<serde_json::Value>> {
-    let project = get_project(db, project_id).await?.ok_or_else(|| {
-        trakkt_core::Error::NotFound(format!("project {project_id} not found"))
-    })?;
-    Ok(serde_json::to_value(&project).ok())
+/// Every caller passes the row it just read back from the database, so the
+/// value serialized here is the same shape a bootstrap would stream for that
+/// entity type.
+///
+/// An entry with no payload is skipped outright by the client — on the live
+/// frame and on delta alike — because `cache/apply.rs` returns on a data-less
+/// insert/update *before* it reaches the entity-type match. A dropped payload
+/// is therefore a silently frozen UI, not a cosmetic loss, so a serialization
+/// failure is logged rather than discarded with `.ok()`.
+fn sync_payload<T: serde::Serialize>(
+    entity: &T,
+    entity_type: &str,
+    entity_id: &str,
+) -> Option<serde_json::Value> {
+    match serde_json::to_value(entity) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                entity_type,
+                entity_id,
+                "Failed to serialize entity for sync payload"
+            );
+            None
+        }
+    }
+}
+
+/// The sync `entity_id` for a project membership.
+///
+/// `project_members` has a composite primary key and no surrogate id, so the
+/// two columns are joined into one stable key. The add and the remove derive it
+/// the same way, which is what lets the client's cache delete target exactly the
+/// row the add upserted.
+fn project_member_entity_id(project_id: &str, user_id: &str) -> String {
+    format!("{project_id}:{user_id}")
 }
 
 /// Parameters for creating a new project.
@@ -266,7 +294,7 @@ pub async fn create_project(
         &project_id
     )?;
     let project = row.into_dto();
-    let payload = serde_json::to_value(&project).ok();
+    let payload = sync_payload(&project, entity_types::PROJECT, &project.project_id);
 
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
@@ -437,7 +465,7 @@ pub async fn update_project(
         params.project_id
     )?;
     let project = row.into_dto();
-    let payload = serde_json::to_value(&project).ok();
+    let payload = sync_payload(&project, entity_types::PROJECT, &project.project_id);
 
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
@@ -540,13 +568,12 @@ pub async fn list_project_members(
     db: &DbPool,
     project_id: &str,
 ) -> trakkt_core::Result<Vec<ProjectMember>> {
+    let sql =
+        format!("{PROJECT_MEMBER_SELECT} WHERE project_id = $1 ORDER BY created_at ASC");
     let rows: Vec<ProjectMemberRow> = trakkt_core::db_fetch_all!(
         db,
         ProjectMemberRow,
-        "SELECT project_id, user_id, role, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM project_members WHERE project_id = $1 \
-         ORDER BY created_at ASC",
+        &sql,
         project_id
     )?;
     Ok(rows.into_iter().map(ProjectMemberRow::into_dto).collect())
@@ -564,9 +591,13 @@ pub async fn add_project_member(
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
 
-    // Resolved before the insert so a missing project is a clean NotFound
-    // instead of a write with nothing to report.
-    let payload = project_sync_payload(db, project_id).await?;
+    // Checked before the insert so a missing project is a clean NotFound rather
+    // than a foreign-key error out of the write.
+    if get_project(db, project_id).await?.is_none() {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "project {project_id} not found"
+        )));
+    }
 
     let sql = format!(
         "INSERT INTO project_members (project_id, user_id, role, created_at) \
@@ -574,19 +605,40 @@ pub async fn add_project_member(
     );
     trakkt_core::db_execute!(db, &sql, project_id, user_id, role)?;
 
+    // Re-read the row just written, for its DB-assigned timestamp. This has to
+    // happen before the sync log write: both the stored entry and the live frame
+    // carry the full membership, and the client skips either without it.
+    let sql = format!("{PROJECT_MEMBER_SELECT} WHERE project_id = $1 AND user_id = $2");
+    let row = trakkt_core::db_fetch_one!(
+        db,
+        ProjectMemberRow,
+        &sql,
+        project_id,
+        user_id
+    )?;
+    let member = row.into_dto();
+    let entity_id = project_member_entity_id(project_id, user_id);
+    let payload = sync_payload(&member, entity_types::PROJECT_MEMBER, &entity_id);
+
     // Sync log — best-effort.
+    //
+    // The membership is its own entity type rather than an update to the parent
+    // project: the INSERT above is the only write this function makes, so the
+    // `projects` row is byte-identical afterwards. Reporting it as a PROJECT
+    // update would make every connected client re-upsert an unchanged project
+    // and would still leave the membership itself invisible.
     let sync_id = sync_log_service::write_sync_entry(
         db,
-        entity_types::PROJECT,
-        project_id,
+        entity_types::PROJECT_MEMBER,
+        &entity_id,
         workspace_id,
         None,
-        SyncActionType::Update,
+        SyncActionType::Insert,
         payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for member add");
+        tracing::warn!(error = %e, project_id = %project_id, user_id = %user_id, "Failed to write sync log entry for member add");
         0
     });
 
@@ -595,9 +647,9 @@ pub async fn add_project_member(
         sync_log_service::broadcast_sync_action(
             ws,
             workspace_id,
-            entity_types::PROJECT,
-            project_id,
-            SyncActionType::Update,
+            entity_types::PROJECT_MEMBER,
+            &entity_id,
+            SyncActionType::Insert,
             payload,
             sync_id,
         )
@@ -628,33 +680,36 @@ pub async fn remove_project_member(
         )));
     }
 
-    let payload = project_sync_payload(db, project_id).await?;
+    let entity_id = project_member_entity_id(project_id, user_id);
 
     // Sync log — best-effort.
+    //
+    // A delete carries no payload: there is no row left to send, and the client
+    // reads the entity id alone to drop the cached row and bump its counter.
     let sync_id = sync_log_service::write_sync_entry(
         db,
-        entity_types::PROJECT,
-        project_id,
+        entity_types::PROJECT_MEMBER,
+        &entity_id,
         workspace_id,
         None,
-        SyncActionType::Update,
-        payload.clone(),
+        SyncActionType::Delete,
+        None,
     )
     .await
     .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for member remove");
+        tracing::warn!(error = %e, project_id = %project_id, user_id = %user_id, "Failed to write sync log entry for member remove");
         0
     });
 
-    // WebSocket broadcast — send full entity data as SyncResponse.
+    // WebSocket broadcast — delete has no entity data.
     if let Some(ws) = ws_manager {
         sync_log_service::broadcast_sync_action(
             ws,
             workspace_id,
-            entity_types::PROJECT,
-            project_id,
-            SyncActionType::Update,
-            payload,
+            entity_types::PROJECT_MEMBER,
+            &entity_id,
+            SyncActionType::Delete,
+            None,
             sync_id,
         )
         .await;
@@ -664,25 +719,6 @@ pub async fn remove_project_member(
 }
 
 // ─── Milestones ─────────────────────────────────────────────────────────────
-
-/// Build the sync payload for a milestone insert or update.
-///
-/// Both call sites already re-read the row they just wrote, so unlike
-/// [`project_sync_payload`] this takes the milestone rather than fetching it
-/// again — the value it serializes is the same row a bootstrap would stream
-/// from `list_milestones_for_workspace`. An entry with no payload is skipped
-/// outright by the client, on the live frame and on delta alike, so a
-/// serialization failure is logged rather than passing silently.
-fn milestone_sync_payload(milestone: &ProjectMilestone) -> Option<serde_json::Value> {
-    match serde_json::to_value(milestone) {
-        Ok(value) => Some(value),
-        Err(e) => {
-            tracing::warn!(error = %e, milestone_id = %milestone.milestone_id,
-                "Failed to serialize milestone for sync payload");
-            None
-        }
-    }
-}
 
 /// List all milestones in a project, ordered by sort_order then creation date.
 pub async fn list_milestones(
@@ -765,7 +801,11 @@ pub async fn create_milestone(
         &milestone_id
     )?;
     let milestone = row.into_dto();
-    let payload = milestone_sync_payload(&milestone);
+    let payload = sync_payload(
+        &milestone,
+        entity_types::PROJECT_MILESTONE,
+        &milestone.milestone_id,
+    );
 
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
@@ -883,7 +923,11 @@ pub async fn update_milestone(
         milestone_id
     )?;
     let milestone = row.into_dto();
-    let payload = milestone_sync_payload(&milestone);
+    let payload = sync_payload(
+        &milestone,
+        entity_types::PROJECT_MILESTONE,
+        &milestone.milestone_id,
+    );
 
     // Sync log — best-effort.
     let sync_id = sync_log_service::write_sync_entry(
@@ -1020,21 +1064,38 @@ pub async fn create_project_update(
         body
     )?;
 
-    let payload = project_sync_payload(db, project_id).await?;
+    // Re-fetch to get the DB-assigned timestamp. This has to happen before the
+    // sync log write: both the stored entry and the live frame carry the full
+    // update, and the client skips either without it.
+    let sql = format!("{PROJECT_UPDATE_SELECT} WHERE update_id = $1");
+    let row = trakkt_core::db_fetch_one!(
+        db,
+        ProjectUpdateRow,
+        &sql,
+        &update_id
+    )?;
+    let update = row.into_dto();
+    let payload = sync_payload(&update, entity_types::PROJECT_UPDATE, &update.update_id);
 
     // Sync log — best-effort.
+    //
+    // The posted update is its own entity type rather than an update to the
+    // parent project: the INSERT above is the only write this function makes, so
+    // the `projects` row is byte-identical afterwards. Reporting it as a PROJECT
+    // update would make every connected client re-upsert an unchanged project
+    // and would still leave the posted update itself invisible.
     let sync_id = sync_log_service::write_sync_entry(
         db,
-        entity_types::PROJECT,
-        project_id,
+        entity_types::PROJECT_UPDATE,
+        &update_id,
         workspace_id,
         None,
-        SyncActionType::Update,
+        SyncActionType::Insert,
         payload.clone(),
     )
     .await
     .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for project update");
+        tracing::warn!(error = %e, update_id = %update_id, "Failed to write sync log entry for project update");
         0
     });
 
@@ -1043,24 +1104,16 @@ pub async fn create_project_update(
         sync_log_service::broadcast_sync_action(
             ws,
             workspace_id,
-            entity_types::PROJECT,
-            project_id,
-            SyncActionType::Update,
+            entity_types::PROJECT_UPDATE,
+            &update_id,
+            SyncActionType::Insert,
             payload,
             sync_id,
         )
         .await;
     }
 
-    // Re-fetch to get DB-assigned timestamp.
-    let sql = format!("{PROJECT_UPDATE_SELECT} WHERE update_id = $1");
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        ProjectUpdateRow,
-        &sql,
-        &update_id
-    )?;
-    Ok(row.into_dto())
+    Ok(update)
 }
 
 /// Compute project progress from issue status categories.

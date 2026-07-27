@@ -117,14 +117,31 @@ pub fn ProjectDetailPage() -> impl IntoView {
         move |(id, _version)| async move { list_milestones(id).await },
     );
 
+    // Posted status updates and memberships are not held in the SyncStore
+    // either — both come from server functions. Their counters bump on every
+    // project_update / project_member sync action, so keying the resources on
+    // them is what makes another client's post, add or remove arrive here
+    // without a reload.
+    let project_updates_version = Signal::derive(move || {
+        sync_store
+            .map(|s| s.project_updates_version().get())
+            .unwrap_or(0)
+    });
+
     let server_updates = Resource::new(
-        move || project_id.get(),
-        move |id| async move { list_project_updates(id).await },
+        move || (project_id.get(), project_updates_version.get()),
+        move |(id, _version)| async move { list_project_updates(id).await },
     );
 
+    let project_members_version = Signal::derive(move || {
+        sync_store
+            .map(|s| s.project_members_version().get())
+            .unwrap_or(0)
+    });
+
     let server_members = Resource::new(
-        move || project_id.get(),
-        move |id| async move { list_project_members(id).await },
+        move || (project_id.get(), project_members_version.get()),
+        move |(id, _version)| async move { list_project_members(id).await },
     );
 
     // Resolve the project from SyncStore or server function.

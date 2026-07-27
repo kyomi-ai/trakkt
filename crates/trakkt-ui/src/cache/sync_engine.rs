@@ -62,6 +62,22 @@ use crate::cache::store::SyncStore;
 use crate::cache::tab_leader::{SyncBroadcast, SyncBroadcastMessage};
 use crate::cache::websocket::{ConnectionState, WebSocketClient};
 
+/// Every entity type a `SyncReset` — and the no-cursor cold start that wipes the
+/// same way — has to clear out of the cache.
+///
+/// The membership rule is not "types this client reads back". It is "types the
+/// cache can ever hold a row of", which is a strictly larger set:
+/// [`enqueue_cache_writes`] has no entity-type allow-list, so **any** action
+/// carrying a payload is persisted, including types nothing hydrates or reads on
+/// demand. A type missing from here is never wiped by anything, so its rows
+/// outlive the reset that exists to guarantee a clean slate — permanently, since
+/// the only other cache delete is a per-entity one driven by a `Delete` action
+/// that has already been and gone.
+///
+/// `every_entity_type_the_cache_persists_is_wiped_by_a_reset` holds this list to
+/// that rule by driving the write path itself, rather than trusting the next
+/// person to remember. Adding an entity type without adding it here fails that
+/// test by name.
 const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
     entity_types::ISSUE,
     entity_types::ISSUE_CONTENT,
@@ -70,10 +86,18 @@ const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
     entity_types::TEAM,
     entity_types::PROJECT,
     entity_types::PROJECT_MILESTONE,
+    entity_types::PROJECT_MEMBER,
+    entity_types::PROJECT_UPDATE,
+    entity_types::RELEASE,
     entity_types::VIEW,
     entity_types::FAVORITE,
     entity_types::NOTIFICATION,
+    entity_types::NOTIFICATION_PREFERENCES,
     entity_types::COMMENT,
+    entity_types::ACTIVITY,
+    entity_types::ISSUE_RELATION,
+    entity_types::ATTACHMENT,
+    entity_types::ISSUE_ATTACHMENT,
     entity_types::WORKSPACE_SETTINGS,
 ];
 
@@ -439,9 +463,11 @@ fn apply_sync_action(
 /// `wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate`
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
+    use std::collections::BTreeSet;
     use std::task::{Context, Poll};
 
     use gloo_timers::future::TimeoutFuture;
+    use trakkt_types::sync::SyncActionType;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     use crate::cache::websocket;
@@ -629,5 +655,157 @@ mod wasm_tests {
         // Stop the backoff loop this test's doomed connection would otherwise
         // leave running.
         websocket::disconnect(&ws);
+    }
+
+    // ── The reset wipe covers everything the cache can hold ─────────────────
+    //
+    // `SyncReset` and the no-cursor cold start both wipe the cache one entity
+    // type at a time, from `ALL_CACHED_ENTITY_TYPES`. Anything the write path
+    // can persist but that list does not name is never wiped by anything.
+    //
+    // The list is hand-written, so a test that re-listed the same entity types
+    // would agree with it by construction and catch nothing — which is exactly
+    // how `project_member` and `project_update` came to be persisted by this
+    // client for a whole release without ever being wiped. So the "can be
+    // persisted" side is derived twice over instead: the universe of entity
+    // types is read out of `entity_types`' own source, and each one is pushed
+    // through the real `enqueue_cache_writes` to see what it queues.
+
+    /// The source of [`entity_types`], embedded at compile time.
+    ///
+    /// Rust cannot enumerate a module's constants, and a hand-copied list of
+    /// them here would rot exactly like the array it is meant to police. Reading
+    /// the declarations back out of the source is what makes a newly declared
+    /// entity type appear in this test on the commit that declares it, with no
+    /// second list for anyone to forget. If the path ever moves this stops
+    /// compiling, which is the loud half of the failure mode.
+    const ENTITY_TYPES_SOURCE: &str = include_str!("../../../trakkt-types/src/sync.rs");
+
+    /// The body of the `pub mod entity_types` block, without the rest of the file.
+    fn entity_types_module_source() -> &'static str {
+        const OPEN: &str = "pub mod entity_types {";
+        let Some(start) = ENTITY_TYPES_SOURCE.find(OPEN) else {
+            panic!(
+                "could not find `{OPEN}` in trakkt-types/src/sync.rs — the module was renamed \
+                 or moved, and this test can no longer see which entity types exist"
+            );
+        };
+        let body = &ENTITY_TYPES_SOURCE[start + OPEN.len()..];
+        // Every declaration inside the module is indented, so the first closing
+        // brace in column zero is the module's own.
+        let Some(end) = body.find("\n}") else {
+            panic!("`{OPEN}` in trakkt-types/src/sync.rs is not closed at column zero");
+        };
+        &body[..end]
+    }
+
+    /// Every entity type string declared in [`entity_types`].
+    ///
+    /// The parse is deliberately strict and self-checking: a declaration it
+    /// cannot read is a declaration this test would silently stop covering, so
+    /// the counts have to agree or the test fails and says so.
+    fn declared_entity_types() -> BTreeSet<&'static str> {
+        let body = entity_types_module_source();
+
+        let declared = body
+            .lines()
+            .filter(|line| line.trim_start().starts_with("pub const "))
+            .count();
+
+        let values: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.split_once("&str = \""))
+            .filter_map(|(_, rest)| rest.split_once('"'))
+            .map(|(value, _)| value)
+            .collect();
+
+        assert_eq!(
+            values.len(),
+            declared,
+            "this test reads the entity types out of the source of \
+             `trakkt_types::sync::entity_types`, and could only parse {} of the {declared} \
+             constants declared there.\n\
+             A declaration it cannot read is one it silently stops checking, so fix the parse \
+             in `declared_entity_types` (crates/trakkt-ui/src/cache/sync_engine.rs) rather \
+             than the declaration — most likely it is no longer a single \
+             `pub const NAME: &str = \"value\";` line.",
+            values.len()
+        );
+        assert!(
+            !values.is_empty(),
+            "parsed no entity types at all out of trakkt-types/src/sync.rs"
+        );
+
+        values.into_iter().collect()
+    }
+
+    /// Push one insert of `entity_type` through the real cache-write path and
+    /// report every entity type it queued an [`IdbOp::Upsert`] for.
+    ///
+    /// One action can persist more than one type — an issue with a body also
+    /// writes an `issue_content` record — so this reports the types of the ops,
+    /// not the type of the action.
+    fn entity_types_persisted_by_an_insert_of(entity_type: &str) -> Vec<String> {
+        let (writer, mut ops) = idb_writer::channel();
+        enqueue_cache_writes(
+            &writer,
+            &SyncAction {
+                sync_id: 1,
+                entity_type: entity_type.to_owned(),
+                entity_id: "entity-1".to_owned(),
+                workspace_id: "ws-1".to_owned(),
+                action: SyncActionType::Insert,
+                // Entities arrive as JSON objects. A non-null `description` is
+                // what makes the issue arm split its body into a second record,
+                // so this payload reaches that branch too.
+                data: Some(serde_json::json!({"description": "a body"})),
+                timestamp: "2026-07-27T00:00:00Z".to_owned(),
+            },
+        );
+        drop(writer);
+
+        let mut persisted = Vec::new();
+        while let Ok(op) = ops.try_recv() {
+            if let IdbOp::Upsert { entity_type, .. } = op {
+                persisted.push(entity_type);
+            }
+        }
+        persisted
+    }
+
+    /// The invariant `SyncReset` rests on: nothing the cache can hold survives
+    /// the wipe.
+    #[wasm_bindgen_test]
+    fn every_entity_type_the_cache_persists_is_wiped_by_a_reset() {
+        let wiped: BTreeSet<&str> = ALL_CACHED_ENTITY_TYPES.iter().copied().collect();
+
+        let mut unwiped: BTreeSet<String> = BTreeSet::new();
+        for entity_type in declared_entity_types() {
+            for persisted in entity_types_persisted_by_an_insert_of(entity_type) {
+                if !wiped.contains(persisted.as_str()) {
+                    unwiped.insert(persisted);
+                }
+            }
+        }
+
+        let as_array_entries = |types: &BTreeSet<String>| -> String {
+            types
+                .iter()
+                .map(|t| format!("    entity_types::{},", t.to_uppercase()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        assert!(
+            unwiped.is_empty(),
+            "These entity types are written to IndexedDB but never wiped.\n\
+             `enqueue_cache_writes` queues an upsert for them, while `SyncReset` and the \
+             no-cursor cold start only clear the types in ALL_CACHED_ENTITY_TYPES — so their \
+             rows outlive the reset that is supposed to leave a clean slate, and nothing else \
+             ever removes them.\n\
+             ALL_CACHED_ENTITY_TYPES is the array at the top of \
+             crates/trakkt-ui/src/cache/sync_engine.rs. Add:\n{}",
+            as_array_entries(&unwiped)
+        );
     }
 }
