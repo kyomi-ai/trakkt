@@ -129,6 +129,11 @@ pub struct CreateStatusParams<'a> {
 }
 
 /// Create a new status in a workspace.
+///
+/// The INSERT and its `sync_log` entry are one transaction: a status that
+/// commits without its sync row is invisible to every future delta, and an issue
+/// referencing a status the client has never seen has nothing to render — so a
+/// failed log write rolls the status back rather than leaving it stranded.
 pub async fn create_status(
     db: &DbPool,
     params: &CreateStatusParams<'_>,
@@ -142,8 +147,10 @@ pub async fn create_status(
         "INSERT INTO statuses (status_id, workspace_id, team_id, name, category, position, color, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, {now})"
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &status_id,
         params.workspace_id,
@@ -156,9 +163,10 @@ pub async fn create_status(
 
     // Re-fetch to get the DB-assigned created_at. This has to happen before the
     // sync log write: both the stored entry and the live frame carry the full
-    // status, and the client cannot apply either without it.
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    // status, and the client cannot apply either without it. The row does not
+    // exist outside the transaction yet, so the read runs on it.
+    let row = trakkt_core::tx_fetch_one!(
+        &mut tx,
         StatusRow,
         "SELECT status_id, workspace_id, team_id, name, category, position, color, \
                 CAST(created_at AS TEXT) AS created_at \
@@ -166,37 +174,19 @@ pub async fn create_status(
         &status_id
     )?;
     let status = row.into_dto();
-    let payload = serde_json::to_value(&status).ok();
+    let payload = sync_log_service::sync_payload(&status, entity_types::STATUS, &status_id);
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::STATUS,
         &status_id,
         params.workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, status_id = %status_id, "Failed to write sync log entry for status create");
-        0
-    });
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            params.workspace_id,
-            entity_types::STATUS,
-            &status_id,
-            SyncActionType::Insert,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(status)
 }

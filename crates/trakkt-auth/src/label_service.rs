@@ -45,6 +45,10 @@ impl LabelRow {
 ///
 /// If `team_id` is `None`, the label is workspace-scoped (available to all teams).
 /// If `team_id` is `Some(...)`, the label is team-scoped (only available within that team).
+///
+/// The INSERT and its `sync_log` entry are one transaction: a label that commits
+/// without its sync row is invisible to every future delta, so a failed log
+/// write rolls the label back rather than leaving it stranded.
 pub async fn create_label(
     db: &DbPool,
     workspace_id: &str,
@@ -61,13 +65,16 @@ pub async fn create_label(
         "INSERT INTO labels (label_id, workspace_id, team_id, name, color, created_at) \
          VALUES ($1, $2, $3, $4, $5, {now})"
     );
-    trakkt_core::db_execute!(db, &sql, &label_id, workspace_id, team_id, name, color)?;
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(&mut tx, &sql, &label_id, workspace_id, team_id, name, color)?;
 
     // Re-fetch to get the DB-assigned created_at. This has to happen before the
     // sync log write: both the stored entry and the live frame carry the full
-    // label, and the client cannot apply either without it.
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    // label, and the client cannot apply either without it. The row does not
+    // exist outside the transaction yet, so the read runs on it.
+    let row = trakkt_core::tx_fetch_one!(
+        &mut tx,
         LabelRow,
         "SELECT label_id, workspace_id, team_id, name, color, \
                 CAST(created_at AS TEXT) AS created_at \
@@ -75,37 +82,19 @@ pub async fn create_label(
         &label_id
     )?;
     let label = row.into_dto();
-    let payload = serde_json::to_value(&label).ok();
+    let payload = sync_log_service::sync_payload(&label, entity_types::LABEL, &label_id);
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::LABEL,
         &label_id,
         workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label create");
-        0
-    });
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::LABEL,
-            &label_id,
-            SyncActionType::Insert,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(label)
 }
@@ -167,6 +156,10 @@ pub async fn get_label_by_id(
 }
 
 /// Update a label's name and color.
+///
+/// The UPDATE and its `sync_log` entry are one transaction: a rename that
+/// commits without its sync row leaves the old name on every other client
+/// forever, and no later delta reports it.
 pub async fn update_label(
     db: &DbPool,
     label_id: &str,
@@ -174,8 +167,10 @@ pub async fn update_label(
     color: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Label> {
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "UPDATE labels SET name = $1, color = $2 WHERE label_id = $3",
         name,
         color,
@@ -183,14 +178,17 @@ pub async fn update_label(
     )?;
 
     if result.rows_affected() == 0 {
+        // `tx` is dropped here, which rolls it back (see `DbTx`).
         return Err(trakkt_core::Error::NotFound(format!(
             "label {label_id} not found"
         )));
     }
 
-    // Fetch the updated row (need workspace_id for sync log).
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    // Fetch the updated row (need workspace_id for sync log). The new values are
+    // not visible on the pool until the commit, so the read runs on the
+    // transaction.
+    let row = trakkt_core::tx_fetch_one!(
+        &mut tx,
         LabelRow,
         "SELECT label_id, workspace_id, team_id, name, color, \
                 CAST(created_at AS TEXT) AS created_at \
@@ -198,37 +196,19 @@ pub async fn update_label(
         label_id
     )?;
     let label = row.into_dto();
-    let payload = serde_json::to_value(&label).ok();
+    let payload = sync_log_service::sync_payload(&label, entity_types::LABEL, label_id);
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::LABEL,
         label_id,
         &label.workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label update");
-        0
-    });
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            &label.workspace_id,
-            entity_types::LABEL,
-            label_id,
-            SyncActionType::Update,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(label)
 }
@@ -236,12 +216,18 @@ pub async fn update_label(
 /// Delete a label.
 ///
 /// Cascading deletes remove associated `issue_labels` rows.
+///
+/// The DELETE and its `sync_log` entry are one transaction: a delete that
+/// commits without its sync row leaves the label on every other client forever,
+/// and no later delta can repair it — the row it would have to re-read is gone.
 pub async fn delete_label(
     db: &DbPool,
     label_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    // Fetch workspace_id before delete for the sync log.
+    // Fetch workspace_id before delete for the sync log. This reads state that
+    // predates the transaction, so it stays on the pool ahead of it — once the
+    // transaction is open the pool is unreachable on SQLite (see `DbTx`).
     let row = trakkt_core::db_fetch_optional!(
         db,
         LabelRow,
@@ -255,43 +241,27 @@ pub async fn delete_label(
         trakkt_core::Error::NotFound(format!("label {label_id} not found"))
     })?;
 
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM labels WHERE label_id = $1",
         label_id
     )?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    // The sync entry follows the DELETE it describes; a delete carries no
+    // payload, since there is no row left to send.
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::LABEL,
         label_id,
         &label.workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Delete,
         None,
+        ws_manager,
     )
     .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, label_id = %label_id, "Failed to write sync log entry for label delete");
-        0
-    });
-
-    // WebSocket broadcast — delete has no entity data.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            &label.workspace_id,
-            entity_types::LABEL,
-            label_id,
-            SyncActionType::Delete,
-            None,
-            sync_id,
-        )
-        .await;
-    }
-
-    Ok(())
 }
 
 /// Get all labels attached to a specific issue.
