@@ -240,10 +240,31 @@ async fn run_and_collect(
 
 /// Spawn `handle_sync_bootstrap` against `conn`'s sender.
 fn spawn_bootstrap(db: &DbPool, conn: &TestConnection) -> JoinHandle<()> {
+    spawn_bootstrap_in(db, conn, WORKSPACE)
+}
+
+/// Spawn `handle_sync_bootstrap` for a named workspace, which is only
+/// interesting for workspaces the fixture did *not* create.
+fn spawn_bootstrap_in(
+    db: &DbPool,
+    conn: &TestConnection,
+    workspace_id: &'static str,
+) -> JoinHandle<()> {
     let tx = conn.tx.clone();
     let flag = Arc::clone(&conn.catching_up);
     let db = db.clone();
-    tokio::spawn(async move { handle_sync_bootstrap(&tx, &flag, &db, USER, WORKSPACE).await })
+    tokio::spawn(async move { handle_sync_bootstrap(&tx, &flag, &db, USER, workspace_id).await })
+}
+
+/// The watermarks carried by the `SyncComplete` frames in `frames`.
+fn watermarks(frames: &[SyncResponse]) -> Vec<i64> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            SyncResponse::SyncComplete { last_sync_id } => Some(*last_sync_id),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Spawn `handle_sync_delta` against `conn`'s sender.
@@ -490,5 +511,211 @@ async fn a_connection_closing_mid_bootstrap_releases_its_catch_up_exemption() {
         delivered.len() < complete_frames.len(),
         "the stream must be abandoned mid-flight: delivered all {} frames of the baseline",
         complete_frames.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (d) A bootstrap that cannot read the workspace sends no watermark
+// ---------------------------------------------------------------------------
+
+/// A `SyncComplete` is a promise that everything below the watermark has been
+/// delivered. A bootstrap whose reads failed cannot make that promise, and the
+/// client it lies to is unrecoverable without deleting its IndexedDB by hand:
+/// the rows it never received sit below its stored cursor, so no delta will
+/// ever mention them again.
+///
+/// The failure is a real one — the table one of the eleven reads selects from
+/// is taken out of service, so the query errors the way a transient database
+/// fault would. Nothing in the handler knows this is a test.
+///
+/// `favorites` is the table because exactly one bootstrap read touches it.
+/// `issues` would tell the more dramatic story, but four of the reads join
+/// through it (`list_issues`, `list_teams`, `list_notifications`,
+/// `list_comments_for_workspace`), so a bootstrap that aborted after only
+/// three of them were fixed would still pass — the failure has to be
+/// attributable to a single read for this test to be able to catch a partial
+/// fix. Nothing has a foreign key into `favorites`, so it can simply be
+/// dropped.
+#[tokio::test]
+async fn a_failed_entity_read_ends_the_bootstrap_without_a_watermark() {
+    let db = seeded_workspace().await;
+    let manager = WebSocketManager::new(None, db.clone());
+    let mut conns = register_connections(&manager, USER, 1);
+    let conn = &mut conns[0];
+
+    // Control: this workspace, this connection and this harness produce a
+    // completed bootstrap. Without it, "no frames arrived" is a claim any
+    // amount of broken wiring would also satisfy.
+    let healthy = run_and_collect(spawn_bootstrap(&db, conn), &mut conn.rx).await;
+    assert!(
+        matches!(healthy.last(), Some(SyncResponse::SyncComplete { .. })),
+        "the control bootstrap must complete, got {:?}",
+        healthy.last()
+    );
+    assert!(
+        streamed_entity_types(&healthy).contains(&entity_types::ISSUE),
+        "the control bootstrap must stream the seeded issues, got {:?}",
+        streamed_entity_types(&healthy)
+    );
+
+    trakkt_core::db_execute!(db, "DROP TABLE favorites")
+        .expect("take the favorites table out of service");
+
+    let frames = run_and_collect(spawn_bootstrap(&db, conn), &mut conn.rx).await;
+
+    assert!(
+        watermarks(&frames).is_empty(),
+        "a bootstrap that could not read the workspace must not hand out a \
+         watermark, got {frames:?}"
+    );
+    // The reads all happen before the first frame goes out, so a failed one
+    // costs the client nothing to discard: it receives no stream at all.
+    assert!(
+        frames.is_empty(),
+        "a bootstrap that could not read the workspace should stream nothing, \
+         got {frames:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (e) An intact bootstrap still ends with exactly one watermark
+// ---------------------------------------------------------------------------
+
+/// The other half of (d): withholding the watermark on failure is only correct
+/// if it is still sent, once, on success — and if it is the workspace's real
+/// `latest_sync_id` rather than a placeholder.
+#[tokio::test]
+async fn an_intact_bootstrap_ends_with_exactly_one_watermark() {
+    let db = seeded_workspace().await;
+    let expected = trakkt_auth::sync_log_service::get_latest_sync_id(&db, WORKSPACE)
+        .await
+        .expect("read the workspace watermark");
+    assert!(
+        expected > 0,
+        "the fixture writes sync_log entries, so its watermark cannot be the \
+         zero a failed read would produce"
+    );
+
+    let manager = WebSocketManager::new(None, db.clone());
+    let mut conns = register_connections(&manager, USER, 1);
+    let conn = &mut conns[0];
+
+    let frames = run_and_collect(spawn_bootstrap(&db, conn), &mut conn.rx).await;
+
+    assert_eq!(
+        watermarks(&frames),
+        vec![expected],
+        "a completed bootstrap sends the workspace's watermark exactly once, \
+         got {frames:?}"
+    );
+    assert!(
+        matches!(frames.last(), Some(SyncResponse::SyncComplete { .. })),
+        "the watermark closes the stream, got {:?}",
+        frames.last()
+    );
+    // The seeded workspace has a settings row, so it is streamed. This is the
+    // contrast the next test needs: an absent snapshot there is an absent row,
+    // not an absent code path.
+    assert!(
+        streamed_entity_types(&frames).contains(&entity_types::WORKSPACE_SETTINGS),
+        "a workspace with a row streams its settings snapshot, got {:?}",
+        streamed_entity_types(&frames)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (f) A workspace with no settings row is not a failure
+// ---------------------------------------------------------------------------
+
+/// "No settings row" and "the settings read failed" used to be the same value.
+/// Now that the second aborts the bootstrap, the first must still complete —
+/// otherwise a workspace that simply has no row would be permanently
+/// un-bootstrappable.
+#[tokio::test]
+async fn a_workspace_with_no_settings_row_still_completes() {
+    const ABSENT: &str = "ws_never_created";
+
+    let db = seeded_workspace().await;
+
+    // The premise, stated against the service rather than assumed: reading an
+    // absent workspace is an answer, not an error.
+    let snapshot = trakkt_auth::workspace_service::get_workspace_settings_for_sync(&db, ABSENT)
+        .await
+        .expect("reading a workspace that does not exist is not a failure");
+    assert!(
+        snapshot.is_none(),
+        "a workspace with no row has no snapshot, got {snapshot:?}"
+    );
+
+    let manager = WebSocketManager::new(None, db.clone());
+    let mut conns = register_connections(&manager, USER, 1);
+    let conn = &mut conns[0];
+
+    let frames = run_and_collect(spawn_bootstrap_in(&db, conn, ABSENT), &mut conn.rx).await;
+
+    assert!(
+        !streamed_entity_types(&frames).contains(&entity_types::WORKSPACE_SETTINGS),
+        "there is no settings row to stream, got {:?}",
+        streamed_entity_types(&frames)
+    );
+    assert_eq!(
+        watermarks(&frames),
+        vec![0],
+        "an empty workspace still completes, at the watermark it has, got {frames:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (g) Unreadable workspace settings are a failure, not an absence
+// ---------------------------------------------------------------------------
+
+/// `get_workspace_settings_for_sync` has two ways to come back empty-handed,
+/// and they used to be the same value: no row, and a `settings` column that is
+/// not JSON. Only the first is an answer. Streaming the second as "this
+/// workspace has no settings" and then certifying it with a watermark is how a
+/// client ends up permanently believing a configured workspace is unconfigured.
+///
+/// The column is written directly here because no service can produce this row:
+/// `update_workspace_settings` serializes a `serde_json::Value`, so everything
+/// it writes parses. A row like this comes from outside the service layer —
+/// hand-editing, a bad restore, a migration — which is exactly the case a
+/// bootstrap has to survive without lying.
+#[tokio::test]
+async fn unparseable_workspace_settings_end_the_bootstrap_without_a_watermark() {
+    let db = seeded_workspace().await;
+    let manager = WebSocketManager::new(None, db.clone());
+    let mut conns = register_connections(&manager, USER, 1);
+    let conn = &mut conns[0];
+
+    // Control: the same workspace, before the column is corrupted.
+    let healthy = run_and_collect(spawn_bootstrap(&db, conn), &mut conn.rx).await;
+    assert!(
+        matches!(healthy.last(), Some(SyncResponse::SyncComplete { .. })),
+        "the control bootstrap must complete, got {:?}",
+        healthy.last()
+    );
+
+    trakkt_core::db_execute!(
+        db,
+        "UPDATE workspaces SET settings = $1 WHERE workspace_id = $2",
+        "{ not json",
+        WORKSPACE
+    )
+    .expect("write a settings column that cannot be parsed");
+
+    // The service reports it as a failure rather than as an absent snapshot.
+    assert!(
+        trakkt_auth::workspace_service::get_workspace_settings_for_sync(&db, WORKSPACE)
+            .await
+            .is_err(),
+        "settings that cannot be parsed are unknown, not absent"
+    );
+
+    let frames = run_and_collect(spawn_bootstrap(&db, conn), &mut conn.rx).await;
+
+    assert!(
+        watermarks(&frames).is_empty(),
+        "a bootstrap that could not read the workspace's settings must not hand \
+         out a watermark, got {frames:?}"
     );
 }

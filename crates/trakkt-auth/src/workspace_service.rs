@@ -94,21 +94,49 @@ struct WorkspaceSnapshotRow {
     updated_at: String,
 }
 
+/// Snapshot for the `sync_log` entry that accompanies a workspace write.
+///
+/// Deliberately best-effort, unlike the bootstrap caller. The write this
+/// follows has already committed, so a failure here cannot be surfaced as "the
+/// update failed" without lying about what is in the database; the entry is
+/// written without a payload instead, which clients skip
+/// (`trakkt_ui::cache::apply` logs and ignores a dataless upsert) and the next
+/// bootstrap repairs. That is the same best-effort contract the
+/// `write_sync_entry` calls below already have — the difference from the
+/// bootstrap path is that there, degrading the payload also certifies it.
 async fn fetch_workspace_settings_snapshot(
     pool: &DbPool,
     workspace_id: &str,
 ) -> Option<serde_json::Value> {
-    get_workspace_settings_for_sync(pool, workspace_id).await
+    match get_workspace_settings_for_sync(pool, workspace_id).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                workspace_id = %workspace_id,
+                "Failed to read workspace settings snapshot -- writing the sync entry without one"
+            );
+            None
+        }
+    }
 }
 
 /// Return a workspace settings snapshot (name, settings, updated_at) as a
 /// JSON value for the sync bootstrap protocol.
 ///
-/// Returns `None` if the workspace does not exist or the query fails.
+/// `Ok(None)` means the workspace has no row: a real answer, and one the
+/// bootstrap streams as "this workspace has no settings entity". `Err` means
+/// the snapshot is unknown — either the query failed or the stored `settings`
+/// JSON could not be parsed.
+///
+/// Those two must stay distinguishable to the caller. Collapsing them, as this
+/// function used to, hands a bootstrap "there are no settings" for a workspace
+/// that has them, and the bootstrap then seals that with a full watermark the
+/// client will never revisit.
 pub async fn get_workspace_settings_for_sync(
     pool: &DbPool,
     workspace_id: &str,
-) -> Option<serde_json::Value> {
+) -> trakkt_core::Result<Option<serde_json::Value>> {
     let row = trakkt_core::db_fetch_optional!(
         pool,
         WorkspaceSnapshotRow,
@@ -118,21 +146,23 @@ pub async fn get_workspace_settings_for_sync(
                   CAST(updated_at AS TEXT) AS updated_at
            FROM workspaces WHERE workspace_id = $1"#,
         workspace_id
-    )
-    .ok()?;
+    )?;
 
-    let row = row?;
-    let settings_json: Option<serde_json::Value> = row
-        .settings
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok());
+    let Some(row) = row else {
+        return Ok(None);
+    };
 
-    Some(serde_json::json!({
+    let settings_json: Option<serde_json::Value> = match row.settings.as_deref() {
+        Some(settings) => Some(serde_json::from_str(settings)?),
+        None => None,
+    };
+
+    Ok(Some(serde_json::json!({
         "workspace_id": row.workspace_id,
         "name": row.name,
         "settings": settings_json,
         "updated_at": row.updated_at,
-    }))
+    })))
 }
 
 /// Update workspace display name.
