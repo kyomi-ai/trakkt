@@ -5678,6 +5678,7 @@ dependencies = [
 name = "trakkt-ui"
 version = "0.1.0"
 dependencies = [
+ "any_spawner",
  "axum",
  "base64 0.22.1",
  "chrono",
