@@ -17,6 +17,10 @@ use serde::Deserialize;
 
 use trakkt_auth::websocket::manager::{CatchUpFlag, CatchUpGuard, ConnectionHandle, WsSender};
 use trakkt_auth::{jwt, user_service};
+use trakkt_types::models::{
+    Comment, Favorite, IssueWithDetails, Label, Notification, Project, ProjectMilestone, Status,
+    Team, View,
+};
 
 use crate::state::AppState;
 
@@ -366,16 +370,25 @@ async fn handle_client_message(
 
 /// Handle a `sync_bootstrap` request.
 ///
-/// Streams all issues and labels for the workspace as `SyncAction` messages
-/// with `action = Insert`, then closes with a `SyncComplete` carrying the
-/// current `latest_sync_id`. Clients should store this ID and use `sync_delta`
-/// for subsequent reconnects.
+/// Streams the whole workspace dataset as `SyncAction` messages with
+/// `action = Insert`, then closes with a `SyncComplete` carrying the current
+/// `latest_sync_id`. Clients should store this ID and use `sync_delta` for
+/// subsequent reconnects.
 ///
 /// The whole stream goes to `conn_tx` — the connection that asked for it — so
 /// the `SyncComplete` watermark is only ever adopted by the client that
 /// received the entities it covers.
 ///
-/// Public because that per-connection addressing is a property worth asserting
+/// Any failure — a query that errors, an entity that cannot be encoded, a
+/// connection that goes away — ends the handler *without* a `SyncComplete`.
+/// That is the one invariant this handler exists to hold, and it is why every
+/// step below returns rather than degrades: a client handed a short dataset
+/// plus a full watermark records itself as caught up, and no future
+/// `sync_delta` will ever backfill what it missed — only wiping its IndexedDB
+/// will. A client handed nothing retries on its next reconnect. `handle_sync_delta`
+/// makes the same trade for the same reason.
+///
+/// Public because the per-connection addressing is a property worth asserting
 /// from outside this module: `tests/sync_ws.rs` drives it against a real
 /// `WebSocketManager` with several connections registered for one user, which
 /// is the only place the fan-out bug this doc comment describes can be seen.
@@ -386,7 +399,6 @@ pub async fn handle_sync_bootstrap(
     user_id: &str,
     workspace_id: &str,
 ) {
-    use trakkt_types::models::IssueFilters;
     use trakkt_types::sync::entity_types;
 
     // Held for the whole handler, so a live edit arriving while this stream
@@ -407,130 +419,314 @@ pub async fn handle_sync_bootstrap(
         .await
         .unwrap_or(0);
 
-    // 2. Fetch all non-archived issues (archived issues are excluded from bootstrap).
-    let issues = trakkt_auth::issue_service::list_issues(
-        db,
+    // 2. Read the whole dataset before any of it goes on the wire.
+    let data = match fetch_bootstrap_data(db, user_id, workspace_id).await {
+        Ok(data) => data,
+        // `fetch_bootstrap_data` has already logged which read failed. Returning
+        // here is the whole point: no watermark is sent, so the client keeps the
+        // cursor it had and asks again on its next reconnect. Substituting an
+        // empty list for the failed read instead — as this handler used to —
+        // streams a workspace that looks emptied and then certifies it as
+        // complete.
+        Err(_) => return,
+    };
+
+    // 3. Assemble the batches in the order clients receive them. Nothing is
+    //    serialized yet; `stream_bootstrap` converts each batch when its turn
+    //    comes, so an abandoned stream never pays for the batches behind it.
+    let mut batches = vec![
+        PendingBatch::new(entity_types::ISSUE, "issue_id", &data.issues),
+        PendingBatch::new(entity_types::LABEL, "label_id", &data.labels),
+        PendingBatch::new(entity_types::STATUS, "status_id", &data.statuses),
+        PendingBatch::new(entity_types::TEAM, "team_id", &data.teams),
+        PendingBatch::new(entity_types::PROJECT, "project_id", &data.projects),
+        PendingBatch::new(entity_types::VIEW, "view_id", &data.views),
+        PendingBatch::new(entity_types::FAVORITE, "favorite_id", &data.favorites),
+        PendingBatch::new(
+            entity_types::NOTIFICATION,
+            "notification_id",
+            &data.notifications,
+        ),
+        PendingBatch::new(entity_types::COMMENT, "comment_id", &data.comments),
+        PendingBatch::new(
+            entity_types::PROJECT_MILESTONE,
+            "milestone_id",
+            &data.milestones,
+        ),
+    ];
+
+    // Workspace settings is a single entity, not a list — and a workspace with
+    // no row simply has none to stream, which is not a failure.
+    if let Some(settings) = &data.workspace_settings {
+        batches.push(PendingBatch::new(
+            entity_types::WORKSPACE_SETTINGS,
+            "workspace_id",
+            std::slice::from_ref(settings),
+        ));
+    }
+
+    // 4. Stream them, and close with the watermark read back in step 1 only if
+    //    every one of them made it.
+    stream_bootstrap(conn_tx, user_id, workspace_id, latest_sync_id, batches).await;
+}
+
+/// Everything a bootstrap streams, read before any of it is put on the wire.
+///
+/// Read as a unit so that a failure in any single query aborts the bootstrap
+/// before the client sees a single frame, rather than silently shrinking the
+/// dataset the trailing watermark then certifies as complete.
+struct BootstrapData {
+    issues: Vec<IssueWithDetails>,
+    labels: Vec<Label>,
+    statuses: Vec<Status>,
+    teams: Vec<Team>,
+    projects: Vec<Project>,
+    views: Vec<View>,
+    favorites: Vec<Favorite>,
+    notifications: Vec<Notification>,
+    comments: Vec<Comment>,
+    milestones: Vec<ProjectMilestone>,
+    /// `None` means the workspace has no row at all — a real answer, streamed
+    /// as "no settings entity". A read that *failed* never reaches this field:
+    /// it comes back as `Err` from [`fetch_bootstrap_data`].
+    workspace_settings: Option<serde_json::Value>,
+}
+
+/// Await one bootstrap read, naming it in the log if it fails.
+///
+/// Every read aborts the bootstrap the same way, so the only thing worth
+/// varying between them is `query` — knowing *which* read failed is the entire
+/// diagnostic value, and it is what eleven copy-pasted `match` arms were
+/// spending eleven blocks of code to say. The error is returned unchanged so
+/// the caller's `?` does the aborting.
+///
+/// Logged at `error!`: a failed read no longer degrades the response, it ends
+/// it, and a bootstrap that never completes is not a warning-level event.
+async fn bootstrap_read<T>(
+    query: &'static str,
+    user_id: &str,
+    workspace_id: &str,
+    read: impl std::future::Future<Output = trakkt_core::Result<T>>,
+) -> trakkt_core::Result<T> {
+    read.await.map_err(|e| {
+        tracing::error!(
+            user_id,
+            workspace_id,
+            query,
+            error = %e,
+            "sync_bootstrap read failed -- aborting without a watermark"
+        );
+        e
+    })
+}
+
+/// Read every entity list a bootstrap streams, in the order it streams them.
+///
+/// Returns `Err` as soon as any read fails; the caller must abandon the
+/// bootstrap rather than stream what it did manage to read.
+async fn fetch_bootstrap_data(
+    db: &trakkt_core::DbPool,
+    user_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<BootstrapData> {
+    use trakkt_types::models::IssueFilters;
+
+    // Archived issues are excluded from bootstrap.
+    let issue_filters = IssueFilters {
+        include_archived: Some(false),
+        ..Default::default()
+    };
+
+    let issues = bootstrap_read(
+        "list_issues",
+        user_id,
         workspace_id,
-        None,
-        &IssueFilters {
-            include_archived: Some(false),
-            ..Default::default()
-        },
+        trakkt_auth::issue_service::list_issues(db, workspace_id, None, &issue_filters),
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(user_id, workspace_id, error = %e, "list_issues failed during bootstrap");
-        vec![]
-    });
+    .await?;
 
-    // 3. Fetch all labels.
-    let labels = trakkt_auth::label_service::list_labels(db, workspace_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_labels failed during bootstrap");
-            vec![]
-        });
+    let labels = bootstrap_read(
+        "list_labels",
+        user_id,
+        workspace_id,
+        trakkt_auth::label_service::list_labels(db, workspace_id),
+    )
+    .await?;
 
-    // 4. Fetch statuses, teams, and projects.
-    let statuses = trakkt_auth::status_service::list_statuses(db, workspace_id, None)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_statuses failed during bootstrap");
-            vec![]
-        });
+    let statuses = bootstrap_read(
+        "list_statuses",
+        user_id,
+        workspace_id,
+        trakkt_auth::status_service::list_statuses(db, workspace_id, None),
+    )
+    .await?;
 
-    let teams = trakkt_auth::team_service::list_teams(db, workspace_id, Some(user_id))
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_teams failed during bootstrap");
-            vec![]
-        });
+    let teams = bootstrap_read(
+        "list_teams",
+        user_id,
+        workspace_id,
+        trakkt_auth::team_service::list_teams(db, workspace_id, Some(user_id)),
+    )
+    .await?;
 
-    let projects = trakkt_auth::project_service::list_projects(db, workspace_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_projects failed during bootstrap");
-            vec![]
-        });
+    let projects = bootstrap_read(
+        "list_projects",
+        user_id,
+        workspace_id,
+        trakkt_auth::project_service::list_projects(db, workspace_id),
+    )
+    .await?;
 
-    let views = trakkt_auth::view_service::list_views(db, workspace_id, user_id, None)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_views failed during bootstrap");
-            vec![]
-        });
+    let views = bootstrap_read(
+        "list_views",
+        user_id,
+        workspace_id,
+        trakkt_auth::view_service::list_views(db, workspace_id, user_id, None),
+    )
+    .await?;
 
-    let favorites = trakkt_auth::favorite_service::list_favorites(db, user_id, workspace_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_favorites failed during bootstrap");
-            vec![]
-        });
+    let favorites = bootstrap_read(
+        "list_favorites",
+        user_id,
+        workspace_id,
+        trakkt_auth::favorite_service::list_favorites(db, user_id, workspace_id),
+    )
+    .await?;
 
-    let notifications = trakkt_auth::notification_service::list_notifications(db, user_id, false, false, None, None, None, trakkt_auth::notification_service::DEFAULT_NOTIFICATION_LIMIT, 0)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_notifications failed during bootstrap");
-            vec![]
-        });
+    let notifications = bootstrap_read(
+        "list_notifications",
+        user_id,
+        workspace_id,
+        trakkt_auth::notification_service::list_notifications(
+            db,
+            user_id,
+            false,
+            false,
+            None,
+            None,
+            None,
+            trakkt_auth::notification_service::DEFAULT_NOTIFICATION_LIMIT,
+            0,
+        ),
+    )
+    .await?;
 
-    let comments = trakkt_auth::comment_service::list_comments_for_workspace(db, workspace_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_comments_for_workspace failed during bootstrap");
-            vec![]
-        });
+    let comments = bootstrap_read(
+        "list_comments_for_workspace",
+        user_id,
+        workspace_id,
+        trakkt_auth::comment_service::list_comments_for_workspace(db, workspace_id),
+    )
+    .await?;
 
-    // Fetch milestones across all projects in the workspace.
-    let milestones = trakkt_auth::project_service::list_milestones_for_workspace(db, workspace_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(user_id, workspace_id, error = %e, "list_milestones_for_workspace failed during bootstrap");
-            vec![]
-        });
+    // Milestones across all projects in the workspace.
+    let milestones = bootstrap_read(
+        "list_milestones_for_workspace",
+        user_id,
+        workspace_id,
+        trakkt_auth::project_service::list_milestones_for_workspace(db, workspace_id),
+    )
+    .await?;
 
-    // Fetch workspace settings snapshot.
-    let ws_settings = trakkt_auth::workspace_service::get_workspace_settings_for_sync(db, workspace_id)
-        .await;
+    let workspace_settings = bootstrap_read(
+        "get_workspace_settings_for_sync",
+        user_id,
+        workspace_id,
+        trakkt_auth::workspace_service::get_workspace_settings_for_sync(db, workspace_id),
+    )
+    .await?;
 
-    // 5. Stream each entity as a SyncAction with action=Insert.
-    //
-    // Each batch is serialized only when its turn comes and the stream stops at
-    // the first failed send: once the socket is gone there is nothing to gain
-    // from serializing and queueing the remaining batches. Bailing out also
-    // skips the `SyncComplete` below, so a client that dropped mid-bootstrap
-    // never records a watermark for entities it did not receive.
-    macro_rules! stream_batch {
-        ($entity_type:expr, $id_field:expr, $values:expr) => {
-            if !stream_entities(conn_tx, workspace_id, $entity_type, $id_field, $values).await {
-                tracing::debug!(
+    Ok(BootstrapData {
+        issues,
+        labels,
+        statuses,
+        teams,
+        projects,
+        views,
+        favorites,
+        notifications,
+        comments,
+        milestones,
+        workspace_settings,
+    })
+}
+
+/// Turn one entity list into the JSON frames it will be streamed as.
+///
+/// Boxed because the batches differ in element type: erasing that behind a
+/// closure is what lets [`stream_bootstrap`] hold them in one list and write
+/// the serialize-stream-abort logic once instead of once per entity type. It
+/// also keeps serialization lazy, so peak memory is one batch of JSON rather
+/// than all eleven at once, and an abandoned stream never encodes the batches
+/// behind it.
+type BatchSerializer<'a> =
+    Box<dyn FnOnce() -> Result<Vec<serde_json::Value>, serde_json::Error> + Send + 'a>;
+
+/// One entity list waiting for its turn on the wire.
+struct PendingBatch<'a> {
+    /// Entity type carried on every frame in the batch.
+    entity_type: &'static str,
+    /// JSON key holding each entity's primary key (e.g. `"issue_id"`).
+    id_field: &'static str,
+    /// Encodes the batch, or reports the entity that could not be encoded.
+    serialize: BatchSerializer<'a>,
+}
+
+impl<'a> PendingBatch<'a> {
+    fn new<T: serde::Serialize + Sync>(
+        entity_type: &'static str,
+        id_field: &'static str,
+        items: &'a [T],
+    ) -> Self {
+        Self {
+            entity_type,
+            id_field,
+            serialize: Box::new(move || to_sync_values(items)),
+        }
+    }
+}
+
+/// Stream every batch, then close the stream with `latest_sync_id`.
+///
+/// The watermark is sent only after every batch has been encoded and delivered
+/// in full. Both failure modes — an entity that will not serialize, and a
+/// connection that stopped accepting frames — return early instead, leaving the
+/// client's stored cursor exactly where it was so its next reconnect asks for
+/// the same data again.
+async fn stream_bootstrap(
+    conn_tx: &WsSender,
+    user_id: &str,
+    workspace_id: &str,
+    latest_sync_id: i64,
+    batches: Vec<PendingBatch<'_>>,
+) {
+    for batch in batches {
+        let values = match (batch.serialize)() {
+            Ok(values) => values,
+            // `to_sync_values` has already logged the entity and the error.
+            Err(_) => {
+                tracing::error!(
                     user_id,
                     workspace_id,
-                    entity_type = $entity_type,
-                    "sync_bootstrap aborted: connection closed"
+                    entity_type = batch.entity_type,
+                    "sync_bootstrap aborted: batch could not be serialized"
                 );
                 return;
             }
         };
+
+        if !stream_entities(conn_tx, workspace_id, batch.entity_type, batch.id_field, values).await
+        {
+            tracing::debug!(
+                user_id,
+                workspace_id,
+                entity_type = batch.entity_type,
+                "sync_bootstrap aborted: connection closed"
+            );
+            return;
+        }
     }
 
-    stream_batch!(entity_types::ISSUE, "issue_id", to_sync_values(&issues));
-    stream_batch!(entity_types::LABEL, "label_id", to_sync_values(&labels));
-    stream_batch!(entity_types::STATUS, "status_id", to_sync_values(&statuses));
-    stream_batch!(entity_types::TEAM, "team_id", to_sync_values(&teams));
-    stream_batch!(entity_types::PROJECT, "project_id", to_sync_values(&projects));
-    stream_batch!(entity_types::VIEW, "view_id", to_sync_values(&views));
-    stream_batch!(entity_types::FAVORITE, "favorite_id", to_sync_values(&favorites));
-    stream_batch!(entity_types::NOTIFICATION, "notification_id", to_sync_values(&notifications));
-    stream_batch!(entity_types::COMMENT, "comment_id", to_sync_values(&comments));
-    stream_batch!(entity_types::PROJECT_MILESTONE, "milestone_id", to_sync_values(&milestones));
-
-    // Workspace settings is a single entity (not a list).
-    if let Some(ws_settings_val) = ws_settings {
-        stream_batch!(entity_types::WORKSPACE_SETTINGS, "workspace_id", vec![ws_settings_val]);
-    }
-
-    // 6. Signal completion with the watermark read back in step 1.
     send_sync_response(
         conn_tx,
         trakkt_types::sync::SyncResponse::SyncComplete {
@@ -776,21 +972,28 @@ async fn drain_delta(
 
 /// Serialize a batch of entities for streaming.
 ///
-/// An entity that cannot be serialized cannot be put on the wire at all, so it
-/// is logged and dropped rather than aborting the bootstrap.
-fn to_sync_values<T: serde::Serialize>(items: &[T]) -> Vec<serde_json::Value> {
+/// An entity that cannot be serialized cannot be put on the wire at all, and
+/// the first one that fails takes the whole bootstrap with it: dropping it
+/// instead would hand the client a batch quietly missing a row, and then a
+/// `SyncComplete` certifying that batch as the complete dataset. The client has
+/// no way to learn otherwise — the row is below its new watermark, so no delta
+/// will ever mention it again.
+///
+/// The `Err` is the encoding failure itself; the entity type and the underlying
+/// error are logged here, where the concrete `T` is still known.
+fn to_sync_values<T: serde::Serialize>(
+    items: &[T],
+) -> Result<Vec<serde_json::Value>, serde_json::Error> {
     items
         .iter()
-        .filter_map(|item| match serde_json::to_value(item) {
-            Ok(value) => Some(value),
-            Err(e) => {
-                tracing::warn!(
+        .map(|item| {
+            serde_json::to_value(item).inspect_err(|e| {
+                tracing::error!(
                     entity = std::any::type_name::<T>(),
                     error = %e,
-                    "Failed to serialize entity for bootstrap, skipping"
+                    "Failed to serialize entity for bootstrap, aborting the stream"
                 );
-                None
-            }
+            })
         })
         .collect()
 }
@@ -978,6 +1181,116 @@ mod tests {
         assert!(
             delivered <= 2,
             "expected the stream to stop within one frame of the close, delivered {delivered}"
+        );
+    }
+
+    /// An entity that refuses to be encoded.
+    ///
+    /// `serde_json::to_value` only fails on values JSON cannot express, and no
+    /// entity model this handler streams can produce one, so the failure has to
+    /// be introduced deliberately. This stands in for an *entity*, not for any
+    /// production code: everything it is handed to below — `PendingBatch`,
+    /// `to_sync_values`, `stream_bootstrap` — is exactly what
+    /// `handle_sync_bootstrap` runs.
+    struct Unencodable;
+
+    impl serde::Serialize for Unencodable {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            _serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("this entity cannot be encoded"))
+        }
+    }
+
+    /// The entity ids carried by the `SyncAction` frames in `frames`.
+    fn streamed_entity_ids(frames: &[SyncResponse]) -> Vec<&str> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                SyncResponse::SyncAction(action) => Some(action.entity_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A batch that cannot be encoded ends the stream where it stands.
+    ///
+    /// The batches ahead of it have already reached the client, so what is at
+    /// stake is not the missing frames — it is the watermark. Sending it would
+    /// have the client file a dataset it knows is short as the complete
+    /// workspace, and every future delta starts above the rows it never got.
+    #[tokio::test]
+    async fn a_batch_that_cannot_be_encoded_ends_the_bootstrap_without_a_watermark() {
+        let (conn_tx, mut conn_rx) = mpsc::channel::<String>(16);
+        let issues = [issue_value("iss_1"), issue_value("iss_2")];
+        let unencodable = [Unencodable];
+
+        stream_bootstrap(
+            &conn_tx,
+            "usr_1",
+            "ws_1",
+            99,
+            vec![
+                PendingBatch::new(entity_types::ISSUE, "issue_id", &issues),
+                PendingBatch::new(entity_types::LABEL, "label_id", &unencodable),
+            ],
+        )
+        .await;
+        drop(conn_tx);
+
+        let mut frames = Vec::new();
+        while let Some(frame) = conn_rx.recv().await {
+            frames.push(parse_frame(&frame));
+        }
+
+        // Non-vacuity: the stream ran, and got as far as the batch in front of
+        // the one that could not be encoded.
+        assert_eq!(
+            streamed_entity_ids(&frames),
+            vec!["iss_1", "iss_2"],
+            "the batches ahead of the failure should have streamed, got {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, SyncResponse::SyncComplete { .. })),
+            "a bootstrap that could not encode a batch must not certify what it did \
+             send as complete, got {frames:?}"
+        );
+    }
+
+    /// The same stream with nothing broken in it: every batch encodes, so the
+    /// watermark is sent. Without this, the assertion above is satisfied by a
+    /// `stream_bootstrap` that never sends a watermark at all.
+    #[tokio::test]
+    async fn a_fully_encodable_stream_ends_with_the_watermark() {
+        let (conn_tx, mut conn_rx) = mpsc::channel::<String>(16);
+        let issues = [issue_value("iss_1"), issue_value("iss_2")];
+
+        stream_bootstrap(
+            &conn_tx,
+            "usr_1",
+            "ws_1",
+            99,
+            vec![PendingBatch::new(entity_types::ISSUE, "issue_id", &issues)],
+        )
+        .await;
+        drop(conn_tx);
+
+        let mut frames = Vec::new();
+        while let Some(frame) = conn_rx.recv().await {
+            frames.push(parse_frame(&frame));
+        }
+
+        assert_eq!(streamed_entity_ids(&frames), vec!["iss_1", "iss_2"]);
+        assert!(
+            matches!(
+                frames.last(),
+                Some(SyncResponse::SyncComplete { last_sync_id: 99 })
+            ),
+            "an unbroken stream closes with the watermark it was given, got {:?}",
+            frames.last()
         );
     }
 
