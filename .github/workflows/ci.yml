@@ -2,11 +2,12 @@
 # Trakkt — CI (Pull Request Checks)
 # =============================================================================
 # Runs on every PR to main, including new pushes to existing PRs.
-# Four jobs:
+# Five jobs:
 #   1. lint-suppression — blocks new #[allow(...)] and = "allow" in Cargo.toml
 #   2. migration-consistency — blocks duplicate/diverging migration versions
 #   3. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
-#   4. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
+#   4. test (slowest) — cargo test across the whole workspace
+#   5. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
 # =============================================================================
 
 name: CI
@@ -123,6 +124,101 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
         run: cargo clippy --locked -p trakkt-ui --target wasm32-unknown-unknown --features hydrate -- -D warnings
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  # ---------------------------------------------------------------------------
+  # Slowest check: cargo test across the whole workspace
+  #
+  # Until this job existed CI never ran the test suite at all, so a failing test
+  # could sit on main indefinitely with zero signal — which is exactly what
+  # happened to the OpenAPI operation-set test.
+  #
+  # No service containers: every test uses in-memory SQLite. Do not add Postgres
+  # or Redis here.
+  #
+  # Setup mirrors the clippy job. The build dependencies, sccache wiring and local
+  # dev patch stripping are required — the workspace does not compile without
+  # them. The asset-prep steps (dist/, Tailwind) are not required by any test
+  # today and are kept deliberately for parity; see the note on those steps
+  # below. The one deliberate difference is the wasm32 target, which is
+  # omitted: it is only needed for clippy's wasm compilation check. This job runs
+  # `cargo test` on the host target only, so wasm32 would cost an extra toolchain
+  # download for nothing. (The wasm-bindgen-test suite needs a browser runner and
+  # is tracked separately in TRA-9932.)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    # Bounds the whole job, not just the test step: setup (apt, toolchain, cargo
+    # update, tailwind) burns ~2-3min before compilation starts. Worst legitimate
+    # cold run is ~18min — 295s local cold x ~3 (the CI/local ratio clippy shows:
+    # 1m38s local, ~5m CI) plus setup. 30 leaves ~1.7x headroom there while capping
+    # a hung test at 30min instead of GitHub's 6-hour default. TRA-9930 was a test
+    # that hung for eight minutes with no output; unbounded, that costs a runner-day.
+    timeout-minutes: 30
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Verify sccache can reach GHA cache
+        run: |
+          echo 'fn main(){}' > /tmp/sccache_test.rs
+          if sccache $(rustc --print sysroot)/bin/rustc /tmp/sccache_test.rs --crate-type bin -o /tmp/sccache_test_out; then
+            echo "SCCACHE_AVAILABLE=true" >> $GITHUB_ENV
+            sccache --show-stats 2>&1 | head -5
+          else
+            echo "::warning::sccache GHA cache probe failed (see above), building without cache"
+            echo "SCCACHE_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+          rm -f /tmp/sccache_test.rs /tmp/sccache_test_out
+
+      - name: Strip local dev patches (path overrides not available in CI)
+        run: sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
+
+      # Stripping the patches invalidates the committed lockfile. Regenerating it
+      # here is what lets the `--locked` test run below succeed: it validates
+      # against this regenerated file, not the committed one.
+      - name: Regenerate lockfile after stripping local patches
+        run: cargo update --workspace
+
+      # The next three steps mirror the clippy job's asset prep. No workspace
+      # test currently requires them: `ServeDir::new(dist_dir())` is only wired
+      # up in `build_router()`, which runs from apps/server/src/main.rs and never
+      # from a test, and nothing in the workspace include_str!s style/output.css.
+      # They are kept on purpose, not by accident — they cost a few seconds, they
+      # keep this job's setup a faithful mirror of clippy's (which does need
+      # them), and they mean nothing here has to change the day a test does touch
+      # dist/ or the built CSS.
+      - name: Ensure trakkt-ui/dist/ exists for ServeDir
+        run: mkdir -p crates/trakkt-ui/dist
+
+      - name: Install tailwindcss
+        run: |
+          curl -sLO https://github.com/tailwindlabs/tailwindcss/releases/download/v4.2.2/tailwindcss-linux-x64
+          chmod +x tailwindcss-linux-x64
+          sudo mv tailwindcss-linux-x64 /usr/local/bin/tailwindcss
+
+      - name: Build Tailwind CSS
+        working-directory: crates/trakkt-ui
+        run: tailwindcss --input style/main.css --output style/output.css
+
+      - name: cargo test (workspace)
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: cargo test --workspace --locked
 
       - name: sccache stats
         if: always()

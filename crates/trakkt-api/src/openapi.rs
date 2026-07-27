@@ -225,6 +225,66 @@ fn build_responses(is_post: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// Every operation the generated OpenAPI spec is expected to expose, sorted.
+    ///
+    /// This list is deliberately hand-maintained rather than derived from
+    /// `crate::all_operations()`. It is a checklist of the public REST surface,
+    /// not a restatement of the code: deriving it would make the test agree with
+    /// whatever the registry happens to contain and catch nothing. Because it is
+    /// explicit, adding or removing an endpoint has to be an intentional,
+    /// reviewable edit here — and a path+method collision, where one operation
+    /// silently overwrites another in the spec, shows up as a missing operation
+    /// instead of passing unnoticed.
+    ///
+    /// Keep it sorted; `expected_operations_are_sorted_and_unique` enforces that
+    /// so future diffs stay readable.
+    const EXPECTED_OPERATIONS: &[&str] = &[
+        "add_comment",
+        "add_relation",
+        "attach_to_issue",
+        "create_issue",
+        "create_label",
+        "create_milestone",
+        "create_project",
+        "create_release",
+        "delete_attachment",
+        "delete_issue",
+        "delete_milestone",
+        "delete_project",
+        "detach_from_issue",
+        "download_attachment",
+        "get_issue",
+        "get_project",
+        "get_release",
+        "list_attachments",
+        "list_issue_activities",
+        "list_issue_attachments",
+        "list_issue_github_links",
+        "list_issue_relations",
+        "list_issues",
+        "list_labels",
+        "list_milestones",
+        "list_projects",
+        "list_releases",
+        "list_starred_issues",
+        "list_statuses",
+        "list_teams",
+        "list_unreleased_issues",
+        "list_workspace_activities",
+        "lookup_branch",
+        "lookup_commit",
+        "remove_relation",
+        "search_issues",
+        "star_issue",
+        "unstar_issue",
+        "update_issue",
+        "update_milestone",
+        "update_project",
+        "update_team_settings",
+        "upload_attachment",
+    ];
 
     #[test]
     fn spec_version() {
@@ -239,24 +299,83 @@ mod tests {
         assert_eq!(spec["info"]["version"], "0.1.0");
     }
 
-    #[test]
-    fn all_36_operations_present() {
+    /// Collect every `operationId` present in the generated spec.
+    fn spec_operation_ids() -> BTreeSet<String> {
         let spec = generate_openapi_spec();
         let paths = spec["paths"].as_object().expect("paths should be an object");
 
-        let mut operation_ids: Vec<String> = Vec::new();
-        for (_path, methods) in paths {
+        let mut operation_ids = BTreeSet::new();
+        for methods in paths.values() {
             if let Some(obj) = methods.as_object() {
-                for (_method, op) in obj {
+                for op in obj.values() {
                     if let Some(id) = op["operationId"].as_str() {
-                        operation_ids.push(id.to_string());
+                        operation_ids.insert(id.to_string());
                     }
                 }
             }
         }
-        operation_ids.sort();
+        operation_ids
+    }
 
-        assert_eq!(operation_ids.len(), 36, "expected 36 operations, got {}: {operation_ids:?}", operation_ids.len());
+    #[test]
+    fn spec_exposes_expected_operations() {
+        let actual = spec_operation_ids();
+        let expected: BTreeSet<String> =
+            EXPECTED_OPERATIONS.iter().map(|s| (*s).to_string()).collect();
+
+        let unexpected: Vec<&String> = actual.difference(&expected).collect();
+        let missing: Vec<&String> = expected.difference(&actual).collect();
+
+        let as_list_entries = |names: &[&String]| -> String {
+            names
+                .iter()
+                .map(|name| format!("        \"{name}\","))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut problems: Vec<String> = Vec::new();
+        if !unexpected.is_empty() {
+            problems.push(format!(
+                "Present in the spec but missing from EXPECTED_OPERATIONS.\n\
+                 If you just added an endpoint, this is the expected failure: add these lines to \
+                 EXPECTED_OPERATIONS, in sorted position.\n{}",
+                as_list_entries(&unexpected)
+            ));
+        }
+        if !missing.is_empty() {
+            problems.push(format!(
+                "Listed in EXPECTED_OPERATIONS but absent from the spec.\n\
+                 The operation was removed or renamed (delete or rename these lines), or its REST \
+                 path+method now collides with another operation and is being overwritten in the \
+                 spec (fix the collision instead).\n{}",
+                as_list_entries(&missing)
+            ));
+        }
+
+        assert!(
+            problems.is_empty(),
+            "The OpenAPI operation set no longer matches the expected public API surface.\n\
+             EXPECTED_OPERATIONS is the list at the top of `mod tests` in \
+             crates/trakkt-api/src/openapi.rs.\n\n{}",
+            problems.join("\n\n")
+        );
+    }
+
+    #[test]
+    fn expected_operations_are_sorted_and_unique() {
+        let out_of_order: Vec<String> = EXPECTED_OPERATIONS
+            .windows(2)
+            .filter(|pair| pair[0] >= pair[1])
+            .map(|pair| format!("        \"{}\" then \"{}\"", pair[0], pair[1]))
+            .collect();
+
+        assert!(
+            out_of_order.is_empty(),
+            "EXPECTED_OPERATIONS must stay sorted and duplicate-free so diffs remain readable.\n\
+             Out of order (or duplicated) at:\n{}",
+            out_of_order.join("\n")
+        );
     }
 
     #[test]
