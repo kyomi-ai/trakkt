@@ -665,6 +665,25 @@ pub async fn remove_project_member(
 
 // ─── Milestones ─────────────────────────────────────────────────────────────
 
+/// Build the sync payload for a milestone insert or update.
+///
+/// Both call sites already re-read the row they just wrote, so unlike
+/// [`project_sync_payload`] this takes the milestone rather than fetching it
+/// again — the value it serializes is the same row a bootstrap would stream
+/// from `list_milestones_for_workspace`. An entry with no payload is skipped
+/// outright by the client, on the live frame and on delta alike, so a
+/// serialization failure is logged rather than passing silently.
+fn milestone_sync_payload(milestone: &ProjectMilestone) -> Option<serde_json::Value> {
+    match serde_json::to_value(milestone) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(error = %e, milestone_id = %milestone.milestone_id,
+                "Failed to serialize milestone for sync payload");
+            None
+        }
+    }
+}
+
 /// List all milestones in a project, ordered by sort_order then creation date.
 pub async fn list_milestones(
     db: &DbPool,
@@ -735,23 +754,9 @@ pub async fn create_milestone(
         target_date
     )?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
-        entity_types::PROJECT_MILESTONE,
-        &milestone_id,
-        workspace_id,
-        None,
-        SyncActionType::Insert,
-        None,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone create");
-        0
-    });
-
-    // Re-fetch to get DB-assigned timestamp.
+    // Re-fetch to get the DB-assigned timestamp. This has to happen before the
+    // sync log write: both the stored entry and the live frame carry the full
+    // milestone, and the client skips either without it.
     let sql = format!("{MILESTONE_SELECT} WHERE milestone_id = $1");
     let row = trakkt_core::db_fetch_one!(
         db,
@@ -760,6 +765,23 @@ pub async fn create_milestone(
         &milestone_id
     )?;
     let milestone = row.into_dto();
+    let payload = milestone_sync_payload(&milestone);
+
+    // Sync log — best-effort.
+    let sync_id = sync_log_service::write_sync_entry(
+        db,
+        entity_types::PROJECT_MILESTONE,
+        &milestone_id,
+        workspace_id,
+        None,
+        SyncActionType::Insert,
+        payload.clone(),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone create");
+        0
+    });
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -769,7 +791,7 @@ pub async fn create_milestone(
             entity_types::PROJECT_MILESTONE,
             &milestone_id,
             SyncActionType::Insert,
-            serde_json::to_value(&milestone).ok(),
+            payload,
             sync_id,
         )
         .await;
@@ -850,23 +872,9 @@ pub async fn update_milestone(
         )));
     }
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
-        entity_types::PROJECT_MILESTONE,
-        milestone_id,
-        workspace_id,
-        None,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone update");
-        0
-    });
-
-    // Re-fetch the updated milestone.
+    // Re-fetch the updated milestone. This has to happen before the sync log
+    // write: both the stored entry and the live frame carry the full milestone,
+    // and the client skips either without it.
     let sql = format!("{MILESTONE_SELECT} WHERE milestone_id = $1");
     let row = trakkt_core::db_fetch_one!(
         db,
@@ -875,6 +883,23 @@ pub async fn update_milestone(
         milestone_id
     )?;
     let milestone = row.into_dto();
+    let payload = milestone_sync_payload(&milestone);
+
+    // Sync log — best-effort.
+    let sync_id = sync_log_service::write_sync_entry(
+        db,
+        entity_types::PROJECT_MILESTONE,
+        milestone_id,
+        workspace_id,
+        None,
+        SyncActionType::Update,
+        payload.clone(),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone update");
+        0
+    });
 
     // WebSocket broadcast — send full entity data as SyncResponse.
     if let Some(ws) = ws_manager {
@@ -884,7 +909,7 @@ pub async fn update_milestone(
             entity_types::PROJECT_MILESTONE,
             milestone_id,
             SyncActionType::Update,
-            serde_json::to_value(&milestone).ok(),
+            payload,
             sync_id,
         )
         .await;

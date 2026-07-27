@@ -530,7 +530,7 @@ fn sync_action_frame(
 mod tests {
     use super::*;
     use trakkt_types::models::{
-        Favorite, IssueWithDetails, Label, Project, Status, Team, View,
+        Favorite, IssueWithDetails, Label, Project, ProjectMilestone, Status, Team, View,
     };
     use trakkt_types::sync::{entity_types, SyncResponse};
 
@@ -1515,6 +1515,156 @@ mod tests {
         let received: Project =
             serde_json::from_value(data).expect("payload deserializes into a Project");
         assert_eq!(received, project);
+    }
+
+    // ─── Milestone frames and payloads (TRA-9938) ────────────────────────────
+    //
+    // Milestones showed up at bootstrap and then froze: the sync entries were
+    // written with no payload, so the client's data-less guard dropped every
+    // insert and update before it could reach any entity arm.
+
+    async fn create_test_milestone(
+        db: &DbPool,
+        project_id: &str,
+        name: &str,
+        ws: Option<&WebSocketManager>,
+    ) -> ProjectMilestone {
+        crate::project_service::create_milestone(
+            db,
+            project_id,
+            name,
+            Some("Ship the first cut"),
+            Some("2026-09-01"),
+            ws,
+            WS,
+        )
+        .await
+        .expect("create milestone")
+    }
+
+    #[tokio::test]
+    async fn milestone_create_frame_carries_the_new_milestone() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+        let project = create_test_project(&db, Some(&manager)).await;
+        next_sync_action(&mut conn).await; // the project create frame
+
+        let milestone = create_test_milestone(&db, &project.project_id, "Beta", Some(&manager)).await;
+
+        let action = next_sync_action(&mut conn).await;
+        assert!(matches!(action.action, SyncActionType::Insert));
+        let data = payload_of(
+            &action,
+            entity_types::PROJECT_MILESTONE,
+            &milestone.milestone_id,
+        );
+
+        let received: ProjectMilestone =
+            serde_json::from_value(data).expect("payload deserializes into a ProjectMilestone");
+        assert_eq!(
+            received, milestone,
+            "the frame must carry the same row the caller got back"
+        );
+        assert!(
+            !received.created_at.is_empty(),
+            "the payload is built after the re-fetch, so the DB-assigned \
+             created_at has to be in it"
+        );
+        assert_eq!(
+            received.target_date.as_deref(),
+            Some("2026-09-01"),
+            "the date the milestone was created with has to survive the round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn milestone_update_frame_carries_the_updated_milestone() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+        let project = create_test_project(&db, Some(&manager)).await;
+        next_sync_action(&mut conn).await; // the project create frame
+        let milestone = create_test_milestone(&db, &project.project_id, "Beta", Some(&manager)).await;
+        next_sync_action(&mut conn).await; // the milestone create frame
+
+        let updated = crate::project_service::update_milestone(
+            &db,
+            &milestone.milestone_id,
+            Some("Beta 2"),
+            None,
+            Some(Some("2026-10-15")),
+            Some(&manager),
+            WS,
+        )
+        .await
+        .expect("update milestone");
+
+        let action = next_sync_action(&mut conn).await;
+        assert!(matches!(action.action, SyncActionType::Update));
+        let data = payload_of(
+            &action,
+            entity_types::PROJECT_MILESTONE,
+            &milestone.milestone_id,
+        );
+
+        let received: ProjectMilestone =
+            serde_json::from_value(data).expect("payload deserializes into a ProjectMilestone");
+        assert_eq!(received, updated);
+        assert_eq!(
+            received.name, "Beta 2",
+            "the frame must carry the new name, not the row as it was before"
+        );
+        assert_eq!(
+            received.target_date.as_deref(),
+            Some("2026-10-15"),
+            "a re-dated milestone has to arrive re-dated"
+        );
+    }
+
+    /// The durable half for milestones. Run with **no `ws_manager`**, so the
+    /// live frame cannot satisfy any of it: this is what a client that was
+    /// offline for the whole thing replays on reconnect.
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_milestone_write() {
+        let db = two_user_workspace().await;
+
+        let project = create_test_project(&db, None).await;
+        let created = create_test_milestone(&db, &project.project_id, "Beta", None).await;
+        let updated = crate::project_service::update_milestone(
+            &db,
+            &created.milestone_id,
+            Some("Beta 2"),
+            None,
+            Some(Some("2026-10-15")),
+            None,
+            WS,
+        )
+        .await
+        .expect("update milestone");
+
+        let payloads: Vec<ProjectMilestone> =
+            delta_payloads(&db, USER_B, entity_types::PROJECT_MILESTONE).await;
+
+        assert_eq!(
+            payloads.len(),
+            2,
+            "one milestone create plus one milestone update"
+        );
+        assert_eq!(payloads[0], created);
+        assert!(
+            !payloads[0].created_at.is_empty(),
+            "the payload is built from the re-fetch, so the DB-assigned \
+             created_at has to be in it"
+        );
+        assert_eq!(payloads[1], updated);
+        assert_eq!(
+            payloads[1].name, "Beta 2",
+            "the update row must carry the new value, not the row as it was before"
+        );
+        assert_eq!(
+            payloads[1].target_date.as_deref(),
+            Some("2026-10-15"),
+            "a re-dated milestone has to survive a reconnect re-dated"
+        );
     }
 
     /// The durable half: what a client that was offline for all of it gets on

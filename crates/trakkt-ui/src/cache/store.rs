@@ -54,6 +54,10 @@ struct SyncStoreInner {
     /// Version counter bumped when a comment sync action arrives.
     /// Used by the detail page to trigger a re-read from IndexedDB.
     comments_version: ArcRwSignal<u32>,
+    /// Version counter bumped when a project_milestone sync action arrives.
+    /// Used by the project detail page and the issue metadata sidebar to
+    /// trigger a refetch of the milestone list from the server.
+    milestones_version: ArcRwSignal<u32>,
     /// Where this tab's `remove_*` methods send the matching cache delete.
     ///
     /// Set by the Layout once the tab's sync role is known, and set again if a
@@ -102,6 +106,7 @@ impl SyncStore {
                 activities_version: ArcRwSignal::new(0),
                 relations_version: ArcRwSignal::new(0),
                 comments_version: ArcRwSignal::new(0),
+                milestones_version: ArcRwSignal::new(0),
                 delete_route: RefCell::new(DeleteRoute::default()),
             })),
         }
@@ -229,6 +234,28 @@ impl SyncStore {
     pub fn bump_comments_version(&self) {
         self.inner.with_value(|inner| {
             inner.comments_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for milestones — bumped on each project_milestone sync
+    /// action.
+    ///
+    /// Milestones are not held in this store: the project detail page and the
+    /// issue metadata sidebar both read them straight from the `list_milestones`
+    /// server function. This counter is the reactive dependency that tells them
+    /// to ask again.
+    pub fn milestones_version(&self) -> Signal<u32> {
+        let sig = self.inner.with_value(|inner| inner.milestones_version.clone());
+        Signal::derive(move || sig.get())
+    }
+
+    /// Bump the milestones version counter.
+    ///
+    /// Called by the sync engine when a "project_milestone" entity type arrives
+    /// via WebSocket, signaling that the milestone lists should refetch.
+    pub fn bump_milestones_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.milestones_version.update(|v| *v += 1);
         });
     }
 
@@ -530,6 +557,7 @@ impl SyncStore {
             inner.activities_version.set(0);
             inner.relations_version.set(0);
             inner.comments_version.set(0);
+            inner.milestones_version.set(0);
         });
     }
 }
