@@ -2,12 +2,14 @@
 # Trakkt — CI (Pull Request Checks)
 # =============================================================================
 # Runs on every PR to main, including new pushes to existing PRs.
-# Five jobs:
+# Six jobs, all independent — they run in parallel, so PR wall-clock is the
+# slowest job, not the sum:
 #   1. lint-suppression — blocks new #[allow(...)] and = "allow" in Cargo.toml
 #   2. migration-consistency — blocks duplicate/diverging migration versions
 #   3. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
 #   4. test (slowest) — cargo test across the whole workspace
-#   5. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
+#   5. wasm-test (slow) — executes the trakkt-ui wasm-bindgen-test suite in Firefox
+#   6. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
 # =============================================================================
 
 name: CI
@@ -219,6 +221,128 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
         run: cargo test --workspace --locked
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  # ---------------------------------------------------------------------------
+  # Slow check: the trakkt-ui wasm-bindgen-test suite, executed in a real browser
+  #
+  # The clippy job's wasm32 step is a *compile* check. It proves the IndexedDB
+  # cache, the Web Locks leader-election shim and the hydration gate typecheck. It
+  # proves nothing about whether they work, and until this job existed nothing in
+  # CI ever executed them.
+  #
+  # That gap is unusually expensive for this particular crate. web-sys keeps the
+  # Web Locks API behind `web_sys_unstable_apis`, and enabling that cfg breaks
+  # kode-leptos, so `cache/tab_leader.rs` binds the API with a hand-written
+  # `#[wasm_bindgen] extern "C"` block. A wrong hand-written FFI signature
+  # compiles perfectly and fails at the first call — a compile pass is
+  # structurally incapable of catching it. Only running the tests does.
+  #
+  # A separate job rather than extra steps on clippy: jobs run in parallel, so
+  # this costs runner minutes but no PR wall-clock (Test Suite is longer).
+  #
+  # Setup mirrors the clippy and test jobs everywhere the workspace forces it to,
+  # and deliberately diverges where it does not — see the per-step notes.
+  # ---------------------------------------------------------------------------
+  wasm-test:
+    name: WASM Browser Tests
+    runs-on: ubuntu-latest
+    # Bounds the whole job. Measured cold locally at 154-189s wall depending on
+    # machine load, of which the tests themselves are 0.7s — this is a build cost,
+    # not a test cost, and it is ~64% of the workspace `cargo test` cold build
+    # (295s). Two ways to the same bound: scaling Test Suite's real CI time
+    # (7m18s) by that 0.64 plus ~1min for the Firefox install predicts ~6min
+    # typical; applying the CI/local ratio the other jobs exhibit (clippy: 1m38s
+    # local, ~5m CI, ~3x) to a 189s cold build plus ~3-4min of setup (apt,
+    # toolchain with the wasm32 target, cargo update, wasm-pack download, Firefox
+    # install, and the geckodriver that wasm-pack fetches on first run) predicts
+    # ~13min worst legitimate cold. 20 covers the pessimistic case with ~1.5x
+    # headroom, close to Test Suite's 1.7x. The failure this actually caps is a
+    # headless browser that never reports: if geckodriver hangs, wasm-pack waits
+    # forever, and GitHub's 6-hour default would burn a runner-day on it.
+    timeout-minutes: 20
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      # Required, not cargo-culted: `cc` is in this target's build-dependency
+      # graph (`cargo tree -p trakkt-ui --target wasm32-unknown-unknown
+      # --features hydrate -e build`), so a build script here shells out to a C
+      # compiler. Kept as one apt invocation identical to clippy's rather than
+      # trimmed to the exact subset — a divergence here would cost more to
+      # explain later than the two seconds it saves.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Firefox rather than Chrome. Both support Web Locks, and `--chrome` would
+      # work — but every local verification of this suite has been on Firefox, and
+      # this job exists specifically to validate hand-written browser FFI. Running
+      # CI on an engine no one has ever run these tests against would mean a first
+      # red build tells you nothing about whether the code or the browser is at
+      # fault. Installed explicitly rather than relying on the runner image:
+      # GitHub has removed preinstalled browsers from images before, and that
+      # removal would surface here as a confusing wasm-pack failure.
+      #
+      # Deliberately unpinned. Pinning a browser freezes the one variable this
+      # suite is meant to exercise; a Firefox release that breaks the Locks shim
+      # is a finding, not a CI fault.
+      - uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: latest
+
+      # Released binary, not `cargo install` — installing from source compiles
+      # wasm-pack and its dependency tree on every run for no benefit. Version is
+      # pinned; `curl` of a tagged release asset matches how this workflow already
+      # installs tailwindcss. geckodriver is not installed here on purpose:
+      # wasm-pack fetches a matching one itself on first run.
+      - name: Install wasm-pack
+        run: |
+          curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.14.0/wasm-pack-v0.14.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.14.0-x86_64-unknown-linux-musl/wasm-pack
+          wasm-pack --version
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Verify sccache can reach GHA cache
+        run: |
+          echo 'fn main(){}' > /tmp/sccache_test.rs
+          if sccache $(rustc --print sysroot)/bin/rustc /tmp/sccache_test.rs --crate-type bin -o /tmp/sccache_test_out; then
+            echo "SCCACHE_AVAILABLE=true" >> $GITHUB_ENV
+            sccache --show-stats 2>&1 | head -5
+          else
+            echo "::warning::sccache GHA cache probe failed (see above), building without cache"
+            echo "SCCACHE_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+          rm -f /tmp/sccache_test.rs /tmp/sccache_test_out
+
+      - name: Strip local dev patches (path overrides not available in CI)
+        run: sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
+
+      # Stripping the patches invalidates the committed lockfile. Regenerating it
+      # here is what lets the `--locked` run below succeed: it validates against
+      # this regenerated file, not the committed one.
+      - name: Regenerate lockfile after stripping local patches
+        run: cargo update --workspace
+
+      # No dist/ or Tailwind steps here, unlike clippy and test. They would be
+      # inert: `ServeDir::new(dist_dir())` lives only in apps/server, which is not
+      # in this target's dependency graph at all, and nothing in the workspace
+      # include_str!s style/output.css. Verified empirically — the suite passes
+      # 12/12 locally with style/output.css absent and dist/ empty.
+      - name: wasm-pack test (trakkt-ui, headless Firefox)
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate --locked
 
       - name: sccache stats
         if: always()
