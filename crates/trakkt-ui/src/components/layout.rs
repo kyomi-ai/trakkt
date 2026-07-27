@@ -137,6 +137,23 @@ pub fn Layout() -> impl IntoView {
         // in a single pass.
         let hydration_gate = HydrationGate::new();
 
+        // The owner the sync engine's connection-state watcher is registered
+        // under. It has to be this one — created here, at setup — rather than
+        // whichever owner is current when the leader half below runs.
+        //
+        // That half runs inside the effect body, and an `Effect` re-run calls
+        // `Owner::with_cleanup` on its own owner: everything the previous run
+        // created is disposed. A watcher registered from in there would be torn
+        // down by the next re-run, leaving the socket reconnecting on its own
+        // backoff with nothing left to notice it reaching `Connected` — so no
+        // `sync_bootstrap` or `sync_delta` would ever go out again and the tab
+        // would look connected while it had silently stopped syncing.
+        //
+        // A child of the component's owner, so the watcher is disposed with the
+        // Layout and not before. Same reasoning as the handles above; this one
+        // is a reactive scope rather than a browser handle.
+        let engine_owner = Owner::new();
+
         // Track what has already been done so neither half re-runs when the
         // effect re-fires (it re-fires on promotion, by design).
         let sync_started = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -269,7 +286,12 @@ pub fn Layout() -> impl IntoView {
             // before the socket exists is safe — and required: the dial below
             // happens on a later turn of the event loop, so the engine is
             // listening well before the first byte can arrive.
+            //
+            // The watcher goes under `engine_owner` rather than this effect
+            // run's own owner, which is what keeps it alive across any later
+            // re-run of this effect. See where `engine_owner` is created.
             let writer = sync_engine::start_sync_engine(
+                &engine_owner,
                 &ws_client,
                 &sync_store,
                 &workspace_id,

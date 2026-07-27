@@ -132,7 +132,28 @@ const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
 /// the deletes follower tabs ask for over the broadcast channel, land on the
 /// same ordered queue as the sync stream's writes. See
 /// [`crate::cache::delete_route`].
+///
+/// # Ownership
+///
+/// `owner` is the reactive owner the connection-state watcher below is
+/// registered under, and it is a parameter rather than "whatever is current"
+/// because the two are not the same thing here.
+///
+/// This function is called from inside the body of the Layout's startup
+/// `Effect`, on the run that promotes this tab to leader. An `Effect` re-run
+/// calls [`Owner::with_cleanup`] on its own owner, which disposes every reactive
+/// node the previous run created — so a watcher registered under the *current*
+/// owner would be torn down by the next re-run of that effect, with nothing left
+/// to notice the socket reaching `Connected`. The socket would go on reconnecting
+/// on its own backoff while no `sync_bootstrap` or `sync_delta` was ever sent
+/// again: a tab that looks connected and has silently stopped syncing.
+///
+/// Pass an owner that outlives the effect run — the Layout creates one at
+/// component setup, so the watcher lives exactly as long as the tab's Layout
+/// does. Passing the current owner from inside an effect body reintroduces the
+/// defect.
 pub fn start_sync_engine(
+    owner: &Owner,
     ws: &WebSocketClient,
     store: &SyncStore,
     workspace_id: &str,
@@ -224,76 +245,81 @@ pub fn start_sync_engine(
     let writer_state = writer.clone();
     let broadcast_state = broadcast;
 
-    Effect::new(move |_| {
-        let state = ws_for_state.connection_state.get();
-        if state != ConnectionState::Connected {
-            return;
-        }
+    // Registered under `owner`, not under whatever owner happens to be current.
+    // See this function's "Ownership" section: the caller is an effect body, and
+    // an effect disposes everything its previous run created.
+    owner.with(|| {
+        Effect::new(move |_| {
+            let state = ws_for_state.connection_state.get();
+            if state != ConnectionState::Connected {
+                return;
+            }
 
-        let wid = wid_state.clone();
-        let ws_send = ws_for_state.clone();
-        let writer_connect = writer_state.clone();
-        let broadcast_connect = broadcast_state.clone();
-        spawn_local(async move {
-            let cache_db = match db::init_cache_db(&wid).await {
-                Ok(db) => Some(db),
-                Err(e) => {
-                    tracing::warn!("sync: failed to open cache db: {e}");
-                    None
-                }
-            };
+            let wid = wid_state.clone();
+            let ws_send = ws_for_state.clone();
+            let writer_connect = writer_state.clone();
+            let broadcast_connect = broadcast_state.clone();
+            spawn_local(async move {
+                let cache_db = match db::init_cache_db(&wid).await {
+                    Ok(db) => Some(db),
+                    Err(e) => {
+                        tracing::warn!("sync: failed to open cache db: {e}");
+                        None
+                    }
+                };
 
-            let idb_cursor = match cache_db {
-                Some(ref db) => match db::get_last_sync_id(db, &wid).await {
-                    Ok(Some(s)) => match s.parse::<i64>() {
-                        Ok(v) => v,
+                let idb_cursor = match cache_db {
+                    Some(ref db) => match db::get_last_sync_id(db, &wid).await {
+                        Ok(Some(s)) => match s.parse::<i64>() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("sync: failed to parse cursor {s:?}: {e}");
+                                0
+                            }
+                        },
+                        Ok(None) => 0,
                         Err(e) => {
-                            tracing::warn!("sync: failed to parse cursor {s:?}: {e}");
+                            tracing::warn!("sync: failed to read cursor from IDB: {e}");
                             0
                         }
                     },
-                    Ok(None) => 0,
-                    Err(e) => {
-                        tracing::warn!("sync: failed to read cursor from IDB: {e}");
-                        0
+                    None => 0,
+                };
+
+                if idb_cursor > 0 {
+                    tracing::info!(idb_cursor, "sync: cursor found — sending sync_delta");
+                    if !ws_send.send(serde_json::json!({
+                        "type": "sync_delta",
+                        "last_sync_id": idb_cursor
+                    })) {
+                        tracing::warn!("sync: failed to send sync_delta");
                     }
-                },
-                None => 0,
-            };
+                } else {
+                    store_state.reset();
 
-            if idb_cursor > 0 {
-                tracing::info!(idb_cursor, "sync: cursor found — sending sync_delta");
-                if !ws_send.send(serde_json::json!({
-                    "type": "sync_delta",
-                    "last_sync_id": idb_cursor
-                })) {
-                    tracing::warn!("sync: failed to send sync_delta");
-                }
-            } else {
-                store_state.reset();
+                    for et in ALL_CACHED_ENTITY_TYPES {
+                        writer_connect.enqueue(IdbOp::DeleteAllOfType {
+                            entity_type: (*et).to_owned(),
+                        });
+                    }
+                    // Same wipe-and-re-bootstrap as sync_reset, so followers must
+                    // clear their memory here too or they keep entities this tab
+                    // just dropped.
+                    broadcast_after_commit(
+                        &writer_connect,
+                        &broadcast_connect,
+                        SyncBroadcastMessage::Reset,
+                    );
+                    // The clears must complete before the server starts streaming,
+                    // or a clear could land on top of freshly bootstrapped rows.
+                    writer_connect.flush().await;
 
-                for et in ALL_CACHED_ENTITY_TYPES {
-                    writer_connect.enqueue(IdbOp::DeleteAllOfType {
-                        entity_type: (*et).to_owned(),
-                    });
+                    tracing::info!("sync: no cursor — sending sync_bootstrap");
+                    if !ws_send.send(serde_json::json!({"type": "sync_bootstrap"})) {
+                        tracing::warn!("sync: failed to send sync_bootstrap");
+                    }
                 }
-                // Same wipe-and-re-bootstrap as sync_reset, so followers must
-                // clear their memory here too or they keep entities this tab
-                // just dropped.
-                broadcast_after_commit(
-                    &writer_connect,
-                    &broadcast_connect,
-                    SyncBroadcastMessage::Reset,
-                );
-                // The clears must complete before the server starts streaming,
-                // or a clear could land on top of freshly bootstrapped rows.
-                writer_connect.flush().await;
-
-                tracing::info!("sync: no cursor — sending sync_bootstrap");
-                if !ws_send.send(serde_json::json!({"type": "sync_bootstrap"})) {
-                    tracing::warn!("sync: failed to send sync_bootstrap");
-                }
-            }
+            });
         });
     });
 
@@ -498,7 +524,9 @@ fn apply_sync_action(
 /// `wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate`
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
+    use std::rc::Rc;
     use std::task::{Context, Poll};
 
     use gloo_timers::future::TimeoutFuture;
@@ -712,7 +740,12 @@ mod wasm_tests {
     /// A cross-tab message carrying a label the seeded cache does not contain,
     /// so hydration's bulk `set_labels` would visibly wipe it.
     fn live_label_action(workspace_id: &str) -> SyncBroadcastMessage {
-        let item = label(LIVE_LABEL_INDEX, workspace_id);
+        label_action(workspace_id, LIVE_LABEL_INDEX)
+    }
+
+    /// The same, for callers that need more than one distinguishable label.
+    fn label_action(workspace_id: &str, index: usize) -> SyncBroadcastMessage {
+        let item = label(index, workspace_id);
         let data = match serde_json::to_value(&item) {
             Ok(data) => data,
             Err(e) => panic!("failed to encode the live label: {e}"),
@@ -998,6 +1031,262 @@ mod wasm_tests {
         assert!(
             store.initialized().get_untracked(),
             "pages waiting on `initialized` would sit in their skeleton state forever"
+        );
+    }
+
+    // ── The connection-state watcher's owner (TRA-9945) ─────────────────────
+    //
+    // `start_sync_engine` is called from inside the body of the Layout's startup
+    // effect, and it creates an `Effect` of its own. A re-run of an effect calls
+    // `Owner::with_cleanup` on its own owner, which disposes every reactive node
+    // the previous run created — so which owner that inner effect belongs to
+    // decides whether the tab keeps syncing after the outer effect re-runs.
+    //
+    // This is the first test in the repo to drive a real `Effect`; see
+    // `boot_effect_executor` for what that cost.
+
+    /// Boot the executor Leptos runs `Effect` tasks on.
+    ///
+    /// Production gets this from `mount_to_body` / `hydrate_body`, which a
+    /// `wasm-bindgen-test` never calls — so without this, `Effect::new` spawns
+    /// onto nothing and the effect below would never run at all, passing this
+    /// test for the wrong reason. It is the same executor either way:
+    /// `init_wasm_bindgen` installs `wasm_bindgen_futures::spawn_local`, which
+    /// is what `leptos::task::spawn_local` resolves to on this target.
+    ///
+    /// Global and set once per page, so a second caller being told it is
+    /// already set is the answer it wanted.
+    fn boot_effect_executor() {
+        match any_spawner::Executor::init_wasm_bindgen() {
+            Ok(()) | Err(any_spawner::ExecutorError::AlreadySet) => {}
+        }
+    }
+
+    /// Poll `condition` every turn of the event loop until it holds, or fail.
+    ///
+    /// The work being waited on is real IndexedDB I/O, whose duration is not
+    /// something a test can name. A fixed delay long enough to be reliable would
+    /// be far longer than the wait usually needs; this costs the actual latency
+    /// and still fails — loudly, and saying what it was waiting for — if the
+    /// thing never happens.
+    async fn wait_until(what: &str, mut condition: impl AsyncFnMut() -> bool) {
+        for _ in 0..500 {
+            if condition().await {
+                return;
+            }
+            TimeoutFuture::new(10).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// How many labels the shared cache holds for `workspace_id`.
+    async fn cached_label_count(workspace_id: &str) -> usize {
+        let cache_db = match db::init_cache_db(workspace_id).await {
+            Ok(cache_db) => cache_db,
+            Err(e) => panic!("failed to open cache db: {e}"),
+        };
+        match db::read_all(&cache_db, entity_types::LABEL, workspace_id).await {
+            Ok(entries) => entries.len(),
+            Err(e) => panic!("failed to read cached labels: {e}"),
+        }
+    }
+
+    /// The ticket's criterion: force a re-run of the effect that started the
+    /// engine, then bring the socket up, and the client must still ask the
+    /// server for its data.
+    ///
+    /// What is asserted is the cursor-less connect path — `store.reset()`
+    /// followed by a wipe of every cached entity type — which is the whole of
+    /// the work the watcher does immediately before `sync_bootstrap` goes out,
+    /// on the same straight line, in the same task. The `send` itself is the one
+    /// step this cannot reach: it needs a real open socket to a real sync
+    /// server, and a headless browser test has neither. So the assertion is on
+    /// the observable half of that sequence rather than on the wire.
+    ///
+    /// Pre-fix this fails on both counts: the re-run disposes the watcher, so
+    /// `Connected` is observed by nobody and neither the store nor the cache is
+    /// ever touched.
+    #[wasm_bindgen_test]
+    async fn the_connection_state_watcher_survives_a_re_run_of_the_effect_that_started_it() {
+        boot_effect_executor();
+
+        let component = Owner::new();
+        component.set();
+
+        let wid = "ws-owner-outer-rerun";
+        seed_labels(wid).await;
+        assert_eq!(
+            cached_label_count(wid).await,
+            SEEDED_LABELS,
+            "fixture: the cache must hold rows for the bootstrap wipe to remove"
+        );
+
+        let store = SyncStore::new();
+        // Where hydration leaves the store, so the reset the watcher performs is
+        // a visible change rather than a value that was already there.
+        store.set_initialized(true);
+
+        let ws = websocket::disconnected();
+
+        // Created at component setup, as the Layout creates it — outside the
+        // effect whose re-run is the hazard.
+        let engine_owner = Owner::new();
+
+        // The Layout's startup effect in miniature. It tracks a signal that
+        // bumps after startup (leadership, in production), and its leader half
+        // is guarded so the engine starts exactly once — which is why the
+        // watcher is never re-registered to paper over its own disposal.
+        let promoted = RwSignal::new(false);
+        // Counts runs of the outer effect. Without it a test in which the
+        // re-run never happened would pass whatever the ownership was, which is
+        // the one way this test could quietly stop testing anything.
+        let outer_runs = Rc::new(Cell::new(0_u32));
+        // Holds the writer handle open: the writer task ends when the last
+        // handle drops, and the wipe below has to reach it.
+        let writer: Rc<RefCell<Option<IdbWriter>>> = Rc::new(RefCell::new(None));
+
+        {
+            let ws = ws.clone();
+            let writer = Rc::clone(&writer);
+            let outer_runs = Rc::clone(&outer_runs);
+            let wid = wid.to_owned();
+            Effect::new(move |_| {
+                promoted.get();
+                outer_runs.set(outer_runs.get() + 1);
+                // The leader half's guard: the engine starts once, and is never
+                // re-registered to paper over its own disposal.
+                if writer.borrow().is_some() {
+                    return;
+                }
+                *writer.borrow_mut() =
+                    Some(start_sync_engine(&engine_owner, &ws, &store, &wid, None));
+            });
+        }
+        wait_until("the engine to start", async || writer.borrow().is_some()).await;
+
+        // The re-run the ticket names. It is scheduled rather than synchronous,
+        // so wait for it to land: what follows must observe a watcher that has
+        // already survived a cleanup, not one that outran it.
+        promoted.set(true);
+        wait_until("the outer effect to re-run", async || outer_runs.get() >= 2).await;
+
+        ws.connection_state.set(ConnectionState::Connected);
+
+        wait_until("the store to be reset for a bootstrap", async || {
+            !store.initialized().get_untracked()
+        })
+        .await;
+        wait_until("the cache to be wiped for a bootstrap", async || {
+            cached_label_count(wid).await == 0
+        })
+        .await;
+    }
+
+    /// The other half of the same question: that re-run must leave the *rest* of
+    /// the effect body alone.
+    ///
+    /// The cross-tab subscription, its [`BroadcastQueue`] and the
+    /// [`release_when_hydrated`] task are set up in the same effect body as the
+    /// engine and are not behind the leader check, so a promotion re-run runs a
+    /// cleanup straight over them. None of them is a reactive node — they are
+    /// plain `Rc`s, a JS closure the channel owns, and an unscoped
+    /// `spawn_local` — so the cleanup has nothing of theirs to dispose. This
+    /// holds them to that, because "nothing here is arena-allocated" is a
+    /// property a later refactor can quietly take away.
+    ///
+    /// Three things would each show up here as a different failure: a dropped
+    /// backlog, a subscription that stops delivering, and a release task that
+    /// the cleanup cancelled.
+    ///
+    /// Re-subscribing is *not* among them, and deliberately so: dropping the
+    /// guard below leaves this passing, because
+    /// [`SyncBroadcast::set_on_message`] assigns `onmessage` and drops the
+    /// previous `Closure` rather than adding a second listener. So a promotion
+    /// that re-ran this whole block would be wasteful, not wrong — the leader
+    /// check is what makes it not happen, and this is why it is not the only
+    /// thing standing between a re-run and duplicate delivery.
+    #[wasm_bindgen_test]
+    async fn a_re_run_leaves_the_cross_tab_subscription_and_its_backlog_intact() {
+        boot_effect_executor();
+
+        let component = Owner::new();
+        component.set();
+
+        let wid = "ws-owner-rerun-follower";
+        let store = SyncStore::new();
+        let gate = HydrationGate::new();
+        let (subscriber, poster) = channel_pair(wid);
+
+        let queue = BroadcastQueue::new(move |message| apply_broadcast(&store, None, message));
+
+        let promoted = RwSignal::new(false);
+        let wired = Rc::new(Cell::new(false));
+        {
+            // Exactly the Layout's follower wiring, in the Layout's order,
+            // inside an effect that will re-run — including `leptos::task::
+            // spawn_local`, which is the unscoped spawn the Layout uses. A
+            // scoped one would be cancelled by the cleanup, and the release
+            // assertion at the end is what would catch that.
+            let queue = queue.clone();
+            let subscriber = subscriber.clone();
+            let gate = gate.clone();
+            let wired = Rc::clone(&wired);
+            Effect::new(move |_| {
+                promoted.get();
+                if wired.get() {
+                    return;
+                }
+                wired.set(true);
+                let handler_queue = queue.clone();
+                subscriber.set_on_message(move |message| handler_queue.deliver(message));
+                leptos::task::spawn_local(release_when_hydrated(gate.clone(), queue.clone()));
+            });
+        }
+        wait_until("the follower wiring to go up", async || wired.get()).await;
+
+        // Arrives while hydration is still outstanding, so it is held.
+        poster.post(&label_action(wid, LIVE_LABEL_INDEX));
+        wait_until("the first action to be held", async || queue.pending() == 1).await;
+
+        // The promotion re-run.
+        promoted.set(true);
+        settle().await;
+
+        assert_eq!(
+            queue.pending(),
+            1,
+            "the re-run threw away messages that had already arrived — nothing \
+             re-delivers them, so those entities stay stale until the page reloads"
+        );
+
+        const SECOND_LABEL_INDEX: usize = LIVE_LABEL_INDEX + 1;
+        poster.post(&label_action(wid, SECOND_LABEL_INDEX));
+        settle().await;
+
+        assert_eq!(
+            queue.pending(),
+            2,
+            "the subscription no longer delivers exactly once — the re-run either \
+             dropped the listener or left a second one registered alongside it"
+        );
+
+        // The release task spawned in the *first* run must still be waiting.
+        gate.open();
+        settle().await;
+
+        assert_eq!(queue.pending(), 0, "the release task did not survive the re-run");
+        assert_eq!(
+            store
+                .labels()
+                .get_untracked()
+                .iter()
+                .map(|l| l.label_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                label(LIVE_LABEL_INDEX, wid).label_id,
+                label(SECOND_LABEL_INDEX, wid).label_id,
+            ],
+            "the held and the live message must come out as one stream, in arrival order"
         );
     }
 
