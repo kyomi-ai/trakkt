@@ -374,7 +374,12 @@ async fn handle_client_message(
 /// The whole stream goes to `conn_tx` — the connection that asked for it — so
 /// the `SyncComplete` watermark is only ever adopted by the client that
 /// received the entities it covers.
-async fn handle_sync_bootstrap(
+///
+/// Public because that per-connection addressing is a property worth asserting
+/// from outside this module: `tests/sync_ws.rs` drives it against a real
+/// `WebSocketManager` with several connections registered for one user, which
+/// is the only place the fan-out bug this doc comment describes can be seen.
+pub async fn handle_sync_bootstrap(
     conn_tx: &WsSender,
     catching_up: &CatchUpFlag,
     db: &trakkt_core::DbPool,
@@ -542,7 +547,11 @@ async fn handle_sync_bootstrap(
 /// Streams all sync log entries with `sync_id > last_sync_id`. If the
 /// requested `sync_id` is no longer in the log (pruned), sends `SyncReset`
 /// so the client falls back to a full bootstrap.
-async fn handle_sync_delta(
+///
+/// Public for the same reason as [`handle_sync_bootstrap`]: `tests/sync_ws.rs`
+/// asserts that a `SyncReset` reaches only the connection that asked for it,
+/// which needs a real multi-connection `WebSocketManager` to observe.
+pub async fn handle_sync_delta(
     conn_tx: &WsSender,
     catching_up: &CatchUpFlag,
     db: &trakkt_core::DbPool,
