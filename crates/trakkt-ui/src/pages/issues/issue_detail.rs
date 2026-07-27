@@ -849,9 +849,22 @@ fn MetadataSidebar(
     let milestone_trigger_ref = NodeRef::<leptos::html::Div>::new();
     let (milestone_search, set_milestone_search) = signal(String::new());
 
-    // Milestones: reactive resource that refetches when project_id changes
+    // Milestones: refetched when the issue's project changes, and when another
+    // client creates, renames or re-dates one. The list is read straight from
+    // the server function rather than the SyncStore, so `milestones_version` —
+    // bumped by every project_milestone sync action — is the only thing that
+    // can tell this dropdown its names and dates went stale.
+    let milestones_version = Signal::derive(move || {
+        sync_store.map(|s| s.milestones_version().get()).unwrap_or(0)
+    });
     let milestones = RwSignal::new(Vec::<trakkt_types::models::ProjectMilestone>::new());
     Effect::new(move || {
+        // Read unconditionally so the subscription is established on every run
+        // regardless of which branch is taken, not just on runs where the issue
+        // happens to have a project. Reading it inside the branch would pick the
+        // dependency up later and less predictably; this keeps the effect's
+        // dependency set stable instead of varying with the data.
+        let _ = milestones_version.get();
         let pid = project_id.get();
         if let Some(pid) = pid {
             leptos::task::spawn_local(async move {

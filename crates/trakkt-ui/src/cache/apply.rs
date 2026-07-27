@@ -155,6 +155,24 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                     // Bump the version counter so reactive dependencies refetch.
                     store.bump_relations_version();
                 }
+                et if et == entity_types::PROJECT_MILESTONE => {
+                    // Milestones are fetched on-demand by the project detail
+                    // page and the issue metadata sidebar, straight from the
+                    // `list_milestones` server function. Bump the version
+                    // counter so those reactive dependencies refetch.
+                    //
+                    // `entity_data` is deliberately not read here, and that is
+                    // not an oversight to tidy away. The guard above returns on
+                    // a data-less insert/update before this match is reached, so
+                    // without a payload on the wire this arm never runs at all —
+                    // which is exactly the bug that left milestones frozen after
+                    // bootstrap. Carrying it also keeps milestones the same
+                    // shape as every other entity on the stream (bootstrap
+                    // already streams them with full data), and it is what a
+                    // future cached milestone list would need on the delta path
+                    // to apply the change without a round trip.
+                    store.bump_milestones_version();
+                }
                 other => {
                     tracing::debug!(
                         entity_type = other,
@@ -185,6 +203,11 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                 }
                 et if et == entity_types::ACTIVITY => store.bump_activities_version(),
                 et if et == entity_types::ISSUE_RELATION => store.bump_relations_version(),
+                et if et == entity_types::PROJECT_MILESTONE => {
+                    // Same on-demand read path as insert/update: the milestone
+                    // lists refetch from the server when this bumps.
+                    store.bump_milestones_version();
+                }
                 other => {
                     tracing::debug!(
                         entity_type = other,
@@ -374,6 +397,13 @@ pub fn enqueue_cache_writes(writer: &IdbWriter, action: &SyncAction) {
                 }
                 et if et == entity_types::COMMENT => {
                     enqueue_delete(writer, entity_types::COMMENT, entity_id);
+                }
+                et if et == entity_types::PROJECT_MILESTONE => {
+                    // Milestone inserts/updates are persisted by the generic
+                    // upsert above (bootstrap streams them, and now so does
+                    // delta), so the delete has to be persisted too or the
+                    // removed row outlives the milestone in the cache.
+                    enqueue_delete(writer, entity_types::PROJECT_MILESTONE, entity_id);
                 }
                 // Unhandled types are reported by the memory half.
                 _ => {}
@@ -584,6 +614,85 @@ mod tests {
         });
     }
 
+    fn milestone_json() -> serde_json::Value {
+        serde_json::json!({
+            "milestone_id": "ms-1",
+            "project_id": "proj-1",
+            "name": "Beta",
+            "description": null,
+            "target_date": "2026-09-01",
+            "sort_order": 0,
+            "created_at": "2026-07-26T00:00:00Z",
+        })
+    }
+
+    #[test]
+    fn a_milestone_action_bumps_only_the_milestones_version() {
+        with_store(|store| {
+            apply_action_to_memory(
+                &store,
+                &action(
+                    entity_types::PROJECT_MILESTONE,
+                    SyncActionType::Insert,
+                    Some(milestone_json()),
+                ),
+            );
+
+            assert_eq!(
+                store.milestones_version().get_untracked(),
+                1,
+                "the project detail page and the issue metadata sidebar refetch \
+                 `list_milestones` when this bumps — without it a milestone \
+                 created elsewhere never appears"
+            );
+            assert_eq!(store.comments_version().get_untracked(), 0);
+            assert_eq!(store.activities_version().get_untracked(), 0);
+            assert_eq!(store.relations_version().get_untracked(), 0);
+        });
+    }
+
+    #[test]
+    fn a_milestone_update_bumps_the_milestones_version_and_touches_no_list() {
+        with_store(|store| {
+            apply_action_to_memory(
+                &store,
+                &action(
+                    entity_types::PROJECT_MILESTONE,
+                    SyncActionType::Update,
+                    Some(milestone_json()),
+                ),
+            );
+
+            assert_eq!(
+                store.milestones_version().get_untracked(),
+                1,
+                "a rename or a re-date has to reach the milestone lists"
+            );
+            // Milestones are not a cached list in this store: a payload shaped
+            // like a milestone must not be mistaken for any entity that is.
+            assert!(store.projects().get_untracked().is_empty());
+            assert!(store.issues().get_untracked().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_milestone_action_without_a_payload_reaches_nothing() {
+        with_store(|store| {
+            apply_action_to_memory(
+                &store,
+                &action(entity_types::PROJECT_MILESTONE, SyncActionType::Insert, None),
+            );
+
+            assert_eq!(
+                store.milestones_version().get_untracked(),
+                0,
+                "the data-less guard returns before the entity match, so a \
+                 payload-less milestone insert never reaches its arm at all — \
+                 this is why the server has to send one"
+            );
+        });
+    }
+
     #[test]
     fn version_counters_also_bump_on_delete() {
         with_store(|store| {
@@ -591,6 +700,7 @@ mod tests {
                 entity_types::COMMENT,
                 entity_types::ACTIVITY,
                 entity_types::ISSUE_RELATION,
+                entity_types::PROJECT_MILESTONE,
             ] {
                 apply_action_to_memory(
                     &store,
@@ -601,6 +711,12 @@ mod tests {
             assert_eq!(store.comments_version().get_untracked(), 1);
             assert_eq!(store.activities_version().get_untracked(), 1);
             assert_eq!(store.relations_version().get_untracked(), 1);
+            assert_eq!(
+                store.milestones_version().get_untracked(),
+                1,
+                "a deleted milestone has to disappear from the lists too — a \
+                 delete carries no payload, so the counter is all there is"
+            );
         });
     }
 
@@ -698,6 +814,41 @@ mod tests {
                 "{entity_type} has no cached rows to delete"
             );
         }
+    }
+
+    #[test]
+    fn a_milestone_delete_queues_the_cache_delete() {
+        assert_eq!(
+            cache_ops(&action(
+                entity_types::PROJECT_MILESTONE,
+                SyncActionType::Delete,
+                None
+            )),
+            vec!["delete:project_milestone:issue-1"],
+            "milestone inserts/updates are persisted by the generic upsert, so \
+             the delete has to be persisted too"
+        );
+    }
+
+    #[test]
+    fn a_milestone_upsert_queues_the_row_it_carries() {
+        let ops = cache_ops(&action(
+            entity_types::PROJECT_MILESTONE,
+            SyncActionType::Update,
+            Some(milestone_json()),
+        ));
+
+        assert_eq!(ops.len(), 1, "expected one milestone record, got {ops:?}");
+        assert!(
+            ops[0].starts_with("upsert:project_milestone:issue-1:"),
+            "got {:?}",
+            ops[0]
+        );
+        assert!(
+            ops[0].contains("\"name\":\"Beta\""),
+            "the persisted row is the payload the server sent: {:?}",
+            ops[0]
+        );
     }
 
     #[test]

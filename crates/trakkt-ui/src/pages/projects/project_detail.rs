@@ -104,9 +104,17 @@ pub fn ProjectDetailPage() -> impl IntoView {
         move |id| async move { get_project_progress(id).await },
     );
 
+    // Milestones are not held in the SyncStore — they come from the server
+    // function. `milestones_version` bumps on every project_milestone sync
+    // action, so keying the resource on it is what makes another client's
+    // create/rename/re-date arrive here without a reload.
+    let milestones_version = Signal::derive(move || {
+        sync_store.map(|s| s.milestones_version().get()).unwrap_or(0)
+    });
+
     let server_milestones = Resource::new(
-        move || project_id.get(),
-        move |id| async move { list_milestones(id).await },
+        move || (project_id.get(), milestones_version.get()),
+        move |(id, _version)| async move { list_milestones(id).await },
     );
 
     let server_updates = Resource::new(
