@@ -92,12 +92,18 @@ const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
 /// multi-writer race the lock exists to prevent. `broadcast` is the channel the
 /// leader republishes applied actions on so follower tabs can update their own
 /// in-memory stores; it is `None` when the browser has no `BroadcastChannel`.
+///
+/// Returns the handle to the cache writer it spawns. Nothing else may open one:
+/// the Layout keeps this handle so that this tab's own UI-initiated deletes, and
+/// the deletes follower tabs ask for over the broadcast channel, land on the
+/// same ordered queue as the sync stream's writes. See
+/// [`crate::cache::delete_route`].
 pub fn start_sync_engine(
     ws: &WebSocketClient,
     store: &SyncStore,
     workspace_id: &str,
     broadcast: Option<SyncBroadcast>,
-) {
+) -> IdbWriter {
     // ── Spawn the single cache writer ───────────────────────────────────────
     //
     // One task, one database handle, one ordered queue. Nothing else in the
@@ -181,7 +187,7 @@ pub fn start_sync_engine(
     let ws_for_state = ws.clone();
     let wid_state = workspace_id.to_owned();
     let store_state = *store;
-    let writer_state = writer;
+    let writer_state = writer.clone();
     let broadcast_state = broadcast;
 
     Effect::new(move |_| {
@@ -256,6 +262,8 @@ pub fn start_sync_engine(
             }
         });
     });
+
+    writer
 }
 
 // ── Startup ordering ────────────────────────────────────────────────────────

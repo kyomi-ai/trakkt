@@ -96,7 +96,9 @@ pub fn Layout() -> impl IntoView {
     // has finished removes the window rather than papering over it.
     #[cfg(target_arch = "wasm32")]
     {
+        use crate::cache::delete_route::DeleteRoute;
         use crate::cache::hydration_gate::HydrationGate;
+        use crate::cache::idb_writer::IdbWriter;
         use crate::cache::sync_engine;
         use crate::cache::tab_leader::{self, Leadership, SyncBroadcast};
         use crate::cache::websocket;
@@ -143,6 +145,13 @@ pub fn Layout() -> impl IntoView {
             StoredValue::new(send_wrapper::SendWrapper::new(None));
         let leadership: StoredValue<send_wrapper::SendWrapper<Option<tab_leader::LeadershipRequest>>> =
             StoredValue::new(send_wrapper::SendWrapper::new(None));
+        // The cache writer, set only once this tab holds the leadership lock. A
+        // follower never has one — which is the whole reason its deletes travel
+        // over the broadcast channel instead. The message handler below reads it
+        // on every message, so a tab promoted after the handler was installed
+        // starts servicing other tabs' deletes without re-registering anything.
+        let cache_writer: StoredValue<send_wrapper::SendWrapper<Option<IdbWriter>>> =
+            StoredValue::new(send_wrapper::SendWrapper::new(None));
 
         Effect::new(move |_| {
             // Re-runs when leadership is granted; both halves below are guarded.
@@ -162,7 +171,6 @@ pub fn Layout() -> impl IntoView {
             // ── Every tab ───────────────────────────────────────────────────
             if !sync_started.get() {
                 sync_started.set(true);
-                sync_store.set_workspace_id(workspace_id.clone());
 
                 // 1. Hydrate from IDB (instant cached data), then open the gate
                 //    the leader's dial is waiting on.
@@ -172,21 +180,32 @@ pub fn Layout() -> impl IntoView {
                     hydration_gate.clone(),
                 ));
 
-                // 2. Subscribe to the leader's broadcast. A follower's entire
+                // 2. Subscribe to the cross-tab channel. A follower's entire
                 //    live-update path runs through here; the leader opens the
                 //    same channel to publish on (it never receives its own
-                //    messages back).
+                //    messages back) and to service the cache deletes follower
+                //    tabs ask it to perform.
                 match SyncBroadcast::open(&workspace_id) {
                     Ok(channel) => {
                         channel.set_on_message(move |message| {
-                            crate::cache::apply::apply_broadcast_to_memory(&sync_store, &message);
+                            cache_writer.with_value(|writer| {
+                                crate::cache::apply::apply_broadcast(
+                                    &sync_store,
+                                    (**writer).as_ref(),
+                                    &message,
+                                );
+                            });
                         });
+                        // Until this tab wins the lock it owns no cache writer,
+                        // so its own deletes go to the tab that does.
+                        sync_store.set_delete_route(DeleteRoute::delegated(channel.clone()));
                         *broadcast.write_value() =
                             send_wrapper::SendWrapper::new(Some(channel));
                     }
                     Err(e) => tracing::warn!(
                         "sync: no BroadcastChannel ({e:?}) — this tab will not see the \
-                         leader's updates until it reloads"
+                         leader's updates until it reloads, and cannot ask the leader to \
+                         delete anything from the shared cache"
                     ),
                 }
 
@@ -223,12 +242,19 @@ pub fn Layout() -> impl IntoView {
             // before the socket exists is safe — and required: the dial below
             // happens on a later turn of the event loop, so the engine is
             // listening well before the first byte can arrive.
-            sync_engine::start_sync_engine(
+            let writer = sync_engine::start_sync_engine(
                 &ws_client,
                 &sync_store,
                 &workspace_id,
                 broadcast.with_value(|channel| (**channel).clone()),
             );
+
+            // This tab now owns every write to the shared cache. Its own deletes
+            // go straight onto the queue rather than round-tripping through the
+            // channel to itself, and the handler installed above starts
+            // enqueueing the deletes other tabs ask for.
+            sync_store.set_delete_route(DeleteRoute::owned(writer.clone()));
+            *cache_writer.write_value() = send_wrapper::SendWrapper::new(Some(writer));
 
             // Dial once hydration is done, with a token already in hand.
             //
