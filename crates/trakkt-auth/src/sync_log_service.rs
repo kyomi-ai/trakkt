@@ -3064,4 +3064,753 @@ mod tests {
             "the broadcast must report the committed state"
         );
     }
+
+    // ─── Atomic team mutation + sync entry (TRA-9947) ────────────────────────
+
+    /// Reject `sync_log` INSERTs carrying one action only.
+    ///
+    /// Same real trigger as [`reject_sync_log_inserts`], narrowed by action
+    /// rather than by entity. `create_team` writes both its entries against the
+    /// same `entity_id` — the team's — so an entity-scoped rejection cannot tell
+    /// them apart; the action can, which is what puts the failure on the second
+    /// write while the first one succeeds.
+    async fn reject_sync_log_inserts_for_action(db: &DbPool, action: &str) {
+        let sql = format!(
+            "CREATE TRIGGER reject_sync_log_for_action BEFORE INSERT ON sync_log \
+             WHEN NEW.action = '{action}' \
+             BEGIN SELECT RAISE(ABORT, 'sync_log insert rejected'); END"
+        );
+        db_execute!(db, &sql).expect("install action-scoped sync_log rejection trigger");
+    }
+
+    /// Every team in the database, in a stable order.
+    async fn team_ids(db: &DbPool) -> Vec<String> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            team_id: String,
+        }
+        let rows: Vec<Row> =
+            db_fetch_all!(db, Row, "SELECT team_id FROM teams ORDER BY team_id").expect("read teams");
+        rows.into_iter().map(|r| r.team_id).collect()
+    }
+
+    /// Every team membership, in a stable order.
+    async fn team_memberships(db: &DbPool) -> Vec<(String, String, String)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            team_id: String,
+            user_id: String,
+            role: String,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT team_id, user_id, role FROM team_members ORDER BY team_id, user_id"
+        )
+        .expect("read team members");
+        rows.into_iter()
+            .map(|r| (r.team_id, r.user_id, r.role))
+            .collect()
+    }
+
+    /// Where every issue sits: the three columns a team delete reassigns.
+    async fn issue_placements(db: &DbPool) -> Vec<(String, String, i64, String)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            issue_id: String,
+            team_id: String,
+            number: i64,
+            status_id: String,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT issue_id, team_id, number, status_id FROM issues ORDER BY issue_id"
+        )
+        .expect("read issue placements");
+        rows.into_iter()
+            .map(|r| (r.issue_id, r.team_id, r.number, r.status_id))
+            .collect()
+    }
+
+    /// Every favorite, in a stable order.
+    async fn favorites(db: &DbPool) -> Vec<(String, String, String)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            favorite_id: String,
+            target_type: String,
+            target_id: String,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT favorite_id, target_type, target_id FROM favorites ORDER BY favorite_id"
+        )
+        .expect("read favorites");
+        rows.into_iter()
+            .map(|r| (r.favorite_id, r.target_type, r.target_id))
+            .collect()
+    }
+
+    /// Every status and label id, in a stable order — the two tables the team
+    /// delete reaches only through `ON DELETE CASCADE`.
+    async fn cascade_child_ids(db: &DbPool) -> (Vec<String>, Vec<String>) {
+        #[derive(sqlx::FromRow)]
+        struct IdRow {
+            id: String,
+        }
+        let statuses: Vec<IdRow> = db_fetch_all!(
+            db,
+            IdRow,
+            "SELECT status_id AS id FROM statuses ORDER BY status_id"
+        )
+        .expect("read statuses");
+        let labels: Vec<IdRow> =
+            db_fetch_all!(db, IdRow, "SELECT label_id AS id FROM labels ORDER BY label_id")
+                .expect("read labels");
+        (
+            statuses.into_iter().map(|r| r.id).collect(),
+            labels.into_iter().map(|r| r.id).collect(),
+        )
+    }
+
+    /// Every user's `default_team_id`, in a stable order.
+    async fn user_default_teams(db: &DbPool) -> Vec<(String, Option<String>)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            user_id: String,
+            default_team_id: Option<String>,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT user_id, default_team_id FROM users ORDER BY user_id"
+        )
+        .expect("read user default teams");
+        rows.into_iter()
+            .map(|r| (r.user_id, r.default_team_id))
+            .collect()
+    }
+
+    /// A team's icon columns — including `icon_data` and `icon_mime`, which no
+    /// `Team` read carries, so nothing else would notice an upload surviving.
+    #[derive(sqlx::FromRow, Debug, PartialEq)]
+    struct IconState {
+        icon_type: Option<String>,
+        icon_name: Option<String>,
+        icon_color: Option<String>,
+        icon_data: Option<Vec<u8>>,
+        icon_mime: Option<String>,
+    }
+
+    async fn icon_state(db: &DbPool, team_id: &str) -> IconState {
+        trakkt_core::db_fetch_optional!(
+            db,
+            IconState,
+            "SELECT icon_type, icon_name, icon_color, icon_data, icon_mime \
+             FROM teams WHERE team_id = $1",
+            team_id
+        )
+        .expect("read team icon columns")
+        .expect("the team exists")
+    }
+
+    async fn team_settings_json(db: &DbPool, team_id: &str) -> Option<String> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            settings: Option<String>,
+        }
+        trakkt_core::db_fetch_optional!(
+            db,
+            Row,
+            "SELECT CAST(settings AS TEXT) AS settings FROM teams WHERE team_id = $1",
+            team_id
+        )
+        .expect("read team settings")
+        .expect("the team exists")
+        .settings
+    }
+
+    async fn sync_log_row_count(db: &DbPool) -> i64 {
+        db_fetch_scalar!(db, i64, "SELECT COUNT(*) FROM sync_log").expect("count sync_log rows")
+    }
+
+    /// Created with no creator, deliberately: that is what leaves the team's own
+    /// Insert entry as the only sync write in the transaction. With a creator
+    /// there is a second entry behind it, and this test would pass on that one
+    /// failing even if the Insert entry's own failure were being swallowed.
+    #[tokio::test]
+    async fn team_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let teams_before = team_ids(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::team_service::create_team(
+            &db,
+            &crate::team_service::CreateTeamParams {
+                workspace_id: WS,
+                name: "Never happened",
+                key: "NEVR",
+                description: None,
+                icon: None,
+                creator_id: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("a create whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            team_ids(&db).await,
+            teams_before,
+            "a team with no sync_log row is invisible to every future delta, so \
+             it must not survive the failed write"
+        );
+    }
+
+    /// The member-add entry is `create_team`'s *second* sync write. Rejecting it
+    /// alone leaves a transaction that already holds a good Insert row, two
+    /// inserts, and has to unwind all of it — the case a per-write
+    /// `unwrap_or(0)` would commit silently.
+    #[tokio::test]
+    async fn team_create_rolls_back_when_the_member_add_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let teams_before = team_ids(&db).await;
+        let members_before = team_memberships(&db).await;
+
+        reject_sync_log_inserts_for_action(&db, "update").await;
+
+        let err = crate::team_service::create_team(
+            &db,
+            &crate::team_service::CreateTeamParams {
+                workspace_id: WS,
+                name: "Never happened",
+                key: "NEVR",
+                description: None,
+                icon: None,
+                creator_id: Some(USER_A),
+            },
+            None,
+        )
+        .await
+        .expect_err("a create whose member-add sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(team_ids(&db).await, teams_before, "the team must not survive");
+        assert_eq!(
+            team_memberships(&db).await,
+            members_before,
+            "the creator's membership must not survive"
+        );
+        assert_eq!(
+            sync_log_row_count(&db).await,
+            0,
+            "the team's own Insert entry was written and accepted before the \
+             member-add entry failed, so it is the proof of the rollback: it \
+             must not be left committed on its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let before = crate::team_service::get_team(&db, "team_vis")
+            .await
+            .expect("read the team")
+            .expect("the fixture team exists");
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::team_service::update_team(
+            &db,
+            "team_vis",
+            WS,
+            Some("Renamed in a doomed transaction".to_string()),
+            Some("DOOM".to_string()),
+            None,
+        )
+        .await
+        .expect_err("an update whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            crate::team_service::get_team(&db, "team_vis")
+                .await
+                .expect("read the team back")
+                .expect("the team still exists"),
+            before,
+            "the rename must be rolled back, not left committed with no sync row"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_icon_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let before = icon_state(&db, "team_vis").await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::team_service::update_team_icon(
+            &db,
+            "team_vis",
+            WS,
+            Some("preset"),
+            Some("rocket"),
+            Some("#0D9488"),
+            None,
+        )
+        .await
+        .expect_err("an icon change whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            icon_state(&db, "team_vis").await,
+            before,
+            "the icon change must be rolled back — an icon no client is ever \
+             told about is worse than no icon change at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_icon_upload_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let before = icon_state(&db, "team_vis").await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::team_service::upload_team_icon(
+            &db,
+            "team_vis",
+            WS,
+            b"png-bytes-nobody-will-see",
+            "image/png",
+            None,
+        )
+        .await
+        .expect_err("an upload whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            icon_state(&db, "team_vis").await,
+            before,
+            "the uploaded bytes must be rolled back with everything else — \
+             `icon_data` is in no sync payload, so a survivor here is invisible \
+             to every client until it re-reads the team"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_icon_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        crate::team_service::upload_team_icon(
+            &db,
+            "team_vis",
+            WS,
+            b"png-bytes-that-survive",
+            "image/png",
+            None,
+        )
+        .await
+        .expect("upload the icon being cleared");
+        let before = icon_state(&db, "team_vis").await;
+        assert_eq!(
+            before.icon_type.as_deref(),
+            Some("custom"),
+            "precondition: there is an icon to clear"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::team_service::delete_team_icon(&db, "team_vis", WS, None)
+            .await
+            .expect_err("an icon clear whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            icon_state(&db, "team_vis").await,
+            before,
+            "clearing the icon must be rolled back, leaving the uploaded icon \
+             exactly as it was"
+        );
+    }
+
+    /// A second team, doomed, carrying one of everything `delete_team` touches:
+    /// an issue to reassign, a favorite, a user default, a membership, and the
+    /// team-scoped status and label that only `ON DELETE CASCADE` removes.
+    ///
+    /// The ids are fixed because `CREATE TRIGGER` bodies cannot take bind
+    /// parameters — the rejection has to name its target as a literal.
+    async fn seed_doomed_team(db: &DbPool) {
+        add_workspace_backlog_status(db).await;
+
+        db_execute!(
+            db,
+            "INSERT INTO teams (team_id, workspace_id, name, key) VALUES ($1, $2, $3, $4)",
+            "team_doomed",
+            WS,
+            "Doomed",
+            "DOOM"
+        )
+        .expect("insert the doomed team");
+
+        db_execute!(
+            db,
+            "INSERT INTO statuses (status_id, workspace_id, team_id, name, category) \
+             VALUES ($1, $2, $3, $4, $5)",
+            "sts_doomed",
+            WS,
+            "team_doomed",
+            "Doomed Backlog",
+            "backlog"
+        )
+        .expect("insert the doomed team's own status");
+
+        db_execute!(
+            db,
+            "INSERT INTO labels (label_id, workspace_id, team_id, name, color) \
+             VALUES ($1, $2, $3, $4, $5)",
+            "lbl_doomed",
+            WS,
+            "team_doomed",
+            "Doomed",
+            "#DC2626"
+        )
+        .expect("insert the doomed team's own label");
+
+        db_execute!(
+            db,
+            "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)",
+            "team_doomed",
+            USER_B,
+            "lead"
+        )
+        .expect("insert the doomed team's membership");
+
+        db_execute!(
+            db,
+            "INSERT INTO issues \
+                (issue_id, workspace_id, team_id, number, title, creator_id, status_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "iss_doomed",
+            WS,
+            "team_doomed",
+            1_i32,
+            "Gets reassigned",
+            USER_A,
+            "sts_doomed"
+        )
+        .expect("insert the issue that has to be reassigned");
+
+        db_execute!(
+            db,
+            "INSERT INTO favorites (favorite_id, user_id, workspace_id, target_type, target_id) \
+             VALUES ($1, $2, $3, $4, $5)",
+            "fav_doomed",
+            USER_B,
+            WS,
+            "team",
+            "team_doomed"
+        )
+        .expect("insert the favorite pointing at the doomed team");
+
+        db_execute!(
+            db,
+            "UPDATE users SET default_team_id = $1 WHERE user_id = $2",
+            "team_doomed",
+            USER_B
+        )
+        .expect("point a user's default at the doomed team");
+    }
+
+    /// Everything `delete_team` writes, read straight from the tables: the
+    /// issues it reassigns, the favorites and user defaults it clears, the teams
+    /// it deletes, and the memberships, statuses and labels that go with the
+    /// team through `ON DELETE CASCADE`.
+    ///
+    /// Every field is an ordered `Vec` of the rows themselves — a count would
+    /// pass just as happily on rows that came back changed.
+    #[derive(Debug, PartialEq)]
+    struct TeamDeleteFootprint {
+        issues: Vec<(String, String, i64, String)>,
+        favorites: Vec<(String, String, String)>,
+        user_defaults: Vec<(String, Option<String>)>,
+        teams: Vec<String>,
+        memberships: Vec<(String, String, String)>,
+        cascaded_statuses: Vec<String>,
+        cascaded_labels: Vec<String>,
+    }
+
+    async fn team_delete_footprint(db: &DbPool) -> TeamDeleteFootprint {
+        let (cascaded_statuses, cascaded_labels) = cascade_child_ids(db).await;
+        TeamDeleteFootprint {
+            issues: issue_placements(db).await,
+            favorites: favorites(db).await,
+            user_defaults: user_default_teams(db).await,
+            teams: team_ids(db).await,
+            memberships: team_memberships(db).await,
+            cascaded_statuses,
+            cascaded_labels,
+        }
+    }
+
+    /// The team delete's own sync entry is the last write in the transaction —
+    /// after the reassignments, after the favorites and user-default clears,
+    /// after the DELETE and its cascade. Rejecting it proves the whole cascade
+    /// unwinds, including the reassignment entries that were already accepted.
+    #[tokio::test]
+    async fn team_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_doomed_team(&db).await;
+        let before = team_delete_footprint(&db).await;
+
+        reject_sync_log_inserts_for_entity(&db, "team_doomed").await;
+
+        let err = crate::team_service::delete_team(&db, "team_doomed", WS, Some("team_vis"), None, None)
+            .await
+            .expect_err("a delete whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        let after = team_delete_footprint(&db).await;
+        assert_eq!(
+            after.issues, before.issues,
+            "the reassigned issue must be back on its own team, with its \
+             original number and status"
+        );
+        assert_eq!(
+            after.favorites, before.favorites,
+            "the deleted favorite must be back"
+        );
+        assert_eq!(
+            after.user_defaults, before.user_defaults,
+            "the cleared default_team_id must be back"
+        );
+        assert_eq!(
+            after.teams, before.teams,
+            "a team delete with no sync_log row leaves the team on every other \
+             client forever, so the DELETE must be rolled back"
+        );
+        assert_eq!(
+            after.memberships, before.memberships,
+            "the membership the DELETE cascaded away must be back"
+        );
+        assert_eq!(
+            (after.cascaded_statuses, after.cascaded_labels),
+            (before.cascaded_statuses, before.cascaded_labels),
+            "the team-scoped status and label the DELETE cascaded away must be \
+             back — the rollback has to unwind the schema's cascade too"
+        );
+
+        assert_eq!(
+            sync_log_row_count(&db).await,
+            0,
+            "the reassigned issue's sync entry was written and accepted before \
+             the team entry failed, so it is the proof of the rollback: it must \
+             not be left committed on its own"
+        );
+    }
+
+    /// The reassignment loop's entry is the *first* sync write in the same
+    /// transaction. Rejecting it instead proves the loop is inside the
+    /// transaction at all — with the entry written on the pool, the `UPDATE
+    /// issues` that precedes it commits regardless.
+    #[tokio::test]
+    async fn team_delete_rolls_back_when_a_reassigned_issues_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_doomed_team(&db).await;
+        let before = team_delete_footprint(&db).await;
+
+        reject_sync_log_inserts_for_entity(&db, "iss_doomed").await;
+
+        let err = crate::team_service::delete_team(&db, "team_doomed", WS, Some("team_vis"), None, None)
+            .await
+            .expect_err("a delete whose reassignment sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        let after = team_delete_footprint(&db).await;
+        assert_eq!(
+            after.issues, before.issues,
+            "an issue moved to another team with no sync row to report it keeps \
+             its old team on every other client, and its number is now taken — \
+             so the UPDATE must be rolled back"
+        );
+        assert_eq!(
+            after.teams, before.teams,
+            "the team must survive with its issue"
+        );
+        assert_eq!(
+            after, before,
+            "nothing else the delete touches may be left half-applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_member_add_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let before = team_memberships(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::team_service::add_team_member(&db, "team_vis", USER_B, "member", WS)
+            .await
+            .expect_err("a member add whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            team_memberships(&db).await,
+            before,
+            "`team_members` is not a synced entity type, so no later delta can \
+             repair a membership that committed without its sync row — the \
+             INSERT must be rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_member_remove_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        crate::team_service::add_team_member(&db, "team_vis", USER_B, "member", WS)
+            .await
+            .expect("add the member being removed");
+        let before = team_memberships(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::team_service::remove_team_member(&db, "team_vis", USER_B, WS)
+            .await
+            .expect_err("a member remove whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            team_memberships(&db).await,
+            before,
+            "a removal with no sync row leaves the member on every other client \
+             forever, so the DELETE must be rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_member_role_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        crate::team_service::add_team_member(&db, "team_vis", USER_B, "member", WS)
+            .await
+            .expect("add the member being promoted");
+        let before = team_memberships(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::team_service::update_team_member_role(&db, "team_vis", USER_B, "lead", WS)
+                .await
+                .expect_err("a role change whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            team_memberships(&db).await,
+            before,
+            "the promotion must be rolled back, not left committed with no sync \
+             row to carry it to anyone else"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_settings_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        crate::team_service::update_team_settings(
+            &db,
+            "team_vis",
+            WS,
+            &trakkt_types::models::TeamSettings {
+                auto_archive_days: Some(7),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("write the settings the rollback has to restore");
+        let before = team_settings_json(&db, "team_vis").await;
+        assert!(
+            before.as_deref().is_some_and(|s| s.contains("\"auto_archive_days\":7")),
+            "precondition: the settings the rollback restores are really there; \
+             got {before:?}"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::team_service::update_team_settings(
+            &db,
+            "team_vis",
+            WS,
+            &trakkt_types::models::TeamSettings {
+                auto_archive_days: Some(30),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("a settings change whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            team_settings_json(&db, "team_vis").await,
+            before,
+            "the settings change must be rolled back — auto-archiving that no \
+             client is ever told about silently changes what the team sees"
+        );
+    }
 }
