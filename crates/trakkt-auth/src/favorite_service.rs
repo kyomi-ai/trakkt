@@ -9,7 +9,7 @@ use trakkt_core::DbPool;
 use trakkt_types::models::Favorite;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
-use crate::sync_log_service;
+use crate::sync_log_service::{self, SyncAudience};
 use crate::websocket::WebSocketManager;
 
 // ─── Row types ──────────────────────────────────────────────────────────────
@@ -74,6 +74,14 @@ pub async fn list_favorites(
 /// Add a favorite. Uses ON CONFLICT DO NOTHING so duplicate adds are idempotent.
 ///
 /// Returns the favorite (newly created or existing).
+///
+/// The INSERT and its `sync_log` entry are one transaction: a favorite that
+/// commits without its sync row never reaches the sidebar of the browser that
+/// did not issue the request, and no later delta can repair it.
+///
+/// A favorite is private to the user who pinned it — `list_favorites` filters on
+/// `user_id` — so the entry and the live frame are both scoped to them via
+/// [`SyncAudience::User`].
 pub async fn add_favorite(
     db: &DbPool,
     user_id: &str,
@@ -92,8 +100,10 @@ pub async fn add_favorite(
          VALUES ($1, $2, $3, $4, $5, 0, {now}) \
          ON CONFLICT (user_id, workspace_id, target_type, target_id) DO NOTHING"
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &favorite_id,
         user_id,
@@ -102,59 +112,48 @@ pub async fn add_favorite(
         target_id
     )?;
 
-    // Re-fetch to get the actual row (may be the existing one on conflict).
-    let sql = format!(
-        "{FAVORITE_SELECT} WHERE user_id = $1 AND workspace_id = $2 \
-         AND target_type = $3 AND target_id = $4"
-    );
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    // Re-fetch to get the actual row (may be the existing one on conflict). The
+    // row does not exist outside the transaction yet, so the read runs on it.
+    let row: FavoriteRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         FavoriteRow,
-        &sql,
+        &format!(
+            "{FAVORITE_SELECT} WHERE user_id = $1 AND workspace_id = $2 \
+             AND target_type = $3 AND target_id = $4"
+        ),
         user_id,
         workspace_id,
         target_type,
         target_id
     )?;
     let favorite = row.into_dto();
-    let payload = serde_json::to_value(&favorite).ok();
+    let payload =
+        sync_log_service::sync_payload(&favorite, entity_types::FAVORITE, &favorite.favorite_id);
 
-    // Sync log — best-effort. A favorite is private to the user who pinned it
-    // (`list_favorites` filters on `user_id`), so scope the row to them.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::FAVORITE,
         &favorite.favorite_id,
         workspace_id,
-        Some(user_id),
+        SyncAudience::User(user_id),
         SyncActionType::Insert,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, favorite_id = %favorite.favorite_id, "Failed to write sync log entry for favorite add");
-        0
-    });
-
-    // WebSocket delivery — full entity data, owner only.
-    if let Some(ws) = ws_manager {
-        sync_log_service::send_sync_action_to_user(
-            ws,
-            user_id,
-            workspace_id,
-            entity_types::FAVORITE,
-            &favorite.favorite_id,
-            SyncActionType::Insert,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(favorite)
 }
 
 /// Remove a favorite by target type and ID.
+///
+/// The DELETE and its `sync_log` entry are one transaction — an unpin that
+/// commits without its sync row leaves the favorite in the sidebar of every
+/// other browser the user has open, and no later delta can repair it: the row it
+/// would have to re-read is gone.
+///
+/// Scoped to the owner via [`SyncAudience::User`], matching the insert: only that
+/// user's cache ever held the favorite, so only they need the delete.
 pub async fn remove_favorite(
     db: &DbPool,
     user_id: &str,
@@ -163,7 +162,10 @@ pub async fn remove_favorite(
     target_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    // Fetch the favorite_id before deleting so we can broadcast the correct entity_id.
+    // Fetch the favorite_id before deleting so we can address the correct
+    // entity_id. This reads state that predates the transaction, so it stays on
+    // the pool ahead of `begin` — once the transaction is open the pool is
+    // unreachable on SQLite (see `DbTx`).
     let sql = "SELECT favorite_id FROM favorites \
          WHERE user_id = $1 AND workspace_id = $2 AND target_type = $3 AND target_id = $4"
         .to_string();
@@ -188,48 +190,33 @@ pub async fn remove_favorite(
         return Ok(());
     };
 
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM favorites WHERE favorite_id = $1",
         &id_row.favorite_id
     )?;
 
     if result.rows_affected() == 0 {
-        // Race condition — already gone. That's fine.
+        // Race condition — already gone. That's fine, but the transaction has to
+        // be released before returning: nothing was written, and on SQLite it
+        // holds the only connection until it ends.
+        tx.rollback().await?;
         return Ok(());
     }
 
-    // Sync log — best-effort. Scoped to the owner, matching the insert: only
-    // that user's cache ever held the favorite, so only they need the delete.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::FAVORITE,
         &id_row.favorite_id,
         workspace_id,
-        Some(user_id),
+        SyncAudience::User(user_id),
         SyncActionType::Delete,
         None,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, favorite_id = %id_row.favorite_id, "Failed to write sync log entry for favorite remove");
-        0
-    });
-
-    // WebSocket delivery — delete has no entity data, owner only.
-    if let Some(ws) = ws_manager {
-        sync_log_service::send_sync_action_to_user(
-            ws,
-            user_id,
-            workspace_id,
-            entity_types::FAVORITE,
-            &id_row.favorite_id,
-            SyncActionType::Delete,
-            None,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(())
 }

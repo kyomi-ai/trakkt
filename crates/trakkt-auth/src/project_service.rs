@@ -309,11 +309,12 @@ pub async fn create_project(
     let payload =
         sync_log_service::sync_payload(&project, entity_types::PROJECT, &project.project_id);
 
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::PROJECT,
         &project_id,
         params.workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         payload,
         ws_manager,
@@ -469,11 +470,12 @@ pub async fn update_project(
     let payload =
         sync_log_service::sync_payload(&project, entity_types::PROJECT, &project.project_id);
 
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::PROJECT,
         params.project_id,
         &project.workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload,
         ws_manager,
@@ -522,11 +524,12 @@ pub async fn delete_project(
 
     // The sync entry follows the DELETE it describes — the same order as
     // `issue_service::delete_issue` and `team_service::delete_team`.
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::PROJECT,
         project_id,
         &project.workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Delete,
         None,
         ws_manager,
@@ -608,11 +611,12 @@ pub async fn add_project_member(
     // `projects` row is byte-identical afterwards. Reporting it as a PROJECT
     // update would make every connected client re-upsert an unchanged project
     // and would still leave the membership itself invisible.
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::PROJECT_MEMBER,
         &entity_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         payload,
         ws_manager,
@@ -660,11 +664,12 @@ pub async fn remove_project_member(
 
     // A delete carries no payload: there is no row left to send, and the client
     // reads the entity id alone to drop the cached row and bump its counter.
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::PROJECT_MEMBER,
         &entity_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Delete,
         None,
         ws_manager,
@@ -767,11 +772,12 @@ pub async fn create_milestone(
         &milestone.milestone_id,
     );
 
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::PROJECT_MILESTONE,
         &milestone_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         payload,
         ws_manager,
@@ -878,11 +884,12 @@ pub async fn update_milestone(
         &milestone.milestone_id,
     );
 
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::PROJECT_MILESTONE,
         milestone_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload,
         ws_manager,
@@ -920,11 +927,12 @@ pub async fn delete_milestone(
         )));
     }
 
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::PROJECT_MILESTONE,
         milestone_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Delete,
         None,
         ws_manager,
@@ -1009,11 +1017,12 @@ pub async fn create_project_update(
     // the `projects` row is byte-identical afterwards. Reporting it as a PROJECT
     // update would make every connected client re-upsert an unchanged project
     // and would still leave the posted update itself invisible.
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::PROJECT_UPDATE,
         &update_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         payload,
         ws_manager,

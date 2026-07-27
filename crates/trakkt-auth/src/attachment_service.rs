@@ -171,11 +171,12 @@ pub async fn create_attachment(
     let payload =
         sync_log_service::sync_payload(&attachment, entity_types::ATTACHMENT, &attachment_id);
 
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::ATTACHMENT,
         &attachment_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         payload,
         ws_manager,
@@ -264,11 +265,12 @@ pub async fn delete_attachment(
         workspace_id
     )?;
 
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::ATTACHMENT,
         attachment_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Delete,
         None,
         ws_manager,
@@ -329,11 +331,12 @@ pub async fn attach_to_issue(
 
     let entity_id = format!("{issue_id}:{attachment_id}");
 
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::ISSUE_ATTACHMENT,
         &entity_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         None,
         ws_manager,
@@ -380,11 +383,12 @@ pub async fn detach_from_issue(
 
     let entity_id = format!("{issue_id}:{attachment_id}");
 
-    sync_log_service::commit_and_broadcast(
+    sync_log_service::commit_and_deliver(
         tx,
         entity_types::ISSUE_ATTACHMENT,
         &entity_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Delete,
         None,
         ws_manager,
