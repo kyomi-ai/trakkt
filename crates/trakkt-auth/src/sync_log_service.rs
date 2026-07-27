@@ -6201,4 +6201,531 @@ mod tests {
         );
     }
 
+    // ─── Labels, relations, statuses (TRA-9952) ──────────────────────────────
+    //
+    // Six single-entry writers. Each transaction contains exactly one `sync_log`
+    // insert, so the blanket [`reject_sync_log_inserts`] trigger lands on the
+    // write under test rather than an earlier one it would shadow. The narrowed
+    // helpers exist for the multi-entry writers and are not needed here.
+    //
+    // `create_relation` is the one worth saying out loud: it *does* cause a
+    // second entry, a NOTIFICATION per watcher, but that happens after the
+    // commit through `create_notification`'s own transaction. The relation's own
+    // entry is still the only one in the transaction being tested — the trigger
+    // aborts it before the notification loop is ever reached.
+
+    /// Every label row, in a stable order.
+    async fn labels(db: &DbPool) -> Vec<(String, Option<String>, String, String)> {
+        #[derive(sqlx::FromRow)]
+        struct LabelFootprintRow {
+            label_id: String,
+            team_id: Option<String>,
+            name: String,
+            color: String,
+        }
+
+        let rows: Vec<LabelFootprintRow> = db_fetch_all!(
+            db,
+            LabelFootprintRow,
+            "SELECT label_id, team_id, name, color FROM labels ORDER BY label_id"
+        )
+        .expect("read labels back");
+
+        rows.into_iter()
+            .map(|r| (r.label_id, r.team_id, r.name, r.color))
+            .collect()
+    }
+
+    /// Every status row, in a stable order.
+    async fn status_rows(db: &DbPool) -> Vec<(String, String, String, i64)> {
+        #[derive(sqlx::FromRow)]
+        struct StatusFootprintRow {
+            status_id: String,
+            name: String,
+            category: String,
+            position: i64,
+        }
+
+        let rows: Vec<StatusFootprintRow> = db_fetch_all!(
+            db,
+            StatusFootprintRow,
+            "SELECT status_id, name, category, position FROM statuses ORDER BY status_id"
+        )
+        .expect("read statuses back");
+
+        rows.into_iter()
+            .map(|r| (r.status_id, r.name, r.category, r.position))
+            .collect()
+    }
+
+    /// Every relation row, in a stable order.
+    async fn relations(db: &DbPool) -> Vec<(String, String, String, String)> {
+        #[derive(sqlx::FromRow)]
+        struct RelationFootprintRow {
+            relation_id: String,
+            source_issue_id: String,
+            target_issue_id: String,
+            relation_type: String,
+        }
+
+        let rows: Vec<RelationFootprintRow> = db_fetch_all!(
+            db,
+            RelationFootprintRow,
+            "SELECT relation_id, source_issue_id, target_issue_id, relation_type \
+             FROM issue_relations ORDER BY relation_id"
+        )
+        .expect("read relations back");
+
+        rows.into_iter()
+            .map(|r| {
+                (
+                    r.relation_id,
+                    r.source_issue_id,
+                    r.target_issue_id,
+                    r.relation_type,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn label_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let before = labels(&db).await;
+        assert_eq!(
+            before,
+            Vec::new(),
+            "precondition: the fixture creates no labels, so any row below came \
+             from the create"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::label_service::create_label(&db, WS, "Bug", "#DC2626", Some("team_vis"), None)
+                .await
+                .expect_err("a label whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            labels(&db).await,
+            before,
+            "a label with no sync_log row is invisible to every future delta, so \
+             it must not survive the failed write"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            Vec::new(),
+            "and nothing may be left in sync_log either"
+        );
+    }
+
+    #[tokio::test]
+    async fn label_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let label =
+            crate::label_service::create_label(&db, WS, "Bug", "#DC2626", Some("team_vis"), None)
+                .await
+                .expect("create the label to rename");
+
+        let before = labels(&db).await;
+        let entries_before = sync_entries(&db).await;
+        assert_eq!(
+            before,
+            vec![(
+                label.label_id.clone(),
+                Some("team_vis".to_string()),
+                "Bug".to_string(),
+                "#DC2626".to_string()
+            )],
+            "precondition: the label exists with its original name and color"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::label_service::update_label(&db, &label.label_id, "Defect", "#B91C1C", None)
+                .await
+                .expect_err("a rename whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            labels(&db).await,
+            before,
+            "a rename with no sync_log row leaves the old name on every other \
+             client forever and no later delta reports it, so the new name must \
+             be rolled back"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            entries_before,
+            "the create's entry stays; the update's must not be there at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn label_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let label =
+            crate::label_service::create_label(&db, WS, "Bug", "#DC2626", Some("team_vis"), None)
+                .await
+                .expect("create the label to delete");
+
+        let before = labels(&db).await;
+        let entries_before = sync_entries(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::label_service::delete_label(&db, &label.label_id, None)
+            .await
+            .expect_err("a delete whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            labels(&db).await,
+            before,
+            "a delete with no sync_log row leaves the label on every other client \
+             forever, and no later delta can repair it — the row it would have to \
+             re-read is gone — so the DELETE must be rolled back"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            entries_before,
+            "and no delete entry may be left behind either"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let before = status_rows(&db).await;
+        assert_eq!(
+            before,
+            vec![(
+                "sts_vis".to_string(),
+                "Backlog".to_string(),
+                "backlog".to_string(),
+                0
+            )],
+            "precondition: only the fixture's own status exists"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::status_service::create_status(
+            &db,
+            &crate::status_service::CreateStatusParams {
+                workspace_id: WS,
+                team_id: Some("team_vis"),
+                name: "Triage",
+                category: "unstarted",
+                position: 7,
+                color: Some("#0D9488"),
+            },
+            None,
+        )
+        .await
+        .expect_err("a status whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            status_rows(&db).await,
+            before,
+            "an issue moved to a status the client has never received has \
+             nothing to render, so a status with no sync_log row must not survive"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            Vec::new(),
+            "and nothing may be left in sync_log either"
+        );
+    }
+
+    #[tokio::test]
+    async fn relation_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+
+        let before = relations(&db).await;
+        assert_eq!(
+            before,
+            Vec::new(),
+            "precondition: the fixture creates no relations, so any row below \
+             came from the create"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::relation_service::create_relation(
+            &db,
+            WS,
+            "iss_vis",
+            "iss_second",
+            "blocks",
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a relation whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            relations(&db).await,
+            before,
+            "a relation with no sync_log row is invisible to every future delta, \
+             so it must not survive the failed write"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            Vec::new(),
+            "and nothing may be left in sync_log either"
+        );
+    }
+
+    #[tokio::test]
+    async fn relation_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+
+        let relation = crate::relation_service::create_relation(
+            &db,
+            WS,
+            "iss_vis",
+            "iss_second",
+            "blocks",
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("create the relation to delete");
+
+        let before = relations(&db).await;
+        let entries_before = sync_entries(&db).await;
+        assert_eq!(
+            before,
+            vec![(
+                relation.relation_id.clone(),
+                "iss_vis".to_string(),
+                "iss_second".to_string(),
+                "blocks".to_string()
+            )],
+            "precondition: the relation exists"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::relation_service::delete_relation(&db, &relation.relation_id, WS, None)
+            .await
+            .expect_err("a delete whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            relations(&db).await,
+            before,
+            "a delete with no sync_log row leaves the relation on every other \
+             client forever, and no later delta can repair it, so the DELETE must \
+             be rolled back"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            entries_before,
+            "the create's entry stays; the delete's must not be there at all"
+        );
+    }
+
+    /// The UNIQUE(source, target, type) rejection, now that the INSERT runs on a
+    /// transaction.
+    ///
+    /// `create_relation` maps that one `sqlx::Error::Database` to `BadRequest` —
+    /// "you already have this relation" is the user's mistake, not a server
+    /// fault, and the UI shows it as such. `tx_execute!` and `db_execute!` are
+    /// not interchangeable by assumption, so this asserts the **variant**: it is
+    /// what proves the driver still reports a constraint violation as
+    /// `Error::Database`, carrying the code and message the mapping matches on.
+    /// `expect_err` alone would pass just as happily on an `Internal` wrapping
+    /// the raw sqlx error.
+    ///
+    /// It also pins the disposal of the transaction the failed INSERT was
+    /// running in. `?` on the mapped error drops the `DbTx`; sqlx's `Drop`
+    /// queues a rollback that runs on the connection's next use, including when
+    /// it is returned to the pool. Both halves of that show up below. A
+    /// transaction left dangling would still hold SQLite's only connection, so
+    /// the reads would stall until the pool's acquire timeout elapsed — 30s, the
+    /// sqlx default, which the SQLite branch of `DbPool::connect` does not
+    /// override — and then fail with `PoolTimedOut`; they instead return
+    /// promptly. A rollback that was queued but swallowed would leave a second
+    /// relation row; there is one.
+    #[tokio::test]
+    async fn a_duplicate_relation_is_rejected_as_a_bad_request() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+
+        let relation = crate::relation_service::create_relation(
+            &db,
+            WS,
+            "iss_vis",
+            "iss_second",
+            "relates_to",
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("the first relation is created");
+
+        let before = relations(&db).await;
+        let entries_before = sync_entries(&db).await;
+
+        let err = crate::relation_service::create_relation(
+            &db,
+            WS,
+            "iss_vis",
+            "iss_second",
+            "relates_to",
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the same relation a second time must be rejected");
+
+        assert!(
+            matches!(err, trakkt_core::Error::BadRequest(_)),
+            "a UNIQUE violation is the user's mistake and has to stay a \
+             BadRequest — an Internal here means the driver's error no longer \
+             reaches the mapping in the shape it matches on, and the UI would \
+             report a server fault for a duplicate click; got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("This relation already exists"),
+            "and it must keep saying what the user did; got: {err}"
+        );
+
+        let after = relations(&db).await;
+        assert_eq!(
+            after, before,
+            "the rejected INSERT rolled back with its transaction, so the \
+             original relation is still the only one"
+        );
+        assert_eq!(
+            after,
+            vec![(
+                relation.relation_id.clone(),
+                "iss_vis".to_string(),
+                "iss_second".to_string(),
+                "relates_to".to_string()
+            )],
+            "and it is the first create's row, unchanged"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            entries_before,
+            "a relation that was never created has nothing to replay"
+        );
+    }
+
+    /// The persisted entry and the live frame carry the same relation.
+    ///
+    /// `create_relation` used to persist `payload: None` while broadcasting the
+    /// serialized relation. `cache/apply.rs` returns on a data-less insert before
+    /// it reaches the entity-type match, so a client that missed the live frame
+    /// and replayed the delta dropped the row on the floor — issue relations were
+    /// invisible to delta sync entirely. `commit_and_deliver` takes one payload
+    /// for both paths, which is what makes the two agree by construction; this
+    /// pins the persisted side of it.
+    ///
+    /// Runs with no `ws_manager` at all, deliberately: a test holding a
+    /// connection would pass on the broadcast alone while the stored row stayed
+    /// empty, which is exactly the bug being fixed.
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_relation_write() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+
+        let created = crate::relation_service::create_relation(
+            &db,
+            WS,
+            "iss_vis",
+            "iss_second",
+            "blocks",
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("create relation");
+
+        let payloads: Vec<trakkt_types::models::IssueRelation> =
+            delta_payloads(&db, USER_B, entity_types::ISSUE_RELATION).await;
+
+        assert_eq!(payloads.len(), 1, "one relation create");
+        assert_eq!(
+            payloads[0], created,
+            "the persisted entry must carry the same relation the broadcast did"
+        );
+        assert!(
+            !payloads[0].created_at.is_empty(),
+            "the payload is built from the re-fetch inside the transaction, so \
+             the DB-assigned created_at has to be in it"
+        );
+
+        crate::relation_service::delete_relation(&db, &created.relation_id, WS, None)
+            .await
+            .expect("delete relation");
+
+        assert_eq!(
+            sync_entries(&db).await,
+            vec![
+                (
+                    entity_types::ISSUE_RELATION.to_string(),
+                    created.relation_id.clone(),
+                    "insert".to_string()
+                ),
+                (
+                    entity_types::ISSUE_RELATION.to_string(),
+                    created.relation_id.clone(),
+                    "delete".to_string()
+                ),
+            ],
+            "one entry per write, and the delete carries no payload because \
+             there is no row left to send"
+        );
+    }
 }
