@@ -449,27 +449,6 @@ pub async fn get_issue_by_id(
     }
 }
 
-/// Build the sync payload for a change to `issue_id`.
-///
-/// The client's ISSUE arm deserializes an `IssueWithDetails`, so the payload has
-/// to be the joined detail row — the bare `issues` row is missing `team_key`,
-/// the status fields and the labels, and would fail to deserialize. An entry
-/// with no payload is skipped outright by the client, on the live frame and on
-/// delta alike, so an issue that cannot be read is an error rather than a
-/// payload-less write.
-///
-/// Callers must have already established that the issue exists; every call site
-/// either just inserted it or just updated it under a `rows_affected` check.
-pub(crate) async fn issue_sync_payload(
-    db: &DbPool,
-    issue_id: &str,
-) -> trakkt_core::Result<Option<serde_json::Value>> {
-    let issue = get_issue_by_id(db, issue_id)
-        .await?
-        .ok_or_else(|| trakkt_core::Error::NotFound(format!("issue {issue_id} not found")))?;
-    Ok(issue_payload_value(&issue))
-}
-
 /// Read an issue by its UUID on an open transaction.
 ///
 /// Transaction-scoped [`get_issue_by_id`]. A mutation's payload has to be read
@@ -495,9 +474,20 @@ async fn get_issue_by_id_tx(
 
 /// Build the sync payload for a change made on an open transaction.
 ///
-/// Transaction-scoped [`issue_sync_payload`], with the same contract: callers
-/// have already established that the issue exists, so a missing row is an error.
-async fn issue_sync_payload_tx(
+/// The client's ISSUE arm deserializes an `IssueWithDetails`, so the payload has
+/// to be the joined detail row — the bare `issues` row is missing `team_key`,
+/// the status fields and the labels, and would fail to deserialize. An entry
+/// with no payload is skipped outright by the client, on the live frame and on
+/// delta alike, so an issue that cannot be read is an error rather than a
+/// payload-less write.
+///
+/// Callers must have already established that the issue exists; every call site
+/// either just inserted it or just updated it under a `rows_affected` check.
+///
+/// Visible to the crate because `team_service::delete_team` reassigns issues
+/// inside its own transaction: a pool-based read would see the pre-reassignment
+/// row, and on SQLite would not complete at all (see [`DbTx`]).
+pub(crate) async fn issue_sync_payload_tx(
     tx: &mut DbTx,
     issue_id: &str,
 ) -> trakkt_core::Result<Option<serde_json::Value>> {
