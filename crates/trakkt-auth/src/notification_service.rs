@@ -12,7 +12,7 @@ use trakkt_types::enums::ActionSource;
 use trakkt_types::models::{Notification, NotificationPreferences};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
-use crate::sync_log_service;
+use crate::sync_log_service::{self, SyncAudience};
 use crate::websocket::WebSocketManager;
 
 pub const DEFAULT_NOTIFICATION_LIMIT: i64 = 50;
@@ -86,6 +86,22 @@ impl NotificationRow {
 // ─── Service functions ──────────────────────────────────────────────────────
 
 /// Create a notification for a user about an issue event.
+///
+/// The INSERT and its `sync_log` entry are one transaction: a notification that
+/// commits without its sync row never reaches the recipient's inbox live, and no
+/// later delta can replay it.
+///
+/// A notification belongs to its recipient alone — the payload carries the issue
+/// title, the actor's name and the read state — so the entry and the live frame
+/// are both scoped to `user_id` via [`SyncAudience::User`].
+///
+/// # Transaction nesting
+///
+/// This opens its own transaction, so no caller may hold one across the call.
+/// All four call sites are clear: `comment_service::create_comment` (commits at
+/// its own line before notifying), `issue_service::update_issue` and
+/// `issue_service::set_issue_labels` (likewise), and
+/// `relation_service::create_relation`, which opens no transaction at all.
 pub async fn create_notification(
     db: &DbPool,
     workspace_id: &str,
@@ -109,8 +125,10 @@ pub async fn create_notification(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, {bf}, {now})",
         bf = sql_compat::bool_false(is_pg),
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &notification_id,
         workspace_id,
@@ -123,8 +141,11 @@ pub async fn create_notification(
         action_source_label
     )?;
 
-    let notification = trakkt_core::db_fetch_optional!(
-        db,
+    // Read back on the transaction — the row does not exist outside it yet, and
+    // the joins that fill in the issue title, team key and actor name are what
+    // make the payload usable by the client.
+    let notification: Option<NotificationRow> = trakkt_core::tx_fetch_optional!(
+        &mut tx,
         NotificationRow,
         "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
                 n.type AS notification_type, n.read, \
@@ -144,40 +165,21 @@ pub async fn create_notification(
         &notification_id
     )?;
     let notification_data = notification.map(|r| r.into_dto());
+    let payload = notification_data.as_ref().and_then(|n| {
+        sync_log_service::sync_payload(n, entity_types::NOTIFICATION, &notification_id)
+    });
 
-    // A notification belongs to its recipient alone — the payload carries the
-    // issue title, the actor's name and the read state. Scope the sync row to
-    // `user_id` so delta sync never replays it to other workspace members, and
-    // deliver the live frame to that user only.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::NOTIFICATION,
         &notification_id,
         workspace_id,
-        Some(user_id),
+        SyncAudience::User(user_id),
         SyncActionType::Insert,
-        notification_data.as_ref().and_then(|n| serde_json::to_value(n).ok()),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, notification_id = %notification_id, "Failed to write sync log entry for notification create");
-        0
-    });
-
-    // WebSocket delivery with full entity data — recipient only.
-    if let Some(ws) = ws_manager {
-        sync_log_service::send_sync_action_to_user(
-            ws,
-            user_id,
-            workspace_id,
-            entity_types::NOTIFICATION,
-            &notification_id,
-            SyncActionType::Insert,
-            notification_data.and_then(|n| serde_json::to_value(&n).ok()),
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(())
 }
@@ -534,11 +536,38 @@ impl NotificationPreferencesRow {
     }
 }
 
+/// Base SELECT for notification preferences queries.
+///
+/// Shared by the pool, transaction and batch reads so the column list cannot
+/// drift between them — the same shape the client is handed as a sync payload.
+const PREFERENCES_SELECT: &str = "\
+    SELECT preference_id, user_id, workspace_id, \
+           notify_status_changes, notify_comments, notify_assignments, \
+           notify_priority_changes, \
+           notify_label_changes, notify_due_date_changes, notify_estimate_changes, \
+           notify_milestone_changes, notify_project_changes, notify_team_changes, \
+           notify_relation_changes, \
+           notify_own_agent_actions, notify_own_api_actions, \
+           delivery_channel \
+    FROM notification_preferences";
+
 /// Get notification preferences for a user in a workspace.
 ///
 /// Uses an upsert (INSERT ... ON CONFLICT DO NOTHING / INSERT OR IGNORE)
 /// to atomically create a default row if none exists, avoiding a TOCTOU race
 /// between the existence check and the insert.
+///
+/// When the upsert actually inserts, that INSERT and its `sync_log` entry are
+/// one transaction: a preferences row that commits without its sync row leaves
+/// the settings screen on the user's other browsers showing nothing until they
+/// next bootstrap. When the row already existed nothing was written, so the
+/// transaction is rolled back and no sync entry is produced — this function is
+/// called on every preferences read, and logging an entry per read would flood
+/// the delta stream.
+///
+/// The returned defaults are read back from the row the database actually
+/// stored rather than reconstructed in Rust, so a change to the column defaults
+/// cannot leave the sync payload describing preferences the user does not have.
 pub async fn get_or_default_preferences(
     db: &DbPool,
     user_id: &str,
@@ -568,97 +597,89 @@ pub async fn get_or_default_preferences(
          VALUES ($1, $2, $3, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bt}, {bf}, {bf}, $4, {now}, {now}) \
          {conflict_clause}"
     );
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &preference_id,
         user_id,
         workspace_id,
         "in_app"
     )?;
+    let inserted = result.rows_affected() > 0;
 
-    // If a row was actually inserted, write sync log + broadcast.
-    if result.rows_affected() > 0 {
-        let prefs = NotificationPreferences {
-            preference_id: preference_id.clone(),
-            user_id: user_id.to_string(),
-            workspace_id: workspace_id.to_string(),
-            notify_status_changes: true,
-            notify_comments: true,
-            notify_assignments: true,
-            notify_priority_changes: true,
-            notify_label_changes: true,
-            notify_due_date_changes: true,
-            notify_estimate_changes: true,
-            notify_milestone_changes: true,
-            notify_project_changes: true,
-            notify_team_changes: true,
-            notify_relation_changes: true,
-            notify_own_agent_actions: false,
-            notify_own_api_actions: false,
-            delivery_channel: "in_app".to_string(),
-        };
-
-        // Preferences are one user's settings (the table is keyed
-        // UNIQUE(user_id, workspace_id)) — scope the row and the frame to them.
-        let sync_id = sync_log_service::write_sync_entry(
-            db,
-            entity_types::NOTIFICATION_PREFERENCES,
-            &preference_id,
-            workspace_id,
-            Some(user_id),
-            SyncActionType::Insert,
-            serde_json::to_value(&prefs).ok(),
-        )
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to write sync log for notification preferences create");
-            0
-        });
-
-        if let Some(ws) = ws_manager {
-            sync_log_service::send_sync_action_to_user(
-                ws,
-                user_id,
-                workspace_id,
-                entity_types::NOTIFICATION_PREFERENCES,
-                &preference_id,
-                SyncActionType::Insert,
-                serde_json::to_value(&prefs).ok(),
-                sync_id,
-            )
-            .await;
-        }
-    }
-
-    // Always fetch the current state (whether we just inserted or it already existed).
-    let row = trakkt_core::db_fetch_optional!(
-        db,
+    // Always fetch the current state (whether we just inserted or it already
+    // existed). This runs on the transaction: on the insert path the row does
+    // not exist outside it yet.
+    let row: Option<NotificationPreferencesRow> = trakkt_core::tx_fetch_optional!(
+        &mut tx,
         NotificationPreferencesRow,
-        "SELECT preference_id, user_id, workspace_id, \
-                notify_status_changes, notify_comments, notify_assignments, \
-                notify_priority_changes, \
-                notify_label_changes, notify_due_date_changes, notify_estimate_changes, \
-                notify_milestone_changes, notify_project_changes, notify_team_changes, \
-                notify_relation_changes, \
-                notify_own_agent_actions, notify_own_api_actions, \
-                delivery_channel \
-         FROM notification_preferences \
-         WHERE user_id = $1 AND workspace_id = $2",
+        &format!("{PREFERENCES_SELECT} WHERE user_id = $1 AND workspace_id = $2"),
         user_id,
         workspace_id
     )?;
 
-    match row {
-        Some(r) => Ok(r.into_dto()),
-        None => Err(trakkt_core::Error::NotFound("Notification preferences".into())),
+    let Some(row) = row else {
+        tx.rollback().await?;
+        return Err(trakkt_core::Error::NotFound("Notification preferences".into()));
+    };
+    let prefs = row.into_dto();
+
+    if !inserted {
+        // The row already existed, so nothing was written and there is nothing
+        // to log. Release the transaction before returning — on SQLite it holds
+        // the only connection until it ends.
+        tx.rollback().await?;
+        return Ok(prefs);
     }
+
+    // Preferences are one user's settings (the table is keyed
+    // UNIQUE(user_id, workspace_id)) — scope the row and the frame to them.
+    let payload = sync_log_service::sync_payload(
+        &prefs,
+        entity_types::NOTIFICATION_PREFERENCES,
+        &prefs.preference_id,
+    );
+
+    sync_log_service::commit_and_deliver(
+        tx,
+        entity_types::NOTIFICATION_PREFERENCES,
+        &prefs.preference_id,
+        workspace_id,
+        SyncAudience::User(user_id),
+        SyncActionType::Insert,
+        payload,
+        ws_manager,
+    )
+    .await?;
+
+    Ok(prefs)
 }
 
 /// Update a single boolean preference field.
 ///
 /// The field name is validated against a fixed allow-list to prevent SQL
 /// injection. Returns the updated preferences.
+///
+/// The UPDATE and its `sync_log` entry are one transaction, scoped to the owning
+/// user via [`SyncAudience::User`].
+///
+/// # Why the row is ensured before the transaction opens
+///
+/// [`get_or_default_preferences`] takes a `&DbPool` and opens a transaction of
+/// its own. Calling it between our `begin` and `commit` would nest one
+/// transaction inside another and, on SQLite, deadlock outright — the pool is
+/// pinned to a single connection which ours already holds. So it runs first, on
+/// the pool, and finishes before `begin`. The read-back afterwards cannot use it
+/// for the same reason and goes through [`PREFERENCES_SELECT`] on the
+/// transaction instead — which is also the only way to see the row this
+/// transaction just wrote.
+///
+/// That ordering has a second consequence worth stating: when the preferences
+/// row does not exist yet, this function produces **two** sync entries — an
+/// `Insert` from `get_or_default_preferences` and then this `Update`. They are
+/// separate transactions, so each rolls back independently.
 pub async fn update_preference(
     db: &DbPool,
     user_id: &str,
@@ -688,7 +709,8 @@ pub async fn update_preference(
         }
     };
 
-    // Ensure the row exists (inserts defaults if missing).
+    // Ensure the row exists (inserts defaults if missing). Runs on the pool and
+    // completes its own transaction before ours opens — see the note above.
     let _prefs = get_or_default_preferences(db, user_id, workspace_id, ws_manager).await?;
 
     let is_pg = db.is_postgres();
@@ -703,40 +725,43 @@ pub async fn update_preference(
         "UPDATE notification_preferences SET {column} = {bool_val}, updated_at = {now} \
          WHERE user_id = $1 AND workspace_id = $2"
     );
-    trakkt_core::db_execute!(db, &sql, user_id, workspace_id)?;
+    let mut tx = db.begin().await?;
 
-    // Re-fetch the updated preferences.
-    let updated = get_or_default_preferences(db, user_id, workspace_id, ws_manager).await?;
+    trakkt_core::tx_execute!(&mut tx, &sql, user_id, workspace_id)?;
 
-    // Sync log + broadcast for the update (best-effort).
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    // Re-fetch the updated preferences on the transaction — the new value is not
+    // visible on the pool until the commit.
+    let row: Option<NotificationPreferencesRow> = trakkt_core::tx_fetch_optional!(
+        &mut tx,
+        NotificationPreferencesRow,
+        &format!("{PREFERENCES_SELECT} WHERE user_id = $1 AND workspace_id = $2"),
+        user_id,
+        workspace_id
+    )?;
+
+    let Some(row) = row else {
+        tx.rollback().await?;
+        return Err(trakkt_core::Error::NotFound("Notification preferences".into()));
+    };
+    let updated = row.into_dto();
+
+    let payload = sync_log_service::sync_payload(
+        &updated,
+        entity_types::NOTIFICATION_PREFERENCES,
+        &updated.preference_id,
+    );
+
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::NOTIFICATION_PREFERENCES,
         &updated.preference_id,
         workspace_id,
-        Some(user_id),
+        SyncAudience::User(user_id),
         SyncActionType::Update,
-        serde_json::to_value(&updated).ok(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "Failed to write sync log for notification preferences update");
-        0
-    });
-
-    if let Some(ws) = ws_manager {
-        sync_log_service::send_sync_action_to_user(
-            ws,
-            user_id,
-            workspace_id,
-            entity_types::NOTIFICATION_PREFERENCES,
-            &updated.preference_id,
-            SyncActionType::Update,
-            serde_json::to_value(&updated).ok(),
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(updated)
 }
@@ -757,16 +782,7 @@ pub async fn batch_get_preferences(
 
     let (in_clause, _) = trakkt_core::db::in_clause_placeholders(user_ids.len(), 2);
     let sql = format!(
-        "SELECT preference_id, user_id, workspace_id, \
-                notify_status_changes, notify_comments, notify_assignments, \
-                notify_priority_changes, \
-                notify_label_changes, notify_due_date_changes, notify_estimate_changes, \
-                notify_milestone_changes, notify_project_changes, notify_team_changes, \
-                notify_relation_changes, \
-                notify_own_agent_actions, notify_own_api_actions, \
-                delivery_channel \
-         FROM notification_preferences \
-         WHERE workspace_id = $1 AND user_id IN {in_clause}"
+        "{PREFERENCES_SELECT} WHERE workspace_id = $1 AND user_id IN {in_clause}"
     );
 
     let rows: Vec<NotificationPreferencesRow> = trakkt_core::db_with_pool!(db, |pool| {

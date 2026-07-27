@@ -556,15 +556,64 @@ pub(crate) fn sync_payload<T: serde::Serialize>(
     }
 }
 
+/// Who a mutation's sync row is addressed to — on both sides of the sync
+/// protocol at once.
+///
+/// A `sync_log` row reaches a client two ways: live over the socket, and later
+/// as part of a delta replay. Those are the same audience, and getting them to
+/// disagree is precisely the TRA-9920 leak — a row persisted as one member's
+/// private data but pushed live to everyone, or the reverse, where a member's
+/// live frame never arrives again after a reconnect.
+///
+/// So the two are not separate parameters. This one value decides the
+/// `visibility_user_id` column *and* the delivery call, and
+/// [`commit_and_deliver`] is the only thing that reads it. A caller cannot scope
+/// the persisted row to one user and broadcast the frame to the workspace,
+/// because there is no pair of arguments to disagree about.
+///
+/// It is also deliberately not `Option<&str>`. `None` is the kind of thing that
+/// gets typed when a `user_id` is not to hand, and it would silently mean
+/// "publish this to the whole workspace"; `Workspace` has to be chosen on
+/// purpose and reads as a decision at the call site.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SyncAudience<'a> {
+    /// Visible to every member of the workspace: `visibility_user_id` is NULL
+    /// and the live frame is broadcast workspace-wide.
+    Workspace,
+    /// Visible to one user: `visibility_user_id` is that user, and the live
+    /// frame goes only to their connections.
+    ///
+    /// Required for every entity whose read path filters by `user_id` —
+    /// notifications, notification preferences, favorites, and unshared views.
+    /// Downgrading one of these to [`SyncAudience::Workspace`] republishes one
+    /// member's private rows to the whole workspace.
+    User(&'a str),
+}
+
+impl<'a> SyncAudience<'a> {
+    /// The `visibility_user_id` column value for this audience.
+    fn visibility_user_id(self) -> Option<&'a str> {
+        match self {
+            Self::Workspace => None,
+            Self::User(user_id) => Some(user_id),
+        }
+    }
+}
+
 /// Finish a mutation whose statements have already run on `tx`: log the change,
-/// commit, then broadcast.
+/// commit, then deliver it to `audience`.
 ///
 /// This is the shared tail of every transactional mutation in the service layer,
 /// and the ordering is the part that has to be right every time — the `sync_log`
 /// entry inside the transaction so the change and the row that replays it commit
-/// together, the broadcast strictly after the commit so it carries a `sync_id`
+/// together, the delivery strictly after the commit so it carries a `sync_id`
 /// that exists and so it never runs while the transaction holds the SQLite
-/// connection (see [`DbTx`]).
+/// connection (see [`DbTx`]). Note that even the workspace broadcast reads
+/// `workspace_users` from the pool, so "after the commit" is a hard requirement
+/// and not a stylistic one.
+///
+/// `audience` is mandatory rather than defaulted because the wrong answer is a
+/// data leak, not a cosmetic bug — see [`SyncAudience`].
 ///
 /// Takes the transaction by value: committing it is part of the job, and no
 /// caller has anything left to do on it. Anything the entry's payload needs read
@@ -572,18 +621,19 @@ pub(crate) fn sync_payload<T: serde::Serialize>(
 /// handing it over — the new state is not visible on the pool until the commit,
 /// and on SQLite the pool is not reachable at all while the transaction is open.
 ///
-/// Not every commit-then-broadcast helper belongs here.
+/// Not every commit-then-deliver helper belongs here.
 /// `team_service::commit_team_update` reads the same way at a glance but is a
 /// different function: it does its own transaction-scoped read-back of the team,
 /// hard-codes the TEAM entity type and the `Update` action, and returns the row
 /// it read to its caller. Generalising it into this signature would take a
 /// read-back callback and a second return type to serve one module — a worse
 /// abstraction, not a shared one. Leave it where it is.
-pub(crate) async fn commit_and_broadcast(
+pub(crate) async fn commit_and_deliver(
     mut tx: DbTx,
     entity_type: &str,
     entity_id: &str,
     workspace_id: &str,
+    audience: SyncAudience<'_>,
     action: SyncActionType,
     payload: Option<serde_json::Value>,
     ws_manager: Option<&WebSocketManager>,
@@ -593,7 +643,7 @@ pub(crate) async fn commit_and_broadcast(
         entity_type,
         entity_id,
         workspace_id,
-        None,
+        audience.visibility_user_id(),
         action.clone(),
         payload.clone(),
     )
@@ -601,17 +651,37 @@ pub(crate) async fn commit_and_broadcast(
 
     tx.commit().await?;
 
+    // Delivery mirrors the column written above — the same `audience` drives
+    // both, so the live frame can never reach an audience the persisted row
+    // would not.
     if let Some(ws) = ws_manager {
-        broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_type,
-            entity_id,
-            action,
-            payload,
-            sync_id,
-        )
-        .await;
+        match audience {
+            SyncAudience::Workspace => {
+                broadcast_sync_action(
+                    ws,
+                    workspace_id,
+                    entity_type,
+                    entity_id,
+                    action,
+                    payload,
+                    sync_id,
+                )
+                .await;
+            }
+            SyncAudience::User(user_id) => {
+                send_sync_action_to_user(
+                    ws,
+                    user_id,
+                    workspace_id,
+                    entity_type,
+                    entity_id,
+                    action,
+                    payload,
+                    sync_id,
+                )
+                .await;
+            }
+        }
     }
 
     Ok(())
@@ -4701,6 +4771,624 @@ mod tests {
             "an unlink with no sync row leaves the attachment hanging off the \
              issue on every other client forever, so the DELETE must be rolled \
              back"
+        );
+    }
+
+    // ─── Per-user services: atomicity and audience (TRA-9950) ────────────────
+    //
+    // Notifications, notification preferences, favorites and unshared views are
+    // the entities whose sync rows carry a `visibility_user_id`. Two things have
+    // to hold at once here, and the second is the one a shared commit-and-
+    // broadcast helper quietly breaks:
+    //
+    //   1. the mutation and its `sync_log` row commit together, and
+    //   2. both halves stay addressed to the owning user — the persisted row
+    //      (`visibility_user_id`) and the live frame.
+    //
+    // Getting (2) wrong is the TRA-9920 leak, so it is asserted directly against
+    // a real `WebSocketManager` rather than inferred from the diff.
+
+    /// Every view, in a stable order.
+    async fn views(db: &DbPool) -> Vec<(String, String, bool)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            view_id: String,
+            name: String,
+            is_shared: bool,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT view_id, name, is_shared FROM views ORDER BY view_id"
+        )
+        .expect("read views");
+        rows.into_iter()
+            .map(|r| (r.view_id, r.name, r.is_shared))
+            .collect()
+    }
+
+    /// Every notification, in a stable order.
+    async fn notifications(db: &DbPool) -> Vec<(String, String, String)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            notification_id: String,
+            user_id: String,
+            notification_type: String,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT notification_id, user_id, type AS notification_type \
+             FROM notifications ORDER BY notification_id"
+        )
+        .expect("read notifications");
+        rows.into_iter()
+            .map(|r| (r.notification_id, r.user_id, r.notification_type))
+            .collect()
+    }
+
+    /// Every notification preferences row, in a stable order.
+    ///
+    /// `notify_comments` is the field the update tests flip, so it is the one
+    /// carried here.
+    async fn preferences(db: &DbPool) -> Vec<(String, String, bool)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            preference_id: String,
+            user_id: String,
+            notify_comments: bool,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT preference_id, user_id, notify_comments \
+             FROM notification_preferences ORDER BY preference_id"
+        )
+        .expect("read notification preferences");
+        rows.into_iter()
+            .map(|r| (r.preference_id, r.user_id, r.notify_comments))
+            .collect()
+    }
+
+    /// Create a view for `owner`, sharing it or not.
+    async fn make_view(
+        db: &DbPool,
+        owner: &str,
+        name: &str,
+        is_shared: bool,
+        ws: Option<&WebSocketManager>,
+    ) -> View {
+        crate::view_service::create_view(
+            db,
+            &crate::view_service::CreateViewParams {
+                workspace_id: WS,
+                user_id: owner,
+                name,
+                icon: None,
+                filters: "{}",
+                display_options: "{}",
+                is_shared,
+                team_id: None,
+                position: 0,
+            },
+            ws,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create view {name}: {e}"))
+    }
+
+    /// Give `user` a notification about the fixture issue.
+    async fn notify(db: &DbPool, user: &str, ws: Option<&WebSocketManager>) {
+        crate::notification_service::create_notification(
+            db,
+            WS,
+            user,
+            "iss_vis",
+            TYPE_ASSIGNED,
+            Some(USER_B),
+            None,
+            trakkt_types::enums::ActionSource::User,
+            None,
+            ws,
+        )
+        .await
+        .expect("create notification");
+    }
+
+    use crate::notification_service::TYPE_ASSIGNED;
+
+    #[tokio::test]
+    async fn favorite_add_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
+            .await
+            .expect_err("an add whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            favorites(&db).await,
+            Vec::new(),
+            "a favorite with no sync_log row never reaches the user's other \
+             browsers, so it must not survive the failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn favorite_remove_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let favorite =
+            crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
+                .await
+                .expect("A favorites the issue");
+
+        let before = favorites(&db).await;
+        assert_eq!(
+            before,
+            vec![(
+                favorite.favorite_id.clone(),
+                "issue".to_string(),
+                "iss_vis".to_string()
+            )],
+            "the favorite has to exist for its removal to be rolled back"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::favorite_service::remove_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
+                .await
+                .expect_err("a remove whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            favorites(&db).await,
+            before,
+            "an unpin with no sync row leaves the favorite in the sidebar of \
+             every other browser forever, so the DELETE must be rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::view_service::create_view(
+            &db,
+            &crate::view_service::CreateViewParams {
+                workspace_id: WS,
+                user_id: USER_A,
+                name: "Never saved",
+                icon: None,
+                filters: "{}",
+                display_options: "{}",
+                is_shared: false,
+                team_id: None,
+                position: 0,
+            },
+            None,
+        )
+        .await
+        .expect_err("a create whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            views(&db).await,
+            Vec::new(),
+            "a view with no sync_log row is invisible to every future delta, so \
+             it must not survive the failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let view = make_view(&db, USER_A, "Original name", false, None).await;
+
+        let before = views(&db).await;
+        assert_eq!(
+            before,
+            vec![(view.view_id.clone(), "Original name".to_string(), false)],
+            "the view has to exist for its update to be rolled back"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::view_service::update_view(
+            &db,
+            &crate::view_service::UpdateViewParams {
+                view_id: &view.view_id,
+                name: Some("Renamed"),
+                icon: None,
+                filters: None,
+                display_options: None,
+                is_shared: Some(true),
+                sort_order: None,
+                team_id: None,
+                position: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("an update whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            views(&db).await,
+            before,
+            "an edit with no sync row leaves every other client showing the old \
+             name and share state, so the UPDATE must be rolled back — including \
+             the `is_shared` flip, which also decides who the row is addressed to"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let view = make_view(&db, USER_A, "Keep me", false, None).await;
+
+        let before = views(&db).await;
+        assert_eq!(
+            before,
+            vec![(view.view_id.clone(), "Keep me".to_string(), false)],
+            "the view has to exist for its deletion to be rolled back"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::view_service::delete_view(&db, &view.view_id, WS, None)
+            .await
+            .expect_err("a delete whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            views(&db).await,
+            before,
+            "a delete with no sync row leaves the view in every other sidebar \
+             forever and no later delta can repair it, so the DELETE must be \
+             rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::create_notification(
+            &db,
+            WS,
+            USER_A,
+            "iss_vis",
+            TYPE_ASSIGNED,
+            Some(USER_B),
+            None,
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a create whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            notifications(&db).await,
+            Vec::new(),
+            "a notification with no sync_log row never reaches the recipient's \
+             inbox live and no delta can replay it, so it must not survive the \
+             failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_preferences_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::notification_service::get_or_default_preferences(&db, USER_A, WS, None)
+                .await
+                .expect_err("a create whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            preferences(&db).await,
+            Vec::new(),
+            "a preferences row with no sync_log row leaves the settings screen \
+             on the user's other browsers stale, so it must not survive the \
+             failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_preferences_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        // Seed the row *before* installing the trigger. Without this,
+        // `update_preference` writes two sync entries — the `Insert` from
+        // `get_or_default_preferences` and then its own `Update` — and the
+        // rejection would land on the first one, so the test would pass without
+        // ever reaching the transaction it is meant to exercise.
+        let seeded = crate::notification_service::get_or_default_preferences(&db, USER_A, WS, None)
+            .await
+            .expect("seed A's preferences");
+
+        let before = preferences(&db).await;
+        assert_eq!(
+            before,
+            vec![(seeded.preference_id.clone(), USER_A.to_string(), true)],
+            "the preferences row has to exist, and `notify_comments` has to \
+             start true, for the flip below to be observable"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::update_preference(
+            &db,
+            USER_A,
+            WS,
+            "notify_comments",
+            false,
+            None,
+        )
+        .await
+        .expect_err("an update whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            preferences(&db).await,
+            before,
+            "a preference change with no sync row leaves the user's other \
+             browsers showing the old setting, so the UPDATE must be rolled back"
+        );
+    }
+
+    // ─── Both halves of per-user visibility ──────────────────────────────────
+    //
+    // A per-user row has to stay private on *both* paths, and the two are easy
+    // to get out of step: `visibility_user_id` governs the delta replay, the
+    // delivery call governs the live frame. A conversion that routed these
+    // through a workspace-wide commit helper would keep the first test passing
+    // (the column would still be set) or the second (the frame would still be
+    // addressed) depending on which half it got wrong — so both are asserted.
+
+    /// Give A one of every per-user entity, plus a shared view as a control.
+    /// Returns `(notification_id, favorite_id, preference_id, private_view_id,
+    /// shared_view_id)`.
+    async fn seed_every_per_user_entity(
+        db: &DbPool,
+    ) -> (String, String, String, String, String) {
+        notify(db, USER_A, None).await;
+        let notification_id = crate::notification_service::list_notifications(
+            db, USER_A, false, false, None, None, None, 50, 0,
+        )
+        .await
+        .expect("list A's notifications")
+        .first()
+        .expect("A has a notification")
+        .notification_id
+        .clone();
+
+        let favorite =
+            crate::favorite_service::add_favorite(db, USER_A, WS, "issue", "iss_vis", None)
+                .await
+                .expect("A favorites the issue");
+
+        let prefs = crate::notification_service::get_or_default_preferences(db, USER_A, WS, None)
+            .await
+            .expect("A's preferences");
+
+        let private = make_view(db, USER_A, "A's private view", false, None).await;
+        let shared = make_view(db, USER_A, "A's shared view", true, None).await;
+
+        (
+            notification_id,
+            favorite.favorite_id,
+            prefs.preference_id,
+            private.view_id,
+            shared.view_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn per_user_rows_never_reach_another_members_delta() {
+        let db = two_user_workspace().await;
+        let (notification, favorite, preference, private_view, shared_view) =
+            seed_every_per_user_entity(&db).await;
+
+        let b_entries = get_entries_since(&db, WS, USER_B, 0, 10_000)
+            .await
+            .expect("B's delta");
+        let b_ids: Vec<String> = b_entries.iter().map(|e| e.entity_id.clone()).collect();
+
+        for (label, id) in [
+            ("notification", &notification),
+            ("favorite", &favorite),
+            ("notification preferences", &preference),
+            ("private view", &private_view),
+        ] {
+            assert!(
+                !b_ids.contains(id),
+                "B's delta carried A's {label} ({id}); \
+                 `visibility_user_id` must be Some(A) for it: {b_ids:?}"
+            );
+        }
+
+        // Every per-user entity type, empty for B — B created none of their own.
+        for entity_type in [
+            entity_types::NOTIFICATION,
+            entity_types::FAVORITE,
+            entity_types::NOTIFICATION_PREFERENCES,
+        ] {
+            assert_eq!(
+                delta_entity_ids(&db, USER_B, entity_type).await,
+                Vec::<String>::new(),
+                "B owns no {entity_type} of their own, so their delta must \
+                 contain none"
+            );
+        }
+
+        // The control: B does receive the shared view, so the filter is scoping
+        // rows rather than simply withholding everything.
+        assert_eq!(
+            delta_entity_ids(&db, USER_B, entity_types::VIEW).await,
+            vec![shared_view.clone()],
+            "B must still receive the shared view — otherwise this test would \
+             pass just as well with delta sync broken outright"
+        );
+
+        // And A still receives all of their own.
+        let a_ids: Vec<String> = get_entries_since(&db, WS, USER_A, 0, 10_000)
+            .await
+            .expect("A's delta")
+            .into_iter()
+            .map(|e| e.entity_id)
+            .collect();
+        for (label, id) in [
+            ("notification", &notification),
+            ("favorite", &favorite),
+            ("notification preferences", &preference),
+            ("private view", &private_view),
+        ] {
+            assert!(
+                a_ids.contains(id),
+                "the scope must not over-restrict: A's own {label} ({id}) is \
+                 missing from A's delta: {a_ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn per_user_live_frames_reach_only_their_owner() {
+        let db = two_user_workspace().await;
+        let manager = WebSocketManager::new(None, db.clone());
+
+        let mut a_conn = manager.connect(USER_A).expect("A connects");
+        let mut b_conn = manager.connect(USER_B).expect("B connects");
+        a_conn.rx.recv().await.expect("A's connect heartbeat");
+        b_conn.rx.recv().await.expect("B's connect heartbeat");
+
+        // One mutation per converted per-user site, in order.
+        let favorite =
+            crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", Some(&manager))
+                .await
+                .expect("A favorites the issue");
+        notify(&db, USER_A, Some(&manager)).await;
+        crate::notification_service::get_or_default_preferences(&db, USER_A, WS, Some(&manager))
+            .await
+            .expect("A's preferences are created");
+        crate::notification_service::update_preference(
+            &db,
+            USER_A,
+            WS,
+            "notify_comments",
+            false,
+            Some(&manager),
+        )
+        .await
+        .expect("A turns comment notifications off");
+        let private = make_view(&db, USER_A, "A's private view", false, Some(&manager)).await;
+        crate::favorite_service::remove_favorite(
+            &db,
+            USER_A,
+            WS,
+            "issue",
+            "iss_vis",
+            Some(&manager),
+        )
+        .await
+        .expect("A unpins the issue");
+
+        // A receives every one of them, in order, each addressed to A's own row.
+        let mut a_frames = Vec::new();
+        for _ in 0..6 {
+            let action = next_sync_action(&mut a_conn).await;
+            a_frames.push((action.entity_type.clone(), action.entity_id.clone()));
+            assert!(
+                action.sync_id > 0,
+                "a per-user frame still has to carry the id of its committed \
+                 row so a client that missed it can spot the gap: {action:?}"
+            );
+        }
+        assert_eq!(
+            a_frames,
+            vec![
+                (entity_types::FAVORITE.to_string(), favorite.favorite_id.clone()),
+                (entity_types::NOTIFICATION.to_string(), a_frames[1].1.clone()),
+                (
+                    entity_types::NOTIFICATION_PREFERENCES.to_string(),
+                    a_frames[2].1.clone()
+                ),
+                (
+                    entity_types::NOTIFICATION_PREFERENCES.to_string(),
+                    a_frames[3].1.clone()
+                ),
+                (entity_types::VIEW.to_string(), private.view_id.clone()),
+                (entity_types::FAVORITE.to_string(), favorite.favorite_id.clone()),
+            ],
+            "the owner must receive a live frame for each of their own mutations"
+        );
+
+        // …and B receives none of them. This is the assertion a workspace-wide
+        // commit helper breaks: the persisted rows would still be scoped, but
+        // every frame above would have been pushed to B as well.
+        assert!(
+            b_conn.rx.try_recv().is_err(),
+            "B received a live frame for one of A's per-user mutations — this is \
+             the TRA-9920 leak on the socket"
+        );
+
+        // The control: a *shared* view does reach B over the same connection, so
+        // the assertion above is about audience and not about delivery being
+        // broken.
+        let shared = make_view(&db, USER_A, "A's shared view", true, Some(&manager)).await;
+        let b_frame = next_sync_action(&mut b_conn).await;
+        assert_eq!(
+            (b_frame.entity_type.as_str(), b_frame.entity_id.as_str()),
+            (entity_types::VIEW, shared.view_id.as_str()),
+            "a shared view must still broadcast to every member"
         );
     }
 }
