@@ -23,6 +23,16 @@ use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 
 /// Verify a project belongs to the given workspace, returning the project.
 ///
+/// This **authorizes**: the `project_id` comes from the caller, and the answer
+/// decides whether the operation proceeds.
+///
+/// It reaches for the unscoped [`project_service::get_project`] and does the
+/// workspace comparison itself, rather than calling
+/// `project_service::get_project_in_workspace`, so that both the missing and
+/// the foreign case report the same `ApiError::NotFound("Project not found")` —
+/// an API-surface message that names no project id. The comparison below is
+/// load-bearing; dropping it turns this into a plain fetch.
+///
 /// Ported from `verify_project_ownership` in `routes/mcp.rs`.
 pub async fn verify_project_ownership(
     ctx: &ApiCtx<'_>,
@@ -53,6 +63,11 @@ pub async fn list_projects(
 }
 
 /// Get a single project by its ID, including milestones.
+///
+/// Note the name collision: this is the API-surface handler and it
+/// **authorizes** via [`verify_project_ownership`] before reading anything.
+/// `trakkt_auth::project_service::get_project` is a different function and is
+/// unscoped — reaching for that one here would drop the workspace check.
 ///
 /// Ported from `tool_get_project` in `routes/mcp.rs`.
 pub async fn get_project(

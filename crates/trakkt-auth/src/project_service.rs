@@ -183,7 +183,14 @@ pub async fn list_projects(
     Ok(rows.into_iter().map(ProjectRow::into_dto).collect())
 }
 
-/// Get a single project by ID.
+/// Get a single project by ID, across every workspace.
+///
+/// This lookup is **unscoped**: it will return a project belonging to any
+/// workspace. It answers "does this id exist", never "may this caller touch
+/// it". Use it only where the id is already known to be in the caller's
+/// workspace, or where the result's `workspace_id` is compared afterwards.
+/// Anywhere the id came from the caller and the answer decides access, use
+/// [`get_project_in_workspace`] instead.
 pub async fn get_project(
     db: &DbPool,
     project_id: &str,
@@ -196,6 +203,34 @@ pub async fn get_project(
         project_id
     )?;
     Ok(row.map(ProjectRow::into_dto))
+}
+
+/// Get a project by ID, requiring it to belong to `workspace_id`.
+///
+/// Use this wherever the `project_id` came from the caller. [`get_project`]
+/// looks up a project id across every workspace, so on its own it cannot tell a
+/// project the caller owns from one they merely named — the caller has to
+/// compare `workspace_id` afterwards, and forgetting to is silent.
+///
+/// A project in another workspace is reported as `NotFound`, not `Forbidden`:
+/// the caller cannot see that workspace, and an error distinguishing "wrong
+/// workspace" from "no such project" turns any project id into an existence
+/// oracle.
+pub async fn get_project_in_workspace(
+    db: &DbPool,
+    project_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<Project> {
+    let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1 AND p.workspace_id = $2");
+    let row = trakkt_core::db_fetch_optional!(
+        db,
+        ProjectRow,
+        &sql,
+        project_id,
+        workspace_id
+    )?;
+    row.map(ProjectRow::into_dto)
+        .ok_or_else(|| trakkt_core::Error::NotFound(format!("project {project_id} not found")))
 }
 
 /// Build the sync payload for an insert or update of `entity_type`.
@@ -591,13 +626,13 @@ pub async fn add_project_member(
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
 
-    // Checked before the insert so a missing project is a clean NotFound rather
-    // than a foreign-key error out of the write.
-    if get_project(db, project_id).await?.is_none() {
-        return Err(trakkt_core::Error::NotFound(format!(
-            "project {project_id} not found"
-        )));
-    }
+    // Resolved before the insert for two reasons: a missing project is a clean
+    // NotFound rather than a foreign-key error out of the write, and the resolve
+    // is workspace-scoped, so a project id from another workspace never reaches
+    // the INSERT below. Every caller also checks ownership one layer up; this is
+    // the second layer, held where the mutation is rather than in caller
+    // discipline.
+    get_project_in_workspace(db, project_id, workspace_id).await?;
 
     let sql = format!(
         "INSERT INTO project_members (project_id, user_id, role, created_at) \
@@ -667,6 +702,13 @@ pub async fn remove_project_member(
     workspace_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
+    // Resolved before the DELETE so a project id from another workspace cannot
+    // reach it. Without this the DELETE is the only filter, and it matches on
+    // `project_id` alone — a foreign project's membership row would be a legal
+    // target. Every caller also checks ownership one layer up; this is the
+    // second layer, held where the mutation is rather than in caller discipline.
+    get_project_in_workspace(db, project_id, workspace_id).await?;
+
     let result = trakkt_core::db_execute!(
         db,
         "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
@@ -1153,4 +1195,280 @@ pub async fn get_project_progress(
         cancelled: row.cancelled,
         percent_done,
     })
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trakkt_core::db_execute;
+
+    const WS_A: &str = "ws_alpha";
+    const WS_B: &str = "ws_beta";
+    const USER_A: &str = "usr_alpha";
+    const USER_B: &str = "usr_beta";
+
+    /// Two separate workspaces, one project each, seeded through the real
+    /// service so the rows are exactly what production writes.
+    ///
+    /// `USER_A` belongs to workspace A only, and is the caller in the
+    /// cross-workspace cases below: the workspace-B project is one they can name
+    /// but must not be able to touch. `USER_B` is seeded as a member of it, so
+    /// the remove case has a real membership row to try to disturb.
+    ///
+    /// Returns `(project_a_id, project_b_id)`.
+    async fn two_workspaces() -> (DbPool, WebSocketManager, String, String) {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+
+        for user_id in [USER_A, USER_B] {
+            db_execute!(
+                &db,
+                "INSERT INTO users (user_id, email, name) VALUES ($1, $2, $3)",
+                user_id,
+                format!("{user_id}@example.test"),
+                user_id
+            )
+            .expect("insert user");
+        }
+
+        for (ws, owner) in [(WS_A, USER_A), (WS_B, USER_B)] {
+            db_execute!(
+                &db,
+                "INSERT INTO workspaces (workspace_id, owner_user_id) VALUES ($1, $2)",
+                ws,
+                owner
+            )
+            .expect("insert workspace");
+            db_execute!(
+                &db,
+                "INSERT INTO workspace_users (workspace_id, user_id) VALUES ($1, $2)",
+                ws,
+                owner
+            )
+            .expect("insert workspace membership");
+        }
+
+        // A real manager, so the broadcast arm of every mutation runs for real
+        // rather than being skipped by a `None`.
+        let ws_manager = WebSocketManager::new(None, db.clone());
+
+        let mut project_ids = Vec::new();
+        for (ws, name) in [(WS_A, "Alpha"), (WS_B, "Beta")] {
+            let project = create_project(
+                &db,
+                &CreateProjectParams {
+                    workspace_id: ws,
+                    name,
+                    description: None,
+                    icon: None,
+                    color: None,
+                    lead_id: None,
+                    start_date: None,
+                    target_date: None,
+                },
+                Some(&ws_manager),
+            )
+            .await
+            .expect("create project");
+            project_ids.push(project.project_id);
+        }
+        let project_b = project_ids.pop().expect("project B");
+        let project_a = project_ids.pop().expect("project A");
+
+        add_project_member(&db, &project_b, USER_B, "member", WS_B, Some(&ws_manager))
+            .await
+            .expect("seed the existing membership in workspace B");
+
+        (db, ws_manager, project_a, project_b)
+    }
+
+    /// The full `project_members` table, ordered, as `(project_id, user_id,
+    /// role)`. Read straight from the table: the point is not to take the
+    /// mutation's return value for it.
+    async fn all_members(db: &DbPool) -> Vec<(String, String, Option<String>)> {
+        #[derive(sqlx::FromRow)]
+        struct MemberRow {
+            project_id: String,
+            user_id: String,
+            role: Option<String>,
+        }
+        let rows: Vec<MemberRow> = trakkt_core::db_fetch_all!(
+            db,
+            MemberRow,
+            "SELECT project_id, user_id, role FROM project_members \
+             ORDER BY project_id ASC, user_id ASC"
+        )
+        .expect("read project_members");
+        rows.into_iter()
+            .map(|r| (r.project_id, r.user_id, r.role))
+            .collect()
+    }
+
+    async fn sync_rows_for_workspace(db: &DbPool, workspace_id: &str) -> i64 {
+        trakkt_core::db_fetch_scalar!(
+            db,
+            i64,
+            "SELECT COUNT(*) FROM sync_log WHERE workspace_id = $1",
+            workspace_id
+        )
+        .expect("count sync log rows")
+    }
+
+    async fn member_sync_rows_for_workspace(db: &DbPool, workspace_id: &str) -> i64 {
+        trakkt_core::db_fetch_scalar!(
+            db,
+            i64,
+            "SELECT COUNT(*) FROM sync_log WHERE workspace_id = $1 AND entity_type = $2",
+            workspace_id,
+            entity_types::PROJECT_MEMBER
+        )
+        .expect("count project member sync log rows")
+    }
+
+    #[tokio::test]
+    async fn add_project_member_refuses_a_project_in_another_workspace() {
+        let (db, ws_manager, _project_a, project_b) = two_workspaces().await;
+        let members_before = all_members(&db).await;
+        let sync_before = sync_rows_for_workspace(&db, WS_B).await;
+        let member_sync_before = member_sync_rows_for_workspace(&db, WS_B).await;
+
+        // The project genuinely exists — an unscoped `is_none()` check passes
+        // straight through it. Only a workspace-scoped resolve can refuse this.
+        assert!(
+            get_project(&db, &project_b)
+                .await
+                .expect("unscoped read")
+                .is_some(),
+            "the foreign project really does exist, so the refusal below has to \
+             come from the workspace scoping and not from a missing row"
+        );
+
+        let result =
+            add_project_member(&db, &project_b, USER_A, "admin", WS_A, Some(&ws_manager)).await;
+
+        assert!(
+            matches!(result, Err(trakkt_core::Error::NotFound(_))),
+            "a project id from another workspace must be indistinguishable from a \
+             project id that does not exist, got {result:?}"
+        );
+        assert_eq!(
+            all_members(&db).await,
+            members_before,
+            "project_members must be unchanged — the caller must not have \
+             inserted themselves into the foreign project"
+        );
+        assert_eq!(
+            sync_rows_for_workspace(&db, WS_B).await,
+            sync_before,
+            "no sync_log row may be written into a workspace the caller cannot see"
+        );
+        assert_eq!(
+            member_sync_rows_for_workspace(&db, WS_B).await,
+            member_sync_before,
+            "a refused mutation must not emit a PROJECT_MEMBER sync frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_project_member_refuses_a_project_in_another_workspace() {
+        let (db, ws_manager, _project_a, project_b) = two_workspaces().await;
+        let members_before = all_members(&db).await;
+        let sync_before = sync_rows_for_workspace(&db, WS_B).await;
+        let member_sync_before = member_sync_rows_for_workspace(&db, WS_B).await;
+
+        assert!(
+            get_project(&db, &project_b)
+                .await
+                .expect("unscoped read")
+                .is_some(),
+            "the foreign project really does exist, so the refusal below has to \
+             come from the workspace scoping and not from a missing row"
+        );
+
+        let result =
+            remove_project_member(&db, &project_b, USER_B, WS_A, Some(&ws_manager)).await;
+
+        assert!(
+            matches!(result, Err(trakkt_core::Error::NotFound(_))),
+            "a project id from another workspace must be indistinguishable from a \
+             project id that does not exist, got {result:?}"
+        );
+        assert_eq!(
+            all_members(&db).await,
+            members_before,
+            "the seeded membership in the other workspace must survive intact"
+        );
+        assert_eq!(
+            sync_rows_for_workspace(&db, WS_B).await,
+            sync_before,
+            "no sync_log row may be written into a workspace the caller cannot see"
+        );
+        assert_eq!(
+            member_sync_rows_for_workspace(&db, WS_B).await,
+            member_sync_before,
+            "a refused mutation must not emit a PROJECT_MEMBER sync frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_mutations_still_work_within_the_workspace() {
+        let (db, ws_manager, project_a, _project_b) = two_workspaces().await;
+        let sync_before = member_sync_rows_for_workspace(&db, WS_A).await;
+
+        add_project_member(&db, &project_a, USER_A, "admin", WS_A, Some(&ws_manager))
+            .await
+            .expect("adding a member to a project in the caller's own workspace");
+        assert!(
+            all_members(&db)
+                .await
+                .contains(&(project_a.clone(), USER_A.to_string(), Some("admin".to_string()))),
+            "the membership must be written with the role it was given"
+        );
+
+        remove_project_member(&db, &project_a, USER_A, WS_A, Some(&ws_manager))
+            .await
+            .expect("removing a member of a project in the caller's own workspace");
+        assert!(
+            !all_members(&db)
+                .await
+                .iter()
+                .any(|(p, u, _)| p == &project_a && u == USER_A),
+            "the membership must be gone"
+        );
+
+        assert_eq!(
+            member_sync_rows_for_workspace(&db, WS_A).await - sync_before,
+            2,
+            "the add and the remove each report themselves as a PROJECT_MEMBER action"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_project_in_workspace_hides_a_project_from_another_workspace() {
+        let (db, _ws_manager, project_a, project_b) = two_workspaces().await;
+
+        assert!(
+            get_project(&db, &project_b)
+                .await
+                .expect("unscoped read")
+                .is_some(),
+            "the project really does exist — the scoped read below has to be what hides it"
+        );
+        assert!(
+            matches!(
+                get_project_in_workspace(&db, &project_b, WS_A).await,
+                Err(trakkt_core::Error::NotFound(_))
+            ),
+            "a project in another workspace must read as missing"
+        );
+
+        let project = get_project_in_workspace(&db, &project_a, WS_A)
+            .await
+            .expect("a project in the caller's own workspace resolves");
+        assert_eq!(project.project_id, project_a);
+        assert_eq!(project.workspace_id, WS_A);
+    }
 }
