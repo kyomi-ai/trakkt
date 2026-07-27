@@ -435,7 +435,7 @@ mod wasm_tests {
 
         run_writer(CacheDbSink::open(open(wid).await, wid.to_owned()), rx).await;
 
-        assert_eq!(count_entities(wid).await, 100);
+        assert_eq!(count_entities(wid).await, 99); // TRA-9932 TEMPORARY: proving CI fails on a broken wasm test
         assert_eq!(cursor(wid).await.as_deref(), Some("1234"));
     }
 
