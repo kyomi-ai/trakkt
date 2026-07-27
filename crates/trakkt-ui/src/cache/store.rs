@@ -58,6 +58,14 @@ struct SyncStoreInner {
     /// Used by the project detail page and the issue metadata sidebar to
     /// trigger a refetch of the milestone list from the server.
     milestones_version: ArcRwSignal<u32>,
+    /// Version counter bumped when a project_member sync action arrives.
+    /// Used by the project detail page to trigger a refetch of the member list
+    /// from the server.
+    project_members_version: ArcRwSignal<u32>,
+    /// Version counter bumped when a project_update sync action arrives.
+    /// Used by the project detail page to trigger a refetch of the posted
+    /// status updates from the server.
+    project_updates_version: ArcRwSignal<u32>,
     /// Where this tab's `remove_*` methods send the matching cache delete.
     ///
     /// Set by the Layout once the tab's sync role is known, and set again if a
@@ -107,6 +115,8 @@ impl SyncStore {
                 relations_version: ArcRwSignal::new(0),
                 comments_version: ArcRwSignal::new(0),
                 milestones_version: ArcRwSignal::new(0),
+                project_members_version: ArcRwSignal::new(0),
+                project_updates_version: ArcRwSignal::new(0),
                 delete_route: RefCell::new(DeleteRoute::default()),
             })),
         }
@@ -256,6 +266,52 @@ impl SyncStore {
     pub fn bump_milestones_version(&self) {
         self.inner.with_value(|inner| {
             inner.milestones_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for project members — bumped on each project_member sync
+    /// action.
+    ///
+    /// Memberships are not held in this store: the project detail page reads
+    /// them straight from the `list_project_members` server function. This
+    /// counter is the reactive dependency that tells it to ask again.
+    pub fn project_members_version(&self) -> Signal<u32> {
+        let sig = self
+            .inner
+            .with_value(|inner| inner.project_members_version.clone());
+        Signal::derive(move || sig.get())
+    }
+
+    /// Bump the project members version counter.
+    ///
+    /// Called by the sync engine when a "project_member" entity type arrives via
+    /// WebSocket, signaling that the member list should refetch.
+    pub fn bump_project_members_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.project_members_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for project status updates — bumped on each
+    /// project_update sync action.
+    ///
+    /// Posted updates are not held in this store: the project detail page reads
+    /// them straight from the `list_project_updates` server function. This
+    /// counter is the reactive dependency that tells it to ask again.
+    pub fn project_updates_version(&self) -> Signal<u32> {
+        let sig = self
+            .inner
+            .with_value(|inner| inner.project_updates_version.clone());
+        Signal::derive(move || sig.get())
+    }
+
+    /// Bump the project updates version counter.
+    ///
+    /// Called by the sync engine when a "project_update" entity type arrives via
+    /// WebSocket, signaling that the posted update list should refetch.
+    pub fn bump_project_updates_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.project_updates_version.update(|v| *v += 1);
         });
     }
 
@@ -558,6 +614,8 @@ impl SyncStore {
             inner.relations_version.set(0);
             inner.comments_version.set(0);
             inner.milestones_version.set(0);
+            inner.project_members_version.set(0);
+            inner.project_updates_version.set(0);
         });
     }
 }

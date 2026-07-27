@@ -530,7 +530,8 @@ fn sync_action_frame(
 mod tests {
     use super::*;
     use trakkt_types::models::{
-        Favorite, IssueWithDetails, Label, Project, ProjectMilestone, Status, Team, View,
+        Favorite, IssueWithDetails, Label, Project, ProjectMember, ProjectMilestone, ProjectUpdate,
+        Status, Team, View,
     };
     use trakkt_types::sync::{entity_types, SyncResponse};
 
@@ -1449,8 +1450,26 @@ mod tests {
         );
     }
 
+    // ─── Member and posted-update frames and payloads (TRA-9940) ─────────────
+    //
+    // Both used to be reported as an Update to the *parent project*, carrying a
+    // project row that neither operation changes — `add_project_member`,
+    // `remove_project_member` and `create_project_update` each write to exactly
+    // one satellite table and never touch `projects`. So the frame said
+    // "something about this project changed", the client re-upserted an
+    // identical project, and the membership or the posted update itself was
+    // never on the wire at all, live or on reconnect.
+
+    /// The sync entity id for a membership: `project_members` has a composite
+    /// primary key and no surrogate id, so the two columns are joined. Written
+    /// out here rather than shared with the service, so a change to the id
+    /// scheme has to be made deliberately in both places.
+    fn member_entity_id(project_id: &str, user_id: &str) -> String {
+        format!("{project_id}:{user_id}")
+    }
+
     #[tokio::test]
-    async fn project_member_add_frame_carries_the_parent_project() {
+    async fn project_member_add_frame_carries_the_new_member() {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
@@ -1468,19 +1487,34 @@ mod tests {
         .expect("add member");
 
         let action = next_sync_action(&mut conn).await;
-        assert!(matches!(action.action, SyncActionType::Update));
-        let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
+        assert!(
+            matches!(action.action, SyncActionType::Insert),
+            "adding a member creates a membership row, so the frame is an \
+             Insert of that row — not an Update of the parent project"
+        );
+        let data = payload_of(
+            &action,
+            entity_types::PROJECT_MEMBER,
+            &member_entity_id(&project.project_id, USER_B),
+        );
 
-        // `project_members` is not a synced entity type, so the change is
-        // reported as an update to the parent project and carries the project
-        // row — which the membership change itself does not alter.
-        let received: Project =
-            serde_json::from_value(data).expect("payload deserializes into a Project");
-        assert_eq!(received, project);
+        let received: ProjectMember =
+            serde_json::from_value(data).expect("payload deserializes into a ProjectMember");
+        assert_eq!(received.project_id, project.project_id);
+        assert_eq!(
+            received.user_id, USER_B,
+            "the frame has to name who was added — a project row cannot say that"
+        );
+        assert_eq!(received.role, "member");
+        assert!(
+            !received.created_at.is_empty(),
+            "the payload is built after the re-fetch, so the DB-assigned \
+             created_at has to be in it"
+        );
     }
 
     #[tokio::test]
-    async fn project_member_remove_frame_carries_the_parent_project() {
+    async fn project_member_remove_frame_is_a_member_delete() {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
@@ -1509,12 +1543,170 @@ mod tests {
         .expect("remove member");
 
         let action = next_sync_action(&mut conn).await;
-        assert!(matches!(action.action, SyncActionType::Update));
-        let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
+        assert!(
+            matches!(action.action, SyncActionType::Delete),
+            "removing a member deletes the membership row, so the frame is a \
+             Delete — not an Update of a project that did not change"
+        );
+        assert_eq!(action.entity_type, entity_types::PROJECT_MEMBER);
+        assert_eq!(
+            action.entity_id,
+            member_entity_id(&project.project_id, USER_B),
+            "the delete has to name the same key the add upserted, or the \
+             client's cache delete misses the row it is meant to remove"
+        );
+        assert!(
+            action.sync_id > 0,
+            "the frame must carry the sync_log id of its own row so a client \
+             that missed it can spot the gap, got {}",
+            action.sync_id
+        );
+        assert!(
+            action.data.is_none(),
+            "a delete has no row left to send: {action:?}"
+        );
+    }
 
-        let received: Project =
-            serde_json::from_value(data).expect("payload deserializes into a Project");
-        assert_eq!(received, project);
+    #[tokio::test]
+    async fn project_update_create_frame_carries_the_new_update() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+        let project = create_test_project(&db, Some(&manager)).await;
+        next_sync_action(&mut conn).await; // the create frame
+
+        let posted = crate::project_service::create_project_update(
+            &db,
+            &project.project_id,
+            USER_A,
+            "at_risk",
+            Some("Blocked on the vendor"),
+            Some(&manager),
+            WS,
+        )
+        .await
+        .expect("post a project update");
+
+        let action = next_sync_action(&mut conn).await;
+        assert!(
+            matches!(action.action, SyncActionType::Insert),
+            "posting an update creates a row, so the frame is an Insert of that \
+             row — not an Update of the parent project"
+        );
+        let data = payload_of(&action, entity_types::PROJECT_UPDATE, &posted.update_id);
+
+        let received: ProjectUpdate =
+            serde_json::from_value(data).expect("payload deserializes into a ProjectUpdate");
+        assert_eq!(
+            received, posted,
+            "the frame must carry the same row the caller got back"
+        );
+        assert_eq!(
+            received.health, "at_risk",
+            "the health the update was posted with has to be on the wire — the \
+             parent project row carries no health at all"
+        );
+        assert_eq!(received.body.as_deref(), Some("Blocked on the vendor"));
+        assert!(
+            !received.created_at.is_empty(),
+            "the payload is built after the re-fetch, so the DB-assigned \
+             created_at has to be in it"
+        );
+    }
+
+    /// The durable half for memberships and posted updates. Run with **no
+    /// `ws_manager`**, so the live frame cannot satisfy any of it: this is what
+    /// a client that was offline for the whole thing replays on reconnect.
+    ///
+    /// "Reaches a second session" and "survives a reconnect" are separate
+    /// criteria — the three tests above cover the first, this one covers the
+    /// second, and neither can stand in for the other.
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_member_and_posted_update_write() {
+        let db = two_user_workspace().await;
+
+        let project = create_test_project(&db, None).await;
+        crate::project_service::add_project_member(
+            &db,
+            &project.project_id,
+            USER_B,
+            "member",
+            WS,
+            None,
+        )
+        .await
+        .expect("add member");
+        let posted = crate::project_service::create_project_update(
+            &db,
+            &project.project_id,
+            USER_A,
+            "at_risk",
+            Some("Blocked on the vendor"),
+            None,
+            WS,
+        )
+        .await
+        .expect("post a project update");
+        // Removed last so the delete's stored row can be inspected alongside the
+        // add's — the reconnecting client replays both in order.
+        crate::project_service::remove_project_member(&db, &project.project_id, USER_B, WS, None)
+            .await
+            .expect("remove member");
+
+        let members: Vec<ProjectMember> =
+            delta_payloads(&db, USER_B, entity_types::PROJECT_MEMBER).await;
+        assert_eq!(members.len(), 1, "one membership add");
+        assert_eq!(members[0].project_id, project.project_id);
+        assert_eq!(
+            members[0].user_id, USER_B,
+            "the stored row has to name who was added, or a reconnecting client \
+             learns nothing it can act on"
+        );
+        assert_eq!(members[0].role, "member");
+        assert!(
+            !members[0].created_at.is_empty(),
+            "the payload is built from the re-fetch, so the DB-assigned \
+             created_at has to be in it"
+        );
+
+        let updates: Vec<ProjectUpdate> =
+            delta_payloads(&db, USER_B, entity_types::PROJECT_UPDATE).await;
+        assert_eq!(updates.len(), 1, "one posted update");
+        assert_eq!(updates[0], posted);
+        assert_eq!(
+            updates[0].health, "at_risk",
+            "a posted update has to survive a reconnect with its health intact"
+        );
+
+        // `delta_payloads` skips deletes, so the removal is checked directly:
+        // it must be a stored row of its own, not merely an absence.
+        let entries = get_entries_since(&db, WS, USER_B, 0, 10_000)
+            .await
+            .expect("B's delta");
+        let deletes: Vec<&SyncAction> = entries
+            .iter()
+            .filter(|e| {
+                e.entity_type == entity_types::PROJECT_MEMBER
+                    && matches!(e.action, SyncActionType::Delete)
+            })
+            .collect();
+        assert_eq!(
+            deletes.len(),
+            1,
+            "the removal has to be its own stored row, or a client that was \
+             offline for it still shows the member after reconnecting"
+        );
+        assert_eq!(
+            deletes[0].entity_id,
+            member_entity_id(&project.project_id, USER_B),
+            "the stored delete has to name the same key the stored add did"
+        );
+
+        assert!(
+            !entries.iter().any(|e| e.entity_type == entity_types::PROJECT
+                && matches!(e.action, SyncActionType::Update)),
+            "none of these three operations writes to the `projects` table, so \
+             none of them may claim the project changed: {entries:?}"
+        );
     }
 
     // ─── Milestone frames and payloads (TRA-9938) ────────────────────────────
@@ -1743,9 +1935,12 @@ mod tests {
 
         assert_eq!(statuses, 1, "one status create");
         assert_eq!(
-            projects, 4,
-            "one project create plus three updates: member add, member remove, \
-             and the posted project update"
+            projects, 1,
+            "just the project create. The member add, the member remove and the \
+             posted update each write to a satellite table and leave `projects` \
+             byte-identical, so since TRA-9940 they report themselves rather \
+             than claiming the parent project changed — see \
+             `delta_carries_a_payload_for_every_member_and_posted_update_write`"
         );
     }
     // ─── Delta payloads for the remaining services (TRA-9939) ────────────────

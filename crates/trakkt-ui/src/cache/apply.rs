@@ -173,6 +173,25 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                     // to apply the change without a round trip.
                     store.bump_milestones_version();
                 }
+                et if et == entity_types::PROJECT_MEMBER => {
+                    // Memberships are fetched on-demand by the project detail
+                    // page, straight from the `list_project_members` server
+                    // function. Bump the version counter so it refetches.
+                    //
+                    // As with milestones, `entity_data` is deliberately not read
+                    // here. The guard above returns on a data-less insert before
+                    // this match is reached, so the payload on the wire is what
+                    // lets this arm run at all — that is the whole bug. It is
+                    // also what a future cached member list would need on the
+                    // delta path to apply the change without a round trip.
+                    store.bump_project_members_version();
+                }
+                et if et == entity_types::PROJECT_UPDATE => {
+                    // Posted status updates are fetched on-demand by the project
+                    // detail page from `list_project_updates` — same on-demand
+                    // read path, same payload reasoning as the member arm above.
+                    store.bump_project_updates_version();
+                }
                 other => {
                     tracing::debug!(
                         entity_type = other,
@@ -207,6 +226,20 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                     // Same on-demand read path as insert/update: the milestone
                     // lists refetch from the server when this bumps.
                     store.bump_milestones_version();
+                }
+                et if et == entity_types::PROJECT_MEMBER => {
+                    // Removing a member is the one membership edit that arrives
+                    // as a Delete — there is no row left to send, so this
+                    // counter is the only thing that tells the project detail
+                    // page its member list is stale.
+                    store.bump_project_members_version();
+                }
+                et if et == entity_types::PROJECT_UPDATE => {
+                    // Same on-demand read path as the insert arm. No server path
+                    // deletes a posted update today; handling it here is what
+                    // stops one from arriving as silence if that changes, which
+                    // is the exact failure this ticket fixed for members.
+                    store.bump_project_updates_version();
                 }
                 other => {
                     tracing::debug!(
@@ -405,6 +438,20 @@ pub fn enqueue_cache_writes(writer: &IdbWriter, action: &SyncAction) {
                     // removed row outlives the milestone in the cache.
                     enqueue_delete(writer, entity_types::PROJECT_MILESTONE, entity_id);
                 }
+                et if et == entity_types::PROJECT_MEMBER => {
+                    // A membership add is persisted by the generic upsert above
+                    // (it carries a payload), so the remove has to be persisted
+                    // too or the removed member outlives the membership in the
+                    // cache. Both sides derive the same `project_id:user_id`
+                    // entity id, so this deletes exactly the row the add wrote.
+                    enqueue_delete(writer, entity_types::PROJECT_MEMBER, entity_id);
+                }
+                et if et == entity_types::PROJECT_UPDATE => {
+                    // Same pairing as above: posted updates are persisted by the
+                    // generic upsert, so a delete has to remove the row rather
+                    // than leave it behind.
+                    enqueue_delete(writer, entity_types::PROJECT_UPDATE, entity_id);
+                }
                 // Unhandled types are reported by the memory half.
                 _ => {}
             }
@@ -514,6 +561,21 @@ mod tests {
             action: kind,
             data,
             timestamp: "2026-07-26T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// Same as [`action`] but with a caller-chosen entity id, for the entity
+    /// types whose id is not a bare uuid — a membership is keyed
+    /// `project_id:user_id`, and the add and the remove have to agree on it.
+    fn action_with_id(
+        entity_type: &str,
+        entity_id: &str,
+        kind: SyncActionType,
+        data: Option<serde_json::Value>,
+    ) -> SyncAction {
+        SyncAction {
+            entity_id: entity_id.to_owned(),
+            ..action(entity_type, kind, data)
         }
     }
 
@@ -693,6 +755,128 @@ mod tests {
         });
     }
 
+    // ── Project members and posted updates (TRA-9940) ───────────────────────
+    //
+    // Neither was on the sync protocol at all: both were reported as an Update
+    // to the parent project, which a membership edit or a posted update leaves
+    // byte-identical. The project detail page reads both from server functions,
+    // so a version counter is the only thing that can tell it to ask again.
+
+    fn project_member_json() -> serde_json::Value {
+        serde_json::json!({
+            "project_id": "proj-1",
+            "user_id": "usr-bob",
+            "role": "member",
+            "created_at": "2026-07-26T00:00:00Z",
+        })
+    }
+
+    fn project_update_json() -> serde_json::Value {
+        serde_json::json!({
+            "update_id": "upd-1",
+            "project_id": "proj-1",
+            "user_id": "usr-alice",
+            "health": "at_risk",
+            "body": "Blocked on the vendor",
+            "created_at": "2026-07-26T00:00:00Z",
+        })
+    }
+
+    #[test]
+    fn a_project_member_action_bumps_only_the_project_members_version() {
+        with_store(|store| {
+            apply_action_to_memory(
+                &store,
+                &action(
+                    entity_types::PROJECT_MEMBER,
+                    SyncActionType::Insert,
+                    Some(project_member_json()),
+                ),
+            );
+
+            assert_eq!(
+                store.project_members_version().get_untracked(),
+                1,
+                "the project detail page refetches `list_project_members` when \
+                 this bumps — without it a member added elsewhere never appears"
+            );
+            assert_eq!(store.project_updates_version().get_untracked(), 0);
+            assert_eq!(store.milestones_version().get_untracked(), 0);
+            assert_eq!(store.comments_version().get_untracked(), 0);
+            assert_eq!(store.activities_version().get_untracked(), 0);
+            assert_eq!(store.relations_version().get_untracked(), 0);
+            // A membership payload carries a `project_id`. It must not be
+            // mistaken for the project itself — that misrouting is the shape of
+            // the bug this replaced.
+            assert!(store.projects().get_untracked().is_empty());
+            assert!(store.issues().get_untracked().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_project_update_action_bumps_only_the_project_updates_version() {
+        with_store(|store| {
+            apply_action_to_memory(
+                &store,
+                &action(
+                    entity_types::PROJECT_UPDATE,
+                    SyncActionType::Insert,
+                    Some(project_update_json()),
+                ),
+            );
+
+            assert_eq!(
+                store.project_updates_version().get_untracked(),
+                1,
+                "the project detail page refetches `list_project_updates` when \
+                 this bumps — without it an update posted elsewhere never appears"
+            );
+            assert_eq!(store.project_members_version().get_untracked(), 0);
+            assert_eq!(store.milestones_version().get_untracked(), 0);
+            assert_eq!(store.comments_version().get_untracked(), 0);
+            assert_eq!(store.activities_version().get_untracked(), 0);
+            assert_eq!(store.relations_version().get_untracked(), 0);
+            assert!(store.projects().get_untracked().is_empty());
+            assert!(store.issues().get_untracked().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_project_member_action_without_a_payload_reaches_nothing() {
+        with_store(|store| {
+            apply_action_to_memory(
+                &store,
+                &action(entity_types::PROJECT_MEMBER, SyncActionType::Insert, None),
+            );
+
+            assert_eq!(
+                store.project_members_version().get_untracked(),
+                0,
+                "the data-less guard returns before the entity match, so a \
+                 payload-less member insert never reaches its arm at all — this \
+                 is why the server has to send one"
+            );
+        });
+    }
+
+    #[test]
+    fn a_project_update_action_without_a_payload_reaches_nothing() {
+        with_store(|store| {
+            apply_action_to_memory(
+                &store,
+                &action(entity_types::PROJECT_UPDATE, SyncActionType::Insert, None),
+            );
+
+            assert_eq!(
+                store.project_updates_version().get_untracked(),
+                0,
+                "the data-less guard returns before the entity match, so a \
+                 payload-less posted-update insert never reaches its arm at all \
+                 — this is why the server has to send one"
+            );
+        });
+    }
+
     #[test]
     fn version_counters_also_bump_on_delete() {
         with_store(|store| {
@@ -701,6 +885,8 @@ mod tests {
                 entity_types::ACTIVITY,
                 entity_types::ISSUE_RELATION,
                 entity_types::PROJECT_MILESTONE,
+                entity_types::PROJECT_MEMBER,
+                entity_types::PROJECT_UPDATE,
             ] {
                 apply_action_to_memory(
                     &store,
@@ -716,6 +902,19 @@ mod tests {
                 1,
                 "a deleted milestone has to disappear from the lists too — a \
                  delete carries no payload, so the counter is all there is"
+            );
+            assert_eq!(
+                store.project_members_version().get_untracked(),
+                1,
+                "removing a member is the *only* way a membership edit arrives \
+                 as a Delete, and it carries no payload — this counter is the \
+                 whole signal that the member list went stale"
+            );
+            assert_eq!(
+                store.project_updates_version().get_untracked(),
+                1,
+                "no server path deletes a posted update today; handling it here \
+                 is what keeps one from arriving as silence if that changes"
             );
         });
     }
@@ -814,6 +1013,59 @@ mod tests {
                 "{entity_type} has no cached rows to delete"
             );
         }
+    }
+
+    #[test]
+    fn a_member_add_and_remove_use_the_same_cache_key() {
+        // The server derives `project_id:user_id` for both the Insert and the
+        // Delete. If the two ever disagreed the remove would delete nothing and
+        // the departed member's row would outlive the membership.
+        let key = "proj-1:usr-bob";
+
+        let upserts = cache_ops(&action_with_id(
+            entity_types::PROJECT_MEMBER,
+            key,
+            SyncActionType::Insert,
+            Some(project_member_json()),
+        ));
+        assert_eq!(upserts.len(), 1, "expected one member record, got {upserts:?}");
+        assert!(
+            upserts[0].starts_with("upsert:project_member:proj-1:usr-bob:"),
+            "got {:?}",
+            upserts[0]
+        );
+        assert!(
+            upserts[0].contains("\"user_id\":\"usr-bob\""),
+            "the persisted row is the payload the server sent: {:?}",
+            upserts[0]
+        );
+
+        assert_eq!(
+            cache_ops(&action_with_id(
+                entity_types::PROJECT_MEMBER,
+                key,
+                SyncActionType::Delete,
+                None
+            )),
+            vec!["delete:project_member:proj-1:usr-bob"],
+            "member adds are persisted by the generic upsert, so the remove has \
+             to be persisted too — against the very same key"
+        );
+    }
+
+    #[test]
+    fn a_project_update_delete_queues_the_cache_delete() {
+        assert_eq!(
+            cache_ops(&action_with_id(
+                entity_types::PROJECT_UPDATE,
+                "upd-1",
+                SyncActionType::Delete,
+                None
+            )),
+            vec!["delete:project_update:upd-1"],
+            "posted updates are persisted by the generic upsert, so a delete \
+             has to remove the row rather than leave it behind"
+        );
     }
 
     #[test]
