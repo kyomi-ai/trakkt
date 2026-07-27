@@ -11,11 +11,13 @@ use trakkt_core::enums::TransferStatus;
 use trakkt_core::models::{
     OwnershipTransfer, Workspace, WorkspaceInvitation, WorkspaceUser,
 };
+use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use serde::{Deserialize, Serialize};
 
 use crate::sync_log_service;
+use crate::websocket::WebSocketManager;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 /// Get all active workspace user memberships for a workspace.
@@ -94,31 +96,95 @@ struct WorkspaceSnapshotRow {
     updated_at: String,
 }
 
-/// Snapshot for the `sync_log` entry that accompanies a workspace write.
+/// The `SELECT` behind both snapshot readers below.
 ///
-/// Deliberately best-effort, unlike the bootstrap caller. The write this
-/// follows has already committed, so a failure here cannot be surfaced as "the
-/// update failed" without lying about what is in the database; the entry is
-/// written without a payload instead, which clients skip
-/// (`trakkt_ui::cache::apply` logs and ignores a dataless upsert) and the next
-/// bootstrap repairs. That is the same best-effort contract the
-/// `write_sync_entry` calls below already have — the difference from the
-/// bootstrap path is that there, degrading the payload also certifies it.
-async fn fetch_workspace_settings_snapshot(
-    pool: &DbPool,
-    workspace_id: &str,
-) -> Option<serde_json::Value> {
-    match get_workspace_settings_for_sync(pool, workspace_id).await {
-        Ok(snapshot) => snapshot,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                workspace_id = %workspace_id,
-                "Failed to read workspace settings snapshot -- writing the sync entry without one"
-            );
-            None
-        }
+/// One reads it on the pool for the bootstrap, the other on an open transaction
+/// for the `sync_log` payload. Same columns and the same JSONB-to-TEXT casts —
+/// only the executor differs, so the two cannot drift into reporting different
+/// shapes for the same entity.
+const WORKSPACE_SNAPSHOT_SQL: &str = r#"SELECT workspace_id,
+          name,
+          CAST(settings AS TEXT) AS settings,
+          CAST(updated_at AS TEXT) AS updated_at
+   FROM workspaces WHERE workspace_id = $1"#;
+
+impl WorkspaceSnapshotRow {
+    /// The `workspace_settings` entity as the sync protocol carries it.
+    ///
+    /// `Err` only for a `settings` column that is not parseable JSON, which is
+    /// a corrupt row rather than an absent one.
+    fn into_sync_value(self) -> trakkt_core::Result<serde_json::Value> {
+        let settings_json: Option<serde_json::Value> = match self.settings.as_deref() {
+            Some(settings) => Some(serde_json::from_str(settings)?),
+            None => None,
+        };
+
+        Ok(serde_json::json!({
+            "workspace_id": self.workspace_id,
+            "name": self.name,
+            "settings": settings_json,
+            "updated_at": self.updated_at,
+        }))
     }
+}
+
+/// Read the snapshot for a `sync_log` payload **on the transaction that just
+/// wrote it**, so the payload is the post-update state.
+///
+/// Running this on the pool instead fails two different ways and neither is
+/// obvious. On SQLite the pool is pinned to one connection ([`DbPool::connect`])
+/// which the open transaction is holding, so the read waits forever on a
+/// connection only the commit can free. On Postgres it does not block at all —
+/// it reads the *pre-update* row from outside the transaction and persists that
+/// as the payload, so the entry describing a rename carries the old name and
+/// every client applies a no-op. The second failure is silent, which is why the
+/// executor is the transaction and not the pool.
+///
+/// # Why a failure here fails the whole update
+///
+/// This used to degrade to a `None` payload and let the update stand, on the
+/// reasoning that the update had already committed and so could not honestly be
+/// reported as failed. That reasoning is gone: the update has *not* committed
+/// when this runs, and returning `Err` rolls it back with the entry.
+///
+/// Degrading is now the dishonest option. A `None` payload is not a
+/// lower-fidelity entry — `cache/apply.rs` returns on a data-less upsert before
+/// it reaches the entity-type match, so clients drop the row outright. The
+/// entry would burn a `sync_id` and advance every client's watermark past a
+/// change it never delivered, leaving the stale name on screen until a full
+/// bootstrap. That is exactly the invisible-mutation failure this conversion
+/// exists to remove, and it would be reintroduced deliberately.
+///
+/// The remaining failure modes are all real faults, none of them "the workspace
+/// is fine, we just could not decorate the entry": the query erroring on a
+/// connection the commit needs anyway, or a `settings` column that will not
+/// parse — which for `update_workspace_settings` means the value it serialized
+/// itself moments ago does not round-trip. Failing loudly lets the caller retry
+/// against a database that never diverged from its clients.
+async fn workspace_settings_snapshot_in_tx(
+    tx: &mut DbTx,
+    workspace_id: &str,
+) -> trakkt_core::Result<serde_json::Value> {
+    let row = trakkt_core::tx_fetch_optional!(
+        &mut *tx,
+        WorkspaceSnapshotRow,
+        WORKSPACE_SNAPSHOT_SQL,
+        workspace_id
+    )?;
+
+    // Unreachable: callers only get here after their own UPDATE reported
+    // `rows_affected() > 0` on this same transaction, so the row is there and
+    // visible. Stated as an error rather than left to flow on, because the value
+    // an absent row would produce is the `None` payload the doc comment above
+    // rejects.
+    let Some(row) = row else {
+        return Err(trakkt_core::Error::Internal(format!(
+            "workspace {workspace_id} disappeared between its own UPDATE and the \
+             snapshot read on the same transaction"
+        )));
+    };
+
+    row.into_sync_value()
 }
 
 /// Return a workspace settings snapshot (name, settings, updated_at) as a
@@ -140,63 +206,56 @@ pub async fn get_workspace_settings_for_sync(
     let row = trakkt_core::db_fetch_optional!(
         pool,
         WorkspaceSnapshotRow,
-        r#"SELECT workspace_id,
-                  name,
-                  CAST(settings AS TEXT) AS settings,
-                  CAST(updated_at AS TEXT) AS updated_at
-           FROM workspaces WHERE workspace_id = $1"#,
+        WORKSPACE_SNAPSHOT_SQL,
         workspace_id
     )?;
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
-    let settings_json: Option<serde_json::Value> = match row.settings.as_deref() {
-        Some(settings) => Some(serde_json::from_str(settings)?),
-        None => None,
-    };
-
-    Ok(Some(serde_json::json!({
-        "workspace_id": row.workspace_id,
-        "name": row.name,
-        "settings": settings_json,
-        "updated_at": row.updated_at,
-    })))
+    row.map(WorkspaceSnapshotRow::into_sync_value).transpose()
 }
 
 /// Update workspace display name.
+///
+/// The UPDATE and its `sync_log` entry are one transaction: a rename that
+/// commits without its sync row leaves the old name on every other client, and
+/// no later delta reports it — the row a delta would re-read already carries the
+/// new name, so nothing marks it as changed.
 pub async fn update_workspace_name(
     pool: &DbPool,
     workspace_id: &str,
     name: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<bool> {
     let is_pg = pool.is_postgres();
     let now_expr = sql_compat::now(is_pg);
     let sql = format!(
         "UPDATE workspaces SET name = $1, updated_at = {now_expr} WHERE workspace_id = $2"
     );
-    let result = trakkt_core::db_execute!(pool, &sql, name, workspace_id)?;
 
-    // Sync log — best-effort: log a warning and continue on failure.
-    if result.rows_affected() > 0 {
-        let snapshot = fetch_workspace_settings_snapshot(pool, workspace_id).await;
-        if let Err(e) = sync_log_service::write_sync_entry(
-            pool,
-            entity_types::WORKSPACE_SETTINGS,
-            workspace_id,
-            workspace_id,
-            None,
-            SyncActionType::Update,
-            snapshot,
-        )
-        .await
-        {
-            tracing::warn!(error = %e, workspace_id = %workspace_id, "Failed to write sync log entry");
-        }
+    let mut tx = pool.begin().await?;
+    let result = trakkt_core::tx_execute!(&mut tx, &sql, name, workspace_id)?;
+
+    if result.rows_affected() == 0 {
+        // `tx` is dropped here, which rolls it back (see `DbTx`).
+        return Ok(false);
     }
 
-    Ok(result.rows_affected() > 0)
+    // Read back on the transaction, not the pool: the new name is not visible
+    // outside this transaction yet (see `workspace_settings_snapshot_in_tx`).
+    let snapshot = workspace_settings_snapshot_in_tx(&mut tx, workspace_id).await?;
+
+    sync_log_service::commit_and_deliver(
+        tx,
+        entity_types::WORKSPACE_SETTINGS,
+        workspace_id,
+        workspace_id,
+        sync_log_service::SyncAudience::Workspace,
+        SyncActionType::Update,
+        Some(snapshot),
+        ws_manager,
+    )
+    .await?;
+
+    Ok(true)
 }
 
 /// Update workspace settings JSON (full replace).
@@ -207,10 +266,15 @@ pub async fn update_workspace_name(
 /// expression is of type text`). We keep the bind as text (sqlx serializes
 /// `String` to TEXT on both backends) and perform the cast in SQL on
 /// Postgres. SQLite stores JSON in TEXT columns, so no cast is needed.
+///
+/// The UPDATE and its `sync_log` entry are one transaction, for the same reason
+/// as [`update_workspace_name`]: settings that commit without their sync row are
+/// invisible to every future delta.
 pub async fn update_workspace_settings(
     pool: &DbPool,
     workspace_id: &str,
     settings: &serde_json::Value,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<bool> {
     let is_pg = pool.is_postgres();
     let now = sql_compat::now(is_pg);
@@ -225,27 +289,32 @@ pub async fn update_workspace_settings(
             "UPDATE workspaces SET settings = $1, updated_at = {now} WHERE workspace_id = $2"
         )
     };
-    let result = trakkt_core::db_execute!(pool, &sql, &settings_str, workspace_id)?;
+    let mut tx = pool.begin().await?;
+    let result = trakkt_core::tx_execute!(&mut tx, &sql, &settings_str, workspace_id)?;
 
-    // Sync log — best-effort: log a warning and continue on failure.
-    if result.rows_affected() > 0 {
-        let snapshot = fetch_workspace_settings_snapshot(pool, workspace_id).await;
-        if let Err(e) = sync_log_service::write_sync_entry(
-            pool,
-            entity_types::WORKSPACE_SETTINGS,
-            workspace_id,
-            workspace_id,
-            None,
-            SyncActionType::Update,
-            snapshot,
-        )
-        .await
-        {
-            tracing::warn!(error = %e, workspace_id = %workspace_id, "Failed to write sync log entry");
-        }
+    if result.rows_affected() == 0 {
+        // `tx` is dropped here, which rolls it back (see `DbTx`).
+        return Ok(false);
     }
 
-    Ok(result.rows_affected() > 0)
+    // Read back on the transaction, not the pool: the new settings are not
+    // visible outside this transaction yet (see
+    // `workspace_settings_snapshot_in_tx`).
+    let snapshot = workspace_settings_snapshot_in_tx(&mut tx, workspace_id).await?;
+
+    sync_log_service::commit_and_deliver(
+        tx,
+        entity_types::WORKSPACE_SETTINGS,
+        workspace_id,
+        workspace_id,
+        sync_log_service::SyncAudience::Workspace,
+        SyncActionType::Update,
+        Some(snapshot),
+        ws_manager,
+    )
+    .await?;
+
+    Ok(true)
 }
 
 /// Set the workspace-level default team.
@@ -701,6 +770,15 @@ pub async fn update_transfer_status(
 /// 1. Update workspace owner_user_id
 /// 2. Ensure new owner has workspace_admin role
 /// 3. Mark transfer as accepted with completed_at
+///
+/// All three or none. A workspace whose owner moved while the transfer stayed
+/// `pending` can be accepted a second time; a new owner without the
+/// `workspace_admin` role owns a workspace they cannot administer.
+///
+/// Runs on [`DbTx`] rather than a hand-written `match` over both pool variants.
+/// The two arms it replaced held the same three statements written out twice,
+/// so every edit had to be made in both places to stay correct, and only one of
+/// them was ever exercised by a given test run.
 pub async fn complete_ownership_transfer(
     pool: &DbPool,
     transfer_id: &str,
@@ -724,34 +802,11 @@ pub async fn complete_ownership_transfer(
          WHERE transfer_id = $1"
     );
 
-    match pool {
-        trakkt_core::db::DbPool::Postgres(pg) => {
-            let mut tx = pg.begin().await?;
-            sqlx::query(&update_owner_sql)
-                .bind(new_owner_id).bind(workspace_id)
-                .execute(&mut *tx).await?;
-            sqlx::query(&update_role_sql)
-                .bind(workspace_id).bind(new_owner_id)
-                .execute(&mut *tx).await?;
-            sqlx::query(&update_transfer_sql)
-                .bind(transfer_id)
-                .execute(&mut *tx).await?;
-            tx.commit().await?;
-        }
-        trakkt_core::db::DbPool::Sqlite(sq) => {
-            let mut tx = sq.begin().await?;
-            sqlx::query(&update_owner_sql)
-                .bind(new_owner_id).bind(workspace_id)
-                .execute(&mut *tx).await?;
-            sqlx::query(&update_role_sql)
-                .bind(workspace_id).bind(new_owner_id)
-                .execute(&mut *tx).await?;
-            sqlx::query(&update_transfer_sql)
-                .bind(transfer_id)
-                .execute(&mut *tx).await?;
-            tx.commit().await?;
-        }
-    }
+    let mut tx = pool.begin().await?;
+    trakkt_core::tx_execute!(&mut tx, &update_owner_sql, new_owner_id, workspace_id)?;
+    trakkt_core::tx_execute!(&mut tx, &update_role_sql, workspace_id, new_owner_id)?;
+    trakkt_core::tx_execute!(&mut tx, &update_transfer_sql, transfer_id)?;
+    tx.commit().await?;
 
     Ok(true)
 }

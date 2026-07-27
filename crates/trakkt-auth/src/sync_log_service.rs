@@ -6728,4 +6728,370 @@ mod tests {
              there is no row left to send"
         );
     }
+
+    // ─── Workspace settings and ownership transfer (TRA-9953) ────────────────
+    //
+    // Entry count per function, established before the triggers were chosen:
+    //
+    // - `update_workspace_name`      1 entry (WORKSPACE_SETTINGS / update)
+    // - `update_workspace_settings`  1 entry (WORKSPACE_SETTINGS / update)
+    // - `complete_ownership_transfer` 0 entries
+    //
+    // The first two are single-entry, so the blanket [`reject_sync_log_inserts`]
+    // trigger lands on the write under test and not on an earlier one that would
+    // shadow it. The narrowed helpers are for multi-entry writers and are not
+    // needed here.
+    //
+    // `complete_ownership_transfer` writes no sync entry at all, so no trigger on
+    // `sync_log` can reach it. Its rollback test aborts the third of its three
+    // statements instead — see
+    // `ownership_transfer_rolls_back_the_first_two_statements_when_the_third_fails`.
+
+    const TRANSFER: &str = "xfer_vis";
+
+    /// Every workspace row as `(workspace_id, name, settings, owner_user_id)`.
+    async fn workspaces(db: &DbPool) -> Vec<(String, Option<String>, Option<String>, String)> {
+        #[derive(sqlx::FromRow)]
+        struct WorkspaceFootprintRow {
+            workspace_id: String,
+            name: Option<String>,
+            settings: Option<String>,
+            owner_user_id: String,
+        }
+
+        let rows: Vec<WorkspaceFootprintRow> = db_fetch_all!(
+            db,
+            WorkspaceFootprintRow,
+            "SELECT workspace_id, name, CAST(settings AS TEXT) AS settings, owner_user_id \
+             FROM workspaces ORDER BY workspace_id"
+        )
+        .expect("read workspaces back");
+
+        rows.into_iter()
+            .map(|r| (r.workspace_id, r.name, r.settings, r.owner_user_id))
+            .collect()
+    }
+
+    /// Every workspace membership as `(user_id, role)`, in a stable order.
+    async fn memberships(db: &DbPool) -> Vec<(String, String)> {
+        #[derive(sqlx::FromRow)]
+        struct MembershipRow {
+            user_id: String,
+            role: String,
+        }
+
+        let rows: Vec<MembershipRow> = db_fetch_all!(
+            db,
+            MembershipRow,
+            "SELECT user_id, role FROM workspace_users ORDER BY user_id"
+        )
+        .expect("read memberships back");
+
+        rows.into_iter().map(|r| (r.user_id, r.role)).collect()
+    }
+
+    /// Every ownership transfer as `(transfer_id, status, completed_at)`.
+    async fn transfers(db: &DbPool) -> Vec<(String, String, Option<String>)> {
+        #[derive(sqlx::FromRow)]
+        struct TransferRow {
+            transfer_id: String,
+            status: String,
+            completed_at: Option<String>,
+        }
+
+        let rows: Vec<TransferRow> = db_fetch_all!(
+            db,
+            TransferRow,
+            "SELECT transfer_id, status, CAST(completed_at AS TEXT) AS completed_at \
+             FROM ownership_transfers ORDER BY transfer_id"
+        )
+        .expect("read transfers back");
+
+        rows.into_iter()
+            .map(|r| (r.transfer_id, r.status, r.completed_at))
+            .collect()
+    }
+
+    /// Give the fixture workspace a name, so a rename has an old value to be
+    /// rolled back to rather than rolling back to NULL.
+    async fn name_the_workspace(db: &DbPool, name: &str) {
+        db_execute!(
+            db,
+            "UPDATE workspaces SET name = $1 WHERE workspace_id = $2",
+            name,
+            WS
+        )
+        .expect("name the fixture workspace");
+    }
+
+    /// A pending transfer of the fixture workspace from A to B.
+    async fn pending_transfer(db: &DbPool) {
+        db_execute!(
+            db,
+            "INSERT INTO ownership_transfers \
+                (transfer_id, workspace_id, from_user_id, to_user_id, status, expires_at) \
+             VALUES ($1, $2, $3, $4, 'pending', $5)",
+            TRANSFER,
+            WS,
+            USER_A,
+            USER_B,
+            "2099-01-01T00:00:00Z"
+        )
+        .expect("insert pending ownership transfer");
+    }
+
+    #[tokio::test]
+    async fn workspace_rename_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        name_the_workspace(&db, "Old Name").await;
+
+        let before = workspaces(&db).await;
+        assert_eq!(
+            before,
+            vec![(WS.to_string(), Some("Old Name".to_string()), None, USER_A.to_string())],
+            "precondition: the workspace carries the name the rename will try to \
+             replace"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::workspace_service::update_workspace_name(&db, WS, "New Name", None)
+            .await
+            .expect_err("a rename whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            workspaces(&db).await,
+            before,
+            "a rename with no sync_log row leaves the old name on every other \
+             client and no later delta reports it — the row a delta re-reads \
+             already holds the new name, so nothing marks it changed — which is \
+             why the rename must not survive"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            Vec::new(),
+            "and nothing may be left in sync_log either"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_settings_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        crate::workspace_service::update_workspace_settings(
+            &db,
+            WS,
+            &serde_json::json!({ "default_auto_archive_days": 30 }),
+            None,
+        )
+        .await
+        .expect("seed the settings the failed write will try to replace");
+
+        let before = workspaces(&db).await;
+        let entries_before = sync_entries(&db).await;
+        assert_eq!(
+            entries_before.len(),
+            1,
+            "precondition: the seeding write is one entry, so the count below \
+             distinguishes it from the write under test"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::workspace_service::update_workspace_settings(
+            &db,
+            WS,
+            &serde_json::json!({ "default_auto_archive_days": 90 }),
+            None,
+        )
+        .await
+        .expect_err("a settings write whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            workspaces(&db).await,
+            before,
+            "settings that commit without their sync row are invisible to every \
+             future delta, so the 90 must be rolled back to the 30"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            entries_before,
+            "the seeding write's entry stays; the failed write's must not be \
+             there at all"
+        );
+    }
+
+    /// The persisted payload must be the state *after* the update, not before.
+    ///
+    /// This is the assertion that pins the snapshot read to the transaction. Read
+    /// on the pool instead and it fails two ways, neither of them an error
+    /// return: on Postgres the read sits outside the transaction and returns the
+    /// pre-update row, so the entry describing the rename carries the old name
+    /// and every client applies a no-op; on SQLite the pool is pinned to one
+    /// connection the transaction is holding, so it blocks until the test times
+    /// out. Read on the transaction but *before* the UPDATE and it is the stale
+    /// value again on both backends.
+    ///
+    /// A stale payload is silent in a way a missing one is not — the entry exists,
+    /// carries data, deserializes, and advances the client's watermark past a
+    /// change it never delivered. Only comparing the payload against the new
+    /// value catches it, which is what this does.
+    #[tokio::test]
+    async fn workspace_sync_entry_carries_the_post_update_state() {
+        let db = two_user_workspace().await;
+        name_the_workspace(&db, "Old Name").await;
+
+        crate::workspace_service::update_workspace_name(&db, WS, "New Name", None)
+            .await
+            .expect("rename the workspace");
+        crate::workspace_service::update_workspace_settings(
+            &db,
+            WS,
+            &serde_json::json!({ "default_auto_archive_days": 90 }),
+            None,
+        )
+        .await
+        .expect("update the workspace settings");
+
+        let payloads: Vec<serde_json::Value> =
+            delta_payloads(&db, USER_A, entity_types::WORKSPACE_SETTINGS).await;
+
+        assert_eq!(payloads.len(), 2, "one entry per write");
+
+        assert_eq!(
+            payloads[0].get("name"),
+            Some(&serde_json::json!("New Name")),
+            "the rename's entry must carry the name the rename set, which is the \
+             whole change being reported; the pre-update value here is a payload \
+             that tells every client nothing changed"
+        );
+
+        assert_eq!(
+            payloads[1].get("settings"),
+            Some(&serde_json::json!({ "default_auto_archive_days": 90 })),
+            "the settings write's entry must carry the settings it wrote"
+        );
+        assert_eq!(
+            payloads[1].get("name"),
+            Some(&serde_json::json!("New Name")),
+            "and the rest of the snapshot stays at its committed value"
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_transfer_commits_its_three_statements_together() {
+        let db = two_user_workspace().await;
+        pending_transfer(&db).await;
+
+        assert_eq!(
+            memberships(&db).await,
+            vec![
+                (USER_A.to_string(), "workspace_user".to_string()),
+                (USER_B.to_string(), "workspace_user".to_string()),
+            ],
+            "precondition: B is an ordinary member, so the admin role below comes \
+             from the transfer"
+        );
+
+        let completed =
+            crate::workspace_service::complete_ownership_transfer(&db, TRANSFER, WS, USER_B)
+                .await
+                .expect("complete the transfer");
+        assert!(completed);
+
+        assert_eq!(
+            workspaces(&db).await,
+            vec![(WS.to_string(), None, None, USER_B.to_string())],
+            "statement 1: the workspace owner moves to B"
+        );
+        assert_eq!(
+            memberships(&db).await,
+            vec![
+                (USER_A.to_string(), "workspace_user".to_string()),
+                (USER_B.to_string(), "workspace_admin".to_string()),
+            ],
+            "statement 2: an owner who cannot administer their own workspace is \
+             the half-state this transaction exists to prevent"
+        );
+
+        let transfers = transfers(&db).await;
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].0, TRANSFER);
+        assert_eq!(
+            transfers[0].1, "accepted",
+            "statement 3: a transfer left pending after its owner moved can be \
+             accepted a second time"
+        );
+        assert!(
+            transfers[0].2.is_some(),
+            "and completed_at is stamped with it"
+        );
+    }
+
+    /// Abort the third statement and prove the first two unwind behind it.
+    ///
+    /// `complete_ownership_transfer` writes no `sync_log` entry, so none of the
+    /// sync_log triggers can reach it. The equivalent injection is a trigger on
+    /// the table its *last* statement writes: same real schema object, same
+    /// `RAISE(ABORT)`, and it fails at the point where the owner change and the
+    /// role grant have already been accepted by the database.
+    async fn reject_transfer_status_updates(db: &DbPool) {
+        db_execute!(
+            db,
+            "CREATE TRIGGER reject_transfer_update BEFORE UPDATE ON ownership_transfers \
+             BEGIN SELECT RAISE(ABORT, 'ownership_transfer update rejected'); END"
+        )
+        .expect("install ownership_transfers rejection trigger");
+    }
+
+    #[tokio::test]
+    async fn ownership_transfer_rolls_back_the_first_two_statements_when_the_third_fails() {
+        let db = two_user_workspace().await;
+        pending_transfer(&db).await;
+
+        let workspaces_before = workspaces(&db).await;
+        let memberships_before = memberships(&db).await;
+        let transfers_before = transfers(&db).await;
+
+        reject_transfer_status_updates(&db).await;
+
+        let err = crate::workspace_service::complete_ownership_transfer(&db, TRANSFER, WS, USER_B)
+            .await
+            .expect_err("a transfer whose final statement is rejected must fail");
+
+        assert!(
+            err.to_string().contains("ownership_transfer update rejected"),
+            "the caller must see the failure; got: {err}"
+        );
+
+        assert_eq!(
+            workspaces(&db).await,
+            workspaces_before,
+            "the owner change must unwind: an owner move recorded against a \
+             transfer still marked pending can be replayed by accepting it again"
+        );
+        assert_eq!(
+            memberships(&db).await,
+            memberships_before,
+            "and so must the role grant, which would otherwise leave B with \
+             workspace_admin on a workspace they were never given"
+        );
+        assert_eq!(
+            transfers(&db).await,
+            transfers_before,
+            "the transfer itself is untouched, so it is still pending and still \
+             completable"
+        );
+    }
 }
