@@ -6,6 +6,7 @@
 //! Projects are workspace-scoped containers that group issues towards a common
 //! goal. Each project can have members, milestones, and periodic health updates.
 
+use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use trakkt_types::models::{Project, ProjectMember, ProjectMilestone, ProjectProgress, ProjectUpdate};
@@ -273,6 +274,59 @@ fn project_member_entity_id(project_id: &str, user_id: &str) -> String {
     format!("{project_id}:{user_id}")
 }
 
+/// Finish a mutation whose statements have already run on `tx`: log the change,
+/// commit, then broadcast.
+///
+/// Every mutation in this module ends this way, and the ordering is the part
+/// that has to be right every time — the `sync_log` entry inside the
+/// transaction so the change and the row that replays it commit together, the
+/// broadcast strictly after the commit so it carries a `sync_id` that exists and
+/// so it never runs while the transaction holds the SQLite connection (see
+/// [`DbTx`]).
+///
+/// Takes the transaction by value: committing it is part of the job, and no
+/// caller has anything left to do on it. Anything the entry's payload needs read
+/// back from the database is read by the caller *on this transaction* before
+/// handing it over — the new state is not visible on the pool until the commit,
+/// and on SQLite the pool is not reachable at all while the transaction is open.
+async fn commit_and_broadcast(
+    mut tx: DbTx,
+    entity_type: &str,
+    entity_id: &str,
+    workspace_id: &str,
+    action: SyncActionType,
+    payload: Option<serde_json::Value>,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    let sync_id = sync_log_service::write_sync_entry_in_tx(
+        &mut tx,
+        entity_type,
+        entity_id,
+        workspace_id,
+        None,
+        action.clone(),
+        payload.clone(),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_type,
+            entity_id,
+            action,
+            payload,
+            sync_id,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
 /// Parameters for creating a new project.
 pub struct CreateProjectParams<'a> {
     pub workspace_id: &'a str,
@@ -286,6 +340,10 @@ pub struct CreateProjectParams<'a> {
 }
 
 /// Create a new project in a workspace.
+///
+/// The INSERT and its `sync_log` entry are one transaction: a project that
+/// commits without its sync row is invisible to every future delta, so a failed
+/// log write rolls the project back rather than leaving it stranded.
 pub async fn create_project(
     db: &DbPool,
     params: &CreateProjectParams<'_>,
@@ -304,8 +362,10 @@ pub async fn create_project(
              created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, 'planned', $7, {sd}, {td}, 0, {now}, {now})"
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &project_id,
         params.workspace_id,
@@ -320,10 +380,11 @@ pub async fn create_project(
 
     // Re-fetch to get DB-assigned timestamps. This has to happen before the sync
     // log write: both the stored entry and the live frame carry the full
-    // project, and the client cannot apply either without it.
+    // project, and the client cannot apply either without it. The row does not
+    // exist outside the transaction yet, so the read runs on it.
     let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1");
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    let row: ProjectRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         ProjectRow,
         &sql,
         &project_id
@@ -331,35 +392,16 @@ pub async fn create_project(
     let project = row.into_dto();
     let payload = sync_payload(&project, entity_types::PROJECT, &project.project_id);
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    commit_and_broadcast(
+        tx,
         entity_types::PROJECT,
         &project_id,
         params.workspace_id,
-        None,
         SyncActionType::Insert,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for project create");
-        0
-    });
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            params.workspace_id,
-            entity_types::PROJECT,
-            &project_id,
-            SyncActionType::Insert,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(project)
 }
@@ -388,6 +430,9 @@ pub struct UpdateProjectParams<'a> {
 /// Update a project.
 ///
 /// Only fields that are `Some` are changed. `updated_at` is always set.
+///
+/// The UPDATE and its `sync_log` entry are one transaction — see
+/// [`create_project`].
 pub async fn update_project(
     db: &DbPool,
     params: &UpdateProjectParams<'_>,
@@ -449,7 +494,9 @@ pub async fn update_project(
         "UPDATE projects SET {set_clause} WHERE project_id = ${pid_idx}"
     );
 
-    let affected: u64 = trakkt_core::db_with_pool!(db, |p| {
+    let mut tx = db.begin().await?;
+
+    let affected: u64 = trakkt_core::tx_with!(&mut tx, |e| {
         let mut query = sqlx::query(&sql);
 
         if let Some(v) = params.name {
@@ -482,19 +529,21 @@ pub async fn update_project(
 
         query = query.bind(params.project_id);
 
-        query.execute(p).await.map(|r| r.rows_affected())
+        query.execute(e).await.map(|r| r.rows_affected())
     })?;
 
     if affected == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "project {} not found", params.project_id
         )));
     }
 
-    // Re-fetch the updated project.
+    // Re-fetch the updated project. The new state is only visible on the
+    // transaction, so the read runs on it.
     let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1");
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    let row: ProjectRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         ProjectRow,
         &sql,
         params.project_id
@@ -502,35 +551,16 @@ pub async fn update_project(
     let project = row.into_dto();
     let payload = sync_payload(&project, entity_types::PROJECT, &project.project_id);
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    commit_and_broadcast(
+        tx,
         entity_types::PROJECT,
         params.project_id,
         &project.workspace_id,
-        None,
         SyncActionType::Update,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, project_id = %params.project_id, "Failed to write sync log entry for project update");
-        0
-    });
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            &project.workspace_id,
-            entity_types::PROJECT,
-            params.project_id,
-            SyncActionType::Update,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(project)
 }
@@ -539,12 +569,19 @@ pub async fn update_project(
 ///
 /// Cascading deletes remove associated members, milestones, and updates.
 /// Issues linked to this project will have `project_id` set to NULL (ON DELETE SET NULL).
+///
+/// The DELETE, everything the schema cascades from it, and the `sync_log` entry
+/// that reports it are one transaction. A delete that commits without its sync
+/// row leaves the project on every other client forever, and no later delta can
+/// repair it — the row it would have to re-read is gone.
 pub async fn delete_project(
     db: &DbPool,
     project_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    // Fetch workspace_id before delete for the sync log.
+    // Fetch workspace_id before delete for the sync log. This reads state that
+    // predates the transaction, so it stays on the pool ahead of it — once the
+    // transaction is open the pool is unreachable on SQLite (see `DbTx`).
     let sql = format!("{PROJECT_SELECT} WHERE p.project_id = $1");
     let row = trakkt_core::db_fetch_optional!(
         db,
@@ -557,43 +594,26 @@ pub async fn delete_project(
         trakkt_core::Error::NotFound(format!("project {project_id} not found"))
     })?;
 
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM projects WHERE project_id = $1",
         project_id
     )?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    // The sync entry follows the DELETE it describes — the same order as
+    // `issue_service::delete_issue` and `team_service::delete_team`.
+    commit_and_broadcast(
+        tx,
         entity_types::PROJECT,
         project_id,
         &project.workspace_id,
-        None,
         SyncActionType::Delete,
         None,
+        ws_manager,
     )
     .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, project_id = %project_id, "Failed to write sync log entry for project delete");
-        0
-    });
-
-    // WebSocket broadcast — delete has no entity data.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            &project.workspace_id,
-            entity_types::PROJECT,
-            project_id,
-            SyncActionType::Delete,
-            None,
-            sync_id,
-        )
-        .await;
-    }
-
-    Ok(())
 }
 
 // ─── Project Members ────────────────────────────────────────────────────────
@@ -615,6 +635,10 @@ pub async fn list_project_members(
 }
 
 /// Add a member to a project.
+///
+/// The INSERT and its `sync_log` entry are one transaction. `project_members` is
+/// not an entity type a delta re-reads, so a membership that commits without its
+/// sync row can never be repaired — it simply never reaches another client.
 pub async fn add_project_member(
     db: &DbPool,
     project_id: &str,
@@ -632,20 +656,26 @@ pub async fn add_project_member(
     // the INSERT below. Every caller also checks ownership one layer up; this is
     // the second layer, held where the mutation is rather than in caller
     // discipline.
+    // This is authorization, and it runs on the pool, so it stays ahead of the
+    // transaction on both counts (see `DbTx`).
     get_project_in_workspace(db, project_id, workspace_id).await?;
 
     let sql = format!(
         "INSERT INTO project_members (project_id, user_id, role, created_at) \
          VALUES ($1, $2, $3, {now})"
     );
-    trakkt_core::db_execute!(db, &sql, project_id, user_id, role)?;
+
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(&mut tx, &sql, project_id, user_id, role)?;
 
     // Re-read the row just written, for its DB-assigned timestamp. This has to
     // happen before the sync log write: both the stored entry and the live frame
-    // carry the full membership, and the client skips either without it.
+    // carry the full membership, and the client skips either without it. The row
+    // does not exist outside the transaction yet, so the read runs on it.
     let sql = format!("{PROJECT_MEMBER_SELECT} WHERE project_id = $1 AND user_id = $2");
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    let row: ProjectMemberRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         ProjectMemberRow,
         &sql,
         project_id,
@@ -655,46 +685,27 @@ pub async fn add_project_member(
     let entity_id = project_member_entity_id(project_id, user_id);
     let payload = sync_payload(&member, entity_types::PROJECT_MEMBER, &entity_id);
 
-    // Sync log — best-effort.
-    //
     // The membership is its own entity type rather than an update to the parent
     // project: the INSERT above is the only write this function makes, so the
     // `projects` row is byte-identical afterwards. Reporting it as a PROJECT
     // update would make every connected client re-upsert an unchanged project
     // and would still leave the membership itself invisible.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    commit_and_broadcast(
+        tx,
         entity_types::PROJECT_MEMBER,
         &entity_id,
         workspace_id,
-        None,
         SyncActionType::Insert,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
     .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, project_id = %project_id, user_id = %user_id, "Failed to write sync log entry for member add");
-        0
-    });
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::PROJECT_MEMBER,
-            &entity_id,
-            SyncActionType::Insert,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
-
-    Ok(())
 }
 
 /// Remove a member from a project.
+///
+/// The DELETE and its `sync_log` entry are one transaction — see
+/// [`add_project_member`] for why a membership write cannot be repaired later.
 pub async fn remove_project_member(
     db: &DbPool,
     project_id: &str,
@@ -707,16 +718,21 @@ pub async fn remove_project_member(
     // `project_id` alone — a foreign project's membership row would be a legal
     // target. Every caller also checks ownership one layer up; this is the
     // second layer, held where the mutation is rather than in caller discipline.
+    // It is authorization, and it runs on the pool, so it stays ahead of the
+    // transaction on both counts (see `DbTx`).
     get_project_in_workspace(db, project_id, workspace_id).await?;
 
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
         project_id,
         user_id
     )?;
 
     if result.rows_affected() == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "member {user_id} not found in project {project_id}"
         )));
@@ -724,40 +740,18 @@ pub async fn remove_project_member(
 
     let entity_id = project_member_entity_id(project_id, user_id);
 
-    // Sync log — best-effort.
-    //
     // A delete carries no payload: there is no row left to send, and the client
     // reads the entity id alone to drop the cached row and bump its counter.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    commit_and_broadcast(
+        tx,
         entity_types::PROJECT_MEMBER,
         &entity_id,
         workspace_id,
-        None,
         SyncActionType::Delete,
         None,
+        ws_manager,
     )
     .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, project_id = %project_id, user_id = %user_id, "Failed to write sync log entry for member remove");
-        0
-    });
-
-    // WebSocket broadcast — delete has no entity data.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::PROJECT_MEMBER,
-            &entity_id,
-            SyncActionType::Delete,
-            None,
-            sync_id,
-        )
-        .await;
-    }
-
-    Ok(())
 }
 
 // ─── Milestones ─────────────────────────────────────────────────────────────
@@ -803,6 +797,9 @@ pub async fn list_milestones_for_workspace(
 }
 
 /// Create a new milestone in a project.
+///
+/// The INSERT and its `sync_log` entry are one transaction — see
+/// [`create_project`].
 pub async fn create_milestone(
     db: &DbPool,
     project_id: &str,
@@ -822,8 +819,10 @@ pub async fn create_milestone(
             (milestone_id, project_id, name, description, target_date, sort_order, created_at) \
          VALUES ($1, $2, $3, $4, {td}, 0, {now})"
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &milestone_id,
         project_id,
@@ -834,10 +833,11 @@ pub async fn create_milestone(
 
     // Re-fetch to get the DB-assigned timestamp. This has to happen before the
     // sync log write: both the stored entry and the live frame carry the full
-    // milestone, and the client skips either without it.
+    // milestone, and the client skips either without it. The row does not exist
+    // outside the transaction yet, so the read runs on it.
     let sql = format!("{MILESTONE_SELECT} WHERE milestone_id = $1");
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    let row: MilestoneRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         MilestoneRow,
         &sql,
         &milestone_id
@@ -849,40 +849,25 @@ pub async fn create_milestone(
         &milestone.milestone_id,
     );
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    commit_and_broadcast(
+        tx,
         entity_types::PROJECT_MILESTONE,
         &milestone_id,
         workspace_id,
-        None,
         SyncActionType::Insert,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone create");
-        0
-    });
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::PROJECT_MILESTONE,
-            &milestone_id,
-            SyncActionType::Insert,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(milestone)
 }
 
 /// Update a milestone.
+///
+/// The UPDATE and its `sync_log` entry are one transaction — see
+/// [`create_project`]. A call that changes nothing writes neither, and opens no
+/// transaction.
 pub async fn update_milestone(
     db: &DbPool,
     milestone_id: &str,
@@ -930,7 +915,9 @@ pub async fn update_milestone(
         "UPDATE project_milestones SET {set_clause} WHERE milestone_id = ${mid_idx}"
     );
 
-    let affected: u64 = trakkt_core::db_with_pool!(db, |p| {
+    let mut tx = db.begin().await?;
+
+    let affected: u64 = trakkt_core::tx_with!(&mut tx, |e| {
         let mut query = sqlx::query(&sql);
 
         if let Some(v) = name {
@@ -945,10 +932,11 @@ pub async fn update_milestone(
 
         query = query.bind(milestone_id);
 
-        query.execute(p).await.map(|r| r.rows_affected())
+        query.execute(e).await.map(|r| r.rows_affected())
     })?;
 
     if affected == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "milestone {milestone_id} not found"
         )));
@@ -956,10 +944,11 @@ pub async fn update_milestone(
 
     // Re-fetch the updated milestone. This has to happen before the sync log
     // write: both the stored entry and the live frame carry the full milestone,
-    // and the client skips either without it.
+    // and the client skips either without it. The new state is only visible on
+    // the transaction, so the read runs on it.
     let sql = format!("{MILESTONE_SELECT} WHERE milestone_id = $1");
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    let row: MilestoneRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         MilestoneRow,
         &sql,
         milestone_id
@@ -971,35 +960,16 @@ pub async fn update_milestone(
         &milestone.milestone_id,
     );
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    commit_and_broadcast(
+        tx,
         entity_types::PROJECT_MILESTONE,
         milestone_id,
         workspace_id,
-        None,
         SyncActionType::Update,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone update");
-        0
-    });
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::PROJECT_MILESTONE,
-            milestone_id,
-            SyncActionType::Update,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(milestone)
 }
@@ -1007,55 +977,41 @@ pub async fn update_milestone(
 /// Delete a milestone.
 ///
 /// Issues linked to this milestone will have `milestone_id` set to NULL (ON DELETE SET NULL).
+///
+/// The DELETE, the `issues.milestone_id` clearing that the schema drives from
+/// it, and the `sync_log` entry that reports it are one transaction — see
+/// [`delete_project`]. Nothing cascades: the issues outlive the milestone.
 pub async fn delete_milestone(
     db: &DbPool,
     milestone_id: &str,
     ws_manager: Option<&WebSocketManager>,
     workspace_id: &str,
 ) -> trakkt_core::Result<()> {
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM project_milestones WHERE milestone_id = $1",
         milestone_id
     )?;
 
     if result.rows_affected() == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "milestone {milestone_id} not found"
         )));
     }
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    commit_and_broadcast(
+        tx,
         entity_types::PROJECT_MILESTONE,
         milestone_id,
         workspace_id,
-        None,
         SyncActionType::Delete,
         None,
+        ws_manager,
     )
     .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, milestone_id = %milestone_id, "Failed to write sync log entry for milestone delete");
-        0
-    });
-
-    // WebSocket broadcast — delete has no entity data.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::PROJECT_MILESTONE,
-            milestone_id,
-            SyncActionType::Delete,
-            None,
-            sync_id,
-        )
-        .await;
-    }
-
-    Ok(())
 }
 
 // ─── Project Updates ────────────────────────────────────────────────────────
@@ -1078,6 +1034,10 @@ pub async fn list_project_updates(
 }
 
 /// Create a new status update on a project.
+///
+/// The INSERT and its `sync_log` entry are one transaction. `project_updates` is
+/// not an entity type a delta re-reads, so a posted update that commits without
+/// its sync row never reaches another client and cannot be repaired later.
 pub async fn create_project_update(
     db: &DbPool,
     project_id: &str,
@@ -1096,8 +1056,10 @@ pub async fn create_project_update(
             (update_id, project_id, user_id, health, body, created_at) \
          VALUES ($1, $2, $3, $4, $5, {now})"
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &update_id,
         project_id,
@@ -1108,10 +1070,11 @@ pub async fn create_project_update(
 
     // Re-fetch to get the DB-assigned timestamp. This has to happen before the
     // sync log write: both the stored entry and the live frame carry the full
-    // update, and the client skips either without it.
+    // update, and the client skips either without it. The row does not exist
+    // outside the transaction yet, so the read runs on it.
     let sql = format!("{PROJECT_UPDATE_SELECT} WHERE update_id = $1");
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    let row: ProjectUpdateRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         ProjectUpdateRow,
         &sql,
         &update_id
@@ -1119,41 +1082,21 @@ pub async fn create_project_update(
     let update = row.into_dto();
     let payload = sync_payload(&update, entity_types::PROJECT_UPDATE, &update.update_id);
 
-    // Sync log — best-effort.
-    //
     // The posted update is its own entity type rather than an update to the
     // parent project: the INSERT above is the only write this function makes, so
     // the `projects` row is byte-identical afterwards. Reporting it as a PROJECT
     // update would make every connected client re-upsert an unchanged project
     // and would still leave the posted update itself invisible.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    commit_and_broadcast(
+        tx,
         entity_types::PROJECT_UPDATE,
         &update_id,
         workspace_id,
-        None,
         SyncActionType::Insert,
-        payload.clone(),
+        payload,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, update_id = %update_id, "Failed to write sync log entry for project update");
-        0
-    });
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::PROJECT_UPDATE,
-            &update_id,
-            SyncActionType::Insert,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(update)
 }

@@ -3813,4 +3813,541 @@ mod tests {
              client is ever told about silently changes what the team sees"
         );
     }
+
+    // ─── Atomic project mutation + sync entry (TRA-9948) ─────────────────────
+
+    /// A project in `WS` carrying one of everything `delete_project` reaches:
+    /// a member, a milestone, a posted update, and the fixture issue pointing at
+    /// both the project and the milestone.
+    ///
+    /// Written with plain INSERTs rather than through the services, so the
+    /// seeding itself writes no `sync_log` row — every test below installs its
+    /// rejection trigger afterwards and the only write left to reject is the one
+    /// under test. The ids are fixed for the same reason `seed_doomed_team`
+    /// fixes its own: a narrowed `CREATE TRIGGER` cannot take bind parameters.
+    async fn seed_project(db: &DbPool) {
+        db_execute!(
+            db,
+            "INSERT INTO projects (project_id, workspace_id, name, description, status, lead_id) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            "prj_doomed",
+            WS,
+            "Doomed",
+            "The project every rollback below has to restore",
+            "planned",
+            USER_A
+        )
+        .expect("insert the project");
+
+        db_execute!(
+            db,
+            "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3)",
+            "prj_doomed",
+            USER_B,
+            "member"
+        )
+        .expect("insert the project membership");
+
+        db_execute!(
+            db,
+            "INSERT INTO project_milestones \
+                (milestone_id, project_id, name, description, target_date, sort_order) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            "mst_doomed",
+            "prj_doomed",
+            "Doomed Milestone",
+            "Has a description a rename would overwrite",
+            "2026-12-01",
+            3_i32
+        )
+        .expect("insert the milestone");
+
+        db_execute!(
+            db,
+            "INSERT INTO project_updates (update_id, project_id, user_id, health, body) \
+             VALUES ($1, $2, $3, $4, $5)",
+            "upd_doomed",
+            "prj_doomed",
+            USER_A,
+            "on_track",
+            "The only posted update"
+        )
+        .expect("insert the posted update");
+
+        db_execute!(
+            db,
+            "UPDATE issues SET project_id = $1, milestone_id = $2 WHERE issue_id = $3",
+            "prj_doomed",
+            "mst_doomed",
+            "iss_vis"
+        )
+        .expect("point the fixture issue at the project and milestone");
+    }
+
+    /// Every project, in a stable order.
+    async fn project_ids(db: &DbPool) -> Vec<String> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            project_id: String,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT project_id FROM projects ORDER BY project_id"
+        )
+        .expect("read projects");
+        rows.into_iter().map(|r| r.project_id).collect()
+    }
+
+    /// Every project membership, in a stable order.
+    async fn project_memberships(db: &DbPool) -> Vec<(String, String, Option<String>)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            project_id: String,
+            user_id: String,
+            role: Option<String>,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT project_id, user_id, role FROM project_members \
+             ORDER BY project_id, user_id"
+        )
+        .expect("read project members");
+        rows.into_iter()
+            .map(|r| (r.project_id, r.user_id, r.role))
+            .collect()
+    }
+
+    /// Every milestone, in a stable order, with the columns an update rewrites.
+    async fn milestones(
+        db: &DbPool,
+    ) -> Vec<(String, String, String, Option<String>, Option<String>)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            milestone_id: String,
+            project_id: String,
+            name: String,
+            description: Option<String>,
+            target_date: Option<String>,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT milestone_id, project_id, name, description, \
+                    CAST(target_date AS TEXT) AS target_date \
+             FROM project_milestones ORDER BY milestone_id"
+        )
+        .expect("read milestones");
+        rows.into_iter()
+            .map(|r| {
+                (
+                    r.milestone_id,
+                    r.project_id,
+                    r.name,
+                    r.description,
+                    r.target_date,
+                )
+            })
+            .collect()
+    }
+
+    /// Every posted project update, in a stable order.
+    async fn posted_project_updates(db: &DbPool) -> Vec<(String, String, String, Option<String>)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            update_id: String,
+            project_id: String,
+            health: String,
+            body: Option<String>,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT update_id, project_id, health, body FROM project_updates \
+             ORDER BY update_id"
+        )
+        .expect("read posted project updates");
+        rows.into_iter()
+            .map(|r| (r.update_id, r.project_id, r.health, r.body))
+            .collect()
+    }
+
+    /// What every issue points at — the two columns a project or milestone
+    /// delete clears through `ON DELETE SET NULL`.
+    async fn issue_project_links(db: &DbPool) -> Vec<(String, Option<String>, Option<String>)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            issue_id: String,
+            project_id: Option<String>,
+            milestone_id: Option<String>,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT issue_id, project_id, milestone_id FROM issues ORDER BY issue_id"
+        )
+        .expect("read issue project links");
+        rows.into_iter()
+            .map(|r| (r.issue_id, r.project_id, r.milestone_id))
+            .collect()
+    }
+
+    /// Everything `delete_project` removes: the project itself, and the members,
+    /// milestones and posted updates the schema cascades with it, plus the issue
+    /// links it clears through `ON DELETE SET NULL`.
+    ///
+    /// Every field is an ordered `Vec` of the rows themselves — a count would
+    /// pass just as happily on rows that came back changed.
+    #[derive(Debug, PartialEq)]
+    struct ProjectDeleteFootprint {
+        projects: Vec<String>,
+        members: Vec<(String, String, Option<String>)>,
+        milestones: Vec<(String, String, String, Option<String>, Option<String>)>,
+        posted_updates: Vec<(String, String, String, Option<String>)>,
+        issue_links: Vec<(String, Option<String>, Option<String>)>,
+    }
+
+    async fn project_delete_footprint(db: &DbPool) -> ProjectDeleteFootprint {
+        ProjectDeleteFootprint {
+            projects: project_ids(db).await,
+            members: project_memberships(db).await,
+            milestones: milestones(db).await,
+            posted_updates: posted_project_updates(db).await,
+            issue_links: issue_project_links(db).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn project_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let before = project_ids(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::project_service::create_project(
+            &db,
+            &crate::project_service::CreateProjectParams {
+                workspace_id: WS,
+                name: "Never happened",
+                description: None,
+                icon: None,
+                color: None,
+                lead_id: None,
+                start_date: None,
+                target_date: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("a create whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            project_ids(&db).await,
+            before,
+            "a project with no sync_log row is invisible to every future delta, \
+             so it must not survive the failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_project(&db).await;
+        let before = crate::project_service::get_project(&db, "prj_doomed")
+            .await
+            .expect("read the project")
+            .expect("the seeded project exists");
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::project_service::update_project(
+            &db,
+            &crate::project_service::UpdateProjectParams {
+                project_id: "prj_doomed",
+                name: Some("Renamed in a doomed transaction"),
+                description: None,
+                icon: None,
+                color: None,
+                status: Some("completed"),
+                lead_id: Some(None),
+                start_date: None,
+                target_date: Some(Some("2027-01-01")),
+                archived_at: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("an update whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            crate::project_service::get_project(&db, "prj_doomed")
+                .await
+                .expect("read the project back")
+                .expect("the project still exists"),
+            before,
+            "every column the UPDATE touched — the rename, the status, the \
+             cleared lead and the new target date — must be rolled back, not \
+             left committed with no sync row"
+        );
+    }
+
+    /// The delete's sync entry is written after the DELETE and everything the
+    /// schema cascades from it. Rejecting it proves the whole cascade unwinds,
+    /// not just the `projects` row.
+    #[tokio::test]
+    async fn project_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_project(&db).await;
+        let before = project_delete_footprint(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::project_service::delete_project(&db, "prj_doomed", None)
+            .await
+            .expect_err("a delete whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        let after = project_delete_footprint(&db).await;
+        assert_eq!(
+            after.projects, before.projects,
+            "a project delete with no sync_log row leaves the project on every \
+             other client forever, and no later delta can repair it — the row it \
+             would have to re-read is gone. The DELETE must be rolled back"
+        );
+        assert_eq!(
+            after.members, before.members,
+            "the membership the DELETE cascaded away must be back"
+        );
+        assert_eq!(
+            after.milestones, before.milestones,
+            "the milestone the DELETE cascaded away must be back"
+        );
+        assert_eq!(
+            after.posted_updates, before.posted_updates,
+            "the posted update the DELETE cascaded away must be back"
+        );
+        assert_eq!(
+            after.issue_links, before.issue_links,
+            "the issue's project and milestone links must be back — the rollback \
+             has to unwind the schema's ON DELETE SET NULL too"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_member_add_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_project(&db).await;
+        let before = project_memberships(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::project_service::add_project_member(
+            &db,
+            "prj_doomed",
+            USER_A,
+            "admin",
+            WS,
+            None,
+        )
+        .await
+        .expect_err("a member add whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            project_memberships(&db).await,
+            before,
+            "`project_members` is not an entity type a delta re-reads, so no \
+             later delta can repair a membership that committed without its sync \
+             row — the INSERT must be rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_member_remove_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_project(&db).await;
+        let before = project_memberships(&db).await;
+        assert!(
+            before.contains(&(
+                "prj_doomed".to_string(),
+                USER_B.to_string(),
+                Some("member".to_string())
+            )),
+            "precondition: the membership the remove has to fail on is really \
+             there; got {before:?}"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::project_service::remove_project_member(&db, "prj_doomed", USER_B, WS, None)
+                .await
+                .expect_err("a member remove whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            project_memberships(&db).await,
+            before,
+            "a removal with no sync row leaves the member on every other client \
+             forever, so the DELETE must be rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn milestone_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_project(&db).await;
+        let before = milestones(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::project_service::create_milestone(
+            &db,
+            "prj_doomed",
+            "Never happened",
+            Some("A milestone no client would ever hear about"),
+            Some("2027-06-30"),
+            None,
+            WS,
+        )
+        .await
+        .expect_err("a milestone create whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            milestones(&db).await,
+            before,
+            "a milestone with no sync_log row is invisible to every future \
+             delta, so it must not survive the failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn milestone_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_project(&db).await;
+        let before = milestones(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::project_service::update_milestone(
+            &db,
+            "mst_doomed",
+            Some("Renamed in a doomed transaction"),
+            Some("Rewritten description"),
+            Some(None),
+            None,
+            WS,
+        )
+        .await
+        .expect_err("a milestone update whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            milestones(&db).await,
+            before,
+            "the rename, the rewritten description and the cleared target date \
+             must all be rolled back, not left committed with no sync row"
+        );
+    }
+
+    #[tokio::test]
+    async fn milestone_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_project(&db).await;
+        let milestones_before = milestones(&db).await;
+        let links_before = issue_project_links(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::project_service::delete_milestone(&db, "mst_doomed", None, WS)
+            .await
+            .expect_err("a milestone delete whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            milestones(&db).await,
+            milestones_before,
+            "a milestone delete with no sync row leaves it on every other client \
+             forever, so the DELETE must be rolled back"
+        );
+        assert_eq!(
+            issue_project_links(&db).await,
+            links_before,
+            "the issue's milestone link must be back — the rollback has to \
+             unwind the schema's ON DELETE SET NULL too"
+        );
+    }
+
+    #[tokio::test]
+    async fn posted_project_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_project(&db).await;
+        let before = posted_project_updates(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::project_service::create_project_update(
+            &db,
+            "prj_doomed",
+            USER_A,
+            "at_risk",
+            Some("Nobody would ever see this"),
+            None,
+            WS,
+        )
+        .await
+        .expect_err("a posted update whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            posted_project_updates(&db).await,
+            before,
+            "`project_updates` is not an entity type a delta re-reads, so a \
+             posted update that committed without its sync row would never reach \
+             another client — the INSERT must be rolled back"
+        );
+    }
 }
