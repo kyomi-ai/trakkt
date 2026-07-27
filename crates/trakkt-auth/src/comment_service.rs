@@ -5,6 +5,7 @@
 //! Comments belong to issues and support threading via an optional `parent_id`.
 //! Write operations verify ownership before allowing edits/deletes.
 
+use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use trakkt_types::enums::ActionSource;
@@ -57,23 +58,69 @@ impl CommentRow {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/// The query behind [`get_workspace_for_issue`] and its transaction-scoped twin.
+const WORKSPACE_FOR_ISSUE_SELECT: &str =
+    "SELECT workspace_id FROM issues WHERE issue_id = $1";
+
 /// Fetch the workspace_id for a given issue. Used for sync log entries.
 async fn get_workspace_for_issue(
     db: &DbPool,
     issue_id: &str,
 ) -> trakkt_core::Result<String> {
-    let ws_id: String = trakkt_core::db_fetch_scalar!(
-        db,
-        String,
-        "SELECT workspace_id FROM issues WHERE issue_id = $1",
-        issue_id
-    )?;
+    let ws_id: String =
+        trakkt_core::db_fetch_scalar!(db, String, WORKSPACE_FOR_ISSUE_SELECT, issue_id)?;
     Ok(ws_id)
+}
+
+/// Fetch the workspace_id for a given issue on an open transaction.
+///
+/// Transaction-scoped [`get_workspace_for_issue`] — the sync entry needs the
+/// workspace, and the pool is unreachable while a transaction is open (see
+/// [`DbTx`]).
+async fn get_workspace_for_issue_tx(
+    tx: &mut DbTx,
+    issue_id: &str,
+) -> trakkt_core::Result<String> {
+    let ws_id: String =
+        trakkt_core::tx_fetch_scalar!(&mut *tx, String, WORKSPACE_FOR_ISSUE_SELECT, issue_id)?;
+    Ok(ws_id)
+}
+
+/// The comment SELECT with its joined author, keyed by `comment_id` as `$1`.
+const COMMENT_BY_ID_SELECT: &str = "\
+    SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
+           u.name AS author_name, NULL AS author_avatar, \
+           c.action_source, c.action_source_label, \
+           c.created_at, \
+           c.updated_at \
+    FROM comments c \
+    JOIN users u ON u.user_id = c.user_id \
+    WHERE c.comment_id = $1";
+
+/// Serialise a comment into its sync payload.
+///
+/// A payload that cannot be serialised is logged and dropped: the sync entry is
+/// still written, so the change keeps its place in the sequence.
+fn comment_payload_value(comment: &Comment) -> Option<serde_json::Value> {
+    match serde_json::to_value(comment) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(error = %e, comment_id = %comment.comment_id,
+                "Failed to serialize comment for sync payload");
+            None
+        }
+    }
 }
 
 // ─── Service functions ──────────────────────────────────────────────────────
 
 /// Create a new comment on an issue.
+///
+/// The INSERT and its `sync_log` entry commit as one transaction, so a comment
+/// never exists without the sync row that carries it to other clients. The
+/// workspace is resolved up front: without it there is no sync entry to write,
+/// which makes it a precondition of the write rather than something to warn
+/// about afterwards.
 pub async fn create_comment(
     db: &DbPool,
     issue_id: &str,
@@ -89,64 +136,51 @@ pub async fn create_comment(
     let comment_id = uuid::Uuid::new_v4().to_string();
     let action_source_str = action_source.as_str();
 
+    // Resolve the workspace once — needed for the sync log, the broadcast and
+    // the notifications. Runs on the pool, so it happens before the transaction
+    // opens.
+    let workspace_id = get_workspace_for_issue(db, issue_id).await?;
+
     let sql = format!(
         "INSERT INTO comments (comment_id, issue_id, user_id, body, parent_id, action_source, action_source_label, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, {now}, {now})"
     );
-    trakkt_core::db_execute!(db, &sql, &comment_id, issue_id, user_id, body, parent_id, action_source_str, action_source_label)?;
+
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(&mut tx, &sql, &comment_id, issue_id, user_id, body, parent_id, action_source_str, action_source_label)?;
 
     // Re-fetch with joined user data (needed for sync broadcast and return value).
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        CommentRow,
-        "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
-                u.name AS author_name, NULL AS author_avatar, \
-                c.action_source, c.action_source_label, \
-                c.created_at, \
-                c.updated_at \
-         FROM comments c \
-         JOIN users u ON u.user_id = c.user_id \
-         WHERE c.comment_id = $1",
-        &comment_id
-    )?;
+    let row = trakkt_core::tx_fetch_one!(&mut tx, CommentRow, COMMENT_BY_ID_SELECT, &comment_id)?;
     let comment = row.into_dto();
+    let payload = comment_payload_value(&comment);
 
-    // Resolve workspace once — needed for sync log, broadcast, and notifications.
-    let resolved_workspace_id = get_workspace_for_issue(db, issue_id).await;
+    let sync_id = sync_log_service::write_sync_entry_in_tx(
+        &mut tx,
+        entity_types::COMMENT,
+        &comment_id,
+        &workspace_id,
+        None,
+        SyncActionType::Insert,
+        payload.clone(),
+    )
+    .await?;
 
-    // Sync log + broadcast — best-effort.
-    match &resolved_workspace_id {
-        Ok(workspace_id) => {
-            let sync_id = sync_log_service::write_sync_entry(
-                db,
-                entity_types::COMMENT,
-                &comment_id,
-                workspace_id,
-                None,
-                SyncActionType::Insert,
-                serde_json::to_value(&comment).ok(),
-            )
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment create");
-                0
-            });
-            if let Some(ws) = ws_manager {
-                sync_log_service::broadcast_sync_action(
-                    ws,
-                    workspace_id,
-                    entity_types::COMMENT,
-                    &comment_id,
-                    SyncActionType::Insert,
-                    serde_json::to_value(&comment).ok(),
-                    sync_id,
-                )
-                .await;
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, comment_id = %comment_id, "Failed to resolve workspace for sync log");
-        }
+    tx.commit().await?;
+
+    // Everything below reaches for the pool or the socket, so it has to follow
+    // the commit.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            &workspace_id,
+            entity_types::COMMENT,
+            &comment_id,
+            SyncActionType::Insert,
+            payload,
+            sync_id,
+        )
+        .await;
     }
 
     // Auto-watch: commenter watches the issue they commented on (best-effort).
@@ -155,57 +189,55 @@ pub async fn create_comment(
     }
 
     // Notify watchers about the new comment (best-effort).
-    if let Ok(ws_id) = &resolved_workspace_id {
-        match crate::watcher_service::list_watchers_of_issue(db, issue_id).await {
-            Ok(watchers) => {
-                let prefs_map = match crate::notification_service::batch_get_preferences(
-                    db, &watchers, ws_id,
+    match crate::watcher_service::list_watchers_of_issue(db, issue_id).await {
+        Ok(watchers) => {
+            let prefs_map = match crate::notification_service::batch_get_preferences(
+                db, &watchers, &workspace_id,
+            )
+            .await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to fetch notification preferences, using defaults");
+                    std::collections::HashMap::new()
+                }
+            };
+
+            for watcher_id in &watchers {
+                // Self-exclusion check with preference awareness
+                if crate::notification_service::should_suppress_self_notification(
+                    watcher_id, user_id, action_source, &prefs_map,
+                ) {
+                    continue;
+                }
+
+                // Event type preference check
+                let type_enabled = prefs_map
+                    .get(watcher_id.as_str())
+                    .is_none_or(|p| p.notify_comments);
+                if !type_enabled {
+                    continue;
+                }
+
+                if let Err(e) = crate::notification_service::create_notification(
+                    db,
+                    &workspace_id,
+                    watcher_id,
+                    issue_id,
+                    crate::notification_service::TYPE_COMMENTED,
+                    Some(user_id),
+                    Some(&comment_id),
+                    action_source,
+                    action_source_label,
+                    ws_manager,
                 )
-                .await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to fetch notification preferences, using defaults");
-                        std::collections::HashMap::new()
-                    }
-                };
-
-                for watcher_id in &watchers {
-                    // Self-exclusion check with preference awareness
-                    if crate::notification_service::should_suppress_self_notification(
-                        watcher_id, user_id, action_source, &prefs_map,
-                    ) {
-                        continue;
-                    }
-
-                    // Event type preference check
-                    let type_enabled = prefs_map
-                        .get(watcher_id.as_str())
-                        .is_none_or(|p| p.notify_comments);
-                    if !type_enabled {
-                        continue;
-                    }
-
-                    if let Err(e) = crate::notification_service::create_notification(
-                        db,
-                        ws_id,
-                        watcher_id,
-                        issue_id,
-                        crate::notification_service::TYPE_COMMENTED,
-                        Some(user_id),
-                        Some(&comment_id),
-                        action_source,
-                        action_source_label,
-                        ws_manager,
-                    )
-                    .await
-                    {
-                        tracing::warn!(error = %e, "Failed to create comment notification");
-                    }
+                .await
+                {
+                    tracing::warn!(error = %e, "Failed to create comment notification");
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, issue_id = %issue_id, "Failed to list watchers for comment notification");
-            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, issue_id = %issue_id, "Failed to list watchers for comment notification");
         }
     }
 
@@ -263,6 +295,9 @@ pub async fn list_comments_for_workspace(
 }
 
 /// Update a comment's body. Only the comment's author can edit it.
+///
+/// The UPDATE and its `sync_log` entry commit as one transaction; a rejected
+/// edit rolls back and returns the reason.
 pub async fn update_comment(
     db: &DbPool,
     comment_id: &str,
@@ -277,16 +312,19 @@ pub async fn update_comment(
         "UPDATE comments SET body = $1, updated_at = {now} \
          WHERE comment_id = $2 AND user_id = $3"
     );
-    let result = trakkt_core::db_execute!(db, &sql, body, comment_id, user_id)?;
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(&mut tx, &sql, body, comment_id, user_id)?;
 
     if result.rows_affected() == 0 {
         // Distinguish between "not found" and "not owned by user".
-        let exists: i64 = trakkt_core::db_fetch_scalar!(
-            db,
+        let exists: i64 = trakkt_core::tx_fetch_scalar!(
+            &mut tx,
             i64,
             "SELECT COUNT(*) FROM comments WHERE comment_id = $1",
             comment_id
         )?;
+        tx.rollback().await?;
         if exists == 0 {
             return Err(trakkt_core::Error::NotFound(format!(
                 "comment {comment_id} not found"
@@ -298,78 +336,60 @@ pub async fn update_comment(
     }
 
     // Re-fetch with joined user data.
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        CommentRow,
-        "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
-                u.name AS author_name, NULL AS author_avatar, \
-                c.action_source, c.action_source_label, \
-                c.created_at, \
-                c.updated_at \
-         FROM comments c \
-         JOIN users u ON u.user_id = c.user_id \
-         WHERE c.comment_id = $1",
-        comment_id
-    )?;
+    let row = trakkt_core::tx_fetch_one!(&mut tx, CommentRow, COMMENT_BY_ID_SELECT, comment_id)?;
     let comment = row.into_dto();
+    let payload = comment_payload_value(&comment);
 
-    // Sync log + broadcast — best-effort.
-    match get_workspace_for_issue(db, &comment.issue_id).await {
-        Ok(workspace_id) => {
-            let sync_id = sync_log_service::write_sync_entry(
-                db,
-                entity_types::COMMENT,
-                comment_id,
-                &workspace_id,
-                None,
-                SyncActionType::Update,
-                serde_json::to_value(&comment).ok(),
-            )
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment update");
-                0
-            });
-            if let Some(ws) = ws_manager {
-                sync_log_service::broadcast_sync_action(
-                    ws,
-                    &workspace_id,
-                    entity_types::COMMENT,
-                    comment_id,
-                    SyncActionType::Update,
-                    serde_json::to_value(&comment).ok(),
-                    sync_id,
-                )
-                .await;
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, comment_id = %comment_id, "Failed to resolve workspace for sync log");
-        }
+    let workspace_id = get_workspace_for_issue_tx(&mut tx, &comment.issue_id).await?;
+
+    let sync_id = sync_log_service::write_sync_entry_in_tx(
+        &mut tx,
+        entity_types::COMMENT,
+        comment_id,
+        &workspace_id,
+        None,
+        SyncActionType::Update,
+        payload.clone(),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    // The broadcast reaches for the socket, so it has to follow the commit.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            &workspace_id,
+            entity_types::COMMENT,
+            comment_id,
+            SyncActionType::Update,
+            payload,
+            sync_id,
+        )
+        .await;
     }
 
     Ok(comment)
 }
 
 /// Delete a comment. Only the comment's author can delete it.
+///
+/// The ownership check, the DELETE and the `sync_log` entry all run in one
+/// transaction, so the comment cannot change owner underneath the check and can
+/// never be removed without the sync row that tells clients to drop it.
 pub async fn delete_comment(
     db: &DbPool,
     comment_id: &str,
     user_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
+    let mut tx = db.begin().await?;
+
     // Fetch the comment first for ownership check and sync log.
-    let row = trakkt_core::db_fetch_optional!(
-        db,
+    let row = trakkt_core::tx_fetch_optional!(
+        &mut tx,
         CommentRow,
-        "SELECT c.comment_id, c.issue_id, c.user_id, c.body, c.parent_id, \
-                u.name AS author_name, NULL AS author_avatar, \
-                c.action_source, c.action_source_label, \
-                c.created_at, \
-                c.updated_at \
-         FROM comments c \
-         JOIN users u ON u.user_id = c.user_id \
-         WHERE c.comment_id = $1",
+        COMMENT_BY_ID_SELECT,
         comment_id
     )?;
 
@@ -383,45 +403,39 @@ pub async fn delete_comment(
         ));
     }
 
-    trakkt_core::db_execute!(
-        db,
+    trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM comments WHERE comment_id = $1",
         comment_id
     )?;
 
-    // Sync log + broadcast — best-effort.
-    match get_workspace_for_issue(db, &comment.issue_id).await {
-        Ok(workspace_id) => {
-            let sync_id = sync_log_service::write_sync_entry(
-                db,
-                entity_types::COMMENT,
-                comment_id,
-                &workspace_id,
-                None,
-                SyncActionType::Delete,
-                None,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, comment_id = %comment_id, "Failed to write sync log entry for comment delete");
-                0
-            });
-            if let Some(ws) = ws_manager {
-                sync_log_service::broadcast_sync_action(
-                    ws,
-                    &workspace_id,
-                    entity_types::COMMENT,
-                    comment_id,
-                    SyncActionType::Delete,
-                    None,
-                    sync_id,
-                )
-                .await;
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, comment_id = %comment_id, "Failed to resolve workspace for sync log");
-        }
+    let workspace_id = get_workspace_for_issue_tx(&mut tx, &comment.issue_id).await?;
+
+    let sync_id = sync_log_service::write_sync_entry_in_tx(
+        &mut tx,
+        entity_types::COMMENT,
+        comment_id,
+        &workspace_id,
+        None,
+        SyncActionType::Delete,
+        None,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    // The broadcast reaches for the socket, so it has to follow the commit.
+    if let Some(ws) = ws_manager {
+        sync_log_service::broadcast_sync_action(
+            ws,
+            &workspace_id,
+            entity_types::COMMENT,
+            comment_id,
+            SyncActionType::Delete,
+            None,
+            sync_id,
+        )
+        .await;
     }
 
     Ok(())

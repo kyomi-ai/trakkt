@@ -13,8 +13,9 @@
 //! - Postgres uses `RETURNING sync_id` to get the assigned ID; SQLite uses `last_insert_rowid()`
 //! - `data` is stored as JSONB on Postgres and TEXT on SQLite
 
+use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
-use trakkt_core::{db_execute, db_fetch_all, db_fetch_scalar, DbPool};
+use trakkt_core::{db_execute, db_fetch_all, db_fetch_scalar, tx_execute, tx_fetch_scalar, DbPool};
 use trakkt_types::sync::{SyncAction, SyncActionType};
 
 use crate::websocket::WebSocketManager;
@@ -104,10 +105,45 @@ fn normalise_timestamp(ts: &str) -> String {
 
 // ─── write_sync_entry ────────────────────────────────────────────────────────
 
+/// The `sync_log` INSERT for the active backend.
+///
+/// Postgres appends `RETURNING sync_id`; SQLite has no RETURNING support here
+/// and reads the id back with `last_insert_rowid()` instead.
+fn sync_entry_insert_sql(is_pg: bool) -> String {
+    let now_expr = sql_compat::now(is_pg);
+    // Postgres: `data` is JSONB — the bound JSON string needs the cast.
+    // SQLite:   `data` is TEXT — the JSON string goes in as-is.
+    let data_expr = sql_compat::cast_to_json(is_pg, "$5");
+    let returning = if is_pg { "RETURNING sync_id" } else { "" };
+    format!(
+        r#"
+        INSERT INTO sync_log (entity_type, entity_id, workspace_id, action, data, visibility_user_id, created_at)
+        VALUES ($1, $2, $3, $4, {data_expr}, $6, {now_expr})
+        {returning}
+        "#
+    )
+}
+
+/// Serialise a sync entry payload to the string bound as `data`.
+fn serialise_sync_entry_data(
+    data: Option<&serde_json::Value>,
+) -> trakkt_core::Result<Option<String>> {
+    data.map(serde_json::to_string).transpose().map_err(|e| {
+        trakkt_core::Error::Internal(format!("failed to serialise sync entry data: {e}"))
+    })
+}
+
 /// Insert a row into `sync_log` and return the assigned `sync_id`.
 ///
 /// Uses `RETURNING sync_id` on Postgres and `SELECT last_insert_rowid()` on
 /// SQLite because the ID is assigned by the database (BIGSERIAL / AUTOINCREMENT).
+///
+/// This is the non-transactional form: the insert auto-commits on its own, so a
+/// failure leaves the caller's mutation already committed with no `sync_log`
+/// row to replay it — permanently invisible to delta sync. Services whose
+/// mutation and log write have been made atomic use
+/// [`write_sync_entry_in_tx`] instead; this form remains for the services that
+/// have not been converted yet.
 ///
 /// `visibility_user_id` scopes who may receive this row on delta sync:
 /// - `None` — workspace-visible: every member of `workspace_id` receives it.
@@ -128,30 +164,12 @@ pub async fn write_sync_entry(
     data: Option<serde_json::Value>,
 ) -> trakkt_core::Result<i64> {
     let is_pg = db.is_postgres();
-    let now_expr = sql_compat::now(is_pg);
     let action_str = action_type_to_str(&action);
-
-    // Serialise the data payload.
-    // Postgres: stored as JSONB — pass the JSON string with ::jsonb cast.
-    // SQLite:   stored as TEXT — pass the JSON string directly.
-    let data_str: Option<String> = data
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|e| {
-            trakkt_core::Error::Internal(format!("failed to serialise sync entry data: {e}"))
-        })?;
+    let data_str = serialise_sync_entry_data(data.as_ref())?;
+    let sql = sync_entry_insert_sql(is_pg);
 
     let sync_id: i64 = if is_pg {
-        // Postgres: use RETURNING to get the assigned BIGSERIAL id.
-        let json_cast = sql_compat::cast_to_json(is_pg, "$5");
-        let sql = format!(
-            r#"
-            INSERT INTO sync_log (entity_type, entity_id, workspace_id, action, data, visibility_user_id, created_at)
-            VALUES ($1, $2, $3, $4, {json_cast}, $6, {now_expr})
-            RETURNING sync_id
-            "#
-        );
+        // Postgres: RETURNING hands back the assigned BIGSERIAL id.
         db_fetch_scalar!(
             db,
             i64,
@@ -165,13 +183,10 @@ pub async fn write_sync_entry(
         )
         .map_err(|e| trakkt_core::Error::Internal(format!("failed to write sync entry: {e}")))?
     } else {
-        // SQLite: INSERT then query last_insert_rowid().
-        let sql = format!(
-            r#"
-            INSERT INTO sync_log (entity_type, entity_id, workspace_id, action, data, visibility_user_id, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, {now_expr})
-            "#
-        );
+        // SQLite: INSERT then query last_insert_rowid(). Correct only because
+        // the SQLite pool is pinned to a single connection, so both statements
+        // land on the same one — see `write_sync_entry_in_tx` for the form that
+        // does not depend on that.
         db_execute!(
             db,
             &sql,
@@ -199,6 +214,84 @@ pub async fn write_sync_entry(
         visibility_user_id,
         action = action_str,
         "Wrote sync log entry"
+    );
+
+    Ok(sync_id)
+}
+
+// ─── write_sync_entry_in_tx ──────────────────────────────────────────────────
+
+/// Insert a row into `sync_log` on the caller's open transaction and return the
+/// assigned `sync_id`.
+///
+/// Same insert as [`write_sync_entry`], same `visibility_user_id` contract —
+/// the difference is only where it runs. Because the row lands in the caller's
+/// transaction, the mutation it describes and the log entry that replays it
+/// commit together or not at all: a failure here rolls the mutation back
+/// instead of leaving an entity change that no future delta can see.
+///
+/// The returned `sync_id` is the real id of the row that will be committed. It
+/// is safe to broadcast **after** the commit succeeds; never broadcast while
+/// this transaction is still open (see [`DbTx`]).
+///
+/// On SQLite the INSERT and `last_insert_rowid()` run on the transaction's own
+/// connection, so the pairing is correct by construction rather than by the
+/// pool being pinned to one connection.
+pub async fn write_sync_entry_in_tx(
+    tx: &mut DbTx,
+    entity_type: &str,
+    entity_id: &str,
+    workspace_id: &str,
+    visibility_user_id: Option<&str>,
+    action: SyncActionType,
+    data: Option<serde_json::Value>,
+) -> trakkt_core::Result<i64> {
+    let is_pg = tx.is_postgres();
+    let action_str = action_type_to_str(&action);
+    let data_str = serialise_sync_entry_data(data.as_ref())?;
+    let sql = sync_entry_insert_sql(is_pg);
+
+    let sync_id: i64 = if is_pg {
+        tx_fetch_scalar!(
+            &mut *tx,
+            i64,
+            &sql,
+            entity_type,
+            entity_id,
+            workspace_id,
+            action_str,
+            data_str,
+            visibility_user_id
+        )
+        .map_err(|e| trakkt_core::Error::Internal(format!("failed to write sync entry: {e}")))?
+    } else {
+        tx_execute!(
+            &mut *tx,
+            &sql,
+            entity_type,
+            entity_id,
+            workspace_id,
+            action_str,
+            data_str,
+            visibility_user_id
+        )
+        .map_err(|e| trakkt_core::Error::Internal(format!("failed to write sync entry: {e}")))?;
+
+        tx_fetch_scalar!(&mut *tx, i64, "SELECT last_insert_rowid()").map_err(|e| {
+            trakkt_core::Error::Internal(format!(
+                "failed to get last_insert_rowid after sync entry insert: {e}"
+            ))
+        })?
+    };
+
+    tracing::debug!(
+        sync_id,
+        entity_type,
+        entity_id,
+        workspace_id,
+        visibility_user_id,
+        action = action_str,
+        "Wrote sync log entry in transaction"
     );
 
     Ok(sync_id)
@@ -1950,6 +2043,680 @@ mod tests {
             payloads[1].team_key, "VIS",
             "the reassignment row must carry the issue's new team, which is the \
              whole change being reported"
+        );
+    }
+
+    // ─── Atomic mutation + sync entry (TRA-9923) ─────────────────────────────
+
+    /// Reject every `sync_log` INSERT, at the database.
+    ///
+    /// `RAISE(ABORT)` fails the statement and backs out its changes while
+    /// leaving the surrounding transaction open and usable — the exact shape of
+    /// a sync entry write that fails after the mutation statements have already
+    /// run. The service code is untouched and knows nothing about it: the
+    /// failure arrives as an ordinary sqlx error from a real schema object.
+    async fn reject_sync_log_inserts(db: &DbPool) {
+        db_execute!(
+            db,
+            "CREATE TRIGGER reject_sync_log BEFORE INSERT ON sync_log \
+             BEGIN SELECT RAISE(ABORT, 'sync_log insert rejected'); END"
+        )
+        .expect("install sync_log rejection trigger");
+    }
+
+    /// Reject `sync_log` INSERTs for one entity id only.
+    ///
+    /// Same real trigger as [`reject_sync_log_inserts`], narrowed by a `WHEN`
+    /// clause. A service that writes several sync entries in one transaction
+    /// would otherwise always fail on the first one; scoping the rejection is
+    /// what puts the failure on a later write instead. `entity_id` is a test
+    /// constant — `CREATE TRIGGER` bodies cannot take bind parameters.
+    async fn reject_sync_log_inserts_for_entity(db: &DbPool, entity_id: &str) {
+        let sql = format!(
+            "CREATE TRIGGER reject_sync_log_for_entity BEFORE INSERT ON sync_log \
+             WHEN NEW.entity_id = '{entity_id}' \
+             BEGIN SELECT RAISE(ABORT, 'sync_log insert rejected'); END"
+        );
+        db_execute!(db, &sql).expect("install scoped sync_log rejection trigger");
+    }
+
+    async fn count_scalar(db: &DbPool, sql: &str, bind: &str) -> i64 {
+        db_fetch_scalar!(db, i64, sql, bind).expect("count query")
+    }
+
+    /// The label ids currently attached to an issue, in a stable order.
+    async fn issue_label_ids(db: &DbPool, issue_id: &str) -> Vec<String> {
+        #[derive(sqlx::FromRow)]
+        struct LabelIdRow {
+            label_id: String,
+        }
+
+        let rows: Vec<LabelIdRow> = db_fetch_all!(
+            db,
+            LabelIdRow,
+            "SELECT label_id FROM issue_labels WHERE issue_id = $1 ORDER BY label_id",
+            issue_id
+        )
+        .expect("read issue labels back");
+        rows.into_iter().map(|r| r.label_id).collect()
+    }
+
+    #[tokio::test]
+    async fn issue_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        add_workspace_backlog_status(&db).await;
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::issue_service::create_issue(
+            &db,
+            &trakkt_types::models::CreateIssueParams {
+                workspace_id: WS.to_string(),
+                team_id: "team_vis".to_string(),
+                creator_id: USER_A.to_string(),
+                title: "Never happened".to_string(),
+                description: None,
+                priority: 2,
+                assignee_id: None,
+                due_date: None,
+                label_ids: Vec::new(),
+                project_id: None,
+                milestone_id: None,
+                estimate: None,
+            },
+            None,
+        )
+        .await
+        .expect_err("a create whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM issues WHERE title = $1",
+                "Never happened"
+            )
+            .await,
+            0,
+            "an issue with no sync_log row is invisible to every future delta, \
+             so it must not survive the failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::comment_service::create_comment(
+            &db,
+            "iss_vis",
+            USER_A,
+            "Never happened",
+            None,
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a comment whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM comments WHERE body = $1",
+                "Never happened"
+            )
+            .await,
+            0,
+            "a comment with no sync_log row never reaches another client, so it \
+             must not survive the failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::issue_service::update_issue(
+            &db,
+            WS,
+            "VIS",
+            1,
+            &trakkt_types::models::IssueUpdate {
+                title: Some("Renamed in a doomed transaction".to_string()),
+                ..Default::default()
+            },
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an update whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "got: {err}"
+        );
+
+        let title: String =
+            db_fetch_scalar!(&db, String, "SELECT title FROM issues WHERE issue_id = $1", "iss_vis")
+                .expect("read issue title back");
+        assert_eq!(
+            title, "A leaky issue",
+            "the UPDATE must be rolled back, not left committed with no sync row"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::issue_service::delete_issue(&db, WS, "VIS", 1, None)
+            .await
+            .expect_err("a delete whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM issues WHERE issue_id = $1",
+                "iss_vis"
+            )
+            .await,
+            1,
+            "a delete with no sync_log row leaves every other client showing the \
+             issue forever, so the DELETE must be rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_labels_roll_back_when_their_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        let bug = crate::label_service::create_label(
+            &db, WS, "Bug", "#DC2626", Some("team_vis"), None,
+        )
+        .await
+        .expect("create label");
+        let regression = crate::label_service::create_label(
+            &db, WS, "Regression", "#B91C1C", Some("team_vis"), None,
+        )
+        .await
+        .expect("create second label");
+
+        // The prior state the rollback has to restore.
+        crate::issue_service::set_issue_labels(
+            &db,
+            "iss_vis",
+            std::slice::from_ref(&bug.label_id),
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("set the issue's initial labels");
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::issue_service::set_issue_labels(
+            &db,
+            "iss_vis",
+            std::slice::from_ref(&regression.label_id),
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a relabelling whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            issue_label_ids(&db, "iss_vis").await,
+            vec![bug.label_id.clone()],
+            "set_issue_labels deletes before it inserts — a failed sync entry \
+             must roll both back, not leave the issue relabelled with no sync \
+             row to report it"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_sort_order_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        crate::issue_service::set_sort_order(&db, WS, "VIS", 1, 5.0, None)
+            .await
+            .expect("set the issue's initial sort order");
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::issue_service::set_sort_order(&db, WS, "VIS", 1, 99.5, None)
+            .await
+            .expect_err("a reorder whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        let sort_order: f64 = db_fetch_scalar!(
+            &db,
+            f64,
+            "SELECT sort_order FROM issues WHERE issue_id = $1",
+            "iss_vis"
+        )
+        .expect("read sort_order back");
+        assert!(
+            (sort_order - 5.0).abs() < f64::EPSILON,
+            "the reorder must be rolled back — a board position no client is \
+             ever told about is worse than no reorder at all; got {sort_order}"
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_update_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        let comment = crate::comment_service::create_comment(
+            &db,
+            "iss_vis",
+            USER_A,
+            "The original body",
+            None,
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("create the comment being edited");
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::comment_service::update_comment(
+            &db,
+            &comment.comment_id,
+            USER_A,
+            "An edit nobody will ever see",
+            None,
+        )
+        .await
+        .expect_err("an edit whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        let body: String = db_fetch_scalar!(
+            &db,
+            String,
+            "SELECT body FROM comments WHERE comment_id = $1",
+            &comment.comment_id
+        )
+        .expect("read the comment body back");
+        assert_eq!(
+            body, "The original body",
+            "the edit must be rolled back, not left committed with no sync row \
+             to carry it to anyone else"
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        let comment = crate::comment_service::create_comment(
+            &db,
+            "iss_vis",
+            USER_A,
+            "The comment that survives",
+            None,
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("create the comment being deleted");
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::comment_service::delete_comment(&db, &comment.comment_id, USER_A, None)
+                .await
+                .expect_err("a delete whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM comments WHERE comment_id = $1",
+                &comment.comment_id
+            )
+            .await,
+            1,
+            "a delete with no sync_log row leaves the comment on every other \
+             client forever, so the DELETE must be rolled back"
+        );
+        let body: String = db_fetch_scalar!(
+            &db,
+            String,
+            "SELECT body FROM comments WHERE comment_id = $1",
+            &comment.comment_id
+        )
+        .expect("read the comment body back");
+        assert_eq!(body, "The comment that survives");
+    }
+
+    /// The blocked-issue loop inside `update_issue` writes its own sync entries,
+    /// one per issue whose derived `is_blocked` flag moves with this status
+    /// change. Those writes are reached only when `status_id` changes *and* a
+    /// blocking relation exists, so a title-only update never exercises them.
+    ///
+    /// The rejection is scoped to the blocked issue's id so the update's own
+    /// entry succeeds first and the loop's entry is the one that fails — the
+    /// failure has to unwind a transaction that already contains a good sync
+    /// row, which is the case a per-write `unwrap_or(0)` would silently commit.
+    #[tokio::test]
+    async fn issue_status_change_rolls_back_when_a_blocked_issues_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+
+        // Moving the blocker into this status is what clears the blocked flag.
+        db_execute!(
+            &db,
+            "INSERT INTO statuses (status_id, workspace_id, team_id, name, category) \
+             VALUES ($1, $2, $3, $4, $5)",
+            "sts_done",
+            WS,
+            "team_vis",
+            "Done",
+            "completed"
+        )
+        .expect("insert completed status");
+
+        db_execute!(
+            &db,
+            "INSERT INTO issues \
+                (issue_id, workspace_id, team_id, number, title, creator_id, status_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "iss_blocked",
+            WS,
+            "team_vis",
+            2_i32,
+            "Waiting on the leaky issue",
+            USER_A,
+            "sts_vis"
+        )
+        .expect("insert the blocked issue");
+
+        crate::relation_service::create_relation(
+            &db,
+            WS,
+            "iss_vis",
+            "iss_blocked",
+            "blocks",
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("iss_vis blocks iss_blocked");
+
+        let blocked_before = crate::issue_service::get_issue_by_id(&db, "iss_blocked")
+            .await
+            .expect("read the blocked issue")
+            .expect("the blocked issue exists");
+        assert!(
+            blocked_before.is_blocked,
+            "precondition: the blocker is not completed, so the issue is blocked"
+        );
+
+        reject_sync_log_inserts_for_entity(&db, "iss_blocked").await;
+
+        let err = crate::issue_service::update_issue(
+            &db,
+            WS,
+            "VIS",
+            1,
+            &trakkt_types::models::IssueUpdate {
+                status_id: Some("sts_done".to_string()),
+                ..Default::default()
+            },
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect_err(
+            "an update whose blocked-issue sync entry cannot be written must fail",
+        );
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        let status_id: String = db_fetch_scalar!(
+            &db,
+            String,
+            "SELECT status_id FROM issues WHERE issue_id = $1",
+            "iss_vis"
+        )
+        .expect("read the issue's status back");
+        assert_eq!(
+            status_id, "sts_vis",
+            "the status change must be rolled back — a blocked issue that never \
+             hears about it stays blocked on every other client"
+        );
+
+        let blocked_after = crate::issue_service::get_issue_by_id(&db, "iss_blocked")
+            .await
+            .expect("read the blocked issue")
+            .expect("the blocked issue exists");
+        assert!(
+            blocked_after.is_blocked,
+            "the blocked issue's derived state is computed from the blocker's \
+             status, so a committed status change would silently unblock it \
+             with no sync row to report either issue"
+        );
+
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM sync_log WHERE entity_id = $1",
+                "iss_vis"
+            )
+            .await,
+            0,
+            "the update's own sync entry succeeded before the loop failed, so it \
+             is proof of the rollback: it must not be left committed on its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_id_returned_in_the_transaction_addresses_the_committed_row() {
+        let db = two_user_workspace().await;
+
+        let mut tx = db.begin().await.expect("begin transaction");
+        let first = write_sync_entry_in_tx(
+            &mut tx,
+            entity_types::ISSUE,
+            "iss_first",
+            WS,
+            None,
+            SyncActionType::Insert,
+            None,
+        )
+        .await
+        .expect("first entry");
+        let second = write_sync_entry_in_tx(
+            &mut tx,
+            entity_types::ISSUE,
+            "iss_second",
+            WS,
+            None,
+            SyncActionType::Update,
+            None,
+        )
+        .await
+        .expect("second entry");
+        tx.commit().await.expect("commit transaction");
+
+        assert!(first > 0 && second > 0, "0 is never a real sync_log id");
+        assert_ne!(
+            first, second,
+            "each entry in the transaction must get its own id"
+        );
+
+        // The point of the check: the id handed back inside the transaction is
+        // the id of the row that actually landed, not of some other insert.
+        for (sync_id, expected_entity) in [(first, "iss_first"), (second, "iss_second")] {
+            let entity_id: String = db_fetch_scalar!(
+                &db,
+                String,
+                "SELECT entity_id FROM sync_log WHERE sync_id = $1",
+                sync_id
+            )
+            .expect("committed sync_log row");
+            assert_eq!(
+                entity_id, expected_entity,
+                "sync_id {sync_id} must address the row it was returned for"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_transaction_leaves_no_sync_entry() {
+        let db = two_user_workspace().await;
+
+        let mut tx = db.begin().await.expect("begin transaction");
+        let sync_id = write_sync_entry_in_tx(
+            &mut tx,
+            entity_types::ISSUE,
+            "iss_discarded",
+            WS,
+            None,
+            SyncActionType::Insert,
+            None,
+        )
+        .await
+        .expect("entry written inside the transaction");
+        tx.rollback().await.expect("roll back transaction");
+
+        assert!(
+            !is_sync_id_available(&db, WS, sync_id)
+                .await
+                .expect("check availability"),
+            "an entry from a rolled-back transaction must not be readable"
+        );
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM sync_log WHERE entity_id = $1",
+                "iss_discarded"
+            )
+            .await,
+            0,
+            "the row must be gone entirely"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_update_broadcasts_the_sync_id_it_committed() {
+        let db = two_user_workspace().await;
+        let manager = WebSocketManager::new(None, db.clone());
+
+        let mut conn = manager.connect(USER_B).expect("connection");
+        // Discard the connect heartbeat.
+        conn.rx.recv().await.expect("heartbeat frame");
+
+        crate::issue_service::update_issue(
+            &db,
+            WS,
+            "VIS",
+            1,
+            &trakkt_types::models::IssueUpdate {
+                title: Some("Renamed".to_string()),
+                ..Default::default()
+            },
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            Some(&manager),
+        )
+        .await
+        .expect("update issue");
+
+        let frame = conn.rx.recv().await.expect("broadcast frame");
+        let action = match serde_json::from_str::<SyncResponse>(&frame)
+            .expect("broadcast frame is a SyncResponse")
+        {
+            SyncResponse::SyncAction(action) => action,
+            other => panic!("expected a sync_action frame, got {other:?}"),
+        };
+
+        assert_eq!(action.entity_id, "iss_vis");
+        assert_ne!(
+            action.sync_id, 0,
+            "the live frame must carry the real sync_log id — 0 was the \
+             warn-and-continue substitute this change removed"
+        );
+
+        let committed: i64 = db_fetch_scalar!(
+            &db,
+            i64,
+            "SELECT MAX(sync_id) FROM sync_log WHERE entity_id = $1 AND action = $2",
+            "iss_vis",
+            "update"
+        )
+        .expect("committed sync_log row");
+        assert_eq!(
+            action.sync_id, committed,
+            "the broadcast id has to be the id of the row that was committed, \
+             or a client that misses the frame cannot spot the gap"
+        );
+
+        let payload: IssueWithDetails = serde_json::from_value(
+            action.data.expect("the frame carries the issue"),
+        )
+        .expect("frame payload deserializes as an issue");
+        assert_eq!(
+            payload.title, "Renamed",
+            "the broadcast must report the committed state"
         );
     }
 }

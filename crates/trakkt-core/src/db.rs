@@ -62,6 +62,27 @@ impl DbPool {
         matches!(self, Self::Sqlite(_))
     }
 
+    /// Open a transaction on whichever backend is active.
+    ///
+    /// See [`DbTx`] for the rules that apply while one is open — in particular
+    /// that the pool must not be queried until the transaction ends.
+    pub async fn begin(&self) -> crate::Result<DbTx> {
+        match self {
+            Self::Postgres(pg) => {
+                let tx = pg.begin().await.map_err(|e| {
+                    crate::Error::Internal(format!("failed to begin transaction: {e}"))
+                })?;
+                Ok(DbTx::Postgres(tx))
+            }
+            Self::Sqlite(sq) => {
+                let tx = sq.begin().await.map_err(|e| {
+                    crate::Error::Internal(format!("failed to begin transaction: {e}"))
+                })?;
+                Ok(DbTx::Sqlite(tx))
+            }
+        }
+    }
+
     /// Extract the inner `PgPool` for Postgres-only code paths.
     ///
     /// Panics if called on a SQLite pool.
@@ -70,6 +91,62 @@ impl DbPool {
             Self::Postgres(pg) => pg,
             Self::Sqlite(_) => panic!("pg_pool() called on SQLite pool"),
         }
+    }
+}
+
+/// An open database transaction — the transactional counterpart of [`DbPool`].
+///
+/// One variant per backend, each holding that backend's `sqlx::Transaction`.
+/// Statements run on it through the `tx_*` macros ([`tx_execute!`],
+/// [`tx_fetch_one!`], [`tx_fetch_optional!`], [`tx_fetch_all!`],
+/// [`tx_fetch_scalar!`], [`tx_with!`]), which mirror the `db_*` macros one for
+/// one and take a `&mut DbTx` in place of a `&DbPool`.
+///
+/// # Rollback
+///
+/// Dropping a `DbTx` without calling [`DbTx::commit`] rolls the transaction
+/// back, so propagating an error out of a function that owns one — `?` on any
+/// statement — is a rollback. [`DbTx::rollback`] states that explicitly for
+/// error paths that are not a `?` (a business-rule rejection, say).
+///
+/// # No pool access while open
+///
+/// The SQLite pool is pinned to a single connection (see [`DbPool::connect`]),
+/// which the transaction holds for its whole lifetime. Any `db_*` call issued
+/// against the pool before the transaction ends therefore waits on a connection
+/// that cannot be released until it does. Everything needed between `begin` and
+/// `commit` must go through the transaction, and side effects that touch the
+/// pool — WebSocket broadcasts, notification writes — belong after the commit.
+///
+/// The same property is what makes `SELECT last_insert_rowid()` correct on
+/// SQLite: the INSERT and the rowid read share one connection by construction
+/// rather than by pool configuration.
+pub enum DbTx {
+    Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
+    Sqlite(sqlx::Transaction<'static, sqlx::Sqlite>),
+}
+
+impl DbTx {
+    pub fn is_postgres(&self) -> bool {
+        matches!(self, Self::Postgres(_))
+    }
+
+    /// Commit the transaction, making every statement run on it durable.
+    pub async fn commit(self) -> crate::Result<()> {
+        match self {
+            Self::Postgres(tx) => tx.commit().await,
+            Self::Sqlite(tx) => tx.commit().await,
+        }
+        .map_err(|e| crate::Error::Internal(format!("failed to commit transaction: {e}")))
+    }
+
+    /// Roll the transaction back, discarding every statement run on it.
+    pub async fn rollback(self) -> crate::Result<()> {
+        match self {
+            Self::Postgres(tx) => tx.rollback().await,
+            Self::Sqlite(tx) => tx.rollback().await,
+        }
+        .map_err(|e| crate::Error::Internal(format!("failed to roll back transaction: {e}")))
     }
 }
 
@@ -202,6 +279,105 @@ macro_rules! db_fetch_scalar {
                 sqlx::query_scalar::<_, $type>($query)$(.bind($bind))*.fetch_one(pg).await,
             $crate::db::DbPool::Sqlite(sq) =>
                 sqlx::query_scalar::<_, $type>($query)$(.bind($bind))*.fetch_one(sq).await,
+        }
+    }
+}
+
+// ─── Transaction-scoped query macros ─────────────────────────────────────────
+//
+// One per `db_*` macro above, with the same argument order and the same return
+// type. The first argument is a `&mut DbTx` rather than a `&DbPool`: write
+// `tx_execute!(&mut tx, …)` where `tx` is owned, or `tx_execute!(&mut *tx, …)`
+// to reborrow a `&mut DbTx` parameter.
+
+/// Execute a query on an open transaction without returning rows.
+///
+/// Transaction-scoped [`db_execute!`].
+#[macro_export]
+macro_rules! tx_execute {
+    ($tx:expr, $query:expr $(, $bind:expr)*) => {
+        match $tx {
+            $crate::db::DbTx::Postgres(t) =>
+                sqlx::query($query)$(.bind($bind))*.execute(&mut **t).await
+                    .map($crate::db::DbQueryResult::from_pg),
+            $crate::db::DbTx::Sqlite(t) =>
+                sqlx::query($query)$(.bind($bind))*.execute(&mut **t).await
+                    .map($crate::db::DbQueryResult::from_sqlite),
+        }
+    }
+}
+
+/// Fetch exactly one typed row on an open transaction.
+///
+/// Transaction-scoped [`db_fetch_one!`].
+#[macro_export]
+macro_rules! tx_fetch_one {
+    ($tx:expr, $type:ty, $query:expr $(, $bind:expr)*) => {
+        match $tx {
+            $crate::db::DbTx::Postgres(t) =>
+                sqlx::query_as::<_, $type>($query)$(.bind($bind))*.fetch_one(&mut **t).await,
+            $crate::db::DbTx::Sqlite(t) =>
+                sqlx::query_as::<_, $type>($query)$(.bind($bind))*.fetch_one(&mut **t).await,
+        }
+    }
+}
+
+/// Fetch zero or one typed row on an open transaction.
+///
+/// Transaction-scoped [`db_fetch_optional!`].
+#[macro_export]
+macro_rules! tx_fetch_optional {
+    ($tx:expr, $type:ty, $query:expr $(, $bind:expr)*) => {
+        match $tx {
+            $crate::db::DbTx::Postgres(t) =>
+                sqlx::query_as::<_, $type>($query)$(.bind($bind))*.fetch_optional(&mut **t).await,
+            $crate::db::DbTx::Sqlite(t) =>
+                sqlx::query_as::<_, $type>($query)$(.bind($bind))*.fetch_optional(&mut **t).await,
+        }
+    }
+}
+
+/// Fetch all typed rows on an open transaction.
+///
+/// Transaction-scoped [`db_fetch_all!`].
+#[macro_export]
+macro_rules! tx_fetch_all {
+    ($tx:expr, $type:ty, $query:expr $(, $bind:expr)*) => {
+        match $tx {
+            $crate::db::DbTx::Postgres(t) =>
+                sqlx::query_as::<_, $type>($query)$(.bind($bind))*.fetch_all(&mut **t).await,
+            $crate::db::DbTx::Sqlite(t) =>
+                sqlx::query_as::<_, $type>($query)$(.bind($bind))*.fetch_all(&mut **t).await,
+        }
+    }
+}
+
+/// Fetch a single scalar value on an open transaction.
+///
+/// Transaction-scoped [`db_fetch_scalar!`].
+#[macro_export]
+macro_rules! tx_fetch_scalar {
+    ($tx:expr, $type:ty, $query:expr $(, $bind:expr)*) => {
+        match $tx {
+            $crate::db::DbTx::Postgres(t) =>
+                sqlx::query_scalar::<_, $type>($query)$(.bind($bind))*.fetch_one(&mut **t).await,
+            $crate::db::DbTx::Sqlite(t) =>
+                sqlx::query_scalar::<_, $type>($query)$(.bind($bind))*.fetch_one(&mut **t).await,
+        }
+    }
+}
+
+/// Dispatch to whichever transaction variant is active, for queries whose binds
+/// are built at runtime.
+///
+/// Transaction-scoped [`db_with_pool!`]. The closure receives `e`, a
+/// `&mut PgConnection` or `&mut SqliteConnection` inside the transaction.
+#[macro_export]
+macro_rules! tx_with {
+    ($tx:expr, |$e:ident| $body:expr) => {
+        match $tx {
+            $crate::db::DbTx::Postgres(t) => { let $e = &mut **t; $body }
+            $crate::db::DbTx::Sqlite(t) => { let $e = &mut **t; $body }
         }
     }
 }
