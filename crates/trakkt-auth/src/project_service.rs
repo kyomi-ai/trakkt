@@ -6,7 +6,6 @@
 //! Projects are workspace-scoped containers that group issues towards a common
 //! goal. Each project can have members, milestones, and periodic health updates.
 
-use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use trakkt_types::models::{Project, ProjectMember, ProjectMilestone, ProjectProgress, ProjectUpdate};
@@ -234,36 +233,6 @@ pub async fn get_project_in_workspace(
         .ok_or_else(|| trakkt_core::Error::NotFound(format!("project {project_id} not found")))
 }
 
-/// Build the sync payload for an insert or update of `entity_type`.
-///
-/// Every caller passes the row it just read back from the database, so the
-/// value serialized here is the same shape a bootstrap would stream for that
-/// entity type.
-///
-/// An entry with no payload is skipped outright by the client — on the live
-/// frame and on delta alike — because `cache/apply.rs` returns on a data-less
-/// insert/update *before* it reaches the entity-type match. A dropped payload
-/// is therefore a silently frozen UI, not a cosmetic loss, so a serialization
-/// failure is logged rather than discarded with `.ok()`.
-fn sync_payload<T: serde::Serialize>(
-    entity: &T,
-    entity_type: &str,
-    entity_id: &str,
-) -> Option<serde_json::Value> {
-    match serde_json::to_value(entity) {
-        Ok(value) => Some(value),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                entity_type,
-                entity_id,
-                "Failed to serialize entity for sync payload"
-            );
-            None
-        }
-    }
-}
-
 /// The sync `entity_id` for a project membership.
 ///
 /// `project_members` has a composite primary key and no surrogate id, so the
@@ -272,59 +241,6 @@ fn sync_payload<T: serde::Serialize>(
 /// row the add upserted.
 fn project_member_entity_id(project_id: &str, user_id: &str) -> String {
     format!("{project_id}:{user_id}")
-}
-
-/// Finish a mutation whose statements have already run on `tx`: log the change,
-/// commit, then broadcast.
-///
-/// Every mutation in this module ends this way, and the ordering is the part
-/// that has to be right every time — the `sync_log` entry inside the
-/// transaction so the change and the row that replays it commit together, the
-/// broadcast strictly after the commit so it carries a `sync_id` that exists and
-/// so it never runs while the transaction holds the SQLite connection (see
-/// [`DbTx`]).
-///
-/// Takes the transaction by value: committing it is part of the job, and no
-/// caller has anything left to do on it. Anything the entry's payload needs read
-/// back from the database is read by the caller *on this transaction* before
-/// handing it over — the new state is not visible on the pool until the commit,
-/// and on SQLite the pool is not reachable at all while the transaction is open.
-async fn commit_and_broadcast(
-    mut tx: DbTx,
-    entity_type: &str,
-    entity_id: &str,
-    workspace_id: &str,
-    action: SyncActionType,
-    payload: Option<serde_json::Value>,
-    ws_manager: Option<&WebSocketManager>,
-) -> trakkt_core::Result<()> {
-    let sync_id = sync_log_service::write_sync_entry_in_tx(
-        &mut tx,
-        entity_type,
-        entity_id,
-        workspace_id,
-        None,
-        action.clone(),
-        payload.clone(),
-    )
-    .await?;
-
-    tx.commit().await?;
-
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_type,
-            entity_id,
-            action,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
-
-    Ok(())
 }
 
 /// Parameters for creating a new project.
@@ -390,9 +306,10 @@ pub async fn create_project(
         &project_id
     )?;
     let project = row.into_dto();
-    let payload = sync_payload(&project, entity_types::PROJECT, &project.project_id);
+    let payload =
+        sync_log_service::sync_payload(&project, entity_types::PROJECT, &project.project_id);
 
-    commit_and_broadcast(
+    sync_log_service::commit_and_broadcast(
         tx,
         entity_types::PROJECT,
         &project_id,
@@ -549,9 +466,10 @@ pub async fn update_project(
         params.project_id
     )?;
     let project = row.into_dto();
-    let payload = sync_payload(&project, entity_types::PROJECT, &project.project_id);
+    let payload =
+        sync_log_service::sync_payload(&project, entity_types::PROJECT, &project.project_id);
 
-    commit_and_broadcast(
+    sync_log_service::commit_and_broadcast(
         tx,
         entity_types::PROJECT,
         params.project_id,
@@ -604,7 +522,7 @@ pub async fn delete_project(
 
     // The sync entry follows the DELETE it describes — the same order as
     // `issue_service::delete_issue` and `team_service::delete_team`.
-    commit_and_broadcast(
+    sync_log_service::commit_and_broadcast(
         tx,
         entity_types::PROJECT,
         project_id,
@@ -683,14 +601,14 @@ pub async fn add_project_member(
     )?;
     let member = row.into_dto();
     let entity_id = project_member_entity_id(project_id, user_id);
-    let payload = sync_payload(&member, entity_types::PROJECT_MEMBER, &entity_id);
+    let payload = sync_log_service::sync_payload(&member, entity_types::PROJECT_MEMBER, &entity_id);
 
     // The membership is its own entity type rather than an update to the parent
     // project: the INSERT above is the only write this function makes, so the
     // `projects` row is byte-identical afterwards. Reporting it as a PROJECT
     // update would make every connected client re-upsert an unchanged project
     // and would still leave the membership itself invisible.
-    commit_and_broadcast(
+    sync_log_service::commit_and_broadcast(
         tx,
         entity_types::PROJECT_MEMBER,
         &entity_id,
@@ -742,7 +660,7 @@ pub async fn remove_project_member(
 
     // A delete carries no payload: there is no row left to send, and the client
     // reads the entity id alone to drop the cached row and bump its counter.
-    commit_and_broadcast(
+    sync_log_service::commit_and_broadcast(
         tx,
         entity_types::PROJECT_MEMBER,
         &entity_id,
@@ -843,13 +761,13 @@ pub async fn create_milestone(
         &milestone_id
     )?;
     let milestone = row.into_dto();
-    let payload = sync_payload(
+    let payload = sync_log_service::sync_payload(
         &milestone,
         entity_types::PROJECT_MILESTONE,
         &milestone.milestone_id,
     );
 
-    commit_and_broadcast(
+    sync_log_service::commit_and_broadcast(
         tx,
         entity_types::PROJECT_MILESTONE,
         &milestone_id,
@@ -954,13 +872,13 @@ pub async fn update_milestone(
         milestone_id
     )?;
     let milestone = row.into_dto();
-    let payload = sync_payload(
+    let payload = sync_log_service::sync_payload(
         &milestone,
         entity_types::PROJECT_MILESTONE,
         &milestone.milestone_id,
     );
 
-    commit_and_broadcast(
+    sync_log_service::commit_and_broadcast(
         tx,
         entity_types::PROJECT_MILESTONE,
         milestone_id,
@@ -1002,7 +920,7 @@ pub async fn delete_milestone(
         )));
     }
 
-    commit_and_broadcast(
+    sync_log_service::commit_and_broadcast(
         tx,
         entity_types::PROJECT_MILESTONE,
         milestone_id,
@@ -1080,14 +998,18 @@ pub async fn create_project_update(
         &update_id
     )?;
     let update = row.into_dto();
-    let payload = sync_payload(&update, entity_types::PROJECT_UPDATE, &update.update_id);
+    let payload = sync_log_service::sync_payload(
+        &update,
+        entity_types::PROJECT_UPDATE,
+        &update.update_id,
+    );
 
     // The posted update is its own entity type rather than an update to the
     // parent project: the INSERT above is the only write this function makes, so
     // the `projects` row is byte-identical afterwards. Reporting it as a PROJECT
     // update would make every connected client re-upsert an unchanged project
     // and would still leave the posted update itself invisible.
-    commit_and_broadcast(
+    sync_log_service::commit_and_broadcast(
         tx,
         entity_types::PROJECT_UPDATE,
         &update_id,

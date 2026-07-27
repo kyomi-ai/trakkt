@@ -5,6 +5,11 @@
 //! Attachments are workspace-scoped file records. The actual file data is stored
 //! via `AttachmentStorage` (local filesystem or S3), while this service manages
 //! the database records and validation logic.
+//!
+//! Nothing in this module touches object storage. The blob writes live in
+//! `trakkt-api`'s attachment handlers, outside any transaction, ordered so a
+//! failure wastes storage rather than leaving a row pointing at a blob that is
+//! not there — see `crates/trakkt-api/src/attachments.rs`.
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
@@ -111,6 +116,15 @@ pub fn validate_file_size(size: usize) -> trakkt_core::Result<()> {
 // ─── Service functions ───────────────────────────────────────────────────────
 
 /// Insert a new attachment record.
+///
+/// The INSERT and its `sync_log` entry are one transaction: an attachment that
+/// commits without its sync row is invisible to every future delta, so a failed
+/// log write rolls the record back rather than leaving it stranded.
+///
+/// The stored blob is written by the caller *before* this function runs, so a
+/// rollback here leaves an orphaned blob and no row — wasted storage, which is
+/// the failure this ordering is chosen for. The reverse order would leave a row
+/// pointing at a blob that was never stored.
 pub async fn create_attachment(
     db: &DbPool,
     workspace_id: &str,
@@ -129,8 +143,10 @@ pub async fn create_attachment(
         "INSERT INTO attachments (attachment_id, workspace_id, filename, content_type, size_bytes, storage_path, uploaded_by, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, {now})"
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &attachment_id,
         workspace_id,
@@ -141,25 +157,10 @@ pub async fn create_attachment(
         uploaded_by
     )?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
-        entity_types::ATTACHMENT,
-        &attachment_id,
-        workspace_id,
-        None,
-        SyncActionType::Insert,
-        None,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, attachment_id = %attachment_id, "Failed to write sync log entry for attachment create");
-        0
-    });
-
-    // Re-fetch to get the DB-assigned created_at.
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    // Re-fetch to get the DB-assigned created_at. The row does not exist outside
+    // the transaction yet, so the read runs on it.
+    let row: AttachmentRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         AttachmentRow,
         "SELECT attachment_id, workspace_id, filename, content_type, size_bytes, storage_path, uploaded_by, \
                 CAST(created_at AS TEXT) AS created_at \
@@ -167,20 +168,19 @@ pub async fn create_attachment(
         &attachment_id
     )?;
     let attachment = row.into_dto();
+    let payload =
+        sync_log_service::sync_payload(&attachment, entity_types::ATTACHMENT, &attachment_id);
 
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::ATTACHMENT,
-            &attachment_id,
-            SyncActionType::Insert,
-            serde_json::to_value(&attachment).ok(),
-            sync_id,
-        )
-        .await;
-    }
+    sync_log_service::commit_and_broadcast(
+        tx,
+        entity_types::ATTACHMENT,
+        &attachment_id,
+        workspace_id,
+        SyncActionType::Insert,
+        payload,
+        ws_manager,
+    )
+    .await?;
 
     Ok(attachment)
 }
@@ -225,6 +225,16 @@ pub async fn list_attachments(
 
 /// Delete an attachment record.
 /// Returns the storage_path so the caller can delete the stored file.
+///
+/// The DELETE, the `issue_attachments` links the schema cascades with it, and
+/// the `sync_log` entry that reports it are one transaction. A delete that
+/// commits without its sync row leaves the attachment on every other client
+/// forever, and no later delta can repair it — the row it would have to re-read
+/// is gone.
+///
+/// The `storage_path` is returned only on success, so an `Err` here stops the
+/// caller's blob delete at its `?`: the row and its blob survive together rather
+/// than the blob being destroyed under a row that was rolled back.
 pub async fn delete_attachment(
     db: &DbPool,
     attachment_id: &str,
@@ -232,7 +242,10 @@ pub async fn delete_attachment(
     user_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<String> {
-    // Fetch the attachment first to check ownership
+    // Fetch the attachment first to check ownership. This reads state that
+    // predates the transaction, and the check below is authorization, so both
+    // stay on the pool ahead of `begin` — once the transaction is open the pool
+    // is unreachable on SQLite (see `DbTx`).
     let attachment = get_attachment(db, attachment_id, workspace_id).await?;
 
     // Only the uploader can delete (workspace admin check happens at the API layer)
@@ -242,42 +255,25 @@ pub async fn delete_attachment(
         ));
     }
 
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM attachments WHERE attachment_id = $1 AND workspace_id = $2",
         attachment_id,
         workspace_id
     )?;
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_broadcast(
+        tx,
         entity_types::ATTACHMENT,
         attachment_id,
         workspace_id,
-        None,
         SyncActionType::Delete,
         None,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, attachment_id = %attachment_id, "Failed to write sync log entry for attachment delete");
-        0
-    });
-
-    // WebSocket broadcast — delete has no entity data.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::ATTACHMENT,
-            attachment_id,
-            SyncActionType::Delete,
-            None,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(attachment.storage_path)
 }
@@ -289,6 +285,10 @@ pub async fn delete_attachment(
 /// Verifies that the attachment belongs to the given workspace, then inserts
 /// into the `issue_attachments` junction table. Uses `ON CONFLICT DO NOTHING`
 /// so re-attaching is idempotent.
+///
+/// The INSERT and its `sync_log` entry are one transaction. `issue_attachments`
+/// is not an entity type a delta re-reads, so a link that commits without its
+/// sync row can never be repaired — it simply never reaches another client.
 pub async fn attach_to_issue(
     db: &DbPool,
     workspace_id: &str,
@@ -296,7 +296,9 @@ pub async fn attach_to_issue(
     attachment_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    // Verify attachment belongs to workspace.
+    // Verify attachment belongs to workspace. This is authorization over state
+    // that predates the transaction, so it stays on the pool ahead of `begin`
+    // (see `DbTx`) — as does the issue check below.
     let _attachment = get_attachment(db, attachment_id, workspace_id).await?;
 
     // Verify issue belongs to workspace.
@@ -321,39 +323,22 @@ pub async fn attach_to_issue(
          VALUES ($1, $2, {now}) \
          ON CONFLICT (issue_id, attachment_id) DO NOTHING"
     );
-    trakkt_core::db_execute!(db, &sql, issue_id, attachment_id)?;
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(&mut tx, &sql, issue_id, attachment_id)?;
 
     let entity_id = format!("{issue_id}:{attachment_id}");
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_broadcast(
+        tx,
         entity_types::ISSUE_ATTACHMENT,
         &entity_id,
         workspace_id,
-        None,
         SyncActionType::Insert,
         None,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, %entity_id, "Failed to write sync log entry for issue attachment link");
-        0
-    });
-
-    // WebSocket broadcast.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::ISSUE_ATTACHMENT,
-            &entity_id,
-            SyncActionType::Insert,
-            None,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(())
 }
@@ -362,6 +347,10 @@ pub async fn attach_to_issue(
 ///
 /// Removes the row from the `issue_attachments` junction table. Does NOT
 /// delete the attachment record itself.
+///
+/// The DELETE and its `sync_log` entry are one transaction — an unlink that
+/// commits without its sync row leaves the attachment hanging off the issue on
+/// every other client forever, and no later delta can repair it.
 pub async fn detach_from_issue(
     db: &DbPool,
     workspace_id: &str,
@@ -369,16 +358,21 @@ pub async fn detach_from_issue(
     attachment_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
+    // Authorization over state that predates the transaction, so it stays on the
+    // pool ahead of `begin` (see `DbTx`).
     let _attachment = get_attachment(db, attachment_id, workspace_id).await?;
 
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM issue_attachments WHERE issue_id = $1 AND attachment_id = $2",
         issue_id,
         attachment_id
     )?;
 
     if result.rows_affected() == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "Attachment '{attachment_id}' is not linked to issue '{issue_id}'"
         )));
@@ -386,35 +380,16 @@ pub async fn detach_from_issue(
 
     let entity_id = format!("{issue_id}:{attachment_id}");
 
-    // Sync log — best-effort.
-    let sync_id = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_broadcast(
+        tx,
         entity_types::ISSUE_ATTACHMENT,
         &entity_id,
         workspace_id,
-        None,
         SyncActionType::Delete,
         None,
+        ws_manager,
     )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, %entity_id, "Failed to write sync log entry for issue attachment unlink");
-        0
-    });
-
-    // WebSocket broadcast.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::ISSUE_ATTACHMENT,
-            &entity_id,
-            SyncActionType::Delete,
-            None,
-            sync_id,
-        )
-        .await;
-    }
+    .await?;
 
     Ok(())
 }

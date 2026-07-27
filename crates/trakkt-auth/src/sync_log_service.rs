@@ -524,6 +524,99 @@ fn sync_action_frame(
     }
 }
 
+// ─── Mutation completion ─────────────────────────────────────────────────────
+
+/// Build the sync payload for an insert or update of `entity_type`.
+///
+/// Callers pass the row they just read back from the database, so the value
+/// serialized here is the same shape a bootstrap would stream for that entity
+/// type.
+///
+/// An entry with no payload is skipped outright by the client — on the live
+/// frame and on delta alike — because `cache/apply.rs` returns on a data-less
+/// insert/update *before* it reaches the entity-type match. A dropped payload is
+/// therefore a silently frozen UI, not a cosmetic loss, so a serialization
+/// failure is logged rather than discarded with `.ok()`.
+pub(crate) fn sync_payload<T: serde::Serialize>(
+    entity: &T,
+    entity_type: &str,
+    entity_id: &str,
+) -> Option<serde_json::Value> {
+    match serde_json::to_value(entity) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                entity_type,
+                entity_id,
+                "Failed to serialize entity for sync payload"
+            );
+            None
+        }
+    }
+}
+
+/// Finish a mutation whose statements have already run on `tx`: log the change,
+/// commit, then broadcast.
+///
+/// This is the shared tail of every transactional mutation in the service layer,
+/// and the ordering is the part that has to be right every time — the `sync_log`
+/// entry inside the transaction so the change and the row that replays it commit
+/// together, the broadcast strictly after the commit so it carries a `sync_id`
+/// that exists and so it never runs while the transaction holds the SQLite
+/// connection (see [`DbTx`]).
+///
+/// Takes the transaction by value: committing it is part of the job, and no
+/// caller has anything left to do on it. Anything the entry's payload needs read
+/// back from the database is read by the caller *on this transaction* before
+/// handing it over — the new state is not visible on the pool until the commit,
+/// and on SQLite the pool is not reachable at all while the transaction is open.
+///
+/// Not every commit-then-broadcast helper belongs here.
+/// `team_service::commit_team_update` reads the same way at a glance but is a
+/// different function: it does its own transaction-scoped read-back of the team,
+/// hard-codes the TEAM entity type and the `Update` action, and returns the row
+/// it read to its caller. Generalising it into this signature would take a
+/// read-back callback and a second return type to serve one module — a worse
+/// abstraction, not a shared one. Leave it where it is.
+pub(crate) async fn commit_and_broadcast(
+    mut tx: DbTx,
+    entity_type: &str,
+    entity_id: &str,
+    workspace_id: &str,
+    action: SyncActionType,
+    payload: Option<serde_json::Value>,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    let sync_id = write_sync_entry_in_tx(
+        &mut tx,
+        entity_type,
+        entity_id,
+        workspace_id,
+        None,
+        action.clone(),
+        payload.clone(),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    if let Some(ws) = ws_manager {
+        broadcast_sync_action(
+            ws,
+            workspace_id,
+            entity_type,
+            entity_id,
+            action,
+            payload,
+            sync_id,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4348,6 +4441,266 @@ mod tests {
             "`project_updates` is not an entity type a delta re-reads, so a \
              posted update that committed without its sync row would never reach \
              another client — the INSERT must be rolled back"
+        );
+    }
+
+    // ─── Atomic attachment mutation + sync entry (TRA-9949) ──────────────────
+
+    /// Two attachments in `WS`, one already linked to the fixture issue and one
+    /// loose.
+    ///
+    /// Both are needed, and for opposite reasons. `detach_from_issue` returns
+    /// `NotFound` before it ever reaches its sync entry unless the link is
+    /// already there, and `attach_to_issue` inserts `ON CONFLICT DO NOTHING`, so
+    /// pointing it at an already-linked attachment would make its INSERT a
+    /// no-op and leave the rollback assertion with nothing to prove. `att_linked`
+    /// covers the first case, `att_loose` the second.
+    ///
+    /// Written with plain INSERTs rather than through `attachment_service`, so
+    /// the seeding itself writes no `sync_log` row — every test below installs
+    /// its rejection trigger afterwards and the only write left to reject is the
+    /// one under test. The ids are fixed for the same reason `seed_doomed_team`
+    /// and `seed_project` fix theirs: a narrowed `CREATE TRIGGER` cannot take
+    /// bind parameters.
+    ///
+    /// This is a service-layer fixture, so it says nothing about object storage.
+    /// `storage_path` here is just the column the service carries; no test in
+    /// this module can observe whether a blob exists, because the service never
+    /// touches one — see `crates/trakkt-api/src/attachments.rs` for where the
+    /// blob writes actually live.
+    async fn seed_attachments(db: &DbPool) {
+        for (attachment_id, filename) in [
+            ("att_linked", "already-on-the-issue.png"),
+            ("att_loose", "not-linked-yet.png"),
+        ] {
+            db_execute!(
+                db,
+                "INSERT INTO attachments \
+                    (attachment_id, workspace_id, filename, content_type, size_bytes, \
+                     storage_path, uploaded_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                attachment_id,
+                WS,
+                filename,
+                "image/png",
+                1234_i64,
+                format!("{WS}/{attachment_id}.png"),
+                USER_A
+            )
+            .expect("insert attachment");
+        }
+
+        db_execute!(
+            db,
+            "INSERT INTO issue_attachments (issue_id, attachment_id) VALUES ($1, $2)",
+            "iss_vis",
+            "att_linked"
+        )
+        .expect("link att_linked to the fixture issue");
+    }
+
+    /// Every attachment, in a stable order, with every column a rollback has to
+    /// restore.
+    async fn attachment_rows(db: &DbPool) -> Vec<(String, String, String, String, i64, String)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            attachment_id: String,
+            workspace_id: String,
+            filename: String,
+            content_type: String,
+            size_bytes: i64,
+            uploaded_by: String,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT attachment_id, workspace_id, filename, content_type, size_bytes, \
+                    uploaded_by \
+             FROM attachments ORDER BY attachment_id"
+        )
+        .expect("read attachments");
+        rows.into_iter()
+            .map(|r| {
+                (
+                    r.attachment_id,
+                    r.workspace_id,
+                    r.filename,
+                    r.content_type,
+                    r.size_bytes,
+                    r.uploaded_by,
+                )
+            })
+            .collect()
+    }
+
+    /// Every issue/attachment link, in a stable order.
+    async fn issue_attachment_links(db: &DbPool) -> Vec<(String, String)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            issue_id: String,
+            attachment_id: String,
+        }
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT issue_id, attachment_id FROM issue_attachments \
+             ORDER BY issue_id, attachment_id"
+        )
+        .expect("read issue attachment links");
+        rows.into_iter()
+            .map(|r| (r.issue_id, r.attachment_id))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn attachment_create_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_attachments(&db).await;
+        let before = attachment_rows(&db).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::attachment_service::create_attachment(
+            &db,
+            WS,
+            "never-happened.png",
+            "image/png",
+            4096,
+            "ws_visibility/never-happened.png",
+            USER_A,
+            None,
+        )
+        .await
+        .expect_err("a create whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            attachment_rows(&db).await,
+            before,
+            "an attachment row with no sync_log row is invisible to every future \
+             delta, so it must not survive the failed write"
+        );
+    }
+
+    /// `attachments.attachment_id` is the target of an `ON DELETE CASCADE` from
+    /// `issue_attachments`, so rejecting the sync entry has to unwind the link
+    /// the DELETE cascaded away as well as the attachment row itself.
+    #[tokio::test]
+    async fn attachment_delete_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_attachments(&db).await;
+        let attachments_before = attachment_rows(&db).await;
+        let links_before = issue_attachment_links(&db).await;
+        assert!(
+            links_before.contains(&("iss_vis".to_string(), "att_linked".to_string())),
+            "precondition: the link the DELETE has to cascade away is really \
+             there, otherwise the cascade assertion below proves nothing; got \
+             {links_before:?}"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::attachment_service::delete_attachment(
+            &db,
+            "att_linked",
+            WS,
+            USER_A,
+            None,
+        )
+        .await
+        .expect_err("a delete whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            attachment_rows(&db).await,
+            attachments_before,
+            "an attachment delete with no sync_log row leaves the attachment on \
+             every other client forever, and no later delta can repair it — the \
+             row it would have to re-read is gone. The DELETE must be rolled back"
+        );
+        assert_eq!(
+            issue_attachment_links(&db).await,
+            links_before,
+            "the issue link the DELETE cascaded away must be back — the rollback \
+             has to unwind the schema's ON DELETE CASCADE too"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_attach_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_attachments(&db).await;
+        let before = issue_attachment_links(&db).await;
+        assert!(
+            !before.contains(&("iss_vis".to_string(), "att_loose".to_string())),
+            "precondition: `att_loose` is not linked yet, so the INSERT under \
+             test really inserts rather than falling into ON CONFLICT DO \
+             NOTHING; got {before:?}"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::attachment_service::attach_to_issue(&db, WS, "iss_vis", "att_loose", None)
+                .await
+                .expect_err("an attach whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            issue_attachment_links(&db).await,
+            before,
+            "`issue_attachments` is not an entity type a delta re-reads, so no \
+             later delta can repair a link that committed without its sync row — \
+             the INSERT must be rolled back"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_detach_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        seed_attachments(&db).await;
+        let before = issue_attachment_links(&db).await;
+        assert!(
+            before.contains(&("iss_vis".to_string(), "att_linked".to_string())),
+            "precondition: the link the detach has to remove is really there, \
+             otherwise the call returns NotFound before it ever reaches its sync \
+             entry; got {before:?}"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::attachment_service::detach_from_issue(&db, WS, "iss_vis", "att_linked", None)
+                .await
+                .expect_err("a detach whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            issue_attachment_links(&db).await,
+            before,
+            "an unlink with no sync row leaves the attachment hanging off the \
+             issue on every other client forever, so the DELETE must be rolled \
+             back"
         );
     }
 }
