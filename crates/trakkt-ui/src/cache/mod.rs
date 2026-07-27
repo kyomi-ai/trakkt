@@ -40,6 +40,14 @@ pub mod apply;
 /// two halves it orders are `wasm32`-only.
 pub mod hydration_gate;
 
+/// Where a tab sends the cache deletes its own UI initiates: onto the writer
+/// queue if it owns the cache, or over the broadcast channel to the tab that
+/// does.
+///
+/// Not target-gated: the leader's route is pure Rust over the writer queue and
+/// unit tested natively, while the follower's transport is `wasm32`-only.
+pub mod delete_route;
+
 /// Cross-tab leader election and the leader→follower broadcast channel.
 ///
 /// Not target-gated: the wire format is pure Rust and tested natively, while

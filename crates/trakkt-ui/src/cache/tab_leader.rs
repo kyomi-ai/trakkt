@@ -55,13 +55,38 @@ use web_sys::{BroadcastChannel, MessageEvent};
 
 // ── Wire format (all targets) ───────────────────────────────────────────────
 
-/// A message published by the leader tab to its followers.
+/// One record in the shared entity cache.
+///
+/// The cache is keyed by `(entity_type, workspace_id, entity_id)` and the
+/// channel is already scoped to a single workspace, so these two fields name a
+/// row uniquely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedEntity {
+    pub entity_type: String,
+    pub entity_id: String,
+}
+
+impl CachedEntity {
+    pub fn new(entity_type: &str, entity_id: &str) -> Self {
+        Self {
+            entity_type: entity_type.to_owned(),
+            entity_id: entity_id.to_owned(),
+        }
+    }
+}
+
+/// A message published between the tabs sharing one workspace's cache.
 ///
 /// Serialized as JSON with a `type` discriminator, matching the shape of the
 /// server's own [`trakkt_types::sync::SyncResponse`] envelope. The format is a
 /// contract between tabs of the *same* build only — it never crosses the
 /// network — but keeping it explicit means a stale tab that fails to decode a
 /// message logs a warning instead of silently mis-applying it.
+///
+/// Almost every variant travels leader→follower and reports a write the leader
+/// has **already** committed. [`SyncBroadcastMessage::CacheDelete`] is the one
+/// that travels the other way: it *requests* a write, because a follower tab
+/// has no cache writer of its own to perform it with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SyncBroadcastMessage {
@@ -72,6 +97,15 @@ pub enum SyncBroadcastMessage {
     /// The leader is wiping the shared cache and re-bootstrapping. Followers
     /// drop their in-memory state; the re-bootstrap stream refills it.
     Reset,
+    /// A tab that does not own the cache asks the leader to delete these
+    /// records from it.
+    ///
+    /// Only the leader acts on this — it enqueues the deletes on the same FIFO
+    /// writer the sync stream uses, so a UI-initiated delete is ordered against
+    /// the stream's writes to the same object store instead of racing them.
+    /// Tabs that are not the leader ignore it. See
+    /// [`crate::cache::delete_route`].
+    CacheDelete { entities: Vec<CachedEntity> },
 }
 
 impl SyncBroadcastMessage {

@@ -11,16 +11,22 @@
 //! read from it compile on both SSR and CSR targets; they receive empty vectors
 //! on SSR and wait for `initialized()` to become `true` on the client. Only the
 //! IndexedDB hydration call-site is wasm32-only.
+//!
+//! The store holds no IndexedDB handle and performs no cache write. A UI delete
+//! removes the entity from memory here and hands the durable half to
+//! [`DeleteRoute`], which reaches the one tab that owns every cache write. See
+//! [`crate::cache::delete_route`].
+
+use std::cell::RefCell;
 
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
 use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
-
-#[cfg(target_arch = "wasm32")]
-use leptos::task::spawn_local;
-#[cfg(target_arch = "wasm32")]
 use trakkt_types::sync::entity_types;
+
+use crate::cache::delete_route::DeleteRoute;
+use crate::cache::tab_leader::CachedEntity;
 
 // ── Inner storage ─────────────────────────────────────────────────────────────
 
@@ -48,12 +54,13 @@ struct SyncStoreInner {
     /// Version counter bumped when a comment sync action arrives.
     /// Used by the detail page to trigger a re-read from IndexedDB.
     comments_version: ArcRwSignal<u32>,
-    /// Workspace ID for IndexedDB operations.
+    /// Where this tab's `remove_*` methods send the matching cache delete.
     ///
-    /// Set once after the user context resolves. `remove_*` methods use this
-    /// to delete the corresponding IDB entry so stale data is not hydrated
-    /// on page refresh.
-    workspace_id: ArcRwSignal<Option<String>>,
+    /// Set by the Layout once the tab's sync role is known, and set again if a
+    /// follower is promoted to leader. Not a signal: nothing renders from it,
+    /// and the deletes that read it run from event handlers, not from reactive
+    /// closures. See [`DeleteRoute`].
+    delete_route: RefCell<DeleteRoute>,
 }
 
 // ── Public handle ─────────────────────────────────────────────────────────────
@@ -95,7 +102,7 @@ impl SyncStore {
                 activities_version: ArcRwSignal::new(0),
                 relations_version: ArcRwSignal::new(0),
                 comments_version: ArcRwSignal::new(0),
-                workspace_id: ArcRwSignal::new(None),
+                delete_route: RefCell::new(DeleteRoute::default()),
             })),
         }
     }
@@ -159,17 +166,13 @@ impl SyncStore {
         Signal::derive(move || sig.get())
     }
 
-    /// Set the workspace ID used for IndexedDB operations.
+    /// Set where this tab's `remove_*` cache deletes are routed.
     ///
-    /// Called once from the Layout after the user context resolves. Until
-    /// this is set, `remove_*` methods skip the IDB delete.
-    pub fn set_workspace_id(&self, id: String) {
-        self.inner.with_value(|inner| inner.workspace_id.set(Some(id)));
-    }
-
-    /// Read the current workspace ID, if set.
-    pub fn workspace_id(&self) -> Option<String> {
-        self.inner.with_value(|inner| inner.workspace_id.get_untracked())
+    /// Called by the Layout: to the broadcast channel while this tab is a
+    /// follower, and to the writer queue once it holds the leadership lock.
+    pub fn set_delete_route(&self, route: DeleteRoute) {
+        self.inner
+            .with_value(|inner| *inner.delete_route.borrow_mut() = route);
     }
 
     /// Version counter for activities — bumped on each activity sync action.
@@ -377,45 +380,27 @@ impl SyncStore {
         });
     }
 
-    /// Spawn an async task to delete an entity from IndexedDB.
+    /// Route the removal of `entities` to the tab that owns the shared cache.
     ///
-    /// No-op when `workspace_id` has not been set yet (SSR or pre-auth).
-    /// On WASM, opens the IDB cache and deletes the key. The delete is
-    /// idempotent — removing a non-existent key is a silent no-op.
-    #[cfg(target_arch = "wasm32")]
-    fn delete_from_idb(&self, entity_type: &'static str, entity_id: &str) {
-        let Some(wid) = self.workspace_id() else {
-            return;
-        };
-        let eid = entity_id.to_owned();
-        spawn_local(async move {
-            match super::db::init_cache_db(&wid).await {
-                Ok(cache_db) => {
-                    if let Err(e) = super::db::delete(&cache_db, entity_type, &eid, &wid).await {
-                        tracing::warn!(
-                            entity_type,
-                            entity_id = %eid,
-                            "SyncStore: IDB delete failed: {e}"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("SyncStore: failed to open cache db for delete: {e}");
-                }
-            }
-        });
+    /// The store never writes IndexedDB itself: one tab per browser owns every
+    /// cache write, and it may not be this one. See [`DeleteRoute`].
+    fn delete_from_cache(&self, entities: Vec<CachedEntity>) {
+        // Cloned out before dispatching so the route cannot be borrowed across
+        // the call — the sink reaches transports this store knows nothing about.
+        let route = self
+            .inner
+            .with_value(|inner| inner.delete_route.borrow().clone());
+        route.delete(entities);
     }
 
     // ── Single-item removes, memory only (sync engine) ───────────────────────
     //
-    // The sync engine must not let the store spawn its own IndexedDB delete:
-    // that write would race the sync cursor, which is exactly the durability
-    // hole the FIFO writer queue exists to close. It calls these memory-only
-    // variants and enqueues the matching deletes on the writer queue itself, so
-    // they stay ordered with every other cache write.
+    // The sync engine enqueues the matching cache deletes on the writer queue
+    // itself, so they stay ordered against the cursor that claims to cover them.
+    // It calls these memory-only variants for the other half.
     //
-    // UI-initiated deletes keep using the `remove_*` methods below, which pair
-    // the memory removal with the IndexedDB delete exactly as before.
+    // Followers call them too, from the leader's broadcast: a follower updates
+    // memory and nothing else.
 
     /// Remove an issue from the in-memory list only.
     pub fn remove_issue_in_memory(&self, issue_id: &str) {
@@ -490,72 +475,30 @@ impl SyncStore {
     }
 
     // ── Single-item removes (UI-initiated deletes) ───────────────────────────
+    //
+    // Both halves of a delete the user just clicked: the in-memory removal
+    // lands here and now, so the list updates without waiting on anything, and
+    // the cache delete is routed to the tab that owns the shared cache.
+    //
+    // Only entity types the UI actually deletes have a method here. The sync
+    // stream's own deletes do not come through these — they are applied by
+    // `cache::apply`, which pairs `remove_*_in_memory` above with a write it
+    // enqueues on the leader's queue itself.
 
-    /// Remove an issue by `issue_id`, and from IndexedDB.
-    pub fn remove_issue(&self, issue_id: &str) {
-        self.remove_issue_in_memory(issue_id);
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::ISSUE, issue_id);
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::ISSUE_CONTENT, issue_id);
-    }
-
-    /// Remove a label by `label_id`, and from IndexedDB.
-    pub fn remove_label(&self, label_id: &str) {
-        self.remove_label_in_memory(label_id);
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::LABEL, label_id);
-    }
-
-    /// Remove a status by `status_id`, and from IndexedDB.
-    pub fn remove_status(&self, status_id: &str) {
-        self.remove_status_in_memory(status_id);
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::STATUS, status_id);
-    }
-
-    /// Remove a team by `team_id`, and from IndexedDB.
+    /// Remove a team by `team_id`, from memory and from the shared cache.
+    ///
+    /// Used by both "delete team" and "leave team". The latter is why the cache
+    /// delete has to be durable: leaving a team emits a `TEAM`/`Update` sync
+    /// action, never a delete, so nothing else will ever evict the row.
     pub fn remove_team(&self, team_id: &str) {
         self.remove_team_in_memory(team_id);
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::TEAM, team_id);
+        self.delete_from_cache(vec![CachedEntity::new(entity_types::TEAM, team_id)]);
     }
 
-    /// Remove a project by `project_id`, and from IndexedDB.
+    /// Remove a project by `project_id`, from memory and from the shared cache.
     pub fn remove_project(&self, project_id: &str) {
         self.remove_project_in_memory(project_id);
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::PROJECT, project_id);
-    }
-
-    /// Remove a view by `view_id`, and from IndexedDB.
-    pub fn remove_view(&self, view_id: &str) {
-        self.remove_view_in_memory(view_id);
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::VIEW, view_id);
-    }
-
-    /// Remove a favorite by `favorite_id`, and from IndexedDB.
-    pub fn remove_favorite(&self, favorite_id: &str) {
-        self.remove_favorite_in_memory(favorite_id);
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::FAVORITE, favorite_id);
-    }
-
-    /// Remove a notification by `notification_id`, and from IndexedDB.
-    pub fn remove_notification(&self, notification_id: &str) {
-        self.remove_notification_in_memory(notification_id);
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::NOTIFICATION, notification_id);
-    }
-
-    /// Remove a comment by `comment_id` (deletes from IndexedDB).
-    ///
-    /// Comments are not held in memory — the detail page reads them from
-    /// IndexedDB on demand.
-    pub fn remove_comment(&self, _comment_id: &str) {
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::COMMENT, _comment_id);
+        self.delete_from_cache(vec![CachedEntity::new(entity_types::PROJECT, project_id)]);
     }
 
     // ── State transitions ─────────────────────────────────────────────────────

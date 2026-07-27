@@ -196,14 +196,59 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
     }
 }
 
+/// Handle one message received from another tab of this browser.
+///
+/// Two halves again, split by role. Every tab replays the leader's published
+/// actions into its own memory. The leader additionally performs the cache
+/// deletes a follower asks for, because a follower has no writer to perform them
+/// with — `writer` is `Some` on exactly the tab that owns the cache, which is
+/// what makes "one writer owns every cache write" hold for UI-initiated deletes
+/// as well as for the sync stream.
+///
+/// One entry point rather than two so a caller cannot wire up half of it.
+pub fn apply_broadcast(
+    store: &SyncStore,
+    writer: Option<&IdbWriter>,
+    message: &SyncBroadcastMessage,
+) {
+    if let Some(writer) = writer {
+        enqueue_broadcast_cache_writes(writer, message);
+    }
+    apply_broadcast_to_memory(store, message);
+}
+
+/// Queue the cache writes another tab asked this one to perform.
+///
+/// Leader-only, and only [`SyncBroadcastMessage::CacheDelete`] carries any: the
+/// other variants report writes this tab has already made, and a
+/// `BroadcastChannel` never delivers to the object that posted.
+fn enqueue_broadcast_cache_writes(writer: &IdbWriter, message: &SyncBroadcastMessage) {
+    match message {
+        SyncBroadcastMessage::CacheDelete { entities } => {
+            for entity in entities {
+                enqueue_delete(writer, &entity.entity_type, &entity.entity_id);
+            }
+        }
+        SyncBroadcastMessage::Action(_)
+        | SyncBroadcastMessage::Complete { .. }
+        | SyncBroadcastMessage::Reset => {}
+    }
+}
+
 /// Apply one broadcast message from the leader tab to a follower's store.
 ///
 /// The follower mirrors the leader's in-memory state exactly: the leader posts
 /// each action after its cache write commits, so replaying them here converges
 /// on the same store contents without the follower ever touching IndexedDB.
-pub fn apply_broadcast_to_memory(store: &SyncStore, message: &SyncBroadcastMessage) {
+fn apply_broadcast_to_memory(store: &SyncStore, message: &SyncBroadcastMessage) {
     match message {
         SyncBroadcastMessage::Action(action) => apply_action_to_memory(store, action),
+        SyncBroadcastMessage::CacheDelete { .. } => {
+            // Nothing to do in memory. The tab that asked for the delete already
+            // dropped the entity from its own store — that is what made the UI
+            // react immediately — and every other tab converges through the
+            // server's own sync action for the same change.
+        }
         SyncBroadcastMessage::Complete { last_sync_id } => {
             // Mirrors the leader's own `sync_complete` handling. By the time
             // this is posted the cursor and every entity of the stream are in
@@ -346,6 +391,7 @@ mod tests {
     use trakkt_types::sync::SyncActionType;
 
     use crate::cache::idb_writer::channel;
+    use crate::cache::tab_leader::CachedEntity;
 
     use super::*;
 
@@ -698,6 +744,82 @@ mod tests {
             assert!(
                 store.initialized().get_untracked(),
                 "followers must leave the loading state when the leader finishes a stream"
+            );
+        });
+    }
+
+    /// Run the broadcast handler as the leader and report what it queued.
+    fn broadcast_cache_ops(message: &SyncBroadcastMessage) -> Vec<String> {
+        let mut queued = Vec::new();
+        with_store(|store| {
+            let (writer, ops) = channel();
+            apply_broadcast(&store, Some(&writer), message);
+            drop(writer);
+            queued = drain(ops);
+        });
+        queued
+    }
+
+    #[test]
+    fn the_leader_queues_the_deletes_a_follower_asks_for() {
+        assert_eq!(
+            broadcast_cache_ops(&SyncBroadcastMessage::CacheDelete {
+                entities: vec![
+                    CachedEntity::new(entity_types::ISSUE, "issue-1"),
+                    CachedEntity::new(entity_types::ISSUE_CONTENT, "issue-1"),
+                ],
+            }),
+            vec!["delete:issue:issue-1", "delete:issue_content:issue-1"],
+            "a follower has no writer of its own — the leader is what makes its \
+             delete durable"
+        );
+    }
+
+    #[test]
+    fn the_leader_queues_nothing_for_messages_that_report_its_own_writes() {
+        for message in [
+            SyncBroadcastMessage::Action(action(
+                entity_types::ISSUE,
+                SyncActionType::Delete,
+                None,
+            )),
+            SyncBroadcastMessage::Complete { last_sync_id: 3 },
+            SyncBroadcastMessage::Reset,
+        ] {
+            assert!(
+                broadcast_cache_ops(&message).is_empty(),
+                "{message:?} describes a write that already happened — re-queueing it \
+                 would replay the leader's own stream back into the cache"
+            );
+        }
+    }
+
+    #[test]
+    fn a_follower_ignores_the_delete_requests_it_overhears() {
+        with_store(|store| {
+            apply_action_to_memory(
+                &store,
+                &action(
+                    entity_types::ISSUE,
+                    SyncActionType::Update,
+                    Some(issue_json(serde_json::Value::Null)),
+                ),
+            );
+
+            // Delivered to every other tab on the channel, not just the leader.
+            apply_broadcast(
+                &store,
+                None,
+                &SyncBroadcastMessage::CacheDelete {
+                    entities: vec![CachedEntity::new(entity_types::ISSUE, "issue-1")],
+                },
+            );
+
+            assert_eq!(
+                store.issues().get_untracked().len(),
+                1,
+                "a tab that owns no writer has nothing to do with another tab's delete \
+                 request — its own store converges through the server's sync action"
             );
         });
     }
