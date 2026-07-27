@@ -34,6 +34,23 @@
 //! [`HydrationGate::opened`] until hydration finishes, while a follower promoted
 //! long after hydration completed sees an already-open gate and dials
 //! immediately.
+//!
+//! ## Why the open is a drop guard
+//!
+//! A gate that is never opened is worse than no gate: the leader is left with no
+//! socket, and — since TRA-9944 — the follower half holds every broadcast
+//! message it receives forever, so the hold buffer grows without limit.
+//! [`HydrationGate::open_on_drop`] is what makes "hydration always opens the
+//! gate" a property of the type rather than of whoever edits the hydration
+//! routine next. Held at the top of that routine, the gate opens when the scope
+//! ends on the normal return, on an early return, on any `?` a later edit
+//! introduces, and when the future is dropped before it ever finished.
+//!
+//! It does *not* cover a panic. `[profile.release]` sets `panic = "abort"` and
+//! `wasm-dev` and `dev-server` inherit it, so nothing this repo ships unwinds
+//! and no destructor runs on that path. Nothing is lost against the trailing
+//! `gate.open()` this replaced — that had the same hole — and an aborted
+//! instance can neither dial nor be handed another message.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -67,10 +84,12 @@ impl HydrationGate {
 
     /// Open the gate, releasing every current and future waiter.
     ///
-    /// Idempotent: opening an already-open gate does nothing. Callers must open
-    /// the gate on *every* path out of hydration, including failure — an empty
+    /// Idempotent: opening an already-open gate does nothing. The gate must be
+    /// opened on *every* path out of hydration, including failure — an empty
     /// store is a valid state to start syncing from, and a gate left closed
-    /// would strand the tab with no socket at all.
+    /// would strand the tab with no socket and an unbounded hold buffer. Prefer
+    /// [`HydrationGate::open_on_drop`], which guarantees exactly that rather
+    /// than asking each exit path to remember.
     pub fn open(&self) {
         let wakers = {
             let mut state = self.state.borrow_mut();
@@ -96,6 +115,40 @@ impl HydrationGate {
         Opened {
             state: Rc::clone(&self.state),
         }
+    }
+
+    /// A guard that opens the gate when it is dropped.
+    ///
+    /// Bind it at the top of the hydration routine. Returning normally,
+    /// returning early, and propagating an error out of a `?` all run the
+    /// destructor, so no exit path can forget to open the gate — including one
+    /// a later edit adds. Dropping the future before it completes runs it too,
+    /// which is what the native tests below exercise; no wasm path drops the
+    /// hydration task today, since `leptos::task::spawn_local` hands straight to
+    /// `wasm_bindgen_futures::spawn_local` with no owner scoping, but it would
+    /// the moment that spawn moves to a cancelling one.
+    ///
+    /// A panic is the exit this does *not* cover: every shipped profile is
+    /// `panic = "abort"`, so no destructor runs there.
+    ///
+    /// This matters because the two things waiting on the gate degrade very
+    /// differently from a gate that stays shut: the dial simply never happens,
+    /// while the follower's hold buffer keeps accepting broadcast messages it
+    /// will never drain.
+    pub fn open_on_drop(&self) -> OpenOnDrop {
+        OpenOnDrop { gate: self.clone() }
+    }
+}
+
+/// Guard returned by [`HydrationGate::open_on_drop`].
+#[must_use = "the gate opens when this guard is dropped — binding it to `_` opens it immediately"]
+pub struct OpenOnDrop {
+    gate: HydrationGate,
+}
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.gate.open();
     }
 }
 
@@ -224,6 +277,80 @@ mod tests {
         }
 
         assert_eq!(gate.state.borrow().wakers.len(), 1);
+    }
+
+    // ── The drop guard ──────────────────────────────────────────────────────
+
+    #[test]
+    fn the_guard_opens_the_gate_when_it_is_dropped() {
+        let gate = HydrationGate::new();
+        {
+            let _open_on_exit = gate.open_on_drop();
+            assert!(!gate.is_open(), "the guard must not open the gate up front");
+        }
+        assert!(gate.is_open());
+    }
+
+    /// The failure exits out of hydration — an early `return`, a `?` on an
+    /// unreadable cache — must open the gate exactly like the success one. An
+    /// empty store is a valid state to start syncing from; a closed gate is not.
+    #[test]
+    fn an_early_return_still_opens_the_gate() {
+        fn hydrate(gate: &HydrationGate, cache_is_readable: bool) -> Result<(), &'static str> {
+            let _open_on_exit = gate.open_on_drop();
+            if !cache_is_readable {
+                return Err("cache unavailable");
+            }
+            Ok(())
+        }
+
+        let gate = HydrationGate::new();
+        assert!(hydrate(&gate, false).is_err());
+        assert!(
+            gate.is_open(),
+            "hydration that could not read the cache left the gate shut — the dial \
+             never happens and the follower's hold buffer never drains"
+        );
+    }
+
+    /// A hydration future dropped mid-await is the one exit a trailing
+    /// `gate.open()` call cannot cover, because that line is never reached. No
+    /// wasm path drops it today — `spawn_local` is not owner-scoped — so this is
+    /// insurance for native executors and for any later move to a cancelling
+    /// spawn.
+    #[test]
+    fn a_task_dropped_mid_flight_still_opens_the_gate() {
+        let gate = HydrationGate::new();
+
+        let mut hydration = {
+            let gate = gate.clone();
+            Box::pin(async move {
+                let _open_on_exit = gate.open_on_drop();
+                // Stands in for the IndexedDB read this parks on.
+                std::future::pending::<()>().await;
+            })
+        };
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(hydration.as_mut().poll(&mut cx), Poll::Pending);
+        assert!(!gate.is_open(), "hydration has not finished yet");
+
+        drop(hydration);
+        assert!(
+            gate.is_open(),
+            "an abandoned hydration task must still release whatever is waiting on it"
+        );
+    }
+
+    #[test]
+    fn a_guard_dropped_after_an_explicit_open_is_harmless() {
+        let gate = HydrationGate::new();
+        let guard = gate.open_on_drop();
+        gate.open();
+        drop(guard);
+
+        assert!(gate.is_open());
     }
 
     /// Hand control back to the executor exactly once.

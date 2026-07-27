@@ -40,6 +40,15 @@ pub mod apply;
 /// two halves it orders are `wasm32`-only.
 pub mod hydration_gate;
 
+/// The FIFO that holds cross-tab broadcast messages while the store is
+/// hydrating, so none of them is applied to a list that is about to be
+/// bulk-replaced — and none of them is lost, which deferring the subscription
+/// instead would guarantee.
+///
+/// Not target-gated: the queue is pure Rust over the message type and unit
+/// tested natively, while the channel that feeds it is `wasm32`-only.
+pub mod broadcast_queue;
+
 /// Where a tab sends the cache deletes its own UI initiates: onto the writer
 /// queue if it owns the cache, or over the broadcast channel to the tab that
 /// does.
