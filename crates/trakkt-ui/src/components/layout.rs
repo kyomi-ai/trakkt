@@ -89,13 +89,21 @@ pub fn Layout() -> impl IntoView {
     //                 immediately if it wins the lock, or later on promotion
     //                 when the previous leader's tab closes.
     //
-    // The dial waits on `hydration_gate`. Hydration replaces whole store lists
-    // at once, so a sync action applied while it is still in flight gets wiped
-    // by the `set_*` that lands after it — and the cursor has already moved
-    // past, so nothing re-delivers it. Not opening the socket until hydration
-    // has finished removes the window rather than papering over it.
+    // Both live-update paths wait on `hydration_gate`. Hydration replaces whole
+    // store lists at once, so anything applied while it is still in flight gets
+    // wiped by the `set_*` that lands after it — and the leader's cursor has
+    // already moved past, so nothing re-delivers it.
+    //
+    // The two wait differently because their transports differ. The socket is
+    // simply not dialed until hydration finishes: nothing has been received
+    // yet, so delaying it only reorders. The cross-tab channel cannot be
+    // treated the same way — it has no replay, so a late subscription would
+    // *drop* whatever other tabs posted in that window rather than delay it.
+    // So the subscription goes up immediately and its messages are held in a
+    // FIFO until the gate opens. See `cache::broadcast_queue`.
     #[cfg(target_arch = "wasm32")]
     {
+        use crate::cache::broadcast_queue::BroadcastQueue;
         use crate::cache::delete_route::DeleteRoute;
         use crate::cache::hydration_gate::HydrationGate;
         use crate::cache::idb_writer::IdbWriter;
@@ -122,10 +130,11 @@ pub fn Layout() -> impl IntoView {
             on_cleanup(move || websocket::disconnect(&ws_for_cleanup));
         }
 
-        // Latch that hydration opens and the dial waits on. Lives at setup
-        // because the two halves can run in different executions of the effect
-        // below: a promoted follower hydrated long ago, while the first tab
-        // hydrates and takes leadership in a single pass.
+        // Latch that hydration opens, and that both the dial and the cross-tab
+        // message queue wait on. Lives at setup because its halves can run in
+        // different executions of the effect below: a promoted follower
+        // hydrated long ago, while the first tab hydrates and takes leadership
+        // in a single pass.
         let hydration_gate = HydrationGate::new();
 
         // Track what has already been done so neither half re-runs when the
@@ -185,17 +194,35 @@ pub fn Layout() -> impl IntoView {
                 //    same channel to publish on (it never receives its own
                 //    messages back) and to service the cache deletes follower
                 //    tabs ask it to perform.
+                //
+                //    The subscription is registered now and its messages are
+                //    queued, rather than the subscription itself being delayed
+                //    until hydration finishes. That ordering matters both ways:
+                //    delaying it would lose messages outright, and applying
+                //    them on arrival would hand them to lists hydration is
+                //    about to replace.
+                //
+                //    The queue is created here, in the same synchronous block
+                //    that spawned hydration above — so there is no arrangement
+                //    in which a queue exists to fill but no hydration exists to
+                //    release it, and the backlog is bounded by hydration
+                //    finishing.
                 match SyncBroadcast::open(&workspace_id) {
                     Ok(channel) => {
-                        channel.set_on_message(move |message| {
+                        let queue = BroadcastQueue::new(move |message| {
                             cache_writer.with_value(|writer| {
                                 crate::cache::apply::apply_broadcast(
                                     &sync_store,
                                     (**writer).as_ref(),
-                                    &message,
+                                    message,
                                 );
                             });
                         });
+                        leptos::task::spawn_local(sync_engine::release_when_hydrated(
+                            hydration_gate.clone(),
+                            queue.clone(),
+                        ));
+                        channel.set_on_message(move |message| queue.deliver(message));
                         // Until this tab wins the lock it owns no cache writer,
                         // so its own deletes go to the tab that does.
                         sync_store.set_delete_route(DeleteRoute::delegated(channel.clone()));

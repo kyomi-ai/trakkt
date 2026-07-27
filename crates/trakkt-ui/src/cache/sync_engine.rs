@@ -18,13 +18,22 @@
 //! ## Startup ordering
 //!
 //! Hydration bulk-replaces the store's lists while the sync stream applies
-//! individual actions to them, so the two must not overlap: a delta action
-//! applied during hydration is wiped by the `set_*` that lands after it, and the
-//! cursor has already moved past it. [`hydrate_then_open_gate`] and
-//! [`dial_when_hydrated`] are the two halves of that ordering — the socket is
-//! not dialed until hydration has finished, so there is no window in which a
-//! message could arrive early and nothing to buffer. See
-//! [`crate::cache::hydration_gate`].
+//! individual actions to them, so the two must not overlap: an action applied
+//! during hydration is wiped by the `set_*` that lands after it, and the cursor
+//! has already moved past it. [`hydrate_then_open_gate`] opens the one latch
+//! both live-update paths wait on. See [`crate::cache::hydration_gate`].
+//!
+//! The two paths wait on it differently, because their transports differ:
+//!
+//! * [`dial_when_hydrated`] — the leader's WebSocket. Delaying the *dial* costs
+//!   nothing: no message has been received when the socket does not exist yet,
+//!   so there is no window and nothing to buffer.
+//! * [`release_when_hydrated`] — every tab's cross-tab `BroadcastChannel`. That
+//!   channel has no replay, so delaying the *subscription* would drop what
+//!   other tabs posted during hydration rather than reorder it. The Layout
+//!   subscribes at once into a
+//!   [`BroadcastQueue`](crate::cache::broadcast_queue::BroadcastQueue) and this
+//!   releases it. See [`crate::cache::broadcast_queue`].
 //!
 //! ## Reconnect handling
 //!
@@ -55,6 +64,7 @@ use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Proj
 use trakkt_types::sync::{SyncAction, SyncResponse, entity_types};
 
 use crate::cache::apply::{apply_action_to_memory, enqueue_cache_writes};
+use crate::cache::broadcast_queue::BroadcastQueue;
 use crate::cache::db;
 use crate::cache::hydration_gate::HydrationGate;
 use crate::cache::idb_writer::{self, CacheDbSink, IdbOp, IdbWriter};
@@ -322,15 +332,41 @@ pub async fn dial_when_hydrated(
     ws.dial(&user_id, &workspace_id, &token);
 }
 
+/// Release the cross-tab message queue, but not before hydration has finished.
+///
+/// The follower half of the same ordering [`dial_when_hydrated`] gives the
+/// leader, and the reason it is a *queue* rather than a second delayed start: a
+/// `BroadcastChannel` has no replay, so deferring the subscription would drop
+/// everything other tabs posted during hydration instead of merely reordering
+/// it. The Layout subscribes immediately and feeds
+/// [`BroadcastQueue`](crate::cache::broadcast_queue::BroadcastQueue), which
+/// holds what arrives until this releases it.
+///
+/// Correctness does not depend on *when* that happens. The queue applies
+/// messages in arrival order whether they were held or not, so a late release
+/// only means a larger backlog — never a reorder. All this has to guarantee is
+/// that it happens, which the gate does on every exit from hydration below.
+pub async fn release_when_hydrated(gate: HydrationGate, queue: BroadcastQueue) {
+    gate.opened().await;
+    queue.release();
+}
+
 /// Hydrate the store from the local cache, then open `gate`.
 ///
 /// Runs on every tab, leader or not, and starts immediately — cached data still
-/// reaches the screen without waiting for the network. The gate is what the
-/// leader's dial waits on, so it must open on every path out of here: a cache
-/// that cannot be opened leaves an empty store, which is a perfectly valid state
-/// to start syncing from, while a gate left closed would strand the tab with no
-/// socket at all.
+/// reaches the screen without waiting for the network.
+///
+/// The gate is what the leader's dial and the follower's message queue both wait
+/// on, so it must open on every path out of here — including the one where the
+/// cache cannot be opened at all. An empty store is a perfectly valid state to
+/// start syncing from; a gate left closed would strand the tab with no socket
+/// *and* a queue that accepts broadcast messages forever without ever applying
+/// them. [`HydrationGate::open_on_drop`] is what makes that unconditional: the
+/// guard below opens the gate when this scope ends, which here means the normal
+/// return and the error arm; its own docs cover the exits beyond those two.
 pub async fn hydrate_then_open_gate(workspace_id: String, store: SyncStore, gate: HydrationGate) {
+    let _open_gate_on_exit = gate.open_on_drop();
+
     match db::init_cache_db(&workspace_id).await {
         Ok(cache_db) => {
             hydrate_store_from_db(&cache_db, &workspace_id, &store).await;
@@ -345,7 +381,6 @@ pub async fn hydrate_then_open_gate(workspace_id: String, store: SyncStore, gate
             store.set_initialized(true);
         }
     }
-    gate.open();
 }
 
 // ── Hydration ───────────────────────────────────────────────────────────────
@@ -470,6 +505,8 @@ mod wasm_tests {
     use trakkt_types::sync::SyncActionType;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
+    use crate::cache::apply::apply_broadcast;
+    use crate::cache::tab_leader::CachedEntity;
     use crate::cache::websocket;
 
     use super::*;
@@ -655,6 +692,313 @@ mod wasm_tests {
         // Stop the backoff loop this test's doomed connection would otherwise
         // leave running.
         websocket::disconnect(&ws);
+    }
+
+    // ── The cross-tab queue is released by the same gate (TRA-9944) ─────────
+    //
+    // The follower half of the ordering above. These drive the production
+    // wiring end to end: a real `BroadcastChannel`, the real
+    // `hydrate_then_open_gate`, and the real `apply_broadcast` the Layout
+    // installs — with `release_when_hydrated` as the only thing between them.
+
+    /// Number of turns of the event loop that reliably covers a
+    /// `BroadcastChannel` delivery, which is a task rather than a duration.
+    async fn settle() {
+        for _ in 0..20 {
+            TimeoutFuture::new(1).await;
+        }
+    }
+
+    /// A cross-tab message carrying a label the seeded cache does not contain,
+    /// so hydration's bulk `set_labels` would visibly wipe it.
+    fn live_label_action(workspace_id: &str) -> SyncBroadcastMessage {
+        let item = label(LIVE_LABEL_INDEX, workspace_id);
+        let data = match serde_json::to_value(&item) {
+            Ok(data) => data,
+            Err(e) => panic!("failed to encode the live label: {e}"),
+        };
+        SyncBroadcastMessage::Action(SyncAction {
+            sync_id: 9_999,
+            entity_type: entity_types::LABEL.to_owned(),
+            entity_id: item.label_id,
+            workspace_id: workspace_id.to_owned(),
+            action: SyncActionType::Insert,
+            data: Some(data),
+            timestamp: "2026-07-27T00:00:00Z".to_owned(),
+        })
+    }
+
+    /// Deliberately outside the `0..SEEDED_LABELS` range the fixtures seed, so
+    /// the live label cannot be confused with a hydrated one.
+    const LIVE_LABEL_INDEX: usize = 9_999;
+
+    fn live_label_id() -> String {
+        format!("label-{LIVE_LABEL_INDEX}")
+    }
+
+    /// A pair of channels on one workspace: the tab under test subscribes to
+    /// `subscriber`, another tab posts on `poster`.
+    fn channel_pair(workspace_id: &str) -> (SyncBroadcast, SyncBroadcast) {
+        let subscriber = match SyncBroadcast::open(workspace_id) {
+            Ok(channel) => channel,
+            Err(e) => panic!("failed to open the subscriber's channel: {e:?}"),
+        };
+        let poster = match SyncBroadcast::open(workspace_id) {
+            Ok(channel) => channel,
+            Err(e) => panic!("failed to open the poster's channel: {e:?}"),
+        };
+        (subscriber, poster)
+    }
+
+    /// The ticket's headline criterion: an action broadcast while this tab is
+    /// still hydrating is applied *after* hydration — not lost, and not wiped by
+    /// hydration's bulk `set_labels`.
+    ///
+    /// Pre-fix, the handler called `apply_broadcast` the moment the message
+    /// arrived, so the label landed in the store and the `set_labels` a few
+    /// turns later replaced the whole list without it. Nothing re-delivers it:
+    /// the leader posted it after its own cache write committed and its cursor
+    /// moved past.
+    #[wasm_bindgen_test]
+    async fn an_action_broadcast_during_hydration_is_applied_after_it() {
+        let owner = Owner::new();
+        owner.set();
+
+        let wid = "ws-queue-hydration";
+        seed_labels(wid).await;
+
+        let store = SyncStore::new();
+        let gate = HydrationGate::new();
+        let (subscriber, poster) = channel_pair(wid);
+
+        // Exactly the Layout's follower wiring, in the Layout's order: the
+        // queue and its release are both in place before anything can arrive,
+        // so a release that does not actually wait on the gate shows up here
+        // rather than being hidden by the test's own sequencing.
+        let queue = BroadcastQueue::new(move |message| apply_broadcast(&store, None, message));
+        let handler_queue = queue.clone();
+        subscriber.set_on_message(move |message| handler_queue.deliver(message));
+        wasm_bindgen_futures::spawn_local(release_when_hydrated(gate.clone(), queue.clone()));
+
+        poster.post(&live_label_action(wid));
+        settle().await;
+
+        assert_eq!(
+            queue.pending(),
+            1,
+            "the action was applied before hydration had even started — it is about to \
+             be wiped by hydration's bulk set_*, and nothing re-delivers it"
+        );
+        assert!(
+            store.labels().get_untracked().is_empty(),
+            "an action applied now is about to be wiped by hydration's bulk set_*"
+        );
+
+        hydrate_then_open_gate(wid.to_owned(), store, gate).await;
+        settle().await;
+
+        let labels = store.labels().get_untracked();
+        assert_eq!(
+            labels.len(),
+            SEEDED_LABELS + 1,
+            "the broadcast action was applied before hydration replaced the list, so \
+             hydration wiped it — and nothing ever re-delivers it"
+        );
+        assert!(
+            labels.iter().any(|l| l.label_id == live_label_id()),
+            "the held action reached the store as itself, not merely as a count"
+        );
+        assert_eq!(queue.pending(), 0, "nothing may be left held after release");
+    }
+
+    /// TRA-9933 made the **leader** service follower tabs' cache deletes through
+    /// this same handler, so holding messages now also defers a leader's
+    /// servicing of another tab's delete until its own hydration completes.
+    ///
+    /// That is the intended trade — deferred, never dropped — and this is what
+    /// holds it to "never dropped": the row is still cached while the queue is
+    /// held, and gone once it is released.
+    #[wasm_bindgen_test]
+    async fn a_held_cache_delete_still_reaches_the_leaders_writer() {
+        let owner = Owner::new();
+        owner.set();
+
+        let wid = "ws-queue-hydration-delete";
+        const TEAM_ID: &str = "team-held-delete";
+        seed_labels(wid).await;
+
+        let team_json = serde_json::json!({
+            "team_id": TEAM_ID,
+            "workspace_id": wid,
+            "name": "Engineering",
+            "key": "ENG",
+        })
+        .to_string();
+        let cache_db = match db::init_cache_db(wid).await {
+            Ok(cache_db) => cache_db,
+            Err(e) => panic!("failed to open cache db: {e}"),
+        };
+        if let Err(e) = db::upsert(
+            &cache_db,
+            entity_types::TEAM,
+            TEAM_ID,
+            wid,
+            &team_json,
+            "2026-07-27T00:00:00Z",
+        )
+        .await
+        {
+            panic!("failed to seed the team row: {e}");
+        }
+        drop(cache_db);
+
+        async fn team_is_cached(workspace_id: &str, team_id: &str) -> bool {
+            let cache_db = match db::init_cache_db(workspace_id).await {
+                Ok(cache_db) => cache_db,
+                Err(e) => panic!("failed to open cache db: {e}"),
+            };
+            match db::read_one(&cache_db, entity_types::TEAM, team_id, workspace_id).await {
+                Ok(record) => record.is_some(),
+                Err(e) => panic!("read_one failed: {e}"),
+            }
+        }
+
+        assert!(
+            team_is_cached(wid, TEAM_ID).await,
+            "fixture: the team should be cached before the delete is asked for"
+        );
+
+        let store = SyncStore::new();
+        let gate = HydrationGate::new();
+        let (subscriber, poster) = channel_pair(wid);
+
+        // This tab is the leader: it owns the one cache writer.
+        let (writer, ops) = idb_writer::channel();
+        let queue = {
+            let writer = writer.clone();
+            BroadcastQueue::new(move |message| apply_broadcast(&store, Some(&writer), message))
+        };
+        let handler_queue = queue.clone();
+        subscriber.set_on_message(move |message| handler_queue.deliver(message));
+        // Wired before anything can arrive, as the Layout wires it — so a
+        // release that does not wait on the gate is caught below rather than
+        // masked by the test's own sequencing.
+        wasm_bindgen_futures::spawn_local(release_when_hydrated(gate.clone(), queue.clone()));
+
+        let driver = async move {
+            poster.post(&SyncBroadcastMessage::CacheDelete {
+                entities: vec![CachedEntity::new(entity_types::TEAM, TEAM_ID)],
+            });
+            settle().await;
+
+            assert_eq!(
+                queue.pending(),
+                1,
+                "the delete request was serviced before hydration finished — unordered \
+                 against the actions ahead of it on the channel"
+            );
+            writer.flush().await;
+            assert!(
+                team_is_cached(wid, TEAM_ID).await,
+                "a delete serviced while the queue is held would be unordered against \
+                 the actions ahead of it on the channel"
+            );
+
+            hydrate_then_open_gate(wid.to_owned(), store, gate).await;
+            settle().await;
+
+            assert_eq!(
+                queue.pending(),
+                0,
+                "the delete request was still held after hydration finished"
+            );
+            writer.flush().await;
+            let still_cached = team_is_cached(wid, TEAM_ID).await;
+
+            // Release the handler — and the writer handle the queue holds —
+            // so the writer loop can finish.
+            drop(subscriber);
+            drop(queue);
+            drop(writer);
+            still_cached
+        };
+
+        let sink = CacheDbSink::open(
+            match db::init_cache_db(wid).await {
+                Ok(cache_db) => cache_db,
+                Err(e) => panic!("failed to open cache db: {e}"),
+            },
+            wid.to_owned(),
+        );
+        let ((), still_cached) =
+            futures::future::join(idb_writer::run_writer(sink, ops), driver).await;
+
+        assert!(
+            !still_cached,
+            "holding the delete turned into dropping it — the shared cache still holds \
+             a team another tab's user deleted, and leaving a team emits no server-side \
+             delete that would ever remove it"
+        );
+    }
+
+    /// The empty-cache path: hydration that reads nothing back must still
+    /// release the queue and leave the store usable.
+    ///
+    /// This is as close as a browser test can get to the IndexedDB-failure arm
+    /// of [`hydrate_then_open_gate`]. That arm cannot be forced from here: the
+    /// only deterministic way to make `Database::open` fail is a version
+    /// downgrade, which is irreversible for the page and would break every
+    /// other test sharing the `trakkt-sync` database. It is covered instead by
+    /// [`HydrationGate::open_on_drop`], which opens the gate on *every* exit
+    /// from that function — the error arm included — and is unit tested
+    /// natively in `cache::hydration_gate`.
+    #[wasm_bindgen_test]
+    async fn hydration_with_nothing_cached_still_releases_the_queue() {
+        let owner = Owner::new();
+        owner.set();
+
+        let wid = "ws-queue-empty-cache";
+        let store = SyncStore::new();
+        let gate = HydrationGate::new();
+        let (subscriber, poster) = channel_pair(wid);
+
+        let queue = BroadcastQueue::new(move |message| apply_broadcast(&store, None, message));
+        let handler_queue = queue.clone();
+        subscriber.set_on_message(move |message| handler_queue.deliver(message));
+        wasm_bindgen_futures::spawn_local(release_when_hydrated(gate.clone(), queue.clone()));
+
+        poster.post(&live_label_action(wid));
+        settle().await;
+        assert_eq!(
+            queue.pending(),
+            1,
+            "the action was applied before hydration had even started"
+        );
+
+        hydrate_then_open_gate(wid.to_owned(), store, gate).await;
+        settle().await;
+
+        assert_eq!(
+            queue.pending(),
+            0,
+            "a hydration with nothing to read left the queue held forever — every \
+             later message would accumulate behind it unbounded"
+        );
+        assert_eq!(
+            store
+                .labels()
+                .get_untracked()
+                .iter()
+                .map(|l| l.label_id.clone())
+                .collect::<Vec<_>>(),
+            vec![live_label_id()],
+            "an empty cache is a valid starting point: the held action is still the \
+             only thing that should be in the list"
+        );
+        assert!(
+            store.initialized().get_untracked(),
+            "pages waiting on `initialized` would sit in their skeleton state forever"
+        );
     }
 
     // ── The reset wipe covers everything the cache can hold ─────────────────
