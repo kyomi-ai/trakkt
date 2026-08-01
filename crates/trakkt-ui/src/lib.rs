@@ -11,6 +11,11 @@ pub mod server_fns;
 pub mod types;
 pub mod utils;
 
+/// Setup shared by the browser tests in `cache/` and `pages/`. Test-only, and
+/// wasm-only because `any_spawner` is a `wasm32`-gated dev-dependency.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_test_support;
+
 pub use app::App;
 
 /// Register all server functions with the Leptos runtime.

@@ -130,8 +130,9 @@ tokio = { workspace = true }
 # Run: wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
-# Leptos drives `Effect` tasks through this, and boots it from `mount_to_body` /
-# `hydrate_body` — neither of which a `wasm-bindgen-test` runs. Tests that need a
-# real `Effect` to fire have to initialise it themselves. Already in the lock
+# Leptos spawns through this — `Effect`, `Resource` and `LocalResource` all do,
+# on construction — and boots it from `mount_to_body` / `hydrate_body`, neither
+# of which a `wasm-bindgen-test` runs. Tests that spawn before they mount have to
+# initialise it themselves; see `src/wasm_test_support.rs`. Already in the lock
 # file as a transitive dependency of leptos, and pinned to the same version.
 any_spawner = "0.3"
