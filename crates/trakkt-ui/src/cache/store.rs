@@ -66,18 +66,6 @@ struct SyncStoreInner {
     /// Used by the project detail page to trigger a refetch of the posted
     /// status updates from the server.
     project_updates_version: ArcRwSignal<u32>,
-    /// Version counter bumped when an attachment or issue_attachment sync
-    /// action arrives. Used by the issue detail page's attachment list to
-    /// trigger a refetch from the server.
-    attachments_version: ArcRwSignal<u32>,
-    /// Version counter bumped when a notification_preferences sync action
-    /// arrives. Used by the notification settings page to trigger a refetch
-    /// from the server.
-    notification_preferences_version: ArcRwSignal<u32>,
-    /// Version counter bumped when a workspace_settings sync action arrives.
-    /// Used by the workspace settings page to trigger a refetch from the
-    /// server.
-    workspace_settings_version: ArcRwSignal<u32>,
     /// Where this tab's `remove_*` methods send the matching cache delete.
     ///
     /// Set by the Layout once the tab's sync role is known, and set again if a
@@ -129,9 +117,6 @@ impl SyncStore {
                 milestones_version: ArcRwSignal::new(0),
                 project_members_version: ArcRwSignal::new(0),
                 project_updates_version: ArcRwSignal::new(0),
-                attachments_version: ArcRwSignal::new(0),
-                notification_preferences_version: ArcRwSignal::new(0),
-                workspace_settings_version: ArcRwSignal::new(0),
                 delete_route: RefCell::new(DeleteRoute::default()),
             })),
         }
@@ -327,82 +312,6 @@ impl SyncStore {
     pub fn bump_project_updates_version(&self) {
         self.inner.with_value(|inner| {
             inner.project_updates_version.update(|v| *v += 1);
-        });
-    }
-
-    /// Version counter for attachments — bumped on each attachment and
-    /// issue_attachment sync action.
-    ///
-    /// Attachments are not held in this store: the issue detail page reads them
-    /// straight from the `list_issue_attachments` server function. This counter
-    /// is the reactive dependency that tells it to ask again.
-    ///
-    /// One counter covers both entity types because they invalidate exactly one
-    /// reader between them — that list changes when an attachment is uploaded or
-    /// deleted (`attachment`) and when one is linked to or unlinked from an
-    /// issue (`issue_attachment`).
-    pub fn attachments_version(&self) -> Signal<u32> {
-        let sig = self.inner.with_value(|inner| inner.attachments_version.clone());
-        Signal::derive(move || sig.get())
-    }
-
-    /// Bump the attachments version counter.
-    ///
-    /// Called by the sync engine when an "attachment" or "issue_attachment"
-    /// entity type arrives via WebSocket, signaling that the issue's attachment
-    /// list should refetch.
-    pub fn bump_attachments_version(&self) {
-        self.inner.with_value(|inner| {
-            inner.attachments_version.update(|v| *v += 1);
-        });
-    }
-
-    /// Version counter for notification preferences — bumped on each
-    /// notification_preferences sync action.
-    ///
-    /// Preferences are not held in this store: the notification settings page
-    /// reads them straight from the `get_notification_preferences` server
-    /// function. This counter is the reactive dependency that tells it to ask
-    /// again — the frames are scoped to a single user, so what it carries is
-    /// that user's own change made on another tab or another device.
-    pub fn notification_preferences_version(&self) -> Signal<u32> {
-        let sig = self
-            .inner
-            .with_value(|inner| inner.notification_preferences_version.clone());
-        Signal::derive(move || sig.get())
-    }
-
-    /// Bump the notification preferences version counter.
-    ///
-    /// Called by the sync engine when a "notification_preferences" entity type
-    /// arrives via WebSocket, signaling that the settings page should refetch.
-    pub fn bump_notification_preferences_version(&self) {
-        self.inner.with_value(|inner| {
-            inner.notification_preferences_version.update(|v| *v += 1);
-        });
-    }
-
-    /// Version counter for workspace settings — bumped on each
-    /// workspace_settings sync action.
-    ///
-    /// The workspace settings page reads its data through its own
-    /// `get_workspace_settings` server function rather than from this store, so
-    /// this counter is the reactive dependency that tells it to ask again after
-    /// another admin renames the workspace or changes its auto-archive default.
-    pub fn workspace_settings_version(&self) -> Signal<u32> {
-        let sig = self
-            .inner
-            .with_value(|inner| inner.workspace_settings_version.clone());
-        Signal::derive(move || sig.get())
-    }
-
-    /// Bump the workspace settings version counter.
-    ///
-    /// Called by the sync engine when a "workspace_settings" entity type
-    /// arrives via WebSocket, signaling that the settings page should refetch.
-    pub fn bump_workspace_settings_version(&self) {
-        self.inner.with_value(|inner| {
-            inner.workspace_settings_version.update(|v| *v += 1);
         });
     }
 
@@ -707,9 +616,6 @@ impl SyncStore {
             inner.milestones_version.set(0);
             inner.project_members_version.set(0);
             inner.project_updates_version.set(0);
-            inner.attachments_version.set(0);
-            inner.notification_preferences_version.set(0);
-            inner.workspace_settings_version.set(0);
         });
     }
 }

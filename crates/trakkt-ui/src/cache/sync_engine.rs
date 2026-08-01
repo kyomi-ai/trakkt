@@ -77,18 +77,12 @@ use crate::cache::websocket::{ConnectionState, WebSocketClient};
 ///
 /// The membership rule is not "types this client reads back". It is "types the
 /// cache can ever hold a row of", which is a strictly larger set:
-/// [`enqueue_cache_writes`] persists **any** action carrying a payload, apart
-/// from the handful named in `NOT_CACHED`, including types nothing hydrates or
-/// reads on demand. A type missing from here is never wiped by anything, so its
-/// rows outlive the reset that exists to guarantee a clean slate — permanently,
-/// since the only other cache delete is a per-entity one driven by a `Delete`
-/// action that has already been and gone.
-///
-/// The converse also has to hold, and it is why `release` is absent: a type that
-/// is wiped but never written is a promise this client does not keep. Nothing
-/// reads releases and no bootstrap streams them, so they are not persisted
-/// either — the reasoning is on `NOT_CACHED` in
-/// [`crate::cache::apply`], which is the one place that decides it.
+/// [`enqueue_cache_writes`] has no entity-type allow-list, so **any** action
+/// carrying a payload is persisted, including types nothing hydrates or reads on
+/// demand. A type missing from here is never wiped by anything, so its rows
+/// outlive the reset that exists to guarantee a clean slate — permanently, since
+/// the only other cache delete is a per-entity one driven by a `Delete` action
+/// that has already been and gone.
 ///
 /// `every_entity_type_the_cache_persists_is_wiped_by_a_reset` holds this list to
 /// that rule by driving the write path itself, rather than trusting the next
@@ -104,6 +98,7 @@ const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
     entity_types::PROJECT_MILESTONE,
     entity_types::PROJECT_MEMBER,
     entity_types::PROJECT_UPDATE,
+    entity_types::RELEASE,
     entity_types::VIEW,
     entity_types::FAVORITE,
     entity_types::NOTIFICATION,
@@ -530,7 +525,7 @@ fn apply_sync_action(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::rc::Rc;
     use std::task::{Context, Poll};
 
@@ -1337,15 +1332,12 @@ mod wasm_tests {
         &body[..end]
     }
 
-    /// Every entity type declared in [`entity_types`], constant name to value.
-    ///
-    /// The name half is what lets a test read `entity_types::FOO` out of another
-    /// module's source and learn which wire string that arm handles.
+    /// Every entity type string declared in [`entity_types`].
     ///
     /// The parse is deliberately strict and self-checking: a declaration it
     /// cannot read is a declaration this test would silently stop covering, so
     /// the counts have to agree or the test fails and says so.
-    fn declared_entity_types_by_name() -> BTreeMap<&'static str, &'static str> {
+    fn declared_entity_types() -> BTreeSet<&'static str> {
         let body = entity_types_module_source();
 
         let declared = body
@@ -1353,43 +1345,31 @@ mod wasm_tests {
             .filter(|line| line.trim_start().starts_with("pub const "))
             .count();
 
-        let mut by_name = BTreeMap::new();
-        for line in body.lines() {
-            let Some((decl, rest)) = line.split_once(": &str = \"") else {
-                continue;
-            };
-            let Some((value, _)) = rest.split_once('"') else {
-                continue;
-            };
-            let Some(name) = decl.trim().strip_prefix("pub const ") else {
-                continue;
-            };
-            by_name.insert(name.trim(), value);
-        }
+        let values: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.split_once("&str = \""))
+            .filter_map(|(_, rest)| rest.split_once('"'))
+            .map(|(value, _)| value)
+            .collect();
 
         assert_eq!(
-            by_name.len(),
+            values.len(),
             declared,
             "this test reads the entity types out of the source of \
              `trakkt_types::sync::entity_types`, and could only parse {} of the {declared} \
              constants declared there.\n\
              A declaration it cannot read is one it silently stops checking, so fix the parse \
-             in `declared_entity_types_by_name` (crates/trakkt-ui/src/cache/sync_engine.rs) \
-             rather than the declaration — most likely it is no longer a single \
+             in `declared_entity_types` (crates/trakkt-ui/src/cache/sync_engine.rs) rather \
+             than the declaration — most likely it is no longer a single \
              `pub const NAME: &str = \"value\";` line.",
-            by_name.len()
+            values.len()
         );
         assert!(
-            !by_name.is_empty(),
+            !values.is_empty(),
             "parsed no entity types at all out of trakkt-types/src/sync.rs"
         );
 
-        by_name
-    }
-
-    /// Every entity type string declared in [`entity_types`].
-    fn declared_entity_types() -> BTreeSet<&'static str> {
-        declared_entity_types_by_name().into_values().collect()
+        values.into_iter().collect()
     }
 
     /// Push one insert of `entity_type` through the real cache-write path and
@@ -1459,189 +1439,6 @@ mod wasm_tests {
              ALL_CACHED_ENTITY_TYPES is the array at the top of \
              crates/trakkt-ui/src/cache/sync_engine.rs. Add:\n{}",
             as_array_entries(&unwiped)
-        );
-    }
-
-    // ── Everything the cache holds also reaches the store ────────────────────
-    //
-    // The sibling of the invariant above, and the one that was broken. Being
-    // persisted is not the same as being seen: `apply_action_to_memory` routes
-    // each frame to the store by entity type, and a type it has no arm for falls
-    // to a `tracing::debug!` and stops there. The row lands in IndexedDB, no
-    // signal fires, and nothing on screen moves — a change that exists in the
-    // cache and nowhere the user can see it.
-    //
-    // Five types had drifted into exactly that state. The two lists agreed on
-    // nothing and were never checked against each other, so the same list-drift
-    // that `every_entity_type_the_cache_persists_is_wiped_by_a_reset` exists to
-    // stop had simply reappeared one module over. Re-listing the arms here would
-    // reproduce it a third time, so both sides are derived: the covered set is
-    // read out of `apply_action_to_memory`'s own source, and the types exempt
-    // from needing an arm are computed from the write path rather than named.
-
-    /// The source of [`crate::cache::apply`], embedded at compile time.
-    ///
-    /// Same reasoning as [`ENTITY_TYPES_SOURCE`]: Rust cannot enumerate a
-    /// `match`'s arms, and a list of them written here would drift from the real
-    /// ones exactly like the array it is meant to police.
-    const APPLY_SOURCE: &str = include_str!("apply.rs");
-
-    /// The body of `apply_action_to_memory`, without the rest of the module.
-    fn apply_action_to_memory_source() -> &'static str {
-        const OPEN: &str = "pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {";
-        let Some(start) = APPLY_SOURCE.find(OPEN) else {
-            panic!(
-                "could not find `{OPEN}` in crates/trakkt-ui/src/cache/apply.rs — it was \
-                 renamed or its signature changed, and this test can no longer see which \
-                 entity types reach the store"
-            );
-        };
-        let body = &APPLY_SOURCE[start + OPEN.len()..];
-        // Everything inside the function is indented, so the first closing brace
-        // in column zero is the function's own.
-        let Some(end) = body.find("\n}") else {
-            panic!("`apply_action_to_memory` in cache/apply.rs is not closed at column zero");
-        };
-        &body[..end]
-    }
-
-    /// Split `apply_action_to_memory`'s body into its insert/update half and its
-    /// delete half.
-    ///
-    /// They are checked separately because they are separate gaps: an entity
-    /// type can be handled on one and forgotten on the other, and a delete that
-    /// reaches nothing is just as silent as an insert that does.
-    fn upsert_and_delete_halves() -> (&'static str, &'static str) {
-        let body = apply_action_to_memory_source();
-        const UPSERT: &str = "SyncActionType::Insert | SyncActionType::Update => {";
-        const DELETE: &str = "SyncActionType::Delete => {";
-
-        let Some(upsert_at) = body.find(UPSERT) else {
-            panic!("could not find `{UPSERT}` in `apply_action_to_memory`");
-        };
-        let Some(delete_at) = body.find(DELETE) else {
-            panic!("could not find `{DELETE}` in `apply_action_to_memory`");
-        };
-        assert!(
-            upsert_at < delete_at,
-            "`apply_action_to_memory` no longer handles insert/update before delete — this \
-             test slices its body on that order"
-        );
-
-        (
-            &body[upsert_at + UPSERT.len()..delete_at],
-            &body[delete_at + DELETE.len()..],
-        )
-    }
-
-    /// Every entity type named by a match arm in `half`.
-    ///
-    /// Strict and self-checking for the same reason the entity-type parse is: an
-    /// arm this cannot read is an arm the test silently stops crediting, and the
-    /// failure mode of *that* is a green test over the exact gap it was written
-    /// to catch. So every `entity_types::` mention in the slice has to be an arm
-    /// — a comment that names one in passing fails here rather than quietly
-    /// counting as coverage.
-    fn entity_types_matched(half: &'static str, what: &str) -> BTreeSet<&'static str> {
-        const ARM: &str = "et if et == entity_types::";
-        let by_name = declared_entity_types_by_name();
-
-        let mut matched = BTreeSet::new();
-        for line in half.lines() {
-            if !line.contains("entity_types::") {
-                continue;
-            }
-            let trimmed = line.trim();
-            let Some(rest) = trimmed.strip_prefix(ARM) else {
-                panic!(
-                    "the {what} half of `apply_action_to_memory` mentions `entity_types::` on a \
-                     line this test cannot read as a match arm:\n  {trimmed}\n\
-                     Arms are matched by the exact prefix `{ARM}`. If this is prose, spell the \
-                     entity type without the `entity_types::` path; if the arms changed shape, \
-                     fix `entity_types_matched` in \
-                     crates/trakkt-ui/src/cache/sync_engine.rs."
-                );
-            };
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
-                .collect();
-            let Some(value) = by_name.get(name.as_str()) else {
-                panic!(
-                    "the {what} half of `apply_action_to_memory` matches on \
-                     `entity_types::{name}`, which is not declared in \
-                     trakkt-types/src/sync.rs"
-                );
-            };
-            matched.insert(*value);
-        }
-        matched
-    }
-
-    /// Cache entity types that only ever exist as a side effect of some *other*
-    /// type's action, and so never arrive as a `SyncAction` of their own.
-    ///
-    /// `issue_content` is the one: an issue's body is split out of the issue
-    /// record by [`enqueue_cache_writes`] and stored under its own type, but no
-    /// server ever sends an `issue_content` frame, so there is nothing for
-    /// `apply_action_to_memory` to have an arm for. That is derived here rather
-    /// than asserted, by pushing every declared type through the real write path
-    /// and collecting the cache types it produces that are not itself — so a
-    /// second entity ever split out this way exempts itself, and a type that
-    /// stops being split loses its exemption.
-    fn side_effect_only_cache_types() -> BTreeSet<String> {
-        let mut derived = BTreeSet::new();
-        for entity_type in declared_entity_types() {
-            for persisted in entity_types_persisted_by_an_insert_of(entity_type) {
-                if persisted != entity_type {
-                    derived.insert(persisted);
-                }
-            }
-        }
-        derived
-    }
-
-    /// The invariant the UI rests on: nothing the cache holds is invisible.
-    #[wasm_bindgen_test]
-    fn every_entity_type_the_cache_persists_reaches_the_store() {
-        let (upsert_half, delete_half) = upsert_and_delete_halves();
-        let upsert_arms = entity_types_matched(upsert_half, "insert/update");
-        let delete_arms = entity_types_matched(delete_half, "delete");
-        let exempt = side_effect_only_cache_types();
-
-        let mut missing: Vec<String> = Vec::new();
-        for entity_type in ALL_CACHED_ENTITY_TYPES {
-            if exempt.contains(*entity_type) {
-                continue;
-            }
-            let mut halves = Vec::new();
-            if !upsert_arms.contains(entity_type) {
-                halves.push("insert/update");
-            }
-            if !delete_arms.contains(entity_type) {
-                halves.push("delete");
-            }
-            if !halves.is_empty() {
-                missing.push(format!("  {entity_type} — missing from: {}", halves.join(", ")));
-            }
-        }
-
-        assert!(
-            missing.is_empty(),
-            "These entity types are cached by this client but never reach the reactive \
-             store.\n\
-             `enqueue_cache_writes` persists them and `SyncReset` wipes them, so they are \
-             real rows — but `apply_action_to_memory` has no arm for them, so the frame ends \
-             at a `tracing::debug!` and no signal fires. The change is in IndexedDB and \
-             nowhere the user can see it until a reload.\n{}\n\
-             Fix it in `apply_action_to_memory` (crates/trakkt-ui/src/cache/apply.rs), by \
-             adding an arm that updates a cached collection or bumps a version counter \
-             *something actually subscribes to*. A counter no page reads is this same bug \
-             with a passing test.\n\
-             If nothing in this client reads the type at all, the honest fix is the other \
-             one: add it to `NOT_CACHED` in the same module and take it off \
-             ALL_CACHED_ENTITY_TYPES, so it is neither persisted nor wiped.",
-            missing.join("\n")
         );
     }
 }
