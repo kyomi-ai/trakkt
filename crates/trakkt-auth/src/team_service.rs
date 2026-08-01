@@ -620,10 +620,19 @@ pub async fn upload_team_icon(
 
 /// Fetch a team's custom icon binary data and MIME type.
 ///
-/// Returns `None` if no custom icon is uploaded (`icon_data` is NULL).
+/// The lookup is workspace-scoped: the row must match *both* `team_id` and
+/// `workspace_id`, mirroring `upload_team_icon` and `delete_team_icon`. A team
+/// id belonging to another workspace therefore reads as absent rather than
+/// returning that workspace's bytes, so a caller that has authenticated a user
+/// but passes the wrong `workspace_id` cannot leak across tenants.
+///
+/// Returns `Ok(None)` when the team exists in `workspace_id` but has no custom
+/// icon uploaded (`icon_data` / `icon_mime` are NULL), and `Err(NotFound)` when
+/// no row matches the `(team_id, workspace_id)` pair.
 pub async fn get_team_icon_data(
     db: &DbPool,
     team_id: &str,
+    workspace_id: &str,
 ) -> trakkt_core::Result<Option<(Vec<u8>, String)>> {
     #[derive(sqlx::FromRow)]
     struct IconDataRow {
@@ -634,8 +643,9 @@ pub async fn get_team_icon_data(
     let row = trakkt_core::db_fetch_optional!(
         db,
         IconDataRow,
-        "SELECT icon_data, icon_mime FROM teams WHERE team_id = $1",
-        team_id
+        "SELECT icon_data, icon_mime FROM teams WHERE team_id = $1 AND workspace_id = $2",
+        team_id,
+        workspace_id
     )?;
 
     match row {
@@ -1481,5 +1491,75 @@ mod tests {
             .expect("a team in the caller's own workspace resolves");
         assert_eq!(team.team_id, TEAM_A);
         assert_eq!(team.workspace_id, WS_A);
+    }
+
+    // ─── Icon reads ─────────────────────────────────────────────────────────
+
+    /// A PNG magic-byte prefix plus a marker, so a leak is recognisable in a
+    /// failure message.
+    const ICON_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nalpha-team-icon-bytes";
+    const ICON_MIME: &str = "image/png";
+
+    /// Write icon bytes straight onto the team row.
+    ///
+    /// Deliberately not via `upload_team_icon`: these tests are about the WHERE
+    /// clause of the *read*, so the write side must not be able to mask a
+    /// missing scope by refusing to store the row in the first place.
+    async fn seed_icon(db: &DbPool, team_id: &str, data: &[u8], mime: &str) {
+        db_execute!(
+            db,
+            "UPDATE teams SET icon_type = 'custom', icon_data = $1, icon_mime = $2 \
+             WHERE team_id = $3",
+            data,
+            mime,
+            team_id
+        )
+        .expect("seed icon bytes");
+    }
+
+    #[tokio::test]
+    async fn get_team_icon_data_returns_the_icon_for_its_own_workspace() {
+        let db = two_workspaces().await;
+        seed_icon(&db, TEAM_A, ICON_BYTES, ICON_MIME).await;
+
+        let (data, mime) = get_team_icon_data(&db, TEAM_A, WS_A)
+            .await
+            .expect("a team read with its own workspace id resolves")
+            .expect("the seeded icon is present");
+
+        assert_eq!(data, ICON_BYTES, "the stored bytes come back verbatim");
+        assert_eq!(mime, ICON_MIME);
+    }
+
+    #[tokio::test]
+    async fn get_team_icon_data_hides_an_icon_from_another_workspace() {
+        let db = two_workspaces().await;
+        seed_icon(&db, TEAM_A, ICON_BYTES, ICON_MIME).await;
+
+        // Prove the fixture really stores readable bytes first, so the negative
+        // assertion below can only be the workspace scope hiding them rather
+        // than an icon that was never written.
+        assert!(
+            get_team_icon_data(&db, TEAM_A, WS_A)
+                .await
+                .expect("own-workspace read")
+                .is_some(),
+            "fixture must store an icon for the cross-workspace case to mean anything"
+        );
+
+        // Workspace B naming workspace A's team: the id is real and guessable,
+        // which is exactly the case an auth check alone would still let through.
+        match get_team_icon_data(&db, TEAM_A, WS_B).await {
+            Err(trakkt_core::Error::NotFound(_)) => {}
+            Ok(Some((data, mime))) => panic!(
+                "cross-workspace read leaked {} bytes of team A's icon (mime {mime})",
+                data.len()
+            ),
+            Ok(None) => panic!(
+                "cross-workspace read must be NotFound — Ok(None) would tell the \
+                 caller the team exists in their workspace but has no icon"
+            ),
+            Err(e) => panic!("expected NotFound for a team in another workspace, got {e:?}"),
+        }
     }
 }

@@ -18,6 +18,11 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 - Every write operation must append to `sync_log` after the main write.
 - When changing a service function signature, grep for ALL call sites (server functions, websocket bootstrap, tests, other services).
 
+### Transactions
+- Never call a pool-scoped macro (`db_fetch_*!`, `db_execute!`, `db_with_pool!`) or a `&DbPool`-taking helper between `db.begin()` and the matching commit. SQLite runs with `max_connections(1)`, so the open transaction holds the only connection — the pool call stalls until sqlx's 30s `acquire_timeout` fires and then fails with `PoolTimedOut`. Use the `tx_*!` macros or a `_tx` helper variant instead. Do all authorization reads and validation on the pool *before* `db.begin()`.
+- Route every commit through `SyncBatch`/`commit_and_deliver` rather than hand-rolling commit-then-broadcast. One `SyncAudience` value must drive both the persisted `visibility_user_id` column and the delivery call, so "persist private but broadcast workspace-wide" is unrepresentable.
+- The payload persisted to `sync_log.data` must be the same value that is broadcast. Passing `None` to the persisted column while broadcasting a real payload silently drops the entity from every client's delta replay — `cache/apply.rs` discards data-less insert/update actions before they reach IndexedDB.
+
 ### Server Functions (Leptos)
 - Server functions are thin wrappers: extract auth, extract context, call service, return.
 - No business logic in server functions — delegate to `trakkt-auth` services.
@@ -35,6 +40,10 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 
 ### Double-Option (Clearable Fields)
 - `IssueUpdate` uses double-Option for clearable fields (`Option<Option<T>>`). `Some(None)` means "clear the field" (set to NULL), not "set the field". When checking if a field was set to a value, use `matches!(field, Some(Some(_)))`, not `.is_some()` — the latter fires on field-clear too.
+
+### Comment and Doc Accuracy
+- A comment that makes a checkable claim must be checked. Reviews repeatedly find comments asserting a consequence that does not hold ("would hang forever" when the real outcome is a 30s `PoolTimedOut`; "replaces 11 copy-pasted blocks" when it was 10; a `Drop` guard "covers panics" when `panic = "abort"` is set in the release profile). If you cannot verify a claim, state the narrower thing you can verify.
+- Prefer documenting the invariant a caller depends on at the callee, not only at the caller. A guarantee recorded only at the call site is silently invalidated the next time the callee is edited in isolation.
 
 ### No Banned Patterns
 - No `#[allow(dead_code)]`, `#[allow(unused_variables)]`, `#[allow(unused_imports)]`
