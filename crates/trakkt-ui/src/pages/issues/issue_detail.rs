@@ -3295,17 +3295,9 @@ fn AttachmentsSection(
     let tk_for_detach = team_key.clone();
     let (version, set_version) = signal(0u32);
 
-    // `version` covers this tab's own uploads and detaches. The store counter
-    // covers everyone else's: an attachment/issue_attachment frame bumps it, and
-    // without it a file added or removed elsewhere never appears here.
-    let sync_store = use_context::<crate::cache::store::SyncStore>();
-    let ws_version = Signal::derive(move || {
-        sync_store.map(|s| s.attachments_version().get()).unwrap_or(0)
-    });
-
     let attachments_resource = Resource::new(
-        move || (tk.clone(), number, version.get(), ws_version.get()),
-        move |(tk, num, _, _)| async move { list_issue_attachments(tk, num).await },
+        move || (tk.clone(), number, version.get()),
+        move |(tk, num, _)| async move { list_issue_attachments(tk, num).await },
     );
 
     // ── Upload via hidden file input ────────────────────────────────────
