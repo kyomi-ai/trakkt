@@ -541,6 +541,7 @@ mod wasm_tests {
     use crate::cache::apply::apply_broadcast;
     use crate::cache::tab_leader::CachedEntity;
     use crate::cache::websocket;
+    use crate::wasm_test_support::boot_leptos_executor;
 
     use super::*;
 
@@ -1048,24 +1049,7 @@ mod wasm_tests {
     // decides whether the tab keeps syncing after the outer effect re-runs.
     //
     // This is the first test in the repo to drive a real `Effect`; see
-    // `boot_effect_executor` for what that cost.
-
-    /// Boot the executor Leptos runs `Effect` tasks on.
-    ///
-    /// Production gets this from `mount_to_body` / `hydrate_body`, which a
-    /// `wasm-bindgen-test` never calls — so without this, `Effect::new` spawns
-    /// onto nothing and the effect below would never run at all, passing this
-    /// test for the wrong reason. It is the same executor either way:
-    /// `init_wasm_bindgen` installs `wasm_bindgen_futures::spawn_local`, which
-    /// is what `leptos::task::spawn_local` resolves to on this target.
-    ///
-    /// Global and set once per page, so a second caller being told it is
-    /// already set is the answer it wanted.
-    fn boot_effect_executor() {
-        match any_spawner::Executor::init_wasm_bindgen() {
-            Ok(()) | Err(any_spawner::ExecutorError::AlreadySet) => {}
-        }
-    }
+    // `boot_leptos_executor` for what that cost.
 
     /// Poll `condition` every turn of the event loop until it holds, or fail.
     ///
@@ -1113,7 +1097,7 @@ mod wasm_tests {
     /// ever touched.
     #[wasm_bindgen_test]
     async fn the_connection_state_watcher_survives_a_re_run_of_the_effect_that_started_it() {
-        boot_effect_executor();
+        boot_leptos_executor();
 
         let component = Owner::new();
         component.set();
@@ -1212,7 +1196,7 @@ mod wasm_tests {
     /// thing standing between a re-run and duplicate delivery.
     #[wasm_bindgen_test]
     async fn a_re_run_leaves_the_cross_tab_subscription_and_its_backlog_intact() {
-        boot_effect_executor();
+        boot_leptos_executor();
 
         let component = Owner::new();
         component.set();

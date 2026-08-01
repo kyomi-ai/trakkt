@@ -191,6 +191,8 @@ mod latency_tests {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
+    use crate::wasm_test_support::boot_leptos_executor;
+
     use super::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -335,6 +337,8 @@ mod latency_tests {
 
     #[wasm_bindgen_test]
     async fn a_server_function_round_trip_costs_neither_the_text_nor_the_caret() {
+        boot_leptos_executor();
+
         // 1ms stands in for the server function. Anything that resolves on a
         // macrotask behaves identically — the sweep in this module's docs covers
         // 0ms through 50ms on both resource types.
@@ -364,6 +368,8 @@ mod latency_tests {
 
     #[wasm_bindgen_test]
     async fn only_a_fetcher_that_never_crosses_a_macrotask_costs_the_caret() {
+        boot_leptos_executor();
+
         // The shape that produced the original, wrong diagnosis. Kept so the
         // claim stays falsifiable: it is not that suspense boundaries are
         // harmless, it is that this one is only harmful somewhere production

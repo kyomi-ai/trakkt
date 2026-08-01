@@ -525,6 +525,8 @@ mod wasm_tests {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
+    use crate::wasm_test_support::boot_leptos_executor;
+
     use super::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -692,6 +694,8 @@ mod wasm_tests {
     /// panic itself is asserted on by `e2e/tests/sync/panic-probe.spec.ts`.
     #[wasm_bindgen_test]
     async fn a_write_after_the_archive_card_is_rebuilt_still_reaches_the_select() {
+        boot_leptos_executor();
+
         let owner = Owner::new();
         owner.set();
 

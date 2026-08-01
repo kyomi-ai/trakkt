@@ -482,6 +482,7 @@ mod wasm_tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     use crate::cache::store::SyncStore;
+    use crate::wasm_test_support::boot_leptos_executor;
 
     use super::*;
 
@@ -538,6 +539,8 @@ mod wasm_tests {
     /// echoed anything back.
     #[wasm_bindgen_test]
     async fn an_in_flight_toggle_survives_the_row_being_rebuilt() {
+        boot_leptos_executor();
+
         let owner = Owner::new();
         owner.set();
 
@@ -637,6 +640,8 @@ mod wasm_tests {
     /// needed; neither replaces the other.
     #[wasm_bindgen_test]
     async fn a_write_after_the_row_is_rebuilt_still_reaches_the_switch() {
+        boot_leptos_executor();
+
         let owner = Owner::new();
         owner.set();
 
@@ -704,6 +709,8 @@ mod wasm_tests {
     /// The row still follows the server for values the user has not touched.
     #[wasm_bindgen_test]
     async fn a_toggle_follows_the_server_when_nothing_is_in_flight() {
+        boot_leptos_executor();
+
         let owner = Owner::new();
         owner.set();
 
@@ -733,6 +740,8 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn a_local_resource_refetches_when_a_signal_its_fetcher_reads_bumps() {
+        boot_leptos_executor();
+
         let owner = Owner::new();
         owner.set();
 
