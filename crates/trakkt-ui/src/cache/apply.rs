@@ -23,6 +23,13 @@
 //! Both halves are pure Rust over the store and the writer queue, so this
 //! module is not target-gated and its behaviour — including which entity types
 //! bump which version counter — is unit tested natively.
+//!
+//! The counters are tested twice over, and the second time is the one that
+//! matters. A version counter holds no data, so a native test that asserts one
+//! incremented passes just as well against an arm nothing subscribes to — which
+//! is a change that reaches the cache and never the screen. The browser tests at
+//! the bottom of this file rebuild the exact source signal each page hands to
+//! its `Resource` and assert *that* moved.
 
 use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
 use trakkt_types::sync::{SyncAction, SyncActionType, entity_types};
@@ -192,6 +199,46 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                     // read path, same payload reasoning as the member arm above.
                     store.bump_project_updates_version();
                 }
+                et if et == entity_types::ATTACHMENT => {
+                    // Attachments are fetched on-demand by the issue detail
+                    // page's attachment section, straight from the
+                    // `list_issue_attachments` server function. Bump the counter
+                    // so it refetches: an upload made in another tab, on another
+                    // device, or by an agent otherwise never appears in the list.
+                    store.bump_attachments_version();
+                }
+                et if et == entity_types::ISSUE_ATTACHMENT => {
+                    // Linking an existing attachment to an issue changes the very
+                    // same list, so it shares the counter — one counter per
+                    // reader, not per entity type.
+                    //
+                    // This arm only runs when the frame carries a payload, and
+                    // `attach_to_issue` in
+                    // `crates/trakkt-auth/src/attachment_service.rs` records the
+                    // link with `None`. So the paths that are live today are the
+                    // `Delete` arm below (an unlink) and the attachment insert an
+                    // upload emits alongside its link. Sending the junction row
+                    // here is the server's half — `add_project_member` in
+                    // `project_service.rs` already does exactly that for the
+                    // membership its own arm depends on. Handling it here is what
+                    // leaves that a change to one service function rather than a
+                    // second silent gap to rediscover.
+                    store.bump_attachments_version();
+                }
+                et if et == entity_types::NOTIFICATION_PREFERENCES => {
+                    // Preferences are fetched on-demand by the notification
+                    // settings page from `get_notification_preferences`. These
+                    // frames are scoped to one user, so what this delivers is
+                    // that user's own change from another tab or device.
+                    store.bump_notification_preferences_version();
+                }
+                et if et == entity_types::WORKSPACE_SETTINGS => {
+                    // The workspace settings page reads through its own
+                    // `get_workspace_settings` round trip, so a rename or an
+                    // auto-archive change by another admin reaches it only when
+                    // this counter tells it to ask again.
+                    store.bump_workspace_settings_version();
+                }
                 other => {
                     tracing::debug!(
                         entity_type = other,
@@ -240,6 +287,31 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                     // stops one from arriving as silence if that changes, which
                     // is the exact failure this ticket fixed for members.
                     store.bump_project_updates_version();
+                }
+                et if et == entity_types::ATTACHMENT => {
+                    // Deleting an attachment removes it from every issue it was
+                    // linked to, so the detail page's list has to refetch.
+                    store.bump_attachments_version();
+                }
+                et if et == entity_types::ISSUE_ATTACHMENT => {
+                    // Unlinking is the one attachment-link edit that arrives as a
+                    // Delete — there is no row left to send. Unlike its insert
+                    // twin this arm needs no payload to run, so it is the live
+                    // path today: a detach performed elsewhere reaches the list
+                    // through here and nowhere else.
+                    store.bump_attachments_version();
+                }
+                et if et == entity_types::NOTIFICATION_PREFERENCES => {
+                    // No server path deletes a preferences row today. Handling it
+                    // is what stops one from arriving as silence if that changes
+                    // — the same reasoning as the posted-update arm above.
+                    store.bump_notification_preferences_version();
+                }
+                et if et == entity_types::WORKSPACE_SETTINGS => {
+                    // Likewise: settings are only ever updated today, never
+                    // deleted. The settings page has one reactive dependency, and
+                    // it must not depend on which action type carried the change.
+                    store.bump_workspace_settings_version();
                 }
                 other => {
                     tracing::debug!(
@@ -325,6 +397,33 @@ fn apply_broadcast_to_memory(store: &SyncStore, message: &SyncBroadcastMessage) 
 
 // ── Cache half (leader only) ────────────────────────────────────────────────
 
+/// Entity types that arrive on the sync stream and are deliberately **not**
+/// written to the local cache.
+///
+/// [`enqueue_cache_writes`] otherwise persists any action carrying a payload,
+/// with no regard for whether anything reads it back. That default is right for
+/// every type but one.
+///
+/// `release` has no reader in this client at all: no route, no page, no server
+/// function, no hydration step and no on-demand cache read mentions releases —
+/// they are created and listed exclusively through the API and MCP tools. Nor
+/// could the cached rows serve a future one, because `sync_bootstrap` does not
+/// stream releases: a cache filled only by whichever deltas happened to arrive
+/// while some tab was open is an arbitrary subset, never a list. The
+/// user-visible half of publishing a release does reach the UI, but as the
+/// `issue` updates the same transaction emits for every issue it contains.
+///
+/// So the rows were written, wiped by the next reset, and read by nothing in
+/// between. Skipping them here is what lets `release` come off
+/// `ALL_CACHED_ENTITY_TYPES` (see `crates/trakkt-ui/src/cache/sync_engine.rs`)
+/// without breaking the invariant that everything the cache can hold is wiped by
+/// a reset — the two are checked against each other by
+/// `every_entity_type_the_cache_persists_is_wiped_by_a_reset`.
+///
+/// Giving releases a UI means undoing both halves: stream them from the
+/// bootstrap, drop this entry, and put `release` back on that array.
+const NOT_CACHED: &[&str] = &[entity_types::RELEASE];
+
 /// Queue the removal of one cached entity record.
 fn enqueue_delete(writer: &IdbWriter, entity_type: &str, entity_id: &str) {
     writer.enqueue(IdbOp::Delete {
@@ -349,6 +448,11 @@ pub fn enqueue_cache_writes(writer: &IdbWriter, action: &SyncAction) {
             let Some(ref entity_data) = action.data else {
                 return;
             };
+
+            // Types nothing reads back are not written at all. See `NOT_CACHED`.
+            if NOT_CACHED.contains(&entity_type) {
+                return;
+            }
 
             // For issues: split the description into a separate issue_content
             // entity in IDB so it is not bulk-loaded during hydration. The
@@ -459,6 +563,111 @@ pub fn enqueue_cache_writes(writer: &IdbWriter, action: &SyncAction) {
     }
 }
 
+// ── Test support ────────────────────────────────────────────────────────────
+
+/// Fixtures and setup shared by the native tests below and the browser tests
+/// after them, so neither target's copy can drift from the other's.
+#[cfg(test)]
+mod test_support {
+    use leptos::prelude::*;
+    use trakkt_types::sync::{SyncAction, SyncActionType};
+
+    use crate::cache::store::SyncStore;
+
+    /// One sync frame, with the entity id every fixture here shares.
+    pub(super) fn action(
+        entity_type: &str,
+        kind: SyncActionType,
+        data: Option<serde_json::Value>,
+    ) -> SyncAction {
+        SyncAction {
+            sync_id: 1,
+            entity_type: entity_type.to_owned(),
+            entity_id: "issue-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            action: kind,
+            data,
+            timestamp: "2026-07-26T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// Same as [`action`] but with a caller-chosen entity id, for the entity
+    /// types whose id is not a bare uuid — a membership is keyed
+    /// `project_id:user_id`, an attachment link `issue_id:attachment_id`, and
+    /// the add and the remove have to agree on it.
+    pub(super) fn action_with_id(
+        entity_type: &str,
+        entity_id: &str,
+        kind: SyncActionType,
+        data: Option<serde_json::Value>,
+    ) -> SyncAction {
+        SyncAction {
+            entity_id: entity_id.to_owned(),
+            ..action(entity_type, kind, data)
+        }
+    }
+
+    /// Reactive primitives need an owner on both targets.
+    pub(super) fn with_store(test: impl FnOnce(SyncStore)) {
+        let owner = Owner::new();
+        owner.set();
+        test(SyncStore::new());
+    }
+
+    // The four entity types this ticket added arms for are exercised only by the
+    // browser tests — the counters they bump are meaningless without a reader,
+    // and a reader is a reactive signal. So their payloads are wasm-only; built
+    // on the native target they are three functions nothing calls.
+
+    /// The payload `create_attachment` sends, as the wire carries it.
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn attachment_json() -> serde_json::Value {
+        serde_json::json!({
+            "attachment_id": "att-1",
+            "filename": "diagram.png",
+            "content_type": "image/png",
+            "size_bytes": 4096,
+            "created_at": "2026-07-26T00:00:00Z",
+        })
+    }
+
+    /// The payload `update_notification_preference` sends.
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn notification_preferences_json() -> serde_json::Value {
+        serde_json::json!({
+            "preference_id": "pref-1",
+            "user_id": "usr-alice",
+            "workspace_id": "ws-1",
+            "notify_status_changes": true,
+            "notify_comments": false,
+            "notify_assignments": true,
+            "notify_priority_changes": true,
+            "notify_label_changes": true,
+            "notify_due_date_changes": true,
+            "notify_estimate_changes": true,
+            "notify_milestone_changes": true,
+            "notify_project_changes": true,
+            "notify_team_changes": true,
+            "notify_relation_changes": true,
+            "notify_own_agent_actions": false,
+            "notify_own_api_actions": false,
+            "delivery_channel": "in_app",
+        })
+    }
+
+    /// The snapshot `update_workspace_name` and `update_workspace_settings`
+    /// both send — the shape `WorkspaceSnapshotRow::into_sync_value` builds.
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn workspace_settings_json() -> serde_json::Value {
+        serde_json::json!({
+            "workspace_id": "ws-1",
+            "name": "Renamed Workspace",
+            "settings": {"default_auto_archive_days": 30},
+            "updated_at": "2026-07-26T00:00:00Z",
+        })
+    }
+}
+
 // ── Native unit tests ───────────────────────────────────────────────────────
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -470,6 +679,7 @@ mod tests {
     use crate::cache::idb_writer::channel;
     use crate::cache::tab_leader::CachedEntity;
 
+    use super::test_support::*;
     use super::*;
 
     /// A one-line description of a queued op, for order-sensitive assertions.
@@ -546,44 +756,6 @@ mod tests {
             "has_relations": false,
             "labels": [],
         })
-    }
-
-    fn action(
-        entity_type: &str,
-        kind: SyncActionType,
-        data: Option<serde_json::Value>,
-    ) -> SyncAction {
-        SyncAction {
-            sync_id: 1,
-            entity_type: entity_type.to_owned(),
-            entity_id: "issue-1".to_owned(),
-            workspace_id: "ws-1".to_owned(),
-            action: kind,
-            data,
-            timestamp: "2026-07-26T00:00:00Z".to_owned(),
-        }
-    }
-
-    /// Same as [`action`] but with a caller-chosen entity id, for the entity
-    /// types whose id is not a bare uuid — a membership is keyed
-    /// `project_id:user_id`, and the add and the remove have to agree on it.
-    fn action_with_id(
-        entity_type: &str,
-        entity_id: &str,
-        kind: SyncActionType,
-        data: Option<serde_json::Value>,
-    ) -> SyncAction {
-        SyncAction {
-            entity_id: entity_id.to_owned(),
-            ..action(entity_type, kind, data)
-        }
-    }
-
-    /// Reactive primitives need an owner on the native target.
-    fn with_store(test: impl FnOnce(SyncStore)) {
-        let owner = Owner::new();
-        owner.set();
-        test(SyncStore::new());
     }
 
     // ── Memory half ─────────────────────────────────────────────────────────
@@ -1005,12 +1177,30 @@ mod tests {
         );
     }
 
+    /// What the delete path queues for the two types whose deletes it ignores.
+    ///
+    /// The name and the old message both claimed these types have no cached
+    /// rows. That is true of `activity` — every activity frame carries a `None`
+    /// payload, so the insert path returns before it can persist anything — and
+    /// false of `issue_relation`, whose inserts *do* carry a payload and are
+    /// persisted by the generic upsert. Its rows therefore outlive the relation
+    /// until the next reset.
+    ///
+    /// The behaviour is left exactly as it was on purpose. The fix is not a
+    /// third arm here: the insert path persists everything with a payload while
+    /// this delete path is a hand-written list, which is the same list-drift
+    /// `every_entity_type_the_cache_persists_reaches_the_store` was added for,
+    /// one level down. Deriving the delete from the persist path, with its own
+    /// guard, is its own change — so this records what is true today rather than
+    /// half-correcting it.
     #[test]
     fn entity_types_with_no_cached_rows_queue_nothing() {
         for entity_type in [entity_types::ACTIVITY, entity_types::ISSUE_RELATION] {
             assert!(
                 cache_ops(&action(entity_type, SyncActionType::Delete, None)).is_empty(),
-                "{entity_type} has no cached rows to delete"
+                "{entity_type}'s delete queues nothing today — for `activity` because it has \
+                 no cached rows at all, for `issue_relation` because its rows are persisted \
+                 and never removed"
             );
         }
     }
@@ -1228,6 +1418,49 @@ mod tests {
     }
 
     #[test]
+    fn a_release_upsert_is_not_persisted() {
+        // Nothing in this client reads releases back — no route, no page, no
+        // hydration step, no on-demand cache read — and no bootstrap streams
+        // them, so a cached release row could never be more than an arbitrary
+        // fragment. Writing rows nothing reads is the reason `release` is on
+        // `NOT_CACHED` and off `ALL_CACHED_ENTITY_TYPES`, and the reason it has
+        // no store arm either.
+        assert!(
+            cache_ops(&action_with_id(
+                entity_types::RELEASE,
+                "rel-1",
+                SyncActionType::Insert,
+                Some(serde_json::json!({
+                    "release_id": "rel-1",
+                    "name": "v1.2.0",
+                    "issue_count": 3,
+                })),
+            ))
+            .is_empty(),
+            "a release must not reach IndexedDB — it is wiped by no reset and read by \
+             nothing, so the row would only ever be written"
+        );
+    }
+
+    #[test]
+    fn a_release_upsert_still_persists_nothing_when_it_carries_the_issues_it_names() {
+        // Publishing a release emits an `issue` update per issue it contains,
+        // alongside the release itself. Those are ordinary issue frames and must
+        // keep working — the skip is scoped to the release entity, not to the
+        // transaction that produced it.
+        let ops = cache_ops(&action(
+            entity_types::ISSUE,
+            SyncActionType::Update,
+            Some(issue_json(serde_json::Value::Null)),
+        ));
+        assert_eq!(
+            ops.len(),
+            1,
+            "the issue updates a release emits are still cached, got {ops:?}"
+        );
+    }
+
+    #[test]
     fn a_follower_clears_memory_on_reset() {
         with_store(|store| {
             apply_broadcast_to_memory(
@@ -1247,5 +1480,306 @@ mod tests {
                 "the leader wiped the shared cache — the follower must not keep rendering it"
             );
         });
+    }
+}
+
+// ── Browser tests: the frames a reader actually observes ────────────────────
+
+/// Tests that an applied frame changes what a page reads, run in a browser.
+///
+/// The counters these entity types bump hold no data, so "the counter went up"
+/// is not evidence of anything — an arm that bumped a counter nobody subscribed
+/// to would pass such a test while the screen stayed frozen, which is the bug
+/// this file was fixed for. So each test builds the *same source signal* its
+/// page hands to `Resource::new` and asserts that value moved. A Leptos
+/// `Resource` refetches exactly when its source changes, so a moved source is a
+/// refetch, and a refetch is the change reaching the page.
+///
+/// Run with:
+/// `wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate`
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use leptos::prelude::*;
+    use trakkt_types::sync::SyncActionType;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use super::test_support::*;
+    use super::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// The source `AttachmentsSection` hands to `Resource::new`, rebuilt here.
+    ///
+    /// See `AttachmentsSection` in `crates/trakkt-ui/src/pages/issues/issue_detail.rs`:
+    /// `(team_key, number, version.get(), ws_version.get())`. The page's own
+    /// `version` — its uploads and detaches — is held still here, so the only
+    /// thing that can move this tuple is a frame from the sync stream.
+    fn attachment_list_source(store: SyncStore) -> Signal<(String, i32, u32, u32)> {
+        Signal::derive(move || ("TRA".to_owned(), 42, 0, store.attachments_version().get()))
+    }
+
+    /// The source `NotificationsPage` reads inside its `LocalResource` fetcher.
+    fn notification_preferences_source(store: SyncStore) -> Signal<u32> {
+        Signal::derive(move || store.notification_preferences_version().get())
+    }
+
+    /// The source `WorkspacePage` hands to `Resource::new`.
+    fn workspace_settings_source(store: SyncStore) -> Signal<u32> {
+        Signal::derive(move || store.workspace_settings_version().get())
+    }
+
+    /// Apply `action` and report what each of the three page sources read
+    /// before and after, so every test can assert its own reader moved *and*
+    /// that it did not drag the other two along with it.
+    struct Observed {
+        attachments: bool,
+        notification_preferences: bool,
+        workspace_settings: bool,
+    }
+
+    fn observe(action: &SyncAction) -> Observed {
+        let mut observed = Observed {
+            attachments: false,
+            notification_preferences: false,
+            workspace_settings: false,
+        };
+        with_store(|store| {
+            let attachments = attachment_list_source(store);
+            let prefs = notification_preferences_source(store);
+            let settings = workspace_settings_source(store);
+
+            let before = (
+                attachments.get_untracked(),
+                prefs.get_untracked(),
+                settings.get_untracked(),
+            );
+
+            apply_action_to_memory(&store, action);
+
+            observed.attachments = attachments.get_untracked() != before.0;
+            observed.notification_preferences = prefs.get_untracked() != before.1;
+            observed.workspace_settings = settings.get_untracked() != before.2;
+        });
+        observed
+    }
+
+    // ── attachment ──────────────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn an_attachment_upload_refetches_the_issue_attachment_list() {
+        let observed = observe(&action_with_id(
+            entity_types::ATTACHMENT,
+            "att-1",
+            SyncActionType::Insert,
+            Some(attachment_json()),
+        ));
+
+        assert!(
+            observed.attachments,
+            "the issue detail page's attachment list must refetch when an attachment is \
+             uploaded — without it a file added by another tab, another user or an agent \
+             never appears on the issue"
+        );
+        assert!(!observed.notification_preferences);
+        assert!(!observed.workspace_settings);
+    }
+
+    #[wasm_bindgen_test]
+    fn deleting_an_attachment_refetches_the_issue_attachment_list() {
+        let observed = observe(&action_with_id(
+            entity_types::ATTACHMENT,
+            "att-1",
+            SyncActionType::Delete,
+            None,
+        ));
+
+        assert!(
+            observed.attachments,
+            "a deleted attachment is gone from every issue it was linked to — the list has \
+             to ask again, and a delete carries no payload so this counter is all there is"
+        );
+        assert!(!observed.notification_preferences);
+        assert!(!observed.workspace_settings);
+    }
+
+    // ── issue_attachment ────────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn linking_an_attachment_to_an_issue_refetches_the_list() {
+        let observed = observe(&action_with_id(
+            entity_types::ISSUE_ATTACHMENT,
+            "issue-1:att-1",
+            SyncActionType::Insert,
+            Some(serde_json::json!({
+                "issue_id": "issue-1",
+                "attachment_id": "att-1",
+                "created_at": "2026-07-26T00:00:00Z",
+            })),
+        ));
+
+        assert!(
+            observed.attachments,
+            "linking an existing attachment changes the very list an upload changes, so it \
+             shares the counter"
+        );
+        assert!(!observed.notification_preferences);
+        assert!(!observed.workspace_settings);
+    }
+
+    #[wasm_bindgen_test]
+    fn unlinking_an_attachment_from_an_issue_refetches_the_list() {
+        let observed = observe(&action_with_id(
+            entity_types::ISSUE_ATTACHMENT,
+            "issue-1:att-1",
+            SyncActionType::Delete,
+            None,
+        ));
+
+        assert!(
+            observed.attachments,
+            "an unlink is the only attachment-link edit that arrives as a Delete, and the \
+             attachment itself still exists — nothing else tells the list it went stale"
+        );
+        assert!(!observed.notification_preferences);
+        assert!(!observed.workspace_settings);
+    }
+
+    #[wasm_bindgen_test]
+    fn a_link_frame_without_a_payload_still_reaches_nothing() {
+        // Not a gap in this module: the data-less guard is deliberate, and it is
+        // what stops a payload-less frame from burning a sync id and advancing
+        // every client's watermark past a change it never delivered.
+        //
+        // It does mean `attach_to_issue` in `crates/trakkt-auth/src/attachment_service.rs`
+        // has a live gap of its own: it records the link with `None`, so the
+        // link half of the arm above cannot run for a link made through the API
+        // or an agent. Uploads are unaffected — they emit an `attachment` insert
+        // with a payload alongside — and an unlink needs no payload. Sending the
+        // junction row here is the server's half, exactly as `add_project_member`
+        // already does; this test is what makes that gap visible rather than
+        // silent.
+        let observed = observe(&action_with_id(
+            entity_types::ISSUE_ATTACHMENT,
+            "issue-1:att-1",
+            SyncActionType::Insert,
+            None,
+        ));
+
+        assert!(
+            !observed.attachments,
+            "the data-less guard returns before the entity match, so a payload-less link \
+             insert never reaches its arm at all — this is why the server has to send one"
+        );
+    }
+
+    // ── notification_preferences ────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn a_preference_change_refetches_the_notification_settings_page() {
+        let observed = observe(&action_with_id(
+            entity_types::NOTIFICATION_PREFERENCES,
+            "pref-1",
+            SyncActionType::Update,
+            Some(notification_preferences_json()),
+        ));
+
+        assert!(
+            observed.notification_preferences,
+            "these frames are scoped to one user, so this is that user toggling a preference \
+             on another tab or another device — the settings page has to ask again or the \
+             two go on disagreeing"
+        );
+        assert!(!observed.attachments);
+        assert!(!observed.workspace_settings);
+    }
+
+    #[wasm_bindgen_test]
+    fn deleting_a_preferences_row_refetches_the_notification_settings_page() {
+        // No server path deletes a preferences row today. Handling it is what
+        // stops one from arriving as silence if that changes.
+        let observed = observe(&action_with_id(
+            entity_types::NOTIFICATION_PREFERENCES,
+            "pref-1",
+            SyncActionType::Delete,
+            None,
+        ));
+
+        assert!(
+            observed.notification_preferences,
+            "the settings page has one reactive dependency, and which action type carried \
+             the change must not decide whether it fires"
+        );
+        assert!(!observed.attachments);
+        assert!(!observed.workspace_settings);
+    }
+
+    // ── workspace_settings ──────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn a_workspace_rename_refetches_the_workspace_settings_page() {
+        let observed = observe(&action_with_id(
+            entity_types::WORKSPACE_SETTINGS,
+            "ws-1",
+            SyncActionType::Update,
+            Some(workspace_settings_json()),
+        ));
+
+        assert!(
+            observed.workspace_settings,
+            "the page reads its data through `get_workspace_settings`, not from this store, \
+             so without this it shows what it read on mount until it is navigated away from \
+             and back — while another admin's rename sits in the cache unseen"
+        );
+        assert!(!observed.attachments);
+        assert!(!observed.notification_preferences);
+    }
+
+    #[wasm_bindgen_test]
+    fn deleting_workspace_settings_refetches_the_workspace_settings_page() {
+        // As with preferences: settings are only ever updated today, never
+        // deleted, and the page must not depend on that staying true.
+        let observed = observe(&action_with_id(
+            entity_types::WORKSPACE_SETTINGS,
+            "ws-1",
+            SyncActionType::Delete,
+            None,
+        ));
+
+        assert!(
+            observed.workspace_settings,
+            "one reactive dependency, either action type"
+        );
+        assert!(!observed.attachments);
+        assert!(!observed.notification_preferences);
+    }
+
+    // ── release ─────────────────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn a_release_frame_reaches_no_reader_because_there_is_none() {
+        // The other half of the determination `NOT_CACHED` records. Releases are
+        // created and listed exclusively through the API and MCP tools; no route,
+        // page or server function in this crate reads them. Adding a counter
+        // would give this file a subscriber-less signal, which is the same defect
+        // with a passing test — so the frame is deliberately left to fall
+        // through, and it is not written to the cache either.
+        //
+        // What a user *can* see of a release does arrive: the same transaction
+        // emits an `issue` update for every issue it contains, and those take the
+        // ordinary issue path.
+        let observed = observe(&action_with_id(
+            entity_types::RELEASE,
+            "rel-1",
+            SyncActionType::Insert,
+            Some(serde_json::json!({
+                "release_id": "rel-1",
+                "name": "v1.2.0",
+                "issue_count": 3,
+            })),
+        ));
+
+        assert!(!observed.attachments);
+        assert!(!observed.notification_preferences);
+        assert!(!observed.workspace_settings);
     }
 }
