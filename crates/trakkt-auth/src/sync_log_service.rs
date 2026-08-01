@@ -7094,4 +7094,309 @@ mod tests {
              completable"
         );
     }
+
+    // ─── Activity rows and their sync entries (TRA-9954) ─────────────────────
+
+    /// A recorder over the fixture workspace, acting as A with no socket.
+    fn activity_recorder(db: &DbPool) -> crate::activity_service::ActivityRecorder<'_> {
+        crate::activity_service::ActivityRecorder::new(
+            db,
+            WS,
+            USER_A,
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+    }
+
+    /// A snapshot of the fixture issue differing from its neighbours only in
+    /// `description_hash` — so a diff of two of them records exactly one
+    /// activity, on the coalescing path.
+    fn description_snapshot(
+        description_hash: Option<u64>,
+    ) -> crate::activity_service::IssueSnapshot {
+        crate::activity_service::IssueSnapshot {
+            status_id: "sts_vis".to_string(),
+            status_name: "Backlog".to_string(),
+            priority: 2,
+            assignee_id: None,
+            assignee_name: None,
+            title: "A leaky issue".to_string(),
+            description_hash,
+            estimate: None,
+            project_id: None,
+            project_name: None,
+            milestone_id: None,
+            milestone_name: None,
+            parent_issue_id: None,
+            parent_identifier: None,
+            due_date: None,
+            labels: Vec::new(),
+        }
+    }
+
+    /// Every activity on the fixture issue, read back through the same service
+    /// function the timeline calls — rows as data, not a count.
+    async fn issue_activities(db: &DbPool) -> Vec<trakkt_types::models::IssueActivity> {
+        crate::activity_service::list_issue_activities(db, "iss_vis")
+            .await
+            .expect("read the issue's activities back")
+    }
+
+    /// The ACTIVITY entries of A's delta-from-zero stream, in `sync_id` order.
+    async fn activity_sync_entries(db: &DbPool) -> Vec<SyncAction> {
+        get_entries_since(db, WS, USER_A, 0, 10_000)
+            .await
+            .expect("delta entries")
+            .into_iter()
+            .filter(|e| e.entity_type == entity_types::ACTIVITY)
+            .collect()
+    }
+
+    /// Backdate an activity by `seconds`, keeping it inside or pushing it
+    /// outside the coalescing window as the caller chooses.
+    ///
+    /// The coalescing branch's only data effect is stamping `created_at` with
+    /// `datetime('now')`, which has one-second resolution — a row written in the
+    /// same second as the update is indistinguishable from one the update never
+    /// touched. Backdating first is what makes both the update and its rollback
+    /// observable.
+    async fn backdate_activity(db: &DbPool, activity_id: &str, seconds: i64) {
+        let sql = format!(
+            "UPDATE issue_activities SET created_at = datetime('now', '-{seconds} seconds') \
+             WHERE activity_id = $1"
+        );
+        let result = db_execute!(db, &sql, activity_id).expect("backdate the activity");
+        assert_eq!(
+            result.rows_affected(),
+            1,
+            "backdating must hit the activity it names"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_insert_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let recorder = activity_recorder(&db);
+
+        // Seed one real activity before the trigger exists, so what follows is a
+        // statement about surviving state rather than about an empty table.
+        recorder
+            .record("iss_vis", "created", None)
+            .await
+            .expect("seed one activity");
+
+        let before = issue_activities(&db).await;
+        assert_eq!(
+            before.len(),
+            1,
+            "precondition: the seeded activity is the only one"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = recorder
+            .record_field_change(&crate::activity_service::FieldChangeParams {
+                issue_id: "iss_vis",
+                action_type: "title_changed",
+                field: "title",
+                old_value: Some("A leaky issue"),
+                new_value: Some("Never happened"),
+                metadata: None,
+            })
+            .await
+            .expect_err("an activity whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed warning \
+             and a fabricated sync_id; got: {err}"
+        );
+
+        let after = issue_activities(&db).await;
+        assert_eq!(
+            after, before,
+            "an activity with no sync_log row is invisible to every future \
+             delta, so it must not survive the failed write — and the activity \
+             that was already there must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn coalesced_activity_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let recorder = activity_recorder(&db);
+
+        recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(None),
+                &description_snapshot(Some(1)),
+            )
+            .await
+            .expect("seed one description_changed activity");
+
+        let seeded = issue_activities(&db).await;
+        assert_eq!(
+            seeded.len(),
+            1,
+            "precondition: the first description change inserted exactly one \
+             activity"
+        );
+        assert_eq!(seeded[0].action_type, "description_changed");
+
+        // 10s is inside the 60s coalescing window, so the next change still
+        // coalesces — and the timestamp it would rewrite is now distinguishable.
+        backdate_activity(&db, &seeded[0].activity_id, 10).await;
+        let before = issue_activities(&db).await;
+
+        // Reject the `update` entry only, not every entry. The coalescing branch
+        // writes `update` and the insert branch writes `insert`, so a call that
+        // took the insert branch instead would have had its entry accepted and
+        // returned `Ok` — which is what stops the assertions below from passing
+        // for the wrong reason.
+        reject_sync_log_inserts_for_action(&db, "update").await;
+
+        let err = recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(Some(1)),
+                &description_snapshot(Some(2)),
+            )
+            .await
+            .expect_err("a coalesced activity whose sync entry cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed warning \
+             and a fabricated sync_id; got: {err}"
+        );
+
+        let after = issue_activities(&db).await;
+        assert_eq!(
+            after, before,
+            "the coalescing UPDATE must unwind with the sync entry it could not \
+             write: a refreshed timestamp no delta can replay drifts the \
+             activity feed permanently"
+        );
+        assert_eq!(
+            activity_sync_entries(&db).await.len(),
+            1,
+            "only the seeding insert's entry survives — the rejected update \
+             wrote nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_description_change_inside_the_window_updates_the_activity_already_written() {
+        let db = two_user_workspace().await;
+        let recorder = activity_recorder(&db);
+
+        recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(None),
+                &description_snapshot(Some(1)),
+            )
+            .await
+            .expect("first description change");
+
+        let seeded = issue_activities(&db).await;
+        assert_eq!(seeded.len(), 1, "precondition: one activity so far");
+        backdate_activity(&db, &seeded[0].activity_id, 10).await;
+        let before = issue_activities(&db).await;
+
+        recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(Some(1)),
+                &description_snapshot(Some(2)),
+            )
+            .await
+            .expect("second description change inside the window");
+
+        let after = issue_activities(&db).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "a repeated save inside the window must refresh the activity already \
+             recorded, not flood the feed with a second one"
+        );
+        assert_eq!(
+            after[0].activity_id, before[0].activity_id,
+            "and it must be that same row"
+        );
+        assert_ne!(
+            after[0].created_at, before[0].created_at,
+            "whose timestamp the coalescing branch moves forward"
+        );
+
+        let entries = activity_sync_entries(&db).await;
+        assert_eq!(
+            entries.len(),
+            2,
+            "both the insert and the coalesced update are replayable"
+        );
+        assert_eq!(entries[0].action, SyncActionType::Insert);
+        assert_eq!(entries[0].entity_id, after[0].activity_id);
+        assert_eq!(
+            entries[1].action,
+            SyncActionType::Update,
+            "the second change reports an update, because that is what it did to \
+             the row"
+        );
+        assert_eq!(entries[1].entity_id, after[0].activity_id);
+    }
+
+    #[tokio::test]
+    async fn a_description_change_after_the_window_inserts_a_second_activity() {
+        let db = two_user_workspace().await;
+        let recorder = activity_recorder(&db);
+
+        recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(None),
+                &description_snapshot(Some(1)),
+            )
+            .await
+            .expect("first description change");
+
+        let seeded = issue_activities(&db).await;
+        assert_eq!(seeded.len(), 1, "precondition: one activity so far");
+
+        // 120s is outside the 60s window, so this one must not coalesce. Without
+        // this case the coalescing test above would pass just as well against a
+        // branch that coalesces unconditionally.
+        backdate_activity(&db, &seeded[0].activity_id, 120).await;
+        let before = issue_activities(&db).await;
+
+        recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(Some(1)),
+                &description_snapshot(Some(2)),
+            )
+            .await
+            .expect("second description change outside the window");
+
+        let after = issue_activities(&db).await;
+        assert_eq!(
+            after.len(),
+            2,
+            "a save an hour later is a separate edit and gets its own entry"
+        );
+        assert_eq!(
+            after[0], before[0],
+            "the older activity is left exactly as it was"
+        );
+
+        let entries = activity_sync_entries(&db).await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].action, SyncActionType::Insert);
+        assert_eq!(
+            entries[1].entity_id, after[1].activity_id,
+            "and the second entry replays the new row, not the old one"
+        );
+    }
 }
