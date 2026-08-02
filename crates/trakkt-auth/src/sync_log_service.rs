@@ -911,14 +911,15 @@ mod tests {
             (SyncActionType::Delete, "delete"),
         ] {
             assert_eq!(action_type_to_str(&action), expected);
-            let parsed = parse_action_type(expected).expect("should parse");
+            let parsed = parse_action_type(expected)
+                .unwrap_or_else(|e| panic!("parsing the wire string {expected:?} back into a SyncActionType: {e}"));
             assert_eq!(action_type_to_str(&parsed), expected);
         }
     }
 
     #[test]
     fn test_parse_action_type_unknown() {
-        let err = parse_action_type("upsert").unwrap_err();
+        let err = parse_action_type("upsert").expect_err("parsing the unrecognised action type \"upsert\" must be rejected");
         assert!(err.to_string().contains("unknown sync action type"));
     }
 
@@ -4239,10 +4240,12 @@ mod tests {
             .collect()
     }
 
+    /// One `project_milestones` row as the assertion helpers compare it:
+    /// `(milestone_id, project_id, name, description, target_date)`.
+    type MilestoneRow = (String, String, String, Option<String>, Option<String>);
+
     /// Every milestone, in a stable order, with the columns an update rewrites.
-    async fn milestones(
-        db: &DbPool,
-    ) -> Vec<(String, String, String, Option<String>, Option<String>)> {
+    async fn milestones(db: &DbPool) -> Vec<MilestoneRow> {
         #[derive(sqlx::FromRow)]
         struct Row {
             milestone_id: String,
@@ -4323,7 +4326,7 @@ mod tests {
     struct ProjectDeleteFootprint {
         projects: Vec<String>,
         members: Vec<(String, String, Option<String>)>,
-        milestones: Vec<(String, String, String, Option<String>, Option<String>)>,
+        milestones: Vec<MilestoneRow>,
         posted_updates: Vec<(String, String, String, Option<String>)>,
         issue_links: Vec<(String, Option<String>, Option<String>)>,
     }
