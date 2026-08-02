@@ -2914,6 +2914,258 @@ mod tests {
         );
     }
 
+    // ─── Cascaded issue deletes (TRA-9957) ───────────────────────────────────
+    //
+    // `delete_issue` issues one `DELETE FROM issues`; every dependent row goes
+    // with it through the database's own `ON DELETE CASCADE`. `sync_delta`
+    // replays entity-scoped actions, so a cascaded entity that never gets its
+    // own delete entry is never evicted from a client's cache — it survives
+    // every reconnect. These tests pin the entries the cascade must produce.
+
+    /// Add `count` comments to `issue_id` through the real service, so each one
+    /// is a row the product would have written, with its own sync entry.
+    ///
+    /// Returns the comment ids in creation order.
+    async fn seed_comments(db: &DbPool, issue_id: &str, count: usize) -> Vec<String> {
+        let mut ids = Vec::with_capacity(count);
+        for n in 0..count {
+            let comment = crate::comment_service::create_comment(
+                db,
+                issue_id,
+                USER_A,
+                &format!("comment {n} on {issue_id}"),
+                None,
+                trakkt_types::enums::ActionSource::User,
+                None,
+                None,
+            )
+            .await
+            .expect("create comment");
+            ids.push(comment.comment_id);
+        }
+        ids
+    }
+
+    /// The `sync_log` entries written after the first `skip` of them, so a test
+    /// can assert on one operation's output without restating the seed's.
+    async fn sync_entries_after(db: &DbPool, skip: usize) -> Vec<(String, String, String)> {
+        let mut all = sync_entries(db).await;
+        all.split_off(skip)
+    }
+
+    /// Relate two issues through the real service, returning the relation id.
+    async fn seed_relation(
+        db: &DbPool,
+        source: &str,
+        target: &str,
+        relation_type: &str,
+    ) -> String {
+        crate::relation_service::create_relation(
+            db,
+            WS,
+            source,
+            target,
+            relation_type,
+            Some(USER_A),
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("create relation")
+        .relation_id
+    }
+
+    #[tokio::test]
+    async fn issue_delete_emits_one_entry_per_cascaded_comment_alongside_the_issue() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+
+        let mut doomed = seed_comments(&db, "iss_vis", 3).await;
+        let survivor = seed_comments(&db, "iss_second", 1).await;
+
+        let seeded_entries = sync_entries(&db).await.len();
+
+        crate::issue_service::delete_issue(&db, WS, "VIS", 1, None)
+            .await
+            .expect("delete the issue the comments hang off");
+
+        let mut written = sync_entries_after(&db, seeded_entries).await;
+
+        // The issue's own entry leads; the comment entries follow in whatever
+        // order the read returned them, which no `ORDER BY` fixes.
+        assert_eq!(
+            written.first(),
+            Some(&(
+                entity_types::ISSUE.to_string(),
+                "iss_vis".to_string(),
+                "delete".to_string()
+            )),
+            "the issue's own delete entry must still be written, and first; \
+             got: {written:?}"
+        );
+
+        let mut expected: Vec<(String, String, String)> = doomed
+            .drain(..)
+            .map(|id| (entity_types::COMMENT.to_string(), id, "delete".to_string()))
+            .collect();
+        expected.sort();
+
+        let mut comment_entries: Vec<(String, String, String)> = written
+            .drain(..)
+            .filter(|(entity_type, _, _)| entity_type == entity_types::COMMENT)
+            .collect();
+        comment_entries.sort();
+
+        assert_eq!(
+            comment_entries, expected,
+            "every comment the cascade destroyed needs its own delete entry — \
+             without one it stays in the replaying client's cache forever, and \
+             no comment belonging to another issue may be evicted"
+        );
+
+        // The entries describe a state the database really reached, and only
+        // that state.
+        assert_eq!(
+            count_scalar(&db, "SELECT COUNT(*) FROM comments WHERE issue_id = $1", "iss_vis").await,
+            0,
+            "the cascade must have removed the comments the entries announce"
+        );
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM comments WHERE comment_id = $1",
+                &survivor[0]
+            )
+            .await,
+            1,
+            "the other issue's comment is untouched, so the fixture can tell \
+             'evicted the right rows' apart from 'evicted everything'"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_delete_emits_an_entry_for_every_relation_at_either_end() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+        db_execute!(
+            &db,
+            "INSERT INTO issues \
+                (issue_id, workspace_id, team_id, number, title, creator_id, status_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "iss_third",
+            WS,
+            "team_vis",
+            3_i32,
+            "The bystander",
+            USER_A,
+            "sts_vis"
+        )
+        .expect("insert the third issue");
+
+        // `issue_relations` cascades from both ends, so the doomed issue takes
+        // the relation that names it as source and the one that names it as
+        // target. The third names it at neither end and must survive.
+        let as_source = seed_relation(&db, "iss_vis", "iss_second", "blocks").await;
+        let as_target = seed_relation(&db, "iss_third", "iss_vis", "blocks").await;
+        // `relates_to` rather than a third `blocks`: the two above already make
+        // third -> vis -> second, so blocking second -> third would close the
+        // loop and `create_relation` rejects it as a cycle.
+        let bystander = seed_relation(&db, "iss_second", "iss_third", "relates_to").await;
+
+        let seeded_entries = sync_entries(&db).await.len();
+
+        crate::issue_service::delete_issue(&db, WS, "VIS", 1, None)
+            .await
+            .expect("delete the issue both relations name");
+
+        let mut written = sync_entries_after(&db, seeded_entries).await;
+
+        let mut expected = vec![
+            (
+                entity_types::ISSUE_RELATION.to_string(),
+                as_source.clone(),
+                "delete".to_string(),
+            ),
+            (
+                entity_types::ISSUE_RELATION.to_string(),
+                as_target.clone(),
+                "delete".to_string(),
+            ),
+        ];
+        expected.sort();
+
+        let mut relation_entries: Vec<(String, String, String)> = written
+            .drain(..)
+            .filter(|(entity_type, _, _)| entity_type == entity_types::ISSUE_RELATION)
+            .collect();
+        relation_entries.sort();
+
+        assert_eq!(
+            relation_entries, expected,
+            "a relation is destroyed whichever end the deleted issue sits at, \
+             and the surviving issue on the other end keeps showing it until \
+             its own delete entry arrives"
+        );
+
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM issue_relations WHERE relation_id = $1",
+                &bystander
+            )
+            .await,
+            1,
+            "the relation between the two surviving issues is untouched, so \
+             'entries for the right relations' is distinguishable from \
+             'entries for all of them'"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_delete_and_its_cascade_entries_roll_back_together() {
+        let db = two_user_workspace().await;
+        let doomed = seed_comments(&db, "iss_vis", 3).await;
+
+        let seeded_entries = sync_entries(&db).await.len();
+
+        // Installed after the seed so it rejects only the cascade's entries.
+        // The ISSUE entry is written first and accepted; the failure lands on a
+        // COMMENT entry, which is what proves the accepted entry and the DELETE
+        // unwind behind it rather than committing on their own.
+        reject_sync_log_inserts_for_entity_type(&db, entity_types::COMMENT).await;
+
+        let err = crate::issue_service::delete_issue(&db, WS, "VIS", 1, None)
+            .await
+            .expect_err("a delete whose cascade entries cannot be written must fail");
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            count_scalar(&db, "SELECT COUNT(*) FROM issues WHERE issue_id = $1", "iss_vis").await,
+            1,
+            "the DELETE has to roll back with the entries that describe it"
+        );
+        assert_eq!(
+            count_scalar(&db, "SELECT COUNT(*) FROM comments WHERE issue_id = $1", "iss_vis").await,
+            doomed.len() as i64,
+            "the cascaded comments come back with the issue — a cascade that \
+             half-committed would leave clients with comments hanging off an \
+             issue that no longer exists"
+        );
+        assert_eq!(
+            sync_entries_after(&db, seeded_entries).await,
+            Vec::new(),
+            "no entry from the failed transaction may survive, including the \
+             ISSUE entry the trigger let through: it announces a removal that \
+             was rolled back"
+        );
+    }
+
     #[tokio::test]
     async fn issue_labels_roll_back_when_their_sync_entry_cannot_be_written() {
         let db = two_user_workspace().await;
