@@ -1,0 +1,17 @@
+// expect: violations
+// Two findings, both true. The call below passes `&DbPool` into a helper from
+// inside the span. The second is the hop the ticket named as a limitation: pool
+// access inside a `&mut DbTx` helper, which can only run with a transaction
+// open. The `tx_` macro in that helper is correctly left alone.
+pub async fn outer(db: &DbPool) -> trakkt_core::Result<()> {
+    let mut tx = db.begin().await?;
+    stamp(&mut tx, db).await?; //~ VIOLATION
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn stamp(tx: &mut DbTx, db: &DbPool) -> trakkt_core::Result<()> {
+    trakkt_core::tx_execute!(&mut *tx, "UPDATE t SET x = 1")?;
+    trakkt_core::db_execute!(db, "UPDATE t SET y = 2")?; //~ VIOLATION
+    Ok(())
+}

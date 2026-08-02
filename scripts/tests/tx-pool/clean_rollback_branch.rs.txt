@@ -1,0 +1,15 @@
+// expect: clean
+// A diverging early-out branch. The pool call after the rollback is legal, and
+// after the `if` closes the transaction is open again on the fall-through path,
+// so the `tx_` macro below it is still inside the span.
+pub async fn maybe(db: &DbPool, ok: bool) -> trakkt_core::Result<()> {
+    let mut tx = db.begin().await?;
+    if !ok {
+        tx.rollback().await?;
+        trakkt_core::db_execute!(db, "INSERT INTO audit VALUES ('rejected')")?;
+        return Ok(());
+    }
+    trakkt_core::tx_execute!(&mut tx, "UPDATE t SET x = 1")?;
+    tx.commit().await?;
+    Ok(())
+}

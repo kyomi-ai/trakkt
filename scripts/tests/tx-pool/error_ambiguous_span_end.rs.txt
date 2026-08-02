@@ -1,0 +1,13 @@
+// expect: error:does not `return`, `break` or `continue`
+// Both branches close the transaction and neither diverges, so a textual
+// analysis cannot say whether line 12 is inside the span. Must fail, not guess.
+pub async fn ambiguous(db: &DbPool, flag: bool) -> trakkt_core::Result<()> {
+    let mut tx = db.begin().await?;
+    if flag {
+        tx.rollback().await?;
+    } else {
+        tx.commit().await?;
+    }
+    trakkt_core::db_execute!(db, "UPDATE t SET y = 2")?;
+    Ok(())
+}

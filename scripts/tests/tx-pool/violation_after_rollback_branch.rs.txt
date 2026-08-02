@@ -1,0 +1,14 @@
+// expect: violations
+// Same shape as clean_rollback_branch, but the pool call is AFTER the branch
+// closes — where the transaction is open again on the fall-through path, with
+// the commit still to come.
+pub async fn maybe(db: &DbPool, ok: bool) -> trakkt_core::Result<()> {
+    let mut tx = db.begin().await?;
+    if !ok {
+        tx.rollback().await?;
+        return Ok(());
+    }
+    trakkt_core::db_execute!(db, "UPDATE t SET y = 2")?; //~ VIOLATION
+    tx.commit().await?;
+    Ok(())
+}

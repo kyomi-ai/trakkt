@@ -2,14 +2,15 @@
 # Trakkt — CI (Pull Request Checks)
 # =============================================================================
 # Runs on every PR to main, including new pushes to existing PRs.
-# Six jobs, all independent — they run in parallel, so PR wall-clock is the
+# Seven jobs, all independent — they run in parallel, so PR wall-clock is the
 # slowest job, not the sum:
 #   1. lint-suppression — blocks new #[allow(...)] and = "allow" in Cargo.toml
 #   2. migration-consistency — blocks duplicate/diverging migration versions
-#   3. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
-#   4. test (slowest) — cargo test across the whole workspace
-#   5. wasm-test (slow) — executes the trakkt-ui wasm-bindgen-test suite in Firefox
-#   6. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
+#   3. tx-pool — blocks pool access inside an open database transaction
+#   4. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
+#   5. test (slowest) — cargo test across the whole workspace
+#   6. wasm-test (slow) — executes the trakkt-ui wasm-bindgen-test suite in Firefox
+#   7. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
 # =============================================================================
 
 name: CI
@@ -62,6 +63,46 @@ jobs:
 
       - name: Check migration versions
         run: scripts/check-migrations.sh
+
+  # ---------------------------------------------------------------------------
+  # Fast check: no pool access while a database transaction is open
+  #
+  # SQLite runs with max_connections(1), so an open DbTx holds the only
+  # connection. A db_*! macro or a &DbPool-taking helper called before the commit
+  # waits on a connection the transaction cannot release: the request stalls for
+  # sqlx's 30s acquire_timeout and then fails with PoolTimedOut. It compiles and
+  # clippy passes, so nothing else in CI can see it. Same script developers run
+  # locally; its header documents what it deliberately cannot detect.
+  # ---------------------------------------------------------------------------
+  tx-pool:
+    name: Transaction Pool Safety
+    runs-on: ubuntu-latest
+    # Text analysis over the workspace sources, 3.3s locally, no build. The
+    # failure this caps is not a slow check but a stuck one — pathological regex
+    # backtracking on a source file — where GitHub's 6-hour default would burn a
+    # runner-day. 5 gives ~90x headroom over the measured run and still fails
+    # fast. (TRA-9961 tracks the jobs above and below that have no bound at all;
+    # this adds one rather than adding to that list.)
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      # python3 is preinstalled on the ubuntu-latest image (3.12.3 on
+      # ubuntu-24.04, 3.14.4 on 26.04); the script needs only 3.9+. Probed in its
+      # own step so that an image which ever drops it fails here, unambiguously,
+      # rather than as a confusing "command not found" on the check itself.
+      - name: Verify python3 is available
+        run: python3 --version
+
+      # First, that the guard still works. It fails silently when it breaks — a
+      # bug in span detection or in the signature parser makes it report nothing,
+      # which against a clean tree is indistinguishable from success. The
+      # fixtures in scripts/tests/tx-pool make that observable.
+      - name: Self-test the check
+        run: scripts/check-tx-pool.py --self-test
+
+      - name: Check for pool access inside open transactions
+        run: scripts/check-tx-pool.py
 
   # ---------------------------------------------------------------------------
   # Slow check: cargo clippy (compiles + lints the entire workspace)
