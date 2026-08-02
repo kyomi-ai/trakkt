@@ -1,0 +1,7 @@
+// expect: error:not a plain `let` binding
+pub async fn odd(db: &DbPool) -> trakkt_core::Result<()> {
+    let (mut tx, n) = (db.begin().await?, 1);
+    trakkt_core::tx_execute!(&mut tx, "UPDATE t SET x = $1", n)?;
+    tx.commit().await?;
+    Ok(())
+}

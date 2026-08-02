@@ -1,0 +1,18 @@
+// expect: clean
+// The lexer must blank comments and string literals. Every "violation" in this
+// file is inside a comment, a string, or a format string whose braces would
+// otherwise corrupt the brace-depth tracking the span walk depends on.
+pub async fn tricky(db: &DbPool, n: i64) -> trakkt_core::Result<()> {
+    let mut tx = db.begin().await?;
+
+    // Do not call db_execute!(db, ...) here — this line is a comment.
+    /* Nor db_fetch_all!(db, ...) here, and /* nested */ still a comment. */
+    let sql = format!("UPDATE t SET a = {n} WHERE b = '}}' AND c = '{{'");
+    let _lifetime: &'static str = "db_execute!(db, \"not code\")";
+    let _raw = r#"db_fetch_one!(db, "still not code") { unbalanced"#;
+    let _ch = '}';
+
+    trakkt_core::tx_execute!(&mut tx, &sql)?;
+    tx.commit().await?;
+    Ok(())
+}

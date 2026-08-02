@@ -1,0 +1,19 @@
+// expect: clean
+// The shape almost every service uses: reads on the pool before `begin()`,
+// transaction work in between, broadcasts on the pool after the commit. The
+// pool calls before begin and after commit are correct and must NOT be flagged.
+pub async fn create_thing(db: &DbPool, id: &str) -> trakkt_core::Result<()> {
+    let workspace_id = lookup_workspace(db, id).await?;
+
+    let mut tx = db.begin().await?;
+    trakkt_core::tx_execute!(&mut tx, "INSERT INTO things VALUES ($1)", id)?;
+    tx.commit().await?;
+
+    trakkt_core::db_execute!(db, "UPDATE counters SET n = n + 1")?;
+    let _ = lookup_workspace(db, &workspace_id).await?;
+    Ok(())
+}
+
+async fn lookup_workspace(db: &DbPool, id: &str) -> trakkt_core::Result<String> {
+    Ok(trakkt_core::db_fetch_scalar!(db, String, "SELECT w FROM t WHERE id = $1", id)?)
+}
