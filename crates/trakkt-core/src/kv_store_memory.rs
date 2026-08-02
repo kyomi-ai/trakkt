@@ -216,66 +216,97 @@ mod tests {
     #[tokio::test]
     async fn set_and_get() {
         let s = store().await;
-        s.set("k", "v", None).await.unwrap();
-        assert_eq!(s.get("k").await.unwrap(), Some("v".to_string()));
+        s.set("k", "v", None).await.expect("storing a key with no TTL");
+        assert_eq!(
+            s.get("k").await.expect("reading back the key that was just stored"),
+            Some("v".to_string())
+        );
     }
 
     #[tokio::test]
     async fn missing_key_returns_none() {
         let s = store().await;
-        assert_eq!(s.get("missing").await.unwrap(), None);
+        assert_eq!(
+            s.get("missing").await.expect("reading a key that was never stored"),
+            None
+        );
     }
 
     #[tokio::test]
     async fn del_removes_key() {
         let s = store().await;
-        s.set("k", "v", None).await.unwrap();
-        s.del("k").await.unwrap();
-        assert_eq!(s.get("k").await.unwrap(), None);
+        s.set("k", "v", None).await.expect("storing the key that del will remove");
+        s.del("k").await.expect("deleting the key that was just stored");
+        assert_eq!(s.get("k").await.expect("reading back the deleted key"), None);
     }
 
     #[tokio::test]
     async fn getdel_returns_and_removes() {
         let s = store().await;
-        s.set("k", "v", None).await.unwrap();
-        assert_eq!(s.getdel("k").await.unwrap(), Some("v".to_string()));
-        assert_eq!(s.get("k").await.unwrap(), None);
+        s.set("k", "v", None)
+            .await
+            .expect("storing the key that getdel will consume");
+        assert_eq!(
+            s.getdel("k").await.expect("getdel returning the stored value"),
+            Some("v".to_string())
+        );
+        assert_eq!(
+            s.get("k").await.expect("reading back the key getdel consumed"),
+            None
+        );
     }
 
     #[tokio::test]
     async fn getdel_missing_returns_none() {
         let s = store().await;
-        assert_eq!(s.getdel("missing").await.unwrap(), None);
+        assert_eq!(
+            s.getdel("missing").await.expect("getdel on a key that was never stored"),
+            None
+        );
     }
 
     #[tokio::test]
     async fn incr_creates_and_increments() {
         let s = store().await;
-        assert_eq!(s.incr("counter").await.unwrap(), 1);
-        assert_eq!(s.incr("counter").await.unwrap(), 2);
-        assert_eq!(s.incr("counter").await.unwrap(), 3);
+        assert_eq!(s.incr("counter").await.expect("incr creating a counter at 1"), 1);
+        assert_eq!(s.incr("counter").await.expect("incr raising the counter to 2"), 2);
+        assert_eq!(s.incr("counter").await.expect("incr raising the counter to 3"), 3);
     }
 
     #[tokio::test]
     async fn set_with_ttl_accessible_before_expiry() {
         let s = store().await;
         // A key with a generous TTL should be readable immediately.
-        s.set("expiring", "val", Some(60)).await.unwrap();
-        assert_eq!(s.get("expiring").await.unwrap(), Some("val".to_string()));
+        s.set("expiring", "val", Some(60))
+            .await
+            .expect("storing a key with a 60-second TTL");
+        assert_eq!(
+            s.get("expiring")
+                .await
+                .expect("reading the key back well inside its 60-second TTL"),
+            Some("val".to_string())
+        );
     }
 
     #[tokio::test]
     async fn expire_sets_ttl() {
         let s = store().await;
-        s.set("k", "v", None).await.unwrap();
-        s.expire("k", 60).await.unwrap();
+        s.set("k", "v", None)
+            .await
+            .expect("storing the key that expire will attach a TTL to");
+        s.expire("k", 60).await.expect("attaching a 60-second TTL to the stored key");
         // Key should still be accessible immediately after setting TTL.
-        assert_eq!(s.get("k").await.unwrap(), Some("v".to_string()));
+        assert_eq!(
+            s.get("k")
+                .await
+                .expect("reading the key back immediately after its TTL was set"),
+            Some("v".to_string())
+        );
     }
 
     #[tokio::test]
     async fn ping_succeeds() {
         let s = store().await;
-        s.ping().await.unwrap();
+        s.ping().await.expect("pinging the in-memory store");
     }
 }

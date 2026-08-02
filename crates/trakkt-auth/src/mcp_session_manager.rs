@@ -526,8 +526,12 @@ mod tests {
 
         mgr.notify_tools_changed("ws-test-13").await;
 
-        let msg = rx.recv().await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        let msg = rx
+            .recv()
+            .await
+            .expect("notify_tools_changed to push a notification to the registered SSE sender");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&msg).expect("the pushed notification to be valid JSON");
 
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["method"], "notifications/tools/list_changed");

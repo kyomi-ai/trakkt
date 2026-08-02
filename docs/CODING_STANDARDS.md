@@ -51,6 +51,44 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 - No hardcoded `"unknown"` IP addresses
 - No duplicated helper functions across modules
 
+## The Clippy Gate
+
+### Run the same commands CI runs
+
+CI's `Clippy` job runs exactly these two commands, and nothing else:
+
+```
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked -p trakkt-ui --target wasm32-unknown-unknown --features hydrate --all-targets -- -D warnings
+```
+
+Run both locally before pushing. The second needs the wasm target installed once: `rustup target add wasm32-unknown-unknown`.
+
+`--all-targets` is load-bearing, not decoration. Without it clippy lints only the `lib`/`bin` targets, which are compiled *without* `cfg(test)` — so `#[cfg(test)]` modules, `tests/`, benches and examples are never linted at all. Everything in this document that clippy can enforce was unenforced in test code until TRA-9956 added the flag, and 108 violations had accumulated behind it: 106 `unwrap_used`, one `type_complexity`, one `dead_code`.
+
+It is close to free. Measured locally cold — `cargo clean` plus a private empty `SCCACHE_DIR` per run, so both start at a 0% cache hit rate — the two commands total 318s with the flag and 318s without (201s+117s vs 206s+112s). Roughly 700 dependency crates dominate the build and both forms compile them identically; `--all-targets` adds 18 compile units (+1.2%), all of them workspace test targets.
+
+The two commands are not redundant. The first compiles for the host, where `cfg(target_arch = "wasm32")` is false, so it cannot see the `#[cfg(all(test, target_arch = "wasm32"))]` `wasm-bindgen-test` modules in `trakkt-ui`. Only the second lints those. `trakkt-ui` declares no `[[bin]]`, `[[test]]`, `[[example]]` or `[[bench]]` targets and `crates/trakkt-ui/tests/` holds only Playwright JS, so `--all-targets` and `--tests` cover the same ground there today; `--all-targets` is used for symmetry with the host command and so a future Rust test or example target is covered without a second edit.
+
+Clippy type-checks but never *runs* tests, so neither command needs a live Redis on :6381 — the `redis::tests::test_redis_connects` caveat applies to `cargo test`, not here.
+
+### `unwrap()` in tests
+
+`clippy::unwrap_used` is `warn` at the workspace level (`Cargo.toml`, `[workspace.lints.clippy]`) and `-D warnings` promotes it to an error. It applies in test code on exactly the same terms as production code — there is no `#[cfg(test)]` carve-out, and adding one would recreate the gap the gate exists to close.
+
+Use `expect()` / `expect_err()` and make the message say **what was being attempted**, so a failing test names the belief that turned out false rather than only a line number:
+
+```rust
+let encrypted = encrypt(plaintext, &key).expect("encrypting an ASCII password with the test key");
+let err = parse_action_type("upsert").expect_err("parsing the unrecognised action type \"upsert\" must be rejected");
+```
+
+Filler messages — `expect("unwrap")`, `expect("should work")`, `expect("failed")` — pass the lint and defeat its point. If you cannot say what was expected, read the test until you can.
+
+### No suppressions
+
+Do not silence a clippy finding with `#[allow(...)]`, and never with a crate-level `#![allow(clippy::unwrap_used)]`. The `Lint Suppression Policy` job fails any PR whose diff adds `#[allow(` to a `.rs` file or `= "allow"` to a `Cargo.toml`. Fix the finding instead: `clippy::type_complexity` wants a `type` alias, `dead_code` wants the field genuinely read or removed.
+
 ## Leptos / Frontend
 
 ### Component Patterns

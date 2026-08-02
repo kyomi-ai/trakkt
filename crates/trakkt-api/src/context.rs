@@ -121,24 +121,24 @@ mod tests {
 
     #[test]
     fn resolve_via_identifier() {
-        let (key, num) =
-            resolve_issue_key_and_number(Some("TRA-35"), None, None).unwrap();
+        let (key, num) = resolve_issue_key_and_number(Some("TRA-35"), None, None)
+            .expect("resolving a well-formed identifier with no separate key or number");
         assert_eq!(key, "TRA");
         assert_eq!(num, 35);
     }
 
     #[test]
     fn resolve_via_key_and_number() {
-        let (key, num) =
-            resolve_issue_key_and_number(None, Some("ENG"), Some(7)).unwrap();
+        let (key, num) = resolve_issue_key_and_number(None, Some("ENG"), Some(7))
+            .expect("resolving a separate team key and issue number with no identifier");
         assert_eq!(key, "ENG");
         assert_eq!(num, 7);
     }
 
     #[test]
     fn resolve_identifier_takes_precedence() {
-        let (key, num) =
-            resolve_issue_key_and_number(Some("TRA-10"), Some("ENG"), Some(99)).unwrap();
+        let (key, num) = resolve_issue_key_and_number(Some("TRA-10"), Some("ENG"), Some(99))
+            .expect("resolving when both an identifier and a key/number pair are supplied");
         assert_eq!(key, "TRA");
         assert_eq!(num, 10);
     }

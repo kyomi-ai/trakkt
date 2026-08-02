@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn provisioning_uri_contains_issuer() {
         let secret = generate_secret();
-        let uri = provisioning_uri(&secret, "test@example.com").unwrap();
+        let uri = provisioning_uri(&secret, "test@example.com").expect("building an otpauth provisioning URI from a generated secret");
         assert!(uri.starts_with("otpauth://totp/"));
         assert!(uri.contains("Trakkt"));
         assert!(uri.contains("test%40example.com") || uri.contains("test@example.com"));
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn qr_code_returns_data_uri() {
         let secret = generate_secret();
-        let qr = generate_qr_code(&secret, "test@example.com").unwrap();
+        let qr = generate_qr_code(&secret, "test@example.com").expect("rendering a QR code PNG for a generated secret");
         assert!(qr.starts_with("data:image/png;base64,"));
     }
 
@@ -100,8 +100,10 @@ mod tests {
     #[test]
     fn verify_code_accepts_current() {
         let secret = generate_secret();
-        let totp = build_totp(&secret, "test@example.com").unwrap();
-        let code = totp.generate_current().unwrap();
+        let totp = build_totp(&secret, "test@example.com").expect("building a TOTP instance from a generated secret");
+        let code = totp
+            .generate_current()
+            .expect("generating the code for the current time step");
         assert!(verify_code(&secret, &code));
     }
 }

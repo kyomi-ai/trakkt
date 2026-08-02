@@ -140,8 +140,8 @@ mod tests {
         let secret = "test-secret-key";
         let user_id = Uuid::new_v4();
 
-        let token = create_access_token(user_id, secret, 15).unwrap();
-        let decoded = validate_token(&token, secret).unwrap();
+        let token = create_access_token(user_id, secret, 15).expect("minting a 15-minute access token");
+        let decoded = validate_token(&token, secret).expect("validating a freshly minted token against its own secret");
 
         assert_eq!(decoded.claims.sub, user_id.to_string());
         assert!(decoded.claims.jti.is_some(), "access tokens must have jti");
@@ -162,11 +162,15 @@ mod tests {
     #[test]
     fn wrong_secret_rejects() {
         let user_id = Uuid::new_v4();
-        let token = create_access_token(user_id, "secret-a", 15).unwrap();
+        let token = create_access_token(user_id, "secret-a", 15)
+            .expect("minting a token signed with secret-a before validating it against secret-b");
         let result = validate_token(&token, "secret-b");
         assert!(result.is_err());
         // Should specifically identify signature mismatch
-        let err_msg = format!("{}", result.unwrap_err());
+        let err_msg = format!(
+            "{}",
+            result.expect_err("validating a secret-a token against secret-b must be rejected")
+        );
         assert!(
             err_msg.contains("invalid token signature"),
             "expected signature error, got: {err_msg}"
@@ -180,11 +184,15 @@ mod tests {
 
         // Create a token that expired 5 minutes ago (well past the default
         // 60-second leeway that jsonwebtoken allows).
-        let token = create_access_token(user_id, secret, -5).unwrap();
+        let token = create_access_token(user_id, secret, -5)
+            .expect("minting a token with a negative TTL so it is already expired");
         let result = validate_token(&token, secret);
 
         assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
+        let err_msg = format!(
+            "{}",
+            result.expect_err("validating a token that expired 5 minutes ago must be rejected")
+        );
         assert!(
             err_msg.contains("token expired"),
             "expected 'token expired' error, got: {err_msg}"
@@ -195,7 +203,10 @@ mod tests {
     fn malformed_token_rejected() {
         let result = validate_token("not-a-jwt", "secret");
         assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
+        let err_msg = format!(
+            "{}",
+            result.expect_err("validating a string that is not JWT-shaped must be rejected")
+        );
         assert!(
             err_msg.contains("malformed token") || err_msg.contains("invalid token"),
             "expected malformed/invalid error, got: {err_msg}"
@@ -233,10 +244,11 @@ mod tests {
             &payload,
             &EncodingKey::from_secret(secret.as_bytes()),
         )
-        .unwrap();
+        .expect("encoding a Python-shaped claims map into a JWT");
 
         // Rust should decode this successfully and preserve extra fields
-        let decoded = validate_token(&token, secret).unwrap();
+        let decoded = validate_token(&token, secret)
+            .expect("validating a Python-shaped JWT carrying extra claims Rust does not model");
         assert_eq!(decoded.claims.sub, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(decoded.claims.jti, Some("abc123def456".to_string()));
 
@@ -268,11 +280,11 @@ mod tests {
         let secret = "test-secret-key";
         let user_id = Uuid::new_v4();
 
-        let token1 = create_access_token(user_id, secret, 15).unwrap();
-        let token2 = create_access_token(user_id, secret, 15).unwrap();
+        let token1 = create_access_token(user_id, secret, 15).expect("minting the first access token for this user");
+        let token2 = create_access_token(user_id, secret, 15).expect("minting the second access token for this user");
 
-        let decoded1 = validate_token(&token1, secret).unwrap();
-        let decoded2 = validate_token(&token2, secret).unwrap();
+        let decoded1 = validate_token(&token1, secret).expect("validating the first token to read back its jti");
+        let decoded2 = validate_token(&token2, secret).expect("validating the second token to read back its jti");
 
         assert_ne!(
             decoded1.claims.jti, decoded2.claims.jti,

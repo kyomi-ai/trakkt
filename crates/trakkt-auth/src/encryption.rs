@@ -142,16 +142,17 @@ mod tests {
     fn roundtrip() {
         let key = test_key();
         let plaintext = "my-database-password";
-        let encrypted = encrypt(plaintext, &key).unwrap();
-        let decrypted = decrypt(&encrypted, &key).unwrap();
+        let encrypted = encrypt(plaintext, &key).expect("encrypting an ASCII password with the test key");
+        let decrypted = decrypt(&encrypted, &key).expect("decrypting ciphertext with the key that produced it");
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn roundtrip_empty_string() {
         let key = test_key();
-        let encrypted = encrypt("", &key).unwrap();
-        let decrypted = decrypt(&encrypted, &key).unwrap();
+        let encrypted = encrypt("", &key).expect("encrypting an empty plaintext with the test key");
+        let decrypted =
+            decrypt(&encrypted, &key).expect("decrypting the empty-plaintext ciphertext with the key that produced it");
         assert_eq!(decrypted, "");
     }
 
@@ -159,8 +160,9 @@ mod tests {
     fn roundtrip_unicode() {
         let key = test_key();
         let plaintext = "pässwörd-日本語-🔑";
-        let encrypted = encrypt(plaintext, &key).unwrap();
-        let decrypted = decrypt(&encrypted, &key).unwrap();
+        let encrypted = encrypt(plaintext, &key).expect("encrypting a multi-byte UTF-8 plaintext with the test key");
+        let decrypted = decrypt(&encrypted, &key)
+            .expect("decrypting the multi-byte UTF-8 ciphertext back to a valid UTF-8 string");
         assert_eq!(decrypted, plaintext);
     }
 
@@ -168,20 +170,28 @@ mod tests {
     fn each_encryption_produces_different_ciphertext() {
         let key = test_key();
         let plaintext = "same-plaintext";
-        let enc1 = encrypt(plaintext, &key).unwrap();
-        let enc2 = encrypt(plaintext, &key).unwrap();
+        let enc1 = encrypt(plaintext, &key).expect("first encryption of the shared plaintext");
+        let enc2 = encrypt(plaintext, &key).expect("second encryption of the shared plaintext");
         assert_ne!(enc1, enc2, "nonces must differ, producing different ciphertext");
 
         // But both decrypt to the same value
-        assert_eq!(decrypt(&enc1, &key).unwrap(), plaintext);
-        assert_eq!(decrypt(&enc2, &key).unwrap(), plaintext);
+        assert_eq!(
+            decrypt(&enc1, &key).expect("decrypting the first ciphertext despite its distinct nonce"),
+            plaintext
+        );
+        assert_eq!(
+            decrypt(&enc2, &key).expect("decrypting the second ciphertext despite its distinct nonce"),
+            plaintext
+        );
     }
 
     #[test]
     fn encrypted_starts_with_version_byte() {
         let key = test_key();
-        let encrypted = encrypt("test", &key).unwrap();
-        let data = URL_SAFE.decode(&encrypted).unwrap();
+        let encrypted = encrypt("test", &key).expect("encrypting a short plaintext with the test key");
+        let data = URL_SAFE
+            .decode(&encrypted)
+            .expect("base64url-decoding the string encrypt returned");
         assert_eq!(data[0], VERSION_AES256_GCM);
     }
 
@@ -191,7 +201,7 @@ mod tests {
         let mut key_b = test_key();
         key_b[0] ^= 0xFF;
 
-        let encrypted = encrypt("secret", &key_a).unwrap();
+        let encrypted = encrypt("secret", &key_a).expect("encrypting under key A before attempting decryption with key B");
         let result = decrypt(&encrypted, &key_b);
         assert!(result.is_err());
     }
@@ -199,8 +209,10 @@ mod tests {
     #[test]
     fn truncated_ciphertext_rejected() {
         let key = test_key();
-        let encrypted = encrypt("test", &key).unwrap();
-        let data = URL_SAFE.decode(&encrypted).unwrap();
+        let encrypted = encrypt("test", &key).expect("encrypting a plaintext to obtain a well-formed ciphertext to truncate");
+        let data = URL_SAFE
+            .decode(&encrypted)
+            .expect("base64url-decoding the ciphertext so its bytes can be truncated");
 
         // Truncate to just version + partial nonce (too short)
         let truncated = URL_SAFE.encode(&data[..5]);
@@ -218,8 +230,10 @@ mod tests {
     #[test]
     fn wrong_version_byte_rejected() {
         let key = test_key();
-        let encrypted = encrypt("test", &key).unwrap();
-        let mut data = URL_SAFE.decode(&encrypted).unwrap();
+        let encrypted = encrypt("test", &key).expect("encrypting a plaintext to obtain a ciphertext whose version byte can be tampered with");
+        let mut data = URL_SAFE
+            .decode(&encrypted)
+            .expect("base64url-decoding the ciphertext so its version byte can be overwritten");
 
         // Change version byte to unsupported value
         data[0] = 0xFF;
@@ -227,7 +241,10 @@ mod tests {
 
         let result = decrypt(&tampered, &key);
         assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
+        let err_msg = format!(
+            "{}",
+            result.expect_err("decrypting data with version byte 0xFF must be rejected")
+        );
         assert!(err_msg.contains("unsupported encryption version"));
     }
 
@@ -236,7 +253,7 @@ mod tests {
         // A valid 32-byte key encoded as base64url
         let key_bytes = [42u8; 32];
         let encoded = URL_SAFE.encode(key_bytes);
-        let derived = derive_key(&encoded).unwrap();
+        let derived = derive_key(&encoded).expect("deriving a key from a base64url-encoded 32-byte value");
         assert_eq!(derived, key_bytes);
     }
 
@@ -246,7 +263,10 @@ mod tests {
         let short_key = URL_SAFE.encode([0u8; 16]);
         let result = derive_key(&short_key);
         assert!(result.is_err());
-        let err_msg = format!("{}", result.unwrap_err());
+        let err_msg = format!(
+            "{}",
+            result.expect_err("deriving a key from a 16-byte value must be rejected")
+        );
         assert!(err_msg.contains("must be 32 bytes"));
     }
 
@@ -260,8 +280,8 @@ mod tests {
     fn roundtrip_json() {
         let key = test_key();
         let value = serde_json::json!({"model": "claude", "thinking_events": [1, 2, 3]});
-        let encrypted = encrypt_json(&value, &key).unwrap();
-        let decrypted = decrypt_json(&encrypted, &key).unwrap();
+        let encrypted = encrypt_json(&value, &key).expect("serializing and encrypting a JSON object");
+        let decrypted = decrypt_json(&encrypted, &key).expect("decrypting and reparsing the JSON object");
         assert_eq!(decrypted, value);
     }
 
@@ -269,8 +289,8 @@ mod tests {
     fn roundtrip_json_null() {
         let key = test_key();
         let value = serde_json::Value::Null;
-        let encrypted = encrypt_json(&value, &key).unwrap();
-        let decrypted = decrypt_json(&encrypted, &key).unwrap();
+        let encrypted = encrypt_json(&value, &key).expect("serializing and encrypting a JSON null");
+        let decrypted = decrypt_json(&encrypted, &key).expect("decrypting and reparsing the JSON null");
         assert_eq!(decrypted, value);
     }
 
@@ -278,8 +298,8 @@ mod tests {
     fn roundtrip_slack_bot_token() {
         let key = test_key();
         let token = "slack-bot-1234567890-abcdefghijklmnop";
-        let encrypted = encrypt_slack_token(token, &key).unwrap();
-        let decrypted = decrypt_slack_token(&encrypted, &key).unwrap();
+        let encrypted = encrypt_slack_token(token, &key).expect("encrypting a Slack bot token for storage");
+        let decrypted = decrypt_slack_token(&encrypted, &key).expect("decrypting the stored Slack bot token");
         assert_eq!(decrypted, token);
     }
 
@@ -287,8 +307,8 @@ mod tests {
     fn roundtrip_slack_user_token() {
         let key = test_key();
         let token = "slack-user-9876543210-zyxwvutsrqponml";
-        let encrypted = encrypt_slack_token(token, &key).unwrap();
-        let decrypted = decrypt_slack_token(&encrypted, &key).unwrap();
+        let encrypted = encrypt_slack_token(token, &key).expect("encrypting a Slack user token for storage");
+        let decrypted = decrypt_slack_token(&encrypted, &key).expect("decrypting the stored Slack user token");
         assert_eq!(decrypted, token);
     }
 
@@ -298,7 +318,8 @@ mod tests {
         let mut key_b = test_key();
         key_b[0] ^= 0xFF;
 
-        let encrypted = encrypt_slack_token("slack-bot-secret", &key_a).unwrap();
+        let encrypted = encrypt_slack_token("slack-bot-secret", &key_a)
+            .expect("encrypting a Slack token under key A before attempting decryption with key B");
         let result = decrypt_slack_token(&encrypted, &key_b);
         assert!(result.is_err());
     }
@@ -308,10 +329,16 @@ mod tests {
         let key = test_key();
         let token = "slack-bot-interop-test";
 
-        let from_slack_fn = encrypt_slack_token(token, &key).unwrap();
-        assert_eq!(decrypt(&from_slack_fn, &key).unwrap(), token);
+        let from_slack_fn = encrypt_slack_token(token, &key).expect("encrypting a token via the Slack wrapper");
+        assert_eq!(
+            decrypt(&from_slack_fn, &key).expect("decrypting the Slack-wrapper ciphertext via the raw decrypt"),
+            token
+        );
 
-        let from_raw_fn = encrypt(token, &key).unwrap();
-        assert_eq!(decrypt_slack_token(&from_raw_fn, &key).unwrap(), token);
+        let from_raw_fn = encrypt(token, &key).expect("encrypting the same token via the raw encrypt");
+        assert_eq!(
+            decrypt_slack_token(&from_raw_fn, &key).expect("decrypting the raw ciphertext via the Slack wrapper"),
+            token
+        );
     }
 }

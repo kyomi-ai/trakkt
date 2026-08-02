@@ -110,6 +110,22 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    # Bounds the whole job; this job had no bound at all before (TRA-9961 tracks
+    # that generally). Measured locally cold — `cargo clean` plus a private empty
+    # SCCACHE_DIR per run, so both start at a 0% hit rate — the two clippy steps
+    # total 318s either way: 206s+112s without --all-targets, 201s+117s with it.
+    # The flag is free at this scale because ~700 dependency crates dominate and
+    # both forms compile them identically; it adds 18 compile units (1454 -> 1472,
+    # +1.2%), all of them workspace test targets. Scaling 318s by the one explicit
+    # CI/local ratio this file records (Test Suite: 295s local cold, 7m18s real CI
+    # = ~1.5x) gives ~8min of clippy, plus ~3-4min of setup (apt, toolchain with
+    # the wasm32 target, cargo update, tailwind) = ~12min realistic worst cold.
+    # The pessimistic ~3x ratio the other comments use gives ~20min. 25 covers the
+    # pessimistic case with 1.25x headroom and the realistic one with ~2x, and
+    # stays under Test Suite's 30 — this job does strictly less, it never runs a
+    # test. What it caps is a compile that wedges, which unbounded would burn a
+    # runner-day against GitHub's 6-hour default.
+    timeout-minutes: 25
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -158,15 +174,28 @@ jobs:
         working-directory: crates/trakkt-ui
         run: tailwindcss --input style/main.css --output style/output.css
 
+      # --all-targets is what makes clippy lint test code at all. Without it only
+      # the lib/bin targets are compiled, and those are built without cfg(test),
+      # so #[cfg(test)] modules, tests/, benches and examples are never linted.
+      # 108 violations had accumulated behind that hole (TRA-9956): 106 unwrap_used,
+      # one type_complexity, one dead_code.
+      # Keep this identical to the command recorded in docs/CODING_STANDARDS.md.
       - name: cargo clippy (workspace)
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
-        run: cargo clippy --locked --workspace -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # Not redundant with the step above: that one compiles for the host, where
+      # cfg(target_arch = "wasm32") is false, so it cannot see trakkt-ui's
+      # #[cfg(all(test, target_arch = "wasm32"))] wasm-bindgen-test modules —
+      # 48 tests across cache/ and pages/settings/. This step is the only thing
+      # that lints them. --all-targets rather than --tests: trakkt-ui declares no
+      # bin/test/example/bench targets today so the two are equivalent, and
+      # --all-targets matches the host command and covers a future one for free.
       - name: cargo clippy (trakkt-ui, wasm32)
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
-        run: cargo clippy --locked -p trakkt-ui --target wasm32-unknown-unknown --features hydrate -- -D warnings
+        run: cargo clippy --locked -p trakkt-ui --target wasm32-unknown-unknown --features hydrate --all-targets -- -D warnings
 
       - name: sccache stats
         if: always()
