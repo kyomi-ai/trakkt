@@ -228,6 +228,15 @@ struct IssueLabelRow {
     created_at: String,
 }
 
+/// One id read back from a table an issue's `ON DELETE CASCADE` will empty.
+///
+/// The column is aliased to `id` by each query so a single row type serves them
+/// all; the queries live in [`delete_issue`] and nowhere else.
+#[derive(sqlx::FromRow)]
+struct CascadedIdRow {
+    id: String,
+}
+
 impl IssueLabelRow {
     fn into_dto(self) -> Label {
         Label {
@@ -1178,10 +1187,21 @@ pub async fn update_issue(
 
 /// Delete an issue by team key + number (e.g. "ENG-42").
 ///
-/// Cascading deletes remove associated issue_labels, comments, and watchers.
+/// The single `DELETE FROM issues` destroys every dependent row through the
+/// database's own `ON DELETE CASCADE` foreign keys, so nothing after it can
+/// report what went with it. That is why the cascaded ids are read on the
+/// transaction *before* the DELETE: `sync_delta` replays entity-scoped actions,
+/// so an entity that never receives a delete action is never evicted from a
+/// client's IndexedDB cache — it survives every reconnect until the cache is
+/// cleared by hand.
 ///
-/// The DELETE and its `sync_log` entry commit as one transaction, so a deleted
-/// issue is always accompanied by the row that tells clients to drop it.
+/// The DELETE, the ISSUE entry and one entry per cascaded entity are written on
+/// one transaction and delivered by [`sync_log_service::SyncBatch`] strictly
+/// after it commits, so a client can never be told about a removal that was
+/// rolled back, nor left without the row that replays one that was not.
+///
+/// Only the cascaded types the client caches get an entry. The rest are
+/// enumerated at the read site below, each with the reason it needs none.
 pub async fn delete_issue(
     db: &DbPool,
     workspace_id: &str,
@@ -1221,40 +1241,129 @@ pub async fn delete_issue(
 
     let issue_id = issue_row.issue_id.clone();
 
+    // ── Cascaded rows the client caches, read before the DELETE ─────────────
+    //
+    // Everything below is gone the instant the DELETE runs, and the foreign
+    // keys that remove it report nothing back, so these are the only reads that
+    // can ever see it.
+    //
+    // Comments are cached: `sync_bootstrap` streams them (see the `PendingBatch`
+    // list in `apps/server/src/routes/websocket.rs`) and `comment_service` sends
+    // a payload on every write, so `enqueue_cache_writes` persists them to
+    // IndexedDB. Their delete arm is present in both halves of
+    // `crates/trakkt-ui/src/cache/apply.rs` — the memory bump and the
+    // hand-written delete list — so an entry here evicts the row rather than
+    // only bumping a counter. This is the leak TRA-9957 was filed for.
+    let comment_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        CascadedIdRow,
+        "SELECT comment_id AS id FROM comments WHERE issue_id = $1",
+        &issue_id
+    )?;
+
+    // Relations cascade from *both* ends, so an issue takes with it every
+    // relation naming it as source or as target. They are cached: `create_relation`
+    // sends the serialized relation as its payload, which `enqueue_cache_writes`
+    // persists. The user-visible half is the other issue in each pair — the
+    // relations section of `pages/issues/issue_detail.rs` re-reads on
+    // `relations_version`, which the ISSUE_RELATION delete arm bumps, so without
+    // these entries a surviving issue keeps showing a relation to an issue that
+    // no longer exists.
+    //
+    // Evicting the IndexedDB row additionally needs ISSUE_RELATION added to
+    // `enqueue_cache_writes`'s delete list, which is TRA-9966; the explicit
+    // `relation_service::delete_relation` path has the same gap today, so this
+    // is not a new one.
+    let relation_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        CascadedIdRow,
+        "SELECT relation_id AS id FROM issue_relations \
+         WHERE source_issue_id = $1 OR target_issue_id = $1",
+        &issue_id
+    )?;
+
+    // Deliberately *not* read, because no entry is needed:
+    //
+    // * `issue_labels`, `issue_watchers`, `issue_stars`, `release_issues`,
+    //   `github_links` — none of these has an entity type in
+    //   `trakkt_types::sync::entity_types`, and no service writes a `sync_log`
+    //   row for one. There is nothing on the wire for the client to have cached.
+    //   An issue's labels reach clients inside the ISSUE payload, and the ISSUE
+    //   delete entry takes them with it.
+    // * `issue_activities` — the type exists, but both write sites in
+    //   `activity_service` pass `None` as the payload and `sync_bootstrap` does
+    //   not stream activities, so every ACTIVITY frame is data-less. Both halves
+    //   of `cache/apply.rs` return at their missing-data guard before the match,
+    //   so no activity row ever reaches IndexedDB and there is none to evict.
+    //   Note also that this table does not cascade uniformly: the Postgres
+    //   migration declares `issue_id ... ON DELETE CASCADE` while the SQLite one
+    //   declares no foreign key at all, so on SQLite the rows are orphaned
+    //   rather than removed. `github_links` differs the same way. Neither is
+    //   observable through a query — the per-issue reads are reached through the
+    //   issue, and `list_workspace_activities` inner-joins `issues` — but the
+    //   two schemas disagree, and that disagreement is not this function's to
+    //   fix.
+    // * `issue_attachments` — same reasoning: `attachment_service::attach_to_issue`
+    //   records the link with `None`, and the bootstrap does not stream the type,
+    //   so the junction row is never cached. TRA-9979 is the ticket that would
+    //   give the insert a payload; when it lands, this table joins the two read
+    //   above.
+    // * `notifications` — these do not cascade at all. The foreign key is
+    //   `notifications_issue_id_fkey ... REFERENCES issues(issue_id)` with no
+    //   `ON DELETE` clause on Postgres and the same inline form on SQLite, which
+    //   means NO ACTION in both dialects. Deleting an issue that has any
+    //   notification row fails on the foreign key instead of cascading, so there
+    //   is no removal to describe.
+
     trakkt_core::tx_execute!(
         &mut tx,
         "DELETE FROM issues WHERE issue_id = $1",
         &issue_id
     )?;
 
-    let sync_id = sync_log_service::write_sync_entry_in_tx(
-        &mut tx,
-        entity_types::ISSUE,
-        &issue_id,
-        workspace_id,
-        None,
-        SyncActionType::Delete,
-        None,
-    )
-    .await?;
+    let mut batch = sync_log_service::SyncBatch::new();
 
-    tx.commit().await?;
-
-    // WebSocket broadcast — delete has no entity data.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
+    batch
+        .record(
+            &mut tx,
             entity_types::ISSUE,
             &issue_id,
+            workspace_id,
+            sync_log_service::SyncAudience::Workspace,
             SyncActionType::Delete,
             None,
-            sync_id,
         )
-        .await;
+        .await?;
+
+    for comment in &comment_ids {
+        batch
+            .record(
+                &mut tx,
+                entity_types::COMMENT,
+                &comment.id,
+                workspace_id,
+                sync_log_service::SyncAudience::Workspace,
+                SyncActionType::Delete,
+                None,
+            )
+            .await?;
     }
 
-    Ok(())
+    for relation in &relation_ids {
+        batch
+            .record(
+                &mut tx,
+                entity_types::ISSUE_RELATION,
+                &relation.id,
+                workspace_id,
+                sync_log_service::SyncAudience::Workspace,
+                SyncActionType::Delete,
+                None,
+            )
+            .await?;
+    }
+
+    batch.commit_and_deliver(tx, ws_manager).await
 }
 
 /// Replace all labels on an issue.
