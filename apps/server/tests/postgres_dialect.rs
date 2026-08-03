@@ -588,6 +588,141 @@ dual_backend_test! {
     }
 }
 
+// ─── get_entries_since: the TEAM membership predicate ────────────────────────
+
+/// The second user the TEAM visibility body needs, enrolled in `WORKSPACE`.
+///
+/// `seed_workspace` enrols only the owner, and `WebSocketManager` and the delta
+/// read both key off `workspace_users` — so a user without this row is not a
+/// member of the workspace at all, and "a workspace member who is not a team
+/// member" is exactly the case under test.
+async fn seed_second_workspace_member(db: &DbPool, user_id: &str) {
+    seed_user(db, user_id, &format!("{user_id}@example.test"))
+        .await
+        .expect("seed the workspace member who joins no team");
+
+    let now = sql_compat::now(db.is_postgres());
+    let bool_true = sql_compat::bool_true(db.is_postgres());
+    db_execute!(
+        db,
+        &format!(
+            "INSERT INTO workspace_users (workspace_id, user_id, role, active, created_at) \
+             VALUES ($1, $2, 'member', {bool_true}, {now})"
+        ),
+        WORKSPACE,
+        user_id
+    )
+    .expect("enrol the second user in the workspace");
+}
+
+/// Every TEAM entry `user_id` receives from a delta-from-zero, as
+/// `(entity_id, action)`.
+async fn team_delta(db: &DbPool, user_id: &str) -> Vec<(String, SyncActionType)> {
+    get_entries_since(db, WORKSPACE, user_id, 0, 10_000)
+        .await
+        .expect("read the delta stream a reconnecting client would be sent")
+        .into_iter()
+        .filter(|action| action.entity_type == entity_types::TEAM)
+        .map(|action| (action.entity_id, action.action))
+        .collect()
+}
+
+dual_backend_test! {
+    /// TEAM rows that add or refresh a team reach only that team's current
+    /// members; TEAM rows that remove one reach everybody.
+    ///
+    /// TRA-10013 put a correlated `EXISTS` over `team_members`, and a comparison
+    /// against string literals for `entity_type` and `action`, into
+    /// `get_entries_since` — the query every delta runs. That is new SQL on a hot
+    /// path, and the two engines do not have to agree about it: Postgres decides
+    /// `VARCHAR(50) <> 'team'` under its own type resolution and may plan the
+    /// `EXISTS` as a subplan or a semi-join, while SQLite compares TEXT with its
+    /// own affinity rules. A filter that silently matched nothing on one backend
+    /// would pass every SQLite test in the workspace and ship as a disclosure, so
+    /// the assertion is made against both.
+    ///
+    /// Driven through the real `team_service` rather than hand-written
+    /// `sync_log` rows: what is being checked is which rows the product's own
+    /// writers produce and how this query then treats them.
+    async fn team_delta_entries_are_scoped_to_current_members(db) {
+        const OUTSIDER: &str = "usr_dialect_outsider";
+
+        seed_tenancy(db).await;
+        seed_second_workspace_member(db, OUTSIDER).await;
+
+        let team = trakkt_auth::team_service::create_team(
+            db,
+            &trakkt_auth::team_service::CreateTeamParams {
+                workspace_id: WORKSPACE,
+                name: "Members Only",
+                key: "MEM",
+                description: None,
+                icon: None,
+                creator_id: Some(USER),
+            },
+            None,
+        )
+        .await
+        .expect("create the team the outsider is not a member of");
+
+        trakkt_auth::team_service::update_team(
+            db,
+            &team.team_id,
+            WORKSPACE,
+            Some("Members Only, Renamed".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .expect("rename the team");
+
+        assert_eq!(
+            team_delta(db, OUTSIDER).await,
+            Vec::new(),
+            "a workspace member who is not a team member must receive no TEAM \
+             row for it — not the create, and not the rename"
+        );
+        assert_eq!(
+            team_delta(db, USER).await,
+            vec![
+                (team.team_id.clone(), SyncActionType::Insert),
+                (team.team_id.clone(), SyncActionType::Update),
+                (team.team_id.clone(), SyncActionType::Update),
+            ],
+            "the member must still receive the create, the creator's member-add \
+             update and the rename"
+        );
+
+        // The delete is written after `DELETE FROM teams`, and `team_members`
+        // cascades from `teams(team_id)` on both backends — so by the time this
+        // row is read there is no membership left to authorise it. It has to
+        // reach the member anyway, or the deleted team stays in their cache.
+        trakkt_auth::team_service::delete_team(db, &team.team_id, WORKSPACE, None, None, None)
+            .await
+            .expect("delete the team");
+
+        assert_eq!(
+            team_delta(db, USER).await.last(),
+            Some(&(team.team_id.clone(), SyncActionType::Delete)),
+            "the member's stream must end with the delete even though their \
+             team_members row cascaded away with the team"
+        );
+
+        let memberships: i64 = db_fetch_scalar!(
+            db,
+            i64,
+            "SELECT COUNT(*) FROM team_members WHERE team_id = $1",
+            &team.team_id
+        )
+        .expect("count the memberships left after the cascade");
+        assert_eq!(
+            memberships, 0,
+            "the assertion above is only about the cascade if the cascade really \
+             happened on this backend"
+        );
+    }
+}
+
 // ─── The harness itself ──────────────────────────────────────────────────────
 
 /// A failing Postgres body still drops its throwaway database, and still fails.
