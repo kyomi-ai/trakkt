@@ -2,15 +2,17 @@
 # Trakkt — CI (Pull Request Checks)
 # =============================================================================
 # Runs on every PR to main, including new pushes to existing PRs.
-# Seven jobs, all independent — they run in parallel, so PR wall-clock is the
+# Eight jobs, all independent — they run in parallel, so PR wall-clock is the
 # slowest job, not the sum:
 #   1. lint-suppression — blocks new #[allow(...)] and = "allow" in Cargo.toml
 #   2. migration-consistency — blocks duplicate/diverging migration versions
 #   3. tx-pool — blocks pool access inside an open database transaction
 #   4. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
-#   5. test (slowest) — cargo test across the whole workspace
+#   5. test (slowest) — cargo test across the whole workspace, all on SQLite
 #   6. wasm-test (slow) — executes the trakkt-ui wasm-bindgen-test suite in Firefox
-#   7. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
+#   7. postgres-dialect (slow) — runs the dual-dialect suite against a real
+#      Postgres service container; the only job that executes an `is_pg` query arm
+#   8. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
 # =============================================================================
 
 name: CI
@@ -413,6 +415,161 @@ jobs:
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
         run: wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate --locked
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  # ---------------------------------------------------------------------------
+  # Slow check: the dual-dialect suite, executed against a real Postgres
+  #
+  # Production runs Postgres. Every other job here runs SQLite — the Test Suite
+  # job says so explicitly — so until this existed, a defect confined to an
+  # `is_pg` query arm compiled, passed clippy, passed `cargo test`, and shipped
+  # without anything having executed it. `sort_order` decoded as `f64` from a
+  # FLOAT4 column shipped that way twice.
+  #
+  # A separate job rather than service containers on Test Suite: that job's
+  # comment is a standing instruction not to add Postgres or Redis to it, and
+  # jobs run in parallel, so this costs runner minutes but no PR wall-clock.
+  #
+  # It runs one test binary — apps/server/tests/postgres_dialect.rs — because
+  # that is the only one whose Postgres halves exist. Everything else in the
+  # workspace is SQLite-only and already covered by Test Suite; running it again
+  # here would double the cost for no extra signal.
+  # ---------------------------------------------------------------------------
+  postgres-dialect:
+    name: Postgres Dialect Tests
+    runs-on: ubuntu-latest
+    # Bounds the whole job. It compiles the same dependency graph as Test Suite
+    # (trakkt-server's test targets pull in the whole workspace) but runs one
+    # test binary rather than all of them, and the run itself is ~3s locally
+    # against a live Postgres. So the cost is Test Suite's build minus its test
+    # execution: Test Suite is bounded at 30 for a ~18min worst cold run, and 20
+    # here leaves comparable headroom over the same build plus ~3min of setup.
+    # What it caps is a database that never becomes healthy: without a bound the
+    # service-container wait plus GitHub's 6-hour default would burn a runner-day.
+    timeout-minutes: 20
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      # Published on 5436 — the same port DEFAULT_PG_TEST_URL names, so CI
+      # exercises the configuration a developer gets by default rather than an
+      # untested fallback. Set explicitly anyway: an empty TEST_DATABASE_URL
+      # falling back to a default that someone later edits would silently point
+      # this job somewhere else.
+      TEST_DATABASE_URL: postgres://trakkt:trakkt@localhost:5436/postgres
+    services:
+      postgres:
+        # Pinned to the major version production runs. Unlike the browser in
+        # wasm-test, the point here is not to discover what a new release breaks
+        # — it is to reproduce production's dialect, so drifting to a newer major
+        # than production would test the wrong thing.
+        image: postgres:16
+        env:
+          POSTGRES_USER: trakkt
+          POSTGRES_PASSWORD: trakkt
+          # The maintenance database. No test reads or writes a table in it; it
+          # is connected to only to CREATE and DROP throwaway `trakkt_test_*`
+          # databases, one per test.
+          POSTGRES_DB: postgres
+        ports:
+          - 5436:5432
+        # Without this the job would start `cargo test` while the server is still
+        # initialising, and the suite would fail on a connection refused that has
+        # nothing to do with the code under test.
+        options: >-
+          --health-cmd "pg_isready -U trakkt"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Verify sccache can reach GHA cache
+        run: |
+          echo 'fn main(){}' > /tmp/sccache_test.rs
+          if sccache $(rustc --print sysroot)/bin/rustc /tmp/sccache_test.rs --crate-type bin -o /tmp/sccache_test_out; then
+            echo "SCCACHE_AVAILABLE=true" >> $GITHUB_ENV
+            sccache --show-stats 2>&1 | head -5
+          else
+            echo "::warning::sccache GHA cache probe failed (see above), building without cache"
+            echo "SCCACHE_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+          rm -f /tmp/sccache_test.rs /tmp/sccache_test_out
+
+      - name: Strip local dev patches (path overrides not available in CI)
+        run: sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
+
+      - name: Regenerate lockfile after stripping local patches
+        run: cargo update --workspace
+
+      # Same reasoning as Test Suite: not required by anything this job runs,
+      # kept so the setup stays a faithful mirror of the other cargo jobs.
+      - name: Ensure trakkt-ui/dist/ exists for ServeDir
+        run: mkdir -p crates/trakkt-ui/dist
+
+      - name: Install tailwindcss
+        run: |
+          curl -sLO https://github.com/tailwindlabs/tailwindcss/releases/download/v4.2.2/tailwindcss-linux-x64
+          chmod +x tailwindcss-linux-x64
+          sudo mv tailwindcss-linux-x64 /usr/local/bin/tailwindcss
+
+      - name: Build Tailwind CSS
+        working-directory: crates/trakkt-ui
+        run: tailwindcss --input style/main.css --output style/output.css
+
+      # Proves the service container is reachable from the job before anything is
+      # compiled. Without it, an unreachable database surfaces ~10 minutes later
+      # as a test failure that reads like a code defect.
+      - name: Verify Postgres is reachable
+        run: |
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          PGPASSWORD=trakkt psql -h localhost -p 5436 -U trakkt -d postgres -c 'SELECT version()'
+
+      # --include-ignored is what makes the Postgres halves run. The #[ignore] on
+      # them is a *local* affordance: it lets `cargo test` on a laptop with no
+      # database report `ignored` instead of a green tick for a path it never
+      # touched. In CI there is a database, so `ignored` would mean the opposite
+      # — a Postgres arm quietly not exercised on a PR that is about to merge.
+      #
+      # Two things enforce that, because --include-ignored alone does not.
+      #
+      # First, the harness fails rather than skips: with --include-ignored and no
+      # reachable server, `on_postgres` panics with instructions (verified
+      # locally by pointing TEST_DATABASE_URL at a dead port — 6 failures, exit 101).
+      # So an unreachable database is a red job, never a quiet pass.
+      #
+      # Second, the ignored count is asserted below. --include-ignored is a flag
+      # someone can drop in an edit, and dropping it turns the six Postgres tests
+      # into six `ignored` lines under an otherwise green `test result: ok`.
+      # Asserting `0 ignored` makes that edit fail the job it weakened.
+      - name: cargo test (Postgres dialect suite)
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: |
+          set -o pipefail
+          cargo test --locked -p trakkt-server --test postgres_dialect \
+            -- --include-ignored | tee postgres-dialect.log
+
+      - name: Assert no test was skipped
+        run: |
+          if ! grep -qE 'test result: ok\..*; 0 ignored' postgres-dialect.log; then
+            echo "::error::The Postgres dialect suite reported ignored tests. In CI a \
+          live Postgres is present, so 'ignored' means a Postgres query arm was not \
+          exercised on a PR that is about to merge — see the summary line below."
+            grep 'test result:' postgres-dialect.log || true
+            exit 1
+          fi
+          echo "✅ Every Postgres dialect test ran; none were skipped."
 
       - name: sccache stats
         if: always()
