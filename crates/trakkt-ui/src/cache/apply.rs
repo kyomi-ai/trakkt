@@ -153,8 +153,31 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                 }
                 et if et == entity_types::ACTIVITY => {
                     // Activities are not stored in the SyncStore — they are
-                    // fetched on-demand by the timeline component. Bump the
-                    // version counter so reactive dependencies refetch.
+                    // fetched on-demand by the timeline component, straight from
+                    // the `list_issue_activities` / `list_workspace_activities`
+                    // server functions. Bump the version counter so those
+                    // reactive dependencies refetch.
+                    //
+                    // As with milestones and members, `entity_data` is
+                    // deliberately not read here, and the payload is still what
+                    // makes this arm reachable: the guard above returns on a
+                    // data-less insert/update before this match, and both
+                    // `insert_activity` and `coalesce_or_insert_activity` in
+                    // `crates/trakkt-auth/src/activity_service.rs` used to pass
+                    // `None`. Every ACTIVITY frame was therefore dropped and no
+                    // other client's timeline moved until it was reloaded —
+                    // this arm ran in tests and never in production.
+                    //
+                    // Bumping the counter is the whole of the frame's job, and
+                    // the cache half deliberately does nothing with it: activity
+                    // is on `NOT_CACHED`, so no row is written to IndexedDB.
+                    // Nothing here would read one back — the `activity` entity
+                    // type is named only in this module — and `sync_bootstrap`
+                    // streams eleven types without it
+                    // (`apps/server/src/routes/websocket.rs`), so a cached
+                    // activity table could only ever be the arbitrary subset
+                    // that arrived while some tab was open. Both readers ask the
+                    // server instead, which is what this counter makes them do.
                     store.bump_activities_version();
                 }
                 et if et == entity_types::ISSUE_RELATION => {
@@ -403,7 +426,10 @@ fn apply_broadcast_to_memory(store: &SyncStore, message: &SyncBroadcastMessage) 
 ///
 /// [`enqueue_cache_writes`] otherwise persists any action carrying a payload,
 /// with no regard for whether anything reads it back. That default is right for
-/// every type but one.
+/// every type but the two named here, and both are here for the same reason: a
+/// payload arrives, and nothing in this client will ever read the row back.
+///
+/// # `release`
 ///
 /// `release` has no reader in this client at all: no route, no page, no server
 /// function, no hydration step and no on-demand cache read mentions releases —
@@ -414,16 +440,42 @@ fn apply_broadcast_to_memory(store: &SyncStore, message: &SyncBroadcastMessage) 
 /// user-visible half of publishing a release does reach the UI, but as the
 /// `issue` updates the same transaction emits for every issue it contains.
 ///
-/// So the rows were written, wiped by the next reset, and read by nothing in
-/// between. Skipping them here is what lets `release` come off
-/// `ALL_CACHED_ENTITY_TYPES` (see `crates/trakkt-ui/src/cache/sync_engine.rs`)
-/// without breaking the invariant that everything the cache can hold is wiped by
-/// a reset — the two are checked against each other by
-/// `every_entity_type_the_cache_persists_is_wiped_by_a_reset`.
+/// # `activity`
 ///
-/// Giving releases a UI means undoing both halves: stream them from the
-/// bootstrap, drop this entry, and put `release` back on that array.
-const NOT_CACHED: &[&str] = &[entity_types::RELEASE];
+/// Activities are read, and never from here. Both readers — the issue timeline
+/// and the workspace feed — call a server function (`list_issue_activities`,
+/// `list_workspace_activities`) when the store's activity counter bumps, so what
+/// the frame has to do is bump that counter, which is the memory half's job in
+/// [`apply_action_to_memory`]. The payload exists so that arm can run at all: the
+/// data-less guard returns before the entity match, which is why every activity
+/// frame was dropped before TRA-9987 gave the two write sites in
+/// `crates/trakkt-auth/src/activity_service.rs` a real one.
+///
+/// Persisting the row is the part with no reader. Nothing in `trakkt-ui` reads
+/// an activity out of IndexedDB — the `activity` entity type is named only in
+/// this module and, until this entry, in `ALL_CACHED_ENTITY_TYPES` — and
+/// `sync_bootstrap` streams eleven types without it
+/// (`apps/server/src/routes/websocket.rs`), so as with releases the cache could
+/// only ever hold whichever deltas happened to arrive while a tab was open.
+/// Writing them anyway is unbounded growth in step with every status change,
+/// comment and field edit in the workspace, evicted by nothing: this module's
+/// delete half queues no cache delete for an activity, so only a full
+/// `SyncReset` or a no-cursor cold start clears them.
+///
+/// # Both halves, together
+///
+/// Skipping a type here is what lets it come off `ALL_CACHED_ENTITY_TYPES` (see
+/// `crates/trakkt-ui/src/cache/sync_engine.rs`) without breaking the invariant
+/// that everything the cache can hold is wiped by a reset — the two are checked
+/// against each other by
+/// `every_entity_type_the_cache_persists_is_wiped_by_a_reset`. The entry and the
+/// removal are one change, not two: an entry without the removal promises a wipe
+/// for rows that are never written, and a removal without the entry leaves rows
+/// nothing ever clears.
+///
+/// Giving either type a cached reader means undoing both halves: stream it from
+/// the bootstrap, drop this entry, and put it back on that array.
+const NOT_CACHED: &[&str] = &[entity_types::RELEASE, entity_types::ACTIVITY];
 
 /// Queue the removal of one cached entity record.
 fn enqueue_delete(writer: &IdbWriter, entity_type: &str, entity_id: &str) {
@@ -613,6 +665,39 @@ mod test_support {
         let owner = Owner::new();
         owner.set();
         test(SyncStore::new());
+    }
+
+    /// The payload an ACTIVITY frame carries, built the way the server builds
+    /// it.
+    ///
+    /// Serialized from the real model rather than written out as JSON on
+    /// purpose. `insert_activity` and `coalesce_or_insert_activity` in
+    /// `crates/trakkt-auth/src/activity_service.rs` read the row back and hand
+    /// it to `sync_log_service::sync_payload`, which is `serde_json::to_value`
+    /// over exactly this type — so a field renamed on `IssueActivity` changes
+    /// this fixture and the wire together instead of leaving the two agreeing
+    /// only by hand.
+    ///
+    /// Not target-gated: the native tests assert what a real frame reaches, and
+    /// the browser tests assert what it moves.
+    pub(super) fn issue_activity_json() -> serde_json::Value {
+        let activity = trakkt_types::models::IssueActivity {
+            activity_id: "act-1".to_owned(),
+            issue_id: "issue-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            actor_id: Some("usr-alice".to_owned()),
+            actor_name: Some("Alice".to_owned()),
+            action_type: "status_changed".to_owned(),
+            field: Some("status".to_owned()),
+            old_value: Some("Todo".to_owned()),
+            new_value: Some("In Progress".to_owned()),
+            metadata: None,
+            action_source: trakkt_types::enums::ActionSource::User,
+            action_source_label: None,
+            created_at: "2026-07-26T00:00:00Z".to_owned(),
+        };
+        serde_json::to_value(&activity)
+            .expect("serializing an IssueActivity the way `sync_payload` does")
     }
 
     // The four entity types this ticket added arms for are exercised only by the
@@ -813,7 +898,7 @@ mod tests {
                 &action(
                     entity_types::ACTIVITY,
                     SyncActionType::Insert,
-                    Some(serde_json::json!({"activity_id": "a-1"})),
+                    Some(issue_activity_json()),
                 ),
             );
 
@@ -824,6 +909,27 @@ mod tests {
             );
             assert_eq!(store.comments_version().get_untracked(), 0);
             assert_eq!(store.relations_version().get_untracked(), 0);
+        });
+    }
+
+    #[test]
+    fn an_activity_action_without_a_payload_reaches_nothing() {
+        // The whole of TRA-9987 in one assertion. Both activity writers sent
+        // `None`, so this — not the test above — was the production path, and
+        // the arm the test above exercises never ran outside this file.
+        with_store(|store| {
+            apply_action_to_memory(
+                &store,
+                &action(entity_types::ACTIVITY, SyncActionType::Insert, None),
+            );
+
+            assert_eq!(
+                store.activities_version().get_untracked(),
+                0,
+                "the data-less guard returns before the entity match, so a \
+                 payload-less activity insert never reaches its arm at all — \
+                 this is why the server has to send one"
+            );
         });
     }
 
@@ -1180,14 +1286,22 @@ mod tests {
 
     /// What the delete path queues for the two types whose deletes it ignores.
     ///
-    /// The name and the old message both claimed these types have no cached
-    /// rows. That is true of `activity` — every activity frame carries a `None`
-    /// payload, so the insert path returns before it can persist anything — and
-    /// false of `issue_relation`, whose inserts *do* carry a payload and are
-    /// persisted by the generic upsert. Its rows therefore outlive the relation
-    /// until the next reset.
+    /// The name and the message both claimed these types have no cached rows.
+    /// That is true of `activity`, and is now true by construction rather than by
+    /// accident: it used to hold because every activity frame carried a `None`
+    /// payload, so the insert path returned before it could persist anything;
+    /// TRA-9987 gave those frames a payload and put `activity` on `NOT_CACHED` in
+    /// the same change, so the insert path still writes nothing and this delete
+    /// still has nothing to remove. `an_activity_upsert_is_not_persisted` is the
+    /// half that would fail if that entry were dropped — without it this test
+    /// would keep passing while activity rows accumulated unevicted, which is
+    /// exactly how a green test hides a leak.
     ///
-    /// The behaviour is left exactly as it was on purpose. The fix is not a
+    /// It remains false of `issue_relation`, whose inserts carry a payload and
+    /// are persisted by the generic upsert. Its rows outlive the relation until
+    /// the next reset.
+    ///
+    /// That behaviour is left exactly as it was on purpose. The fix is not a
     /// third arm here: the insert path persists everything with a payload while
     /// this delete path is a hand-written list, which is the same list-drift
     /// `every_entity_type_the_cache_persists_reaches_the_store` was added for,
@@ -1199,9 +1313,9 @@ mod tests {
         for entity_type in [entity_types::ACTIVITY, entity_types::ISSUE_RELATION] {
             assert!(
                 cache_ops(&action(entity_type, SyncActionType::Delete, None)).is_empty(),
-                "{entity_type}'s delete queues nothing today — for `activity` because it has \
-                 no cached rows at all, for `issue_relation` because its rows are persisted \
-                 and never removed"
+                "{entity_type}'s delete queues nothing today — for `activity` because \
+                 `NOT_CACHED` stops the row being written in the first place, for \
+                 `issue_relation` because its rows are persisted and never removed"
             );
         }
     }
@@ -1444,6 +1558,80 @@ mod tests {
     }
 
     #[test]
+    fn an_activity_upsert_is_not_persisted() {
+        // The other half of the payload this ticket added. The payload has to be
+        // there for the memory arm to run — the data-less guard returns before
+        // the entity match — but it must not turn into an IndexedDB row: nothing
+        // in this client reads an activity back, and no bootstrap streams them,
+        // so a cached activity table could only ever be the arbitrary subset that
+        // arrived while a tab was open.
+        //
+        // Without `activity` on `NOT_CACHED` this is not a no-op that goes
+        // unnoticed. The delete half queues nothing for an activity, so nothing
+        // ever evicts one, and the rows grow in step with every status change,
+        // comment and field edit in the whole workspace until a full `SyncReset`.
+        //
+        // The frame used here is the same real payload the memory-half tests
+        // assert *does* reach the timeline counter, so this cannot pass by
+        // sending something the write path would have skipped anyway.
+        assert!(
+            cache_ops(&action_with_id(
+                entity_types::ACTIVITY,
+                "act-1",
+                SyncActionType::Insert,
+                Some(issue_activity_json()),
+            ))
+            .is_empty(),
+            "an activity must not reach IndexedDB — it is evicted by no delete and read \
+             by nothing, so the row would only ever be written"
+        );
+    }
+
+    #[test]
+    fn a_coalesced_activity_update_is_not_persisted_either() {
+        // The coalescing path reports a repeated description save as an Update
+        // of the row already written. `enqueue_cache_writes` handles Insert and
+        // Update in one arm, so this shares the skip — stated separately because
+        // "insert is skipped" and "update is skipped" is the pair a future
+        // per-action-type split would break.
+        assert!(
+            cache_ops(&action_with_id(
+                entity_types::ACTIVITY,
+                "act-1",
+                SyncActionType::Update,
+                Some(issue_activity_json()),
+            ))
+            .is_empty(),
+            "a coalesced activity update must not reach IndexedDB either"
+        );
+    }
+
+    #[test]
+    fn the_activity_skip_does_not_touch_the_comments_a_comment_frame_carries() {
+        // Adding a comment records a `comment_added` activity *and* a comment.
+        // Comments are cached and read back from IndexedDB by the issue detail
+        // page, so the skip has to be scoped to the activity entity and not to
+        // the interaction that produced it — the same distinction
+        // `a_release_upsert_still_persists_nothing_when_it_carries_the_issues_it_names`
+        // draws for releases.
+        let ops = cache_ops(&action_with_id(
+            entity_types::COMMENT,
+            "cmt-1",
+            SyncActionType::Insert,
+            Some(serde_json::json!({
+                "comment_id": "cmt-1",
+                "issue_id": "issue-1",
+                "body": "Looks good",
+            })),
+        ));
+        assert_eq!(
+            ops.len(),
+            1,
+            "the comment an activity accompanies is still cached, got {ops:?}"
+        );
+    }
+
+    #[test]
     fn a_release_upsert_still_persists_nothing_when_it_carries_the_issues_it_names() {
         // Publishing a release emits an `issue` update per issue it contains,
         // alongside the release itself. Those are ordinary issue frames and must
@@ -1524,6 +1712,27 @@ mod wasm_tests {
         Signal::derive(move || ("TRA".to_owned(), 42, 0, version.get()))
     }
 
+    /// The source `IssueTimeline` hands to `Resource::new`, rebuilt here.
+    ///
+    /// See `IssueTimeline` in `crates/trakkt-ui/src/pages/issues/issue_detail.rs`:
+    /// `(team_key, number, activities_version.get())`. Nothing else can move it
+    /// — the `issue` frame an edit emits alongside its activity updates the
+    /// store's issue collection, and `IssueDetailContent` is keyed on
+    /// `(team_key, number)` by the `<For>` that renders it, so neither rebuilds
+    /// this resource. The counter is the only path a new timeline row has.
+    ///
+    /// The counter is resolved once here, outside the closure, as
+    /// `AttachmentsSection` and `NotificationsPage` do it. That is not how
+    /// `IssueTimeline` itself reads it today — issue_detail.rs:2358-2360 calls
+    /// `s.activities_version()` inside the `Signal::derive` closure, allocating
+    /// a fresh owner-registered wrapper per evaluation. That difference is about
+    /// where the wrapper is built, not about what the source depends on, so this
+    /// rebuild still observes the same counter the page does.
+    fn issue_timeline_source(store: SyncStore) -> Signal<(String, i32, u32)> {
+        let version = store.activities_version();
+        Signal::derive(move || ("TRA".to_owned(), 42, version.get()))
+    }
+
     /// The source `NotificationsPage` reads inside its `LocalResource` fetcher.
     fn notification_preferences_source(store: SyncStore) -> Signal<u32> {
         let version = store.notification_preferences_version();
@@ -1536,11 +1745,12 @@ mod wasm_tests {
         Signal::derive(move || version.get())
     }
 
-    /// Apply `action` and report what each of the three page sources read
+    /// Apply `action` and report what each of the four page sources read
     /// before and after, so every test can assert its own reader moved *and*
-    /// that it did not drag the other two along with it.
+    /// that it did not drag the other three along with it.
     struct Observed {
         attachments: bool,
+        activities: bool,
         notification_preferences: bool,
         workspace_settings: bool,
     }
@@ -1548,16 +1758,19 @@ mod wasm_tests {
     fn observe(action: &SyncAction) -> Observed {
         let mut observed = Observed {
             attachments: false,
+            activities: false,
             notification_preferences: false,
             workspace_settings: false,
         };
         with_store(|store| {
             let attachments = attachment_list_source(store);
+            let activities = issue_timeline_source(store);
             let prefs = notification_preferences_source(store);
             let settings = workspace_settings_source(store);
 
             let before = (
                 attachments.get_untracked(),
+                activities.get_untracked(),
                 prefs.get_untracked(),
                 settings.get_untracked(),
             );
@@ -1565,8 +1778,9 @@ mod wasm_tests {
             apply_action_to_memory(&store, action);
 
             observed.attachments = attachments.get_untracked() != before.0;
-            observed.notification_preferences = prefs.get_untracked() != before.1;
-            observed.workspace_settings = settings.get_untracked() != before.2;
+            observed.activities = activities.get_untracked() != before.1;
+            observed.notification_preferences = prefs.get_untracked() != before.2;
+            observed.workspace_settings = settings.get_untracked() != before.3;
         });
         observed
     }
@@ -1588,6 +1802,7 @@ mod wasm_tests {
              uploaded — without it a file added by another tab, another user or an agent \
              never appears on the issue"
         );
+        assert!(!observed.activities);
         assert!(!observed.notification_preferences);
         assert!(!observed.workspace_settings);
     }
@@ -1606,6 +1821,7 @@ mod wasm_tests {
             "a deleted attachment is gone from every issue it was linked to — the list has \
              to ask again, and a delete carries no payload so this counter is all there is"
         );
+        assert!(!observed.activities);
         assert!(!observed.notification_preferences);
         assert!(!observed.workspace_settings);
     }
@@ -1630,6 +1846,7 @@ mod wasm_tests {
             "linking an existing attachment changes the very list an upload changes, so it \
              shares the counter"
         );
+        assert!(!observed.activities);
         assert!(!observed.notification_preferences);
         assert!(!observed.workspace_settings);
     }
@@ -1648,6 +1865,7 @@ mod wasm_tests {
             "an unlink is the only attachment-link edit that arrives as a Delete, and the \
              attachment itself still exists — nothing else tells the list it went stale"
         );
+        assert!(!observed.activities);
         assert!(!observed.notification_preferences);
         assert!(!observed.workspace_settings);
     }
@@ -1680,6 +1898,99 @@ mod wasm_tests {
         );
     }
 
+    // ── activity ────────────────────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn an_activity_insert_refetches_the_issue_timeline() {
+        let observed = observe(&action_with_id(
+            entity_types::ACTIVITY,
+            "act-1",
+            SyncActionType::Insert,
+            Some(issue_activity_json()),
+        ));
+
+        assert!(
+            observed.activities,
+            "the issue detail page's timeline must refetch when an activity is recorded — \
+             a status change, a comment or a field edit made by another user, another tab \
+             or an agent otherwise never appears on the issue until it is reloaded"
+        );
+        assert!(!observed.attachments);
+        assert!(!observed.notification_preferences);
+        assert!(!observed.workspace_settings);
+    }
+
+    #[wasm_bindgen_test]
+    fn a_coalesced_activity_update_refetches_the_issue_timeline() {
+        // `coalesce_or_insert_activity` reports a repeated description save
+        // inside its 60s window as an Update of the row already written, not as
+        // a second insert. The timeline has one reactive dependency, and which
+        // action type carried the change must not decide whether it fires.
+        let observed = observe(&action_with_id(
+            entity_types::ACTIVITY,
+            "act-1",
+            SyncActionType::Update,
+            Some(issue_activity_json()),
+        ));
+
+        assert!(
+            observed.activities,
+            "a coalesced activity moves the row's timestamp, so its position in the \
+             timeline changes — the page has to ask again"
+        );
+        assert!(!observed.attachments);
+        assert!(!observed.notification_preferences);
+        assert!(!observed.workspace_settings);
+    }
+
+    #[wasm_bindgen_test]
+    fn an_activity_frame_without_a_payload_reaches_no_reader() {
+        // The bug this ticket fixed, stated against the reader rather than
+        // against the counter. Both `insert_activity` and
+        // `coalesce_or_insert_activity` passed `None` to `commit_and_deliver`,
+        // so every ACTIVITY frame on the wire looked like this one: the
+        // data-less guard dropped it before the entity match, and the arm below
+        // it ran only in the native test above. A test that asserted the arm was
+        // entered passed throughout.
+        let observed = observe(&action_with_id(
+            entity_types::ACTIVITY,
+            "act-1",
+            SyncActionType::Insert,
+            None,
+        ));
+
+        assert!(
+            !observed.activities,
+            "the data-less guard returns before the entity match, so a payload-less \
+             activity insert never reaches its arm at all — this is why the server has to \
+             send one"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn deleting_an_activity_refetches_the_issue_timeline() {
+        // No server path deletes an activity on its own today; a cascade from an
+        // issue delete emits one, and the timeline of a deleted issue is not on
+        // screen. Handling it is what stops a future one from arriving as
+        // silence — and a delete carries no payload, so this counter is all
+        // there is.
+        let observed = observe(&action_with_id(
+            entity_types::ACTIVITY,
+            "act-1",
+            SyncActionType::Delete,
+            None,
+        ));
+
+        assert!(
+            observed.activities,
+            "the timeline has one reactive dependency, and which action type carried the \
+             change must not decide whether it fires"
+        );
+        assert!(!observed.attachments);
+        assert!(!observed.notification_preferences);
+        assert!(!observed.workspace_settings);
+    }
+
     // ── notification_preferences ────────────────────────────────────────────
 
     #[wasm_bindgen_test]
@@ -1698,6 +2009,7 @@ mod wasm_tests {
              two go on disagreeing"
         );
         assert!(!observed.attachments);
+        assert!(!observed.activities);
         assert!(!observed.workspace_settings);
     }
 
@@ -1718,6 +2030,7 @@ mod wasm_tests {
              the change must not decide whether it fires"
         );
         assert!(!observed.attachments);
+        assert!(!observed.activities);
         assert!(!observed.workspace_settings);
     }
 
@@ -1739,6 +2052,7 @@ mod wasm_tests {
              and back — while another admin's rename sits in the cache unseen"
         );
         assert!(!observed.attachments);
+        assert!(!observed.activities);
         assert!(!observed.notification_preferences);
     }
 
@@ -1758,6 +2072,7 @@ mod wasm_tests {
             "one reactive dependency, either action type"
         );
         assert!(!observed.attachments);
+        assert!(!observed.activities);
         assert!(!observed.notification_preferences);
     }
 
@@ -1787,6 +2102,7 @@ mod wasm_tests {
         ));
 
         assert!(!observed.attachments);
+        assert!(!observed.activities);
         assert!(!observed.notification_preferences);
         assert!(!observed.workspace_settings);
     }

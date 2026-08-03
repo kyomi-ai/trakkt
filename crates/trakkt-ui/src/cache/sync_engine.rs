@@ -84,11 +84,14 @@ use crate::cache::websocket::{ConnectionState, WebSocketClient};
 /// since the only other cache delete is a per-entity one driven by a `Delete`
 /// action that has already been and gone.
 ///
-/// The converse also has to hold, and it is why `release` is absent: a type that
-/// is wiped but never written is a promise this client does not keep. Nothing
-/// reads releases and no bootstrap streams them, so they are not persisted
-/// either — the reasoning is on `NOT_CACHED` in
-/// [`crate::cache::apply`], which is the one place that decides it.
+/// The converse also has to hold, and it is why `release` and `activity` are
+/// absent: a type that is wiped but never written is a promise this client does
+/// not keep. Neither has a reader here — releases are created and listed through
+/// the API and MCP tools only, and both activity readers refetch from the server
+/// when their counter bumps rather than from the cache — and no bootstrap
+/// streams either, so neither is persisted. The reasoning is on `NOT_CACHED` in
+/// [`crate::cache::apply`], which is the one place that decides it; this array
+/// only follows.
 ///
 /// `every_entity_type_the_cache_persists_is_wiped_by_a_reset` holds this list to
 /// that rule by driving the write path itself, rather than trusting the next
@@ -109,7 +112,6 @@ const ALL_CACHED_ENTITY_TYPES: &[&str] = &[
     entity_types::NOTIFICATION,
     entity_types::NOTIFICATION_PREFERENCES,
     entity_types::COMMENT,
-    entity_types::ACTIVITY,
     entity_types::ISSUE_RELATION,
     entity_types::ATTACHMENT,
     entity_types::ISSUE_ATTACHMENT,

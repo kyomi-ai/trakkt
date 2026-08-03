@@ -210,6 +210,58 @@ test('a workspace rename in window A reaches window B without a reload', async (
   await expect(nameFieldB).toHaveValue(newName, { timeout: 20_000 });
 });
 
+test("an activity in window A reaches window B's issue timeline without a reload", async () => {
+  // The reported bug: comment on an issue or change a field, and a colleague
+  // with that issue open sees nothing until they reload. Both activity write
+  // sites logged their sync entry with `None`, and `cache/apply.rs` drops a
+  // data-less insert/update before it reaches the arm that bumps the timeline's
+  // refetch counter — so every ACTIVITY frame was discarded on arrival.
+  //
+  // The assertion is deliberately on an ACTIVITY row rather than on the issue
+  // field itself. `IssueTimeline` hands `(team_key, number, activities_version)`
+  // to its `Resource`, and `IssueDetailContent` is keyed on `(team_key, number)`
+  // by the `<For>` that renders it, so the `issue` frame this same edit emits
+  // updates the header and the description without rebuilding the timeline. The
+  // activity counter is the only path a new timeline row has.
+  const issueTitle = `Sync activity ${crypto.randomBytes(3).toString('hex')}`;
+
+  await pageA.goto('/issues');
+  await pageA.waitForLoadState('networkidle');
+
+  // A fresh workspace shows the empty state, which carries its own "New Issue"
+  // button alongside the header's — take the first either way.
+  await pageA.getByRole('button', { name: 'New Issue' }).first().click();
+  await pageA.waitForSelector('#issue-title', { timeout: 15_000 });
+  await pageA.fill('#issue-title', issueTitle);
+  await pageA.getByRole('button', { name: 'Create Issue' }).click();
+
+  const createdRow = pageA.locator('a[href*="/issues/"]').filter({ hasText: issueTitle }).first();
+  await expect(createdRow).toBeVisible({ timeout: 20_000 });
+  const issueHref = await createdRow.getAttribute('href');
+  expect(issueHref, 'the new issue needs a detail link both windows can open').toBeTruthy();
+
+  await pageA.goto(issueHref!);
+  await pageA.waitForLoadState('networkidle');
+  await pageB.goto(issueHref!);
+  await pageB.waitForLoadState('networkidle');
+
+  // B is on the issue and has the creation activity — so anything missing later
+  // is a missing update, not a timeline that never rendered.
+  await expect(pageB.getByText('created this issue').first()).toBeVisible({ timeout: 20_000 });
+  await expect(pageB.getByText('updated the description')).toHaveCount(0);
+
+  // A edits the description. The debounced auto-save records a
+  // `description_changed` activity through `coalesce_or_insert_activity`.
+  const editorA = pageA.locator('[contenteditable="true"]').first();
+  await expect(editorA).toBeVisible({ timeout: 15_000 });
+  await editorA.click();
+  await pageA.waitForTimeout(200);
+  await pageA.keyboard.type(`Edited by A ${crypto.randomBytes(3).toString('hex')}`, { delay: 30 });
+
+  // B must pick this up from the live frame, with no navigation.
+  await expect(pageB.getByText('updated the description').first()).toBeVisible({ timeout: 30_000 });
+});
+
 test('typing in window B is not destroyed by a frame arriving from window A', async () => {
   // This is the regression TRA-9977 introduced and then fixed. It is the one
   // assertion here that is about data loss rather than staleness.

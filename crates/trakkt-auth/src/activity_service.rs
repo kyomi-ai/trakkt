@@ -23,6 +23,29 @@ use crate::websocket::WebSocketManager;
 
 const DESCRIPTION_COALESCE_WINDOW_SECS: i64 = 60;
 
+/// Columns, table and actor join shared by every `issue_activities` read that
+/// produces an [`IssueActivity`].
+///
+/// Used by [`list_issue_activities`] — what the issue timeline calls — and by
+/// [`read_activity_for_sync`], which builds the payload the sync entry carries.
+/// Those two have to agree column for column: the payload is what another
+/// client applies *instead of* calling `list_issue_activities`, so a column
+/// present in one and not the other is a field that silently differs between a
+/// timeline that was reloaded and one that was updated live. Kept as one
+/// fragment so a column added later cannot land in only one of them.
+///
+/// `WHERE` and `ORDER BY` are deliberately not part of it: the two callers
+/// filter on different columns.
+const ISSUE_ACTIVITY_SELECT: &str = "\
+    SELECT a.activity_id, a.issue_id, a.workspace_id, a.actor_id, \
+           u.name AS actor_name, \
+           a.action_type, a.field, a.old_value, a.new_value, \
+           CAST(a.metadata AS TEXT) AS metadata, \
+           a.action_source, a.action_source_label, \
+           CAST(a.created_at AS TEXT) AS created_at \
+    FROM issue_activities a \
+    LEFT JOIN users u ON u.user_id = a.actor_id";
+
 #[derive(sqlx::FromRow)]
 struct CoalesceRow {
     activity_id: String,
@@ -68,6 +91,32 @@ impl IssueActivityRow {
             created_at: self.created_at,
         }
     }
+}
+
+/// Read one activity back **on the transaction that wrote it**, in the shape
+/// its sync payload has to carry.
+///
+/// The read runs on `tx`, and it has to: the row was written on this
+/// transaction and does not exist for any other reader until it commits, so a
+/// pool query would find nothing. On SQLite it would not even get that far —
+/// the pool is pinned to `max_connections(1)` and this transaction is holding
+/// that connection, so the acquire would block until sqlx's 30s
+/// `acquire_timeout` fired and then fail with `PoolTimedOut` (see `DbTx`, and
+/// `scripts/check-tx-pool.py` which enforces this).
+///
+/// The payload matters because of what the client does without one:
+/// `apply_action_to_memory` (`crates/trakkt-ui/src/cache/apply.rs`) returns on a
+/// data-less insert/update *before* its entity-type match, so an ACTIVITY frame
+/// with no payload reaches no arm at all — neither live nor on a delta replay —
+/// and no other client's timeline moves until it is reloaded.
+async fn read_activity_for_sync(
+    tx: &mut DbTx,
+    activity_id: &str,
+) -> trakkt_core::Result<IssueActivity> {
+    let sql = format!("{ISSUE_ACTIVITY_SELECT} WHERE a.activity_id = $1");
+    let row: IssueActivityRow =
+        trakkt_core::tx_fetch_one!(&mut *tx, IssueActivityRow, &sql, activity_id)?;
+    Ok(row.into_dto())
 }
 
 // ─── Snapshot type ───────────────────────────────────────────────────────────
@@ -555,6 +604,15 @@ impl<'a> ActivityRecorder<'a> {
             }
         };
 
+        // Read back after both branches, not inside either. The coalescing
+        // branch's whole effect is moving `created_at` forward, so a payload
+        // built before it would carry the timestamp the update replaced and
+        // every other client would sort the entry to the wrong place in its
+        // timeline. Reading here is also the only way one payload covers both
+        // branches. See `read_activity_for_sync` for why it runs on `tx`.
+        let activity = read_activity_for_sync(&mut tx, &activity_id).await?;
+        let payload = sync_log_service::sync_payload(&activity, entity_types::ACTIVITY, &activity_id);
+
         // Logs the entry on `tx`, commits, and only then broadcasts — the
         // broadcast resolves its recipients from the pool, which this
         // transaction is holding on SQLite (see `DbTx`).
@@ -565,7 +623,7 @@ impl<'a> ActivityRecorder<'a> {
             self.workspace_id,
             sync_log_service::SyncAudience::Workspace,
             action,
-            None,
+            payload,
             self.ws_manager,
         )
         .await
@@ -589,6 +647,13 @@ impl<'a> ActivityRecorder<'a> {
             )
             .await?;
 
+        // The row the INSERT just wrote, read back for its DB-assigned
+        // `created_at` and its joined `actor_name` — neither is known to this
+        // function, and the timeline renders both. See `read_activity_for_sync`
+        // for why the read is on `tx` rather than the pool.
+        let activity = read_activity_for_sync(&mut tx, &activity_id).await?;
+        let payload = sync_log_service::sync_payload(&activity, entity_types::ACTIVITY, &activity_id);
+
         sync_log_service::commit_and_deliver(
             tx,
             entity_types::ACTIVITY,
@@ -596,7 +661,7 @@ impl<'a> ActivityRecorder<'a> {
             self.workspace_id,
             sync_log_service::SyncAudience::Workspace,
             SyncActionType::Insert,
-            None,
+            payload,
             self.ws_manager,
         )
         .await
@@ -715,21 +780,9 @@ pub async fn list_issue_activities(
     db: &DbPool,
     issue_id: &str,
 ) -> trakkt_core::Result<Vec<IssueActivity>> {
-    let rows: Vec<IssueActivityRow> = trakkt_core::db_fetch_all!(
-        db,
-        IssueActivityRow,
-        "SELECT a.activity_id, a.issue_id, a.workspace_id, a.actor_id, \
-                u.name AS actor_name, \
-                a.action_type, a.field, a.old_value, a.new_value, \
-                CAST(a.metadata AS TEXT) AS metadata, \
-                a.action_source, a.action_source_label, \
-                CAST(a.created_at AS TEXT) AS created_at \
-         FROM issue_activities a \
-         LEFT JOIN users u ON u.user_id = a.actor_id \
-         WHERE a.issue_id = $1 \
-         ORDER BY a.created_at ASC",
-        issue_id
-    )?;
+    let sql = format!("{ISSUE_ACTIVITY_SELECT} WHERE a.issue_id = $1 ORDER BY a.created_at ASC");
+    let rows: Vec<IssueActivityRow> =
+        trakkt_core::db_fetch_all!(db, IssueActivityRow, &sql, issue_id)?;
     Ok(rows.into_iter().map(IssueActivityRow::into_dto).collect())
 }
 
