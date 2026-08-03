@@ -44,6 +44,8 @@ use trakkt_ui::cache::idb_writer::{channel, run_writer, IdbSink, SinkError};
 use trakkt_ui::cache::store::SyncStore;
 
 const USER: &str = "usr_cascade";
+/// A second member, so the per-user half of the delta has someone to exclude.
+const OTHER_USER: &str = "usr_cascade_other";
 const WORKSPACE: &str = "ws_cascade";
 const TEAM: &str = "team_cascade";
 const TEAM_KEY: &str = "CAS";
@@ -102,22 +104,35 @@ impl IdbSink for MapSink {
     }
 }
 
-/// A workspace with one member, one team and the default statuses.
+/// A workspace with two members, one team and the default statuses.
 ///
-/// One member on purpose: `create_comment` notifies an issue's watchers, and
-/// `notifications.issue_id` has no `ON DELETE` clause in either dialect, so a
-/// notification row would make the DELETE fail on the foreign key rather than
-/// cascade. With a single user the self-notification suppression keeps the table
-/// empty, which is asserted below rather than assumed.
+/// Two on purpose. Notifications are the one cascaded type here that is not
+/// workspace-visible — `notification_service::create_notification` writes them
+/// with `SyncAudience::User`, so `get_entries_since` hands each member only
+/// their own. A single-member fixture cannot tell a correctly scoped delete
+/// entry apart from one published to the whole workspace.
 async fn seeded_workspace() -> DbPool {
     let db = test_pool().await.expect("migrated in-memory pool");
 
     seed_user(&db, USER, "cascade@example.test")
         .await
         .expect("seed user");
+    seed_user(&db, OTHER_USER, "cascade-other@example.test")
+        .await
+        .expect("seed the second member");
     seed_workspace(&db, WORKSPACE, USER)
         .await
         .expect("seed workspace");
+    // `seed_workspace` enrols only the owner, and `workspace_users` is what
+    // decides who a change is broadcast to. `role` and `active` are left to the
+    // schema's defaults, as `sync_log_service`'s own two-member fixture does.
+    trakkt_core::db_execute!(
+        &db,
+        "INSERT INTO workspace_users (workspace_id, user_id) VALUES ($1, $2)",
+        WORKSPACE,
+        OTHER_USER
+    )
+    .expect("enrol the second member in the workspace");
     seed_team(&db, TEAM, WORKSPACE, TEAM_KEY)
         .await
         .expect("seed team");
@@ -126,6 +141,38 @@ async fn seeded_workspace() -> DbPool {
         .expect("seed default statuses");
 
     db
+}
+
+/// Notify `user_id` about `issue_id` through the real service, returning the id
+/// of the row it wrote.
+///
+/// `create_notification` returns `()`, so the id is read back from the table.
+/// `(user_id, issue_id)` identifies it: no fixture here gives one member two
+/// notifications on one issue.
+async fn seed_notification(db: &DbPool, user_id: &str, issue_id: &str) -> String {
+    trakkt_auth::notification_service::create_notification(
+        db,
+        WORKSPACE,
+        user_id,
+        issue_id,
+        "status_changed",
+        None,
+        None,
+        ActionSource::User,
+        None,
+        None,
+    )
+    .await
+    .expect("create the notification a cascading delete will have to evict");
+
+    trakkt_core::db_fetch_scalar!(
+        db,
+        String,
+        "SELECT notification_id FROM notifications WHERE user_id = $1 AND issue_id = $2",
+        user_id,
+        issue_id
+    )
+    .expect("read back the id of the notification just created")
 }
 
 /// Create an issue with a description, so it produces an `issue_content` cache
@@ -174,7 +221,7 @@ async fn seed_comments(db: &DbPool, issue_id: &str, count: usize) -> Vec<String>
 }
 
 #[tokio::test]
-async fn a_client_replaying_the_delta_keeps_neither_the_issue_nor_its_comments() {
+async fn a_client_replaying_the_delta_keeps_nothing_the_deleted_issue_took_with_it() {
     let db = seeded_workspace().await;
 
     let doomed = seed_issue(&db, "Deleted in another browser").await;
@@ -182,21 +229,13 @@ async fn a_client_replaying_the_delta_keeps_neither_the_issue_nor_its_comments()
     let doomed_comments = seed_comments(&db, &doomed.issue_id, 3).await;
     let survivor_comments = seed_comments(&db, &survivor.issue_id, 2).await;
 
-    // The fixture's own precondition: with a notification present the DELETE
-    // below would fail on the foreign key instead of cascading, and this test
-    // would be proving something else entirely.
-    let notifications: i64 = trakkt_core::db_fetch_scalar!(
-        &db,
-        i64,
-        "SELECT COUNT(*) FROM notifications WHERE issue_id = $1",
-        &doomed.issue_id
-    )
-    .expect("count notifications on the issue about to be deleted");
-    assert_eq!(
-        notifications, 0,
-        "the seed must not leave a notification on the doomed issue — \
-         notifications.issue_id does not cascade, so one would abort the DELETE"
-    );
+    // Notifications on the doomed issue for both members, and one on the
+    // survivor. Until TRA-9989 gave `notifications.issue_id` an ON DELETE
+    // CASCADE these rows made the DELETE below fail on the foreign key outright,
+    // which is why this fixture used to keep the table empty.
+    let doomed_notification = seed_notification(&db, USER, &doomed.issue_id).await;
+    let other_members_notification = seed_notification(&db, OTHER_USER, &doomed.issue_id).await;
+    let survivor_notification = seed_notification(&db, USER, &survivor.issue_id).await;
 
     trakkt_auth::issue_service::delete_issue(&db, WORKSPACE, TEAM_KEY, doomed.number, None)
         .await
@@ -267,6 +306,29 @@ async fn a_client_replaying_the_delta_keeps_neither_the_issue_nor_its_comments()
              cached"
         );
     }
+
+    assert!(
+        !holds(entity_types::NOTIFICATION, &doomed_notification),
+        "the inbox entry for the deleted issue must not survive the replay — it \
+         renders a title, number and team key that are joined from a row the \
+         cascade destroyed"
+    );
+    assert!(
+        holds(entity_types::NOTIFICATION, &survivor_notification),
+        "the notification on the untouched issue must still be cached, or this \
+         assertion would pass against a replay that evicted every notification"
+    );
+    // The other member's notification is theirs alone. `get_entries_since`
+    // filters on `visibility_user_id`, so neither its insert nor its delete may
+    // appear in this user's delta at all — a delete entry recorded with
+    // `SyncAudience::Workspace` would put the id here.
+    assert!(
+        !actions
+            .iter()
+            .any(|a| a.entity_id == other_members_notification),
+        "the other member's notification id must never reach this user's delta, \
+         in either direction"
+    );
 
     // The in-memory half of the same replay, which is what the issue list on
     // screen is rendered from.
