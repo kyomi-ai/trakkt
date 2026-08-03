@@ -34,17 +34,43 @@
 use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
 use trakkt_types::sync::{SyncAction, SyncActionType, entity_types};
 
+use crate::cache::cached_types::cache_rows_written_by;
 use crate::cache::idb_writer::{IdbOp, IdbWriter};
 use crate::cache::store::SyncStore;
 use crate::cache::tab_leader::SyncBroadcastMessage;
 
 // ── Memory half (every tab) ─────────────────────────────────────────────────
 
+/// What one frame reached in the reactive store.
+///
+/// Reported rather than only logged because "this entity type has an arm" is an
+/// invariant with a test behind it: everything the cache persists must reach the
+/// store, or the change lands in IndexedDB and nowhere the user can see it until
+/// a reload. That guard used to answer the question by reading this module's
+/// source as text and counting `match` arms, which credited an arm without ever
+/// running it — and walked straight past a rebinding of the name `entity_types`.
+/// Asking the function itself is exact, needs no parser, and runs natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreDispatch {
+    /// The frame reached an arm: a cached collection was updated, or a version
+    /// counter something subscribes to was bumped.
+    Handled,
+    /// An insert/update arrived with no `data`, so it was dropped before the
+    /// entity match. Nothing downstream of that guard runs, which is why a
+    /// service that omits the payload delivers nothing at all.
+    MissingPayload,
+    /// No arm handles this entity type. The frame ends here.
+    Unhandled,
+}
+
 /// Apply one `SyncAction` to the reactive store.
 ///
 /// Touches memory only: no IndexedDB, no cursor. The leader pairs this with
 /// [`enqueue_cache_writes`]; a follower runs it alone.
-pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
+///
+/// Returns what the frame reached; see [`StoreDispatch`]. Callers that only want
+/// the effect can ignore it.
+pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) -> StoreDispatch {
     let entity_type = action.entity_type.as_str();
     let entity_id = &action.entity_id;
 
@@ -57,7 +83,7 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                     entity_id,
                     "sync_action insert/update: missing data field — skipping"
                 );
-                return;
+                return StoreDispatch::MissingPayload;
             };
 
             // Update the reactive store.
@@ -170,9 +196,10 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                     //
                     // Bumping the counter is the whole of the frame's job, and
                     // the cache half deliberately does nothing with it: activity
-                    // is on `NOT_CACHED`, so no row is written to IndexedDB.
-                    // Nothing here would read one back — the `activity` entity
-                    // type is named only in this module — and `sync_bootstrap`
+                    // is on `NOT_CACHED` in [`crate::cache::cached_types`], so no
+                    // row is written to IndexedDB. Nothing here would read one
+                    // back — the `activity` entity type is named only in this
+                    // module and in that one — and `sync_bootstrap`
                     // streams eleven types without it
                     // (`apps/server/src/routes/websocket.rs`), so a cached
                     // activity table could only ever be the arbitrary subset
@@ -268,13 +295,17 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                         entity_type = other,
                         "sync_action: unhandled entity type — ignoring"
                     );
+                    return StoreDispatch::Unhandled;
                 }
             }
+            StoreDispatch::Handled
         }
         SyncActionType::Delete => {
-            // Remove from the reactive store in memory only. Entity types with
-            // no cached rows (activity, issue_relation) only bump their version
-            // counter, exactly as before.
+            // Remove from the reactive store in memory only. Which types have a
+            // cached row is not this half's concern and must not become one: the
+            // types on `NOT_CACHED` still have arms here, because the counter
+            // they bump is what their reader — a server function, not the cache
+            // — subscribes to.
             match entity_type {
                 et if et == entity_types::ISSUE => store.remove_issue_in_memory(entity_id),
                 et if et == entity_types::LABEL => store.remove_label_in_memory(entity_id),
@@ -342,8 +373,10 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) {
                         entity_type = other,
                         "sync_action delete: unhandled entity type — ignoring"
                     );
+                    return StoreDispatch::Unhandled;
                 }
             }
+            StoreDispatch::Handled
         }
     }
 }
@@ -394,7 +427,9 @@ fn enqueue_broadcast_cache_writes(writer: &IdbWriter, message: &SyncBroadcastMes
 /// on the same store contents without the follower ever touching IndexedDB.
 fn apply_broadcast_to_memory(store: &SyncStore, message: &SyncBroadcastMessage) {
     match message {
-        SyncBroadcastMessage::Action(action) => apply_action_to_memory(store, action),
+        SyncBroadcastMessage::Action(action) => {
+            apply_action_to_memory(store, action);
+        }
         SyncBroadcastMessage::CacheDelete { .. } => {
             // Nothing to do in memory. The tab that asked for the delete already
             // dropped the entity from its own store — that is what made the UI
@@ -421,62 +456,6 @@ fn apply_broadcast_to_memory(store: &SyncStore, message: &SyncBroadcastMessage) 
 
 // ── Cache half (leader only) ────────────────────────────────────────────────
 
-/// Entity types that arrive on the sync stream and are deliberately **not**
-/// written to the local cache.
-///
-/// [`enqueue_cache_writes`] otherwise persists any action carrying a payload,
-/// with no regard for whether anything reads it back. That default is right for
-/// every type but the two named here, and both are here for the same reason: a
-/// payload arrives, and nothing in this client will ever read the row back.
-///
-/// # `release`
-///
-/// `release` has no reader in this client at all: no route, no page, no server
-/// function, no hydration step and no on-demand cache read mentions releases —
-/// they are created and listed exclusively through the API and MCP tools. Nor
-/// could the cached rows serve a future one, because `sync_bootstrap` does not
-/// stream releases: a cache filled only by whichever deltas happened to arrive
-/// while some tab was open is an arbitrary subset, never a list. The
-/// user-visible half of publishing a release does reach the UI, but as the
-/// `issue` updates the same transaction emits for every issue it contains.
-///
-/// # `activity`
-///
-/// Activities are read, and never from here. Both readers — the issue timeline
-/// and the workspace feed — call a server function (`list_issue_activities`,
-/// `list_workspace_activities`) when the store's activity counter bumps, so what
-/// the frame has to do is bump that counter, which is the memory half's job in
-/// [`apply_action_to_memory`]. The payload exists so that arm can run at all: the
-/// data-less guard returns before the entity match, which is why every activity
-/// frame was dropped before TRA-9987 gave the two write sites in
-/// `crates/trakkt-auth/src/activity_service.rs` a real one.
-///
-/// Persisting the row is the part with no reader. Nothing in `trakkt-ui` reads
-/// an activity out of IndexedDB — the `activity` entity type is named only in
-/// this module and, until this entry, in `ALL_CACHED_ENTITY_TYPES` — and
-/// `sync_bootstrap` streams eleven types without it
-/// (`apps/server/src/routes/websocket.rs`), so as with releases the cache could
-/// only ever hold whichever deltas happened to arrive while a tab was open.
-/// Writing them anyway is unbounded growth in step with every status change,
-/// comment and field edit in the workspace, evicted by nothing: this module's
-/// delete half queues no cache delete for an activity, so only a full
-/// `SyncReset` or a no-cursor cold start clears them.
-///
-/// # Both halves, together
-///
-/// Skipping a type here is what lets it come off `ALL_CACHED_ENTITY_TYPES` (see
-/// `crates/trakkt-ui/src/cache/sync_engine.rs`) without breaking the invariant
-/// that everything the cache can hold is wiped by a reset — the two are checked
-/// against each other by
-/// `every_entity_type_the_cache_persists_is_wiped_by_a_reset`. The entry and the
-/// removal are one change, not two: an entry without the removal promises a wipe
-/// for rows that are never written, and a removal without the entry leaves rows
-/// nothing ever clears.
-///
-/// Giving either type a cached reader means undoing both halves: stream it from
-/// the bootstrap, drop this entry, and put it back on that array.
-const NOT_CACHED: &[&str] = &[entity_types::RELEASE, entity_types::ACTIVITY];
-
 /// Queue the removal of one cached entity record.
 fn enqueue_delete(writer: &IdbWriter, entity_type: &str, entity_id: &str) {
     writer.enqueue(IdbOp::Delete {
@@ -489,9 +468,20 @@ fn enqueue_delete(writer: &IdbWriter, entity_type: &str, entity_id: &str) {
 ///
 /// Leader-only. Nothing is written here directly: every op is appended to the
 /// FIFO writer queue, ordered against the cursor that will claim it.
+///
+/// Both halves are gated on the same
+/// [`cache_rows_written_by`](crate::cache::cached_types::cache_rows_written_by):
+/// the insert path writes nothing for a type that owns no rows, and the delete
+/// path removes exactly the rows the insert path could have written. They cannot
+/// disagree, which is what stopped `attachment`, `issue_relation` and
+/// `notification_preferences` rows being written by the generic upsert and then
+/// removed by no delete arm at all.
 pub fn enqueue_cache_writes(writer: &IdbWriter, action: &SyncAction) {
     let entity_type = action.entity_type.as_str();
     let entity_id = &action.entity_id;
+    // The rows the cache holds for this type: the gate on the way in, and the
+    // exact set to remove on the way out.
+    let cache_rows = cache_rows_written_by(entity_type);
 
     match action.action {
         SyncActionType::Insert | SyncActionType::Update => {
@@ -502,8 +492,10 @@ pub fn enqueue_cache_writes(writer: &IdbWriter, action: &SyncAction) {
                 return;
             };
 
-            // Types nothing reads back are not written at all. See `NOT_CACHED`.
-            if NOT_CACHED.contains(&entity_type) {
+            // Types the cache holds no row of are not written at all — see
+            // `NOT_CACHED` in `crate::cache::cached_types`, which is also what
+            // takes them off the reset wipe and out of the delete below.
+            if cache_rows.is_empty() {
                 return;
             }
 
@@ -556,61 +548,23 @@ pub fn enqueue_cache_writes(writer: &IdbWriter, action: &SyncAction) {
         }
         SyncActionType::Delete => {
             // Queue the cache delete so it stays ordered against the cursor.
-            // Entity types with no cached rows (activity, issue_relation) have
-            // nothing to queue — they only bump a version counter, which is the
-            // memory half's job.
-            match entity_type {
-                et if et == entity_types::ISSUE => {
-                    enqueue_delete(writer, entity_types::ISSUE, entity_id);
-                    enqueue_delete(writer, entity_types::ISSUE_CONTENT, entity_id);
-                }
-                et if et == entity_types::LABEL => {
-                    enqueue_delete(writer, entity_types::LABEL, entity_id);
-                }
-                et if et == entity_types::STATUS => {
-                    enqueue_delete(writer, entity_types::STATUS, entity_id);
-                }
-                et if et == entity_types::TEAM => {
-                    enqueue_delete(writer, entity_types::TEAM, entity_id);
-                }
-                et if et == entity_types::PROJECT => {
-                    enqueue_delete(writer, entity_types::PROJECT, entity_id);
-                }
-                et if et == entity_types::VIEW => {
-                    enqueue_delete(writer, entity_types::VIEW, entity_id);
-                }
-                et if et == entity_types::FAVORITE => {
-                    enqueue_delete(writer, entity_types::FAVORITE, entity_id);
-                }
-                et if et == entity_types::NOTIFICATION => {
-                    enqueue_delete(writer, entity_types::NOTIFICATION, entity_id);
-                }
-                et if et == entity_types::COMMENT => {
-                    enqueue_delete(writer, entity_types::COMMENT, entity_id);
-                }
-                et if et == entity_types::PROJECT_MILESTONE => {
-                    // Milestone inserts/updates are persisted by the generic
-                    // upsert above (bootstrap streams them, and now so does
-                    // delta), so the delete has to be persisted too or the
-                    // removed row outlives the milestone in the cache.
-                    enqueue_delete(writer, entity_types::PROJECT_MILESTONE, entity_id);
-                }
-                et if et == entity_types::PROJECT_MEMBER => {
-                    // A membership add is persisted by the generic upsert above
-                    // (it carries a payload), so the remove has to be persisted
-                    // too or the removed member outlives the membership in the
-                    // cache. Both sides derive the same `project_id:user_id`
-                    // entity id, so this deletes exactly the row the add wrote.
-                    enqueue_delete(writer, entity_types::PROJECT_MEMBER, entity_id);
-                }
-                et if et == entity_types::PROJECT_UPDATE => {
-                    // Same pairing as above: posted updates are persisted by the
-                    // generic upsert, so a delete has to remove the row rather
-                    // than leave it behind.
-                    enqueue_delete(writer, entity_types::PROJECT_UPDATE, entity_id);
-                }
-                // Unhandled types are reported by the memory half.
-                _ => {}
+            //
+            // Derived, not enumerated. This used to be a hand-written match over
+            // twelve entity types while the insert path above was generic, and
+            // the gap between the two is where rows leaked: a type the upsert
+            // persisted but this match had no arm for had its row written and
+            // removed by nothing, so it outlived the entity until the next full
+            // `SyncReset`. Iterating the same slice the insert path was gated on
+            // makes that unrepresentable — a type is either written and removed,
+            // or neither.
+            //
+            // An issue yields two rows, because its body is stored separately;
+            // a type on `NOT_CACHED` yields none, and the frame's whole job is
+            // then the version counter the memory half bumps. A delete for a row
+            // that was never written is a no-op in IndexedDB, which is what makes
+            // it safe to queue both of an issue's rows unconditionally.
+            for row in cache_rows {
+                enqueue_delete(writer, row, entity_id);
             }
         }
     }
@@ -762,6 +716,7 @@ mod tests {
     use leptos::prelude::*;
     use trakkt_types::sync::SyncActionType;
 
+    use crate::cache::cached_types::{all_cached_entity_types, side_effect_only_cache_types};
     use crate::cache::idb_writer::channel;
     use crate::cache::tab_leader::CachedEntity;
 
@@ -1284,38 +1239,23 @@ mod tests {
         );
     }
 
-    /// What the delete path queues for the two types whose deletes it ignores.
+    /// A type the cache holds no row of queues nothing on either half.
     ///
-    /// The name and the message both claimed these types have no cached rows.
-    /// That is true of `activity`, and is now true by construction rather than by
-    /// accident: it used to hold because every activity frame carried a `None`
-    /// payload, so the insert path returned before it could persist anything;
-    /// TRA-9987 gave those frames a payload and put `activity` on `NOT_CACHED` in
-    /// the same change, so the insert path still writes nothing and this delete
-    /// still has nothing to remove. `an_activity_upsert_is_not_persisted` is the
-    /// half that would fail if that entry were dropped — without it this test
-    /// would keep passing while activity rows accumulated unevicted, which is
-    /// exactly how a green test hides a leak.
-    ///
-    /// It remains false of `issue_relation`, whose inserts carry a payload and
-    /// are persisted by the generic upsert. Its rows outlive the relation until
-    /// the next reset.
-    ///
-    /// That behaviour is left exactly as it was on purpose. The fix is not a
-    /// third arm here: the insert path persists everything with a payload while
-    /// this delete path is a hand-written list, which is the same list-drift
-    /// `every_entity_type_the_cache_persists_reaches_the_store` was added for,
-    /// one level down. Deriving the delete from the persist path, with its own
-    /// guard, is its own change — so this records what is true today rather than
-    /// half-correcting it.
+    /// The two halves are one statement now, and that is the change: this used
+    /// to be true of `activity` by construction and false of `issue_relation` by
+    /// accident. `issue_relation` inserts carry a payload and were persisted by
+    /// the generic upsert, while this delete path — a hand-written list of arms —
+    /// had no arm for them, so the rows outlived the relation until the next full
+    /// reset. Both are now on `NOT_CACHED`, so neither is written and neither has
+    /// anything to remove; `a_not_cached_type_is_never_persisted` is the half
+    /// that fails if the write path stops honouring it, without which this test
+    /// would go on passing while rows accumulated unevicted.
     #[test]
-    fn entity_types_with_no_cached_rows_queue_nothing() {
+    fn a_not_cached_type_queues_no_delete() {
         for entity_type in [entity_types::ACTIVITY, entity_types::ISSUE_RELATION] {
             assert!(
                 cache_ops(&action(entity_type, SyncActionType::Delete, None)).is_empty(),
-                "{entity_type}'s delete queues nothing today — for `activity` because \
-                 `NOT_CACHED` stops the row being written in the first place, for \
-                 `issue_relation` because its rows are persisted and never removed"
+                "{entity_type} owns no cache row, so its delete has nothing to queue"
             );
         }
     }
@@ -1532,14 +1472,78 @@ mod tests {
         });
     }
 
+    /// Every type on `NOT_CACHED`, through the real write path.
+    ///
+    /// One assertion per type rather than a loop over the constant, because a
+    /// loop over `NOT_CACHED` would agree with it by construction and would go
+    /// on passing if a type were quietly removed from it. These name the types
+    /// the determination was made about; the payloads are the shapes their
+    /// services really send, so none of them can pass by sending something the
+    /// write path would have skipped anyway.
+    #[test]
+    fn a_not_cached_type_is_never_persisted() {
+        let cases: [(&str, serde_json::Value); 4] = [
+            (
+                entity_types::ATTACHMENT,
+                serde_json::json!({
+                    "attachment_id": "att-1",
+                    "filename": "diagram.png",
+                    "content_type": "image/png",
+                    "size_bytes": 4096,
+                    "created_at": "2026-07-26T00:00:00Z",
+                }),
+            ),
+            (
+                entity_types::ISSUE_ATTACHMENT,
+                serde_json::json!({
+                    "issue_id": "issue-1",
+                    "attachment_id": "att-1",
+                    "created_at": "2026-07-26T00:00:00Z",
+                }),
+            ),
+            (
+                entity_types::ISSUE_RELATION,
+                serde_json::json!({
+                    "relation_id": "rel-1",
+                    "issue_id": "issue-1",
+                    "related_issue_id": "issue-2",
+                    "relation_type": "blocks",
+                }),
+            ),
+            (
+                entity_types::NOTIFICATION_PREFERENCES,
+                serde_json::json!({
+                    "preference_id": "pref-1",
+                    "user_id": "usr-alice",
+                    "workspace_id": "ws-1",
+                    "notify_comments": false,
+                }),
+            ),
+        ];
+
+        for (entity_type, payload) in cases {
+            assert!(
+                cache_ops(&action_with_id(
+                    entity_type,
+                    "entity-1",
+                    SyncActionType::Insert,
+                    Some(payload),
+                ))
+                .is_empty(),
+                "{entity_type} must not reach IndexedDB: its reader refetches from a server \
+                 function when the version counter bumps, and no bootstrap streams the type, \
+                 so the row could only ever be written"
+            );
+        }
+    }
+
     #[test]
     fn a_release_upsert_is_not_persisted() {
         // Nothing in this client reads releases back — no route, no page, no
         // hydration step, no on-demand cache read — and no bootstrap streams
         // them, so a cached release row could never be more than an arbitrary
         // fragment. Writing rows nothing reads is the reason `release` is on
-        // `NOT_CACHED` and off `ALL_CACHED_ENTITY_TYPES`, and the reason it has
-        // no store arm either.
+        // `NOT_CACHED`, and the reason it has no store arm either.
         assert!(
             cache_ops(&action_with_id(
                 entity_types::RELEASE,
@@ -1667,6 +1671,219 @@ mod tests {
             assert!(
                 store.issues().get_untracked().is_empty(),
                 "the leader wiped the shared cache — the follower must not keep rendering it"
+            );
+        });
+    }
+
+    // ── The three lists, checked against each other by execution ─────────────
+    //
+    // "What is written", "what is wiped" and "what is removed per entity" are
+    // one mapping now (`cache::cached_types`), but the write path is still a
+    // separate function that could stop honouring it. These drive every declared
+    // entity type through the real `enqueue_cache_writes` and the real
+    // `apply_action_to_memory` and compare what came out, so a reintroduced
+    // hand-written list fails here rather than being agreed with.
+    //
+    // Nothing is restated: the universe comes from `entity_types::ALL`, which is
+    // emitted by the same macro invocation that declares the constants, so a
+    // newly declared type appears in these tests on the commit that declares it.
+    //
+    // They replace two `wasm32`-only tests that answered the same questions by
+    // `include_str!`-ing this file and `trakkt-types/src/sync.rs` and parsing
+    // `match` arms out of the text. That approach credited an arm it could read
+    // without ever running it, and its own doc comment recorded the hole it could
+    // not close: a `use some::other::module as entity_types;` in this file left
+    // every arm parsing and being credited while comparing against different
+    // strings. Executing the code closes that, and runs under `cargo test`.
+
+    /// Every cache row an insert of `entity_type` really queues.
+    fn rows_persisted_by_an_insert_of(entity_type: &str) -> Vec<String> {
+        cache_ops(&action_with_id(
+            entity_type,
+            "entity-1",
+            SyncActionType::Insert,
+            // A non-null `description` is what makes the issue arm split its
+            // body into a second record, so this payload reaches that branch
+            // too. Types that decode it into nothing still persist the row —
+            // the write path stores the JSON verbatim.
+            Some(serde_json::json!({"description": "a body"})),
+        ))
+        .iter()
+        .filter_map(|op| op.strip_prefix("upsert:"))
+        .filter_map(|op| op.split(':').next())
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// Every cache row a delete of `entity_type` really queues.
+    fn rows_deleted_by_a_delete_of(entity_type: &str) -> Vec<String> {
+        cache_ops(&action_with_id(
+            entity_type,
+            "entity-1",
+            SyncActionType::Delete,
+            None,
+        ))
+        .iter()
+        .filter_map(|op| op.strip_prefix("delete:"))
+        .filter_map(|op| op.split(':').next())
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// The write path persists exactly the rows `cache_rows_written_by` claims.
+    #[test]
+    fn the_write_path_persists_exactly_the_rows_the_cache_claims_to_hold() {
+        for entity_type in entity_types::ALL {
+            let claimed: Vec<String> = cache_rows_written_by(entity_type)
+                .iter()
+                .map(|row| (*row).to_owned())
+                .collect();
+            assert_eq!(
+                rows_persisted_by_an_insert_of(entity_type),
+                claimed,
+                "an insert of `{entity_type}` persisted rows other than the ones \
+                 `cache_rows_written_by` names. The reset wipe and the per-entity delete \
+                 are both derived from that function, so anything the write path stores \
+                 outside it is wiped by nothing and removed by nothing."
+            );
+        }
+    }
+
+    /// The invariant `SyncReset` rests on: nothing the cache can hold survives
+    /// the wipe.
+    ///
+    /// The replacement for the TRA-9940 guard test, and stronger in three ways:
+    /// it runs natively, it reads the universe from `entity_types::ALL` instead
+    /// of parsing source, and it checks the delete path too — which the original
+    /// did not, because the delete path was not part of the list it policed.
+    #[test]
+    fn every_entity_type_the_cache_persists_is_wiped_by_a_reset() {
+        let wiped = all_cached_entity_types();
+
+        let mut unwiped: Vec<String> = Vec::new();
+        for entity_type in entity_types::ALL {
+            for row in rows_persisted_by_an_insert_of(entity_type) {
+                if !wiped.contains(&row.as_str()) && !unwiped.contains(&row) {
+                    unwiped.push(row);
+                }
+            }
+        }
+
+        assert!(
+            unwiped.is_empty(),
+            "These entity types are written to IndexedDB but never wiped: {unwiped:?}.\n\
+             `enqueue_cache_writes` queues an upsert for them, while `SyncReset` and the \
+             no-cursor cold start only clear what `all_cached_entity_types` returns — so \
+             their rows outlive the reset that is supposed to leave a clean slate, and \
+             nothing else ever removes them.\n\
+             Both come from `cache_rows_written_by` in crates/trakkt-ui/src/cache/cached_types.rs. \
+             If they disagree, the write path has stopped being driven by it."
+        );
+    }
+
+    /// The list the original ticket missed: what a `Delete` removes.
+    ///
+    /// The insert path was generic and this one was a hand-written twelve-arm
+    /// `match`, so a persisted type with no arm had its row written and removed
+    /// by nothing — `attachment`, `issue_relation`, `notification_preferences`
+    /// and `workspace_settings` were all in that state, and `issue_attachment`
+    /// would have joined them the moment TRA-9979 gave it a payload. A reset was
+    /// the only thing that ever cleared them.
+    #[test]
+    fn a_delete_removes_every_row_the_write_path_persists() {
+        for entity_type in entity_types::ALL {
+            let persisted = rows_persisted_by_an_insert_of(entity_type);
+            let deleted = rows_deleted_by_a_delete_of(entity_type);
+
+            assert_eq!(
+                deleted, persisted,
+                "a `{entity_type}` delete removes {deleted:?} but its insert persists \
+                 {persisted:?}. A row the write path stores and the delete path leaves \
+                 behind outlives the entity it describes until the next full `SyncReset` \
+                 — which is the leak this pairing exists to make unrepresentable."
+            );
+        }
+    }
+
+    /// The invariant the UI rests on: nothing the cache holds is invisible.
+    ///
+    /// Being persisted is not the same as being seen. `apply_action_to_memory`
+    /// routes each frame to the store by entity type, and a type it has no arm
+    /// for ends at a `tracing::debug!`: the row lands in IndexedDB, no signal
+    /// fires, and nothing on screen moves until a reload.
+    ///
+    /// Asked of the function rather than of its source, so an arm only counts
+    /// when it actually runs. The payload is deliberately not a decodable entity
+    /// — the arms that deserialise log a warning and carry on, and what is under
+    /// test is that the frame reached an arm at all.
+    #[test]
+    fn every_entity_type_the_cache_persists_reaches_the_store() {
+        let exempt = side_effect_only_cache_types();
+
+        with_store(|store| {
+            for entity_type in entity_types::ALL {
+                // A type no frame carries — `issue_content` — cannot have an
+                // arm, and demanding one would be demanding dead code.
+                if cache_rows_written_by(entity_type).is_empty() || exempt.contains(entity_type) {
+                    continue;
+                }
+
+                for kind in [SyncActionType::Insert, SyncActionType::Delete] {
+                    let data = match kind {
+                        SyncActionType::Delete => None,
+                        _ => Some(serde_json::json!({})),
+                    };
+                    assert_eq!(
+                        apply_action_to_memory(
+                            &store,
+                            &action_with_id(entity_type, "entity-1", kind.clone(), data)
+                        ),
+                        StoreDispatch::Handled,
+                        "`{entity_type}` is cached by this client but its {kind:?} frame \
+                         reaches nothing in the reactive store.\n\
+                         `enqueue_cache_writes` persists it and a reset wipes it, so it is a \
+                         real row — but `apply_action_to_memory` has no arm for it, so the \
+                         change is in IndexedDB and nowhere the user can see it.\n\
+                         Fix it there, with an arm that updates a cached collection or bumps \
+                         a version counter *something actually subscribes to* — a counter no \
+                         page reads is this same bug with a passing test. If nothing in this \
+                         client reads the type at all, the honest fix is the other one: add \
+                         it to `NOT_CACHED` in crates/trakkt-ui/src/cache/cached_types.rs, \
+                         which takes it off the write path, the wipe and the delete at once."
+                    );
+                }
+            }
+        });
+    }
+
+    /// The data-less guard runs ahead of the entity match, which is why a
+    /// service that omits the payload delivers nothing at all — the defect
+    /// TRA-9987 fixed for activities and TRA-9979 still owes for attachment
+    /// links. Stated against the reported outcome so the distinction between
+    /// "no payload" and "no arm" cannot collapse.
+    #[test]
+    fn a_data_less_upsert_is_reported_as_such_rather_than_as_unhandled() {
+        with_store(|store| {
+            assert_eq!(
+                apply_action_to_memory(
+                    &store,
+                    &action(entity_types::ISSUE, SyncActionType::Update, None)
+                ),
+                StoreDispatch::MissingPayload
+            );
+            assert_eq!(
+                apply_action_to_memory(
+                    &store,
+                    &action("not_an_entity_type", SyncActionType::Update, Some(serde_json::json!({})))
+                ),
+                StoreDispatch::Unhandled
+            );
+            assert_eq!(
+                apply_action_to_memory(
+                    &store,
+                    &action("not_an_entity_type", SyncActionType::Delete, None)
+                ),
+                StoreDispatch::Unhandled
             );
         });
     }
