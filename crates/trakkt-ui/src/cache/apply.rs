@@ -1721,13 +1721,10 @@ mod wasm_tests {
     /// `(team_key, number)` by the `<For>` that renders it, so neither rebuilds
     /// this resource. The counter is the only path a new timeline row has.
     ///
-    /// The counter is resolved once here, outside the closure, as
-    /// `AttachmentsSection` and `NotificationsPage` do it. That is not how
-    /// `IssueTimeline` itself reads it today — issue_detail.rs:2358-2360 calls
-    /// `s.activities_version()` inside the `Signal::derive` closure, allocating
-    /// a fresh owner-registered wrapper per evaluation. That difference is about
-    /// where the wrapper is built, not about what the source depends on, so this
-    /// rebuild still observes the same counter the page does.
+    /// The counter is resolved once here, outside the closure, which is how
+    /// `IssueTimeline` reads it too — TRA-9991 hoisted it out of the source
+    /// closure, so this rebuild now matches the page shape for shape. See the
+    /// getter contract on [`SyncStore`].
     fn issue_timeline_source(store: SyncStore) -> Signal<(String, i32, u32)> {
         let version = store.activities_version();
         Signal::derive(move || ("TRA".to_owned(), 42, version.get()))
