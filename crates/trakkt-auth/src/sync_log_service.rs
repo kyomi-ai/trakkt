@@ -24,6 +24,30 @@ use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
 
+/// One id read back from a table that a parent's `ON DELETE CASCADE` will
+/// empty, so the delete it needs can be recorded through [`SyncBatch`].
+///
+/// A cascade is performed by the database's own foreign keys and reports
+/// nothing back, so the only way to name the rows it destroys is to read them on
+/// the transaction *before* the parent DELETE. Every such read aliases its id
+/// column to `id`, which is what lets one row type serve all of them — the
+/// column is `comment_id` in one query and `user_id` in the next, and the
+/// caller already knows which is which from the query it wrote.
+///
+/// Lives here, beside [`SyncBatch`], because it exists for the sake of the
+/// entries the batch records; the alternative was a private copy of the same
+/// four lines in every service that deletes a parent row. The reads themselves
+/// are **not** shared: `issue_service::delete_issue` and
+/// `project_service::delete_project` cascade over different tables, into
+/// different entity types, under different audiences and — for the SET NULL half
+/// of a project delete — different action types, so there is no loop body the
+/// two have in common (see [`commit_and_deliver`]'s closing note for the same
+/// judgement made about `team_service::commit_team_update`).
+#[derive(sqlx::FromRow)]
+pub(crate) struct CascadedIdRow {
+    pub(crate) id: String,
+}
+
 /// Internal row type for deserialising `sync_log` query results.
 ///
 /// `data` is TEXT-compatible for both Postgres (JSONB reads as text via sqlx)

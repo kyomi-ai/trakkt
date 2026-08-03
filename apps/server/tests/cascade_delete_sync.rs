@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! What a client is left holding after another browser deletes an issue.
+//! What a client is left holding after another browser deletes an issue or a
+//! project.
 //!
-//! `crates/trakkt-auth`'s own tests assert the `sync_log` rows `delete_issue`
-//! writes. They cannot assert the thing TRA-9957 is actually about, because the
-//! code that decides what survives in a client's cache lives in `trakkt-ui` and
-//! `trakkt-auth` does not — and must not — depend on it. `trakkt-server` depends
-//! on both, so this is the one place a Rust test can run the server's real sync
-//! output through the client's real apply path.
+//! `apps/server/tests/postgres_dialect.rs` asserts the `sync_log` rows the two
+//! deletes write. Neither it nor `crates/trakkt-auth`'s own tests can assert the
+//! thing TRA-9957 and TRA-9971 are actually about, because the code that decides
+//! what survives in a client's cache lives in `trakkt-ui` and `trakkt-auth` does
+//! not — and must not — depend on it. `trakkt-server` depends on both, so this is
+//! the one place a Rust test can run the server's real sync output through the
+//! client's real apply path.
 //!
 //! What runs here is the production code on both sides:
-//! `issue_service::delete_issue` writes the entries,
-//! `sync_log_service::get_entries_since` reads them back exactly as
+//! `issue_service::delete_issue` and `project_service::delete_project` write the
+//! entries, `sync_log_service::get_entries_since` reads them back exactly as
 //! `handle_sync_delta` does, and `cache::apply::enqueue_cache_writes` plus
 //! `cache::idb_writer::run_writer` turn them into cache operations.
 //!
@@ -342,5 +344,229 @@ async fn a_client_replaying_the_delta_keeps_nothing_the_deleted_issue_took_with_
         issue_ids,
         vec![survivor.issue_id.clone()],
         "the reactive store must be left holding only the surviving issue"
+    );
+}
+
+// ─── The same question for a project delete (TRA-9971) ───────────────────────
+
+/// Everything a project delete has to take with it, seeded through the real
+/// services so each row arrives in the cache the way production puts it there.
+struct SeededProject {
+    project_id: String,
+    /// The `entity_id` the client cached the membership under —
+    /// `project_members` has no surrogate id, so it is the composite key
+    /// `project_service::project_member_entity_id` builds.
+    member_entity_id: String,
+    milestone_id: String,
+    update_id: String,
+}
+
+async fn seed_project(db: &DbPool, name: &str) -> SeededProject {
+    let project = trakkt_auth::project_service::create_project(
+        db,
+        &trakkt_auth::project_service::CreateProjectParams {
+            workspace_id: WORKSPACE,
+            name,
+            description: None,
+            icon: None,
+            color: None,
+            lead_id: None,
+            start_date: None,
+            target_date: None,
+        },
+        None,
+    )
+    .await
+    .expect("create the project whose cascade the replay is made against");
+
+    trakkt_auth::project_service::add_project_member(
+        db,
+        &project.project_id,
+        USER,
+        "member",
+        WORKSPACE,
+        None,
+    )
+    .await
+    .expect("add the member whose cached row the delete must evict");
+
+    let milestone = trakkt_auth::project_service::create_milestone(
+        db,
+        &project.project_id,
+        &format!("{name} milestone"),
+        None,
+        None,
+        None,
+        WORKSPACE,
+    )
+    .await
+    .expect("create the milestone whose cached row the delete must evict");
+
+    let update = trakkt_auth::project_service::create_project_update(
+        db,
+        &project.project_id,
+        USER,
+        "on_track",
+        Some("posted before the delete"),
+        None,
+        WORKSPACE,
+    )
+    .await
+    .expect("post the update whose cached row the delete must evict");
+
+    SeededProject {
+        member_entity_id: format!("{}:{USER}", project.project_id),
+        project_id: project.project_id,
+        milestone_id: milestone.milestone_id,
+        update_id: update.update_id,
+    }
+}
+
+/// Move an existing issue into a project, through the real update path.
+async fn assign_to_project(db: &DbPool, number: i32, project_id: &str) {
+    trakkt_auth::issue_service::update_issue(
+        db,
+        WORKSPACE,
+        TEAM_KEY,
+        number,
+        &trakkt_types::models::IssueUpdate {
+            project_id: Some(Some(project_id.to_owned())),
+            ..Default::default()
+        },
+        Some(USER),
+        ActionSource::User,
+        None,
+        None,
+    )
+    .await
+    .expect("assign the issue to the project the delete will detach it from");
+}
+
+#[tokio::test]
+async fn a_client_replaying_the_delta_keeps_nothing_the_deleted_project_took_with_it() {
+    let db = seeded_workspace().await;
+
+    let doomed = seed_project(&db, "Deleted in another browser").await;
+    let survivor = seed_project(&db, "Still here").await;
+
+    let detached = seed_issue(&db, "Was in the deleted project").await;
+    let untouched = seed_issue(&db, "Was in the other project").await;
+    assign_to_project(&db, detached.number, &doomed.project_id).await;
+    assign_to_project(&db, untouched.number, &survivor.project_id).await;
+
+    trakkt_auth::project_service::delete_project(&db, &doomed.project_id, None)
+        .await
+        .expect("delete the project in the browser that owns the tab");
+
+    // Everything a fresh client would be sent: the whole log, in order, read
+    // through the same function `handle_sync_delta` uses.
+    let actions = get_entries_since(&db, WORKSPACE, USER, 0, 10_000)
+        .await
+        .expect("read the delta a replaying client would receive");
+
+    let owner = Owner::new();
+    owner.set();
+    let store = SyncStore::new();
+    let (writer, ops) = channel();
+
+    for action in &actions {
+        apply_action_to_memory(&store, action);
+        enqueue_cache_writes(&writer, action);
+    }
+
+    drop(writer);
+    let sink = MapSink::default();
+    let cache = sink.rows();
+    run_writer(sink, ops).await;
+
+    let cache = cache.borrow();
+    let holds = |entity_type: &str, entity_id: &str| {
+        cache.contains_key(&(entity_type.to_owned(), entity_id.to_owned()))
+    };
+
+    assert!(
+        !holds(entity_types::PROJECT, &doomed.project_id),
+        "the deleted project must not survive the replay"
+    );
+    assert!(
+        !holds(entity_types::PROJECT_MEMBER, &doomed.member_entity_id),
+        "the membership of the deleted project must not survive the replay. \
+         `project_members` is emptied by a foreign key that reports nothing, so \
+         without a delete entry naming this id nothing ever evicts the row — it \
+         outlives every reconnect. That is TRA-9971."
+    );
+    assert!(
+        !holds(entity_types::PROJECT_MILESTONE, &doomed.milestone_id),
+        "the milestone of the deleted project must not survive the replay"
+    );
+    assert!(
+        !holds(entity_types::PROJECT_UPDATE, &doomed.update_id),
+        "the posted update of the deleted project must not survive the replay"
+    );
+
+    // Not vacuous, and the reason the fixture seeds two projects: the same
+    // replay leaves the other project's rows in place, so "nothing cached" and
+    // "the right things evicted" are distinguishable outcomes. These three
+    // assertions are also what proves the rows were being written at all — a
+    // client that cached no membership would pass every assertion above.
+    assert!(
+        holds(entity_types::PROJECT, &survivor.project_id),
+        "the surviving project must still be cached"
+    );
+    assert!(
+        holds(entity_types::PROJECT_MEMBER, &survivor.member_entity_id),
+        "the surviving project's membership must still be cached, or the eviction \
+         assertion above would pass against a replay that cached no membership at all"
+    );
+    assert!(
+        holds(entity_types::PROJECT_MILESTONE, &survivor.milestone_id),
+        "the surviving project's milestone must still be cached"
+    );
+    assert!(
+        holds(entity_types::PROJECT_UPDATE, &survivor.update_id),
+        "the surviving project's posted update must still be cached"
+    );
+
+    // The detached issue is the asymmetric half. It still exists, so it must
+    // still be cached — but showing no project, which only an update carrying
+    // the post-cascade payload can achieve. A delete entry would have removed it
+    // outright; an update built before the DELETE would leave it pointing at the
+    // project the same replay just evicted.
+    let cached_issue = cache
+        .get(&(entity_types::ISSUE.to_owned(), detached.issue_id.clone()))
+        .unwrap_or_else(|| {
+            panic!(
+                "the detached issue must still be cached — `ON DELETE SET NULL` \
+                 leaves it in the database, so a delete entry would drop a row the \
+                 server still has"
+            )
+        });
+    let cached_issue: serde_json::Value = serde_json::from_str(cached_issue)
+        .unwrap_or_else(|e| panic!("parsing the cached issue row {cached_issue:?}: {e}"));
+    assert_eq!(
+        cached_issue.get("project_id"),
+        Some(&serde_json::Value::Null),
+        "the cached issue must show no project. Its cached row is what the issue \
+         list renders from, so a stale project_id here is an issue filed under a \
+         project the client has been told to delete."
+    );
+
+    assert!(
+        holds(entity_types::ISSUE, &untouched.issue_id),
+        "the other project's issue must still be cached"
+    );
+
+    // The in-memory half of the same replay, which is what the screen renders
+    // from. Both issues survive; only the project list loses one.
+    let project_ids: Vec<String> = store
+        .projects()
+        .get()
+        .into_iter()
+        .map(|p| p.project_id)
+        .collect();
+    assert_eq!(
+        project_ids,
+        vec![survivor.project_id.clone()],
+        "the reactive store must be left holding only the surviving project"
     );
 }

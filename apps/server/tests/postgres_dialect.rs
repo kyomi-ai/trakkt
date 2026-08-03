@@ -40,7 +40,8 @@ use futures_util::FutureExt;
 use trakkt_auth::sync_log_service::{get_entries_since, write_sync_entry_in_tx};
 use trakkt_core::db::in_clause_placeholders;
 use trakkt_core::test_helpers::dual_backend::{
-    database_exists, on_postgres, reject_sync_log_inserts,
+    clear_sync_log_rejection, database_exists, on_postgres, reject_sync_log_inserts,
+    reject_sync_log_inserts_of_type,
 };
 use trakkt_core::test_helpers::{seed_team, seed_user, seed_workspace, test_pool};
 use trakkt_core::{
@@ -1718,5 +1719,465 @@ dual_backend_test! {
         );
 
         assert_rejected_for_null_primary_key(outcome, "notification_preferences", "preference_id");
+    }
+}
+
+// ─── Deleting a project reports the rows its cascade removes ─────────────────
+//
+// TRA-9971. `DELETE FROM projects` empties `project_members`,
+// `project_milestones` and `project_updates` through `ON DELETE CASCADE` and
+// clears `issues.project_id` through `ON DELETE SET NULL`, all without the code
+// learning what it destroyed. `sync_delta` replays entity-scoped actions, so an
+// entity that never receives one is never evicted from a client's IndexedDB
+// cache: a browser that did not perform the delete kept the project's members,
+// milestones and posted updates forever.
+//
+// Run on both backends because the cascade is not identical on them.
+// `issues.milestone_id` has an `ON DELETE SET NULL` foreign key on Postgres and
+// no foreign key at all on SQLite — the twelfth of the twelve keys
+// `migrations-sqlite/20260803100000_dual_backend_fk_parity.sql` measured, and
+// the one it deliberately left outstanding. The entry *count* is what must not
+// vary by dialect, and only running both proves it does not.
+
+/// A second workspace member, so the project has more than one membership row
+/// to cascade and the two entity ids have to be distinguished.
+const SECOND_USER: &str = "usr_dialect_second";
+
+/// One `sync_log` row as the cascade assertions read it.
+#[derive(sqlx::FromRow)]
+struct CascadeEntry {
+    sync_id: i64,
+    entity_type: String,
+    entity_id: String,
+    action: String,
+    data: Option<String>,
+}
+
+/// The highest `sync_id` in the log, or 0 when it is empty.
+///
+/// Every assertion below is made against the rows above this watermark. Seeding
+/// goes through the real services, which write entries of their own — a
+/// whole-table read would drown the delete's output in its fixture's.
+async fn sync_watermark(db: &DbPool) -> i64 {
+    db_fetch_scalar!(db, i64, "SELECT COALESCE(MAX(sync_id), 0) FROM sync_log")
+        .expect("read the current high-water mark of the sync log")
+}
+
+/// Every `sync_log` row written above `watermark`, oldest first.
+async fn entries_above(db: &DbPool, watermark: i64) -> Vec<CascadeEntry> {
+    db_fetch_all!(
+        db,
+        CascadeEntry,
+        "SELECT sync_id, entity_type, entity_id, action, CAST(data AS TEXT) AS data \
+         FROM sync_log WHERE sync_id > $1 ORDER BY sync_id ASC",
+        watermark
+    )
+    .expect("read the sync entries the project delete wrote")
+}
+
+/// `(entity_type, entity_id, action)` for each row, sorted.
+///
+/// Sorted because only the *set* is specified. The entries are written in loop
+/// order within each cascaded table, and no query below orders its ids, so the
+/// order two members arrive in is the database's business and not a thing to
+/// assert. Sorting also makes a duplicated entry — the same issue reached
+/// through both of the detach predicates — visible rather than absorbed.
+fn triples(entries: &[CascadeEntry]) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = entries
+        .iter()
+        .map(|e| {
+            (
+                e.entity_type.clone(),
+                e.entity_id.clone(),
+                e.action.clone(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Create an issue attached to `project_id` and/or `milestone_id`.
+///
+/// `create_issue` above hardcodes both to `None`; this cascade needs issues that
+/// hold one, the other, or both, so the detach predicates can be told apart.
+async fn create_attached_issue(
+    db: &DbPool,
+    title: &str,
+    project_id: Option<&str>,
+    milestone_id: Option<&str>,
+) -> Issue {
+    trakkt_auth::issue_service::create_issue(
+        db,
+        &CreateIssueParams {
+            workspace_id: WORKSPACE.to_owned(),
+            team_id: TEAM.to_owned(),
+            creator_id: USER.to_owned(),
+            title: title.to_owned(),
+            description: Some(format!("the body of {title}")),
+            priority: 0,
+            assignee_id: None,
+            due_date: None,
+            label_ids: Vec::new(),
+            project_id: project_id.map(str::to_owned),
+            milestone_id: milestone_id.map(str::to_owned),
+            estimate: None,
+        },
+        None,
+    )
+    .await
+    .expect("create the issue the project cascade detaches")
+}
+
+/// A project with `name`, plus one member, one milestone and one posted update.
+///
+/// Seeded through the real services so every row is exactly what production
+/// writes — including the `sync_log` entries, which is what makes the cached
+/// rows this test is about genuinely reachable.
+///
+/// Returns `(project_id, milestone_id, update_id)`.
+async fn seed_project_with_children(
+    db: &DbPool,
+    name: &str,
+    member: &str,
+) -> (String, String, String) {
+    let project = trakkt_auth::project_service::create_project(
+        db,
+        &trakkt_auth::project_service::CreateProjectParams {
+            workspace_id: WORKSPACE,
+            name,
+            description: None,
+            icon: None,
+            color: None,
+            lead_id: None,
+            start_date: None,
+            target_date: None,
+        },
+        None,
+    )
+    .await
+    .expect("create the project the cascade assertions are made against");
+
+    trakkt_auth::project_service::add_project_member(
+        db,
+        &project.project_id,
+        member,
+        "member",
+        WORKSPACE,
+        None,
+    )
+    .await
+    .expect("add the member the cascade must report the removal of");
+
+    let milestone = trakkt_auth::project_service::create_milestone(
+        db,
+        &project.project_id,
+        &format!("{name} milestone"),
+        None,
+        None,
+        None,
+        WORKSPACE,
+    )
+    .await
+    .expect("create the milestone the cascade must report the removal of");
+
+    let update = trakkt_auth::project_service::create_project_update(
+        db,
+        &project.project_id,
+        USER,
+        "on_track",
+        Some("posted before the delete"),
+        None,
+        WORKSPACE,
+    )
+    .await
+    .expect("post the update the cascade must report the removal of");
+
+    (project.project_id, milestone.milestone_id, update.update_id)
+}
+
+dual_backend_test! {
+    /// Every row a project delete cascades away gets a sync entry naming it, and
+    /// every issue it merely detaches gets an update carrying the new state.
+    ///
+    /// The control project is not decoration. Without it the assertion could not
+    /// tell "the cascade reported exactly its own rows" from "the cascade
+    /// reported every project row in the workspace", and the second is a
+    /// considerably worse bug than the one being fixed.
+    async fn deleting_a_project_reports_every_row_its_cascade_touches(db) {
+        seed_tenancy(db).await;
+        seed_user(db, SECOND_USER, "dialect-second@example.test")
+            .await
+            .expect("seed the project's second member");
+
+        let (doomed, doomed_milestone, doomed_update) =
+            seed_project_with_children(db, "Doomed", USER).await;
+        // A second membership, so an implementation reporting only the first row
+        // of each table is caught.
+        trakkt_auth::project_service::add_project_member(
+            db, &doomed, SECOND_USER, "member", WORKSPACE, None,
+        )
+        .await
+        .expect("add the project's second member");
+
+        let (survivor, survivor_milestone, survivor_update) =
+            seed_project_with_children(db, "Survivor", SECOND_USER).await;
+
+        // The three shapes of detachment, plus one issue that is neither.
+        let own = create_attached_issue(db, "In the project", Some(&doomed), None).await;
+        let both =
+            create_attached_issue(db, "In the project, on its milestone", Some(&doomed), Some(&doomed_milestone))
+                .await;
+        // Not in the project, but holding one of its milestones. Nothing in
+        // `create_issue` or `update_issue` requires a milestone to belong to the
+        // issue's own project, so this is reachable — and it is the case a
+        // `project_id = $1` read alone would miss.
+        let milestone_only =
+            create_attached_issue(db, "On its milestone only", None, Some(&doomed_milestone)).await;
+        let untouched =
+            create_attached_issue(db, "In the other project", Some(&survivor), None).await;
+
+        let watermark = sync_watermark(db).await;
+
+        trakkt_auth::project_service::delete_project(db, &doomed, None)
+            .await
+            .expect("delete the project in the browser that owns the tab");
+
+        let entries = entries_above(db, watermark).await;
+
+        let mut expected: Vec<(String, String, String)> = vec![
+            (entity_types::PROJECT.into(), doomed.clone(), "delete".into()),
+            (entity_types::PROJECT_MEMBER.into(), format!("{doomed}:{USER}"), "delete".into()),
+            (entity_types::PROJECT_MEMBER.into(), format!("{doomed}:{SECOND_USER}"), "delete".into()),
+            (entity_types::PROJECT_MILESTONE.into(), doomed_milestone.clone(), "delete".into()),
+            (entity_types::PROJECT_UPDATE.into(), doomed_update.clone(), "delete".into()),
+            (entity_types::ISSUE.into(), own.issue_id.clone(), "update".into()),
+            (entity_types::ISSUE.into(), both.issue_id.clone(), "update".into()),
+            (entity_types::ISSUE.into(), milestone_only.issue_id.clone(), "update".into()),
+        ];
+        expected.sort();
+
+        assert_eq!(
+            triples(&entries),
+            expected,
+            "the delete must report itself and every row it cascaded away, once each. \
+             A missing member, milestone or update entry is a row that stays in every \
+             other client's IndexedDB through every reconnect — that is TRA-9971. An \
+             extra entry naming the surviving project's rows ({survivor}, \
+             {survivor_milestone}, {survivor_update}) would evict rows that still exist."
+        );
+
+        // One transaction, stated the only way the log can state it: the ids form
+        // a contiguous run. A gap would mean some other transaction's entry
+        // interleaved, which for a single-threaded test means the cascade was
+        // committed in more than one piece.
+        let ids: Vec<i64> = entries.iter().map(|e| e.sync_id).collect();
+        let first = *ids.first().expect("the delete must write at least one entry");
+        assert_eq!(
+            ids,
+            (first..first + ids.len() as i64).collect::<Vec<i64>>(),
+            "the cascade's entries must be a contiguous block of sync_ids — they are \
+             written on one transaction, so nothing can be allocated between them"
+        );
+
+        // The detached issues carry their new state. A delete entry, or an update
+        // with no payload, would be worse than nothing: `cache/apply.rs` drops a
+        // data-less insert/update before it reaches IndexedDB, and a delete would
+        // evict an issue the server still has.
+        for entry in entries.iter().filter(|e| e.entity_type == entity_types::ISSUE) {
+            let raw = entry
+                .data
+                .as_deref()
+                .unwrap_or_else(|| panic!(
+                    "the ISSUE update for {} must carry a payload — a data-less \
+                     update is discarded by the client before it reaches the cache",
+                    entry.entity_id
+                ));
+            let payload: serde_json::Value = serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("parsing the ISSUE payload {raw:?}: {e}"));
+            assert_eq!(
+                payload.get("project_id"),
+                Some(&serde_json::Value::Null),
+                "the payload for issue {} must show the project cleared; a payload \
+                 read before the DELETE would still name {doomed}, and the client \
+                 would put the issue straight back under a project it was just told \
+                 to remove",
+                entry.entity_id
+            );
+        }
+
+        // Not vacuous: the untouched issue keeps its project, so "reported the
+        // right issues" and "reported every issue" are distinguishable.
+        let still_attached: Option<String> = db_fetch_scalar!(
+            db,
+            Option<String>,
+            "SELECT project_id FROM issues WHERE issue_id = $1",
+            &untouched.issue_id
+        )
+        .expect("read the untouched issue's project back");
+        assert_eq!(
+            still_attached.as_deref(),
+            Some(survivor.as_str()),
+            "the other project's issue must keep its project, or the assertions \
+             above would pass against a delete that detached everything"
+        );
+    }
+}
+
+// ─── A rejected cascade entry rolls the whole cascade back ───────────────────
+
+/// How many rows of `table` still belong to `project_id`.
+///
+/// `table` is interpolated rather than bound because a table name cannot be a
+/// bind parameter; both callers pass a literal from this file.
+async fn rows_naming_project(db: &DbPool, table: &str, project_id: &str) -> i64 {
+    db_fetch_scalar!(
+        db,
+        i64,
+        &format!("SELECT COUNT(*) FROM {table} WHERE project_id = $1"),
+        project_id
+    )
+    .unwrap_or_else(|e| panic!("count the {table} rows still naming project {project_id}: {e}"))
+}
+
+/// `(members, milestones, updates)` still belonging to `project_id`.
+async fn child_counts(db: &DbPool, project_id: &str) -> (i64, i64, i64) {
+    (
+        rows_naming_project(db, "project_members", project_id).await,
+        rows_naming_project(db, "project_milestones", project_id).await,
+        rows_naming_project(db, "project_updates", project_id).await,
+    )
+}
+
+dual_backend_test! {
+    /// A rejected sync entry rolls the whole cascade back — probed once per
+    /// entity type the cascade writes.
+    ///
+    /// The trigger is narrowed to one `entity_type` per pass, which is the whole
+    /// point. `reject_sync_log_inserts` fails every insert, so it stops the
+    /// cascade at its first entry and each pass would prove the same single
+    /// thing: that the PROJECT entry is written inside the transaction. It would
+    /// be green against an implementation that wrote nothing else at all —
+    /// exactly the bug. Narrowing lets the entries before the probed type
+    /// through, so each pass is a statement about the loop that writes *its*
+    /// type and no other.
+    ///
+    /// One body rather than five, and one database rather than five, because
+    /// every pass rolls back: the project and its children are exactly as they
+    /// were when the next pass starts, which is what the assertions re-establish
+    /// each time round.
+    async fn a_rejected_entry_of_any_type_rolls_the_whole_project_cascade_back(db) {
+        seed_tenancy(db).await;
+        let (project, milestone, _update) =
+            seed_project_with_children(db, "Rolled back", USER).await;
+        let issue = create_attached_issue(db, "Detached and then not", Some(&project), None).await;
+
+        let counts_before = child_counts(db, &project).await;
+        assert_eq!(
+            counts_before, (1, 1, 1),
+            "the fixture must have one row in each cascaded table, or a rollback \
+             assertion cannot tell a preserved row from a table that was empty \
+             all along"
+        );
+
+        for probed in [
+            entity_types::PROJECT,
+            entity_types::PROJECT_MEMBER,
+            entity_types::PROJECT_MILESTONE,
+            entity_types::PROJECT_UPDATE,
+            entity_types::ISSUE,
+        ] {
+            let watermark = sync_watermark(db).await;
+            reject_sync_log_inserts_of_type(db, probed).await;
+
+            // Destructured rather than `expect_err`, so the success case can name
+            // the entity type this pass is probing. `expect_err` takes a fixed
+            // string, and "the delete succeeded" is the same sentence for all
+            // five passes — which is precisely the confusion the narrowed trigger
+            // exists to remove.
+            let Err(err) = trakkt_auth::project_service::delete_project(db, &project, None).await
+            else {
+                panic!(
+                    "the trigger installed for this pass rejects every {probed} sync \
+                     entry, and the delete succeeded anyway — so no {probed} entry was \
+                     written at all. Every rollback assertion below would be vacuous \
+                     for {probed}, and a client would never be told to evict it."
+                );
+            };
+            assert!(
+                err.to_string().contains("sync_log insert rejected"),
+                "the {probed} pass must fail on the rejected sync entry rather than \
+                 on something else; got: {err}"
+            );
+
+            clear_sync_log_rejection(db).await;
+
+            let survived: i64 = db_fetch_scalar!(
+                db,
+                i64,
+                "SELECT COUNT(*) FROM projects WHERE project_id = $1",
+                &project
+            )
+            .expect("count the project after the rejected delete");
+            assert_eq!(
+                survived, 1,
+                "rejecting the {probed} entry must roll the DELETE back. A project \
+                 removed with no entry to replay its removal stays on every other \
+                 client forever, and no later delta can repair it — the row it would \
+                 have to re-read is gone."
+            );
+
+            assert_eq!(
+                child_counts(db, &project).await,
+                counts_before,
+                "rejecting the {probed} entry must roll the cascade back too — the \
+                 member, milestone and update rows are destroyed by foreign keys the \
+                 same statement fires, so they unwind with it or not at all"
+            );
+
+            let attached: Option<String> = db_fetch_scalar!(
+                db,
+                Option<String>,
+                "SELECT project_id FROM issues WHERE issue_id = $1",
+                &issue.issue_id
+            )
+            .expect("read the issue's project after the rejected delete");
+            assert_eq!(
+                attached.as_deref(),
+                Some(project.as_str()),
+                "rejecting the {probed} entry must restore the issue's project too; \
+                 an issue detached by a rolled-back delete would show as unassigned \
+                 with nothing on the wire to explain it"
+            );
+
+            let orphans = entries_above(db, watermark).await;
+            assert!(
+                orphans.is_empty(),
+                "rejecting the {probed} entry must leave no partial entry behind — \
+                 the entries written before it are in the same transaction and unwind \
+                 with it; found {:?}",
+                triples(&orphans)
+            );
+        }
+
+        // The passes above all failed. The same call with no trigger installed
+        // must succeed, or every assertion here would hold against a
+        // `delete_project` that could never delete anything.
+        trakkt_auth::project_service::delete_project(db, &project, None)
+            .await
+            .expect("with no trigger installed the same delete must succeed");
+        assert_eq!(
+            child_counts(db, &project).await,
+            (0, 0, 0),
+            "the successful delete must actually empty the cascaded tables"
+        );
+        let milestone_gone: i64 = db_fetch_scalar!(
+            db,
+            i64,
+            "SELECT COUNT(*) FROM project_milestones WHERE milestone_id = $1",
+            &milestone
+        )
+        .expect("count the milestone after the successful delete");
+        assert_eq!(milestone_gone, 0, "the milestone must be gone with its project");
     }
 }
