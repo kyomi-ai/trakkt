@@ -32,6 +32,15 @@ jobs:
   lint-suppression:
     name: Lint Suppression Policy
     runs-on: ubuntu-latest
+    # A full-history checkout plus a `git diff | grep` over the PR diff.
+    # Measured at 4-7s across the 12 most recent PR runs (job-level
+    # started_at -> completed_at). Sized as a floor the same way `tx-pool` below
+    # is: 5 is ~43x the observed maximum, cannot plausibly fire on a slow-runner
+    # day, and still caps the runner-day that GitHub's 6-hour default would burn
+    # if the checkout or the grep wedged. Note the `fetch-depth: 0` below — this
+    # job's cost grows with repository history, so the margin does real work over
+    # time rather than only covering noise.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
         with:
@@ -60,6 +69,11 @@ jobs:
   migration-consistency:
     name: Migration Consistency
     runs-on: ubuntu-latest
+    # checkout plus scripts/check-migrations.sh, which reads the migration
+    # directories and compares version prefixes — no build, no network.
+    # Measured at 4-7s across the 12 most recent PR runs. Floor at 5 for the
+    # same reason as `lint-suppression` above.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
 
@@ -83,8 +97,8 @@ jobs:
     # failure this caps is not a slow check but a stuck one — pathological regex
     # backtracking on a source file — where GitHub's 6-hour default would burn a
     # runner-day. 5 gives ~90x headroom over the measured run and still fails
-    # fast. (TRA-9961 tracks the jobs above and below that have no bound at all;
-    # this adds one rather than adding to that list.)
+    # fast. (This job was bounded ahead of TRA-9961, which has since bounded
+    # every remaining job in this file and in the other three workflows.)
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
@@ -581,6 +595,14 @@ jobs:
   trivy-scan:
     name: Trivy Security Scan
     runs-on: ubuntu-latest
+    # Measured at 15-26s across the 12 most recent PR runs — the slowest of this
+    # file's three fast jobs, and the only one with a hard external dependency:
+    # the action pulls Trivy's vulnerability database over the network before it
+    # can scan anything. That download is both the realistic slow path and the
+    # plausible hang, which is why this gets 10 rather than the 5 the other two
+    # fast jobs use. 10 is ~23x the observed maximum and leaves ample room for a
+    # slow or rate-limited database fetch.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
 

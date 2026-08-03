@@ -36,6 +36,18 @@ jobs:
   build:
     name: Build & Push
     runs-on: ubuntu-latest
+    # Measured at 241-324s (4m1s-5m24s) across the 8 most recent runs, job-level
+    # started_at -> completed_at. As with release.yml's `docker`, that is
+    # already a from-scratch compile: Dockerfile.docs runs `COPY . .` before
+    # `cargo run -p gen-api-docs`, so every run this workflow's path filter lets
+    # through rebuilds it cold, and the GHA cache only serves the apt and
+    # mdbook-download layers above the COPY. Realistic worst is those preamble
+    # layers missing plus a slow runner plus a slow crates.io — roughly 10min,
+    # which 15 covers with ~1.5x headroom, the same ratio ci.yml's `Test Suite`
+    # is sized at. Against the observed maximum it is ~2.8x. Well under
+    # release.yml's `docker` because the build is far smaller: one helper binary
+    # and an mdBook, not the server binary plus the WASM frontend.
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -66,6 +78,10 @@ jobs:
     name: Deploy Notify
     needs: [build]
     runs-on: ubuntu-latest
+    # Step-for-step identical to release.yml's `deploy-notify`, and measures the
+    # same: 4-7s across the 8 most recent runs. Floor rather than a multiple,
+    # for the reason recorded on release.yml's `prepare`.
+    timeout-minutes: 5
     steps:
       - uses: actions/create-github-app-token@v3
         id: app-token

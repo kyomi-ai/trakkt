@@ -30,6 +30,16 @@ jobs:
   # ---------------------------------------------------------------------------
   prepare:
     runs-on: ubuntu-latest
+    # One `echo` into $GITHUB_OUTPUT — no checkout, no network, no build.
+    # Measured at 2-4s across the 12 most recent releases (job-level
+    # started_at -> completed_at). There is no worst case to size against, so
+    # this is a floor rather than a multiple of anything: 5 is the smallest
+    # bound that cannot plausibly fire on a slow-runner day (~75x the observed
+    # maximum), matching the floor ci.yml's `tx-pool` job already uses for the
+    # same reason. A tighter number would buy nothing and would risk a spurious
+    # red, which is worse than no bound because it teaches people to ignore the
+    # colour.
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -42,6 +52,29 @@ jobs:
   docker:
     needs: [prepare]
     runs-on: ubuntu-latest
+    # The job whose silent failure motivates this bound: `deploy-notify` and
+    # `release` both need it, so when it hangs the deploy never happens and
+    # nothing turns red until someone asks why the release did not ship.
+    #
+    # Measured at 965-1149s (16m5s-19m9s) across the 12 most recent releases — a
+    # tight band, and that band is already the from-scratch build cost.
+    # Dockerfile.ci runs `COPY . .` before `trunk build --release` and
+    # `cargo build --release`, so any source change invalidates that layer and
+    # both compiles run cold on every release; `cache-from: type=gha` can only
+    # serve the layers above the COPY (apt, `rustup target add`, and the trunk /
+    # wasm-bindgen / tailwindcss downloads). So unlike a job backed by a warm
+    # dependency cache, there is no much-worse cold case hiding behind these
+    # numbers. The remaining variance is a cache miss on those preamble layers,
+    # a slow runner, a bad crates.io day, and the dependency graph growing over
+    # time. 40 is ~2.1x the observed maximum, enough for all four at once, and
+    # surfaces a wedged build in 40 minutes rather than the 6 hours it takes now.
+    #
+    # Deliberately not the 45 that claude-code-review.yml uses, despite the
+    # similar observed maxima (19m9s here, 20m23s there): that job's headroom
+    # covers open-ended variance in how long an LLM review runs, this one's
+    # covers a bounded and well-understood compile. Equal numbers would be a
+    # coincidence rather than a shared rationale.
+    timeout-minutes: 40
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -71,6 +104,11 @@ jobs:
   deploy-notify:
     needs: [prepare, docker]
     runs-on: ubuntu-latest
+    # Two GitHub API calls: mint an app token, then dispatch the event.
+    # Measured at 3-7s across the 12 most recent releases. Sized as a floor
+    # rather than a multiple, for the reason recorded on `prepare` above; 5 is
+    # ~43x the observed maximum and gives a stalled API call somewhere to fail.
+    timeout-minutes: 5
     steps:
       - uses: actions/create-github-app-token@v3
         id: app-token
@@ -98,6 +136,13 @@ jobs:
   release:
     needs: [prepare, docker]
     runs-on: ubuntu-latest
+    # One API call, but `generate_release_notes: true` makes GitHub walk the
+    # commit range since the previous tag, so this is the only short job here
+    # whose cost grows with anything. Measured at 6-11s across the 12 most
+    # recent releases; 5 is ~27x that and absorbs a far larger commit range than
+    # any release so far has produced. Floor rather than a multiple — see
+    # `prepare` above.
+    timeout-minutes: 5
     steps:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
