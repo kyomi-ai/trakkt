@@ -8,6 +8,31 @@ jobs:
   claude-review:
     if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    # An LLM agent job: it drives a review loop against a model API, so its
+    # duration tracks PR size and API latency rather than anything
+    # deterministic. Measured over the 45 most recent completed runs, job-level
+    # started_at -> completed_at (which is the interval timeout-minutes bounds;
+    # run-level figures are much larger because they include queue and dispatch
+    # time — run 30691811839 shows ~15h at the run level for a job that ran 48s,
+    # so it is not evidence of a hang). 44 of those succeeded, spanning 39s to
+    # 20m23s; the 45th was a dependabot PR that the `if` above skipped, which
+    # reports 0s and is excluded. The distribution is heavily right-skewed:
+    # median ~4m55s, eight runs over 10min, two over 19min.
+    #
+    # 45 is ~2.2x the observed maximum. That headroom is for variance, not for a
+    # cold cache — a PR larger than any in the sample legitimately takes longer,
+    # and a bound that kills a real review trains people to ignore a red X,
+    # which is worse than no bound. It still surfaces a stuck agent within one
+    # working session instead of GitHub's 6-hour default, and a model call or
+    # tool wait that never returns is the most plausible way this job hangs.
+    #
+    # No step-level timeout. `Run Claude Code Review` is the only substantial
+    # step and the checkout ahead of it takes seconds, so the job-level bound
+    # already attributes a hang to that step unambiguously; a second bound would
+    # only add a number that can drift out of sync with this one. TRA-9924
+    # declined step-level timeouts for `Test Suite` as a second knob on the same
+    # failure — that holds here too, for this narrower reason.
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write
