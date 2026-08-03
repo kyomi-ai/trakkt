@@ -69,7 +69,15 @@ const DB_VERSION: u8 = 1;
 /// only stops new ones arriving — it cannot retract what a client already
 /// stored. Bumping the hash wipes the cache and forces a re-bootstrap, which is
 /// the only thing that evicts them.
-pub const SCHEMA_HASH: &str = "trakkt-2026-07-v4";
+/// `v5` (TRA-9966): four entity types nothing in this client reads back —
+/// `attachment`, `issue_attachment`, `issue_relation` and
+/// `notification_preferences` — stopped being persisted, and `release` had
+/// already stopped in TRA-9977 without a bump. Rows written before those changes
+/// are evicted by nothing at all once the type is off the reset wipe: the
+/// per-entity delete no longer names it either, so no reset and no `Delete`
+/// action can reach them. This wipe is what actually removes them, and it is why
+/// dropping a type from persistence and bumping this constant are one change.
+pub const SCHEMA_HASH: &str = "trakkt-2026-08-v5";
 
 /// Key under which [`SCHEMA_HASH`] is stored in the `_meta` object store.
 pub const SCHEMA_HASH_KEY: &str = "schemaHash";

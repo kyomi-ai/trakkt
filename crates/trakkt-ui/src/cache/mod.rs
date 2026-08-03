@@ -19,6 +19,15 @@
 
 pub mod store;
 
+/// What the local cache is allowed to hold: one mapping from entity type to the
+/// cache rows it owns, which the write path, the per-entity delete and the reset
+/// wipe are all derived from.
+///
+/// Not target-gated: it is pure Rust over string constants, so the membership
+/// rules — and the invariants that used to be checked by parsing source in a
+/// `wasm32`-only test — are unit tested natively.
+pub mod cached_types;
+
 /// Single FIFO writer that orders every cache write against the sync cursor.
 ///
 /// Not target-gated: the queue and its ordering rules are pure Rust and unit

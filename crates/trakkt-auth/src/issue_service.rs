@@ -1264,9 +1264,9 @@ pub async fn delete_issue(
     // Comments are cached: `sync_bootstrap` streams them (see the `PendingBatch`
     // list in `apps/server/src/routes/websocket.rs`) and `comment_service` sends
     // a payload on every write, so `enqueue_cache_writes` persists them to
-    // IndexedDB. Their delete arm is present in both halves of
-    // `crates/trakkt-ui/src/cache/apply.rs` — the memory bump and the
-    // hand-written delete list — so an entry here evicts the row rather than
+    // IndexedDB. Both halves of `crates/trakkt-ui/src/cache/apply.rs` act on the
+    // delete — the memory bump, and the cache half's delete loop over the rows
+    // a `comment` frame writes — so an entry here evicts the row rather than
     // only bumping a counter. This is the leak TRA-9957 was filed for.
     let comment_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
         &mut tx,
@@ -1276,18 +1276,19 @@ pub async fn delete_issue(
     )?;
 
     // Relations cascade from *both* ends, so an issue takes with it every
-    // relation naming it as source or as target. They are cached: `create_relation`
-    // sends the serialized relation as its payload, which `enqueue_cache_writes`
-    // persists. The user-visible half is the other issue in each pair — the
-    // relations section of `pages/issues/issue_detail.rs` re-reads on
-    // `relations_version`, which the ISSUE_RELATION delete arm bumps, so without
-    // these entries a surviving issue keeps showing a relation to an issue that
-    // no longer exists.
+    // relation naming it as source or as target. The user-visible half is the
+    // other issue in each pair — the relations section of
+    // `pages/issues/issue_detail.rs` re-reads on `relations_version`, which the
+    // ISSUE_RELATION delete arm bumps, so without these entries a surviving
+    // issue keeps showing a relation to an issue that no longer exists.
     //
-    // Evicting the IndexedDB row additionally needs ISSUE_RELATION added to
-    // `enqueue_cache_writes`'s delete list, which is TRA-9966; the explicit
-    // `relation_service::delete_relation` path has the same gap today, so this
-    // is not a new one.
+    // There is no IndexedDB row to evict. `create_relation` does send the
+    // serialized relation as its payload, and `enqueue_cache_writes` used to
+    // persist it while its delete queued nothing — rows written and removed by
+    // no path at all. TRA-9966 put `issue_relation` on `NOT_CACHED` in
+    // `cache/cached_types.rs` instead, because nothing in the client ever reads
+    // one back: the section refetches through `list_issue_relations`, which is
+    // what the counter bump above makes it do.
     let relation_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
         &mut tx,
         CascadedIdRow,
@@ -1300,11 +1301,13 @@ pub async fn delete_issue(
     // `PendingBatch` list in `apps/server/src/routes/websocket.rs`) and
     // `notification_service::create_notification` sends the serialized
     // notification as its payload, so `enqueue_cache_writes` persists them to
-    // IndexedDB. Their delete arm is present in both halves of
-    // `crates/trakkt-ui/src/cache/apply.rs` — `remove_notification_in_memory` in
-    // the memory match and `enqueue_delete(.., NOTIFICATION, ..)` in the
-    // hand-written delete list — so an entry here evicts the row rather than
-    // only bumping a counter. Without it the recipient's inbox keeps an entry
+    // IndexedDB. Both halves of `crates/trakkt-ui/src/cache/apply.rs` act on the
+    // delete — `remove_notification_in_memory` in the memory match, and the
+    // cache half's delete loop, which removes exactly the rows
+    // `cache_rows_written_by` says a `notification` frame writes — so an entry
+    // here evicts the row rather than only bumping a counter. TRA-9966 is what
+    // made that second half follow from the first rather than needing an arm of
+    // its own. Without an entry the recipient's inbox keeps a row
     // for an issue that no longer exists, through every reconnect, and the
     // unread badge in `components/layout.rs` keeps counting it.
     //
@@ -1343,7 +1346,7 @@ pub async fn delete_issue(
     //   An issue's labels reach clients inside the ISSUE payload, and the ISSUE
     //   delete entry takes them with it.
     // * `issue_activities` — there is no cached row to evict, and no reader that
-    //   would want one. `activity` is on `NOT_CACHED` in `cache/apply.rs`, so
+    //   would want one. `activity` is on `NOT_CACHED` in `cache/cached_types.rs`, so
     //   `enqueue_cache_writes` skips it and no activity is ever written to
     //   IndexedDB; nothing in `crates/trakkt-ui` reads one back either. The
     //   timeline that shows activities refetches through
@@ -1367,11 +1370,13 @@ pub async fn delete_issue(
     //   issue, and `list_workspace_activities` inner-joins `issues` — but the
     //   two schemas disagree, and that disagreement is not this function's to
     //   fix.
-    // * `issue_attachments` — same reasoning: `attachment_service::attach_to_issue`
-    //   records the link with `None`, and the bootstrap does not stream the type,
-    //   so the junction row is never cached. TRA-9979 is the ticket that would
-    //   give the insert a payload; when it lands, this table joins the three
-    //   read above.
+    // * `issue_attachments` — same reasoning, and TRA-9966 made it hold whatever
+    //   TRA-9979 does. `attachment_service::attach_to_issue` records the link
+    //   with `None` and the bootstrap does not stream the type, so no junction
+    //   row is cached today; and `issue_attachment` is now on `NOT_CACHED` in
+    //   `cache/cached_types.rs`, so giving that insert a payload will not start
+    //   caching one either. This table therefore stays out of the list read
+    //   above rather than joining it later.
 
     trakkt_core::tx_execute!(
         &mut tx,
