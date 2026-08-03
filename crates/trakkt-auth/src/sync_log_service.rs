@@ -4606,6 +4606,178 @@ mod tests {
         );
     }
 
+    // ─── Team membership visibility on delta (TRA-9963) ──────────────────────
+
+    /// Every TEAM entry in `user_id`'s delta-from-zero stream, as
+    /// `(entity_id, action, has_payload)` in the order the client receives it.
+    async fn delta_team_entries(db: &DbPool, user_id: &str) -> Vec<(String, SyncActionType, bool)> {
+        get_entries_since(db, WS, user_id, 0, 10_000)
+            .await
+            .expect("read the delta stream a reconnecting client would be sent")
+            .into_iter()
+            .filter(|e| e.entity_type == entity_types::TEAM)
+            .map(|e| (e.entity_id, e.action, e.data.is_some()))
+            .collect()
+    }
+
+    /// Replay `user_id`'s delta-from-zero stream through the same TEAM rules the
+    /// client's cache applies, and return the team ids left cached.
+    ///
+    /// The rules are `apply_action_to_memory`'s TEAM arms in
+    /// `crates/trakkt-ui/src/cache/apply.rs`: `Insert`/`Update` with a payload
+    /// calls `upsert_team`, one with no payload is skipped before it reaches the
+    /// match, and `Delete` calls `remove_team_in_memory`. The leader's
+    /// IndexedDB half (`enqueue_cache_writes`) pairs the same two ops on one
+    /// FIFO queue, so the persisted end state is the same one.
+    ///
+    /// Asserting on the *end state* rather than on some row being present is
+    /// what makes ordering load-bearing here. A `Delete` written before the
+    /// `Update` it corrects would satisfy "the stream contains a delete" and
+    /// still leave the team cached; it cannot satisfy this.
+    async fn teams_left_cached_after_delta(db: &DbPool, user_id: &str) -> Vec<String> {
+        let mut cached: Vec<String> = Vec::new();
+        for (entity_id, action, has_payload) in delta_team_entries(db, user_id).await {
+            match action {
+                SyncActionType::Insert | SyncActionType::Update => {
+                    if has_payload && !cached.contains(&entity_id) {
+                        cached.push(entity_id);
+                    }
+                }
+                SyncActionType::Delete => cached.retain(|id| id != &entity_id),
+            }
+        }
+        cached
+    }
+
+    /// The reported bug: leaving a team must not be undone by the next delta,
+    /// and the members who stayed must still be told the membership changed.
+    ///
+    /// Both halves are asserted here on purpose. Scoping the removal so
+    /// narrowly that the remaining members lose the update would satisfy the
+    /// departing user's half on its own.
+    #[tokio::test]
+    async fn leaving_a_team_evicts_it_from_the_departing_users_delta_only() {
+        let db = two_user_workspace().await;
+
+        crate::team_service::add_team_member(&db, "team_vis", USER_A, "lead", WS)
+            .await
+            .expect("add the member who stays");
+        crate::team_service::add_team_member(&db, "team_vis", USER_B, "member", WS)
+            .await
+            .expect("add the member who will leave");
+
+        assert_eq!(
+            teams_left_cached_after_delta(&db, USER_B).await,
+            vec!["team_vis".to_string()],
+            "precondition: while B is a member the delta stream really does put \
+             the team in B's cache — otherwise the assertion below would hold \
+             for a team that was never there"
+        );
+
+        crate::team_service::remove_team_member(&db, "team_vis", USER_B, WS)
+            .await
+            .expect("the member leaves the team");
+
+        assert_eq!(
+            teams_left_cached_after_delta(&db, USER_B).await,
+            Vec::<String>::new(),
+            "a user who left must not be handed the team back by their next \
+             delta; entries B receives: {:?}",
+            delta_team_entries(&db, USER_B).await
+        );
+
+        let stayed = delta_team_entries(&db, USER_A).await;
+        assert_eq!(
+            stayed,
+            vec![
+                ("team_vis".to_string(), SyncActionType::Update, true),
+                ("team_vis".to_string(), SyncActionType::Update, true),
+                ("team_vis".to_string(), SyncActionType::Update, true),
+            ],
+            "A stayed, so all three membership writes must reach A as payload- \
+             carrying TEAM updates — including B's removal, which changed the \
+             member list A is looking at. The user-scoped eviction row must not \
+             be among them: applying it would evict the team from a member who \
+             never left"
+        );
+        assert_eq!(
+            teams_left_cached_after_delta(&db, USER_A).await,
+            vec!["team_vis".to_string()],
+            "and the team must still be cached for A at the end of that stream"
+        );
+    }
+
+    /// The mirror-image path. A user added to a team after their client
+    /// bootstrapped has to *gain* the team, and the only thing that can carry it
+    /// is the membership entry — `team_members` is not a synced entity type, and
+    /// nothing re-runs `list_teams` for a connected client.
+    ///
+    /// This passes on the code as it stood before TRA-9963 as well; it is here
+    /// so the eviction row added for removals cannot start firing on adds
+    /// unnoticed.
+    #[tokio::test]
+    async fn joining_a_team_puts_it_in_the_new_members_delta() {
+        let db = two_user_workspace().await;
+
+        crate::team_service::add_team_member(&db, "team_vis", USER_A, "lead", WS)
+            .await
+            .expect("add the first member");
+
+        crate::team_service::add_team_member(&db, "team_vis", USER_B, "member", WS)
+            .await
+            .expect("the new member joins");
+
+        assert_eq!(
+            teams_left_cached_after_delta(&db, USER_B).await,
+            vec!["team_vis".to_string()],
+            "a member add has to leave the team in the new member's cache, or \
+             the team is missing from their sidebar until a full re-bootstrap; \
+             entries B receives: {:?}",
+            delta_team_entries(&db, USER_B).await
+        );
+        assert!(
+            !delta_team_entries(&db, USER_B)
+                .await
+                .iter()
+                .any(|(_, action, _)| matches!(action, SyncActionType::Delete)),
+            "an add must write no eviction row for anyone"
+        );
+    }
+
+    /// A role change moves nobody in or out of the team, so it must leave the
+    /// team cached for the member whose role changed and for everyone else.
+    #[tokio::test]
+    async fn a_role_change_evicts_the_team_from_nobodys_delta() {
+        let db = two_user_workspace().await;
+
+        crate::team_service::add_team_member(&db, "team_vis", USER_A, "lead", WS)
+            .await
+            .expect("add the member who watches");
+        crate::team_service::add_team_member(&db, "team_vis", USER_B, "member", WS)
+            .await
+            .expect("add the member who gets promoted");
+
+        crate::team_service::update_team_member_role(&db, "team_vis", USER_B, "lead", WS)
+            .await
+            .expect("promote the member");
+
+        for user_id in [USER_A, USER_B] {
+            let entries = delta_team_entries(&db, user_id).await;
+            assert!(
+                !entries
+                    .iter()
+                    .any(|(_, action, _)| matches!(action, SyncActionType::Delete)),
+                "a role change removes nobody from the team, so it must write no \
+                 eviction row; {user_id} received: {entries:?}"
+            );
+            assert_eq!(
+                teams_left_cached_after_delta(&db, user_id).await,
+                vec!["team_vis".to_string()],
+                "{user_id} is still a member, so the team must stay cached"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn team_settings_update_rolls_back_when_its_sync_entry_cannot_be_written() {
         let db = two_user_workspace().await;

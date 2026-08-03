@@ -951,6 +951,35 @@ pub async fn list_team_members(
     Ok(rows.into_iter().map(TeamMemberRow::into_dto).collect())
 }
 
+/// Which of the three membership edits [`write_membership_sync_entry`] is
+/// reporting.
+///
+/// Carried as an enum rather than the free-text label it used to take because
+/// the entry written depends on it: only [`MembershipChange::Removed`] adds the
+/// user-scoped eviction row below. A `&str` would let a caller spell "member
+/// remove" any of several ways and silently get the add behaviour.
+#[derive(Clone, Copy)]
+enum MembershipChange {
+    /// `user_id` was added to the team (or already was a member — the INSERT is
+    /// idempotent).
+    Added,
+    /// `user_id`'s role changed. They were a member before and still are.
+    RoleChanged,
+    /// `user_id` was removed from the team.
+    Removed,
+}
+
+impl MembershipChange {
+    /// The phrase naming this edit in the errors below.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Added => "member add",
+            Self::RoleChanged => "member role update",
+            Self::Removed => "member remove",
+        }
+    }
+}
+
 /// Record a team membership change on the sync log.
 ///
 /// `team_members` is not a synced entity type of its own, so a membership change
@@ -972,12 +1001,60 @@ pub async fn list_team_members(
 /// list, and its `member_count` is reported as 0 by every single-team read. A
 /// client applying this entry learns that the team changed, not how — the same
 /// gap TRA-9940 records for project members.
+///
+/// # Why a removal writes two entries (TRA-9963)
+///
+/// A membership change has two audiences and `sync_log` has one
+/// `visibility_user_id` per row, so one row cannot serve both:
+///
+/// * the members who stayed need a TEAM `Update` — the member list changed, and
+///   the team still exists, so a `Delete` would be a lie to them;
+/// * the member who left needs the team to leave their dataset, and the
+///   `Update` above does the opposite. `get_entries_since` replays every
+///   `visibility_user_id IS NULL` row to every workspace member, and
+///   `apply_action_to_memory`'s TEAM `Update` arm calls `upsert_team`
+///   (`crates/trakkt-ui/src/cache/apply.rs`), which re-adds the team the user
+///   had just correctly evicted.
+///
+/// So a removal writes the workspace-visible `Update` **and then** a
+/// `TEAM`/`Delete` scoped to the departing user. Three properties make that
+/// resolve to the right end state rather than to whichever row happens to land
+/// last, all checked in this tree:
+///
+/// 1. The `Delete` is inserted after the `Update` on the same transaction, so
+///    `sync_log.sync_id` (Postgres BIGSERIAL, SQLite AUTOINCREMENT) is strictly
+///    higher on the `Delete`.
+/// 2. Nothing between here and the client reorders by anything but that id.
+///    `sync_log_service::get_entries_since` is `ORDER BY sync_id ASC`;
+///    `drain_delta` (`apps/server/src/routes/websocket.rs`) sends one frame per
+///    entry in that order and pages forward from the last id delivered.
+/// 3. The client applies frames in arrival order: `set_on_message` in
+///    `crates/trakkt-ui/src/cache/sync_engine.rs` calls `apply_sync_action` per
+///    frame, whose memory half runs synchronously and whose IndexedDB half is
+///    appended to the single FIFO `IdbWriter` queue.
+///
+/// The `Delete` carries no payload, matching `delete_team`'s: neither the
+/// memory nor the cache half of the client's `Delete` arm reads `action.data`.
+///
+/// This is deliberately the narrow fix, not the correct one. TEAM is a
+/// membership-scoped entity streamed workspace-wide on delta while
+/// `handle_sync_bootstrap` streams only `list_teams(.., Some(user))`, so a user
+/// who is not a member of a team still receives that team, with its full
+/// payload, from `create_team`, `commit_team_update` (rename, icon, settings)
+/// and from every membership change on it made by anyone else — all of which
+/// pass `visibility_user_id = None` too. After this fix a departed member still
+/// gets the team back on the next such write. Closing that means deriving TEAM
+/// visibility from membership at query time in `get_entries_since` (the
+/// ticket's option 3), which is a change to the sync protocol's visibility
+/// model and applies to every membership-scoped entity, not just this one.
 async fn write_membership_sync_entry(
     tx: &mut DbTx,
     team: &Team,
     user_id: &str,
-    operation: &str,
+    change: MembershipChange,
 ) -> trakkt_core::Result<()> {
+    let operation = change.label();
+
     sync_log_service::write_sync_entry_in_tx(
         tx,
         entity_types::TEAM,
@@ -996,6 +1073,26 @@ async fn write_membership_sync_entry(
             team.team_id
         ))
     })?;
+
+    if matches!(change, MembershipChange::Removed) {
+        sync_log_service::write_sync_entry_in_tx(
+            tx,
+            entity_types::TEAM,
+            &team.team_id,
+            &team.workspace_id,
+            Some(user_id),
+            SyncActionType::Delete,
+            None,
+        )
+        .await
+        .map_err(|e| {
+            trakkt_core::Error::Internal(format!(
+                "failed to write the departing member's eviction sync log for \
+                 {operation} of user {user_id} on team {}: {e}",
+                team.team_id
+            ))
+        })?;
+    }
 
     Ok(())
 }
@@ -1039,7 +1136,7 @@ pub async fn add_team_member(
     // entry that reports it commit together or not at all.
     let mut tx = db.begin().await?;
     trakkt_core::tx_execute!(&mut tx, &sql, team_id, user_id, role)?;
-    write_membership_sync_entry(&mut tx, &team, user_id, "member add").await?;
+    write_membership_sync_entry(&mut tx, &team, user_id, MembershipChange::Added).await?;
     tx.commit().await?;
 
     Ok(())
@@ -1064,7 +1161,7 @@ pub async fn remove_team_member(
         team_id,
         user_id
     )?;
-    write_membership_sync_entry(&mut tx, &team, user_id, "member remove").await?;
+    write_membership_sync_entry(&mut tx, &team, user_id, MembershipChange::Removed).await?;
     tx.commit().await?;
 
     Ok(())
@@ -1091,7 +1188,7 @@ pub async fn update_team_member_role(
         team_id,
         user_id
     )?;
-    write_membership_sync_entry(&mut tx, &team, user_id, "member role update").await?;
+    write_membership_sync_entry(&mut tx, &team, user_id, MembershipChange::RoleChanged).await?;
     tx.commit().await?;
 
     Ok(())
@@ -1360,6 +1457,27 @@ mod tests {
         .expect("count sync log rows")
     }
 
+    /// Every `sync_log` row of a workspace as `(action, visibility_user_id)`, in
+    /// the `sync_id` order `get_entries_since` replays them in.
+    async fn sync_rows_in_order(db: &DbPool, workspace_id: &str) -> Vec<(String, Option<String>)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            action: String,
+            visibility_user_id: Option<String>,
+        }
+        let rows: Vec<Row> = trakkt_core::db_fetch_all!(
+            db,
+            Row,
+            "SELECT action, visibility_user_id FROM sync_log \
+             WHERE workspace_id = $1 ORDER BY sync_id ASC",
+            workspace_id
+        )
+        .expect("read the sync log rows the membership writes produced");
+        rows.into_iter()
+            .map(|r| (r.action, r.visibility_user_id))
+            .collect()
+    }
+
     #[tokio::test]
     async fn add_team_member_refuses_a_team_in_another_workspace() {
         let db = two_workspaces().await;
@@ -1452,9 +1570,18 @@ mod tests {
         assert_eq!(member_count(&db, TEAM_A).await, 0);
 
         assert_eq!(
-            sync_rows_for_workspace(&db, WS_A).await,
-            3,
-            "each of the three membership changes reports itself as a team update"
+            sync_rows_in_order(&db, WS_A).await,
+            vec![
+                ("update".to_string(), None),
+                ("update".to_string(), None),
+                ("update".to_string(), None),
+                ("delete".to_string(), Some(USER_A.to_string())),
+            ],
+            "each of the three membership changes reports itself as a \
+             workspace-visible team update, and the removal writes one more row: \
+             the eviction scoped to the user who left, after the update it \
+             corrects, so a client replaying both in sync_id order ends with the \
+             team gone (TRA-9963)"
         );
     }
 
