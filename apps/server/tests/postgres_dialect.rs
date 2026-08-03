@@ -31,6 +31,7 @@
 //! `cascade_delete_sync.rs` is here — so nothing has to be rearranged to make
 //! the pair reachable from one test body.
 
+use std::collections::{BTreeSet, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 
@@ -41,10 +42,10 @@ use trakkt_core::db::in_clause_placeholders;
 use trakkt_core::test_helpers::dual_backend::{
     database_exists, on_postgres, reject_sync_log_inserts,
 };
-use trakkt_core::test_helpers::{seed_team, seed_user, seed_workspace};
+use trakkt_core::test_helpers::{seed_team, seed_user, seed_workspace, test_pool};
 use trakkt_core::{
-    db_execute, db_fetch_scalar, dual_backend_test, sql_compat, tx_execute, tx_fetch_all,
-    tx_fetch_one, tx_fetch_optional, tx_fetch_scalar, tx_with, DbPool,
+    db_execute, db_fetch_all, db_fetch_scalar, dual_backend_test, sql_compat, tx_execute,
+    tx_fetch_all, tx_fetch_one, tx_fetch_optional, tx_fetch_scalar, tx_with, DbPool,
 };
 use trakkt_types::enums::ActionSource;
 use trakkt_types::models::{CreateIssueParams, Issue, IssueUpdate};
@@ -785,4 +786,937 @@ async fn a_panicking_postgres_body_still_drops_its_database_and_still_fails() {
         "{name} must be dropped even though the body panicked — otherwise every \
          failing Postgres test leaves a database behind"
     );
+}
+
+// ─── Schema parity between the dialects ──────────────────────────────────────
+//
+// TRA-9999. Everything above executes a query on both backends; this section
+// compares the two *schemas* the queries run against. It exists because the
+// drift it now guards had accumulated invisibly for months: measured on the
+// migrated schemas, Postgres declared 78 foreign keys and SQLite 66. Twelve
+// existed only on Postgres, four more differed in ON DELETE, and three TEXT
+// primary keys were nullable on SQLite alone.
+//
+// The four differing-ON-DELETE keys were the dangerous ones. All four cascaded
+// on Postgres and were NO ACTION on SQLite, so deleting the parent succeeded in
+// production and was rejected outright on SQLite — a change ships green through
+// CI and breaks on one backend. TRA-9989 was that shape and made an issue
+// undeletable in production.
+//
+// The two checks below compare live schemas rather than a table of expected
+// constraints written out here. A hand-maintained table would answer "does the
+// schema match what someone once wrote down", which decays; comparing the two
+// migrated schemas to each other answers "do the dialects still agree", needs
+// no edit when a migration adds a constraint to both, and fails the moment one
+// adds it to only one.
+
+/// One foreign key, reduced to the form both dialects can be read into.
+///
+/// Deliberately no constraint name: Postgres names its keys
+/// (`api_tokens_user_id_fkey`) and SQLite numbers them per table, so the names
+/// can never match and comparing them would report drift on every row.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ForeignKey {
+    table: String,
+    columns: String,
+    references_table: String,
+    references_columns: String,
+    on_delete: String,
+}
+
+impl std::fmt::Display for ForeignKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}({}) -> {}({}) ON DELETE {}",
+            self.table, self.columns, self.references_table, self.references_columns,
+            self.on_delete
+        )
+    }
+}
+
+/// One column of one foreign key, as either dialect's catalogue reports it.
+///
+/// A row per column rather than per constraint so that a composite key is
+/// assembled here, in one place, from both dialects' orderings —
+/// `information_schema` and `PRAGMA foreign_key_list` agree on neither the
+/// column order nor how to aggregate it in SQL.
+#[derive(sqlx::FromRow)]
+struct ForeignKeyColumnRow {
+    table_name: String,
+    /// Groups the columns of one constraint together. Dialect-local and never
+    /// compared across backends — see [`ForeignKey`].
+    constraint_key: String,
+    ordinal: i64,
+    column_name: String,
+    references_table: String,
+    references_column: Option<String>,
+    on_delete: String,
+}
+
+/// One primary-key column and whether the schema forbids NULL in it.
+#[derive(sqlx::FromRow)]
+struct PrimaryKeyColumnRow {
+    table_name: String,
+    column_name: String,
+    not_null: bool,
+}
+
+// Both dialects' queries below skip `_sqlx_migrations`. It is sqlx's own
+// bookkeeping table, created by the migrator rather than declared in either
+// migration directory, and its two dialects genuinely differ: `version` is
+// `BIGINT PRIMARY KEY` on SQLite, which is not the exact `INTEGER` spelling a
+// rowid alias needs and so carries no implicit NOT NULL, while Postgres has it
+// NOT NULL. Nothing a migration can write changes that, so reporting it would
+// be a permanent failure over a table this codebase does not own.
+
+/// Every foreign key Postgres declares, one row per column.
+const PG_FOREIGN_KEY_COLUMNS: &str = "\
+    SELECT c.conrelid::regclass::text AS table_name, \
+           c.conname AS constraint_key, \
+           x.ord AS ordinal, \
+           a.attname AS column_name, \
+           c.confrelid::regclass::text AS references_table, \
+           fa.attname AS references_column, \
+           CASE c.confdeltype \
+                WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' \
+                WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' \
+                WHEN 'd' THEN 'SET DEFAULT' END AS on_delete \
+      FROM pg_constraint c \
+      JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS x(attnum, ord) ON true \
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum \
+      JOIN pg_attribute fa ON fa.attrelid = c.confrelid AND fa.attnum = c.confkey[x.ord] \
+     WHERE c.contype = 'f' AND c.connamespace = 'public'::regnamespace \
+       AND c.conrelid::regclass::text <> '_sqlx_migrations'";
+
+/// Every foreign key SQLite declares, one row per column.
+const SQLITE_FOREIGN_KEY_COLUMNS: &str = "\
+    SELECT m.name AS table_name, \
+           CAST(f.id AS TEXT) AS constraint_key, \
+           f.seq AS ordinal, \
+           f.\"from\" AS column_name, \
+           f.\"table\" AS references_table, \
+           f.\"to\" AS references_column, \
+           f.on_delete AS on_delete \
+      FROM sqlite_master AS m \
+      JOIN pragma_foreign_key_list(m.name) AS f \
+     WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+       AND m.name <> '_sqlx_migrations'";
+
+/// Every primary-key column Postgres declares, and its NOT NULL.
+const PG_PRIMARY_KEY_COLUMNS: &str = "\
+    SELECT c.conrelid::regclass::text AS table_name, \
+           a.attname AS column_name, \
+           a.attnotnull AS not_null \
+      FROM pg_constraint c \
+      JOIN LATERAL unnest(c.conkey) AS k(attnum) ON true \
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
+     WHERE c.contype = 'p' AND c.connamespace = 'public'::regnamespace \
+       AND c.conrelid::regclass::text <> '_sqlx_migrations'";
+
+/// Every primary-key column SQLite declares, and its NOT NULL.
+const SQLITE_PRIMARY_KEY_COLUMNS: &str = "\
+    SELECT m.name AS table_name, \
+           ti.name AS column_name, \
+           ti.\"notnull\" AS not_null \
+      FROM sqlite_master AS m \
+      JOIN pragma_table_info(m.name) AS ti \
+     WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+       AND m.name <> '_sqlx_migrations' AND ti.pk > 0";
+
+/// Foreign keys Postgres declares that SQLite deliberately does not, and why.
+///
+/// An entry here is a promise that the gap is understood, not that it is
+/// acceptable forever. The check asserts in both directions — an entry whose
+/// key has since appeared on SQLite fails just as loudly as an undocumented
+/// gap, so closing the gap forces the entry to be deleted rather than leaving a
+/// permanent exemption behind.
+const FOREIGN_KEYS_POSTGRES_ONLY: &[(&str, &str, &str)] = &[(
+    "issues",
+    "milestone_id",
+    "TRA-9999 closed eleven of the twelve missing keys and left this one. \
+     Re-measure with `PRAGMA foreign_key_list` before attempting it rather than \
+     trusting a figure here: measured on the current schema, eleven foreign \
+     keys across ten tables point at `issues`, and two of those TRA-9999 added \
+     itself. SQLite fires ON DELETE actions during DROP TABLE, so rebuilding \
+     `issues` means rebuilding every one of those tables alongside it, on top \
+     of the 19 migrations that have touched `issues`, to gain one SET NULL. \
+     Both backends accept the milestone delete either way; \
+     what SQLite misses is the clearing of `issues.milestone_id` that \
+     `project_service::delete_milestone` leaves entirely to the schema. See the \
+     closing note in \
+     apps/server/migrations-sqlite/20260803100000_dual_backend_fk_parity.sql.",
+)];
+
+/// Primary-key columns SQLite leaves nullable that Postgres does not, and why.
+///
+/// All three are `INTEGER PRIMARY KEY AUTOINCREMENT`, i.e. rowid aliases, where
+/// binding NULL is the documented way to ask for the next value. Adding NOT
+/// NULL would break every insert that does so, which
+/// [`rowid_alias_primary_keys_still_accept_a_null_bind`] pins down. This is not
+/// the legacy quirk the check is looking for — that one is a non-INTEGER
+/// PRIMARY KEY silently missing its NOT NULL, which lets a row with no primary
+/// key at all be inserted, and more than one, because NULLs do not compare
+/// equal.
+const NULLABLE_PRIMARY_KEYS_SQLITE_ONLY: &[(&str, &str, &str)] = &[
+    ("sync_log", "sync_id", "rowid alias: INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("user_auth_methods", "id", "rowid alias: INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("workspace_users", "id", "rowid alias: INTEGER PRIMARY KEY AUTOINCREMENT"),
+];
+
+/// Read one dialect's foreign keys, assembling multi-column keys in ordinal
+/// order.
+async fn foreign_keys(db: &DbPool, query: &str, dialect: &str) -> BTreeSet<ForeignKey> {
+    let rows: Vec<ForeignKeyColumnRow> = db_fetch_all!(db, ForeignKeyColumnRow, query)
+        .unwrap_or_else(|e| panic!("read {dialect}'s foreign keys from its catalogue: {e}"));
+
+    assert!(
+        !rows.is_empty(),
+        "{dialect} reported no foreign keys at all — this check cannot compare a \
+         catalogue it failed to read, and reporting agreement here would be the \
+         silent pass the whole suite exists to prevent"
+    );
+
+    let mut grouped: HashMap<(String, String), Vec<ForeignKeyColumnRow>> = HashMap::new();
+    for row in rows {
+        grouped
+            .entry((row.table_name.clone(), row.constraint_key.clone()))
+            .or_default()
+            .push(row);
+    }
+
+    grouped
+        .into_values()
+        .map(|mut columns| {
+            columns.sort_by_key(|column| column.ordinal);
+            let first = columns
+                .first()
+                .expect("a group exists only because a column was pushed into it");
+
+            let references_columns = columns
+                .iter()
+                .map(|column| {
+                    column.references_column.clone().unwrap_or_else(|| {
+                        panic!(
+                            "{dialect} reports no target column for the foreign key on \
+                             {}.{} -> {}. Every REFERENCES in both migration \
+                             directories names its target column, and this check \
+                             compares those names; a key relying on the implicit \
+                             primary-key target needs the check taught to resolve it.",
+                            first.table_name, column.column_name, first.references_table
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            ForeignKey {
+                table: first.table_name.clone(),
+                columns: columns
+                    .iter()
+                    .map(|column| column.column_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                references_table: first.references_table.clone(),
+                references_columns,
+                on_delete: first.on_delete.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Read one dialect's primary-key columns that permit NULL.
+async fn nullable_primary_key_columns(
+    db: &DbPool,
+    query: &str,
+    dialect: &str,
+) -> BTreeSet<(String, String)> {
+    let rows: Vec<PrimaryKeyColumnRow> = db_fetch_all!(db, PrimaryKeyColumnRow, query)
+        .unwrap_or_else(|e| panic!("read {dialect}'s primary-key columns: {e}"));
+
+    assert!(
+        !rows.is_empty(),
+        "{dialect} reported no primary-key columns at all — this check cannot \
+         compare a catalogue it failed to read"
+    );
+
+    rows.into_iter()
+        .filter(|row| !row.not_null)
+        .map(|row| (row.table_name, row.column_name))
+        .collect()
+}
+
+/// Render a set of differences as one indented line each, for an assert message.
+fn listed<T: std::fmt::Display>(items: impl IntoIterator<Item = T>) -> String {
+    items.into_iter().map(|item| format!("\n    {item}")).collect()
+}
+
+/// The two dialects declare the same foreign keys, with the same ON DELETE.
+///
+/// This is the check that found TRA-9999, TRA-9969 and TRA-9990, and the one
+/// that has to keep reporting no drift for them to stay closed. It runs against
+/// two freshly migrated databases — `DbPool::connect` over
+/// `apps/server/migrations` and over `apps/server/migrations-sqlite`, the same
+/// calls the server makes at startup — so it compares the schemas that ship
+/// rather than what the migration files appear to say. That distinction is the
+/// point: earlier migrations rebuild tables, so a constraint declared in one
+/// file need not survive into the final schema, and every attempt to measure
+/// this drift by reading SQL got it wrong.
+///
+/// Written out rather than declared with `dual_backend_test!` because it needs
+/// both backends at once; `#[ignore]`d on the same terms as every Postgres half
+/// here, since without a Postgres there is nothing to compare against.
+#[tokio::test]
+#[ignore = "requires a live Postgres — see crates/trakkt-core/src/test_helpers/dual_backend.rs"]
+async fn the_two_dialects_declare_the_same_foreign_keys() {
+    on_postgres(|pg| async move {
+        let sqlite = test_pool()
+            .await
+            .expect("open an in-memory SQLite pool and apply migrations-sqlite");
+
+        let pg_keys = foreign_keys(&pg, PG_FOREIGN_KEY_COLUMNS, "Postgres").await;
+        let sqlite_keys = foreign_keys(&sqlite, SQLITE_FOREIGN_KEY_COLUMNS, "SQLite").await;
+
+        // Each documented exception has to be real on both sides. Without these
+        // two assertions the list would only ever grow: an entry naming a key
+        // Postgres no longer has, or one SQLite has since gained, would sit here
+        // exempting nothing and nobody would find out.
+        for (table, column, reason) in FOREIGN_KEYS_POSTGRES_ONLY {
+            assert!(
+                pg_keys.iter().any(|key| key.table == *table && key.columns == *column),
+                "FOREIGN_KEYS_POSTGRES_ONLY exempts {table}.{column}, but Postgres \
+                 declares no foreign key on that column. The exemption is stale — \
+                 delete it. Recorded reason: {reason}"
+            );
+            assert!(
+                !sqlite_keys.iter().any(|key| key.table == *table && key.columns == *column),
+                "FOREIGN_KEYS_POSTGRES_ONLY exempts {table}.{column}, but SQLite now \
+                 declares a foreign key on it. The gap is closed — delete the \
+                 exemption so this check compares the key like every other one. \
+                 Recorded reason: {reason}"
+            );
+        }
+
+        let expected: BTreeSet<ForeignKey> = pg_keys
+            .iter()
+            .filter(|key| {
+                !FOREIGN_KEYS_POSTGRES_ONLY
+                    .iter()
+                    .any(|(table, column, _)| key.table == *table && key.columns == *column)
+            })
+            .cloned()
+            .collect();
+
+        let missing: Vec<&ForeignKey> = expected.difference(&sqlite_keys).collect();
+        let extra: Vec<&ForeignKey> = sqlite_keys.difference(&expected).collect();
+
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "the two dialects declare different foreign keys.\n\
+             \n\
+             Declared on Postgres, not matched on SQLite:{}\n\
+             \n\
+             Declared on SQLite, not matched on Postgres:{}\n\
+             \n\
+             A key listed on both sides differs only in ON DELETE, which is the \
+             shape that ships green and breaks on one backend: the parent delete \
+             succeeds in production and is rejected on SQLite. Production runs \
+             Postgres, so Postgres is the reference and the SQLite migration is \
+             what moves. A gap that is genuinely intended goes in \
+             FOREIGN_KEYS_POSTGRES_ONLY with its reasoning.",
+            listed(&missing),
+            listed(&extra)
+        );
+    })
+    .await;
+}
+
+/// The two dialects agree on which primary-key columns permit NULL.
+///
+/// SQLite gives a non-`INTEGER PRIMARY KEY` no implicit NOT NULL — a legacy
+/// quirk that made a row with no primary key insertable into `feedback`,
+/// `issue_activities` and `notification_preferences`, and more than one of
+/// them, since NULLs do not compare equal. Postgres has never permitted it.
+/// TRA-10000.
+#[tokio::test]
+#[ignore = "requires a live Postgres — see crates/trakkt-core/src/test_helpers/dual_backend.rs"]
+async fn the_two_dialects_agree_on_primary_key_nullability() {
+    on_postgres(|pg| async move {
+        let sqlite = test_pool()
+            .await
+            .expect("open an in-memory SQLite pool and apply migrations-sqlite");
+
+        let pg_nullable =
+            nullable_primary_key_columns(&pg, PG_PRIMARY_KEY_COLUMNS, "Postgres").await;
+        let sqlite_nullable =
+            nullable_primary_key_columns(&sqlite, SQLITE_PRIMARY_KEY_COLUMNS, "SQLite").await;
+
+        assert!(
+            pg_nullable.is_empty(),
+            "Postgres declares primary-key columns that permit NULL, which it \
+             should not be able to: {}",
+            listed(pg_nullable.iter().map(|(table, column)| format!("{table}.{column}")))
+        );
+
+        for (table, column, reason) in NULLABLE_PRIMARY_KEYS_SQLITE_ONLY {
+            assert!(
+                sqlite_nullable.contains(&((*table).to_string(), (*column).to_string())),
+                "NULLABLE_PRIMARY_KEYS_SQLITE_ONLY exempts {table}.{column}, but \
+                 SQLite now forbids NULL there. Either the exemption is stale and \
+                 should be deleted, or a migration has just made a rowid alias \
+                 NOT NULL and broken every insert that binds NULL to get the next \
+                 value. Recorded reason: {reason}"
+            );
+        }
+
+        let undocumented: Vec<String> = sqlite_nullable
+            .iter()
+            .filter(|(table, column)| {
+                !NULLABLE_PRIMARY_KEYS_SQLITE_ONLY
+                    .iter()
+                    .any(|(exempt_table, exempt_column, _)| {
+                        table == exempt_table && column == exempt_column
+                    })
+            })
+            .map(|(table, column)| format!("{table}.{column}"))
+            .collect();
+
+        assert!(
+            undocumented.is_empty(),
+            "SQLite permits NULL in primary-key columns Postgres does not:{}\n\
+             \n\
+             A TEXT PRIMARY KEY gets no implicit NOT NULL in SQLite, so rows with \
+             no primary key — several of them — are insertable. Add NOT NULL in a \
+             table rebuild. The only legitimate entries are rowid aliases, which \
+             belong in NULLABLE_PRIMARY_KEYS_SQLITE_ONLY.",
+            listed(&undocumented)
+        );
+    })
+    .await;
+}
+
+/// The three rowid aliases still take a NULL bind and assign a value.
+///
+/// The counterweight to [`the_two_dialects_agree_on_primary_key_nullability`]:
+/// that check names three columns SQLite may leave nullable, and this one is why
+/// it must. `INTEGER PRIMARY KEY AUTOINCREMENT` is an alias for the rowid, and
+/// binding NULL is how a caller asks for the next value — `write_sync_entry_in_tx`
+/// and the auth-method and membership inserts all rely on it. A future rebuild
+/// that swept these up with the TEXT primary keys would break every one.
+///
+/// SQLite-only, and not a `dual_backend_test!` pair, because the claim is about
+/// SQLite's rowid rule. The Postgres columns are `bigint NOT NULL DEFAULT
+/// nextval(...)`, where a DEFAULT applies to an *omitted* column and an explicit
+/// NULL is rejected — so the same body would assert the opposite there.
+#[tokio::test]
+async fn rowid_alias_primary_keys_still_accept_a_null_bind() {
+    let db = test_pool()
+        .await
+        .expect("open an in-memory SQLite pool and apply migrations-sqlite");
+
+    seed_user(&db, USER, "rowid@example.test")
+        .await
+        .expect("seed the user the membership and auth-method rows hang off");
+    seed_workspace(&db, WORKSPACE, USER)
+        .await
+        .expect("seed the workspace the membership and sync entries hang off");
+
+    // seed_workspace already enrolled USER, so this is a second membership for a
+    // second user, inserted here rather than through the helper because the
+    // point is the explicit NULL bind on `id`.
+    seed_user(&db, "usr_rowid_second", "rowid2@example.test")
+        .await
+        .expect("seed the second user its membership row names");
+
+    db_execute!(
+        &db,
+        "INSERT INTO workspace_users (id, workspace_id, user_id, role, active, created_at) \
+         VALUES (NULL, $1, $2, 'member', 1, datetime('now'))",
+        WORKSPACE,
+        "usr_rowid_second"
+    )
+    .expect("insert a workspace_users row binding NULL to its rowid-alias id");
+
+    db_execute!(
+        &db,
+        "INSERT INTO user_auth_methods (id, user_id, auth_type, auth_data, created_at) \
+         VALUES (NULL, $1, 'password', 'argon2-hash-placeholder', datetime('now'))",
+        USER
+    )
+    .expect("insert a user_auth_methods row binding NULL to its rowid-alias id");
+
+    db_execute!(
+        &db,
+        "INSERT INTO sync_log (sync_id, workspace_id, entity_type, entity_id, action, created_at) \
+         VALUES (NULL, $1, 'issue', 'iss_rowid', 'insert', datetime('now'))",
+        WORKSPACE
+    )
+    .expect("insert a sync_log row binding NULL to its rowid-alias sync_id");
+
+    for (table, column) in [
+        ("workspace_users", "id"),
+        ("user_auth_methods", "id"),
+        ("sync_log", "sync_id"),
+    ] {
+        let unassigned: i64 = db_fetch_scalar!(
+            &db,
+            i64,
+            &format!("SELECT COUNT(*) FROM {table} WHERE {column} IS NULL")
+        )
+        .unwrap_or_else(|e| panic!("count the {table} rows left with a NULL {column}: {e}"));
+
+        assert_eq!(
+            unassigned, 0,
+            "{table}.{column} is an INTEGER PRIMARY KEY AUTOINCREMENT, so a NULL \
+             bind must be replaced with the next value rather than stored. A row \
+             still holding NULL means the rowid alias was lost — most likely to a \
+             table rebuild that added NOT NULL, or one that changed the declared \
+             type away from INTEGER."
+        );
+    }
+}
+
+// ─── ON DELETE behaviour the two dialects now share ──────────────────────────
+//
+// The four keys of TRA-9999's category B — the ones that existed on both
+// backends with a different ON DELETE. Each body deletes a parent and asserts
+// what happens to the child, so a rebuild that restores the constraint but gets
+// the action wrong fails here rather than passing the structural check above.
+//
+// Every one of these bodies was run against the pre-migration SQLite schema and
+// failed there, with the parent delete rejected outright by a NO ACTION key.
+
+/// Free the workspace of the rows whose foreign keys are NO ACTION on purpose.
+///
+/// Deleting a workspace is blocked by `workspace_users.workspace_id`, and
+/// `seed_workspace` writes exactly one such row — the owner's membership, which
+/// is not optional dressing there because it is what decides who receives a
+/// broadcast. Clearing it is setup for the assertion, not part of it: the
+/// question each caller asks is what happens to its *child* rows, and this
+/// removes the unrelated key that would otherwise reject the delete first and
+/// make the test pass or fail for the wrong reason.
+async fn release_workspace_memberships(db: &DbPool) {
+    db_execute!(db, "DELETE FROM workspace_users WHERE workspace_id = $1", WORKSPACE)
+        .expect("clear the owner membership that would otherwise reject the workspace delete");
+}
+
+dual_backend_test! {
+    /// Deleting a team deletes the views scoped to it, and leaves the rest.
+    ///
+    /// `views.team_id` cascaded on Postgres and was NO ACTION on SQLite
+    /// (TRA-9969), so a team with any saved view could be deleted in production
+    /// and not on SQLite. A view with no team is a workspace-level view and has
+    /// to survive, which is the second assertion — a cascade written against
+    /// the wrong column would take it too.
+    async fn deleting_a_team_deletes_the_views_scoped_to_it(db) {
+        seed_user(db, USER, "views@example.test")
+            .await
+            .expect("seed the workspace owner the views are created by");
+        seed_workspace(db, WORKSPACE, USER)
+            .await
+            .expect("seed the workspace the views belong to");
+        seed_team(db, TEAM, WORKSPACE, TEAM_KEY)
+            .await
+            .expect("seed the team one of the views is scoped to");
+
+        db_execute!(
+            db,
+            "INSERT INTO views (view_id, workspace_id, created_by, name, team_id) \
+             VALUES ($1, $2, $3, 'Team view', $4)",
+            "view_team", WORKSPACE, USER, TEAM
+        )
+        .expect("insert the team-scoped view the team delete must take with it");
+
+        db_execute!(
+            db,
+            "INSERT INTO views (view_id, workspace_id, created_by, name, team_id) \
+             VALUES ($1, $2, $3, 'Workspace view', NULL)",
+            "view_workspace", WORKSPACE, USER
+        )
+        .expect("insert the workspace-level view the team delete must leave alone");
+
+        db_execute!(db, "DELETE FROM teams WHERE team_id = $1", TEAM)
+            .expect("delete the team — rejected outright before views.team_id cascaded");
+
+        let remaining: Vec<String> = view_ids(db).await;
+        assert_eq!(
+            remaining, vec!["view_workspace".to_string()],
+            "deleting a team must delete exactly the views scoped to it. The \
+             team-scoped view surviving means team_id is not cascading; the \
+             workspace-level view disappearing means the cascade is on the wrong \
+             column."
+        );
+    }
+}
+
+dual_backend_test! {
+    /// Deleting a user deletes their notification preferences.
+    ///
+    /// `notification_preferences.user_id` cascaded on Postgres and was NO ACTION
+    /// on SQLite, so a user who had ever opened the notification settings page
+    /// could be deleted in production and not on SQLite.
+    ///
+    /// The user deleted here is a second one that owns nothing. `users` is the
+    /// target of NO ACTION keys from `workspaces.owner_user_id` and
+    /// `workspace_users.user_id` among others — both of which the seeded owner
+    /// holds — and either would reject the delete before the cascade under test
+    /// was reached.
+    async fn deleting_a_user_deletes_their_notification_preferences(db) {
+        const OTHER_USER: &str = "usr_prefs_other";
+
+        seed_user(db, USER, "prefs-owner@example.test")
+            .await
+            .expect("seed the workspace owner whose preferences must survive");
+        seed_workspace(db, WORKSPACE, USER)
+            .await
+            .expect("seed the workspace both preference rows are scoped to");
+        seed_user(db, OTHER_USER, "prefs-other@example.test")
+            .await
+            .expect("seed the user with no workspace of their own, who is deleted below");
+
+        seed_preferences(db, "pref_owner", USER).await;
+        seed_preferences(db, "pref_other", OTHER_USER).await;
+
+        db_execute!(db, "DELETE FROM users WHERE user_id = $1", OTHER_USER)
+            .expect("delete the user — rejected before notification_preferences cascaded");
+
+        let remaining: Vec<String> = preference_ids(db).await;
+        assert_eq!(
+            remaining, vec!["pref_owner".to_string()],
+            "deleting a user must delete exactly their own preference row. The \
+             deleted user's row surviving means user_id is not cascading; the \
+             other user's row disappearing means the cascade is unscoped."
+        );
+    }
+}
+
+dual_backend_test! {
+    /// Deleting a workspace deletes the notification preferences within it.
+    ///
+    /// `notification_preferences.workspace_id` cascaded on Postgres and was NO
+    /// ACTION on SQLite.
+    async fn deleting_a_workspace_deletes_its_notification_preferences(db) {
+        seed_user(db, USER, "prefs-ws@example.test")
+            .await
+            .expect("seed the workspace owner the preference row belongs to");
+        seed_workspace(db, WORKSPACE, USER)
+            .await
+            .expect("seed the workspace being deleted");
+
+        seed_preferences(db, "pref_ws", USER).await;
+        release_workspace_memberships(db).await;
+
+        db_execute!(db, "DELETE FROM workspaces WHERE workspace_id = $1", WORKSPACE)
+            .expect("delete the workspace — rejected before notification_preferences cascaded");
+
+        assert!(
+            preference_ids(db).await.is_empty(),
+            "deleting a workspace must delete the notification preferences scoped \
+             to it; a surviving row means workspace_id is not cascading"
+        );
+    }
+}
+
+dual_backend_test! {
+    /// Deleting a workspace deletes the attachments within it.
+    ///
+    /// `attachments.workspace_id` cascaded on Postgres and was NO ACTION on
+    /// SQLite, so a workspace holding any attachment could be deleted in
+    /// production and not on SQLite.
+    async fn deleting_a_workspace_deletes_its_attachments(db) {
+        seed_user(db, USER, "attach@example.test")
+            .await
+            .expect("seed the user recorded as having uploaded the attachment");
+        seed_workspace(db, WORKSPACE, USER)
+            .await
+            .expect("seed the workspace being deleted");
+
+        db_execute!(
+            db,
+            "INSERT INTO attachments \
+                 (attachment_id, workspace_id, filename, content_type, size_bytes, \
+                  storage_path, uploaded_by) \
+             VALUES ($1, $2, 'note.txt', 'text/plain', $3, 'ws/note.txt', $4)",
+            "att_ws", WORKSPACE, 12_i64, USER
+        )
+        .expect("insert the attachment the workspace delete must take with it");
+
+        release_workspace_memberships(db).await;
+
+        db_execute!(db, "DELETE FROM workspaces WHERE workspace_id = $1", WORKSPACE)
+            .expect("delete the workspace — rejected before attachments cascaded");
+
+        let surviving: i64 = db_fetch_scalar!(db, i64, "SELECT COUNT(*) FROM attachments")
+            .expect("count the attachments left after the workspace delete");
+        assert_eq!(
+            surviving, 0,
+            "deleting a workspace must delete the attachments scoped to it; a \
+             surviving row means workspace_id is not cascading"
+        );
+    }
+}
+
+/// Insert a notification-preferences row for `user_id` in [`WORKSPACE`].
+async fn seed_preferences(db: &DbPool, preference_id: &str, user_id: &str) {
+    db_execute!(
+        db,
+        "INSERT INTO notification_preferences (preference_id, user_id, workspace_id) \
+         VALUES ($1, $2, $3)",
+        preference_id, user_id, WORKSPACE
+    )
+    .unwrap_or_else(|e| panic!("insert the notification preferences {preference_id}: {e}"));
+}
+
+/// Every surviving `views.view_id`, ordered so assertions can compare directly.
+async fn view_ids(db: &DbPool) -> Vec<String> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        view_id: String,
+    }
+    db_fetch_all!(db, Row, "SELECT view_id FROM views ORDER BY view_id")
+        .expect("read the views left after the delete")
+        .into_iter()
+        .map(|row| row.view_id)
+        .collect()
+}
+
+/// Every surviving `notification_preferences.preference_id`, ordered.
+async fn preference_ids(db: &DbPool) -> Vec<String> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        preference_id: String,
+    }
+    db_fetch_all!(
+        db,
+        Row,
+        "SELECT preference_id FROM notification_preferences ORDER BY preference_id"
+    )
+    .expect("read the notification preferences left after the delete")
+    .into_iter()
+    .map(|row| row.preference_id)
+    .collect()
+}
+
+// ─── Deleting an issue takes its dependent rows with it ──────────────────────
+//
+// TRA-9990's two keys, `issue_activities.issue_id` and `github_links.issue_id`.
+// Both were category A — absent from SQLite entirely — so the failure mode
+// before this migration is an orphan rather than a rejection: the issue
+// disappears, and its activity feed and GitHub links stay behind naming an id
+// no row has. Nothing errors, on either backend. That is why the assertions
+// below count surviving rows instead of expecting a rejected delete.
+//
+// The structural check above already guards that these two keys exist and
+// cascade. This body is the runtime counterpart: it fails if the constraint is
+// declared and the rows nevertheless survive.
+
+/// How many rows of `table` still name `issue_id`.
+///
+/// `table` is interpolated rather than bound because a table name cannot be a
+/// bind parameter; every caller passes a literal from this file.
+async fn rows_naming_issue(db: &DbPool, table: &str, issue_id: &str) -> i64 {
+    db_fetch_scalar!(
+        db,
+        i64,
+        &format!("SELECT COUNT(*) FROM {table} WHERE issue_id = $1"),
+        issue_id
+    )
+    .unwrap_or_else(|e| panic!("count the {table} rows still naming issue {issue_id}: {e}"))
+}
+
+dual_backend_test! {
+    /// Deleting an issue deletes its activity rows and its GitHub links.
+    ///
+    /// Both cascades are asserted in one body because they are one ticket and
+    /// one delete: splitting them would seed the same issue twice to assert two
+    /// halves of the same statement. The counts are checked before the delete as
+    /// well as after — without that, a seed that silently failed would leave
+    /// both afterwards-counts at zero and the test would pass having proved
+    /// nothing.
+    async fn deleting_an_issue_deletes_its_activities_and_github_links(db) {
+        seed_tenancy(db).await;
+        let issue = create_issue(db, "An issue carrying an activity and a GitHub link").await;
+        // Bound as `&str` rather than moved: `db_execute!` binds by value, and
+        // the same id is needed by four statements and four counts below.
+        let issue_id = issue.issue_id.as_str();
+
+        db_execute!(
+            db,
+            "INSERT INTO issue_activities \
+                 (activity_id, issue_id, workspace_id, actor_id, action_type, field) \
+             VALUES ($1, $2, $3, $4, 'updated', 'title')",
+            "act_cascade", issue_id, WORKSPACE, USER
+        )
+        .expect("insert the activity row the issue delete must take with it");
+
+        // github_links.installation_id is NOT NULL and now references
+        // github_installations, which in turn references github_apps — so the
+        // link cannot be seeded without the chain above it.
+        db_execute!(
+            db,
+            "INSERT INTO github_apps \
+                 (github_app_id, app_id, app_name, client_id, client_secret_encrypted, \
+                  private_key_encrypted, webhook_secret_encrypted) \
+             VALUES ($1, $2, 'Trakkt Dialect Suite', 'client-id', 'enc', 'enc', 'enc')",
+            "gha_cascade", 4242_i64
+        )
+        .expect("seed the GitHub App the installation hangs off");
+
+        db_execute!(
+            db,
+            "INSERT INTO github_installations \
+                 (installation_id, workspace_id, github_app_id, github_installation_id, \
+                  account_login, account_type) \
+             VALUES ($1, $2, $3, $4, 'octocat', 'User')",
+            "ghi_cascade", WORKSPACE, "gha_cascade", 99_i64
+        )
+        .expect("seed the installation the link hangs off");
+
+        db_execute!(
+            db,
+            "INSERT INTO github_links \
+                 (link_id, workspace_id, issue_id, installation_id, link_type, \
+                  repo_full_name, ref_identifier, url) \
+             VALUES ($1, $2, $3, $4, 'pull_request', 'octocat/trakkt', '7', \
+                     'https://github.test/octocat/trakkt/pull/7')",
+            "ghl_cascade", WORKSPACE, issue_id, "ghi_cascade"
+        )
+        .expect("insert the GitHub link the issue delete must take with it");
+
+        assert_eq!(
+            rows_naming_issue(db, "issue_activities", issue_id).await, 1,
+            "the activity row must exist before the delete, or the assertion after \
+             it proves nothing"
+        );
+        assert_eq!(
+            rows_naming_issue(db, "github_links", issue_id).await, 1,
+            "the GitHub link must exist before the delete, or the assertion after \
+             it proves nothing"
+        );
+
+        db_execute!(db, "DELETE FROM issues WHERE issue_id = $1", issue_id)
+            .expect("delete the issue the activity row and the GitHub link belong to");
+
+        assert_eq!(
+            rows_naming_issue(db, "issue_activities", issue_id).await, 0,
+            "deleting an issue must delete its activity rows. A surviving row is an \
+             orphan naming an issue_id no row has — which is what SQLite did before \
+             issue_activities.issue_id existed at all, silently and without error."
+        );
+        assert_eq!(
+            rows_naming_issue(db, "github_links", issue_id).await, 0,
+            "deleting an issue must delete its GitHub links. A surviving row is an \
+             orphan naming an issue_id no row has — which is what SQLite did before \
+             github_links.issue_id existed at all, silently and without error."
+        );
+    }
+}
+
+// ─── A row with no primary key ───────────────────────────────────────────────
+//
+// TRA-10000. Three TEXT primary keys carried no NOT NULL on SQLite, so a row
+// with no primary key was insertable — and several, since NULLs do not compare
+// equal, which the UNIQUE-looking primary key does nothing to prevent.
+//
+// Each body inserts a row that is valid in every other respect, so that NOT NULL
+// is the only constraint that can reject it. The assertion checks the message
+// says so: a row rejected by a foreign key instead would otherwise report the
+// same pass, and these tables gained foreign keys in the same migration.
+
+/// Assert `outcome` is a NOT NULL rejection naming `table`.`column`.
+///
+/// Takes the whole `Result` rather than the error, because `DbQueryResult` has
+/// no `Debug` and `expect_err` needs one — and because the success arm deserves
+/// the message it gets here rather than a derived one.
+///
+/// Postgres says `null value in column "id" of relation "feedback" violates
+/// not-null constraint`; SQLite says `NOT NULL constraint failed: feedback.id`.
+/// Both name the table and the column and both contain "null", which is all
+/// this needs — and neither says "foreign key", which is the wrong-reason pass
+/// worth ruling out explicitly.
+fn assert_rejected_for_null_primary_key(
+    outcome: Result<trakkt_core::db::DbQueryResult, sqlx::Error>,
+    table: &str,
+    column: &str,
+) {
+    let error = match outcome {
+        Err(error) => error,
+        Ok(_) => panic!(
+            "inserting a {table} row with a NULL {column} was accepted. {column} is \
+             a TEXT PRIMARY KEY, which SQLite gives no implicit NOT NULL, so the \
+             table now holds a row with no primary key — and will take more, since \
+             NULLs do not compare equal."
+        ),
+    };
+    let message = error.to_string().to_lowercase();
+
+    assert!(
+        !message.contains("foreign key"),
+        "the insert into {table} was rejected by a foreign key, not by NOT NULL on \
+         {column}, so it says nothing about the primary key: {error}"
+    );
+    assert!(
+        message.contains("null") && message.contains(column) && message.contains(table),
+        "the insert into {table} must be rejected by NOT NULL on {column}, and the \
+         rejection must name them; got: {error}"
+    );
+}
+
+dual_backend_test! {
+    /// A feedback row with no id is rejected.
+    async fn feedback_rejects_a_null_primary_key(db) {
+        seed_user(db, USER, "feedback-null@example.test")
+            .await
+            .expect("seed the user the feedback row names");
+        seed_workspace(db, WORKSPACE, USER)
+            .await
+            .expect("seed the workspace the feedback row names");
+
+        let outcome = db_execute!(
+            db,
+            "INSERT INTO feedback (id, user_id, workspace_id, feedback_type, description) \
+             VALUES (NULL, $1, $2, 'bug', 'a report with no primary key')",
+            USER, WORKSPACE
+        );
+
+        assert_rejected_for_null_primary_key(outcome, "feedback", "id");
+    }
+}
+
+dual_backend_test! {
+    /// An issue_activities row with no activity_id is rejected.
+    async fn issue_activities_rejects_a_null_primary_key(db) {
+        seed_tenancy(db).await;
+        let issue = create_issue(db, "An issue for the activity row to reference").await;
+
+        let outcome = db_execute!(
+            db,
+            "INSERT INTO issue_activities (activity_id, issue_id, workspace_id, action_type) \
+             VALUES (NULL, $1, $2, 'created')",
+            issue.issue_id, WORKSPACE
+        );
+
+        assert_rejected_for_null_primary_key(outcome, "issue_activities", "activity_id");
+    }
+}
+
+dual_backend_test! {
+    /// A notification_preferences row with no preference_id is rejected.
+    async fn notification_preferences_rejects_a_null_primary_key(db) {
+        seed_user(db, USER, "prefs-null@example.test")
+            .await
+            .expect("seed the user the preference row names");
+        seed_workspace(db, WORKSPACE, USER)
+            .await
+            .expect("seed the workspace the preference row names");
+
+        let outcome = db_execute!(
+            db,
+            "INSERT INTO notification_preferences (preference_id, user_id, workspace_id) \
+             VALUES (NULL, $1, $2)",
+            USER, WORKSPACE
+        );
+
+        assert_rejected_for_null_primary_key(outcome, "notification_preferences", "preference_id");
+    }
 }
