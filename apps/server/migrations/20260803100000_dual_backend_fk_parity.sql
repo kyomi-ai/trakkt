@@ -1,0 +1,27 @@
+-- TRA-9999 (absorbing TRA-9969, TRA-9990, TRA-10000): no schema change on
+-- Postgres. This version exists only so the SQLite side of it can.
+--
+-- The change is SQLite catching up. Every constraint the SQLite counterpart
+-- adds is already present here, which is the whole point: production runs
+-- Postgres, so Postgres is the reference and SQLite is what moved. Read
+-- `apps/server/migrations-sqlite/20260803100000_dual_backend_fk_parity.sql` for
+-- the per-table reasoning and for the one key deliberately left outstanding.
+--
+-- Verified rather than assumed, by replaying all 42 prior migrations of each
+-- directory into a throwaway database and reading `pg_constraint` and
+-- `PRAGMA foreign_key_list` — reading migration text is misleading here,
+-- because earlier migrations rebuild tables and a constraint declared in one
+-- file need not survive into the final schema. Postgres carried 78 foreign
+-- keys, SQLite 66; twelve existed only on Postgres and four more differed in
+-- ON DELETE. Three TEXT primary keys were nullable on SQLite and NOT NULL here.
+-- Nothing in either list called for a Postgres change.
+--
+-- A no-op file rather than no file at all: scripts/check-migrations.sh requires
+-- every version to exist under the same filename in both directories, because
+-- sqlx tracks applied versions per database and a gap in one dialect's sequence
+-- is a divergence no later migration can reconcile. Its header records that an
+-- empty no-op is the intended way to express a dialect-only change.
+-- 20260522000000_full_text_search.sql is the same arrangement mirrored — there
+-- the change was Postgres-only and the SQLite file is the `SELECT 1;`.
+
+SELECT 1;
