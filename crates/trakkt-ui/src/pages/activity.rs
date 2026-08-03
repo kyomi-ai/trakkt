@@ -9,6 +9,7 @@
 use leptos::prelude::*;
 use phosphor_leptos::{Icon, IconWeight};
 
+use crate::cache::store::SyncStore;
 use crate::components::{Button, ButtonVariant, Select, SelectVariant, Spinner};
 use crate::server_fns::activities::list_workspace_activities;
 use crate::server_fns::team::list_workspace_members;
@@ -148,6 +149,54 @@ fn group_activities(activities: &[WorkspaceActivity]) -> GroupedActivities {
         this_week,
         older,
     }
+}
+
+// ─── Live activity frames ────────────────────────────────────────────────────
+
+/// Re-run `refetch` whenever a live ACTIVITY sync frame bumps the store's
+/// activity counter.
+///
+/// This page reads its rows through the `list_workspace_activities` server
+/// function, never from the sync store, so the counter is the only reactive
+/// dependency that can tell it another user, another tab or an agent recorded
+/// something. Without it the feed shows what it read on mount until it is
+/// navigated away from and back.
+///
+/// # The counter is resolved here, never inside the effect
+///
+/// [`SyncStore::activities_version`] builds a fresh `Signal` wrapper on every
+/// call, and each wrapper is an owner-registered arena item. Calling it from a
+/// closure that re-runs allocates another one per run, under whichever owner
+/// happens to be current at the time — and reading one after its owner is
+/// disposed panics. That is the shape TRA-9977 was reverted for, so the getter
+/// is called once, before the effect exists. The rule is recorded on this
+/// function rather than only at its call site, so it survives an edit made
+/// here in isolation.
+///
+/// # Why `store` is optional
+///
+/// `use_context::<SyncStore>()` returns an `Option`. `Layout`
+/// (`crates/trakkt-ui/src/components/layout.rs:38`) provides the store and
+/// wraps every authenticated route, `/activity` among them, but that is a
+/// property of the route table rather than of the type, and every other reader
+/// in this crate — `NotificationsPage`, `IssueDetailContent`,
+/// `AttachmentsSection` — treats it as optional. With no store there is no
+/// counter to subscribe to and nothing to wire; the page still loads and
+/// paginates through its own server calls.
+fn refetch_on_live_activity(store: Option<SyncStore>, refetch: impl Fn() + Send + Sync + 'static) {
+    let Some(version) = store.map(|store| store.activities_version()) else {
+        return;
+    };
+
+    Effect::new(move |previous: Option<u32>| {
+        let current = version.get();
+        // Skip the first fire: the initial-load effect has already asked for
+        // page one, and the same shape is what the filter effect below uses.
+        if previous.is_some_and(|previous| previous != current) {
+            refetch();
+        }
+        current
+    });
 }
 
 // ─── Page component ──────────────────────────────────────────────────────────
@@ -306,6 +355,20 @@ pub fn ActivityPage() -> impl IntoView {
         current
     });
 
+    // Re-fetch on a live activity frame from another client.
+    //
+    // This restarts at page one rather than merging the new rows into what is
+    // already loaded, which is the same reset a filter change performs above.
+    // The trade is that a frame arriving while the user has paged through the
+    // feed with "Load more" drops them back to the newest page; merging instead
+    // means deduplicating by `activity_id` and handling the coalescing path's
+    // updates to rows already held, which is a larger change than making the
+    // frames arrive at all.
+    let fetch_on_live_activity = fetch_activities;
+    refetch_on_live_activity(use_context::<SyncStore>(), move || {
+        fetch_on_live_activity(true);
+    });
+
     let fetch_more = fetch_activities;
 
     view! {
@@ -448,5 +511,126 @@ fn ActivityRow(activity: WorkspaceActivity) -> impl IntoView {
                 {timestamp}
             </span>
         </a>
+    }
+}
+
+// ─── Browser tests ───────────────────────────────────────────────────────────
+
+/// Run with:
+/// `wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate`
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gloo_timers::future::TimeoutFuture;
+    use leptos::prelude::*;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use crate::cache::store::SyncStore;
+    use crate::wasm_test_support::boot_leptos_executor;
+
+    use super::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// What [`refetch_on_live_activity`] is wired to in `ActivityPage`, reduced
+    /// to a counter: a closure that reloads the first page of the feed.
+    ///
+    /// `Rc<Cell<u32>>` rather than a signal so the assertions read a plain
+    /// value and cannot themselves be the thing that is reactive.
+    fn counting_refetch() -> (Rc<Cell<u32>>, impl Fn() + Send + Sync + 'static) {
+        let runs = Rc::new(Cell::new(0u32));
+        let counted = send_wrapper::SendWrapper::new(Rc::clone(&runs));
+        (runs, move || counted.set(counted.get() + 1))
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_live_activity_frame_reloads_the_workspace_feed() {
+        boot_leptos_executor();
+        let owner = Owner::new();
+        owner.set();
+
+        let store = SyncStore::new();
+        let (runs, refetch) = counting_refetch();
+        refetch_on_live_activity(Some(store), refetch);
+
+        TimeoutFuture::new(20).await;
+        assert_eq!(
+            runs.get(),
+            0,
+            "the first fire is the effect registering its dependency — the page's own \
+             initial-load effect has already asked for page one, so refetching here would \
+             be a second request for the same rows"
+        );
+
+        store.bump_activities_version();
+        TimeoutFuture::new(20).await;
+
+        assert_eq!(
+            runs.get(),
+            1,
+            "the workspace activity feed reads its rows through \
+             `list_workspace_activities`, not from the sync store, so this counter is the \
+             only thing that can tell it another user or an agent recorded something — \
+             without it the page shows what it read on mount until it is navigated away \
+             from and back"
+        );
+
+        store.bump_activities_version();
+        TimeoutFuture::new(20).await;
+        assert_eq!(
+            runs.get(),
+            2,
+            "and it keeps following the counter, rather than reacting once and going quiet"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn only_activity_frames_reload_the_workspace_feed() {
+        // The feed shows activities and nothing else, so a comment or a relation
+        // arriving must not send it back to the server. Without this the test
+        // above would pass just as well against a wiring that refetched on any
+        // frame at all.
+        boot_leptos_executor();
+        let owner = Owner::new();
+        owner.set();
+
+        let store = SyncStore::new();
+        let (runs, refetch) = counting_refetch();
+        refetch_on_live_activity(Some(store), refetch);
+
+        TimeoutFuture::new(20).await;
+
+        store.bump_comments_version();
+        store.bump_relations_version();
+        TimeoutFuture::new(20).await;
+
+        assert_eq!(
+            runs.get(),
+            0,
+            "only the activity counter drives this page's refetch"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_feed_still_works_without_a_sync_store() {
+        // `use_context::<SyncStore>()` is an `Option`, and this is what the
+        // `None` arm has to do: nothing, quietly. The page's own initial load and
+        // its filter effects are untouched by it.
+        boot_leptos_executor();
+        let owner = Owner::new();
+        owner.set();
+
+        let (runs, refetch) = counting_refetch();
+        refetch_on_live_activity(None, refetch);
+
+        TimeoutFuture::new(20).await;
+        assert_eq!(
+            runs.get(),
+            0,
+            "with no store there is no counter to subscribe to, so there is nothing to \
+             refetch on"
+        );
     }
 }

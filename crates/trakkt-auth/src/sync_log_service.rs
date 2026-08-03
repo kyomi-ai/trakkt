@@ -7654,4 +7654,285 @@ mod tests {
             "and the second entry replays the new row, not the old one"
         );
     }
+
+    // ─── Activity frames and payloads (TRA-9987) ─────────────────────────────
+    //
+    // Activities reached a second client on reload and never live. Both write
+    // sites logged their entry with `None`, so every ACTIVITY frame on the wire
+    // and in every delta was data-less — and `cache/apply.rs` returns on a
+    // data-less insert/update *before* its entity-type match, so the arm that
+    // bumps the timeline's refetch counter never ran outside its own unit test.
+    // Comment on an issue or change a status, and a colleague with that issue
+    // open saw nothing until they reloaded.
+
+    /// A recorder over the fixture workspace, acting as A on a live socket.
+    ///
+    /// The `None` sibling above covers the durable half; this one is what makes
+    /// the broadcast observable.
+    fn activity_recorder_on<'a>(
+        db: &'a DbPool,
+        manager: &'a WebSocketManager,
+    ) -> crate::activity_service::ActivityRecorder<'a> {
+        crate::activity_service::ActivityRecorder::new(
+            db,
+            WS,
+            USER_A,
+            trakkt_types::enums::ActionSource::User,
+            None,
+            Some(manager),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_activity_insert_frame_carries_the_new_activity() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+        let recorder = activity_recorder_on(&db, &manager);
+
+        recorder
+            .record_field_change(&crate::activity_service::FieldChangeParams {
+                issue_id: "iss_vis",
+                action_type: "status_changed",
+                field: "status",
+                old_value: Some("Backlog"),
+                new_value: Some("In Progress"),
+                metadata: None,
+            })
+            .await
+            .expect("record a status change");
+
+        let recorded = issue_activities(&db).await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "precondition: the status change wrote exactly one activity"
+        );
+
+        let action = next_sync_action(&mut conn).await;
+        assert!(
+            matches!(action.action, SyncActionType::Insert),
+            "recording an activity creates a row, so the frame is an Insert of \
+             that row"
+        );
+        let data = payload_of(&action, entity_types::ACTIVITY, &recorded[0].activity_id);
+
+        let received: trakkt_types::models::IssueActivity =
+            serde_json::from_value(data).expect("payload deserializes into an IssueActivity");
+        assert_eq!(
+            received, recorded[0],
+            "the frame must carry the same row `list_issue_activities` would \
+             return, because it is what the other client applies instead of \
+             calling it"
+        );
+        assert_eq!(received.issue_id, "iss_vis");
+        assert_eq!(received.action_type, "status_changed");
+        assert_eq!(received.old_value.as_deref(), Some("Backlog"));
+        assert_eq!(received.new_value.as_deref(), Some("In Progress"));
+        assert_eq!(
+            received.actor_name.as_deref(),
+            Some(USER_A),
+            "the timeline renders the actor's name, and it lives on `users` — \
+             only the read-back's join can put it on the wire"
+        );
+        assert!(
+            !received.created_at.is_empty(),
+            "the payload is built after the read-back, so the DB-assigned \
+             created_at has to be in it — the timeline sorts on it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_coalesced_activity_frame_carries_the_row_on_both_branches() {
+        let db = two_user_workspace().await;
+        let (manager, mut conn) = watching_member(&db).await;
+        let recorder = activity_recorder_on(&db, &manager);
+
+        // Branch one: nothing recent to coalesce onto, so this inserts.
+        recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(None),
+                &description_snapshot(Some(1)),
+            )
+            .await
+            .expect("first description change");
+
+        let inserted = issue_activities(&db).await;
+        assert_eq!(inserted.len(), 1, "precondition: one activity so far");
+
+        let insert_frame = next_sync_action(&mut conn).await;
+        assert!(matches!(insert_frame.action, SyncActionType::Insert));
+        let insert_payload: trakkt_types::models::IssueActivity = serde_json::from_value(
+            payload_of(
+                &insert_frame,
+                entity_types::ACTIVITY,
+                &inserted[0].activity_id,
+            ),
+        )
+        .expect("the insert branch's payload deserializes into an IssueActivity");
+        assert_eq!(insert_payload, inserted[0]);
+        assert_eq!(insert_payload.action_type, "description_changed");
+
+        // `datetime('now')` has one-second resolution, so a row written in the
+        // same second as the coalescing UPDATE is indistinguishable from one it
+        // never touched. Backdating first is what makes the refreshed timestamp
+        // observable — the same reason the rollback test above does it.
+        backdate_activity(&db, &inserted[0].activity_id, 10).await;
+        let before = issue_activities(&db).await;
+
+        // Branch two: inside the 60s window, so this updates the row already
+        // written rather than inserting a second one.
+        recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(Some(1)),
+                &description_snapshot(Some(2)),
+            )
+            .await
+            .expect("second description change inside the window");
+
+        let after = issue_activities(&db).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "precondition: the second change coalesced rather than inserting"
+        );
+
+        let update_frame = next_sync_action(&mut conn).await;
+        assert!(
+            matches!(update_frame.action, SyncActionType::Update),
+            "the coalescing branch updates the row, so that is what the frame \
+             reports"
+        );
+        let update_payload: trakkt_types::models::IssueActivity = serde_json::from_value(
+            payload_of(
+                &update_frame,
+                entity_types::ACTIVITY,
+                &after[0].activity_id,
+            ),
+        )
+        .expect("the update branch's payload deserializes into an IssueActivity");
+        assert_eq!(
+            update_payload, after[0],
+            "the frame must carry the row as the UPDATE left it"
+        );
+        assert_ne!(
+            update_payload.created_at, before[0].created_at,
+            "the coalescing branch's only effect is moving created_at forward, \
+             so a payload read before it would carry the timestamp it replaced \
+             and every other client would sort the entry to the wrong place in \
+             its timeline"
+        );
+        assert_eq!(
+            update_payload.actor_name.as_deref(),
+            Some(USER_A),
+            "and the update branch reads the same joined actor name the insert \
+             branch does — one read-back covers both"
+        );
+    }
+
+    /// The durable half. Run with **no `ws_manager`**, so no live frame can
+    /// satisfy any of it: this is what a client that was offline for the whole
+    /// thing replays on reconnect.
+    ///
+    /// "Reaches a second window" and "survives a reconnect" are separate
+    /// criteria, and a `sync_log` row stored with a NULL `data` column fails the
+    /// second one silently — `delta_payloads` panics by name on the first entry
+    /// that has none.
+    #[tokio::test]
+    async fn delta_carries_a_payload_for_every_activity_write() {
+        let db = two_user_workspace().await;
+        let recorder = activity_recorder(&db);
+
+        recorder
+            .record("iss_vis", "created", None)
+            .await
+            .expect("record the creation activity");
+        recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(None),
+                &description_snapshot(Some(1)),
+            )
+            .await
+            .expect("first description change");
+
+        let seeded = issue_activities(&db).await;
+        assert_eq!(
+            seeded.len(),
+            2,
+            "precondition: one creation and one description change"
+        );
+        let description_id = seeded
+            .iter()
+            .find(|a| a.action_type == "description_changed")
+            .map(|a| a.activity_id.clone())
+            .expect("the description change is among the seeded activities");
+
+        backdate_activity(&db, &description_id, 10).await;
+        let backdated_created_at = issue_activities(&db)
+            .await
+            .into_iter()
+            .find(|a| a.activity_id == description_id)
+            .map(|a| a.created_at)
+            .expect("the backdated activity is still on the issue");
+
+        recorder
+            .record_issue_diff(
+                "iss_vis",
+                &description_snapshot(Some(1)),
+                &description_snapshot(Some(2)),
+            )
+            .await
+            .expect("second description change inside the window");
+
+        let rows = issue_activities(&db).await;
+        assert_eq!(rows.len(), 2, "the second change coalesced onto the first");
+
+        let payloads: Vec<trakkt_types::models::IssueActivity> =
+            delta_payloads(&db, USER_B, entity_types::ACTIVITY).await;
+        assert_eq!(
+            payloads.len(),
+            3,
+            "two inserts and one coalesced update, each of them replayable"
+        );
+        assert_eq!(payloads[0].action_type, "created");
+        assert_eq!(payloads[1].action_type, "description_changed");
+        assert_eq!(
+            payloads[2].activity_id, description_id,
+            "the third entry replays the row the coalescing branch updated, not \
+             a new one"
+        );
+
+        let refreshed = rows
+            .iter()
+            .find(|a| a.activity_id == description_id)
+            .expect("the coalesced activity is still on the issue");
+        assert_eq!(
+            payloads[2], *refreshed,
+            "a reconnecting client has to see the row as the UPDATE left it, \
+             timestamp included — otherwise its timeline orders that entry \
+             differently from a reloaded one forever"
+        );
+        assert_ne!(
+            payloads[2].created_at, backdated_created_at,
+            "the timestamp is the one thing the coalescing branch changes, so a \
+             payload read before the UPDATE — or one carried over from the \
+             insert — would still hold the value it replaced"
+        );
+
+        for payload in &payloads {
+            assert_eq!(
+                payload.issue_id, "iss_vis",
+                "every stored payload names the issue whose timeline replays it"
+            );
+            assert_eq!(
+                payload.actor_name.as_deref(),
+                Some(USER_A),
+                "and carries the joined actor name, which no caller of \
+                 `insert_activity` knows"
+            );
+            assert!(!payload.created_at.is_empty());
+        }
+    }
 }

@@ -1290,11 +1290,23 @@ pub async fn delete_issue(
     //   row for one. There is nothing on the wire for the client to have cached.
     //   An issue's labels reach clients inside the ISSUE payload, and the ISSUE
     //   delete entry takes them with it.
-    // * `issue_activities` — the type exists, but both write sites in
-    //   `activity_service` pass `None` as the payload and `sync_bootstrap` does
-    //   not stream activities, so every ACTIVITY frame is data-less. Both halves
-    //   of `cache/apply.rs` return at their missing-data guard before the match,
-    //   so no activity row ever reaches IndexedDB and there is none to evict.
+    // * `issue_activities` — there is no cached row to evict, and no reader that
+    //   would want one. `activity` is on `NOT_CACHED` in `cache/apply.rs`, so
+    //   `enqueue_cache_writes` skips it and no activity is ever written to
+    //   IndexedDB; nothing in `crates/trakkt-ui` reads one back either. The
+    //   timeline that shows activities refetches through
+    //   `list_issue_activities`, and that server function cannot return rows this
+    //   DELETE has removed.
+    //
+    //   The reasoning behind that entry changed under TRA-9957's feet and the
+    //   conclusion did not. When this list was written, both write sites in
+    //   `activity_service` passed `None` as the payload, so `cache/apply.rs`
+    //   returned at its missing-data guard and nothing was persisted. TRA-9987
+    //   gave them a payload — that is what makes a live activity reach another
+    //   client's timeline at all — which would have started persisting rows
+    //   nothing reads, so the same change put `activity` on `NOT_CACHED`. Either
+    //   way this table needs no entry here.
+    //
     //   Note also that this table does not cascade uniformly: the Postgres
     //   migration declares `issue_id ... ON DELETE CASCADE` while the SQLite one
     //   declares no foreign key at all, so on SQLite the rows are orphaned
