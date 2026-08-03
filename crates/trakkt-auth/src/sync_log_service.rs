@@ -3122,6 +3122,276 @@ mod tests {
         );
     }
 
+    // ─── Cascaded notifications (TRA-9989) ───────────────────────────────────
+    //
+    // `notifications.issue_id` was NO ACTION in both dialects until
+    // 20260803000000_notification_issue_cascade.sql, so an issue that had any
+    // notification could not be deleted at all — the `DELETE FROM issues` failed
+    // on the foreign key. That migration made it ON DELETE CASCADE, and these
+    // tests pin both halves of the consequence: the delete now succeeds, and
+    // every row it destroys gets a `sync_log` entry addressed to the one member
+    // whose inbox held it.
+    //
+    // Everything here runs on SQLite. The whole suite does (TRA-9958), so the
+    // Postgres arm of that migration is exercised by nothing in this repository
+    // — it has been read by eye and is not covered by a test.
+
+    /// Notify `user_id` about `issue_id` through the real service, returning the
+    /// id of the row it wrote.
+    ///
+    /// `create_notification` returns `()`, so the id is read back from the
+    /// table. `(user_id, issue_id, type)` identifies it because no fixture below
+    /// gives one user two notifications of the same type on the same issue.
+    async fn seed_notification(
+        db: &DbPool,
+        user_id: &str,
+        issue_id: &str,
+        notification_type: &str,
+        actor_id: &str,
+    ) -> String {
+        crate::notification_service::create_notification(
+            db,
+            WS,
+            user_id,
+            issue_id,
+            notification_type,
+            Some(actor_id),
+            None,
+            trakkt_types::enums::ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("create the notification the cascade will have to destroy");
+
+        db_fetch_scalar!(
+            db,
+            String,
+            "SELECT notification_id FROM notifications \
+             WHERE user_id = $1 AND issue_id = $2 AND type = $3",
+            user_id,
+            issue_id,
+            notification_type
+        )
+        .expect("read back the id of the notification just created")
+    }
+
+    /// One `sync_log` row, including the column that decides who may replay it.
+    ///
+    /// [`sync_entries`] drops `visibility_user_id`, which is the whole point of
+    /// the notification tests: a per-user entity recorded with
+    /// `SyncAudience::Workspace` lands here as `None` and is then replayed to
+    /// every member of the workspace.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct VisibleEntry {
+        entity_type: String,
+        entity_id: String,
+        action: String,
+        visibility_user_id: Option<String>,
+    }
+
+    /// [`sync_entries_after`], keeping `visibility_user_id`.
+    async fn visible_entries_after(db: &DbPool, skip: usize) -> Vec<VisibleEntry> {
+        #[derive(sqlx::FromRow)]
+        struct EntryRow {
+            entity_type: String,
+            entity_id: String,
+            action: String,
+            visibility_user_id: Option<String>,
+        }
+
+        let rows: Vec<EntryRow> = db_fetch_all!(
+            db,
+            EntryRow,
+            "SELECT entity_type, entity_id, action, visibility_user_id \
+             FROM sync_log ORDER BY sync_id"
+        )
+        .expect("read sync_log back with its visibility column");
+
+        rows.into_iter()
+            .skip(skip)
+            .map(|r| VisibleEntry {
+                entity_type: r.entity_type,
+                entity_id: r.entity_id,
+                action: r.action,
+                visibility_user_id: r.visibility_user_id,
+            })
+            .collect()
+    }
+
+    /// Every NOTIFICATION entry in `entries`, sorted so a test can compare
+    /// against an expected set without depending on the order the read returned
+    /// the rows in — no `ORDER BY` fixes that order.
+    fn notification_entries(mut entries: Vec<VisibleEntry>) -> Vec<VisibleEntry> {
+        entries.retain(|e| e.entity_type == entity_types::NOTIFICATION);
+        entries.sort();
+        entries
+    }
+
+    fn expected_notification_delete(entity_id: &str, recipient: &str) -> VisibleEntry {
+        VisibleEntry {
+            entity_type: entity_types::NOTIFICATION.to_string(),
+            entity_id: entity_id.to_string(),
+            action: "delete".to_string(),
+            visibility_user_id: Some(recipient.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_issue_carrying_a_notification_can_be_deleted_at_all() {
+        let db = two_user_workspace().await;
+
+        let notification = seed_notification(&db, USER_B, "iss_vis", "assigned", USER_A).await;
+
+        // Before the CASCADE migration this call returned
+        // `Sqlx(Database(SqliteError { code: 787, message: "FOREIGN KEY
+        // constraint failed" }))` and the issue stayed put — no workaround from
+        // the UI, and in production (Postgres) the same NO ACTION constraint.
+        crate::issue_service::delete_issue(&db, WS, "VIS", 1, None)
+            .await
+            .expect("delete an issue that a notification points at");
+
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM issues WHERE issue_id = $1",
+                "iss_vis"
+            )
+            .await,
+            0,
+            "the issue must actually be gone, not merely reported deleted"
+        );
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM notifications WHERE notification_id = $1",
+                &notification
+            )
+            .await,
+            0,
+            "the notification has to go with the issue — a row left behind still \
+             holds the foreign key that made this delete impossible"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_cascaded_notification_entry_is_scoped_to_its_own_recipient() {
+        let db = two_user_workspace().await;
+        seed_second_issue(&db).await;
+
+        // Two members with a notification each on the *same* doomed issue. One
+        // member would not distinguish per-recipient scoping from an entry that
+        // hard-codes a single id, and neither would tell either apart from
+        // `SyncAudience::Workspace`, which writes NULL.
+        let alices = seed_notification(&db, USER_A, "iss_vis", "status_changed", USER_B).await;
+        let bobs = seed_notification(&db, USER_B, "iss_vis", "assigned", USER_A).await;
+        let bystander = seed_notification(&db, USER_B, "iss_second", "assigned", USER_A).await;
+
+        let seeded_entries = sync_entries(&db).await.len();
+
+        crate::issue_service::delete_issue(&db, WS, "VIS", 1, None)
+            .await
+            .expect("delete the issue both members were notified about");
+
+        let mut expected = vec![
+            expected_notification_delete(&alices, USER_A),
+            expected_notification_delete(&bobs, USER_B),
+        ];
+        expected.sort();
+
+        assert_eq!(
+            notification_entries(visible_entries_after(&db, seeded_entries).await),
+            expected,
+            "every cascaded notification needs its own delete entry, carrying \
+             the recipient it was written for. A NULL here is \
+             `SyncAudience::Workspace`, which republishes both members' private \
+             notification ids to the whole workspace; the wrong id delivers the \
+             eviction to someone who never held the row, and leaves the person \
+             who did holding an inbox entry for an issue that no longer exists"
+        );
+
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM notifications WHERE notification_id = $1",
+                &bystander
+            )
+            .await,
+            1,
+            "the notification on the surviving issue is untouched, so 'entries \
+             for the right notifications' is distinguishable from 'entries for \
+             all of them'"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_soft_deleted_notification_cascades_and_gets_an_entry_too() {
+        let db = two_user_workspace().await;
+
+        let visible = seed_notification(&db, USER_A, "iss_vis", "status_changed", USER_B).await;
+        let hidden = seed_notification(&db, USER_A, "iss_vis", "assigned", USER_B).await;
+
+        crate::notification_service::bulk_delete_notifications(
+            &db,
+            std::slice::from_ref(&hidden),
+            USER_A,
+        )
+        .await
+        .expect("soft-delete one of A's two notifications");
+
+        // The premise: a soft-delete only stamps `deleted_at`. The row is still
+        // there, so it still holds the foreign key and the cascade still
+        // destroys it.
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM notifications \
+                 WHERE notification_id = $1 AND deleted_at IS NOT NULL",
+                &hidden
+            )
+            .await,
+            1,
+            "the soft-delete must leave the row in place with `deleted_at` set, \
+             or this test is not about soft-deleted notifications at all"
+        );
+
+        let seeded_entries = sync_entries(&db).await.len();
+
+        crate::issue_service::delete_issue(&db, WS, "VIS", 1, None)
+            .await
+            .expect("delete the issue both of A's notifications point at");
+
+        let mut expected = vec![
+            expected_notification_delete(&visible, USER_A),
+            expected_notification_delete(&hidden, USER_A),
+        ];
+        expected.sort();
+
+        // The read in `delete_issue` deliberately does not filter on
+        // `deleted_at`, and this is what that decision buys. A client that
+        // cached the row before it was soft-deleted still holds it:
+        // `bulk_delete_notifications` writes no `sync_log` entry at all, so
+        // nothing on the wire ever told that client the row was hidden. Skipping
+        // it here would strand it in the cache permanently.
+        assert_eq!(
+            notification_entries(visible_entries_after(&db, seeded_entries).await),
+            expected,
+            "a soft-deleted notification is physically destroyed by the cascade \
+             like any other, so it needs an entry like any other"
+        );
+
+        assert_eq!(
+            count_scalar(
+                &db,
+                "SELECT COUNT(*) FROM notifications WHERE issue_id = $1",
+                "iss_vis"
+            )
+            .await,
+            0,
+            "both rows must be gone, the hidden one included"
+        );
+    }
+
     #[tokio::test]
     async fn issue_delete_and_its_cascade_entries_roll_back_together() {
         let db = two_user_workspace().await;

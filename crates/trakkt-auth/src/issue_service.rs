@@ -237,6 +237,20 @@ struct CascadedIdRow {
     id: String,
 }
 
+/// One cascaded notification: its id, and the user whose inbox holds it.
+///
+/// [`CascadedIdRow`] cannot serve this read. A notification's `sync_log` entry
+/// is scoped to its recipient rather than to the workspace
+/// (`SyncAudience::User`, as `notification_service::create_notification` writes
+/// it), so the delete entry needs the `user_id` of the row it names — and one
+/// issue's notifications belong to several different people. The query lives in
+/// [`delete_issue`] and nowhere else.
+#[derive(sqlx::FromRow)]
+struct CascadedNotificationRow {
+    id: String,
+    user_id: String,
+}
+
 impl IssueLabelRow {
     fn into_dto(self) -> Label {
         Label {
@@ -1282,6 +1296,44 @@ pub async fn delete_issue(
         &issue_id
     )?;
 
+    // Notifications are cached: `sync_bootstrap` streams them (the
+    // `PendingBatch` list in `apps/server/src/routes/websocket.rs`) and
+    // `notification_service::create_notification` sends the serialized
+    // notification as its payload, so `enqueue_cache_writes` persists them to
+    // IndexedDB. Their delete arm is present in both halves of
+    // `crates/trakkt-ui/src/cache/apply.rs` — `remove_notification_in_memory` in
+    // the memory match and `enqueue_delete(.., NOTIFICATION, ..)` in the
+    // hand-written delete list — so an entry here evicts the row rather than
+    // only bumping a counter. Without it the recipient's inbox keeps an entry
+    // for an issue that no longer exists, through every reconnect, and the
+    // unread badge in `components/layout.rs` keeps counting it.
+    //
+    // Each entry is scoped to *its own* notification's recipient. This is the
+    // one cascaded type here that is not workspace-visible: notifications are
+    // written with `SyncAudience::User(user_id)`, and `SyncAudience`'s own doc
+    // records why — a per-user entity downgraded to `SyncAudience::Workspace`
+    // republishes one member's private rows to the whole workspace. An issue's
+    // notifications belong to different people, so one audience value cannot
+    // serve them all; hence the `user_id` on [`CascadedNotificationRow`].
+    //
+    // Deliberately not filtered on `deleted_at`. A soft-deleted notification is
+    // still a row, still holds the foreign key, and so is still destroyed by the
+    // cascade — and a client that cached it before the soft-delete still holds
+    // it, because `notification_service::bulk_delete_notifications` writes no
+    // `sync_log` entry at all. Filtering here would leave exactly those rows
+    // stranded in the cache.
+    //
+    // This is what the CASCADE added by
+    // `20260803000000_notification_issue_cascade.sql` made necessary. Before it,
+    // this foreign key was NO ACTION in both dialects and an issue with any
+    // notification could not be deleted at all.
+    let notifications: Vec<CascadedNotificationRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        CascadedNotificationRow,
+        "SELECT notification_id AS id, user_id FROM notifications WHERE issue_id = $1",
+        &issue_id
+    )?;
+
     // Deliberately *not* read, because no entry is needed:
     //
     // * `issue_labels`, `issue_watchers`, `issue_stars`, `release_issues`,
@@ -1318,14 +1370,8 @@ pub async fn delete_issue(
     // * `issue_attachments` — same reasoning: `attachment_service::attach_to_issue`
     //   records the link with `None`, and the bootstrap does not stream the type,
     //   so the junction row is never cached. TRA-9979 is the ticket that would
-    //   give the insert a payload; when it lands, this table joins the two read
-    //   above.
-    // * `notifications` — these do not cascade at all. The foreign key is
-    //   `notifications_issue_id_fkey ... REFERENCES issues(issue_id)` with no
-    //   `ON DELETE` clause on Postgres and the same inline form on SQLite, which
-    //   means NO ACTION in both dialects. Deleting an issue that has any
-    //   notification row fails on the foreign key instead of cascading, so there
-    //   is no removal to describe.
+    //   give the insert a payload; when it lands, this table joins the three
+    //   read above.
 
     trakkt_core::tx_execute!(
         &mut tx,
@@ -1369,6 +1415,23 @@ pub async fn delete_issue(
                 &relation.id,
                 workspace_id,
                 sync_log_service::SyncAudience::Workspace,
+                SyncActionType::Delete,
+                None,
+            )
+            .await?;
+    }
+
+    // `SyncAudience::User(&notification.user_id)`, not `Workspace`: each entry
+    // is addressed to the one member whose inbox held the row. See the read
+    // above.
+    for notification in &notifications {
+        batch
+            .record(
+                &mut tx,
+                entity_types::NOTIFICATION,
+                &notification.id,
+                workspace_id,
+                sync_log_service::SyncAudience::User(&notification.user_id),
                 SyncActionType::Delete,
                 None,
             )
