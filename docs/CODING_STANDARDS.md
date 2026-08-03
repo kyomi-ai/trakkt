@@ -89,6 +89,98 @@ Filler messages — `expect("unwrap")`, `expect("should work")`, `expect("failed
 
 Do not silence a clippy finding with `#[allow(...)]`, and never with a crate-level `#![allow(clippy::unwrap_used)]`. The `Lint Suppression Policy` job fails any PR whose diff adds `#[allow(` to a `.rs` file or `= "allow"` to a `Cargo.toml`. Fix the finding instead: `clippy::type_complexity` wants a `type` alias, `dead_code` wants the field genuinely read or removed.
 
+## The Postgres dialect suite
+
+Production runs Postgres. Every test in the workspace except this suite runs
+SQLite, so a defect confined to an `is_pg` query arm — a wrong placeholder
+index, a missing cast, `RETURNING` versus `last_insert_rowid()` — compiles,
+passes clippy, passes `cargo test`, and ships without anything having executed
+it. `sort_order` decoded as `f64` from a `FLOAT4` column shipped exactly that way
+twice.
+
+The suite lives in `apps/server/tests/postgres_dialect.rs` and its harness in
+`crates/trakkt-core/src/test_helpers/dual_backend.rs`.
+
+### Running it locally
+
+Start the test-rung Postgres once (5436 is Trakkt's test port; 5435 is Trakkt's
+development database and 5433/5434 belong to another project):
+
+```
+podman run -d --name trakkt-postgres-test -p 5436:5432 \
+    -e POSTGRES_USER=trakkt -e POSTGRES_PASSWORD=trakkt -e POSTGRES_DB=postgres \
+    docker.io/library/postgres:16
+```
+
+Then:
+
+```
+cargo test -p trakkt-server --test postgres_dialect -- --include-ignored
+```
+
+`--include-ignored` is what runs the Postgres halves. Without it you get the
+SQLite halves only. Set `TEST_DATABASE_URL` to point somewhere else; it is used
+only to `CREATE` and `DROP` a throwaway `trakkt_test_*` database per test, and no
+table in the database it names is read or written.
+
+### What happens with no Postgres running
+
+`cargo test` — with or without `--workspace` — still works, and nothing about
+the SQLite path becomes prerequisite-heavy. Each test is declared once with
+`dual_backend_test!` and expands into a pair:
+
+```
+test sync_entry_id_addresses_the_committed_row::sqlite   ... ok
+test sync_entry_id_addresses_the_committed_row::postgres ... ignored, requires a live Postgres — see crates/trakkt-core/src/test_helpers/dual_backend.rs
+```
+
+The SQLite half runs and passes. The Postgres half reports `ignored`, and the
+summary reports a non-zero `N ignored`. That count is the suite stating plainly
+that nothing was verified on Postgres.
+
+It is `#[ignore]` and not a silent skip on purpose, for the reason
+`crates/trakkt-core/src/redis.rs` already records: a harness that catches the
+connection error and returns early prints `ok`, which is indistinguishable from
+a run where Postgres was present and the code genuinely worked. Every machine
+without Postgres would then report success for a path it never touched — the
+exact failure mode this suite exists to remove. Do not "improve" it into a
+silent skip.
+
+Asked to run anyway (`--include-ignored`) with no server reachable, the harness
+**fails** with instructions rather than skipping. `ignored` never means "passed"
+and an unreachable database never means "fine".
+
+### Adding a test
+
+Write one body; the macro runs it on both backends:
+
+```rust
+dual_backend_test! {
+    /// What the assertion is for.
+    async fn a_committed_row_is_readable(db) {
+        // `db` is a `&DbPool` — Postgres in one run, SQLite in the other.
+    }
+}
+```
+
+A single shared body is the point. Two files, one per backend, would answer
+"does some Postgres test exist"; only a shared body keeps answering whether the
+*same* assertion holds on both after someone edits one half.
+
+Assert on decoded values, not on bytes. Postgres stores JSONB parsed and
+re-serialises it, so a payload written as `{"a":1}` reads back as `{"a": 1}`
+while SQLite returns the TEXT verbatim — a byte comparison fails on Postgres for
+no defect at all.
+
+### In CI
+
+The `Postgres Dialect Tests` job runs a `postgres:16` service container on 5436
+— the same port the local default names, so the default is the configuration CI
+exercises rather than an untested fallback. It runs with `--include-ignored` and
+then asserts the summary line reports `0 ignored`: in CI a database is present,
+so `ignored` would mean a Postgres arm quietly not exercised on a PR about to
+merge.
+
 ## Leptos / Frontend
 
 ### Component Patterns

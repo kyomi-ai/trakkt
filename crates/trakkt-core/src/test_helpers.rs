@@ -13,6 +13,11 @@
 //! `trakkt_server::auto_provision_personal_mode` — the production path that
 //! creates the same minimal set, in the same order the foreign keys require.
 //!
+//! [`dual_backend`] also lives here: it runs one test body against both SQLite
+//! and a real Postgres. Each seed function below takes a `&DbPool` and asks it
+//! which backend it is, so the same three calls seed either half of a
+//! [`dual_backend_test!`](crate::dual_backend_test) pair.
+//!
 //! # What does not, and why
 //!
 //! Issues, labels and statuses are *not* seeded here, deliberately. Every one
@@ -41,6 +46,8 @@
 //! trakkt_auth::team_service::add_team_member(&db, "team_1", "usr_1", "lead", "ws_1").await?;
 //! trakkt_auth::status_service::seed_default_statuses(&db, "ws_1").await?;
 //! ```
+
+pub mod dual_backend;
 
 use crate::db::DbPool;
 use crate::db_execute;
