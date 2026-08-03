@@ -94,6 +94,50 @@ struct SyncStoreInner {
 /// Cheaply `Copy`able — the actual data lives behind a `StoredValue`.
 /// Provide at the `Layout` level with [`provide_context`] and access on any
 /// child page with `expect_context::<SyncStore>()`.
+///
+/// # Contract for every getter on this type
+///
+/// **Resolve a getter once, at component setup. Never bind one inside a closure
+/// that re-runs.**
+///
+/// Every read-only getter below — the eight collection getters, `initialized()`,
+/// and all nine `*_version()` counters — returns a **newly built** [`Signal`] on
+/// each call.
+/// The underlying value is a long-lived `ArcRwSignal` held by this store, but
+/// the `Signal` handed back is a fresh `Signal::derive` wrapper, and a `Signal`
+/// is an arena item registered with **whichever owner is current at the moment
+/// of the call** (`reactive_graph-0.2.14`, `ArenaItem::new_with_storage` →
+/// `Owner::register`). When that owner is cleaned up, the arena slot is removed
+/// (`Owner::cleanup`), and any later read of that wrapper panics with "you tried
+/// to access a reactive value ... but it has already been disposed".
+///
+/// The owner does not have to be *torn down* for this to happen. `Effect` and
+/// `Memo` both call `Owner::with_cleanup` on **every re-run**
+/// (`effect/effect.rs`, `computed/inner.rs`), so a wrapper resolved inside an
+/// effect or memo body is disposed the next time that body runs. So is one
+/// resolved inside a component that a `Transition`/`Suspense` boundary rebuilds.
+/// A wrapper that outlives its resolution point — stored in a struct, captured
+/// by a longer-lived closure, or passed as a component prop — is the shape that
+/// panicked `/settings/notifications` and `/settings/workspace` and forced the
+/// revert of #282.
+///
+/// Reading a getter *inline* (`store.foo_version().get()`, wrapper built and
+/// consumed in one expression) does not panic, because the wrapper never
+/// outlives the expression — but it abandons one arena item per evaluation and
+/// is one refactor away from the panicking shape, so it is not the form to
+/// reach for either.
+///
+/// The safe form, used by every `*_version()` call site in `pages/` and
+/// enforced there by `no_page_resolves_a_version_counter_inline`:
+///
+/// ```ignore
+/// // at component setup, outside every closure:
+/// let version = sync_store.map(|s| s.activities_version());
+/// // inside the closure that re-runs, read the already-built Signal:
+/// let source = move || (team_key.clone(), version.map(|v| v.get()).unwrap_or(0));
+/// ```
+///
+/// Each claim above is checked by the tests in this module's `wasm_tests`.
 #[derive(Clone, Copy)]
 pub struct SyncStore {
     inner: StoredValue<SendWrapper<SyncStoreInner>>,
@@ -711,5 +755,295 @@ impl SyncStore {
             inner.notification_preferences_version.set(0);
             inner.workspace_settings_version.set(0);
         });
+    }
+}
+
+/// Checks for the getter contract documented on [`SyncStore`].
+///
+/// That contract is the reason `pages/` resolves every `*_version()` counter at
+/// component setup rather than inside the closure that reads it. It has now cost
+/// three review cycles (#282/#283, TRA-9977, TRA-9991) while living only in
+/// review logs and call-site comments, so the claims it makes are checked here,
+/// next to the getters they are about.
+///
+/// Run with:
+/// `wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate`
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A counter resolved under a subtree's owner dies when that subtree does.
+    ///
+    /// This is the whole reason the contract exists, and the mechanism behind
+    /// the `/settings/notifications` and `/settings/workspace` panics that got
+    /// #282 reverted. `Owner::cleanup` is not only a teardown path: `Effect` and
+    /// `Memo` run their bodies through `Owner::with_cleanup`, so an owner is
+    /// cleaned up on **every re-run**. A wrapper resolved inside such a body and
+    /// kept past that run is reading a removed arena slot.
+    ///
+    /// If this test ever stops panicking, the getters no longer hand back an
+    /// owner-scoped wrapper and the contract on [`SyncStore`] is stale — rewrite
+    /// it rather than deleting this.
+    #[wasm_bindgen_test]
+    #[should_panic(expected = "already been disposed")]
+    fn a_counter_resolved_under_a_subtree_owner_is_disposed_with_that_subtree() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+
+        // Stands in for an effect/memo body, or a component inside a suspense
+        // boundary — anything that runs under an owner it does not outlive.
+        let subtree = Owner::new();
+        let counter = subtree.with(|| store.activities_version());
+
+        subtree.cleanup();
+        let _ = counter.get_untracked();
+    }
+
+    /// The hoisted form survives every rebuild beneath it — the fix, asserted.
+    ///
+    /// Same store, same getter, same reads; the only difference from the test
+    /// above is *where* the getter was called. This is what
+    /// `sync_store.map(|s| s.activities_version())` at component setup buys.
+    #[wasm_bindgen_test]
+    fn a_counter_resolved_at_setup_still_reads_after_the_subtrees_beneath_it_rebuild() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+
+        // Resolved once, at "page setup".
+        let counter = store.activities_version();
+
+        // Three rebuilds of a subtree that reads it.
+        let subtree = Owner::new();
+        for _ in 0..3 {
+            subtree.cleanup();
+            subtree.with(|| {
+                let _ = counter.get_untracked();
+            });
+        }
+
+        store.bump_activities_version();
+        assert_eq!(
+            counter.get_untracked(),
+            1,
+            "a counter resolved at component setup must keep reading after the subtrees \
+             below it are rebuilt. If it does not, every page that keys a Resource on a \
+             sync counter stops refetching the moment its suspense boundary rebuilds"
+        );
+    }
+
+    /// Reading a getter inline does not panic — recorded so it is not re-derived.
+    ///
+    /// `store.foo_version().get()` builds a wrapper and consumes it in the same
+    /// expression, so the wrapper is never read after its owner is cleaned up
+    /// and the panic above cannot occur. What it does do is abandon one arena
+    /// item per evaluation, under whichever owner is current at the time.
+    ///
+    /// This is worth an explicit test because the inline form reads at a glance
+    /// exactly like the form that *does* panic, and the difference has twice
+    /// been mis-stated in review — in both directions. Being safe today is not a
+    /// reason to write it: binding the result instead of consuming it inline is
+    /// a one-line refactor away from the disposed-value panic, which is why
+    /// `pages/` no longer contains the shape.
+    #[wasm_bindgen_test]
+    fn reading_a_counter_inline_does_not_panic_but_abandons_a_wrapper_per_run() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let sync_store = Some(store);
+
+        // The pre-TRA-9991 shape, verbatim.
+        let inline = Signal::derive(move || {
+            sync_store
+                .map(|s| s.activities_version().get())
+                .unwrap_or(0)
+        });
+
+        let subtree = Owner::new();
+        for _ in 0..3 {
+            subtree.cleanup();
+            assert_eq!(subtree.with(|| inline.get_untracked()), 0);
+        }
+
+        store.bump_activities_version();
+        assert_eq!(
+            subtree.with(|| inline.get_untracked()),
+            1,
+            "the inline form reads correctly; it is a per-evaluation allocation, not a \
+             live panic. Any claim that it panics on its own is wrong and should be \
+             checked against this test before it costs another cycle"
+        );
+    }
+
+    /// Every counter a page keys a `Resource` on moves when its entity syncs.
+    ///
+    /// TRA-9991 rewrote the source closures of six such resources
+    /// (`MetadataSidebar`, `RelationsSection`, `IssueTimeline` in
+    /// `pages/issues/issue_detail.rs`; the milestone, update and member
+    /// resources in `pages/projects/project_detail.rs`) to read a counter
+    /// resolved at setup instead of resolving one inline. That is meant to be
+    /// behaviour-preserving, and this is what says so: each source is rebuilt in
+    /// the post-fix shape, and a bump of its own counter — and only its own —
+    /// must move it.
+    #[wasm_bindgen_test]
+    fn each_hoisted_page_source_still_moves_when_its_own_counter_bumps() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let sync_store = Some(store);
+
+        // The post-fix shape, one per rewritten call site.
+        let milestones = sync_store.map(|s| s.milestones_version());
+        let relations = sync_store.map(|s| s.relations_version());
+        let activities = sync_store.map(|s| s.activities_version());
+        let updates = sync_store.map(|s| s.project_updates_version());
+        let members = sync_store.map(|s| s.project_members_version());
+
+        let read = move || {
+            (
+                milestones.map(|v| v.get_untracked()).unwrap_or(0),
+                relations.map(|v| v.get_untracked()).unwrap_or(0),
+                activities.map(|v| v.get_untracked()).unwrap_or(0),
+                updates.map(|v| v.get_untracked()).unwrap_or(0),
+                members.map(|v| v.get_untracked()).unwrap_or(0),
+            )
+        };
+
+        assert_eq!(read(), (0, 0, 0, 0, 0));
+
+        store.bump_milestones_version();
+        assert_eq!(
+            read(),
+            (1, 0, 0, 0, 0),
+            "a project_milestone frame must move the milestone sources on the issue \
+             sidebar and the project page, and nothing else"
+        );
+
+        store.bump_relations_version();
+        assert_eq!(
+            read(),
+            (1, 1, 0, 0, 0),
+            "an issue_relation frame must move the relations section's source, and \
+             nothing else"
+        );
+
+        store.bump_activities_version();
+        assert_eq!(
+            read(),
+            (1, 1, 1, 0, 0),
+            "an activity frame must move the issue timeline's source, and nothing else"
+        );
+
+        store.bump_project_updates_version();
+        assert_eq!(
+            read(),
+            (1, 1, 1, 1, 0),
+            "a project_update frame must move the posted-updates source, and nothing else"
+        );
+
+        store.bump_project_members_version();
+        assert_eq!(
+            read(),
+            (1, 1, 1, 1, 1),
+            "a project_member frame must move the member-list source, and nothing else"
+        );
+    }
+}
+
+/// Source-level guard for the getter contract documented on [`SyncStore`].
+///
+/// Runs on the host (`cargo test --workspace`), not in the browser — it reads
+/// source text rather than executing anything.
+#[cfg(test)]
+mod source_guard {
+    use std::path::{Path, PathBuf};
+
+    /// No page or component may resolve a `*_version()` counter inline.
+    ///
+    /// # Why a source check and not a behavioural one
+    ///
+    /// Because a behavioural one is not possible. The inline form
+    /// (`store.foo_version().get()`) and the hoisted form are
+    /// runtime-indistinguishable at a call site: the inline wrapper is consumed
+    /// in the expression that builds it, so it is never read after its owner is
+    /// cleaned up and it cannot raise the disposed-value panic.
+    /// `reading_a_counter_inline_does_not_panic_but_abandons_a_wrapper_per_run`
+    /// in this file's `wasm_tests` pins that. Reverting any of the six call
+    /// sites TRA-9991 changed leaves the whole browser suite green, which is
+    /// exactly why the shape kept coming back — nothing but review caught it.
+    ///
+    /// So what this enforces is a style rule with teeth: keep the fragile form
+    /// out of `pages/` and `components/` so the safe form is the only one anyone
+    /// copies. The inline form is one refactor away from the panicking shape —
+    /// bind its result instead of consuming it, and the wrapper starts
+    /// outliving the closure that built it.
+    ///
+    /// # What it does not catch
+    ///
+    /// The genuinely dangerous shape: `let v = s.foo_version();` *inside* a
+    /// closure that re-runs. That binds the wrapper under a short-lived owner
+    /// and keeps it, which is the panic
+    /// `a_counter_resolved_under_a_subtree_owner_is_disposed_with_that_subtree`
+    /// demonstrates. Detecting it needs closure-scope tracking over Rust source,
+    /// which a substring scan cannot do; nothing in the tree writes that shape
+    /// today, and the contract on [`SyncStore`] is what stands between it and
+    /// the next author. This check is the cheap half, not the whole guard.
+    #[test]
+    fn no_page_resolves_a_version_counter_inline() {
+        // `store.rs` itself is excluded on purpose: its `wasm_tests` module
+        // keeps a copy of the banned expression as a pinned counter-example.
+        let roots = ["src/pages", "src/components"];
+        let mut offenders = Vec::new();
+
+        for root in roots {
+            let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(root);
+            assert!(
+                dir.is_dir(),
+                "expected {} to exist — this guard scans nothing if the tree moved, and \
+                 a guard that scans nothing passes forever",
+                dir.display()
+            );
+            visit(&dir, &mut offenders);
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these files resolve a SyncStore version counter inside the expression that \
+             reads it:\n  {}\nEach `*_version()` call builds a fresh owner-registered \
+             `Signal` wrapper (see the getter contract on `SyncStore`). Resolve it once at \
+             component setup instead:\n    let version = sync_store.map(|s| \
+             s.activities_version());\nand read `version.map(|v| v.get()).unwrap_or(0)` \
+             inside the closure.",
+            offenders.join("\n  ")
+        );
+    }
+
+    fn visit(dir: &Path, offenders: &mut Vec<String>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("reading {} while scanning for the inline shape: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| panic!("reading an entry under {}: {e}", dir.display()));
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, offenders);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("reading {} while scanning for the inline shape: {e}", path.display()));
+                // Whitespace-stripped so the multi-line form
+                // (`.map(|s| s.project_updates_version()\n.get())`) is caught
+                // too — the pre-TRA-9991 `project_detail.rs` was written that
+                // way, and a line-by-line scan would have missed it.
+                let packed: String = source.split_whitespace().collect();
+                if packed.contains("_version().get(") || packed.contains("_version().read(")
+                    || packed.contains("_version().with(") || packed.contains("_version().track(")
+                {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
     }
 }

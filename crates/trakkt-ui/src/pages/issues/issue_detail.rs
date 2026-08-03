@@ -854,9 +854,13 @@ fn MetadataSidebar(
     // the server function rather than the SyncStore, so `milestones_version` —
     // bumped by every project_milestone sync action — is the only thing that
     // can tell this dropdown its names and dates went stale.
-    let milestones_version = Signal::derive(move || {
-        sync_store.map(|s| s.milestones_version().get()).unwrap_or(0)
-    });
+    //
+    // Resolved once here, not inside the effect. `milestones_version` builds a
+    // fresh owner-registered `Signal` wrapper on every call — see the getter
+    // contract on `SyncStore` — so calling it from a closure that re-runs
+    // allocates another arena item per run, under whichever owner is current.
+    // Same shape as `ws_version` in `AttachmentsSection`.
+    let milestones_version = sync_store.map(|s| s.milestones_version());
     let milestones = RwSignal::new(Vec::<trakkt_types::models::ProjectMilestone>::new());
     Effect::new(move || {
         // Read unconditionally so the subscription is established on every run
@@ -864,7 +868,9 @@ fn MetadataSidebar(
         // happens to have a project. Reading it inside the branch would pick the
         // dependency up later and less predictably; this keeps the effect's
         // dependency set stable instead of varying with the data.
-        let _ = milestones_version.get();
+        if let Some(v) = milestones_version {
+            v.track();
+        }
         let pid = project_id.get();
         if let Some(pid) = pid {
             leptos::task::spawn_local(async move {
@@ -1970,11 +1976,24 @@ fn RelationsSection(
     let tk = team_key.clone();
     let (version, set_version) = signal(0u32);
     let sync_store = use_context::<crate::cache::store::SyncStore>();
-    let ws_version = Signal::derive(move || {
-        sync_store.map(|s| s.relations_version().get()).unwrap_or(0)
-    });
+    // `version` covers this tab's own adds and removes. The store counter covers
+    // everyone else's: an issue_relation frame bumps it.
+    //
+    // Resolved once here, not inside the source closure. `relations_version`
+    // builds a fresh owner-registered `Signal` wrapper on every call — see the
+    // getter contract on `SyncStore` — so calling it from a closure that re-runs
+    // allocates another arena item per run. Same shape as `ws_version` in
+    // `AttachmentsSection`.
+    let ws_version = sync_store.map(|s| s.relations_version());
     let relations_resource = Resource::new(
-        move || (tk.clone(), number, version.get(), ws_version.get()),
+        move || {
+            (
+                tk.clone(),
+                number,
+                version.get(),
+                ws_version.map(|v| v.get()).unwrap_or(0),
+            )
+        },
         move |(tk, num, _, _)| async move { list_issue_relations(tk, num).await },
     );
 
@@ -2354,15 +2373,25 @@ fn IssueTimeline(
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (filter, set_filter) = signal(TimelineFilter::All);
 
-    // Activities version from SyncStore — bumps on WebSocket activity events
-    let activities_version = Signal::derive(move || {
-        sync_store.map(|s| s.activities_version().get()).unwrap_or(0)
-    });
+    // Activities version from SyncStore — bumps on WebSocket activity events.
+    //
+    // Resolved once here, not inside the source closure. `activities_version`
+    // builds a fresh owner-registered `Signal` wrapper on every call — see the
+    // getter contract on `SyncStore` — so calling it from a closure that re-runs
+    // allocates another arena item per run. Same shape as `ws_version` in
+    // `AttachmentsSection`.
+    let activities_version = sync_store.map(|s| s.activities_version());
 
     // Fetch activities reactively, re-fetching when version bumps
     let tk = team_key.clone();
     let activities_resource = Resource::new(
-        move || (tk.clone(), number, activities_version.get()),
+        move || {
+            (
+                tk.clone(),
+                number,
+                activities_version.map(|v| v.get()).unwrap_or(0),
+            )
+        },
         move |(tk, num, _version)| async move {
             list_issue_activities(tk, num).await
         },

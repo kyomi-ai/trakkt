@@ -108,12 +108,19 @@ pub fn ProjectDetailPage() -> impl IntoView {
     // function. `milestones_version` bumps on every project_milestone sync
     // action, so keying the resource on it is what makes another client's
     // create/rename/re-date arrive here without a reload.
-    let milestones_version = Signal::derive(move || {
-        sync_store.map(|s| s.milestones_version().get()).unwrap_or(0)
-    });
+    //
+    // Each of the three counters below is resolved once here, not inside the
+    // source closure that reads it. The getters build a fresh owner-registered
+    // `Signal` wrapper on every call — see the getter contract on `SyncStore` — so
+    // calling one from a closure that re-runs allocates another arena item per
+    // run, under whichever owner is current at the time.
+    let milestones_version = sync_store.map(|s| s.milestones_version());
 
     let server_milestones = Resource::new(
-        move || (project_id.get(), milestones_version.get()),
+        move || (
+            project_id.get(),
+            milestones_version.map(|v| v.get()).unwrap_or(0),
+        ),
         move |(id, _version)| async move { list_milestones(id).await },
     );
 
@@ -122,25 +129,23 @@ pub fn ProjectDetailPage() -> impl IntoView {
     // project_update / project_member sync action, so keying the resources on
     // them is what makes another client's post, add or remove arrive here
     // without a reload.
-    let project_updates_version = Signal::derive(move || {
-        sync_store
-            .map(|s| s.project_updates_version().get())
-            .unwrap_or(0)
-    });
+    let project_updates_version = sync_store.map(|s| s.project_updates_version());
 
     let server_updates = Resource::new(
-        move || (project_id.get(), project_updates_version.get()),
+        move || (
+            project_id.get(),
+            project_updates_version.map(|v| v.get()).unwrap_or(0),
+        ),
         move |(id, _version)| async move { list_project_updates(id).await },
     );
 
-    let project_members_version = Signal::derive(move || {
-        sync_store
-            .map(|s| s.project_members_version().get())
-            .unwrap_or(0)
-    });
+    let project_members_version = sync_store.map(|s| s.project_members_version());
 
     let server_members = Resource::new(
-        move || (project_id.get(), project_members_version.get()),
+        move || (
+            project_id.get(),
+            project_members_version.map(|v| v.get()).unwrap_or(0),
+        ),
         move |(id, _version)| async move { list_project_members(id).await },
     );
 
