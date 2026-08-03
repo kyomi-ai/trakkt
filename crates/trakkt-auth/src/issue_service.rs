@@ -15,6 +15,7 @@ use trakkt_types::models::{CreateIssueParams, Issue, IssueFilters, IssueUpdate, 
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::sync_log_service::CascadedIdRow;
 use crate::websocket::WebSocketManager;
 
 // ─── Row types ──────────────────────────────────────────────────────────────
@@ -226,15 +227,6 @@ struct IssueLabelRow {
     name: String,
     color: String,
     created_at: String,
-}
-
-/// One id read back from a table an issue's `ON DELETE CASCADE` will empty.
-///
-/// The column is aliased to `id` by each query so a single row type serves them
-/// all; the queries live in [`delete_issue`] and nowhere else.
-#[derive(sqlx::FromRow)]
-struct CascadedIdRow {
-    id: String,
 }
 
 /// One cascaded notification: its id, and the user whose inbox holds it.

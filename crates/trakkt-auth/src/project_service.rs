@@ -12,6 +12,7 @@ use trakkt_types::models::{Project, ProjectMember, ProjectMilestone, ProjectProg
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::sync_log_service::CascadedIdRow;
 use crate::websocket::WebSocketManager;
 
 // ─── Row types ──────────────────────────────────────────────────────────────
@@ -103,6 +104,20 @@ impl MilestoneRow {
             created_at: self.created_at,
         }
     }
+}
+
+/// One issue a project delete detaches, and the workspace its `sync_log` entry
+/// belongs in.
+///
+/// [`CascadedIdRow`] cannot serve this read. These issues are the `ON DELETE SET
+/// NULL` half of the cascade — they survive it — so what each needs is an ISSUE
+/// *update* filed in its own workspace, and nothing constrains an issue's
+/// `project_id` or `milestone_id` to the workspace its project is in. The query
+/// lives in [`delete_project`] and nowhere else.
+#[derive(sqlx::FromRow)]
+struct DetachedIssueRow {
+    issue_id: String,
+    workspace_id: String,
 }
 
 /// Internal row type for deserialising `project_updates` query results.
@@ -487,13 +502,30 @@ pub async fn update_project(
 
 /// Delete a project.
 ///
-/// Cascading deletes remove associated members, milestones, and updates.
-/// Issues linked to this project will have `project_id` set to NULL (ON DELETE SET NULL).
+/// The single `DELETE FROM projects` destroys the project's members, milestones
+/// and posted updates through the database's own `ON DELETE CASCADE` foreign
+/// keys, and detaches its issues through `ON DELETE SET NULL`, so nothing after
+/// it can report what went with it. That is why the cascaded ids are read on the
+/// transaction *before* the DELETE: `sync_delta` replays entity-scoped actions,
+/// so an entity that never receives a delete action is never evicted from a
+/// client's IndexedDB cache — it survives every reconnect until the cache is
+/// cleared by hand. That was TRA-9971, and TRA-9957 was the same defect in
+/// [`crate::issue_service::delete_issue`].
 ///
-/// The DELETE, everything the schema cascades from it, and the `sync_log` entry
-/// that reports it are one transaction. A delete that commits without its sync
-/// row leaves the project on every other client forever, and no later delta can
-/// repair it — the row it would have to re-read is gone.
+/// The DELETE, the PROJECT entry, one entry per cascaded row and one ISSUE
+/// update per detached issue are written on one transaction and delivered by
+/// [`sync_log_service::SyncBatch`] strictly after it commits, so a client can
+/// never be told about a removal that was rolled back, nor left without the row
+/// that replays one that was not.
+///
+/// The issues are the asymmetric case. `ON DELETE SET NULL` leaves them in
+/// place, so what they need is an ISSUE **update carrying their new state**, not
+/// a delete: a client told to delete them would drop rows the server still has.
+/// Their payloads are therefore read back *after* the DELETE, which is the only
+/// point at which the cascade's effect on them is visible.
+///
+/// Only the cascaded types the client caches get an entry. The rest are
+/// enumerated at the read site below, each with the reason it needs none.
 pub async fn delete_project(
     db: &DbPool,
     project_id: &str,
@@ -516,25 +548,227 @@ pub async fn delete_project(
 
     let mut tx = db.begin().await?;
 
+    // ── Cascaded rows the client caches, read before the DELETE ─────────────
+    //
+    // Everything named below is gone the instant the DELETE runs, and the
+    // foreign keys that remove it report nothing back, so these are the only
+    // reads that can ever see it. They run on the transaction, not the pool: an
+    // open transaction holds SQLite's only connection (see `DbTx`).
+    //
+    // All three cascaded types are cached. `cache_rows_written_by` in
+    // `crates/trakkt-ui/src/cache/cached_types.rs` is the client's single
+    // membership rule — the write path is gated on it, the per-entity delete
+    // iterates it, and the reset wipe is its union — and none of
+    // `project_member`, `project_milestone` or `project_update` is on its
+    // `NOT_CACHED` list, so each owns exactly its own cache row. The rows really
+    // are written, too: `add_project_member`, `create_milestone` and
+    // `create_project_update` all send a payload, and a payload-carrying frame
+    // is what `enqueue_cache_writes` persists. So an entry here evicts an
+    // IndexedDB row rather than only bumping a counter.
+
+    // `project_members` has a composite primary key and no surrogate id, so the
+    // sync `entity_id` is the one `project_member_entity_id` builds — the same
+    // key `add_project_member` upserted the cached row under, which is what lets
+    // the client's delete target exactly that row. Only `user_id` is read back;
+    // `project_id` is this function's argument.
+    let member_user_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        CascadedIdRow,
+        "SELECT user_id AS id FROM project_members WHERE project_id = $1",
+        project_id
+    )?;
+
+    let milestone_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        CascadedIdRow,
+        "SELECT milestone_id AS id FROM project_milestones WHERE project_id = $1",
+        project_id
+    )?;
+
+    let update_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        CascadedIdRow,
+        "SELECT update_id AS id FROM project_updates WHERE project_id = $1",
+        project_id
+    )?;
+
+    // The issues the cascade detaches. Read here because after the DELETE
+    // neither predicate can find them again — `project_id` is NULL and the
+    // milestones the second one names no longer exist — and read back below,
+    // once the cascade has actually run, for the state their payloads carry.
+    //
+    // Two predicates, because a project takes two kinds of issue with it:
+    //
+    // * `project_id = $1` — the project's own issues, cleared by
+    //   `issues_project_id_fkey` / the SQLite column's `ON DELETE SET NULL`.
+    // * `milestone_id IN (its milestones)` — the second-order cascade. Deleting
+    //   the project deletes `project_milestones`, and on Postgres
+    //   `issues_milestone_id_fkey` (ON DELETE SET NULL) clears every
+    //   `issues.milestone_id` that pointed at one. This set is not a subset of
+    //   the first: neither `create_issue` nor `update_issue` requires an issue's
+    //   milestone to belong to the issue's own project, so an issue outside the
+    //   project can hold one of its milestones.
+    //
+    //   On SQLite those pointers are *not* cleared — `issues.milestone_id` has
+    //   no foreign key there at all, which
+    //   `migrations-sqlite/20260803100000_dual_backend_fk_parity.sql` records in
+    //   its closing note as the twelfth of twelve and deliberately leaves
+    //   outstanding. Both backends still get an entry per issue, because the
+    //   payload below is read back from the row as it actually stands: on
+    //   Postgres it reports the cleared pointer, on SQLite it re-reports the
+    //   unchanged issue. Neither claims a change that did not happen, and the
+    //   number of entries does not vary by dialect.
+    //
+    // `workspace_id` comes off the issue rather than off the project. Nothing
+    // constrains an issue's `project_id` or `milestone_id` to its own workspace
+    // — the two writers above bind whichever id they are given, and the schema
+    // has no such check — and a `sync_log` row filed under the wrong workspace
+    // reaches no client that holds the issue.
+    let detached_issues: Vec<DetachedIssueRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        DetachedIssueRow,
+        "SELECT issue_id, workspace_id FROM issues \
+         WHERE project_id = $1 \
+            OR milestone_id IN \
+               (SELECT milestone_id FROM project_milestones WHERE project_id = $1)",
+        project_id
+    )?;
+
+    // Deliberately *not* given an entry:
+    //
+    // * `favorites` — a favourited project is stored as `(target_type,
+    //   target_id)` with no foreign key to `projects` in either dialect, so this
+    //   DELETE cascades nothing there and the row survives. `favorite` is cached
+    //   (it is not on `NOT_CACHED`, and `sync_bootstrap` streams it), and the
+    //   surviving row is now stale — but it is an orphan the schema leaves
+    //   behind, not a removal this function performed, and a FAVORITE delete
+    //   entry here would report a deletion that did not happen and would silently
+    //   diverge the cache from the table. That is a defect in its own right and
+    //   is reported separately rather than papered over here.
+    // * `notifications` — `context_id` is plain TEXT with no foreign key
+    //   (`migrations-sqlite/20260610400000_notification_context_id.sql`), so a
+    //   project delete cascades nothing there either. Notifications are removed
+    //   by their issue's delete, which is `delete_issue`'s business, not this
+    //   one's; no issue is deleted here.
+    // * `issues.milestone_id` — covered by the read above rather than treated as
+    //   a separate entity type, because the entry it needs is an ISSUE update
+    //   and the issue may already be in that list through `project_id`.
+    // * Nothing else cascades, because nothing else points here. Grepping
+    //   `REFERENCES … projects(` across both migration directories finds four
+    //   referencing columns and no fifth — `project_members.project_id`,
+    //   `project_milestones.project_id`, `project_updates.project_id` and
+    //   `issues.project_id` — and `REFERENCES … project_milestones(` finds only
+    //   `issues.milestone_id`, which is the second-order case handled above.
+    //   `project_members` and `project_updates` are named by no foreign key at
+    //   all, so neither cascades any further. (Grep counts lines, and the SQLite
+    //   side redeclares columns each time a migration rebuilds `issues`, so the
+    //   line count there exceeds the key count; the set of referencing columns
+    //   is the same four either way.)
+
     trakkt_core::tx_execute!(
         &mut tx,
         "DELETE FROM projects WHERE project_id = $1",
         project_id
     )?;
 
-    // The sync entry follows the DELETE it describes — the same order as
+    let mut batch = sync_log_service::SyncBatch::new();
+
+    // The sync entries follow the DELETE they describe — the same order as
     // `issue_service::delete_issue` and `team_service::delete_team`.
-    sync_log_service::commit_and_deliver(
-        tx,
-        entity_types::PROJECT,
-        project_id,
-        &project.workspace_id,
-        sync_log_service::SyncAudience::Workspace,
-        SyncActionType::Delete,
-        None,
-        ws_manager,
-    )
-    .await
+    batch
+        .record(
+            &mut tx,
+            entity_types::PROJECT,
+            project_id,
+            &project.workspace_id,
+            sync_log_service::SyncAudience::Workspace,
+            SyncActionType::Delete,
+            None,
+        )
+        .await?;
+
+    // Every cascaded entry is `SyncAudience::Workspace`, matching the writer of
+    // each type: `add_project_member`, `create_milestone` and
+    // `create_project_update` all publish workspace-wide, so a delete scoped to
+    // one user would leave the row cached for everyone else.
+    //
+    // A delete carries no payload: there is no row left to send, and the client
+    // reads the entity id alone to drop the cached row and bump its counter.
+    for member in &member_user_ids {
+        let entity_id = project_member_entity_id(project_id, &member.id);
+        batch
+            .record(
+                &mut tx,
+                entity_types::PROJECT_MEMBER,
+                &entity_id,
+                &project.workspace_id,
+                sync_log_service::SyncAudience::Workspace,
+                SyncActionType::Delete,
+                None,
+            )
+            .await?;
+    }
+
+    for milestone in &milestone_ids {
+        batch
+            .record(
+                &mut tx,
+                entity_types::PROJECT_MILESTONE,
+                &milestone.id,
+                &project.workspace_id,
+                sync_log_service::SyncAudience::Workspace,
+                SyncActionType::Delete,
+                None,
+            )
+            .await?;
+    }
+
+    for update in &update_ids {
+        batch
+            .record(
+                &mut tx,
+                entity_types::PROJECT_UPDATE,
+                &update.id,
+                &project.workspace_id,
+                sync_log_service::SyncAudience::Workspace,
+                SyncActionType::Delete,
+                None,
+            )
+            .await?;
+    }
+
+    // `Update` with a payload, not `Delete`: these issues outlive the project.
+    // The payload is read here rather than beside the id capture above because
+    // only now does it carry what the cascade left — before the DELETE it would
+    // still name the project, and a client applying it would put the issue back
+    // under a project it has just been told to remove.
+    //
+    // A vanished issue reaches this as `NotFound` — the one thing
+    // `issue_sync_payload_tx` promises that variant means — and it is allowed to
+    // abort the whole delete rather than be skipped. The only way to reach it is
+    // a concurrent `delete_issue` landing in the gap between the id read above
+    // and the DELETE that takes these rows' locks, which SQLite cannot express
+    // at all, having one connection. Failing rolls the cascade back untouched
+    // and the caller's retry succeeds, because the id is no longer there to
+    // capture; skipping instead would commit a cascade leaving one issue stale
+    // in every client's cache, with no later delta able to repair it.
+    for issue in &detached_issues {
+        let payload =
+            crate::issue_service::issue_sync_payload_tx(&mut tx, &issue.issue_id).await?;
+        batch
+            .record(
+                &mut tx,
+                entity_types::ISSUE,
+                &issue.issue_id,
+                &issue.workspace_id,
+                sync_log_service::SyncAudience::Workspace,
+                SyncActionType::Update,
+                payload,
+            )
+            .await?;
+    }
+
+    batch.commit_and_deliver(tx, ws_manager).await
 }
 
 // ─── Project Members ────────────────────────────────────────────────────────
@@ -901,11 +1135,28 @@ pub async fn update_milestone(
 
 /// Delete a milestone.
 ///
-/// Issues linked to this milestone will have `milestone_id` set to NULL (ON DELETE SET NULL).
+/// The DELETE and the `sync_log` entry that reports it are one transaction — see
+/// [`delete_project`]. No row is destroyed alongside it: `project_milestones` is
+/// named by exactly one foreign key, `issues.milestone_id`, and the issues
+/// outlive the milestone.
 ///
-/// The DELETE, the `issues.milestone_id` clearing that the schema drives from
-/// it, and the `sync_log` entry that reports it are one transaction — see
-/// [`delete_project`]. Nothing cascades: the issues outlive the milestone.
+/// # Two things this does not do, both tracked separately
+///
+/// Neither is introduced here; both were true before [`delete_project`] was
+/// taught to report its cascade, and neither is that change's to fix.
+///
+/// * **The issues get no ISSUE update.** On Postgres
+///   `issues_milestone_id_fkey` clears their `milestone_id`, and nothing tells
+///   another client, so its cached issue rows keep naming a milestone that no
+///   longer exists — the same defect TRA-9971 fixed for a project's issues.
+///   [`delete_project`] does emit those updates for the milestones *it*
+///   cascades away, so the two paths currently disagree.
+/// * **On SQLite the pointer is not cleared at all.** `issues.milestone_id` has
+///   no foreign key there; the closing note of
+///   `migrations-sqlite/20260803100000_dual_backend_fk_parity.sql` records it as
+///   the twelfth of twelve keys and explains why rebuilding eleven tables to add
+///   it was not taken. So this DELETE leaves a dangling `milestone_id` on
+///   SQLite and a NULL one on Postgres.
 pub async fn delete_milestone(
     db: &DbPool,
     milestone_id: &str,

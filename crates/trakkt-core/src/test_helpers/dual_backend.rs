@@ -347,6 +347,87 @@ pub async fn reject_sync_log_inserts(db: &DbPool) {
     }
 }
 
+/// Make `sync_log` INSERTs of **one** `entity_type` fail, leaving every other
+/// entity type's insert to succeed.
+///
+/// [`reject_sync_log_inserts`] is enough for a mutation that writes a single
+/// entry, and useless for one that writes several. A cascade delete writes a
+/// PROJECT entry, then one per cascaded member, milestone and update, then an
+/// ISSUE update per detached issue; an unscoped trigger stops it at the first of
+/// those, so every rollback assertion passes for the same reason and none of
+/// them says anything about the loops that follow. Four tests would be green
+/// against an implementation that wrote only the PROJECT entry — which is
+/// exactly the bug under test.
+///
+/// Narrowing the trigger to one entity type is what makes each case fail for its
+/// own reason: the entries before the named type are written and accepted, and
+/// the rejection lands on the one being probed, so a rollback assertion is a
+/// statement about that loop and no other.
+///
+/// The narrowing is a `WHEN` clause on both backends, which is the trigger
+/// itself declining to fire rather than a body that inspects the row — so the
+/// entries it lets past are untouched by it.
+///
+/// `entity_type` is interpolated into the trigger text, not bound: `CREATE
+/// TRIGGER` is DDL and takes no parameters on either backend. Callers pass an
+/// `entity_types::*` constant, never anything from outside the test.
+///
+/// Pair with [`clear_sync_log_rejection`], which is what lets one test body
+/// probe several entity types against one database.
+pub async fn reject_sync_log_inserts_of_type(db: &DbPool, entity_type: &str) {
+    if db.is_postgres() {
+        // `CREATE OR REPLACE` because a body probing several types in turn
+        // reaches this more than once, and the function outlives the trigger
+        // that `clear_sync_log_rejection` drops.
+        db_execute!(
+            db,
+            "CREATE OR REPLACE FUNCTION reject_sync_log() RETURNS trigger LANGUAGE plpgsql \
+             AS $fn$ BEGIN RAISE EXCEPTION 'sync_log insert rejected'; END; $fn$"
+        )
+        .expect("create the Postgres sync_log rejection trigger function");
+
+        db_execute!(
+            db,
+            &format!(
+                "CREATE TRIGGER reject_sync_log BEFORE INSERT ON sync_log \
+                 FOR EACH ROW WHEN (NEW.entity_type = '{entity_type}') \
+                 EXECUTE FUNCTION reject_sync_log()"
+            )
+        )
+        .expect("install the narrowed Postgres sync_log rejection trigger");
+    } else {
+        db_execute!(
+            db,
+            &format!(
+                "CREATE TRIGGER reject_sync_log BEFORE INSERT ON sync_log \
+                 WHEN NEW.entity_type = '{entity_type}' \
+                 BEGIN SELECT RAISE(ABORT, 'sync_log insert rejected'); END"
+            )
+        )
+        .expect("install the narrowed SQLite sync_log rejection trigger");
+    }
+}
+
+/// Remove the trigger [`reject_sync_log_inserts_of_type`] installed, so the next
+/// entity type can be probed on the same database.
+///
+/// The Postgres trigger function is deliberately left in place: dropping it
+/// would need `CASCADE` or a second statement, and
+/// [`reject_sync_log_inserts_of_type`] re-creates it with `CREATE OR REPLACE`
+/// anyway. A function nothing references fires for nothing.
+///
+/// `DROP TRIGGER` is the one piece of this that has no shared spelling —
+/// Postgres requires the table (`DROP TRIGGER … ON sync_log`) and SQLite rejects
+/// it — which is the whole reason this is a helper and not two lines in a test.
+pub async fn clear_sync_log_rejection(db: &DbPool) {
+    let sql = if db.is_postgres() {
+        "DROP TRIGGER reject_sync_log ON sync_log"
+    } else {
+        "DROP TRIGGER reject_sync_log"
+    };
+    db_execute!(db, sql).expect("drop the sync_log rejection trigger");
+}
+
 /// Declare one test body and run it on both backends.
 ///
 /// ```rust,ignore
