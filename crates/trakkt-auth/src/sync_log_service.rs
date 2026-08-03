@@ -13,10 +13,12 @@
 //! - Postgres uses `RETURNING sync_id` to get the assigned ID; SQLite uses `last_insert_rowid()`
 //! - `data` is stored as JSONB on Postgres and TEXT on SQLite
 
+use std::sync::LazyLock;
+
 use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::{db_execute, db_fetch_all, db_fetch_scalar, tx_execute, tx_fetch_scalar, DbPool};
-use trakkt_types::sync::{SyncAction, SyncActionType};
+use trakkt_types::sync::{entity_types, SyncAction, SyncActionType};
 
 use crate::websocket::WebSocketManager;
 
@@ -299,13 +301,98 @@ pub async fn write_sync_entry_in_tx(
 
 // ─── get_entries_since ───────────────────────────────────────────────────────
 
+/// The delta query, with the TEAM membership predicate baked in (TRA-10013).
+///
+/// Built once because `get_entries_since` runs on every delta and `drain_delta`
+/// pages through it in a loop; the string is identical on both backends, so
+/// there is nothing per-call to decide.
+///
+/// # The membership predicate
+///
+/// `sync_log` has one `visibility_user_id` column, which can name a single
+/// user. A team's audience is "its N current members", so the column cannot
+/// express it and no value written at mutation time can: membership changes
+/// after the row is written. The audience is therefore derived here, at read
+/// time, from `team_members` as it stands when the delta is served.
+///
+/// It applies only to rows that would **add or refresh** a team, never to rows
+/// that remove one, and that asymmetry is the whole of the design:
+///
+/// * `action = 'delete'` is exempt. `team_service::delete_team` writes a
+///   workspace-visible TEAM `Delete` *after* the `DELETE FROM teams` it
+///   describes, and `team_members` declares `ON DELETE CASCADE` on
+///   `teams(team_id)` on both backends — so by the time that row is read back,
+///   every membership that would have authorised it is gone. Requiring
+///   membership for deletes would suppress it for the very members who hold the
+///   team, leaving a deleted team in their cache with nothing able to remove it.
+/// * The same exemption is what keeps TRA-9963's eviction row working. A
+///   removal writes a `TEAM`/`Delete` scoped to the departing user, after the
+///   `team_members` row is deleted; the user it is addressed to is by
+///   construction no longer a member, so a membership requirement covering
+///   deletes would swallow the one row that evicts them.
+///
+/// Letting every TEAM `Delete` through does mean a user who was never a member
+/// can receive the `entity_id` of a deleted team. Both TEAM `Delete` writers —
+/// `delete_team` and the eviction row in `write_membership_sync_entry` — pass a
+/// `None` payload, so the row carries a UUID and nothing about the team. On the
+/// client, `apply_action_to_memory`'s TEAM `Delete` arm calls
+/// `remove_team_in_memory`, which is a `retain` and matches nothing when the
+/// team is not held.
+///
+/// Only TEAM is filtered. It is the only entity type reachable in production
+/// whose bootstrap read is membership-scoped — `handle_sync_bootstrap` streams
+/// `list_teams(.., Some(user_id))`, an `INNER JOIN team_members` — while its
+/// writers persist `visibility_user_id = NULL`. The per-user types are already
+/// aligned by their writers through `SyncAudience`: `view` on
+/// `created_by`/`is_shared`, `favorite` and `notification` on their owner. The
+/// one other read that is narrower than workspace-wide is
+/// `list_statuses(.., None)`, whose `WHERE team_id IS NULL` means a team-scoped
+/// status would arrive on delta and never on bootstrap; that is unreachable
+/// today because the only production status writer, `seed_default_statuses`,
+/// hardcodes `team_id` to NULL and writes no `sync_log` row at all, and
+/// `create_status` — which does log, always as workspace-visible — has no
+/// non-test caller. It is not filtered here.
+///
+/// `entity_types::TEAM` and the action string are interpolated from the
+/// constants rather than typed in, so renaming either moves this query with it,
+/// and are literals rather than binds so both planners can see how selective
+/// `entity_type <> 'team'` is.
+static ENTRIES_SINCE_SQL: LazyLock<String> = LazyLock::new(|| {
+    let team = entity_types::TEAM;
+    let delete = action_type_to_str(&SyncActionType::Delete);
+    format!(
+        r#"
+        SELECT sync_id, entity_type, entity_id, workspace_id, action,
+               CAST(data AS TEXT) AS data,
+               CAST(created_at AS TEXT) AS created_at
+        FROM sync_log
+        WHERE workspace_id = $1 AND sync_id > $2
+          AND (visibility_user_id IS NULL OR visibility_user_id = $3)
+          AND (
+                entity_type <> '{team}'
+                OR action = '{delete}'
+                OR EXISTS (
+                     SELECT 1 FROM team_members
+                     WHERE team_members.team_id = sync_log.entity_id
+                       AND team_members.user_id = $3
+                   )
+              )
+        ORDER BY sync_id ASC
+        LIMIT $4
+        "#
+    )
+});
+
 /// Fetch the sync entries with `sync_id > since_sync_id` that `user_id` is
 /// allowed to see in a workspace.
 ///
 /// Workspace-visible rows (`visibility_user_id IS NULL`) go to every member;
-/// per-user rows go only to their owner. This is the enforcement point for the
-/// per-user entity scope — the client applies whatever it receives, so a row
-/// that reaches the wrong user is a leak.
+/// per-user rows go only to their owner. TEAM rows that would add or refresh a
+/// team go only to that team's current members, derived from `team_members` at
+/// read time — see [`ENTRIES_SINCE_SQL`] for why that one entity type needs a
+/// predicate the column cannot hold. This is the enforcement point for entity
+/// scope on delta: the client applies whatever it receives, so a row that
+/// reaches the wrong user is a leak.
 ///
 /// Results are ordered by `sync_id ASC` (oldest first) and capped by `limit`.
 pub async fn get_entries_since(
@@ -320,16 +407,7 @@ pub async fn get_entries_since(
     let rows: Vec<SyncLogRow> = db_fetch_all!(
         db,
         SyncLogRow,
-        r#"
-        SELECT sync_id, entity_type, entity_id, workspace_id, action,
-               CAST(data AS TEXT) AS data,
-               CAST(created_at AS TEXT) AS created_at
-        FROM sync_log
-        WHERE workspace_id = $1 AND sync_id > $2
-          AND (visibility_user_id IS NULL OR visibility_user_id = $3)
-        ORDER BY sync_id ASC
-        LIMIT $4
-        "#,
+        ENTRIES_SINCE_SQL.as_str(),
         workspace_id,
         since_sync_id,
         user_id,
@@ -2577,7 +2655,14 @@ mod tests {
             .await
             .expect("remove team member");
 
-        let payloads: Vec<Team> = delta_payloads(&db, USER_B, entity_types::TEAM).await;
+        // Observed as `USER_A`, the creator, who is a member for the whole
+        // sequence. The other tests in this section watch as `USER_B` — the user
+        // who made none of the writes — but TEAM rows that add or refresh a team
+        // now reach only that team's current members (TRA-10013), and `USER_B`
+        // ends the sequence removed from it, so watching as `USER_B` would
+        // assert on an empty stream. What this test is about is what each row
+        // *carries*, which `USER_A` sees in full.
+        let payloads: Vec<Team> = delta_payloads(&db, USER_A, entity_types::TEAM).await;
 
         assert_eq!(
             payloads.len(),
@@ -4776,6 +4861,499 @@ mod tests {
                 "{user_id} is still a member, so the team must stay cached"
             );
         }
+    }
+
+    // ─── Team visibility is membership-derived on delta (TRA-10013) ──────────
+
+    /// The team ids `handle_sync_bootstrap` streams to `user_id`, sorted.
+    ///
+    /// This is the exact call `fetch_bootstrap_data`
+    /// (`apps/server/src/routes/websocket.rs`) makes for the TEAM batch —
+    /// `list_teams(db, workspace_id, Some(user_id))` — so it is the team set a
+    /// client holds after a `SyncReset`, not an approximation of it.
+    async fn teams_after_bootstrap(db: &DbPool, user_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = crate::team_service::list_teams(db, WS, Some(user_id))
+            .await
+            .expect("read the team set bootstrap would stream")
+            .into_iter()
+            .map(|t| t.team_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A connected client's TEAM cache and the sync cursor it holds it at.
+    ///
+    /// Replaying the delta from zero is not the scenario these tests are about
+    /// and cannot distinguish the two outcomes that matter: a team that was
+    /// never delivered and a team that was delivered and then correctly evicted
+    /// both come out as "absent" when the filter suppresses the rows that would
+    /// have added it. A real client bootstraps once, holds a cursor, and applies
+    /// what arrives after it — so that is what this models, and only under that
+    /// model does the eviction row TRA-9963 added have anything to do.
+    struct TeamCache<'a> {
+        user_id: &'a str,
+        teams: Vec<String>,
+        cursor: i64,
+    }
+
+    impl<'a> TeamCache<'a> {
+        /// What `handle_sync_bootstrap` leaves a freshly connected client
+        /// holding: `list_teams(.., Some(user))`, at the watermark read before
+        /// the data (`get_latest_sync_id`) — the same order, for the same
+        /// reason, as the handler.
+        async fn bootstrapped(db: &DbPool, user_id: &'a str) -> TeamCache<'a> {
+            let cursor = get_latest_sync_id(db, WS)
+                .await
+                .expect("read the watermark bootstrap hands the client");
+            TeamCache {
+                user_id,
+                teams: teams_after_bootstrap(db, user_id).await,
+                cursor,
+            }
+        }
+
+        /// Apply everything since the cursor, then advance it — one delta round
+        /// trip.
+        ///
+        /// The TEAM rules are `apply_action_to_memory`'s TEAM arms in
+        /// `crates/trakkt-ui/src/cache/apply.rs`: `Insert`/`Update` with a
+        /// payload calls `upsert_team`, one with no payload is skipped before it
+        /// reaches the match, and `Delete` calls `remove_team_in_memory`. The
+        /// cursor advances to the last `sync_id` delivered across *all* entity
+        /// types, as `drain_delta` (`apps/server/src/routes/websocket.rs`) does
+        /// — a client does not rewind to re-read entries it filtered out.
+        async fn catch_up(&mut self, db: &DbPool) {
+            let entries = get_entries_since(db, WS, self.user_id, self.cursor, 10_000)
+                .await
+                .expect("read the delta a connected client would be sent");
+
+            for entry in entries {
+                self.cursor = self.cursor.max(entry.sync_id);
+                if entry.entity_type != entity_types::TEAM {
+                    continue;
+                }
+                match entry.action {
+                    SyncActionType::Insert | SyncActionType::Update => {
+                        if entry.data.is_some() && !self.teams.contains(&entry.entity_id) {
+                            self.teams.push(entry.entity_id);
+                        }
+                    }
+                    SyncActionType::Delete => self.teams.retain(|id| id != &entry.entity_id),
+                }
+            }
+
+            self.teams.sort();
+        }
+
+        /// Catch up, then assert the invariant TRA-10013 exists to restore: the
+        /// team set this client now holds is the one it would hold after a
+        /// `SyncReset`.
+        ///
+        /// Asserted directly rather than trigger by trigger. Every leak in this
+        /// area is an instance of the two sync paths disagreeing, so this covers
+        /// triggers nobody thought to enumerate, including ones added later.
+        async fn assert_agrees_with_bootstrap(&mut self, db: &DbPool, when: &str) {
+            self.catch_up(db).await;
+            assert_eq!(
+                self.teams,
+                teams_after_bootstrap(db, self.user_id).await,
+                "{when}: the team set {} holds after applying the delta must \
+                 equal the one they would hold after a SyncReset",
+                self.user_id
+            );
+        }
+    }
+
+    /// Create a team through the real service with `USER_A` as its only member.
+    async fn team_owned_by_a(db: &DbPool, name: &str, key: &str) -> String {
+        crate::team_service::create_team(
+            db,
+            &crate::team_service::CreateTeamParams {
+                workspace_id: WS,
+                name,
+                key,
+                description: None,
+                icon: None,
+                creator_id: Some(USER_A),
+            },
+            None,
+        )
+        .await
+        .expect("create the team USER_A is the sole member of")
+        .team_id
+    }
+
+    /// `create_team` writes a workspace-visible `Insert` and a workspace-visible
+    /// `Update`, so a brand new team landed in the cache of every member of the
+    /// workspace, member of the team or not.
+    #[tokio::test]
+    async fn creating_a_team_reaches_no_non_member() {
+        let db = two_user_workspace().await;
+        let mut alice = TeamCache::bootstrapped(&db, USER_A).await;
+        let mut bob = TeamCache::bootstrapped(&db, USER_B).await;
+
+        let team_id = team_owned_by_a(&db, "Alice Only", "AON").await;
+
+        alice.catch_up(&db).await;
+        assert_eq!(
+            alice.teams,
+            vec![team_id],
+            "the creator is added as a lead member, so the team has to reach them"
+        );
+
+        bob.catch_up(&db).await;
+        assert_eq!(
+            bob.teams,
+            Vec::<String>::new(),
+            "USER_B has never been a member of this team, so its name, key and \
+             settings must not reach them"
+        );
+
+        alice.assert_agrees_with_bootstrap(&db, "after create_team").await;
+        bob.assert_agrees_with_bootstrap(&db, "after create_team").await;
+    }
+
+    /// A rename goes through `commit_team_update`, which every single-statement
+    /// team mutation ends with — rename, key change, icon set/upload/delete and
+    /// `update_team_settings` all land on that one workspace-visible `Update`.
+    #[tokio::test]
+    async fn renaming_a_team_reaches_no_non_member() {
+        let db = two_user_workspace().await;
+        let team_id = team_owned_by_a(&db, "Alice Only", "AON").await;
+        let mut alice = TeamCache::bootstrapped(&db, USER_A).await;
+        let mut bob = TeamCache::bootstrapped(&db, USER_B).await;
+
+        crate::team_service::update_team(&db, &team_id, WS, Some("Renamed".to_owned()), None, None)
+            .await
+            .expect("rename the team USER_B is not a member of");
+
+        bob.catch_up(&db).await;
+        assert_eq!(
+            bob.teams,
+            Vec::<String>::new(),
+            "a rename must not disclose the team to a non-member"
+        );
+
+        alice.catch_up(&db).await;
+        assert_eq!(
+            alice.teams,
+            vec![team_id],
+            "the member must still receive the rename"
+        );
+
+        alice.assert_agrees_with_bootstrap(&db, "after update_team").await;
+        bob.assert_agrees_with_bootstrap(&db, "after update_team").await;
+    }
+
+    /// Settings carry the team's workflow configuration — auto-archive and the
+    /// rest — and reached a non-member through the same `commit_team_update`.
+    #[tokio::test]
+    async fn a_settings_change_reaches_no_non_member() {
+        let db = two_user_workspace().await;
+        let team_id = team_owned_by_a(&db, "Alice Only", "AON").await;
+        let mut alice = TeamCache::bootstrapped(&db, USER_A).await;
+        let mut bob = TeamCache::bootstrapped(&db, USER_B).await;
+
+        crate::team_service::update_team_settings(
+            &db,
+            &team_id,
+            WS,
+            &trakkt_types::models::TeamSettings {
+                auto_archive_days: Some(30),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("write the settings a non-member must not receive");
+
+        bob.catch_up(&db).await;
+        assert_eq!(
+            bob.teams,
+            Vec::<String>::new(),
+            "a settings change must not disclose the team to a non-member"
+        );
+
+        alice.catch_up(&db).await;
+        assert_eq!(
+            alice.teams,
+            vec![team_id],
+            "the member must still receive the settings change"
+        );
+
+        alice.assert_agrees_with_bootstrap(&db, "after update_team_settings").await;
+        bob.assert_agrees_with_bootstrap(&db, "after update_team_settings").await;
+    }
+
+    /// `write_membership_sync_entry`'s workspace-visible `Update` fires on every
+    /// add, removal and role change, so anyone editing a team's membership
+    /// pushed that team to every member of the workspace.
+    #[tokio::test]
+    async fn a_membership_edit_reaches_no_non_member() {
+        let db = two_user_workspace().await;
+        let team_id = team_owned_by_a(&db, "Alice Only", "AON").await;
+        let mut alice = TeamCache::bootstrapped(&db, USER_A).await;
+        let mut bob = TeamCache::bootstrapped(&db, USER_B).await;
+
+        crate::team_service::update_team_member_role(&db, &team_id, USER_A, "member", WS)
+            .await
+            .expect("change the sole member's role");
+
+        bob.catch_up(&db).await;
+        assert_eq!(
+            bob.teams,
+            Vec::<String>::new(),
+            "a membership edit on a team USER_B is not in must not disclose it"
+        );
+
+        alice.catch_up(&db).await;
+        assert_eq!(
+            alice.teams,
+            vec![team_id],
+            "the member whose role changed must keep the team"
+        );
+
+        alice.assert_agrees_with_bootstrap(&db, "after a membership edit").await;
+        bob.assert_agrees_with_bootstrap(&db, "after a membership edit").await;
+    }
+
+    /// TRA-9963 stopped the removal itself from re-adding the team. It did not
+    /// stop the *next* workspace-visible write from doing so: that write carries
+    /// `visibility_user_id = NULL`, and the departed user is still a member of
+    /// the workspace.
+    ///
+    /// The first half of this test is also TRA-9963's own acceptance criterion,
+    /// asserted against a client that really did hold the team: `bob` bootstraps
+    /// as a member, so the eviction row has something to evict.
+    #[tokio::test]
+    async fn a_departed_member_is_not_handed_the_team_back_by_a_later_write() {
+        let db = two_user_workspace().await;
+        let team_id = team_owned_by_a(&db, "Alice Only", "AON").await;
+
+        crate::team_service::add_team_member(&db, &team_id, USER_B, "member", WS)
+            .await
+            .expect("add the member who will leave");
+
+        let mut bob = TeamCache::bootstrapped(&db, USER_B).await;
+        assert_eq!(
+            bob.teams,
+            vec![team_id.clone()],
+            "precondition: USER_B bootstraps holding the team, so the assertions \
+             below are about a team that was really there"
+        );
+
+        crate::team_service::remove_team_member(&db, &team_id, USER_B, WS)
+            .await
+            .expect("the member leaves");
+
+        bob.catch_up(&db).await;
+        assert_eq!(
+            bob.teams,
+            Vec::<String>::new(),
+            "leaving must evict the team from the departing member's cache \
+             (TRA-9963); the workspace-visible Update is filtered out for them \
+             now, so the user-scoped Delete is the only row that can do it"
+        );
+
+        crate::team_service::update_team(
+            &db,
+            &team_id,
+            WS,
+            Some("Renamed After They Left".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .expect("rename the team after the member left");
+
+        bob.catch_up(&db).await;
+        assert_eq!(
+            bob.teams,
+            Vec::<String>::new(),
+            "and a later rename must not hand it back"
+        );
+
+        bob.assert_agrees_with_bootstrap(&db, "after a departure and a rename").await;
+    }
+
+    /// A user removed and re-added inside one delta window ends up holding the
+    /// team.
+    ///
+    /// This is the case where the membership filter is least obviously right:
+    /// the user is a member again by the time the delta is served, so the filter
+    /// lets through both the eviction `Delete` from the removal and every
+    /// `Update` — including ones written while they were *not* a member. The
+    /// team ends cached because the rejoin's `Update` carries the highest
+    /// `sync_id` of the three and `get_entries_since` orders by it.
+    #[tokio::test]
+    async fn rejoining_a_team_after_leaving_leaves_it_cached() {
+        let db = two_user_workspace().await;
+        let team_id = team_owned_by_a(&db, "Alice Only", "AON").await;
+
+        crate::team_service::add_team_member(&db, &team_id, USER_B, "member", WS)
+            .await
+            .expect("add the member who will leave and come back");
+        let mut bob = TeamCache::bootstrapped(&db, USER_B).await;
+
+        crate::team_service::remove_team_member(&db, &team_id, USER_B, WS)
+            .await
+            .expect("the member leaves");
+        crate::team_service::add_team_member(&db, &team_id, USER_B, "member", WS)
+            .await
+            .expect("and rejoins before their client next catches up");
+
+        bob.catch_up(&db).await;
+        assert_eq!(
+            bob.teams,
+            vec![team_id],
+            "the eviction Delete is written before the rejoin's Update, so the \
+             Update is applied last and the team is cached"
+        );
+        bob.assert_agrees_with_bootstrap(&db, "after leaving and rejoining").await;
+    }
+
+    /// The trap on the other side of the fix. `delete_team` writes a
+    /// workspace-visible `Delete` *after* the `DELETE FROM teams` it describes,
+    /// and `team_members` cascades from `teams(team_id)` — so a membership
+    /// filter that also covered removals would suppress that row for every
+    /// member and leave a deleted team in their caches permanently.
+    #[tokio::test]
+    async fn deleting_a_team_still_evicts_it_from_every_members_cache() {
+        let db = two_user_workspace().await;
+        let team_id = team_owned_by_a(&db, "Alice Only", "AON").await;
+
+        crate::team_service::add_team_member(&db, &team_id, USER_B, "member", WS)
+            .await
+            .expect("add a second member");
+
+        let mut clients = [
+            TeamCache::bootstrapped(&db, USER_A).await,
+            TeamCache::bootstrapped(&db, USER_B).await,
+        ];
+        for client in &clients {
+            assert_eq!(
+                client.teams,
+                vec![team_id.clone()],
+                "precondition: {} holds the team before it is deleted",
+                client.user_id
+            );
+        }
+
+        crate::team_service::delete_team(&db, &team_id, WS, None, None, None)
+            .await
+            .expect("delete the team both users are members of");
+
+        for client in &mut clients {
+            client.catch_up(&db).await;
+            assert_eq!(
+                client.teams,
+                Vec::<String>::new(),
+                "the delete has to reach {} even though the membership row that \
+                 would authorise it cascaded away with the team",
+                client.user_id
+            );
+            client.assert_agrees_with_bootstrap(&db, "after delete_team").await;
+        }
+    }
+
+    /// One workspace, every TEAM writer, two clients with different histories —
+    /// with the bootstrap/delta invariant asserted after each step.
+    ///
+    /// The tests above each pin one writer. This pins the property they are all
+    /// instances of, over a sequence where the two users' team sets diverge and
+    /// re-converge, so a filter that satisfies each trigger in isolation but not
+    /// their combination fails here.
+    #[tokio::test]
+    async fn bootstrap_and_delta_agree_through_every_team_writer() {
+        let db = two_user_workspace().await;
+        let mut alice = TeamCache::bootstrapped(&db, USER_A).await;
+        let mut bob = TeamCache::bootstrapped(&db, USER_B).await;
+
+        let alices = team_owned_by_a(&db, "Alices", "ALI").await;
+        let shared = team_owned_by_a(&db, "Shared", "SHR").await;
+        let doomed = team_owned_by_a(&db, "Doomed", "DOO").await;
+        alice.assert_agrees_with_bootstrap(&db, "after three creates").await;
+        bob.assert_agrees_with_bootstrap(&db, "after three creates").await;
+
+        crate::team_service::add_team_member(&db, &shared, USER_B, "member", WS)
+            .await
+            .expect("USER_B joins the shared team");
+        crate::team_service::add_team_member(&db, &doomed, USER_B, "member", WS)
+            .await
+            .expect("USER_B joins the team that will be deleted");
+        alice.assert_agrees_with_bootstrap(&db, "after two joins").await;
+        bob.assert_agrees_with_bootstrap(&db, "after two joins").await;
+        assert_eq!(
+            bob.teams,
+            {
+                let mut expected = vec![shared.clone(), doomed.clone()];
+                expected.sort();
+                expected
+            },
+            "the two joins have to put both teams in USER_B's cache — a filter \
+             that let nothing through would satisfy the invariant vacuously"
+        );
+
+        crate::team_service::update_team(&db, &alices, WS, Some("Alice's".to_owned()), None, None)
+            .await
+            .expect("rename the team USER_B was never in");
+        crate::team_service::update_team_settings(
+            &db,
+            &shared,
+            WS,
+            &trakkt_types::models::TeamSettings {
+                auto_archive_days: Some(14),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("change the shared team's settings");
+        alice
+            .assert_agrees_with_bootstrap(&db, "after a rename and a settings change")
+            .await;
+        bob.assert_agrees_with_bootstrap(&db, "after a rename and a settings change")
+            .await;
+
+        crate::team_service::remove_team_member(&db, &shared, USER_B, WS)
+            .await
+            .expect("USER_B leaves the shared team");
+        crate::team_service::update_team(
+            &db,
+            &shared,
+            WS,
+            Some("Alice's Again".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .expect("rename the shared team after USER_B left");
+        alice.assert_agrees_with_bootstrap(&db, "after a departure and a rename").await;
+        bob.assert_agrees_with_bootstrap(&db, "after a departure and a rename").await;
+
+        crate::team_service::delete_team(&db, &doomed, WS, None, None, None)
+            .await
+            .expect("delete the doomed team");
+        alice.assert_agrees_with_bootstrap(&db, "after a delete").await;
+        bob.assert_agrees_with_bootstrap(&db, "after a delete").await;
+
+        assert_eq!(
+            bob.teams,
+            Vec::<String>::new(),
+            "USER_B left one team and had the other deleted, so they end holding \
+             none — reached by eviction, not by never having been told"
+        );
+        assert_eq!(
+            alice.teams,
+            {
+                let mut expected = vec![alices.clone(), shared.clone()];
+                expected.sort();
+                expected
+            },
+            "USER_A created all three and left none, so they end holding the two \
+             that still exist"
+        );
     }
 
     #[tokio::test]
