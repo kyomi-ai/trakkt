@@ -1,0 +1,287 @@
+# =============================================================================
+# Trakkt — Realtime E2E (two-client browser verification)
+# =============================================================================
+# Drives two browser contexts against one live server and asserts that a change
+# made in the first appears in the second WITHOUT a reload — the layer between
+# "the sync protocol delivered a frame" and "the user saw something change".
+# `cache/apply.rs`'s native tests cover everything up to the version counter
+# bumping; until this existed, deleting `milestones_version` from
+# `project_detail.rs`'s resource key left native, wasm and clippy all green,
+# which was verified by doing exactly that (TRA-9964).
+#
+# ── Why this is a separate workflow, and not a job in ci.yml ─────────────────
+# It needs a `paths:` filter, and `paths:` is a workflow-level trigger filter,
+# not a job-level one. Putting it in ci.yml would filter all eight of that
+# file's jobs — including required ones, which must run on every PR.
+#
+# ── Why it is NOT a required check ──────────────────────────────────────────
+# It is by a wide margin the most expensive thing in this repo. Unlike every
+# other job, it needs BOTH builds: the WASM bundle (there is a real browser
+# loading it) and the server binary (there is a real server serving it). See
+# `timeout-minutes` for the measurements — roughly 26 minutes of compilation
+# before a single assertion runs, against the ~7min that is currently the
+# slowest required check.
+#
+# Making it an eighth required check would therefore move typical PR wall-clock
+# from ~7min to this job's runtime for every PR that touches the client. That is
+# a real change to PR turnaround, and it is deliberately not decided here:
+# branch protection is untouched and the question is recorded in TRA-9964 for a
+# human. Nothing in this file needs to change if the answer is yes — the job
+# `name:` below is already stable.
+#
+# ── Why it still runs on PRs, rather than only on demand ────────────────────
+# A suite that only runs when someone remembers to ask for it is a suite that
+# runs after the regression has shipped. The `paths:` filter is what makes
+# running it automatically affordable: the regression it catches is only
+# reachable by editing the client's pages, components or sync cache, or the
+# server code that feeds them, so PRs that touch none of those pay nothing.
+# `workflow_dispatch` is kept so it can also be run by hand against any branch.
+# =============================================================================
+
+name: Realtime E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      # The two mutation targets and everything that feeds them: the pages that
+      # key a Resource or an Effect on a version counter, the components they
+      # render, the store that owns the counters, and the client sync engine.
+      - 'crates/trakkt-ui/src/pages/**'
+      - 'crates/trakkt-ui/src/components/**'
+      - 'crates/trakkt-ui/src/cache/**'
+      # The server half of the same path: what gets written to sync_log, what is
+      # broadcast live, and what a reconnecting client is replayed.
+      - 'crates/trakkt-auth/src/sync_log_service.rs'
+      - 'crates/trakkt-auth/src/project_service.rs'
+      - 'apps/server/src/**'
+      # The suite itself.
+      - 'e2e/tests/sync/**'
+      - 'e2e/playwright.sync.config.ts'
+      - '.github/workflows/realtime-e2e.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  realtime-e2e:
+    # Stable, and chosen so it still reads correctly if this ever does become a
+    # required check — required-check names cannot churn without an admin
+    # editing branch protection, so it is named for what it verifies rather than
+    # for how it is triggered.
+    name: Realtime E2E (two-client)
+    runs-on: ubuntu-latest
+    # Bounds the whole job. Measured on a developer machine during TRA-9964, in
+    # a fresh worktree with an empty target/:
+    #
+    #   trunk build (WASM + Tailwind), cold          451s
+    #   cargo build --profile dev-server, cold      1096s
+    #   server boot to a 200 on /health                2s
+    #   npm ci (warm npm cache)                        1s
+    #   the whole e2e/tests/sync suite, 13 tests     126s
+    #                                               -----
+    #   parity total, plus ~4min of setup           ~33min
+    #
+    # (Setup is apt, the toolchain with the wasm32 target, the trunk, tailwind
+    # and Chromium downloads, and `cargo update`.) The two builds are 96% of it;
+    # the tests themselves are 6%. This is a build cost, not a test cost.
+    #
+    # 60 is that parity figure with ~1.8x headroom, which is close to the 1.7x
+    # Test Suite allows itself. The headroom is not padding: no measurement of
+    # this job on a GitHub runner exists yet, and the other jobs in this repo
+    # run somewhere between 1.4x and 3x their local time. The first real runs
+    # should be used to bring this number down.
+    #
+    # What the bound actually caps is the failure mode a browser test has and a
+    # unit test does not: something that never resolves. Playwright's per-test
+    # timeout (180s, set in playwright.sync.config.ts) covers a hung assertion,
+    # but not a server that boots into a crash loop or a Chromium that fails to
+    # start — either would sit in the health-check loop below until GitHub's
+    # 6-hour default burned most of a runner-day.
+    timeout-minutes: 60
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      # Published on 5437. 5436 is the Postgres Dialect Tests port; a distinct
+      # one keeps the two readable side by side and means a future job running
+      # both would not collide.
+      DATABASE_URL: postgres://trakkt:trakkt@localhost:5437/trakkt
+      # self_hosted, and it is load-bearing rather than arbitrary. The suite
+      # signs up through the real UI, and the signup form only offers name and
+      # password when `self_hosted && !smtp_configured` (see `SignupView` in
+      # crates/trakkt-ui/src/pages/auth/login.rs). In saas mode the same form
+      # collects an email address and sends a verification link, which no test
+      # can complete. Running this against saas was tried first and failed at
+      # `#signup-password` never appearing.
+      #
+      # SMTP_HOST/SMTP_USER are deliberately not set anywhere in this file:
+      # setting either would flip `smtp_configured` and put the form back into
+      # the email-verification flow.
+      TRAKKT_MODE: self_hosted
+      PORT: "3100"
+      BASE_URL: http://localhost:3100
+      # Throwaway values for a throwaway database that dies with the runner. Not
+      # secrets, and deliberately not shaped like real ones — Trivy's secret
+      # scanner cannot tell a workflow fixture from a leak.
+      JWT_SECRET_KEY: ci-realtime-e2e-jwt-not-a-secret
+      # Must decode to 32 bytes of base64: `Config::from_env` decodes it at
+      # startup and fails there otherwise, which would surface as a server that
+      # exits rather than as a readable error.
+      ENCRYPTION_KEY: Q0ktcmVhbHRpbWUtZTJlLW5vdC1hLXNlY3JldC0wMQ==
+    services:
+      postgres:
+        # Pinned to the major version production runs, for the same reason the
+        # Postgres Dialect Tests job pins it: this suite exercises the delta
+        # replay path (`get_entries_since`), whose SQL has Postgres-specific
+        # arms. A different major would exercise the wrong dialect.
+        image: postgres:16
+        env:
+          POSTGRES_USER: trakkt
+          POSTGRES_PASSWORD: trakkt
+          POSTGRES_DB: trakkt
+        ports:
+          - 5437:5432
+        options: >-
+          --health-cmd "pg_isready -U trakkt"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Verify sccache can reach GHA cache
+        run: |
+          echo 'fn main(){}' > /tmp/sccache_test.rs
+          if sccache $(rustc --print sysroot)/bin/rustc /tmp/sccache_test.rs --crate-type bin -o /tmp/sccache_test_out; then
+            echo "SCCACHE_AVAILABLE=true" >> $GITHUB_ENV
+            sccache --show-stats 2>&1 | head -5
+          else
+            echo "::warning::sccache GHA cache probe failed (see above), building without cache"
+            echo "SCCACHE_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+          rm -f /tmp/sccache_test.rs /tmp/sccache_test_out
+
+      - name: Strip local dev patches (path overrides not available in CI)
+        run: sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
+
+      - name: Regenerate lockfile after stripping local patches
+        run: cargo update --workspace
+
+      - name: Install tailwindcss
+        run: |
+          curl -sLO https://github.com/tailwindlabs/tailwindcss/releases/download/v4.2.2/tailwindcss-linux-x64
+          chmod +x tailwindcss-linux-x64
+          sudo mv tailwindcss-linux-x64 /usr/local/bin/tailwindcss
+
+      # Released binary rather than `cargo install trunk`, matching how this repo
+      # already installs tailwindcss and wasm-pack: building it from source would
+      # compile trunk and its whole dependency tree on every run for no benefit.
+      - name: Install trunk
+        run: |
+          curl -sSfL https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz \
+            | sudo tar xz -C /usr/local/bin trunk
+          trunk --version
+
+      # Unlike every other job in this repo, `dist/` here is not a formality:
+      # this is the only job that serves the real bundle to a real browser, and
+      # `ServeDir::new(dist_dir())` is what hands it over. trunk runs the
+      # Tailwind pre-build hook itself (crates/trakkt-ui/Trunk.toml), so there is
+      # no separate Tailwind step.
+      - name: Build the WASM bundle
+        working-directory: crates/trakkt-ui
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: trunk build
+
+      - name: Build the server
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: cargo build --locked --profile dev-server -p trakkt-server
+
+      # Proves the service container is reachable before a server is pointed at
+      # it. Without this, an unreachable database surfaces as a server that exits
+      # inside `DbPool::connect` — which reads like a code defect.
+      - name: Verify Postgres is reachable
+        run: |
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          PGPASSWORD=trakkt psql -h localhost -p 5437 -U trakkt -d trakkt -c 'SELECT version()'
+
+      # Migrations run inside `DbPool::connect`, so starting the server is what
+      # migrates the database. The binary is `trakkt` (apps/server/Cargo.toml
+      # sets `[[bin]] name = "trakkt"`), and it must be run from the repo root:
+      # `dist_dir()` defaults to the relative path `crates/trakkt-ui/dist`.
+      - name: Start the server
+        run: |
+          ./target/dev-server/trakkt > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 120); do
+            if curl -fsS "http://localhost:${PORT}/health" > /dev/null; then
+              echo "server healthy after ${i}s"
+              exit 0
+            fi
+            if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
+              echo "::error::the server exited before becoming healthy"
+              cat server.log
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::the server never answered /health"
+          cat server.log
+          exit 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install Playwright and Chromium
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      # Its own config, not the repo default: the default wires in
+      # `global-setup.ts`, which reads a SQLite file and logs in as a user this
+      # database does not have. See the header of playwright.sync.config.ts.
+      - name: Run the two-client realtime suite
+        working-directory: e2e
+        run: npx playwright test --config playwright.sync.config.ts
+
+      # The suite fails on any uncaught wasm panic, but one arriving after the
+      # last assertion still leaves a trace here, and the server log is the other
+      # half of any failure that turns out not to be the client's fault.
+      - name: Server log
+        if: always()
+        run: tail -200 server.log || true
+
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: realtime-e2e-traces
+          path: |
+            e2e/test-results/
+            server.log
+          retention-days: 7
+
+      - name: Stop the server
+        if: always()
+        run: kill "$(cat server.pid)" 2>/dev/null || true
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
