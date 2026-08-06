@@ -551,6 +551,7 @@ impl std::fmt::Debug for WebSocketManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trakkt_core::test_helpers::channel::recv_soon;
 
     /// Single-instance manager (no Redis) backed by a throwaway in-memory DB.
     /// None of the paths exercised here run a query; the pool only satisfies
@@ -566,8 +567,12 @@ mod tests {
     /// starts with one frame per connect that happened after it registered.
     /// Drain them so the assertions below only observe test traffic.
     async fn drain_heartbeats(rx: &mut mpsc::Receiver<String>, expected: usize) {
-        for _ in 0..expected {
-            let frame = rx.recv().await.expect("heartbeat frame");
+        for drained in 0..expected {
+            let frame = recv_soon(
+                rx,
+                &format!("connect heartbeat {} of {expected}", drained + 1),
+            )
+            .await;
             let parsed: WebSocketMessage =
                 serde_json::from_str(&frame).expect("heartbeat frame is a WebSocketMessage");
             assert!(
@@ -596,8 +601,8 @@ mod tests {
             .expect("send to the first connection");
 
         assert_eq!(
-            first.rx.recv().await.as_deref(),
-            Some("bootstrap-for-first")
+            recv_soon(&mut first.rx, "the first connection's own bootstrap frame").await,
+            "bootstrap-for-first"
         );
         assert!(
             matches!(second.rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
@@ -618,8 +623,14 @@ mod tests {
 
         manager.deliver_to_local_user(user_id, "workspace-broadcast");
 
-        assert_eq!(first.rx.recv().await.as_deref(), Some("workspace-broadcast"));
-        assert_eq!(second.rx.recv().await.as_deref(), Some("workspace-broadcast"));
+        assert_eq!(
+            recv_soon(&mut first.rx, "the broadcast reaching the first connection").await,
+            "workspace-broadcast"
+        );
+        assert_eq!(
+            recv_soon(&mut second.rx, "the broadcast reaching the second connection").await,
+            "workspace-broadcast"
+        );
     }
 
     /// Queue messages until the connection's outbound channel refuses more.
@@ -731,8 +742,12 @@ mod tests {
         manager.deliver_to_local_user(user_id, "workspace-broadcast");
 
         assert_eq!(
-            healthy.rx.recv().await.as_deref(),
-            Some("workspace-broadcast"),
+            recv_soon(
+                &mut healthy.rx,
+                "the broadcast reaching the connection that is keeping up"
+            )
+            .await,
+            "workspace-broadcast",
             "a healthy connection must still get the frame"
         );
         assert_eq!(

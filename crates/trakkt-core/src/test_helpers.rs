@@ -18,6 +18,15 @@
 //! which backend it is, so the same three calls seed either half of a
 //! [`dual_backend_test!`](crate::dual_backend_test) pair.
 //!
+//! So does [`channel`], whose [`recv_soon`](channel::recv_soon) is the bounded
+//! replacement for `rx.recv().await` in tests that wait on a WebSocket or SSE
+//! delivery. Its three callers today are all test modules in `trakkt-auth`; it
+//! lives here rather than there so `apps/server` can reach it too, which its
+//! dev-dependency on this crate's `test-helpers` feature already lets it do.
+//! `trakkt-auth` has no such feature to export a helper through — only
+//! `#[cfg(test)]` modules, which dependents cannot see — and the standards
+//! forbid a second copy per crate.
+//!
 //! # What does not, and why
 //!
 //! Issues, labels and statuses are *not* seeded here, deliberately. Every one
@@ -47,6 +56,7 @@
 //! trakkt_auth::status_service::seed_default_statuses(&db, "ws_1").await?;
 //! ```
 
+pub mod channel;
 pub mod dual_backend;
 
 use crate::db::DbPool;
