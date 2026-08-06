@@ -659,6 +659,39 @@ mod test_support {
     // and a reader is a reactive signal. So their payloads are wasm-only; built
     // on the native target they are three functions nothing calls.
 
+    /// The payload the notification state changes send, with `read` set by the
+    /// caller.
+    ///
+    /// Serialized from the real model rather than written out as JSON, for the
+    /// same reason [`issue_activity_json`] is: every one of
+    /// `notification_service`'s six state changes reads the row back and hands
+    /// it to `sync_log_service::sync_payload`, which is `serde_json::to_value`
+    /// over exactly this type — so a renamed field moves this fixture and the
+    /// wire together instead of leaving the two agreeing only by hand.
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn notification_json(read: bool) -> serde_json::Value {
+        let notification = trakkt_types::models::Notification {
+            notification_id: "ntf-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            user_id: "usr-alice".to_owned(),
+            issue_id: "issue-1".to_owned(),
+            notification_type: "assigned".to_owned(),
+            read,
+            issue_title: Some("A leaky issue".to_owned()),
+            issue_number: Some(42),
+            team_key: Some("TRA".to_owned()),
+            actor_id: Some("usr-bob".to_owned()),
+            actor_name: Some("Bob".to_owned()),
+            action_source: trakkt_types::enums::ActionSource::User,
+            action_source_label: None,
+            created_at: "2026-07-26T00:00:00Z".to_owned(),
+            deleted_at: None,
+            context_id: None,
+        };
+        serde_json::to_value(&notification)
+            .expect("serializing a Notification the way `sync_payload` does")
+    }
+
     /// The payload `create_attachment` sends, as the wire carries it.
     #[cfg(target_arch = "wasm32")]
     pub(super) fn attachment_json() -> serde_json::Value {
@@ -2319,5 +2352,90 @@ mod wasm_tests {
         assert!(!observed.activities);
         assert!(!observed.notification_preferences);
         assert!(!observed.workspace_settings);
+    }
+
+    // ── notification (TRA-9974) ─────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn a_notification_update_frame_reaches_the_store() {
+        // The NOTIFICATION update arm and `notification`'s absence from
+        // `NOT_CACHED` were both established by reading the code. TRA-9938 and
+        // TRA-9940 each found a client arm missing for a type that looked
+        // supported that way, so this asserts it instead.
+        with_store(|store| {
+            // The tab already holds the notification unread, as a bootstrap or
+            // an insert frame would have left it.
+            let held_before: trakkt_types::models::Notification =
+                serde_json::from_value(notification_json(false))
+                    .expect("the unread notification the second tab starts with");
+            store.upsert_notification(held_before);
+
+            apply_action_to_memory(
+                &store,
+                &action_with_id(
+                    entity_types::NOTIFICATION,
+                    "ntf-1",
+                    SyncActionType::Update,
+                    Some(notification_json(true)),
+                ),
+            );
+
+            let held = store.notifications().get_untracked();
+            assert_eq!(
+                held.len(),
+                1,
+                "the update must replace the row it already held, not append a \
+                 second copy of the same notification: {held:?}"
+            );
+            assert_eq!(held[0].notification_id, "ntf-1");
+            assert!(
+                held[0].read,
+                "the read state has to reach the store — this signal is what the \
+                 inbox and the unread badge render, so a frame that stops short \
+                 of it leaves the other tab showing the notification unread, \
+                 which is the bug TRA-9974 reports"
+            );
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn a_soft_deleted_notification_frame_keeps_the_row_and_stamps_it() {
+        // A soft-delete arrives as an `Update` carrying `deleted_at`, not as a
+        // `Delete`. That distinction is what `issue_service::delete_issue`'s
+        // cascade comment depends on: the row stays in the client's cache, so
+        // the cascade that later destroys it still has to send a `Delete`.
+        with_store(|store| {
+            let live: trakkt_types::models::Notification =
+                serde_json::from_value(notification_json(false))
+                    .expect("the live notification the tab starts with");
+            store.upsert_notification(live);
+
+            let mut dismissed = notification_json(false);
+            dismissed["deleted_at"] = serde_json::Value::String("2026-07-26T01:00:00Z".to_owned());
+
+            apply_action_to_memory(
+                &store,
+                &action_with_id(
+                    entity_types::NOTIFICATION,
+                    "ntf-1",
+                    SyncActionType::Update,
+                    Some(dismissed),
+                ),
+            );
+
+            let held = store.notifications().get_untracked();
+            assert_eq!(
+                held.len(),
+                1,
+                "an update never evicts — only the delete arm calls \
+                 `remove_notification_in_memory`: {held:?}"
+            );
+            assert_eq!(
+                held[0].deleted_at.as_deref(),
+                Some("2026-07-26T01:00:00Z"),
+                "the dismissal has to reach the row itself, since that is what \
+                 the inbox filters on"
+            );
+        });
     }
 }

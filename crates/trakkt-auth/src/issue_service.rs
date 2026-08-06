@@ -1313,10 +1313,14 @@ pub async fn delete_issue(
     //
     // Deliberately not filtered on `deleted_at`. A soft-deleted notification is
     // still a row, still holds the foreign key, and so is still destroyed by the
-    // cascade — and a client that cached it before the soft-delete still holds
-    // it, because `notification_service::bulk_delete_notifications` writes no
-    // `sync_log` entry at all. Filtering here would leave exactly those rows
-    // stranded in the cache.
+    // cascade — and a client that cached it still holds it after the
+    // soft-delete, because `notification_service::bulk_delete_notifications`
+    // reports one as an `Update` carrying the stamped row, not a `Delete`. Only
+    // a `Delete` evicts: the update arm of `crates/trakkt-ui/src/cache/apply.rs`
+    // upserts the notification, and `remove_notification_in_memory` is reached
+    // from the delete arm alone. So the row is in the client's cache either way,
+    // and filtering here would strand exactly the soft-deleted ones there
+    // permanently.
     //
     // This is what the CASCADE added by
     // `20260803000000_notification_issue_cascade.sql` made necessary. Before it,

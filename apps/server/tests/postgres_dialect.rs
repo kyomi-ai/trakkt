@@ -2181,3 +2181,351 @@ dual_backend_test! {
         assert_eq!(milestone_gone, 0, "the milestone must be gone with its project");
     }
 }
+
+// ─── Notification state changes reach exactly their recipient ────────────────
+//
+// TRA-9974. The notification state-change entry points open a transaction,
+// select the rows their predicate matches, UPDATE them and record one `sync_log`
+// entry per row, all before the commit. Everything dialect-shaped in that path is
+// reached only from here: the `read` / `deleted_at` predicates are built from
+// `sql_compat::bool_true`, `bool_false` and `now()`; the id list goes through
+// `in_clause_placeholders`, so the bind indices of the `IN` clause are computed
+// rather than written out; the read-back runs `NOTIFICATION_SELECT` on the open
+// transaction, whose `CAST(n.deleted_at AS TEXT)` exists because Postgres will
+// not decode a TIMESTAMP as TEXT; and the entry lands in `sync_log.data`, which
+// is JSONB on Postgres and TEXT on SQLite.
+//
+// The rest of the workspace's coverage for these functions is in
+// `sync_log_service`'s SQLite-only test module, so none of the above had ever
+// been executed against Postgres. This is a regression guard, not a gap being
+// closed — the assertions passed on both backends when first written.
+
+/// The notification the state changes are made against, and the title every
+/// payload has to carry back.
+const NOTIFIED_ISSUE_TITLE: &str = "The issue the inbox names";
+
+/// The four types the seeded notifications use, one each, so the four entries a
+/// phase writes are four distinct rows rather than one row counted four times.
+const NOTIFICATION_TYPES: [&str; 4] = [
+    trakkt_auth::notification_service::TYPE_ASSIGNED,
+    trakkt_auth::notification_service::TYPE_COMMENTED,
+    trakkt_auth::notification_service::TYPE_STATUS_CHANGED,
+    trakkt_auth::notification_service::TYPE_PRIORITY_CHANGED,
+];
+
+/// One `sync_log` row as the notification assertions read it.
+///
+/// `visibility_user_id` is the column `CascadeEntry` has no need of and this
+/// body exists for: it is what keeps a notification out of every other member's
+/// delta.
+#[derive(sqlx::FromRow)]
+struct NotificationEntry {
+    entity_type: String,
+    entity_id: String,
+    action: String,
+    visibility_user_id: Option<String>,
+    data: Option<String>,
+}
+
+/// Create one notification per [`NOTIFICATION_TYPES`] entry for [`USER`],
+/// returning their ids in table order.
+///
+/// Through the real service, so the rows carry whatever `create_notification`
+/// actually writes; the ids come back from the table because it returns `()`.
+async fn seed_notifications(db: &DbPool, issue_id: &str) -> Vec<String> {
+    for notification_type in NOTIFICATION_TYPES {
+        trakkt_auth::notification_service::create_notification(
+            db,
+            WORKSPACE,
+            USER,
+            issue_id,
+            notification_type,
+            Some(SECOND_USER),
+            None,
+            ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed the {notification_type} notification: {e}"));
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        notification_id: String,
+    }
+    let ids: Vec<String> = db_fetch_all!(
+        db,
+        Row,
+        "SELECT notification_id FROM notifications WHERE user_id = $1 ORDER BY notification_id",
+        USER
+    )
+    .expect("read back the ids of the seeded notifications")
+    .into_iter()
+    .map(|row| row.notification_id)
+    .collect();
+
+    assert_eq!(
+        ids.len(),
+        NOTIFICATION_TYPES.len(),
+        "the fixture must seed one notification per type, or a phase asserting \
+         four entries is asserting something else"
+    );
+    ids
+}
+
+/// The `sync_log` rows written above `watermark`, checked for the shape all the
+/// state-change entry points share, and returned as `(entity_id, payload)`
+/// ordered by entity id.
+///
+/// The payload is decoded rather than compared as bytes. Postgres parses JSONB
+/// on the way in and re-serialises it on the way out, so a payload written as
+/// `{"read":true}` reads back as `{"read": true}` while SQLite hands back the
+/// TEXT it was given — a byte comparison would fail on Postgres with nothing
+/// wrong.
+async fn notification_updates_above(
+    db: &DbPool,
+    watermark: i64,
+    phase: &str,
+) -> Vec<(String, serde_json::Value)> {
+    let entries: Vec<NotificationEntry> = db_fetch_all!(
+        db,
+        NotificationEntry,
+        "SELECT entity_type, entity_id, action, visibility_user_id, \
+                CAST(data AS TEXT) AS data \
+         FROM sync_log WHERE sync_id > $1 ORDER BY entity_id ASC",
+        watermark
+    )
+    .unwrap_or_else(|e| panic!("read the sync entries {phase} wrote: {e}"));
+
+    let mut decoded = Vec::new();
+    for entry in entries {
+        assert_eq!(
+            (entry.entity_type.as_str(), entry.action.as_str()),
+            (entity_types::NOTIFICATION, "update"),
+            "{phase} must write NOTIFICATION `update` entries and nothing else. \
+             `delete` is what issue_service's cascade writes when it physically \
+             destroys a notification, and a client that cannot tell the two \
+             apart evicts a row that was only hidden. Got {:?} for {}",
+            (&entry.entity_type, &entry.action),
+            entry.entity_id
+        );
+        assert_eq!(
+            entry.visibility_user_id.as_deref(),
+            Some(USER),
+            "{phase} must address every entry to the recipient. A NULL here is \
+             workspace-visible — the TRA-9920 leak — and every other member \
+             replays one user's inbox. Entry for {}",
+            entry.entity_id
+        );
+
+        let raw = entry.data.as_deref().unwrap_or_else(|| {
+            panic!(
+                "{phase} must persist a payload for {}: cache/apply.rs discards \
+                 a data-less update before it reaches IndexedDB, so the entry \
+                 would arrive and change nothing",
+                entry.entity_id
+            )
+        });
+        let payload: serde_json::Value = serde_json::from_str(raw)
+            .unwrap_or_else(|e| panic!("parsing the {phase} payload {raw:?}: {e}"));
+
+        assert_eq!(
+            payload.get("issue_title").and_then(serde_json::Value::as_str),
+            Some(NOTIFIED_ISSUE_TITLE),
+            "{phase}'s payload must carry the joined issue title. The read-back \
+             runs on the open transaction; a SELECT that lost \
+             NOTIFICATION_SELECT's LEFT JOINs would hand the client an issue id \
+             it has nothing to render. Got {payload}"
+        );
+
+        decoded.push((entry.entity_id, payload));
+    }
+    decoded
+}
+
+/// A `bool` field of a payload, or a panic naming the field and the phase.
+fn payload_bool(payload: &serde_json::Value, field: &str, phase: &str) -> bool {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| {
+            panic!("{phase}'s payload must carry a boolean `{field}`; got {payload}")
+        })
+}
+
+dual_backend_test! {
+    /// Notification state changes, each writing one recipient-scoped `update`
+    /// per row, with the payload the client applies.
+    ///
+    /// Four `bulk_*` phases over the same four notifications — mark read, mark
+    /// unread, dismiss, restore — for sixteen entries, then two `mark_as_read`
+    /// calls on one of them. Each phase reads only the rows above its own
+    /// watermark, so a phase that wrote none is caught rather than covered by
+    /// its predecessor's.
+    ///
+    /// The `read` and `deleted_at` assertions are the point of running the
+    /// phases in that order: `read` has to move `false → true → false` and
+    /// `deleted_at` `NULL → stamped → NULL`, so an implementation that wrote a
+    /// constant payload, or read the row back before its UPDATE, disagrees with
+    /// one of the four.
+    async fn notification_state_changes_log_one_recipient_scoped_update_each(db) {
+        seed_tenancy(db).await;
+        seed_second_workspace_member(db, SECOND_USER).await;
+        let issue = create_issue(db, NOTIFIED_ISSUE_TITLE).await;
+        let ids = seed_notifications(db, &issue.issue_id).await;
+
+        // (phase name, the call, the `read` the payload must show, whether
+        // `deleted_at` must be stamped). Driven from a list because the four
+        // differ only in those three things, and a copy per phase is four places
+        // for the shape assertions to drift apart.
+        let mut all_entity_ids: Vec<String> = Vec::new();
+
+        for (phase, expected_read, expect_deleted) in [
+            ("bulk_mark_as_read", true, false),
+            ("bulk_mark_as_unread", false, false),
+            ("bulk_delete_notifications", false, true),
+            ("bulk_restore_notifications", false, false),
+        ] {
+            let watermark = sync_watermark(db).await;
+
+            let outcome = match phase {
+                "bulk_mark_as_read" => {
+                    trakkt_auth::notification_service::bulk_mark_as_read(db, &ids, USER, None).await
+                }
+                "bulk_mark_as_unread" => {
+                    trakkt_auth::notification_service::bulk_mark_as_unread(db, &ids, USER, None)
+                        .await
+                }
+                "bulk_delete_notifications" => {
+                    trakkt_auth::notification_service::bulk_delete_notifications(
+                        db, &ids, USER, None,
+                    )
+                    .await
+                }
+                _ => {
+                    trakkt_auth::notification_service::bulk_restore_notifications(
+                        db, &ids, USER, None,
+                    )
+                    .await
+                }
+            };
+            outcome.unwrap_or_else(|e| panic!("{phase} over the four seeded notifications: {e}"));
+
+            let entries = notification_updates_above(db, watermark, phase).await;
+
+            let touched: Vec<String> =
+                entries.iter().map(|(id, _)| id.clone()).collect();
+            assert_eq!(
+                touched, ids,
+                "{phase} must write exactly one entry per notification it \
+                 changed — no more, or a client applies an update twice; no \
+                 fewer, or a tab that reconnects never learns the row moved"
+            );
+
+            for (entity_id, payload) in &entries {
+                assert_eq!(
+                    payload_bool(payload, "read", phase), expected_read,
+                    "{phase}'s payload for {entity_id} must show the read state \
+                     it just wrote. A payload read before the UPDATE carries the \
+                     old value, and the client is told the row is unchanged"
+                );
+                assert_eq!(
+                    payload.get("deleted_at").map(serde_json::Value::is_null),
+                    Some(!expect_deleted),
+                    "{phase}'s payload for {entity_id} must show deleted_at \
+                     {}. The inbox filters on that field, so a stale one leaves \
+                     a dismissed notification on screen. Got {payload}",
+                    if expect_deleted { "stamped" } else { "cleared" }
+                );
+                assert_eq!(
+                    payload.get("user_id").and_then(serde_json::Value::as_str),
+                    Some(USER),
+                    "{phase}'s payload for {entity_id} must name its recipient — \
+                     it is what the visibility backfill reads, and what a client \
+                     checks the row against. Got {payload}"
+                );
+            }
+
+            all_entity_ids.extend(touched);
+        }
+
+        assert_eq!(
+            all_entity_ids.len(),
+            NOTIFICATION_TYPES.len() * 4,
+            "the four phases must write sixteen entries between them; a phase \
+             whose predicate excluded every row writes none, and the per-phase \
+             assertions above would each be vacuous"
+        );
+
+        // `mark_as_read` is the odd one out and its docs say so: it carries no
+        // read-state predicate, only `deleted_at IS NULL`, which setting `read`
+        // leaves standing. So re-reading an already-read notification writes a
+        // second entry, where every `bulk_*` phase above would have written
+        // none. That is the claim `affected_notification_ids`' doc comment makes
+        // about both backends, asserted here so it stays true.
+        for attempt in ["the first read", "the same read again"] {
+            let watermark = sync_watermark(db).await;
+            trakkt_auth::notification_service::mark_as_read(db, &ids[0], USER, None)
+                .await
+                .unwrap_or_else(|e| panic!("mark_as_read on {attempt}: {e}"));
+
+            let entries = notification_updates_above(db, watermark, attempt).await;
+            let touched: Vec<String> = entries.iter().map(|(id, _)| id.clone()).collect();
+            assert_eq!(
+                touched, vec![ids[0].clone()],
+                "{attempt} must write exactly one entry, for the one \
+                 notification named. A predicate on `read` here would make the \
+                 second attempt write none, and the doc comment on \
+                 `affected_notification_ids` would be describing the wrong \
+                 function"
+            );
+            assert!(
+                payload_bool(&entries[0].1, "read", attempt),
+                "{attempt} must leave the payload showing `read`: {:?}",
+                entries[0].1
+            );
+        }
+
+        // The persisted column is only half of it. `get_entries_since` is what a
+        // reconnecting client actually calls, and it is a separate query with a
+        // dialect arm of its own — a correct `visibility_user_id` filtered by a
+        // wrong WHERE still leaks.
+        let second_members_delta: Vec<String> = get_entries_since(db, WORKSPACE, SECOND_USER, 0, 10_000)
+            .await
+            .expect("read the delta a reconnecting second member would be sent")
+            .into_iter()
+            .filter(|action| action.entity_type == entity_types::NOTIFICATION)
+            .map(|action| action.entity_id)
+            .collect();
+        assert!(
+            second_members_delta.is_empty(),
+            "the other member's delta must carry none of the recipient's \
+             notifications, in any action: {second_members_delta:?}"
+        );
+
+        // Not vacuous: the recipient's own delta does carry them, so the
+        // assertion above is about audience and not about the entries being
+        // absent outright. Filtered to `Update` because create_notification
+        // wrote an `Insert` for each of these same ids — an unfiltered check
+        // would hold even if the four phases had written nothing at all.
+        let recipients_updates: Vec<String> = get_entries_since(db, WORKSPACE, USER, 0, 10_000)
+            .await
+            .expect("read the delta the recipient would be sent")
+            .into_iter()
+            .filter(|action| {
+                action.entity_type == entity_types::NOTIFICATION
+                    && matches!(action.action, SyncActionType::Update)
+            })
+            .map(|action| action.entity_id)
+            .collect();
+        for id in &ids {
+            assert!(
+                recipients_updates.contains(id),
+                "the recipient's own delta must replay the update for {id}; \
+                 scoping that is too narrow leaves their other tabs stale \
+                 through every reconnect: {recipients_updates:?}"
+            );
+        }
+    }
+}
