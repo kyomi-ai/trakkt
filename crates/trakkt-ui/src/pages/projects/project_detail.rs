@@ -64,6 +64,190 @@ fn parse_view_param(search: &str) -> String {
     "overview".to_string()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Interaction state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether one inline click-to-edit field is open, and what has been typed into
+/// it but not yet saved.
+#[derive(Clone, Copy)]
+struct InlineTextEdit {
+    editing: RwSignal<bool>,
+    draft: RwSignal<String>,
+}
+
+impl InlineTextEdit {
+    fn new() -> Self {
+        Self {
+            editing: RwSignal::new(false),
+            draft: RwSignal::new(String::new()),
+        }
+    }
+
+    /// Close the field. The draft is left alone — every open path overwrites it
+    /// with the field's current value before setting `editing`.
+    fn close(&self) {
+        self.editing.set(false);
+    }
+}
+
+/// In-progress milestone interactions: which row's inline rename is open and
+/// what has been typed into it, whether the add form is open and what is in it,
+/// and which milestone a delete is being confirmed for.
+#[derive(Clone, Copy)]
+struct MilestoneEditState {
+    editing_id: RwSignal<Option<String>>,
+    edit_name: RwSignal<String>,
+    edit_date: RwSignal<Option<String>>,
+    adding: RwSignal<bool>,
+    new_name: RwSignal<String>,
+    new_date: RwSignal<Option<String>>,
+    deleting_id: RwSignal<Option<String>>,
+}
+
+impl MilestoneEditState {
+    fn new() -> Self {
+        Self {
+            editing_id: RwSignal::new(None),
+            edit_name: RwSignal::new(String::new()),
+            edit_date: RwSignal::new(None),
+            adding: RwSignal::new(false),
+            new_name: RwSignal::new(String::new()),
+            new_date: RwSignal::new(None),
+            deleting_id: RwSignal::new(None),
+        }
+    }
+
+    /// Open the inline rename for `milestone_id`, seeded with its current
+    /// values. This is what `MilestoneRow` used an `Effect` for before the
+    /// drafts were hoisted; entering edit mode only happens here, so doing it
+    /// on the way in is equivalent and needs no effect at all.
+    fn begin_edit(&self, milestone_id: String, name: String, target_date: Option<String>) {
+        self.edit_name.set(name);
+        self.edit_date.set(target_date);
+        self.editing_id.set(Some(milestone_id));
+    }
+
+    /// Close the add form and drop its draft.
+    ///
+    /// Clearing is this method's job precisely because the draft now outlives
+    /// the form: before it was hoisted, closing the form destroyed the signals
+    /// with it, so reopening always started empty by accident.
+    fn close_add(&self) {
+        self.adding.set(false);
+        self.new_name.set(String::new());
+        self.new_date.set(None);
+    }
+}
+
+/// The health-update composer's draft.
+#[derive(Clone, Copy)]
+struct UpdateDraft {
+    posting: RwSignal<bool>,
+    health: RwSignal<String>,
+    body: RwSignal<String>,
+}
+
+impl UpdateDraft {
+    const DEFAULT_HEALTH: &'static str = "on_track";
+
+    fn new() -> Self {
+        Self {
+            posting: RwSignal::new(false),
+            health: RwSignal::new(Self::DEFAULT_HEALTH.to_string()),
+            body: RwSignal::new(String::new()),
+        }
+    }
+
+    /// Close the composer and discard what was in it.
+    fn reset(&self) {
+        self.posting.set(false);
+        self.health.set(Self::DEFAULT_HEALTH.to_string());
+        self.body.set(String::new());
+    }
+}
+
+/// In-progress project-member interactions.
+#[derive(Clone, Copy)]
+struct MemberEditState {
+    adding: RwSignal<bool>,
+    add_value: RwSignal<String>,
+    removing_id: RwSignal<Option<String>>,
+}
+
+impl MemberEditState {
+    fn new() -> Self {
+        Self {
+            adding: RwSignal::new(false),
+            add_value: RwSignal::new(String::new()),
+            removing_id: RwSignal::new(None),
+        }
+    }
+}
+
+/// Everything on the project detail page that represents a user part-way
+/// through an interaction — which inline editor is open, and what has been
+/// typed into it but not yet saved.
+///
+/// It is created by `ProjectDetailPage` and threaded down as a prop rather than
+/// created where it is used, and that is load-bearing rather than stylistic.
+/// `ProjectDetailPage`'s content closure reads `project_data`, `project_issues`,
+/// `server_progress`, `server_milestones`, `server_updates` and
+/// `server_members`, so any one of them settling re-runs it and reconstructs
+/// `ProjectDetailContent` and every section under it. A signal created inside
+/// that closure is therefore replaced, back at its initial value, mid
+/// interaction. `server_milestones` is keyed on `milestones_version`, which
+/// bumps on every `project_milestone` sync frame, so a colleague adding a
+/// milestone in another window closed this window's add form and inline rename
+/// input and discarded what was being typed into them (TRA-10030). Held here,
+/// on a component the router constructs once per route, the signals outlive the
+/// rebuild and the interaction survives it.
+///
+/// This is the standards' "Reactive Primitives" rule — hoist reactive
+/// primitives to component setup level, outside the view closure — applied to
+/// the whole page rather than to one section.
+#[derive(Clone, Copy)]
+struct ProjectEditState {
+    name: InlineTextEdit,
+    description: InlineTextEdit,
+    milestones: MilestoneEditState,
+    update: UpdateDraft,
+    members: MemberEditState,
+    /// Whether the settings tab's delete-project confirmation is open.
+    confirming_delete: RwSignal<bool>,
+}
+
+impl ProjectEditState {
+    fn new() -> Self {
+        Self {
+            name: InlineTextEdit::new(),
+            description: InlineTextEdit::new(),
+            milestones: MilestoneEditState::new(),
+            update: UpdateDraft::new(),
+            members: MemberEditState::new(),
+            confirming_delete: RwSignal::new(false),
+        }
+    }
+
+    /// Drop every open editor and draft.
+    ///
+    /// Needed because the router matches `/projects/:id` once and reuses this
+    /// component across projects: without it, an add form left open on one
+    /// project would appear, still holding its draft, on the next.
+    fn reset(&self) {
+        self.name.close();
+        self.description.close();
+        self.milestones.close_add();
+        self.milestones.editing_id.set(None);
+        self.milestones.deleting_id.set(None);
+        self.update.reset();
+        self.members.adding.set(false);
+        self.members.add_value.set(String::new());
+        self.members.removing_id.set(None);
+        self.confirming_delete.set(false);
+    }
+}
+
 /// Full project detail page — metadata + filtered issue list.
 #[component]
 pub fn ProjectDetailPage() -> impl IntoView {
@@ -196,6 +380,30 @@ pub fn ProjectDetailPage() -> impl IntoView {
             .collect::<Vec<_>>()
     });
 
+    // ── Interaction state ──────────────────────────────────────────────────
+    // Held here, not in the components that read it. See `ProjectEditState`.
+    let edit_state = ProjectEditState::new();
+
+    // The router matches `/projects/:id` once and reuses this component when the
+    // id changes, so `edit_state` has to be cleared explicitly on that move.
+    // The first run has no previous id and clears nothing.
+    Effect::new(move |previous: Option<String>| {
+        let id = project_id.get();
+        if previous.is_some_and(|prev| prev != id) {
+            edit_state.reset();
+        }
+        id
+    });
+
+    // Workspace members, read by both the lead selector and the add-member
+    // picker. Created here for the same reason as `edit_state`: inside the
+    // content closure this was a fresh Resource — and so a fresh
+    // `list_workspace_members` request — on every re-render.
+    let workspace_members = Resource::new(
+        || (),
+        move |_| async move { list_workspace_members().await },
+    );
+
     // Hoist use_navigate to component construction time (not inside closures).
     let nav = use_navigate();
 
@@ -280,6 +488,8 @@ pub fn ProjectDetailPage() -> impl IntoView {
                                     server_updates=server_updates
                                     members=members
                                     server_members=server_members
+                                    workspace_members=workspace_members
+                                    edit_state=edit_state
                                     active_view=active_view
                                     project_id=project_id
                                 />
@@ -330,6 +540,11 @@ fn ProjectDetailContent(
     server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
     members: Vec<ProjectMember>,
     server_members: Resource<Result<Vec<ProjectMember>, ServerFnError>>,
+    /// Workspace members, for the lead selector and the add-member picker.
+    workspace_members: Resource<Result<Vec<WorkspaceMember>, ServerFnError>>,
+    /// Open editors and unsaved drafts, owned by `ProjectDetailPage` so they
+    /// survive this component being reconstructed. See `ProjectEditState`.
+    edit_state: ProjectEditState,
     /// The currently active view tab: "overview", "board", or "list".
     #[prop(into)]
     active_view: Memo<String>,
@@ -354,9 +569,13 @@ fn ProjectDetailContent(
     let nav_create_view = use_navigate();
 
     // ── Editable name (click-to-edit) ────────────────────────────────────
-    let editing_name = RwSignal::new(false);
+    // `editing_name` and `name_draft` are the user's in-progress edit and come
+    // from `edit_state`, so a settling resource cannot discard them.
+    // `name_value` is this component's optimistic mirror of the server's value
+    // and is deliberately re-seeded from the freshly rendered `project`.
+    let editing_name = edit_state.name.editing;
+    let name_draft = edit_state.name.draft;
     let name_value = RwSignal::new(project.name.clone());
-    let name_draft = RwSignal::new(project.name.clone());
 
     let save_name = move || {
         let new_name = name_draft.get_untracked();
@@ -403,10 +622,7 @@ fn ProjectDetailContent(
     // ── Editable lead ──────────────────────────────────────────────────
     let lead_value = RwSignal::new(project.lead_id.clone().unwrap_or_default());
 
-    let members_resource = Resource::new(
-        || (),
-        move |_| async move { list_workspace_members().await },
-    );
+    let members_resource = workspace_members;
 
     let member_options = Signal::derive(move || {
         let mut opts = vec![("".to_string(), "(Unassigned)".to_string())];
@@ -458,9 +674,11 @@ fn ProjectDetailContent(
     };
 
     // ── Editable description (click-to-edit textarea) ────────────────────
-    let editing_desc = RwSignal::new(false);
+    // Same split as the name above: mode and draft are hoisted, the optimistic
+    // value mirror is not.
+    let editing_desc = edit_state.description.editing;
+    let desc_draft = edit_state.description.draft;
     let desc_value = RwSignal::new(project.description.clone().unwrap_or_default());
-    let desc_draft = RwSignal::new(project.description.clone().unwrap_or_default());
 
     let save_desc = move || {
         let new_desc = desc_draft.get_untracked();
@@ -675,6 +893,7 @@ fn ProjectDetailContent(
                 milestones=milestones.clone()
                 issues=issues.clone()
                 server_milestones=server_milestones
+                state=edit_state.milestones
             />
 
             // ── Health Updates ───────────────────────────────────────────
@@ -682,6 +901,7 @@ fn ProjectDetailContent(
                 project_id=project.project_id.clone()
                 updates=updates
                 server_updates=server_updates
+                draft=edit_state.update
             />
 
             // ── Members ──────────────────────────────────────────────────
@@ -690,6 +910,7 @@ fn ProjectDetailContent(
                 members=members
                 server_members=server_members
                 workspace_members=members_resource
+                state=edit_state.members
             />
 
             // ── Divider ───────────────────────────────────────────────────
@@ -782,6 +1003,7 @@ fn ProjectDetailContent(
                         <div class="max-w-[860px] mx-auto w-full">
                             <ProjectSettingsContent
                                 project=project.clone()
+                                confirming_delete=edit_state.confirming_delete
                             />
                         </div>
                     }.into_any()
@@ -1010,11 +1232,13 @@ fn MilestoneSection(
     milestones: Vec<ProjectMilestone>,
     issues: Vec<IssueWithDetails>,
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
+    /// Which row is being renamed, what the add form holds, and which milestone
+    /// a delete is being confirmed for. Owned by `ProjectDetailPage` — this
+    /// component is reconstructed on every `project_milestone` frame, so state
+    /// created here would be discarded mid-edit. See `ProjectEditState`.
+    state: MilestoneEditState,
 ) -> impl IntoView {
-    // ── State signals ──────────────────────────────────────────────────────
-    let editing_milestone_id: RwSignal<Option<String>> = RwSignal::new(None);
-    let adding_milestone: RwSignal<bool> = RwSignal::new(false);
-    let deleting_milestone_id: RwSignal<Option<String>> = RwSignal::new(None);
+    let deleting_milestone_id = state.deleting_id;
 
     // Refetch callback used after mutations.
     let refetch = move || server_milestones.refetch();
@@ -1067,6 +1291,8 @@ fn MilestoneSection(
 
                     let ms_id_edit = ms_id.clone();
                     let ms_id_delete = ms_id.clone();
+                    let ms_name_edit = ms_name.clone();
+                    let ms_date_edit = ms_target_date.clone();
 
                     view! {
                         <MilestoneRow
@@ -1076,9 +1302,17 @@ fn MilestoneSection(
                             done_count=done
                             total_count=total
                             all_done=all_done
-                            editing_milestone_id=editing_milestone_id
+                            state=state
                             on_edit=Callback::new(move |()| {
-                                editing_milestone_id.set(Some(ms_id_edit.clone()));
+                                // Seeding the draft here — rather than from an
+                                // `Effect` inside the row — is what lets the
+                                // draft be hoisted: entering edit mode happens
+                                // only through this callback.
+                                state.begin_edit(
+                                    ms_id_edit.clone(),
+                                    ms_name_edit.clone(),
+                                    ms_date_edit.clone(),
+                                );
                             })
                             on_delete=Callback::new(move |()| {
                                 deleting_milestone_id.set(Some(ms_id_delete.clone()));
@@ -1091,14 +1325,14 @@ fn MilestoneSection(
 
             // ── Add milestone form / button ─────────────────────────────
             <Show
-                when=move || adding_milestone.get()
+                when=move || state.adding.get()
                 fallback=move || {
                     view! {
                         <div class="mt-2">
                             <Button
                                 variant=ButtonVariant::GhostMuted
                                 size=ButtonSize::Sm
-                                on:click=move |_| adding_milestone.set(true)
+                                on:click=move |_| state.adding.set(true)
                             >
                                 <Icon icon=phosphor_leptos::PLUS size="14px"/>
                                 "Add milestone"
@@ -1109,7 +1343,7 @@ fn MilestoneSection(
             >
                 <AddMilestoneForm
                     project_id=project_id.clone()
-                    adding_milestone=adding_milestone
+                    state=state
                     server_milestones=server_milestones
                 />
             </Show>
@@ -1162,10 +1396,16 @@ fn HealthUpdateSection(
     project_id: String,
     updates: Vec<ProjectUpdate>,
     server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
+    /// The composer's draft, owned by `ProjectDetailPage`. This section has the
+    /// same defect as `MilestoneSection` had — it is reconstructed whenever any
+    /// of the page's resources settles, including on a `project_update` frame —
+    /// so a colleague posting an update discarded whatever was half-written
+    /// here. See `ProjectEditState`.
+    draft: UpdateDraft,
 ) -> impl IntoView {
-    let posting_update: RwSignal<bool> = RwSignal::new(false);
-    let post_health: RwSignal<String> = RwSignal::new("on_track".to_string());
-    let post_body: RwSignal<String> = RwSignal::new(String::new());
+    let posting_update = draft.posting;
+    let post_health = draft.health;
+    let post_body = draft.body;
 
     let pid = StoredValue::new(project_id.clone());
     let do_post = move || {
@@ -1180,11 +1420,7 @@ fn HealthUpdateSection(
         let pid_c = pid.get_value();
         leptos::task::spawn_local(async move {
             match create_project_update(pid_c, health_val, body_param).await {
-                Ok(_) => {
-                    posting_update.set(false);
-                    post_health.set("on_track".to_string());
-                    post_body.set(String::new());
-                }
+                Ok(_) => draft.reset(),
                 Err(e) => {
                     leptos::logging::warn!("Failed to create project update: {e}");
                 }
@@ -1253,9 +1489,7 @@ fn HealthUpdateSection(
                 }
             >
                 <PostUpdateForm
-                    posting_update=posting_update
-                    post_health=post_health
-                    post_body=post_body
+                    draft=draft
                     on_post=Callback::new(move |()| do_post())
                 />
             </Show>
@@ -1267,16 +1501,12 @@ fn HealthUpdateSection(
 /// body textarea, and Post/Cancel action buttons.
 #[component]
 fn PostUpdateForm(
-    posting_update: RwSignal<bool>,
-    post_health: RwSignal<String>,
-    post_body: RwSignal<String>,
+    draft: UpdateDraft,
     on_post: Callback<()>,
 ) -> impl IntoView {
-    let cancel = move || {
-        posting_update.set(false);
-        post_health.set("on_track".to_string());
-        post_body.set(String::new());
-    };
+    let post_health = draft.health;
+    let post_body = draft.body;
+    let cancel = move || draft.reset();
 
     view! {
         <div class="mt-2 border border-border rounded-md p-3">
@@ -1354,10 +1584,13 @@ fn ProjectMembersSection(
     members: Vec<ProjectMember>,
     server_members: Resource<Result<Vec<ProjectMember>, ServerFnError>>,
     workspace_members: Resource<Result<Vec<WorkspaceMember>, ServerFnError>>,
+    /// Whether the add-member picker is open and which member a removal is
+    /// being confirmed for. Owned by `ProjectDetailPage` for the same reason as
+    /// the milestone state — see `ProjectEditState`.
+    state: MemberEditState,
 ) -> impl IntoView {
-    // ── State signals ──────────────────────────────────────────────────────
-    let adding_member: RwSignal<bool> = RwSignal::new(false);
-    let removing_member_id: RwSignal<Option<String>> = RwSignal::new(None);
+    let adding_member = state.adding;
+    let removing_member_id = state.removing_id;
 
     let has_members = !members.is_empty();
     let pid = StoredValue::new(project_id.clone());
@@ -1420,7 +1653,7 @@ fn ProjectMembersSection(
     };
 
     // ── Add member handler ────────────────────────────────────────────────
-    let add_member_value: RwSignal<String> = RwSignal::new(String::new());
+    let add_member_value = state.add_value;
 
     // Options for the add-member Select: workspace members not already in
     // the project.
@@ -1606,29 +1839,23 @@ fn MilestoneRow(
     done_count: usize,
     total_count: usize,
     all_done: bool,
-    editing_milestone_id: RwSignal<Option<String>>,
+    /// The page-level milestone interaction state. The row reads which id is
+    /// being edited and the shared name/date draft out of it rather than owning
+    /// them, so a sync frame reconstructing this row does not reset the edit.
+    state: MilestoneEditState,
     on_edit: Callback<()>,
     on_delete: Callback<()>,
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
 ) -> impl IntoView {
+    let editing_milestone_id = state.editing_id;
     let mid = milestone_id.clone();
     let is_editing = Signal::derive(move || {
         editing_milestone_id.get().as_deref() == Some(&mid)
     });
 
-    // ── Edit state signals ──
-    let edit_name = RwSignal::new(name.clone());
-    let edit_date = RwSignal::new(target_date.clone());
-
-    // Reset edit fields when entering edit mode.
-    let name_for_reset = name.clone();
-    let date_for_reset = target_date.clone();
-    Effect::new(move || {
-        if is_editing.get() {
-            edit_name.set(name_for_reset.clone());
-            edit_date.set(date_for_reset.clone());
-        }
-    });
+    // Seeded by `MilestoneEditState::begin_edit` on the way into edit mode.
+    let edit_name = state.edit_name;
+    let edit_date = state.edit_date;
 
     // ── Save handler ──
     // Store originals so the save closure can be called multiple times (Fn, not FnOnce).
@@ -1809,11 +2036,13 @@ fn MilestoneRow(
 #[component]
 fn AddMilestoneForm(
     project_id: String,
-    adding_milestone: RwSignal<bool>,
+    /// The page-level milestone interaction state. The form's draft lives there
+    /// so a sync frame arriving mid-typing cannot close the form or empty it.
+    state: MilestoneEditState,
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
 ) -> impl IntoView {
-    let new_name = RwSignal::new(String::new());
-    let new_date: RwSignal<Option<String>> = RwSignal::new(None);
+    let new_name = state.new_name;
+    let new_date = state.new_date;
 
     let pid = project_id.clone();
     let do_create = move || {
@@ -1822,7 +2051,8 @@ fn AddMilestoneForm(
             return;
         }
         let date_val = new_date.get_untracked();
-        adding_milestone.set(false);
+        // Read both drafts first: this clears them.
+        state.close_add();
 
         let pid_c = pid.clone();
         leptos::task::spawn_local(async move {
@@ -1842,7 +2072,7 @@ fn AddMilestoneForm(
             }
             "Escape" => {
                 ev.prevent_default();
-                adding_milestone.set(false);
+                state.close_add();
             }
             _ => {}
         }
@@ -1879,7 +2109,7 @@ fn AddMilestoneForm(
             <Button
                 variant=ButtonVariant::GhostMuted
                 size=ButtonSize::Sm
-                on:click=move |_| adding_milestone.set(false)
+                on:click=move |_| state.close_add()
             >
                 "Cancel"
             </Button>
@@ -1985,6 +2215,10 @@ fn ProjectIssueRow(issue: IssueWithDetails) -> impl IntoView {
 #[component]
 fn ProjectSettingsContent(
     project: Project,
+    /// Whether the delete confirmation is open. Owned by `ProjectDetailPage`:
+    /// held here, an arriving sync frame reconstructed this component and shut
+    /// the dialog under the user's cursor. See `ProjectEditState`.
+    confirming_delete: RwSignal<bool>,
 ) -> impl IntoView {
     let project_id = StoredValue::new(project.project_id.clone());
     let project_name = StoredValue::new(project.name.clone());
@@ -2008,8 +2242,6 @@ fn ProjectSettingsContent(
     };
 
     // ── Delete confirmation ────────────────────────────────────────────────
-    let (show_delete_confirm, set_show_delete_confirm) = signal(false);
-
     let confirm_message = format!(
         "Are you sure you want to delete \"{}\"? Issues linked to this project will be \
          unlinked. This action cannot be undone.",
@@ -2019,7 +2251,7 @@ fn ProjectSettingsContent(
     let on_confirm_delete = {
         let nav = nav.clone();
         Callback::new(move |()| {
-            set_show_delete_confirm.set(false);
+            confirming_delete.set(false);
             let pid = project_id.get_value();
             let nav = nav.clone();
             leptos::task::spawn_local(async move {
@@ -2039,7 +2271,7 @@ fn ProjectSettingsContent(
     };
 
     let on_cancel_delete = Callback::new(move |()| {
-        set_show_delete_confirm.set(false);
+        confirming_delete.set(false);
     });
 
     view! {
@@ -2109,7 +2341,7 @@ fn ProjectSettingsContent(
                         </div>
                         <Button
                             variant=ButtonVariant::Destructive
-                            on:click=move |_| set_show_delete_confirm.set(true)
+                            on:click=move |_| confirming_delete.set(true)
                         >
                             "Delete project"
                         </Button>
@@ -2120,7 +2352,7 @@ fn ProjectSettingsContent(
 
         // ── Delete confirmation dialog ─────────────────────────────────────
         <ConfirmDialog
-            open=Signal::derive(move || show_delete_confirm.get())
+            open=Signal::derive(move || confirming_delete.get())
             title="Delete project?"
             message=confirm_message
             confirm_text="Delete"
