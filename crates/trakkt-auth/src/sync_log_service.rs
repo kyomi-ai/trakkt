@@ -3444,6 +3444,7 @@ mod tests {
             &db,
             std::slice::from_ref(&hidden),
             USER_A,
+            None,
         )
         .await
         .expect("soft-delete one of A's two notifications");
@@ -3478,10 +3479,11 @@ mod tests {
 
         // The read in `delete_issue` deliberately does not filter on
         // `deleted_at`, and this is what that decision buys. A client that
-        // cached the row before it was soft-deleted still holds it:
-        // `bulk_delete_notifications` writes no `sync_log` entry at all, so
-        // nothing on the wire ever told that client the row was hidden. Skipping
-        // it here would strand it in the cache permanently.
+        // cached the row still holds it after the soft-delete:
+        // `bulk_delete_notifications` reports one as an `Update` carrying the
+        // stamped row, and the update arm of `crates/trakkt-ui/src/cache/apply.rs`
+        // upserts it — only a `Delete` reaches `remove_notification_in_memory`.
+        // Skipping it here would strand it in the cache permanently.
         assert_eq!(
             notification_entries(visible_entries_after(&db, seeded_entries).await),
             expected,
@@ -8979,4 +8981,601 @@ mod tests {
             assert!(!payload.created_at.is_empty());
         }
     }
+
+    // ─── Notification read/state sync (TRA-9974) ─────────────────────────────
+    //
+    // `mark_as_read`, `mark_all_as_read` and the four `bulk_*` functions used to
+    // write no `sync_log` entry at all: a notification read in one tab stayed
+    // unread in every other one, through reconnects, until a full bootstrap.
+    //
+    // Each writes one entry per notification it *actually* changed, which is a
+    // subset of what was asked for — every one of them has a state predicate the
+    // change itself falsifies. The tests below pin the set, not the count: an
+    // entry for a row the predicate excluded announces a change that never
+    // happened, and is as wrong as a missing one.
+
+    /// Distinct notification types, so several notifications can be seeded for
+    /// one user on one issue and still be told apart by [`seed_notification`].
+    const SEED_TYPES: [&str; 3] = [
+        crate::notification_service::TYPE_ASSIGNED,
+        crate::notification_service::TYPE_COMMENTED,
+        crate::notification_service::TYPE_STATUS_CHANGED,
+    ];
+
+    /// Seed `count` notifications for `user` through the real service, returning
+    /// their ids in seed order.
+    ///
+    /// These commit as they go, which is what later lets a blanket `sync_log`
+    /// trigger land on the function under test rather than on the fixture.
+    async fn seed_notifications(db: &DbPool, user: &str, count: usize) -> Vec<String> {
+        let actor = if user == USER_A { USER_B } else { USER_A };
+        let mut ids = Vec::new();
+        for notification_type in SEED_TYPES.iter().take(count) {
+            ids.push(seed_notification(db, user, "iss_vis", notification_type, actor).await);
+        }
+        assert_eq!(ids.len(), count, "SEED_TYPES must cover the requested count");
+        ids
+    }
+
+    /// Every notification of `user` as `(id, read, soft_deleted)`, ordered by id.
+    ///
+    /// Those two booleans are precisely the state the six functions change, so
+    /// an unchanged `Vec` means nothing moved and a changed one names what did.
+    /// Ordered, and compared whole, because a count would not notice one row
+    /// being flipped while another was flipped back.
+    async fn notification_states(db: &DbPool, user: &str) -> Vec<(String, bool, bool)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            notification_id: String,
+            read: bool,
+            deleted: bool,
+        }
+
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT notification_id, read, (deleted_at IS NOT NULL) AS deleted \
+             FROM notifications WHERE user_id = $1 ORDER BY notification_id",
+            user
+        )
+        .expect("read the notification states back");
+
+        rows.into_iter()
+            .map(|r| (r.notification_id, r.read, r.deleted))
+            .collect()
+    }
+
+    /// The entry a state change writes: an `update` addressed to the recipient.
+    ///
+    /// `update` and not `delete` even for a soft-delete —
+    /// [`expected_notification_delete`] is the cascade's entry, and the two have
+    /// to stay distinguishable on the wire.
+    fn expected_notification_update(entity_id: &str, recipient: &str) -> VisibleEntry {
+        VisibleEntry {
+            entity_type: entity_types::NOTIFICATION.to_string(),
+            entity_id: entity_id.to_string(),
+            action: "update".to_string(),
+            visibility_user_id: Some(recipient.to_string()),
+        }
+    }
+
+    /// The NOTIFICATION entries written after `seeded`, sorted for comparison.
+    async fn entries_written_after(db: &DbPool, seeded: usize) -> Vec<VisibleEntry> {
+        notification_entries(visible_entries_after(db, seeded).await)
+    }
+
+    /// [`next_sync_action`], but bounded.
+    ///
+    /// The frame these tests wait for is the thing under test, so the failure
+    /// mode that matters is "it never arrives" — and a bare `rx.recv().await` on
+    /// a channel nothing will ever write to blocks forever. The test would then
+    /// hang instead of failing, which reports nothing at all and takes CI's
+    /// whole job timeout to say it. Verified against this exact case: with the
+    /// `sync_log` write removed from `mark_as_read`, the unbounded form left
+    /// these tests running indefinitely rather than failing.
+    ///
+    /// The bound is generous — everything here is in-process, and a real frame
+    /// arrives in microseconds — so this is a deadlock guard and not a race.
+    async fn next_sync_action_soon(
+        conn: &mut crate::websocket::manager::ConnectionHandle,
+        what: &str,
+    ) -> SyncAction {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), next_sync_action(conn)).await
+        {
+            Ok(action) => action,
+            Err(_) => panic!("no sync frame arrived within 10s while waiting for {what}"),
+        }
+    }
+
+    fn sorted(mut expected: Vec<VisibleEntry>) -> Vec<VisibleEntry> {
+        expected.sort();
+        expected
+    }
+
+    // ── Per-function completeness ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_as_read_logs_an_entry_for_the_notification_it_marked() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::mark_as_read(&db, &ids[1], USER_A, None)
+            .await
+            .expect("A reads their second notification");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            vec![expected_notification_update(&ids[1], USER_A)],
+            "one entry, for the one row that changed — the other two were never \
+             asked about and must not be announced"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_all_as_read_logs_entries_for_only_the_unread_ones() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let b_ids = seed_notifications(&db, USER_B, 1).await;
+
+        crate::notification_service::mark_as_read(&db, &ids[0], USER_A, None)
+            .await
+            .expect("A reads one of them before the sweep");
+
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::mark_all_as_read(&db, USER_A, None)
+            .await
+            .expect("A marks their whole inbox read");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[1], USER_A),
+                expected_notification_update(&ids[2], USER_A),
+            ]),
+            "the already-read one is excluded by the `read = false` predicate, \
+             so it changed nothing and gets no entry"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_B).await,
+            vec![(b_ids[0].clone(), false, false)],
+            "the sweep is scoped to A by `user_id = $1`, so B's inbox is \
+             untouched — which is also what makes 'entries for the right rows' \
+             distinguishable from 'entries for every row'"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_mark_as_read_skips_the_requested_ids_that_were_already_read() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::mark_as_read(&db, &ids[0], USER_A, None)
+            .await
+            .expect("A reads the first one, and that commits");
+
+        let seeded = sync_entries(&db).await.len();
+
+        // All three ids are requested; only two of them can change.
+        crate::notification_service::bulk_mark_as_read(&db, &ids, USER_A, None)
+            .await
+            .expect("A bulk-marks all three read");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[1], USER_A),
+                expected_notification_update(&ids[2], USER_A),
+            ]),
+            "the entries must match the rows that changed, not the ids that \
+             were requested — an entry for the already-read one announces a \
+             change that did not happen"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_mark_as_unread_logs_entries_for_only_the_read_ones() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::bulk_mark_as_read(&db, &ids[..2], USER_A, None)
+            .await
+            .expect("A reads the first two");
+
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::bulk_mark_as_unread(&db, &ids, USER_A, None)
+            .await
+            .expect("A marks all three unread again");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[0], USER_A),
+                expected_notification_update(&ids[1], USER_A),
+            ]),
+            "the third was already unread, so the `read = true` predicate \
+             excluded it and it gets no entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_logs_update_entries_for_only_the_live_ones() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::bulk_delete_notifications(&db, &ids[..1], USER_A, None)
+            .await
+            .expect("A dismisses the first one");
+
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::bulk_delete_notifications(&db, &ids, USER_A, None)
+            .await
+            .expect("A dismisses all three");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[1], USER_A),
+                expected_notification_update(&ids[2], USER_A),
+            ]),
+            "the already-dismissed one is excluded by `deleted_at IS NULL`; and \
+             the action is `update`, because the row is still there — `delete` \
+             is what the cascade in `issue_service` uses when it destroys one"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_restore_logs_entries_for_only_the_deleted_ones() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::bulk_delete_notifications(&db, &ids[..2], USER_A, None)
+            .await
+            .expect("A dismisses the first two");
+
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::bulk_restore_notifications(&db, &ids, USER_A, None)
+            .await
+            .expect("A restores all three");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[0], USER_A),
+                expected_notification_update(&ids[1], USER_A),
+            ]),
+            "the third was never dismissed, so `deleted_at IS NOT NULL` \
+             excluded it and it gets no entry"
+        );
+    }
+
+    // ── Audience isolation, both halves ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_read_state_never_reaches_another_members_delta() {
+        let db = two_user_workspace().await;
+        let a_ids = seed_notifications(&db, USER_A, 2).await;
+
+        crate::notification_service::mark_all_as_read(&db, USER_A, None)
+            .await
+            .expect("A reads their inbox");
+
+        let b_ids = delta_entity_ids(&db, USER_B, entity_types::NOTIFICATION).await;
+        for id in &a_ids {
+            assert!(
+                !b_ids.contains(id),
+                "B's delta carries A's notification {id}: {b_ids:?} — a read \
+                 state is as private as the notification it belongs to"
+            );
+        }
+
+        // The control: A's own delta does carry the read state, so the assertion
+        // above is about audience and not about the entries being missing
+        // outright.
+        //
+        // Filtered to `Update` deliberately, and not read through
+        // `delta_entity_ids`. `create_notification` writes an `Insert` entry for
+        // each of these same ids into the same delta, so an unfiltered control
+        // is satisfied by the fixture: with the `sync_log` write removed from
+        // `mark_all_as_read` entirely, the unfiltered form still passed. Only the
+        // `Update` entries are `mark_all_as_read`'s output.
+        let a_updates: Vec<String> = get_entries_since(&db, WS, USER_A, 0, 10_000)
+            .await
+            .expect("A's delta")
+            .into_iter()
+            .filter(|e| {
+                e.entity_type == entity_types::NOTIFICATION
+                    && matches!(e.action, SyncActionType::Update)
+            })
+            .map(|e| e.entity_id)
+            .collect();
+        for id in &a_ids {
+            assert!(
+                a_updates.contains(id),
+                "the scope must not over-restrict: A's own delta is missing the \
+                 read-state update for {id}: {a_updates:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_state_never_reaches_another_members_live_connection() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 1).await;
+
+        let manager = WebSocketManager::new(None, db.clone());
+        let mut a_conn = manager.connect(USER_A).expect("A connects");
+        let mut b_conn = manager.connect(USER_B).expect("B connects");
+        a_conn.rx.recv().await.expect("A's connect heartbeat");
+        b_conn.rx.recv().await.expect("B's connect heartbeat");
+
+        crate::notification_service::mark_as_read(&db, &ids[0], USER_A, Some(&manager))
+            .await
+            .expect("A reads it");
+
+        let action = next_sync_action_soon(&mut a_conn, "A's own read state").await;
+        assert_eq!(
+            (action.entity_type.as_str(), action.entity_id.as_str()),
+            (entity_types::NOTIFICATION, ids[0].as_str()),
+            "A must receive the frame for their own read state"
+        );
+
+        // The persisted-side test above cannot see this: `visibility_user_id`
+        // could be set correctly on the row while the frame was still pushed
+        // workspace-wide. TRA-9950 established that one of the two is not enough.
+        assert!(
+            b_conn.rx.try_recv().is_err(),
+            "B received a live frame for A's read state — this is the TRA-9920 \
+             leak on the socket"
+        );
+    }
+
+    // ── Rollback ────────────────────────────────────────────────────────────
+    //
+    // All six use the *blanket* trigger, `reject_sync_log_inserts`.
+    //
+    // `reject_sync_log_inserts_for_entity_type` would not discriminate here:
+    // every entry these six write is `entity_types::NOTIFICATION`, so narrowing
+    // by type produces exactly the blanket trigger. What makes the blanket form
+    // correct is the ordering instead — the fixture (`seed_notifications`, and
+    // any prior state change) runs through the real services and *commits* its
+    // own entries before the trigger is installed, so the trigger only ever sees
+    // entries written by the function under test.
+    //
+    // That ordering is the whole point. TRA-9950 hit the opposite case in
+    // `notification_service::update_preference`, where `get_or_default_
+    // preferences` emits an `Insert` from an earlier transaction: a blanket
+    // trigger aborted that one, the test saw an error, and the code under test
+    // was never reached.
+
+    #[tokio::test]
+    async fn mark_as_read_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::mark_as_read(&db, &ids[0], USER_A, None)
+            .await
+            .expect_err("a mark-read whose sync entry cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "the read flag must unwind with the entry that would have carried \
+             it to the other tabs"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_all_as_read_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let _ids = seed_notifications(&db, USER_A, 3).await;
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::mark_all_as_read(&db, USER_A, None)
+            .await
+            .expect_err("a sweep whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "all three rows unwind together — the sweep is one transaction, so \
+             a partial sweep with no entries is not a reachable state"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_mark_as_read_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::bulk_mark_as_read(&db, &ids, USER_A, None)
+            .await
+            .expect_err("a bulk mark-read whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(notification_states(&db, USER_A).await, before);
+    }
+
+    #[tokio::test]
+    async fn bulk_mark_as_unread_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        // The prior state this test restores to, established and committed
+        // before the trigger exists.
+        crate::notification_service::bulk_mark_as_read(&db, &ids, USER_A, None)
+            .await
+            .expect("A reads all three");
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::bulk_mark_as_unread(&db, &ids, USER_A, None)
+            .await
+            .expect_err("a bulk mark-unread whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "every row must still be read, exactly as it was before the call"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::notification_service::bulk_delete_notifications(&db, &ids, USER_A, None)
+                .await
+                .expect_err("a bulk delete whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "nothing may be left soft-deleted with no entry to announce it — \
+             the row would be hidden on the server and visible on every client"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_restore_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::bulk_delete_notifications(&db, &ids, USER_A, None)
+            .await
+            .expect("A dismisses all three");
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::notification_service::bulk_restore_notifications(&db, &ids, USER_A, None)
+                .await
+                .expect_err("a bulk restore whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "every row must still be dismissed, exactly as it was before"
+        );
+    }
+
+    // ── The symptom ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reading_a_notification_in_one_tab_reaches_the_users_other_tab() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 1).await;
+
+        let manager = WebSocketManager::new(None, db.clone());
+        // Two sessions for one user: two browser tabs.
+        let mut tab_one = manager.connect(USER_A).expect("A's first tab connects");
+        let mut tab_two = manager.connect(USER_A).expect("A's second tab connects");
+
+        // `connect` delivers its heartbeat with `deliver_to_local_user`, which
+        // reaches every connection the user already has rather than only the new
+        // one. So the first tab has two queued — its own, then the second tab's
+        // — and the second tab has one.
+        tab_one.rx.recv().await.expect("the first tab's own connect heartbeat");
+        tab_one
+            .rx
+            .recv()
+            .await
+            .expect("the heartbeat the second tab's connect sends to the first");
+        tab_two.rx.recv().await.expect("the second tab's connect heartbeat");
+
+        crate::notification_service::mark_as_read(&db, &ids[0], USER_A, Some(&manager))
+            .await
+            .expect("A reads the notification in the first tab");
+
+        // The other tab is told, and told the new *state* — not merely that
+        // something about the notification changed. `cache/apply.rs` upserts the
+        // payload wholesale, so a payload still saying `read: false` would leave
+        // the second tab showing it unread, which is the reported bug exactly.
+        let action =
+            next_sync_action_soon(&mut tab_two, "the read state reaching the second tab").await;
+        let payload = payload_of(&action, entity_types::NOTIFICATION, &ids[0]);
+        assert_eq!(
+            payload.get("read").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the second tab must receive the notification marked read: {payload}"
+        );
+
+        // The tab that made the change hears it too, over its own connection.
+        let echoed =
+            next_sync_action_soon(&mut tab_one, "the read state echoed to the first tab").await;
+        assert_eq!(
+            (echoed.entity_type.as_str(), echoed.entity_id.as_str()),
+            (entity_types::NOTIFICATION, ids[0].as_str())
+        );
+
+        // And a tab that was offline for the change replays it to the same
+        // state. This is the path that was broken outright before: with no entry
+        // written at all, no delta could carry the read state and only a full
+        // bootstrap corrected the stale tab.
+        let replayed: Vec<serde_json::Value> = get_entries_since(&db, WS, USER_A, 0, 10_000)
+            .await
+            .expect("A's delta")
+            .into_iter()
+            .filter(|e| e.entity_id == ids[0] && matches!(e.action, SyncActionType::Update))
+            .filter_map(|e| e.data)
+            .collect();
+
+        assert_eq!(
+            replayed.len(),
+            1,
+            "exactly one update entry for the one read: {replayed:?}"
+        );
+        assert_eq!(
+            replayed[0].get("read").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a reconnecting tab replays the same read state the live frame \
+             carried: {:?}",
+            replayed[0]
+        );
+    }
+
 }
