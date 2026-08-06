@@ -916,6 +916,7 @@ mod tests {
         Favorite, IssueWithDetails, Label, Project, ProjectMember, ProjectMilestone, ProjectUpdate,
         Status, Team, View,
     };
+    use trakkt_core::test_helpers::channel::recv_soon;
     use trakkt_types::sync::{entity_types, SyncResponse};
 
     /// A single-instance manager over a workspace with one member.
@@ -960,7 +961,7 @@ mod tests {
 
         let mut conn = manager.connect(user_id).expect("connection");
         // Discard the connect heartbeat.
-        conn.rx.recv().await.expect("heartbeat frame");
+        recv_soon(&mut conn.rx, "the connect heartbeat").await;
 
         broadcast_sync_action(
             &manager,
@@ -973,7 +974,7 @@ mod tests {
         )
         .await;
 
-        let frame = conn.rx.recv().await.expect("broadcast frame");
+        let frame = recv_soon(&mut conn.rx, "the broadcast frame under test").await;
         match serde_json::from_str::<SyncResponse>(&frame)
             .expect("broadcast frame is a SyncResponse")
         {
@@ -1443,8 +1444,8 @@ mod tests {
 
         let mut a_conn = manager.connect(USER_A).expect("A connects");
         let mut b_conn = manager.connect(USER_B).expect("B connects");
-        a_conn.rx.recv().await.expect("A's heartbeat");
-        b_conn.rx.recv().await.expect("B's heartbeat");
+        recv_soon(&mut a_conn.rx, "A's connect heartbeat").await;
+        recv_soon(&mut b_conn.rx, "B's connect heartbeat").await;
 
         crate::notification_service::create_notification(
             &db,
@@ -1461,7 +1462,7 @@ mod tests {
         .await
         .expect("notify A");
 
-        let frame = a_conn.rx.recv().await.expect("A receives the notification");
+        let frame = recv_soon(&mut a_conn.rx, "A's notification frame").await;
         match serde_json::from_str::<SyncResponse>(&frame).expect("a SyncResponse") {
             SyncResponse::SyncAction(action) => {
                 assert_eq!(action.entity_type, entity_types::NOTIFICATION);
@@ -1680,7 +1681,7 @@ mod tests {
     async fn watching_member(db: &DbPool) -> (WebSocketManager, crate::websocket::manager::ConnectionHandle) {
         let manager = WebSocketManager::new(None, db.clone());
         let mut conn = manager.connect(USER_B).expect("B connects");
-        conn.rx.recv().await.expect("connect heartbeat");
+        recv_soon(&mut conn.rx, "B's connect heartbeat").await;
         (manager, conn)
     }
 
@@ -1689,13 +1690,22 @@ mod tests {
     /// Going through `SyncResponse` is the point of the test: it is the exact
     /// call `cache/websocket.rs` makes, and it is where the old envelope frame
     /// failed.
-    async fn next_sync_action(conn: &mut crate::websocket::manager::ConnectionHandle) -> SyncAction {
-        let frame = conn.rx.recv().await.expect("a broadcast frame");
+    ///
+    /// `what` names the delivery being awaited, and every failure below repeats
+    /// it. The receive is bounded by [`recv_soon`], so "the frame never arrives"
+    /// is reported as a named failure instead of a hang — see
+    /// [`trakkt_core::test_helpers::channel`] for why that is the failure mode
+    /// this whole family of tests has to be able to report.
+    async fn next_sync_action(
+        conn: &mut crate::websocket::manager::ConnectionHandle,
+        what: &str,
+    ) -> SyncAction {
+        let frame = recv_soon(&mut conn.rx, what).await;
         match serde_json::from_str::<SyncResponse>(&frame).unwrap_or_else(|e| {
-            panic!("frame did not parse as a SyncResponse: {e}\nframe: {frame}")
+            panic!("the frame carrying {what} did not parse as a SyncResponse: {e}\nframe: {frame}")
         }) {
             SyncResponse::SyncAction(action) => action,
-            other => panic!("expected a sync_action frame, got {other:?}"),
+            other => panic!("expected a sync_action frame carrying {what}, got {other:?}"),
         }
     }
 
@@ -1758,7 +1768,7 @@ mod tests {
 
         let status = create_test_status(&db, Some(&manager)).await;
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the status create frame").await;
         assert!(matches!(action.action, SyncActionType::Insert));
         let data = payload_of(&action, entity_types::STATUS, &status.status_id);
 
@@ -1782,7 +1792,7 @@ mod tests {
 
         let project = create_test_project(&db, Some(&manager)).await;
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the project create frame").await;
         assert!(matches!(action.action, SyncActionType::Insert));
         let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
 
@@ -1800,7 +1810,7 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         let updated = crate::project_service::update_project(
             &db,
@@ -1821,7 +1831,7 @@ mod tests {
         .await
         .expect("update project");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the project update frame").await;
         assert!(matches!(action.action, SyncActionType::Update));
         let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
 
@@ -1857,7 +1867,7 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         crate::project_service::add_project_member(
             &db,
@@ -1870,7 +1880,7 @@ mod tests {
         .await
         .expect("add member");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the member-add frame").await;
         assert!(
             matches!(action.action, SyncActionType::Insert),
             "adding a member creates a membership row, so the frame is an \
@@ -1902,7 +1912,7 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         crate::project_service::add_project_member(
             &db,
@@ -1914,7 +1924,7 @@ mod tests {
         )
         .await
         .expect("add member");
-        next_sync_action(&mut conn).await; // the member-add frame
+        next_sync_action(&mut conn, "the member-add frame").await;
 
         crate::project_service::remove_project_member(
             &db,
@@ -1926,7 +1936,7 @@ mod tests {
         .await
         .expect("remove member");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the member-remove frame").await;
         assert!(
             matches!(action.action, SyncActionType::Delete),
             "removing a member deletes the membership row, so the frame is a \
@@ -1956,7 +1966,7 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         let posted = crate::project_service::create_project_update(
             &db,
@@ -1970,7 +1980,7 @@ mod tests {
         .await
         .expect("post a project update");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the project-update create frame").await;
         assert!(
             matches!(action.action, SyncActionType::Insert),
             "posting an update creates a row, so the frame is an Insert of that \
@@ -2123,11 +2133,11 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the project create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         let milestone = create_test_milestone(&db, &project.project_id, "Beta", Some(&manager)).await;
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the milestone create frame").await;
         assert!(matches!(action.action, SyncActionType::Insert));
         let data = payload_of(
             &action,
@@ -2158,9 +2168,9 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the project create frame
+        next_sync_action(&mut conn, "the project create frame").await;
         let milestone = create_test_milestone(&db, &project.project_id, "Beta", Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the milestone create frame
+        next_sync_action(&mut conn, "the milestone create frame").await;
 
         let updated = crate::project_service::update_milestone(
             &db,
@@ -2174,7 +2184,7 @@ mod tests {
         .await
         .expect("update milestone");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the milestone update frame").await;
         assert!(matches!(action.action, SyncActionType::Update));
         let data = payload_of(
             &action,
@@ -3961,7 +3971,7 @@ mod tests {
 
         let mut conn = manager.connect(USER_B).expect("connection");
         // Discard the connect heartbeat.
-        conn.rx.recv().await.expect("heartbeat frame");
+        recv_soon(&mut conn.rx, "the connect heartbeat").await;
 
         crate::issue_service::update_issue(
             &db,
@@ -3980,7 +3990,7 @@ mod tests {
         .await
         .expect("update issue");
 
-        let frame = conn.rx.recv().await.expect("broadcast frame");
+        let frame = recv_soon(&mut conn.rx, "the issue update frame").await;
         let action = match serde_json::from_str::<SyncResponse>(&frame)
             .expect("broadcast frame is a SyncResponse")
         {
@@ -6765,8 +6775,8 @@ mod tests {
 
         let mut a_conn = manager.connect(USER_A).expect("A connects");
         let mut b_conn = manager.connect(USER_B).expect("B connects");
-        a_conn.rx.recv().await.expect("A's connect heartbeat");
-        b_conn.rx.recv().await.expect("B's connect heartbeat");
+        recv_soon(&mut a_conn.rx, "A's connect heartbeat").await;
+        recv_soon(&mut b_conn.rx, "B's connect heartbeat").await;
 
         // One mutation per converted per-user site, in order.
         let favorite =
@@ -6801,8 +6811,12 @@ mod tests {
 
         // A receives every one of them, in order, each addressed to A's own row.
         let mut a_frames = Vec::new();
-        for _ in 0..6 {
-            let action = next_sync_action(&mut a_conn).await;
+        for received in 0..6 {
+            let action = next_sync_action(
+                &mut a_conn,
+                &format!("A's own-mutation frame {} of 6", received + 1),
+            )
+            .await;
             a_frames.push((action.entity_type.clone(), action.entity_id.clone()));
             assert!(
                 action.sync_id > 0,
@@ -6842,7 +6856,8 @@ mod tests {
         // the assertion above is about audience and not about delivery being
         // broken.
         let shared = make_view(&db, USER_A, "A's shared view", true, Some(&manager)).await;
-        let b_frame = next_sync_action(&mut b_conn).await;
+        let b_frame =
+            next_sync_action(&mut b_conn, "the shared view reaching B").await;
         assert_eq!(
             (b_frame.entity_type.as_str(), b_frame.entity_id.as_str()),
             (entity_types::VIEW, shared.view_id.as_str()),
@@ -7250,7 +7265,7 @@ mod tests {
         let manager = WebSocketManager::new(None, db.clone());
 
         let mut conn = manager.connect(USER_B).expect("B connects");
-        conn.rx.recv().await.expect("B's connect heartbeat");
+        recv_soon(&mut conn.rx, "B's connect heartbeat").await;
 
         let release = crate::release_service::create_release(
             &db,
@@ -7268,8 +7283,12 @@ mod tests {
         .expect("create release");
 
         let mut actions = Vec::new();
-        for _ in 0..3 {
-            let action = next_sync_action(&mut conn).await;
+        for received in 0..3 {
+            let action = next_sync_action(
+                &mut conn,
+                &format!("the release's frame {} of 3", received + 1),
+            )
+            .await;
             assert!(
                 action.sync_id > 0,
                 "every frame has to carry the id of its committed row so a \
@@ -8754,7 +8773,7 @@ mod tests {
             "precondition: the status change wrote exactly one activity"
         );
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the activity insert frame").await;
         assert!(
             matches!(action.action, SyncActionType::Insert),
             "recording an activity creates a row, so the frame is an Insert of \
@@ -8806,7 +8825,8 @@ mod tests {
         let inserted = issue_activities(&db).await;
         assert_eq!(inserted.len(), 1, "precondition: one activity so far");
 
-        let insert_frame = next_sync_action(&mut conn).await;
+        let insert_frame =
+            next_sync_action(&mut conn, "the activity insert frame").await;
         assert!(matches!(insert_frame.action, SyncActionType::Insert));
         let insert_payload: trakkt_types::models::IssueActivity = serde_json::from_value(
             payload_of(
@@ -8844,7 +8864,8 @@ mod tests {
             "precondition: the second change coalesced rather than inserting"
         );
 
-        let update_frame = next_sync_action(&mut conn).await;
+        let update_frame =
+            next_sync_action(&mut conn, "the coalesced activity update frame").await;
         assert!(
             matches!(update_frame.action, SyncActionType::Update),
             "the coalescing branch updates the row, so that is what the frame \
@@ -9062,29 +9083,6 @@ mod tests {
     /// The NOTIFICATION entries written after `seeded`, sorted for comparison.
     async fn entries_written_after(db: &DbPool, seeded: usize) -> Vec<VisibleEntry> {
         notification_entries(visible_entries_after(db, seeded).await)
-    }
-
-    /// [`next_sync_action`], but bounded.
-    ///
-    /// The frame these tests wait for is the thing under test, so the failure
-    /// mode that matters is "it never arrives" — and a bare `rx.recv().await` on
-    /// a channel nothing will ever write to blocks forever. The test would then
-    /// hang instead of failing, which reports nothing at all and takes CI's
-    /// whole job timeout to say it. Verified against this exact case: with the
-    /// `sync_log` write removed from `mark_as_read`, the unbounded form left
-    /// these tests running indefinitely rather than failing.
-    ///
-    /// The bound is generous — everything here is in-process, and a real frame
-    /// arrives in microseconds — so this is a deadlock guard and not a race.
-    async fn next_sync_action_soon(
-        conn: &mut crate::websocket::manager::ConnectionHandle,
-        what: &str,
-    ) -> SyncAction {
-        match tokio::time::timeout(std::time::Duration::from_secs(10), next_sync_action(conn)).await
-        {
-            Ok(action) => action,
-            Err(_) => panic!("no sync frame arrived within 10s while waiting for {what}"),
-        }
     }
 
     fn sorted(mut expected: Vec<VisibleEntry>) -> Vec<VisibleEntry> {
@@ -9311,14 +9309,14 @@ mod tests {
         let manager = WebSocketManager::new(None, db.clone());
         let mut a_conn = manager.connect(USER_A).expect("A connects");
         let mut b_conn = manager.connect(USER_B).expect("B connects");
-        a_conn.rx.recv().await.expect("A's connect heartbeat");
-        b_conn.rx.recv().await.expect("B's connect heartbeat");
+        recv_soon(&mut a_conn.rx, "A's connect heartbeat").await;
+        recv_soon(&mut b_conn.rx, "B's connect heartbeat").await;
 
         crate::notification_service::mark_as_read(&db, &ids[0], USER_A, Some(&manager))
             .await
             .expect("A reads it");
 
-        let action = next_sync_action_soon(&mut a_conn, "A's own read state").await;
+        let action = next_sync_action(&mut a_conn, "A's own read state").await;
         assert_eq!(
             (action.entity_type.as_str(), action.entity_id.as_str()),
             (entity_types::NOTIFICATION, ids[0].as_str()),
@@ -9519,13 +9517,13 @@ mod tests {
         // reaches every connection the user already has rather than only the new
         // one. So the first tab has two queued — its own, then the second tab's
         // — and the second tab has one.
-        tab_one.rx.recv().await.expect("the first tab's own connect heartbeat");
-        tab_one
-            .rx
-            .recv()
-            .await
-            .expect("the heartbeat the second tab's connect sends to the first");
-        tab_two.rx.recv().await.expect("the second tab's connect heartbeat");
+        recv_soon(&mut tab_one.rx, "the first tab's own connect heartbeat").await;
+        recv_soon(
+            &mut tab_one.rx,
+            "the heartbeat the second tab's connect sends to the first",
+        )
+        .await;
+        recv_soon(&mut tab_two.rx, "the second tab's connect heartbeat").await;
 
         crate::notification_service::mark_as_read(&db, &ids[0], USER_A, Some(&manager))
             .await
@@ -9536,7 +9534,7 @@ mod tests {
         // payload wholesale, so a payload still saying `read: false` would leave
         // the second tab showing it unread, which is the reported bug exactly.
         let action =
-            next_sync_action_soon(&mut tab_two, "the read state reaching the second tab").await;
+            next_sync_action(&mut tab_two, "the read state reaching the second tab").await;
         let payload = payload_of(&action, entity_types::NOTIFICATION, &ids[0]);
         assert_eq!(
             payload.get("read").and_then(serde_json::Value::as_bool),
@@ -9546,7 +9544,7 @@ mod tests {
 
         // The tab that made the change hears it too, over its own connection.
         let echoed =
-            next_sync_action_soon(&mut tab_one, "the read state echoed to the first tab").await;
+            next_sync_action(&mut tab_one, "the read state echoed to the first tab").await;
         assert_eq!(
             (echoed.entity_type.as_str(), echoed.entity_id.as_str()),
             (entity_types::NOTIFICATION, ids[0].as_str())

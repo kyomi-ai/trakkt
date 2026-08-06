@@ -290,6 +290,7 @@ impl MCPSessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trakkt_core::test_helpers::channel::recv_soon;
 
     async fn test_manager() -> MCPSessionManager {
         let kv = trakkt_core::kv_store::create_kv_store(None)
@@ -459,8 +460,8 @@ mod tests {
 
         mgr.notify_tools_changed("ws-test-10").await;
 
-        let msg1 = rx1.recv().await.expect("should receive notification");
-        let msg2 = rx2.recv().await.expect("should receive notification");
+        let msg1 = recv_soon(&mut rx1, "the first session's list_changed notification").await;
+        let msg2 = recv_soon(&mut rx2, "the second session's list_changed notification").await;
 
         assert!(msg1.contains("notifications/tools/list_changed"));
         assert!(msg2.contains("notifications/tools/list_changed"));
@@ -479,7 +480,11 @@ mod tests {
 
         mgr.notify_tools_changed("ws-test-11").await;
 
-        let msg = rx2.recv().await.expect("should receive notification");
+        let msg = recv_soon(
+            &mut rx2,
+            "the list_changed notification for the one session that has an SSE sender",
+        )
+        .await;
         assert!(msg.contains("notifications/tools/list_changed"));
 
         cleanup(&mgr, &[&_s1, &s2], &["ws-test-11"]).await;
@@ -526,10 +531,11 @@ mod tests {
 
         mgr.notify_tools_changed("ws-test-13").await;
 
-        let msg = rx
-            .recv()
-            .await
-            .expect("notify_tools_changed to push a notification to the registered SSE sender");
+        let msg = recv_soon(
+            &mut rx,
+            "the notification notify_tools_changed pushes to the registered SSE sender",
+        )
+        .await;
         let parsed: serde_json::Value =
             serde_json::from_str(&msg).expect("the pushed notification to be valid JSON");
 
@@ -554,7 +560,11 @@ mod tests {
         mgr.notify_tools_changed("ws-test-14").await;
 
         // ws-test-14 should receive notification
-        let msg = rx1.recv().await.expect("ws-test-14 should receive notification");
+        let msg = recv_soon(
+            &mut rx1,
+            "the list_changed notification for the notified workspace",
+        )
+        .await;
         assert!(msg.contains("notifications/tools/list_changed"));
 
         // ws-test-15 should NOT receive anything

@@ -41,5 +41,12 @@ async-stripe-checkout = { workspace = true }
 async-stripe-core = { workspace = true }
 async-stripe-shared = { workspace = true }
 async-stripe-types = { workspace = true }
+
+# `test-helpers` carries `trakkt_core::test_helpers::channel::recv_soon`, which
+# this crate's `#[cfg(test)]` modules use to bound every receive on a delivery
+# channel. A dev-dependency, so the feature is off in the production build.
+[dev-dependencies]
+trakkt-core = { workspace = true, features = ["test-helpers"] }
+
 [lints]
 workspace = true
