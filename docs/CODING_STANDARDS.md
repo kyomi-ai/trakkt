@@ -89,6 +89,36 @@ Filler messages — `expect("unwrap")`, `expect("should work")`, `expect("failed
 
 Do not silence a clippy finding with `#[allow(...)]`, and never with a crate-level `#![allow(clippy::unwrap_used)]`. The `Lint Suppression Policy` job fails any PR whose diff adds `#[allow(` to a `.rs` file or `= "allow"` to a `Cargo.toml`. Fix the finding instead: `clippy::type_complexity` wants a `type` alias, `dead_code` wants the field genuinely read or removed.
 
+### Rollback tests for sync_log writes
+
+A converted write needs a test proving the mutation rolls back when its `sync_log`
+insert fails. Inject the failure with a real trigger on `sync_log` — no mocks, no
+`#[cfg(test)]` branch in production control flow — and assert **both** an error
+return and that prior state is intact, compared as ordered `Vec`s.
+
+Two helpers exist in `crates/trakkt-core/src/test_helpers/dual_backend.rs`:
+
+- `reject_sync_log_inserts` — a blanket trigger. Correct only for a mutation that
+  writes exactly one entry.
+- `reject_sync_log_inserts_of_type` — narrows with a `WHEN NEW.entity_type = …`
+  clause so entries written *before* the probed type are accepted. Pair with
+  `clear_sync_log_rejection` to probe several types against one database.
+
+A blanket trigger on a function that writes several entries aborts the *first* one,
+so the assertion passes without the code under test ever being reached. TRA-9950 hit
+this in `notification_service::update_preference`, where `get_or_default_preferences`
+emits an `Insert` first; TRA-9971's cascade had the same shape across four loops.
+
+Narrowing by entity type does not discriminate when every entry a function writes
+shares one type — a bulk mark-read writing N `NOTIFICATION` entries is the case.
+There, seed the prior state and let it commit *before* installing the trigger, so the
+trigger only sees the entries the function under test writes. Say which of the two
+you used and why; a rollback test that cannot fail is worse than none.
+
+Mutation-test each converted function individually and report per function. A sweep
+that reports one aggregate result cannot distinguish "all six covered" from "one
+covered five times".
+
 ## The Postgres dialect suite
 
 Production runs Postgres. Every test in the workspace except this suite runs
