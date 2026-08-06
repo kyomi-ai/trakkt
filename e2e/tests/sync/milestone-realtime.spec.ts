@@ -317,3 +317,167 @@ test("a milestone rename reaches window B's issue metadata sidebar without a rel
 
   expectDeliveredByCounter(probeB, since, 'project_milestone', 'list_milestones', renamed);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-10030 — the defect the flake above was a symptom of
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The three tests above all drive the *writing* window through
+// `createMilestone` / `renameMilestone`, and those helpers intermittently
+// failed at `fill` with the input gone. The cause is not in the test: the
+// Milestones section's mode and draft signals were created inside
+// `project_detail.rs`'s reactive rendering closure, which re-runs — and so
+// rebuilds the section from scratch — every time any of the page's five
+// reactive sources settles. One of those is `server_milestones`, keyed on
+// `milestones_version`, which bumps on every `project_milestone` frame.
+//
+// So the flake was a user-facing bug wearing a test's clothes: type a milestone
+// name, have a colleague add a milestone in another window, and your form
+// closes and your text is gone. The two tests below are that bug, stated as the
+// user sees it. They are deterministic where the flake was not — the trigger is
+// a frame the test itself causes, and the assertions run only once its effect
+// (the colleague's row appearing) is on screen, so there is no timing window
+// left to be lucky in.
+//
+// Same class as `two-window-sync.spec.ts`'s "typing in window B is not
+// destroyed by a frame arriving from window A", and written to its shape.
+//
+// ── What these tests do NOT assert, and why ─────────────────────────────────
+//
+// They do not assert `toBeFocused()` on the input after the frame, because that
+// still fails — and it is worth being precise about what survives and what does
+// not, rather than leaving it as "the fix works".
+//
+// The input is still there and still holds what was typed, but it is a
+// *different element*: verified by tagging the node with an attribute before the
+// frame and finding the attribute gone afterwards. Tagging its neighbours
+// narrows the boundary exactly — the row div, the status-dot span inside it, the
+// rows container and the section heading all survive; the input, the DatePicker
+// beside it and the project-name `h1` do not. What they have in common is that
+// each sits inside a `<Show>`.
+//
+// `Show` is a reactive closure, and `tachys`'s `Render` impl for a closure in
+// view position does not diff on rebuild — it builds a fresh subtree and
+// unmounts the old one (`tachys-0.2.18/src/reactive_graph/mod.rs:77-83`). So an
+// ancestor closure re-running destroys every `Show` under it whether or not its
+// own condition changed. Hoisting signals cannot fix that; only the ancestor not
+// re-running can, which means `ProjectDetailContent` taking signals rather than
+// `Vec`s throughout. That is TRA-10031, and its acceptance criteria include
+// restoring the two assertions removed below.
+
+/**
+ * Put window B on the project page with a settled Milestones section.
+ *
+ * The `markWhenQuiet` is load-bearing: B's own page load re-reads
+ * `list_milestones` more than once, and each settling resource re-rendered the
+ * section just as an arriving frame does. Waiting for B to go quiet first is
+ * what makes the frame from A the *only* thing that can re-render it.
+ */
+async function settleWindowBOnProject(expectVisible: string): Promise<Locator> {
+  await pageB.goto(projectHref);
+  await pageB.waitForLoadState('networkidle');
+  const sectionB = milestoneSection(pageB);
+  await expect(sectionB.getByText(expectVisible, { exact: true })).toBeVisible({ timeout: 30_000 });
+  await waitForSyncHandshake(probeB, 'B');
+  await markWhenQuiet(probeB, 'list_milestones');
+  return sectionB;
+}
+
+test("a frame from window A must not close window B's open rename input", async () => {
+  const base = `Rename base ${rand()}`;
+  const typed = `Renamed by B ${rand()}`;
+  const fromA = `Meanwhile from A ${rand()}`;
+
+  await pageA.goto(projectHref);
+  await expect(
+    milestoneSection(pageA).getByRole('button', { name: 'Add milestone' }),
+  ).toBeVisible({ timeout: 30_000 });
+  await createMilestone(pageA, base);
+
+  const sectionB = await settleWindowBOnProject(base);
+
+  // B starts renaming and does NOT save.
+  await sectionB.getByText(base, { exact: true }).click();
+  const inputB = sectionB.locator('input[type="text"]');
+  // Count, not just visibility: the ticket's other hypothesis was that this
+  // locator matches two inputs once a second row is in play. Asserting the
+  // count keeps that answered rather than assumed.
+  await expect(
+    inputB,
+    'exactly one milestone name input must be open — the rename locator must not be ambiguous',
+  ).toHaveCount(1);
+  await inputB.click();
+  await inputB.fill(typed);
+
+  // A adds an unrelated milestone. That is a `project_milestone` frame, which
+  // bumps B's `milestones_version` and re-reads `list_milestones` — the same
+  // re-render the flake was riding on, now caused deliberately.
+  await createMilestone(pageA, fromA);
+
+  // B showing A's new row is proof the frame landed and the section re-rendered.
+  // Everything after this line is asserted about the state *after* the event
+  // that used to destroy it, so there is nothing left to race.
+  await expect(sectionB.getByText(fromA, { exact: true })).toBeVisible({ timeout: 30_000 });
+
+  await expect(
+    inputB,
+    "window B's rename input was closed by a milestone frame from window A",
+  ).toHaveCount(1);
+  await expect(
+    inputB,
+    "window B's half-typed milestone name was discarded by a frame from window A",
+  ).toHaveValue(typed);
+  // Deliberately NOT asserted here: `toBeFocused()`. It fails, and it fails for
+  // a different reason than everything above — see the note below and TRA-10031.
+
+  // And the edit still commits what B typed, against the milestone B was editing.
+  await inputB.press('Enter');
+  await expect(sectionB.getByText(typed, { exact: true })).toBeVisible({ timeout: 20_000 });
+  await expect(sectionB.getByText(base, { exact: true })).toHaveCount(0);
+});
+
+test("a frame from window A must not close window B's open add-milestone form", async () => {
+  const base = `Add base ${rand()}`;
+  const typed = `Added by B ${rand()}`;
+  const fromA = `Meanwhile from A ${rand()}`;
+
+  await pageA.goto(projectHref);
+  await expect(
+    milestoneSection(pageA).getByRole('button', { name: 'Add milestone' }),
+  ).toBeVisible({ timeout: 30_000 });
+  await createMilestone(pageA, base);
+
+  const sectionB = await settleWindowBOnProject(base);
+
+  // B opens the add form and types a name, without submitting.
+  await sectionB.getByRole('button', { name: 'Add milestone' }).click();
+  const nameInputB = sectionB.getByPlaceholder('Milestone name');
+  await expect(nameInputB).toHaveCount(1);
+  await nameInputB.click();
+  await nameInputB.fill(typed);
+
+  await createMilestone(pageA, fromA);
+  await expect(sectionB.getByText(fromA, { exact: true })).toBeVisible({ timeout: 30_000 });
+
+  await expect(
+    nameInputB,
+    "window B's add-milestone form was closed by a milestone frame from window A",
+  ).toHaveCount(1);
+  await expect(
+    nameInputB,
+    "window B's half-typed milestone name was discarded by a frame from window A",
+  ).toHaveValue(typed);
+  // Again, no `toBeFocused()` — TRA-10031.
+
+  // And the form still creates what B typed.
+  await sectionB.getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(sectionB.getByText(typed, { exact: true })).toBeVisible({ timeout: 20_000 });
+
+  // Reopening the form must not resurrect the name that was just submitted —
+  // the drafts now outlive the form, so clearing them is the form's job.
+  await sectionB.getByRole('button', { name: 'Add milestone' }).click();
+  await expect(
+    sectionB.getByPlaceholder('Milestone name'),
+    'a reopened add-milestone form must start empty, not holding the last name created',
+  ).toHaveValue('');
+});
