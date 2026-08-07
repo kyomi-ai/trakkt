@@ -733,29 +733,149 @@ impl SyncStore {
     /// Clear all lists and reset initialized to false.
     ///
     /// Called before hydrating from a different workspace's cache so stale
-    /// data from the previous workspace doesn't leak into the new one.
+    /// data from the previous workspace doesn't leak into the new one, and on
+    /// the cursor-less connect path in [`crate::cache::sync_engine`] before
+    /// every fresh bootstrap.
+    ///
+    /// That second caller is why the eight collections go through
+    /// [`clear_if_populated`] and the nine version counters through
+    /// [`rewind_to_zero`], rather than `set`: on a fresh bootstrap they are
+    /// already empty and already `0`, and `set` notifies whether or not the
+    /// value moved. See [`rewind_to_zero`] for the mechanism and for what an
+    /// unchanged-value notification costs the pages subscribed to one.
+    ///
+    /// `initialized` is the one write here still on `set`. On the cursor-less
+    /// bootstrap path it genuinely moves: hydration sets it `true`
+    /// (`sync_engine::hydrate_store_from_db`, called by
+    /// `sync_engine::hydrate_then_open_gate`, which opens the gate only on its
+    /// way out) and the socket is not dialled until that gate opens
+    /// (`sync_engine::dial_when_hydrated`), so `reset` always finds it `true`
+    /// there. It is reachable as a no-op only through a `SyncReset` or a
+    /// follower `Reset` arriving while it is already `false`.
     pub fn reset(&self) {
         self.inner.with_value(|inner| {
-            inner.issues.set(Vec::new());
-            inner.labels.set(Vec::new());
-            inner.statuses.set(Vec::new());
-            inner.teams.set(Vec::new());
-            inner.projects.set(Vec::new());
-            inner.views.set(Vec::new());
-            inner.favorites.set(Vec::new());
-            inner.notifications.set(Vec::new());
+            clear_if_populated(&inner.issues);
+            clear_if_populated(&inner.labels);
+            clear_if_populated(&inner.statuses);
+            clear_if_populated(&inner.teams);
+            clear_if_populated(&inner.projects);
+            clear_if_populated(&inner.views);
+            clear_if_populated(&inner.favorites);
+            clear_if_populated(&inner.notifications);
             inner.initialized.set(false);
-            inner.activities_version.set(0);
-            inner.relations_version.set(0);
-            inner.comments_version.set(0);
-            inner.milestones_version.set(0);
-            inner.project_members_version.set(0);
-            inner.project_updates_version.set(0);
-            inner.attachments_version.set(0);
-            inner.notification_preferences_version.set(0);
-            inner.workspace_settings_version.set(0);
+            rewind_to_zero(&inner.activities_version);
+            rewind_to_zero(&inner.relations_version);
+            rewind_to_zero(&inner.comments_version);
+            rewind_to_zero(&inner.milestones_version);
+            rewind_to_zero(&inner.project_members_version);
+            rewind_to_zero(&inner.project_updates_version);
+            rewind_to_zero(&inner.attachments_version);
+            rewind_to_zero(&inner.notification_preferences_version);
+            rewind_to_zero(&inner.workspace_settings_version);
         });
     }
+}
+
+/// Rewind a version counter to zero, waking its subscribers only if it moved.
+///
+/// # Why not `set(0)`
+///
+/// `set` notifies unconditionally — it never compares against the value already
+/// there. In `reactive_graph-0.2.14`, `Set::set` is `try_update(|n| *n = value)`,
+/// `try_update` is `try_maybe_update(|val| (true, fun(val)))`, and that `true`
+/// leaves the write guard's `triggerable` in place, so `WriteGuard::drop` calls
+/// `notify()` (`traits.rs`, `signal/guards.rs`).
+///
+/// `maybe_update` is the same write with the notification made conditional: a
+/// `false` return calls `untrack()` on the guard, which *takes* the triggerable,
+/// and `Drop` then finds nothing to notify. The nine counters are `u32`, so
+/// "did it move" is a comparison against `0`.
+///
+/// # What an unchanged-value notification costs
+///
+/// Two things, both measured against this tree rather than assumed:
+///
+/// - A `LocalResource` has no separate source argument, so it subscribes
+///   directly to whatever its fetcher reads and its `AsyncDerived` is marked
+///   *dirty* by the notification — it refetches. `NotificationsPage`
+///   (`pages/settings/notifications.rs`) tracks
+///   `notification_preferences_version` inside its fetcher, so an unchanged
+///   notification there is a real `get_notification_preferences` round trip.
+/// - An `Effect` re-runs its whole body on notification, value unchanged or
+///   not. `IssueDetailContent`'s comments effect (`pages/issues/issue_detail.rs`)
+///   opens IndexedDB and re-reads every comment of the issue from it.
+///
+/// `Resource::new` is the case that does *not* refetch, and this is the part to
+/// keep rather than round off: `ArcResource::new_with_options`
+/// (`leptos_server-0.8.7`) wraps the caller's source closure in an `ArcMemo`,
+/// and a memo whose recomputed value compares equal stops the propagation there
+/// — `update_if_necessary` returns `false` (`reactive_graph-0.2.14`,
+/// `computed/inner.rs`), so the `AsyncDerived` woken by the notification finds
+/// nothing to do. The memo's body still re-runs and the async task still wakes;
+/// the fetcher does not. That covers the `Resource::new` call sites in
+/// `pages/settings/workspace.rs`, `pages/projects/project_detail.rs` and
+/// `pages/issues/issue_detail.rs`.
+///
+/// So TRA-9984's "a wasted server round trip per subscribed page per bootstrap"
+/// holds for the two shapes above and overstates the third. Do not simplify this
+/// back into the blanket claim: the reason to guard the write is not that every
+/// subscriber pays a round trip, it is that the store cannot know which shape is
+/// listening.
+fn rewind_to_zero(counter: &ArcRwSignal<u32>) {
+    counter.maybe_update(|value| {
+        let moved = *value != 0;
+        *value = 0;
+        moved
+    });
+}
+
+/// Empty one of the store's collections, waking its subscribers only if there
+/// was something in it.
+///
+/// The counterpart to [`rewind_to_zero`] for the eight collections
+/// [`SyncStore::reset`] clears, and it exists for exactly the same reason: on
+/// the cursor-less connect path `reset` runs before every fresh bootstrap, and
+/// on a first page load the lists are already empty when it does — hydration
+/// finishes before the socket is dialled, and an empty cache hydrates to empty
+/// lists. `set(Vec::new())` notified every list page anyway. See
+/// [`rewind_to_zero`] for the `maybe_update` mechanism and for the measured
+/// cost of an unchanged-value notification, including the part that is *not*
+/// true of every subscriber:
+///
+/// - A `LocalResource` subscribes directly to what its fetcher reads and is
+///   marked dirty by the notification, so it really does refetch from the
+///   server (`leptos_server-0.8.7`, `ArcLocalResource::new`, which passes the
+///   fetcher to `ArcAsyncDerived::new_unsync` with no separate source).
+/// - An `Effect` re-runs its whole body on notification regardless of value.
+/// - A `Resource::new` does **not** refetch: `ArcResource::new_with_options`
+///   (`leptos_server-0.8.7`) wraps the caller's source closure in an `ArcMemo`,
+///   and a memo whose recomputed value compares equal stops the propagation
+///   there (`reactive_graph-0.2.14`, `computed/inner.rs`, `update_if_necessary`
+///   returns `false`). Its body re-runs and its async task wakes; the fetcher
+///   does not. The ticket's "a wasted server round trip per subscribed page"
+///   is therefore true of the first two shapes and an overstatement for the
+///   third — do not restore it to the blanket claim.
+///
+/// # Why `!is_empty()` and not `PartialEq`
+///
+/// The value written is always an empty `Vec`, so "did it move" is exactly "was
+/// it non-empty". That needs no `PartialEq` on the element type — which matters,
+/// because comparing the old and new lists would mean an element-wise compare of
+/// every issue in the workspace on a path whose whole point is to do less work.
+///
+/// The write is `*list = Vec::new()` rather than `list.clear()` so the old
+/// allocation is dropped exactly as `set(Vec::new())` dropped it. `clear` would
+/// retain the capacity, which is a different memory profile across a workspace
+/// switch than the code this replaced.
+fn clear_if_populated<T>(collection: &ArcRwSignal<Vec<T>>)
+where
+    T: Send + Sync + 'static,
+{
+    collection.maybe_update(|list| {
+        let moved = !list.is_empty();
+        *list = Vec::new();
+        moved
+    });
 }
 
 /// Checks for the getter contract documented on [`SyncStore`].
@@ -770,10 +890,651 @@ impl SyncStore {
 /// `wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate`
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use super::*;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    // ── Probing what `reset()` wakes ────────────────────────────────────────
+
+    /// A `*_version()` getter, as a value so the nine can be walked in a loop.
+    type CounterGetter = fn(&SyncStore) -> Signal<u32>;
+    /// A `bump_*_version()` method, likewise.
+    type CounterBump = fn(&SyncStore);
+
+    /// The nine version counters [`SyncStore::reset`] rewinds.
+    ///
+    /// Each entry is the getter a page resolves at setup and the bump the sync
+    /// engine calls when that entity's frame arrives. All nine are listed so a
+    /// fix applied to eight of them fails, naming the one that was missed.
+    const COUNTERS: [(&str, CounterGetter, CounterBump); 9] = [
+        (
+            "activities_version",
+            SyncStore::activities_version,
+            SyncStore::bump_activities_version,
+        ),
+        (
+            "relations_version",
+            SyncStore::relations_version,
+            SyncStore::bump_relations_version,
+        ),
+        (
+            "comments_version",
+            SyncStore::comments_version,
+            SyncStore::bump_comments_version,
+        ),
+        (
+            "milestones_version",
+            SyncStore::milestones_version,
+            SyncStore::bump_milestones_version,
+        ),
+        (
+            "project_members_version",
+            SyncStore::project_members_version,
+            SyncStore::bump_project_members_version,
+        ),
+        (
+            "project_updates_version",
+            SyncStore::project_updates_version,
+            SyncStore::bump_project_updates_version,
+        ),
+        (
+            "attachments_version",
+            SyncStore::attachments_version,
+            SyncStore::bump_attachments_version,
+        ),
+        (
+            "notification_preferences_version",
+            SyncStore::notification_preferences_version,
+            SyncStore::bump_notification_preferences_version,
+        ),
+        (
+            "workspace_settings_version",
+            SyncStore::workspace_settings_version,
+            SyncStore::bump_workspace_settings_version,
+        ),
+    ];
+
+    /// One subscriber attached to one counter, plus a way to read that counter
+    /// without going through it.
+    struct Probe {
+        name: &'static str,
+        /// How many times the subscriber's body has run.
+        ///
+        /// Not a signal: an instrument that is itself an arena item is
+        /// reachable by the very notifications under test. `SaveLog` in
+        /// `wasm_test_support` keeps its counts in `Rc<Cell<_>>` for that
+        /// reason; this is `Arc<AtomicU32>` only because `Memo::new` requires
+        /// `Send + Sync`, which `Rc` is not. WASM is single-threaded, so the
+        /// ordering is immaterial.
+        runs: Arc<AtomicU32>,
+        /// A `Memo` over the counter — the subscriber.
+        ///
+        /// This is the node `Resource::new` interposes itself:
+        /// `ArcResource::new_with_options` (`leptos_server-0.8.7`) wraps the
+        /// page's source closure in an `ArcMemo`, so on a page keyed to a
+        /// counter this body is the first thing a notification reaches. It
+        /// re-runs on notification alone, whatever the value — which is exactly
+        /// what these tests need to see, since the value is `0` either way.
+        ///
+        /// A memo is lazy, so a notification does not run the body on the spot;
+        /// it marks the memo dirty and the body runs on the next read. That is
+        /// what production does too — the `AsyncDerived` woken by the notify
+        /// calls `update_if_necessary`, which forces the memo. So [`Probe::read`]
+        /// below is the poll, not the observation: the observation is whether
+        /// the body ran during it.
+        memo: Memo<u32>,
+        /// The counter read straight, bypassing the memo, so "was rewound" is
+        /// observable independently of "was notified".
+        raw: Signal<u32>,
+        bump: CounterBump,
+    }
+
+    impl Probe {
+        /// Poll the subscriber. Its body runs during this call if, and only if,
+        /// something notified the counter since the last poll.
+        fn read(&self) -> u32 {
+            self.memo.get_untracked()
+        }
+
+        fn runs(&self) -> u32 {
+            self.runs.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Attach a subscriber to every counter in [`COUNTERS`].
+    ///
+    /// Both getters are resolved here, at "component setup" and under the
+    /// caller's owner, which is the form the getter contract on [`SyncStore`]
+    /// requires and the form `pages/` uses.
+    fn probe_every_counter(store: &SyncStore) -> Vec<Probe> {
+        COUNTERS
+            .iter()
+            .map(|&(name, getter, bump)| {
+                let runs = Arc::new(AtomicU32::new(0));
+                let version = getter(store);
+                let memo = {
+                    let runs = Arc::clone(&runs);
+                    Memo::new(move |_| {
+                        runs.fetch_add(1, Ordering::Relaxed);
+                        version.get()
+                    })
+                };
+                Probe {
+                    name,
+                    runs,
+                    memo,
+                    raw: getter(store),
+                    bump,
+                }
+            })
+            .collect()
+    }
+
+    /// `reset()` on a store whose counters are already zero must wake nobody.
+    ///
+    /// The cursor-less connect path in `cache/sync_engine.rs` calls `reset()`
+    /// immediately before every `sync_bootstrap`, so on a plain page load it
+    /// runs against counters that have never been bumped. `set(0)` notified
+    /// there anyway, and each of those notifications is a page's subscriber
+    /// re-running for a value that did not change.
+    ///
+    /// **This asserts on the subscriber running, not on the counter's value,
+    /// and that is the whole point of the test.** The values are `0` before and
+    /// after either way, so a value assertion passes against the unfixed
+    /// `set(0)` and proves nothing. The run count is the only thing that tells
+    /// the two apart. Note the read below happens in both this test and
+    /// `resetting_a_bumped_store_…`: identical polls, different body-run
+    /// counts, so the difference is the notification and not the poll.
+    #[wasm_bindgen_test]
+    fn resetting_an_already_zero_store_wakes_no_subscriber() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let probes = probe_every_counter(&store);
+
+        // Prime. A memo is lazy, so until it is read its body has never run and
+        // "did not run again" would be true of a subscriber that was never
+        // wired up at all.
+        for probe in &probes {
+            assert_eq!(probe.read(), 0, "fixture: {} starts at zero", probe.name);
+            assert_eq!(
+                probe.runs(),
+                1,
+                "fixture: the subscriber on {} must have run once by now, or the rest of \
+                 this test is watching nothing",
+                probe.name
+            );
+        }
+
+        store.reset();
+
+        for probe in &probes {
+            assert_eq!(
+                probe.read(),
+                0,
+                "{} must still read zero after a reset that found it at zero",
+                probe.name
+            );
+            assert_eq!(
+                probe.runs(),
+                1,
+                "the subscriber on {} re-ran for a reset that changed nothing. Every page \
+                 keyed to that counter woke on a fresh bootstrap for a value that did not \
+                 move — a `LocalResource` refetches from the server, an `Effect` re-reads \
+                 IndexedDB. Rewind the counter with `rewind_to_zero`, not `set(0)`",
+                probe.name
+            );
+        }
+    }
+
+    /// `reset()` on a store that has been bumped must still rewind **and**
+    /// still notify.
+    ///
+    /// The other direction of the same guard. Without this, the fix could
+    /// degrade to "never notify" — a `rewind_to_zero` that always returned
+    /// `false`, or one that skipped the write — and
+    /// `resetting_an_already_zero_store_wakes_no_subscriber` would stay green
+    /// while a workspace switch left every page showing the previous
+    /// workspace's data.
+    ///
+    /// The two halves are asserted through different paths on purpose: the
+    /// rewind through `raw`, which reads the counter itself, and the
+    /// notification through the subscriber's run count. A guard that stopped
+    /// notifying would still pass the rewind half, so the failure names which
+    /// half broke.
+    #[wasm_bindgen_test]
+    fn resetting_a_bumped_store_rewinds_the_counters_and_wakes_their_subscribers() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let probes = probe_every_counter(&store);
+
+        for probe in &probes {
+            assert_eq!(probe.read(), 0, "fixture: {} starts at zero", probe.name);
+        }
+
+        // A frame for each entity type arrives, as it does over the sync
+        // stream.
+        for probe in &probes {
+            (probe.bump)(&store);
+        }
+        for probe in &probes {
+            assert_eq!(
+                probe.read(),
+                1,
+                "fixture: {} must move when its own bump runs",
+                probe.name
+            );
+            assert_eq!(
+                probe.runs(),
+                2,
+                "fixture: the subscriber on {} must have re-run for the bump, or this test \
+                 cannot tell a missing notification from a subscriber that never worked",
+                probe.name
+            );
+        }
+
+        store.reset();
+
+        for probe in &probes {
+            assert_eq!(
+                probe.raw.get_untracked(),
+                0,
+                "{} was not rewound by reset(). A workspace switch leaves the new \
+                 workspace's pages keyed to the previous one's counter",
+                probe.name
+            );
+            let through_subscriber = probe.read();
+            assert_eq!(
+                probe.runs(),
+                3,
+                "the subscriber on {} did not re-run for a reset that moved it from 1 to \
+                 0. The guard has become an unconditional skip: the counter rewinds and \
+                 nothing subscribed to it ever hears about it",
+                probe.name
+            );
+            assert_eq!(
+                through_subscriber,
+                0,
+                "the subscriber on {} re-ran but did not see the rewind",
+                probe.name
+            );
+        }
+    }
+
+    // ── Probing what `reset()` wakes: the collections ───────────────────────
+
+    /// One subscriber attached to one of the store's collections.
+    ///
+    /// The same instrument as [`Probe`], reading the collection's **length**
+    /// rather than its contents: `reset` writes an empty `Vec`, so the length is
+    /// all the assertions need, and reading it with `with` avoids cloning the
+    /// whole list on every poll.
+    struct CollectionProbe {
+        name: &'static str,
+        /// Runs of the subscriber's body. Not a signal — see [`Probe::runs`].
+        runs: Arc<AtomicU32>,
+        memo: Memo<usize>,
+        /// The length read straight off the collection, bypassing the memo, so
+        /// "was cleared" is observable independently of "was notified".
+        raw: Signal<usize>,
+        /// Put one entity into the collection, as a sync frame does.
+        seed: Box<dyn Fn()>,
+    }
+
+    impl CollectionProbe {
+        /// Poll the subscriber. Its body runs during this call if, and only if,
+        /// something notified the collection since the last poll.
+        fn read(&self) -> usize {
+            self.memo.get_untracked()
+        }
+
+        fn runs(&self) -> u32 {
+            self.runs.load(Ordering::Relaxed)
+        }
+    }
+
+    fn probe_collection<T>(
+        name: &'static str,
+        items: Signal<Vec<T>>,
+        seed: impl Fn() + 'static,
+    ) -> CollectionProbe
+    where
+        T: Send + Sync + 'static,
+    {
+        let runs = Arc::new(AtomicU32::new(0));
+        let memo = {
+            let runs = Arc::clone(&runs);
+            Memo::new(move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                items.with(|list| list.len())
+            })
+        };
+        CollectionProbe {
+            name,
+            runs,
+            memo,
+            raw: Signal::derive(move || items.with(|list| list.len())),
+            seed: Box::new(seed),
+        }
+    }
+
+    /// Attach a subscriber to every collection [`SyncStore::reset`] clears.
+    ///
+    /// All eight are listed for the same reason all nine counters are: a guard
+    /// applied to seven of them must fail, naming the one left on `set`.
+    fn probe_every_collection(store: &SyncStore) -> Vec<CollectionProbe> {
+        let store = *store;
+        vec![
+            probe_collection("issues", store.issues(), move || {
+                store.upsert_issue(an_issue())
+            }),
+            probe_collection("labels", store.labels(), move || {
+                store.upsert_label(a_label())
+            }),
+            probe_collection("statuses", store.statuses(), move || {
+                store.upsert_status(a_status())
+            }),
+            probe_collection("teams", store.teams(), move || store.upsert_team(a_team())),
+            probe_collection("projects", store.projects(), move || {
+                store.upsert_project(a_project())
+            }),
+            probe_collection("views", store.views(), move || store.upsert_view(a_view())),
+            probe_collection("favorites", store.favorites(), move || {
+                store.upsert_favorite(a_favorite())
+            }),
+            probe_collection("notifications", store.notifications(), move || {
+                store.upsert_notification(a_notification())
+            }),
+        ]
+    }
+
+    // ── Fixtures ────────────────────────────────────────────────────────────
+    //
+    // One entity per collection. Nothing reads a field of any of them: the
+    // guard's predicate is `!list.is_empty()`, so all these exist to do is make
+    // a list non-empty. They are written out in full rather than built from
+    // JSON because the models carry no `Default`, and a fixture that stops
+    // compiling when a field is added is the cheaper failure.
+
+    fn a_label() -> Label {
+        Label {
+            label_id: "lbl-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            team_id: None,
+            name: "bug".to_owned(),
+            color: "#0D9488".to_owned(),
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn an_issue() -> IssueWithDetails {
+        IssueWithDetails {
+            issue_id: "iss-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            team_id: "tea-1".to_owned(),
+            team_key: "TRA".to_owned(),
+            number: 42,
+            title: "An issue the reset has to drop".to_owned(),
+            description: None,
+            status_id: "sta-1".to_owned(),
+            status_name: "Todo".to_owned(),
+            status_category: "unstarted".to_owned(),
+            priority: 0,
+            assignee_id: None,
+            assignee_name: None,
+            creator_id: "usr-alice".to_owned(),
+            creator_name: None,
+            due_date: None,
+            project_id: None,
+            project_name: None,
+            milestone_id: None,
+            estimate: None,
+            parent_identifier: None,
+            parent_title: None,
+            sort_order: None,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+            updated_at: "2026-08-07T00:00:00Z".to_owned(),
+            started_at: None,
+            completed_at: None,
+            released_at: None,
+            archived_at: None,
+            has_children: false,
+            is_blocked: false,
+            is_blocking: false,
+            has_relations: false,
+            labels: Vec::new(),
+        }
+    }
+
+    fn a_status() -> Status {
+        Status {
+            status_id: "sta-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            team_id: None,
+            name: "Todo".to_owned(),
+            category: "unstarted".to_owned(),
+            position: 0,
+            color: None,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn a_team() -> Team {
+        Team {
+            team_id: "tea-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            name: "Engineering".to_owned(),
+            key: "TRA".to_owned(),
+            description: None,
+            icon: None,
+            icon_type: None,
+            icon_name: None,
+            icon_color: None,
+            member_count: 1,
+            settings: None,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn a_project() -> Project {
+        Project {
+            project_id: "prj-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            name: "Q3 Launch".to_owned(),
+            description: None,
+            icon: None,
+            color: None,
+            status: "planned".to_owned(),
+            lead_id: None,
+            lead_name: None,
+            start_date: None,
+            target_date: None,
+            sort_order: 0.0,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+            updated_at: "2026-08-07T00:00:00Z".to_owned(),
+            archived_at: None,
+        }
+    }
+
+    fn a_view() -> View {
+        View {
+            view_id: "viw-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            team_id: None,
+            created_by: "usr-alice".to_owned(),
+            name: "My open issues".to_owned(),
+            icon: None,
+            filters: "{}".to_owned(),
+            display_options: "{}".to_owned(),
+            sort_order: 0.0,
+            position: 0,
+            is_shared: false,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+            updated_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn a_favorite() -> Favorite {
+        Favorite {
+            favorite_id: "fav-1".to_owned(),
+            user_id: "usr-alice".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            target_type: "issue".to_owned(),
+            target_id: "iss-1".to_owned(),
+            sort_order: 0.0,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn a_notification() -> Notification {
+        Notification {
+            notification_id: "ntf-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            user_id: "usr-alice".to_owned(),
+            issue_id: "iss-1".to_owned(),
+            notification_type: "assigned".to_owned(),
+            read: false,
+            issue_title: None,
+            issue_number: None,
+            team_key: None,
+            actor_id: None,
+            actor_name: None,
+            action_source: trakkt_types::enums::ActionSource::User,
+            action_source_label: None,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+            deleted_at: None,
+            context_id: None,
+        }
+    }
+
+    /// `reset()` on a store whose collections are already empty must wake
+    /// nobody.
+    ///
+    /// The collections half of
+    /// `resetting_an_already_zero_store_wakes_no_subscriber`, and the same trap
+    /// applies: on the cursor-less bootstrap path the lists are already empty
+    /// when `reset` runs — hydration finishes before the socket is dialled and
+    /// an empty cache hydrates to empty lists — so **the lists are empty before
+    /// and after either way**. Asserting they are empty passes against `main`'s
+    /// `set(Vec::new())`. Only the subscriber's run count tells the two apart.
+    ///
+    /// This is the assertion that catches a collection left on `set` when the
+    /// other seven were converted, which is why all eight are probed.
+    #[wasm_bindgen_test]
+    fn resetting_an_already_empty_store_wakes_no_subscriber() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let probes = probe_every_collection(&store);
+
+        // Prime. A memo is lazy, so until it is read its body has never run.
+        for probe in &probes {
+            assert_eq!(probe.read(), 0, "fixture: {} starts empty", probe.name);
+            assert_eq!(
+                probe.runs(),
+                1,
+                "fixture: the subscriber on {} must have run once by now, or the rest of \
+                 this test is watching nothing",
+                probe.name
+            );
+        }
+
+        store.reset();
+
+        for probe in &probes {
+            assert_eq!(
+                probe.read(),
+                0,
+                "{} must still be empty after a reset that found it empty",
+                probe.name
+            );
+            assert_eq!(
+                probe.runs(),
+                1,
+                "the subscriber on {} re-ran for a reset that changed nothing. Every list \
+                 page reading that collection woke on a fresh bootstrap for a value that \
+                 did not move — which is the `Transition` rebuild with no data behind it \
+                 that TRA-9984 is about. Clear it with `clear_if_populated`, not \
+                 `set(Vec::new())`",
+                probe.name
+            );
+        }
+    }
+
+    /// `reset()` on a populated store must still clear **and** still notify.
+    ///
+    /// The other direction, as for the counters. Without it the guard could
+    /// degrade to "never notify" and
+    /// `resetting_an_already_empty_store_wakes_no_subscriber` would stay green
+    /// while a workspace switch left every list page rendering the previous
+    /// workspace's issues.
+    ///
+    /// The two halves go through different paths on purpose — the clear through
+    /// `raw`, which reads the collection itself, the notification through the
+    /// subscriber's run count — so a mutation can fail one without the other.
+    #[wasm_bindgen_test]
+    fn resetting_a_populated_store_clears_the_collections_and_wakes_their_subscribers() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let probes = probe_every_collection(&store);
+
+        for probe in &probes {
+            assert_eq!(probe.read(), 0, "fixture: {} starts empty", probe.name);
+        }
+
+        // One entity of each type arrives, as it does over the sync stream.
+        for probe in &probes {
+            (probe.seed)();
+        }
+        for probe in &probes {
+            assert_eq!(
+                probe.read(),
+                1,
+                "fixture: {} must hold the entity that was just upserted into it",
+                probe.name
+            );
+            assert_eq!(
+                probe.runs(),
+                2,
+                "fixture: the subscriber on {} must have re-run for the upsert, or this \
+                 test cannot tell a missing notification from a subscriber that never \
+                 worked",
+                probe.name
+            );
+        }
+
+        store.reset();
+
+        for probe in &probes {
+            assert_eq!(
+                probe.raw.get_untracked(),
+                0,
+                "{} was not cleared by reset(). The previous workspace's entities are \
+                 still in memory for the next one's pages to render",
+                probe.name
+            );
+            let through_subscriber = probe.read();
+            assert_eq!(
+                probe.runs(),
+                3,
+                "the subscriber on {} did not re-run for a reset that emptied it. The \
+                 guard has become an unconditional skip: the collection is cleared and \
+                 every page still showing its contents is never told",
+                probe.name
+            );
+            assert_eq!(
+                through_subscriber, 0,
+                "the subscriber on {} re-ran but did not see the clear",
+                probe.name
+            );
+        }
+    }
 
     /// A counter resolved under a subtree's owner dies when that subtree does.
     ///
