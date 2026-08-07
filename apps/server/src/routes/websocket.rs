@@ -1639,7 +1639,7 @@ mod tests {
                 entity_types::ISSUE,
                 &format!("iss_{i}"),
                 workspace_id,
-                None,
+                trakkt_auth::sync_log_service::SyncAudience::Workspace,
                 SyncActionType::Update,
                 None,
             )
@@ -1754,7 +1754,7 @@ mod tests {
                     entity_types::ISSUE,
                     "iss_mid_bootstrap",
                     WORKSPACE,
-                    None,
+                    trakkt_auth::sync_log_service::SyncAudience::Workspace,
                     SyncActionType::Update,
                     None,
                 )

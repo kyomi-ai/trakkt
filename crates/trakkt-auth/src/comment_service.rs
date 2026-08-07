@@ -160,7 +160,7 @@ pub async fn create_comment(
         entity_types::COMMENT,
         &comment_id,
         &workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         payload.clone(),
     )
@@ -347,7 +347,7 @@ pub async fn update_comment(
         entity_types::COMMENT,
         comment_id,
         &workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload.clone(),
     )
@@ -416,7 +416,7 @@ pub async fn delete_comment(
         entity_types::COMMENT,
         comment_id,
         &workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Delete,
         None,
     )

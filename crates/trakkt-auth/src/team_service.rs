@@ -140,7 +140,7 @@ async fn commit_team_update(
         entity_types::TEAM,
         team_id,
         workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload.clone(),
     )
@@ -270,7 +270,7 @@ pub async fn create_team(
         entity_types::TEAM,
         &team_id,
         params.workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         payload.clone(),
     )
@@ -282,7 +282,7 @@ pub async fn create_team(
             entity_types::TEAM,
             &team_id,
             params.workspace_id,
-            None,
+            sync_log_service::SyncAudience::Workspace,
             SyncActionType::Update,
             payload.clone(),
         )
@@ -872,7 +872,7 @@ pub async fn delete_team(
                 entity_types::ISSUE,
                 issue_id,
                 workspace_id,
-                None,
+                sync_log_service::SyncAudience::Workspace,
                 SyncActionType::Update,
                 payload.clone(),
             )
@@ -911,7 +911,7 @@ pub async fn delete_team(
         entity_types::TEAM,
         team_id,
         workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Delete,
         None,
     )
@@ -1109,7 +1109,7 @@ async fn write_membership_sync_entry(
         entity_types::TEAM,
         &team.team_id,
         &team.workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         team_payload_value(team),
     )
@@ -1129,7 +1129,7 @@ async fn write_membership_sync_entry(
             entity_types::TEAM,
             &team.team_id,
             &team.workspace_id,
-            Some(user_id),
+            sync_log_service::SyncAudience::User(user_id),
             SyncActionType::Delete,
             None,
         )

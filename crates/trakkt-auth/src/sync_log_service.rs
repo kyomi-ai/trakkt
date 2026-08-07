@@ -166,30 +166,27 @@ fn serialise_sync_entry_data(
 ///
 /// This is the non-transactional form: the insert auto-commits on its own, so a
 /// failure leaves the caller's mutation already committed with no `sync_log`
-/// row to replay it — permanently invisible to delta sync. Services whose
-/// mutation and log write have been made atomic use
-/// [`write_sync_entry_in_tx`] instead; this form remains for the services that
-/// have not been converted yet.
+/// row to replay it — permanently invisible to delta sync. Every service
+/// mutation uses [`write_sync_entry_in_tx`] instead; grepped at TRA-10016, this
+/// form has no caller outside test code, where it is how a test gets a committed
+/// entry without a mutation to attach one to.
 ///
-/// `visibility_user_id` scopes who may receive this row on delta sync:
-/// - `None` — workspace-visible: every member of `workspace_id` receives it.
-/// - `Some(user_id)` — only that user receives it.
-///
-/// Per-user entities (notifications, favorites, notification preferences,
-/// unshared views) MUST pass `Some(owner)`. Passing `None` for them replays one
-/// member's private rows to the whole workspace, which is the leak TRA-9920
-/// fixed. The scope must match what `sync_bootstrap` exposes to the same user,
-/// otherwise a client's dataset depends on which sync path it took.
+/// `audience` decides the `visibility_user_id` column — see [`SyncAudience`] for
+/// what each variant means and why the choice is a named one rather than an
+/// `Option<&str>`. Unlike `commit_and_deliver`, nothing here delivers the live
+/// frame, so the caller is responsible for making the delivery match the
+/// audience it passed.
 pub async fn write_sync_entry(
     db: &DbPool,
     entity_type: &str,
     entity_id: &str,
     workspace_id: &str,
-    visibility_user_id: Option<&str>,
+    audience: SyncAudience<'_>,
     action: SyncActionType,
     data: Option<serde_json::Value>,
 ) -> trakkt_core::Result<i64> {
     let is_pg = db.is_postgres();
+    let visibility_user_id = audience.visibility_user_id();
     let action_str = action_type_to_str(&action);
     let data_str = serialise_sync_entry_data(data.as_ref())?;
     let sql = sync_entry_insert_sql(is_pg);
@@ -250,7 +247,7 @@ pub async fn write_sync_entry(
 /// Insert a row into `sync_log` on the caller's open transaction and return the
 /// assigned `sync_id`.
 ///
-/// Same insert as [`write_sync_entry`], same `visibility_user_id` contract —
+/// Same insert as [`write_sync_entry`], same [`SyncAudience`] contract —
 /// the difference is only where it runs. Because the row lands in the caller's
 /// transaction, the mutation it describes and the log entry that replays it
 /// commit together or not at all: a failure here rolls the mutation back
@@ -268,11 +265,12 @@ pub async fn write_sync_entry_in_tx(
     entity_type: &str,
     entity_id: &str,
     workspace_id: &str,
-    visibility_user_id: Option<&str>,
+    audience: SyncAudience<'_>,
     action: SyncActionType,
     data: Option<serde_json::Value>,
 ) -> trakkt_core::Result<i64> {
     let is_pg = tx.is_postgres();
+    let visibility_user_id = audience.visibility_user_id();
     let action_str = action_type_to_str(&action);
     let data_str = serialise_sync_entry_data(data.as_ref())?;
     let sql = sync_entry_insert_sql(is_pg);
@@ -667,18 +665,100 @@ pub(crate) fn sync_payload<T: serde::Serialize>(
 /// private data but pushed live to everyone, or the reverse, where a member's
 /// live frame never arrives again after a reconnect.
 ///
-/// So the two are not separate parameters. This one value decides the
-/// `visibility_user_id` column *and* the delivery call, and
-/// [`commit_and_deliver`] is the only thing that reads it. A caller cannot scope
-/// the persisted row to one user and broadcast the frame to the workspace,
-/// because there is no pair of arguments to disagree about.
+/// So the two are not separate parameters. `commit_and_deliver` and `SyncBatch`
+/// read this one value for the `visibility_user_id` column *and* for the
+/// delivery call, so a mutation routed through them cannot scope the persisted
+/// row to one user and broadcast the frame to the workspace: there is no pair of
+/// arguments to disagree about.
 ///
-/// It is also deliberately not `Option<&str>`. `None` is the kind of thing that
-/// gets typed when a `user_id` is not to hand, and it would silently mean
-/// "publish this to the whole workspace"; `Workspace` has to be chosen on
-/// purpose and reads as a decision at the call site.
+/// A caller that writes through [`write_sync_entry_in_tx`] directly and then
+/// hand-rolls its own broadcast gets only the column from this value —
+/// `team_service`, `issue_service` and `comment_service` all still do that, and
+/// there the two halves agreeing is a convention rather than a consequence.
+/// Converting them onto `SyncBatch` is what would make it a consequence.
+///
+/// It is also deliberately not `Option<&str>`, and since TRA-10016 that is
+/// enforced rather than merely intended: [`write_sync_entry`] and
+/// [`write_sync_entry_in_tx`] take this type, so the anonymous form does not
+/// compile. `None` is the kind of thing that gets typed when a `user_id` is not
+/// to hand, and it would silently mean "publish this to the whole workspace";
+/// `Workspace` has to be chosen on purpose and reads as a decision at the call
+/// site.
+///
+/// ```compile_fail,E0308
+/// # use trakkt_auth::sync_log_service::{write_sync_entry_in_tx, SyncAudience};
+/// # use trakkt_types::sync::SyncActionType;
+/// # async fn demo(tx: &mut trakkt_core::db::DbTx) -> trakkt_core::Result<i64> {
+/// write_sync_entry_in_tx(
+///     tx,
+///     "team",
+///     "team_1",
+///     "ws_1",
+///     None, // error[E0308]: expected `SyncAudience<'_>`, found `Option<_>`
+///     SyncActionType::Update,
+///     None,
+/// )
+/// .await
+/// # }
+/// ```
+///
+/// The same call with the audience named is the one that compiles. The two
+/// blocks differ on that one line and nowhere else — including the `use`, which
+/// imports `SyncAudience` in both — so the rejection above is a statement about
+/// this type and not about the rest of the signature:
+///
+/// ```no_run
+/// # use trakkt_auth::sync_log_service::{write_sync_entry_in_tx, SyncAudience};
+/// # use trakkt_types::sync::SyncActionType;
+/// # async fn demo(tx: &mut trakkt_core::db::DbTx) -> trakkt_core::Result<i64> {
+/// write_sync_entry_in_tx(
+///     tx,
+///     "team",
+///     "team_1",
+///     "ws_1",
+///     SyncAudience::Workspace,
+///     SyncActionType::Update,
+///     None,
+/// )
+/// .await
+/// # }
+/// ```
+///
+/// # What this type does not cover: TEAM
+///
+/// A team's audience is "its N current members", which no single
+/// `visibility_user_id` value can name and no value written at mutation time
+/// could keep correct as membership changes. TRA-10013 therefore derives it at
+/// **read** time, in `ENTRIES_SINCE_SQL`'s `team_members` predicate, and every
+/// TEAM writer passes [`SyncAudience::Workspace`] here. That is correct at the
+/// writer and narrowed again at the reader, but it makes `Workspace` on a TEAM
+/// write only half a statement about who ends up holding the team:
+/// workspace-visible as persisted, membership-scoped as read.
+///
+/// It says nothing at all about the live frame, and that half is currently
+/// wider. `broadcast_sync_action` resolves its recipients from
+/// `workspace_users`, so the TEAM `Insert` `team_service::create_team` sends and
+/// the TEAM `Update` `team_service::commit_team_update` sends both carry the
+/// team's name, icon and settings to every connected workspace member, and
+/// `apply_action_to_memory`'s TEAM arm (`crates/trakkt-ui/src/cache/apply.rs`)
+/// calls `upsert_team` on whatever arrives. TRA-10013 closed the delta path only.
+/// The three membership mutations are not affected — they take no
+/// `WebSocketManager` and write no live frame — and `delete_team`'s TEAM frame
+/// carries a `None` payload.
+///
+/// There is deliberately no `Team` variant *yet*, and the reason is that today
+/// it could not carry that second half either. Its persisted arm is already
+/// forced: NULL, exactly as `Workspace` writes, because the audience does not
+/// fit in the column. Its delivery arm is the only place it could earn its keep
+/// — by resolving `team_members` and sending to those users — and that is a
+/// change to who receives live frames, with its own blast radius and its own
+/// tests, not something a new variant carries in passing. Added today with the
+/// two arms it can have today, it would be byte-identical to `Workspace`: a
+/// distinction the type system could hold nobody to, reading as enforcement
+/// while enforcing nothing. So the gap is named here rather than papered over,
+/// and `ENTRIES_SINCE_SQL` is where the only narrowing that exists today lives.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum SyncAudience<'a> {
+pub enum SyncAudience<'a> {
     /// Visible to every member of the workspace: `visibility_user_id` is NULL
     /// and the live frame is broadcast workspace-wide.
     Workspace,
@@ -834,7 +914,7 @@ impl<'a> SyncBatch<'a> {
             entity_type,
             entity_id,
             workspace_id,
-            audience.visibility_user_id(),
+            audience,
             action.clone(),
             payload.clone(),
         )
@@ -3886,7 +3966,7 @@ mod tests {
             entity_types::ISSUE,
             "iss_first",
             WS,
-            None,
+            SyncAudience::Workspace,
             SyncActionType::Insert,
             None,
         )
@@ -3897,7 +3977,7 @@ mod tests {
             entity_types::ISSUE,
             "iss_second",
             WS,
-            None,
+            SyncAudience::Workspace,
             SyncActionType::Update,
             None,
         )
@@ -3938,7 +4018,7 @@ mod tests {
             entity_types::ISSUE,
             "iss_discarded",
             WS,
-            None,
+            SyncAudience::Workspace,
             SyncActionType::Insert,
             None,
         )
