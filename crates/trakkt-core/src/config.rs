@@ -91,6 +91,12 @@ pub struct Config {
     /// Backend base URL for constructing OAuth redirect URIs
     pub base_url: String,
 
+    /// Directory holding the Trunk-built frontend bundle (`index.html`, WASM,
+    /// CSS). Resolved once here rather than per request so the path the static
+    /// file service was built from and the path the SPA shell is read from
+    /// cannot disagree.
+    pub dist_dir: String,
+
     // ── Attachments ────────────────────────────────────────────────────
     /// Storage backend for file attachments: "local" or "s3"
     pub attachment_storage: String,
@@ -179,6 +185,8 @@ impl Config {
                 .unwrap_or_else(|_| "support@trakkt.app".into()),
             frontend_url,
             base_url,
+            dist_dir: env::var("TRUNK_DIST_DIR")
+                .unwrap_or_else(|_| "crates/trakkt-ui/dist".into()),
             attachment_storage: env::var("ATTACHMENT_STORAGE").unwrap_or_else(|_| "local".into()),
             attachment_local_path: env::var("ATTACHMENT_LOCAL_PATH").unwrap_or_else(|_| "./data/attachments".into()),
             attachment_s3_endpoint: env::var("ATTACHMENT_S3_ENDPOINT").ok(),
@@ -216,6 +224,10 @@ impl Config {
             support_email: "test@trakkt.app".into(),
             frontend_url: "http://localhost:5173".into(),
             base_url: "http://localhost:8003".into(),
+            // No frontend is built during `cargo test`, so this path does not
+            // exist. Tests that assert on SPA serving point it at a temporary
+            // directory they populate themselves.
+            dist_dir: "crates/trakkt-ui/dist".into(),
             attachment_storage: "local".into(),
             attachment_local_path: "/tmp/trakkt-test-attachments".into(),
             attachment_s3_endpoint: None,
