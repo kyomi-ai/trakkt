@@ -93,6 +93,30 @@ struct WorkspaceSnapshotRow {
     workspace_id: String,
     name: Option<String>,
     settings: Option<String>,
+    /// The workspace-level default team, carried here rather than as an entity
+    /// type of its own.
+    ///
+    /// It is a column on this same `workspaces` row and is semantically a
+    /// workspace-level setting — which is exactly what the `workspace_settings`
+    /// entity already is. A second entity type for one nullable string on the
+    /// row this one already carries would be a second name for the same thing,
+    /// and the two could then disagree about which is current.
+    ///
+    /// The alternative was priced before it was rejected. A new entity type
+    /// costs a constant in `entity_types` (`crates/trakkt-types/src/sync.rs`), a
+    /// bootstrap stream in `apps/server/src/routes/websocket.rs`, both an
+    /// `Update` and a `Delete` arm in `crates/trakkt-ui/src/cache/apply.rs`, a
+    /// version counter on the client store, and a `NOT_CACHED`/cache-membership
+    /// decision — all to move a field that already travels in this row.
+    ///
+    /// Adding the field instead is bounded, and the bound was checked rather
+    /// than assumed: `apply.rs`'s two `WORKSPACE_SETTINGS` arms read **no**
+    /// field off the payload — they only bump `workspace_settings_version`, and
+    /// the settings page refetches through `get_workspace_settings`. The
+    /// bootstrap reader forwards the snapshot opaquely. Nothing decodes a
+    /// cached `workspace_settings` row into a typed struct, so the addition is
+    /// purely additive to every reader that exists.
+    default_team_id: Option<String>,
     updated_at: String,
 }
 
@@ -105,6 +129,7 @@ struct WorkspaceSnapshotRow {
 const WORKSPACE_SNAPSHOT_SQL: &str = r#"SELECT workspace_id,
           name,
           CAST(settings AS TEXT) AS settings,
+          default_team_id,
           CAST(updated_at AS TEXT) AS updated_at
    FROM workspaces WHERE workspace_id = $1"#;
 
@@ -123,6 +148,7 @@ impl WorkspaceSnapshotRow {
             "workspace_id": self.workspace_id,
             "name": self.name,
             "settings": settings_json,
+            "default_team_id": self.default_team_id,
             "updated_at": self.updated_at,
         }))
     }
@@ -320,10 +346,24 @@ pub async fn update_workspace_settings(
 /// Set the workspace-level default team.
 ///
 /// Validates that the team belongs to this workspace before writing.
+///
+/// The UPDATE and its `sync_log` entry are one transaction, for the same reason
+/// as [`update_workspace_name`]: a default-team change that commits without its
+/// sync row is invisible to every connected client until the next full
+/// bootstrap, and no later delta reports it — the row a delta would re-read
+/// already carries the new default, so nothing marks it as changed.
+///
+/// The validation deliberately runs on the pool, *before* `begin()`.
+/// [`crate::team_service::get_team`] takes a `&DbPool`, and SQLite pins the pool
+/// to one connection ([`DbPool::connect`]) which an open transaction holds — a
+/// pool read inside the span would wait on a connection only the commit can
+/// free, until sqlx's 30s acquire timeout fires. Authorization and validation
+/// belong ahead of the transaction in any case.
 pub async fn set_workspace_default_team(
     pool: &DbPool,
     workspace_id: &str,
     team_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<bool> {
     let team = crate::team_service::get_team(pool, team_id)
         .await?
@@ -339,8 +379,33 @@ pub async fn set_workspace_default_team(
     let sql = format!(
         "UPDATE workspaces SET default_team_id = $1, updated_at = {now} WHERE workspace_id = $2"
     );
-    let result = trakkt_core::db_execute!(pool, &sql, team_id, workspace_id)?;
-    Ok(result.rows_affected() > 0)
+
+    let mut tx = pool.begin().await?;
+    let result = trakkt_core::tx_execute!(&mut tx, &sql, team_id, workspace_id)?;
+
+    if result.rows_affected() == 0 {
+        // `tx` is dropped here, which rolls it back (see `DbTx`).
+        return Ok(false);
+    }
+
+    // Read back on the transaction, not the pool: the new default team is not
+    // visible outside this transaction yet (see
+    // `workspace_settings_snapshot_in_tx`).
+    let snapshot = workspace_settings_snapshot_in_tx(&mut tx, workspace_id).await?;
+
+    sync_log_service::commit_and_deliver(
+        tx,
+        entity_types::WORKSPACE_SETTINGS,
+        workspace_id,
+        workspace_id,
+        sync_log_service::SyncAudience::Workspace,
+        SyncActionType::Update,
+        Some(snapshot),
+        ws_manager,
+    )
+    .await?;
+
+    Ok(true)
 }
 
 /// Get the workspace-level default team ID, if set.

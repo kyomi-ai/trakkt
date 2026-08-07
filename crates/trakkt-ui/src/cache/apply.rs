@@ -728,14 +728,16 @@ mod test_support {
         })
     }
 
-    /// The snapshot `update_workspace_name` and `update_workspace_settings`
-    /// both send — the shape `WorkspaceSnapshotRow::into_sync_value` builds.
+    /// The snapshot `update_workspace_name`, `update_workspace_settings` and
+    /// `set_workspace_default_team` all send — the shape
+    /// `WorkspaceSnapshotRow::into_sync_value` builds.
     #[cfg(target_arch = "wasm32")]
     pub(super) fn workspace_settings_json() -> serde_json::Value {
         serde_json::json!({
             "workspace_id": "ws-1",
             "name": "Renamed Workspace",
             "settings": {"default_auto_archive_days": 30},
+            "default_team_id": "team-1",
             "updated_at": "2026-07-26T00:00:00Z",
         })
     }

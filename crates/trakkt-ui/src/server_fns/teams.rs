@@ -201,6 +201,7 @@ pub async fn set_workspace_default_team(team_id: String) -> Result<(), ServerFnE
         ac.db(),
         &ac.ws_id,
         &team_id,
+        ac.ctx.ws_manager.as_ref(),
     )
     .await
     .into_sfn()?;
