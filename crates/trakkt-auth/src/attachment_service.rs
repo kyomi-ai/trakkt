@@ -16,6 +16,7 @@ use trakkt_core::DbPool;
 
 use crate::sync_log_service;
 use crate::websocket::WebSocketManager;
+use trakkt_types::models::IssueAttachment;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 const MAX_FILE_SIZE: usize = 10 * 1024 * 1024; // 10MB
@@ -78,6 +79,35 @@ impl AttachmentRow {
         }
     }
 }
+
+/// Internal row type for deserialising `issue_attachments` junction rows.
+#[derive(sqlx::FromRow)]
+struct IssueAttachmentRow {
+    issue_id: String,
+    attachment_id: String,
+    created_at: String,
+}
+
+impl IssueAttachmentRow {
+    fn into_dto(self) -> IssueAttachment {
+        IssueAttachment {
+            issue_id: self.issue_id,
+            attachment_id: self.attachment_id,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Base SELECT for the `issue_attachments` junction table.
+///
+/// `created_at` is `TIMESTAMPTZ` on Postgres and TEXT on SQLite while the row
+/// type declares `String` for both, so the cast is not cosmetic — see the JSONB
+/// note in `docs/CODING_STANDARDS.md`, which is the same failure in a different
+/// column type.
+const ISSUE_ATTACHMENT_SELECT: &str = "\
+    SELECT issue_id, attachment_id, \
+           CAST(created_at AS TEXT) AS created_at \
+    FROM issue_attachments";
 
 // ─── Validation ──────────────────────────────────────────────────────────────
 
@@ -291,6 +321,19 @@ pub async fn delete_attachment(
 /// The INSERT and its `sync_log` entry are one transaction. `issue_attachments`
 /// is not an entity type a delta re-reads, so a link that commits without its
 /// sync row can never be repaired — it simply never reaches another client.
+///
+/// The entry carries the junction row itself, and has to. An insert entry with
+/// no payload is dropped by `apply_action_to_memory`
+/// (`crates/trakkt-ui/src/cache/apply.rs`) at its data-less guard, which runs
+/// before the entity-type match — so the ISSUE_ATTACHMENT arm there depends on
+/// this call sending one. That is the whole of TRA-9979.
+///
+/// The audience is [`SyncAudience::Workspace`](sync_log_service::SyncAudience)
+/// because the read path is: [`list_issue_attachments`] filters on
+/// `workspace_id` and nothing else, and its only caller resolves that id from
+/// the session's workspace membership. Every workspace member may already read
+/// this link, so nothing is disclosed by broadcasting it — and both sibling
+/// writes (`detach_from_issue`, `create_attachment`) are `Workspace` too.
 pub async fn attach_to_issue(
     db: &DbPool,
     workspace_id: &str,
@@ -329,7 +372,31 @@ pub async fn attach_to_issue(
 
     trakkt_core::tx_execute!(&mut tx, &sql, issue_id, attachment_id)?;
 
+    // Re-read the junction row just written, for its DB-assigned timestamp, and
+    // send it as the payload — exactly as `project_service::add_project_member`
+    // does for the membership row it writes. Both the stored entry and the live
+    // frame carry it, and the client skips either without it:
+    // `apply_action_to_memory` (`crates/trakkt-ui/src/cache/apply.rs`) returns at
+    // its data-less guard *before* the entity-type match, so a `None` here made
+    // the ISSUE_ATTACHMENT insert arm unreachable and a link to an existing file
+    // reached no other client at all, live or on reconnect.
+    //
+    // The read runs on the transaction: the row does not exist on the pool until
+    // the commit, and on SQLite the pool is not reachable at all while the
+    // transaction is open (`max_connections(1)` — see `DbTx`).
+    //
+    // `ON CONFLICT DO NOTHING` above means the INSERT may have been a no-op, in
+    // which case this reads the row the earlier link left. That is the right
+    // answer for an idempotent call: the frame describes the link that now
+    // exists, and re-announcing it costs a client one refetch of a list it
+    // already agrees with.
+    let sql = format!("{ISSUE_ATTACHMENT_SELECT} WHERE issue_id = $1 AND attachment_id = $2");
+    let row: IssueAttachmentRow =
+        trakkt_core::tx_fetch_one!(&mut tx, IssueAttachmentRow, &sql, issue_id, attachment_id)?;
+    let link = row.into_dto();
+
     let entity_id = format!("{issue_id}:{attachment_id}");
+    let payload = sync_log_service::sync_payload(&link, entity_types::ISSUE_ATTACHMENT, &entity_id);
 
     sync_log_service::commit_and_deliver(
         tx,
@@ -338,7 +405,7 @@ pub async fn attach_to_issue(
         workspace_id,
         sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
-        None,
+        payload,
         ws_manager,
     )
     .await?;

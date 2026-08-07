@@ -1081,8 +1081,8 @@ mod tests {
     use super::*;
     use trakkt_types::enums::FavoriteTarget;
     use trakkt_types::models::{
-        Favorite, IssueWithDetails, Label, Project, ProjectMember, ProjectMilestone, ProjectUpdate,
-        Status, Team, View,
+        Favorite, IssueAttachment, IssueWithDetails, Label, Project, ProjectMember,
+        ProjectMilestone, ProjectUpdate, Status, Team, View,
     };
     use trakkt_core::test_helpers::channel::recv_soon;
     use trakkt_types::sync::{entity_types, SyncResponse};
@@ -6272,6 +6272,103 @@ mod tests {
             .collect()
     }
 
+    // ─── Attachment-link frames and payloads (TRA-9979) ──────────────────────
+    //
+    // `attach_to_issue` used to record its ISSUE_ATTACHMENT insert with a `None`
+    // payload. `apply_action_to_memory` (`crates/trakkt-ui/src/cache/apply.rs`)
+    // returns at its data-less guard *before* the entity-type match, so the
+    // frame was dropped and linking an existing file to an issue reached no
+    // other client at all — not live, and not on reconnect either, because the
+    // stored entry was equally empty. The two tests below are that pair: the
+    // live frame and the persisted row, which are separate criteria and neither
+    // of which can stand in for the other.
+    //
+    // An entry existing is not the property under test; the defect was an entry
+    // that existed and was empty. Both tests therefore deserialise the payload
+    // into the `IssueAttachment` the client applies and assert its fields.
+
+    /// The sync entity id for a link: `issue_attachments` has a composite
+    /// primary key and no surrogate id, so the two columns are joined. Written
+    /// out here rather than shared with the service, so a change to the id
+    /// scheme has to be made deliberately in both places — the same reason
+    /// `member_entity_id` above is a local copy.
+    fn link_entity_id(issue_id: &str, attachment_id: &str) -> String {
+        format!("{issue_id}:{attachment_id}")
+    }
+
+    #[tokio::test]
+    async fn issue_attach_frame_carries_the_new_link() {
+        let db = two_user_workspace().await;
+        seed_attachments(&db).await;
+        let (manager, mut conn) = watching_member(&db).await;
+
+        // `att_loose` rather than `att_linked`: with `ON CONFLICT DO NOTHING` an
+        // already-linked attachment makes the INSERT a no-op, and this test
+        // would then be asserting over a row some other statement wrote.
+        crate::attachment_service::attach_to_issue(&db, WS, "iss_vis", "att_loose", Some(&manager))
+            .await
+            .expect("link an existing attachment to the issue");
+
+        let action = next_sync_action(&mut conn, "the attachment-link frame").await;
+        assert!(
+            matches!(action.action, SyncActionType::Insert),
+            "linking creates a junction row, so the frame is an Insert of that \
+             row"
+        );
+        let data = payload_of(
+            &action,
+            entity_types::ISSUE_ATTACHMENT,
+            &link_entity_id("iss_vis", "att_loose"),
+        );
+
+        let received: IssueAttachment =
+            serde_json::from_value(data).expect("payload deserializes into an IssueAttachment");
+        assert_eq!(received.issue_id, "iss_vis");
+        assert_eq!(
+            received.attachment_id, "att_loose",
+            "the frame has to name which attachment was linked — the entity id \
+             alone is a string the client would have to parse"
+        );
+        assert!(
+            !received.created_at.is_empty(),
+            "the payload is built after the re-read on the transaction, so the \
+             DB-assigned created_at has to be in it"
+        );
+    }
+
+    /// The durable half. Run with **no `ws_manager`**, so the live frame cannot
+    /// satisfy any of it: this is what a client that was offline for the whole
+    /// thing replays on reconnect, and it is the half `None` broke silently —
+    /// there was no delivery to notice missing.
+    #[tokio::test]
+    async fn delta_carries_the_junction_row_for_a_link_to_an_existing_attachment() {
+        let db = two_user_workspace().await;
+        seed_attachments(&db).await;
+
+        crate::attachment_service::attach_to_issue(&db, WS, "iss_vis", "att_loose", None)
+            .await
+            .expect("link an existing attachment to the issue");
+
+        // `delta_payloads` panics rather than skipping when a non-delete entry
+        // has no payload, which is exactly the defect: an entry that exists and
+        // is empty would fail here, where "assert an entry exists" would pass.
+        let links: Vec<IssueAttachment> =
+            delta_payloads(&db, USER_B, entity_types::ISSUE_ATTACHMENT).await;
+
+        assert_eq!(links.len(), 1, "one link was made, got {links:?}");
+        assert_eq!(links[0].issue_id, "iss_vis");
+        assert_eq!(
+            links[0].attachment_id, "att_loose",
+            "the stored row has to name what was linked to what, or a \
+             reconnecting client learns nothing it can act on"
+        );
+        assert!(
+            !links[0].created_at.is_empty(),
+            "the payload is built from the re-read, so the DB-assigned \
+             created_at has to be in it"
+        );
+    }
+
     #[tokio::test]
     async fn attachment_create_rolls_back_when_its_sync_entry_cannot_be_written() {
         let db = two_user_workspace().await;
@@ -6356,6 +6453,14 @@ mod tests {
         );
     }
 
+    /// `attach_to_issue` writes exactly **one** `sync_log` entry — one
+    /// `commit_and_deliver` call, no batch and no loop — so a blanket trigger
+    /// would be correct here today. It is narrowed to `ISSUE_ATTACHMENT` anyway,
+    /// because "correct given the current entry count" is a property of the
+    /// implementation and not of this test: an entry added ahead of the link's
+    /// would silently turn the blanket form into an assertion about that new
+    /// entry instead, and it would still pass. The `WHEN` clause makes the
+    /// rejection land on the link entry or nowhere.
     #[tokio::test]
     async fn issue_attach_rolls_back_when_its_sync_entry_cannot_be_written() {
         let db = two_user_workspace().await;
@@ -6368,7 +6473,7 @@ mod tests {
              NOTHING; got {before:?}"
         );
 
-        reject_sync_log_inserts(&db).await;
+        reject_sync_log_inserts_for_entity_type(&db, entity_types::ISSUE_ATTACHMENT).await;
 
         let err =
             crate::attachment_service::attach_to_issue(&db, WS, "iss_vis", "att_loose", None)
