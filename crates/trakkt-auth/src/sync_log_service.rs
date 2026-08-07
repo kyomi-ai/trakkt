@@ -1079,6 +1079,7 @@ impl<'a> SyncBatch<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trakkt_types::enums::FavoriteTarget;
     use trakkt_types::models::{
         Favorite, IssueWithDetails, Label, Project, ProjectMember, ProjectMilestone, ProjectUpdate,
         Status, Team, View,
@@ -1344,8 +1345,15 @@ mod tests {
         .clone();
 
         let favorite =
-            crate::favorite_service::add_favorite(db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::add_favorite(
+                db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect("A favorites the issue");
 
         (notification_id, favorite.favorite_id)
@@ -2654,8 +2662,15 @@ mod tests {
         let db = two_user_workspace().await;
 
         let favorite =
-            crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::add_favorite(
+                &db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect("A favorites the issue");
 
         // A favorite is scoped to its owner, so it is A's delta that carries it.
@@ -6537,8 +6552,15 @@ mod tests {
         let db = two_user_workspace().await;
         reject_sync_log_inserts(&db).await;
 
-        let err = crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
-            .await
+        let err = crate::favorite_service::add_favorite(
+            &db,
+            USER_A,
+            WS,
+            FavoriteTarget::Issue,
+            "iss_vis",
+            None,
+        )
+        .await
             .expect_err("an add whose sync entry cannot be written must fail");
 
         assert!(
@@ -6559,8 +6581,15 @@ mod tests {
     async fn favorite_remove_rolls_back_when_its_sync_entry_cannot_be_written() {
         let db = two_user_workspace().await;
         let favorite =
-            crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::add_favorite(
+                &db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect("A favorites the issue");
 
         let before = favorites(&db).await;
@@ -6577,8 +6606,15 @@ mod tests {
         reject_sync_log_inserts(&db).await;
 
         let err =
-            crate::favorite_service::remove_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::remove_favorite(
+                &db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect_err("a remove whose sync entry cannot be written must fail");
 
         assert!(
@@ -6847,8 +6883,15 @@ mod tests {
         .clone();
 
         let favorite =
-            crate::favorite_service::add_favorite(db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::add_favorite(
+                db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect("A favorites the issue");
 
         let prefs = crate::notification_service::get_or_default_preferences(db, USER_A, WS, None)
@@ -6947,8 +6990,15 @@ mod tests {
 
         // One mutation per converted per-user site, in order.
         let favorite =
-            crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", Some(&manager))
-                .await
+            crate::favorite_service::add_favorite(
+                &db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                Some(&manager),
+            )
+            .await
                 .expect("A favorites the issue");
         notify(&db, USER_A, Some(&manager)).await;
         crate::notification_service::get_or_default_preferences(&db, USER_A, WS, Some(&manager))
@@ -6969,7 +7019,7 @@ mod tests {
             &db,
             USER_A,
             WS,
-            "issue",
+            FavoriteTarget::Issue,
             "iss_vis",
             Some(&manager),
         )

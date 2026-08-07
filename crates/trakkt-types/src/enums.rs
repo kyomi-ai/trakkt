@@ -144,3 +144,141 @@ impl std::str::FromStr for ActionSource {
         }
     }
 }
+
+/// Declares [`FavoriteTarget`] and everything derived from its variant list.
+///
+/// The variants, `ALL`, `as_str` and `from_wire` all come from one macro input,
+/// so none of them can fall behind the others — the same reason
+/// `trakkt_types::sync::declare_entity_types!` exists.
+macro_rules! declare_favorite_targets {
+    ($($variant:ident = $wire:literal;)+) => {
+        /// What a `favorites` row can point at.
+        ///
+        /// `favorites.target_id` is polymorphic — one TEXT column naming a row
+        /// in whichever table `target_type` selects — so no single foreign key
+        /// can express it, and neither dialect's schema deletes a favorite when
+        /// its target goes. Each parent's delete path removes them instead
+        /// (TRA-10025), which is only sound while the set of parents is
+        /// *enumerable*. This enum is that enumeration.
+        ///
+        /// It is also why `target_type` is no longer a free string.
+        /// `favorite_service::add_favorite` takes this type rather than a
+        /// `&str`, so a row whose type no delete path handles cannot be written
+        /// in the first place — before TRA-10025 the column accepted anything
+        /// the HTTP caller sent.
+        ///
+        /// # Adding a variant
+        ///
+        /// One line in the `declare_favorite_targets!` invocation below gives
+        /// the variant its wire string and puts it in [`FavoriteTarget::ALL`].
+        /// What the compiler cannot do for you is delete the rows: that lives in
+        /// the parent's own delete path, via
+        /// `favorite_service::doomed_favorites_tx`.
+        ///
+        /// `every_favorite_target_is_deleted_with_its_target`
+        /// (`apps/server/tests/postgres_dialect.rs`) is what makes that step
+        /// non-optional. It walks [`FavoriteTarget::ALL`] and dispatches through
+        /// an exhaustive `match` of its own, so a new variant does not compile
+        /// until someone writes the arm that deletes one — and the arm has to
+        /// run the real service function, because the assertions are on the rows
+        /// and on the `sync_log` entries afterwards.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum FavoriteTarget {
+            $($variant),+
+        }
+
+        impl FavoriteTarget {
+            /// Every target type a favorite can name, in declaration order.
+            ///
+            /// Emitted from the same macro input as the variants themselves, so
+            /// unlike a hand-maintained array it cannot omit one.
+            pub const ALL: &'static [FavoriteTarget] = &[$(FavoriteTarget::$variant),+];
+
+            /// The string stored in `favorites.target_type` and sent on the wire.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+
+            /// Parse a `favorites.target_type` value.
+            ///
+            /// `None` for anything else, which is what closes the set: the
+            /// server function that takes a client-supplied string rejects the
+            /// request rather than writing a row nothing will ever clean up.
+            pub fn from_wire(wire: &str) -> Option<Self> {
+                match wire {
+                    $($wire => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+declare_favorite_targets! {
+    Issue = "issue";
+    Project = "project";
+    Team = "team";
+    View = "view";
+}
+
+impl std::fmt::Display for FavoriteTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod favorite_target_tests {
+    use std::collections::BTreeSet;
+
+    use super::FavoriteTarget;
+
+    /// Two variants sharing a wire string would make `from_wire` return one of
+    /// them for both, so a favorite of the shadowed type would be deleted by the
+    /// wrong parent's delete path — or by none.
+    #[test]
+    fn every_target_has_a_distinct_wire_string() {
+        let unique: BTreeSet<&str> = FavoriteTarget::ALL.iter().map(|t| t.as_str()).collect();
+
+        assert_eq!(
+            unique.len(),
+            FavoriteTarget::ALL.len(),
+            "`FavoriteTarget::ALL` holds a duplicate wire string: {:?}",
+            FavoriteTarget::ALL
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `from_wire` is the only way a client-supplied string becomes a
+    /// `FavoriteTarget`, so a variant it cannot produce is a type the product
+    /// can never favorite.
+    #[test]
+    fn every_target_round_trips_through_its_wire_string() {
+        for target in FavoriteTarget::ALL {
+            assert_eq!(
+                FavoriteTarget::from_wire(target.as_str()),
+                Some(*target),
+                "{target} has a wire string `from_wire` does not accept"
+            );
+        }
+    }
+
+    /// The rejection is the point of the type: before TRA-10025 this string went
+    /// straight into `favorites.target_type` and produced a row no delete path
+    /// would ever remove.
+    #[test]
+    fn an_unknown_wire_string_is_rejected() {
+        assert_eq!(
+            FavoriteTarget::from_wire("milestone"),
+            None,
+            "`milestone` is not a favorite target — accepting it would write a \
+             row no parent delete path removes, which is exactly the dangling \
+             favorite TRA-10025 fixed"
+        );
+    }
+}

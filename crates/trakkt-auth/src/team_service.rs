@@ -9,10 +9,12 @@
 use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::FavoriteTarget;
 use trakkt_types::models::{IssueTeamMember, Team, TeamSettings, WorkspaceSettings};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::sync_log_service::CascadedIdRow;
 use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
@@ -836,6 +838,43 @@ pub async fn delete_team(
     //    longer exists, or a deleted team no client is ever told about.
     let mut tx = db.begin().await?;
 
+    // Every favorite this delete strands, read before anything is removed —
+    // afterwards nothing connects a favorite to what it named. Two sources, and
+    // the second is the one that is easy to miss:
+    //
+    // * the team itself, pinned as `('team', team_id)`;
+    // * every view scoped to this team. `views.team_id` is `ON DELETE CASCADE`
+    //   in both dialects — Postgres always had it and
+    //   `migrations-sqlite/20260803100000_dual_backend_fk_parity.sql` gave
+    //   SQLite the same, which `deleting_a_team_deletes_the_views_scoped_to_it`
+    //   (`apps/server/tests/postgres_dialect.rs`) holds — so the `DELETE FROM
+    //   teams` below takes those views with it. A favorite pinning one is
+    //   stranded exactly as if the view had been deleted directly, and
+    //   `delete_view` is never reached to notice.
+    //
+    // Nothing is removed here; `delete_and_record` below does the DELETE and
+    // writes the entry that evicts each row from its owner's cache, so the two
+    // cannot come apart. Before TRA-10025 this was a bare `DELETE FROM favorites
+    // WHERE target_type = 'team'` with no entry at all and no view arm — the
+    // rows vanished server-side and stayed in every owner's IndexedDB.
+    let team_scoped_view_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        CascadedIdRow,
+        "SELECT view_id AS id FROM views WHERE team_id = $1",
+        team_id
+    )?;
+
+    let mut doomed_favorites = vec![
+        crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::Team, team_id)
+            .await?,
+    ];
+    for view in &team_scoped_view_ids {
+        doomed_favorites.push(
+            crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::View, &view.id)
+                .await?,
+        );
+    }
+
     // One issue entry per reassignment plus the team's own delete, against a
     // single commit — `SyncBatch`'s exact shape. It holds every entry until the
     // commit, which is not a convenience: `broadcast_raw_to_workspace` resolves
@@ -880,13 +919,13 @@ pub async fn delete_team(
         }
     }
 
-    // Delete favorites referencing this team. `favorites.target_id` is
-    // polymorphic and carries no foreign key, so nothing cascades it.
-    trakkt_core::tx_execute!(
-        &mut tx,
-        "DELETE FROM favorites WHERE target_type = 'team' AND target_id = $1",
-        team_id
-    )?;
+    // Delete the favorites read above, each with the entry that evicts it from
+    // its owner's cache. Ahead of the `DELETE FROM teams` below only for
+    // symmetry with the other three delete paths; `favorites.target_id` carries
+    // no foreign key, so the order does not matter to the database.
+    for doomed in &doomed_favorites {
+        doomed.delete_and_record(&mut tx, &mut batch).await?;
+    }
 
     // Clear default_team_id on any users who had this team as default.
     // `users.default_team_id` is a plain column with no foreign key either.

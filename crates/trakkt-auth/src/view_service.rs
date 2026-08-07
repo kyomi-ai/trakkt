@@ -8,6 +8,7 @@
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::FavoriteTarget;
 use trakkt_types::models::View;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
@@ -422,12 +423,19 @@ pub async fn update_view(
     Ok(view)
 }
 
-/// Delete a view.
+/// Delete a view, and with it every favorite that pinned it.
 ///
 /// The DELETE and its `sync_log` entry are one transaction — a delete that
 /// commits without its sync row leaves the view in every other client's sidebar
 /// forever, and no later delta can repair it: the row it would have to re-read
 /// is gone.
+///
+/// The favorites go the same way and for the same reason. `favorites.target_id`
+/// has no foreign key to `views`, so nothing in either dialect removes them
+/// (TRA-10025); left behind they point at nothing, and being a cached type they
+/// return after every `SyncReset` because the server still has the row. This is
+/// one of the four delete paths
+/// `every_favorite_target_is_deleted_with_its_target` holds to that.
 pub async fn delete_view(
     db: &DbPool,
     view_id: &str,
@@ -448,6 +456,13 @@ pub async fn delete_view(
 
     let mut tx = db.begin().await?;
 
+    // Ahead of the DELETE, because after it nothing connects a favorite to the
+    // view it named. Nothing is removed yet — `delete_and_record` does that, so
+    // the rows cannot go without the entries that evict them from their owners'
+    // caches.
+    let doomed_favorites =
+        crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::View, view_id).await?;
+
     let result = trakkt_core::tx_execute!(
         &mut tx,
         "DELETE FROM views WHERE view_id = $1",
@@ -461,17 +476,28 @@ pub async fn delete_view(
         )));
     }
 
-    sync_log_service::commit_and_deliver(
-        tx,
-        entity_types::VIEW,
-        view_id,
-        workspace_id,
-        view_audience(&view),
-        SyncActionType::Delete,
-        None,
-        ws_manager,
-    )
-    .await?;
+    // A batch rather than `commit_and_deliver`: the view's own entry is no
+    // longer the only one, and a favorite's is addressed to its owner alone
+    // while the view's follows `view_audience`. One commit, N deliveries.
+    let mut batch = sync_log_service::SyncBatch::new();
+
+    batch
+        .record(
+            &mut tx,
+            entity_types::VIEW,
+            view_id,
+            workspace_id,
+            view_audience(&view),
+            SyncActionType::Delete,
+            None,
+        )
+        .await?;
+
+    doomed_favorites
+        .delete_and_record(&mut tx, &mut batch)
+        .await?;
+
+    batch.commit_and_deliver(tx, ws_manager).await?;
 
     Ok(())
 }

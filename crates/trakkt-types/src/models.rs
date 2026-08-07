@@ -202,7 +202,17 @@ pub struct ProjectProgress {
     pub percent_done: f64,
 }
 
-/// A user-pinned favorite (team, project, or view) for quick sidebar access.
+/// A user-pinned issue, project, team or view, for quick sidebar access.
+///
+/// `target_type` is a `String` and not a [`crate::enums::FavoriteTarget`] on
+/// purpose, and the asymmetry is deliberate: writes are strict, reads are not.
+/// `favorite_service::add_favorite` takes the enum, so nothing new can be stored
+/// outside the closed set — but this type also decodes rows that predate
+/// TRA-10025, when the column took whatever string an HTTP caller sent. Parsing
+/// here would turn one such legacy row into a failed bootstrap for its owner
+/// rather than a favorite that renders as nothing.
+/// `migrations/20260807000000_prune_dangling_favorites.sql` is what removes
+/// them; until it has run, this field has to be able to hold one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Favorite {
     pub favorite_id: String,
