@@ -8069,26 +8069,49 @@ mod tests {
 
     const TRANSFER: &str = "xfer_vis";
 
-    /// Every workspace row as `(workspace_id, name, settings, owner_user_id)`.
-    async fn workspaces(db: &DbPool) -> Vec<(String, Option<String>, Option<String>, String)> {
+    /// Every field of a `workspaces` row that a mutation in this module writes.
+    ///
+    /// A struct rather than a tuple because three of the five fields are
+    /// `Option<String>` and two of those — `settings` and `default_team_id` —
+    /// are adjacent. In a tuple an assertion that transposed them would compile
+    /// and pass, and a rollback test that cannot fail is worse than none.
+    #[derive(Debug, PartialEq, Eq)]
+    struct WorkspaceFootprint {
+        workspace_id: String,
+        name: Option<String>,
+        settings: Option<String>,
+        default_team_id: Option<String>,
+        owner_user_id: String,
+    }
+
+    /// Every workspace row, in a stable order.
+    async fn workspaces(db: &DbPool) -> Vec<WorkspaceFootprint> {
         #[derive(sqlx::FromRow)]
         struct WorkspaceFootprintRow {
             workspace_id: String,
             name: Option<String>,
             settings: Option<String>,
+            default_team_id: Option<String>,
             owner_user_id: String,
         }
 
         let rows: Vec<WorkspaceFootprintRow> = db_fetch_all!(
             db,
             WorkspaceFootprintRow,
-            "SELECT workspace_id, name, CAST(settings AS TEXT) AS settings, owner_user_id \
+            "SELECT workspace_id, name, CAST(settings AS TEXT) AS settings, default_team_id, \
+             owner_user_id \
              FROM workspaces ORDER BY workspace_id"
         )
         .expect("read workspaces back");
 
         rows.into_iter()
-            .map(|r| (r.workspace_id, r.name, r.settings, r.owner_user_id))
+            .map(|r| WorkspaceFootprint {
+                workspace_id: r.workspace_id,
+                name: r.name,
+                settings: r.settings,
+                default_team_id: r.default_team_id,
+                owner_user_id: r.owner_user_id,
+            })
             .collect()
     }
 
@@ -8168,7 +8191,13 @@ mod tests {
         let before = workspaces(&db).await;
         assert_eq!(
             before,
-            vec![(WS.to_string(), Some("Old Name".to_string()), None, USER_A.to_string())],
+            vec![WorkspaceFootprint {
+                workspace_id: WS.to_string(),
+                name: Some("Old Name".to_string()),
+                settings: None,
+                default_team_id: None,
+                owner_user_id: USER_A.to_string(),
+            }],
             "precondition: the workspace carries the name the rename will try to \
              replace"
         );
@@ -8309,6 +8338,166 @@ mod tests {
         );
     }
 
+    // ─── Workspace default team (TRA-9978) ───────────────────────────────────
+    //
+    // `set_workspace_default_team` writes exactly one entry
+    // (WORKSPACE_SETTINGS / update), so the blanket [`reject_sync_log_inserts`]
+    // trigger lands on the write under test rather than shadowing it behind an
+    // earlier one. The seeding call below writes its own entry, but it commits
+    // *before* the trigger is installed, so the trigger only ever sees the
+    // entry the function under test writes.
+
+    const TEAM_SECOND: &str = "team_second";
+
+    /// A second team in the fixture workspace, so a default-team change has a
+    /// prior value to be rolled back to rather than rolling back to NULL.
+    async fn add_second_team(db: &DbPool) {
+        db_execute!(
+            db,
+            "INSERT INTO teams (team_id, workspace_id, name, key) VALUES ($1, $2, $3, $4)",
+            TEAM_SECOND,
+            WS,
+            "Second",
+            "SEC"
+        )
+        .expect("insert a second team");
+    }
+
+    #[tokio::test]
+    async fn workspace_default_team_change_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        add_second_team(&db).await;
+
+        crate::workspace_service::set_workspace_default_team(&db, WS, "team_vis", None)
+            .await
+            .expect("seed the default team the failed write will try to replace");
+
+        let before = workspaces(&db).await;
+        assert_eq!(
+            before,
+            vec![WorkspaceFootprint {
+                workspace_id: WS.to_string(),
+                name: None,
+                settings: None,
+                default_team_id: Some("team_vis".to_string()),
+                owner_user_id: USER_A.to_string(),
+            }],
+            "precondition: the workspace carries the default team the write \
+             below will try to replace, so the rollback assertion is comparing \
+             against a real value and not against NULL"
+        );
+
+        let entries_before = sync_entries(&db).await;
+        assert_eq!(
+            entries_before.len(),
+            1,
+            "precondition: the seeding write is one entry, so the comparison \
+             below distinguishes it from the write under test"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::workspace_service::set_workspace_default_team(&db, WS, TEAM_SECOND, None)
+                .await
+                .expect_err(
+                    "a default-team change whose sync entry cannot be written must fail",
+                );
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            workspaces(&db).await,
+            before,
+            "a default-team change with no sync_log row is invisible to every \
+             connected client until the next full bootstrap, and no later delta \
+             reports it — the row a delta re-reads already holds the new default, \
+             so nothing marks it changed — which is why it must not survive"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            entries_before,
+            "the seeding write's entry stays; the failed write's must not be \
+             there at all"
+        );
+    }
+
+    /// The persisted payload must carry the default team the write *set*, not
+    /// the one it replaced.
+    ///
+    /// This is the assertion that pins the snapshot read to the transaction,
+    /// for the same reasons spelled out on
+    /// [`workspace_sync_entry_carries_the_post_update_state`]: on Postgres a
+    /// pool read here sits outside the transaction, returns the pre-update row,
+    /// and silently persists a stale snapshot that advances every client's
+    /// watermark past a change it never delivered; on SQLite it stalls on the
+    /// single connection the transaction holds instead. Comparing the payload
+    /// against the newly-set team is what makes both impossible.
+    ///
+    /// It also pins `default_team_id` into the snapshot at all. Before TRA-9978
+    /// the column was absent from `WORKSPACE_SNAPSHOT_SQL`, so an entry for a
+    /// default-team change would have carried a payload in which nothing had
+    /// changed.
+    #[tokio::test]
+    async fn workspace_default_team_sync_entry_carries_the_post_update_state() {
+        let db = two_user_workspace().await;
+        add_second_team(&db).await;
+
+        crate::workspace_service::set_workspace_default_team(&db, WS, "team_vis", None)
+            .await
+            .expect("set the default team");
+        crate::workspace_service::set_workspace_default_team(&db, WS, TEAM_SECOND, None)
+            .await
+            .expect("move the default team to the second team");
+
+        let payloads: Vec<serde_json::Value> =
+            delta_payloads(&db, USER_A, entity_types::WORKSPACE_SETTINGS).await;
+
+        assert_eq!(payloads.len(), 2, "one entry per write");
+
+        assert_eq!(
+            payloads[0].get("default_team_id"),
+            Some(&serde_json::json!("team_vis")),
+            "the first write's entry must carry the team it set — the pre-update \
+             value here is NULL, a payload that tells every client nothing changed"
+        );
+        assert_eq!(
+            payloads[1].get("default_team_id"),
+            Some(&serde_json::json!(TEAM_SECOND)),
+            "and the second write's entry must carry the team *it* set, not the \
+             one the first write left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_the_workspace_default_team_writes_one_workspace_wide_entry() {
+        let db = two_user_workspace().await;
+
+        let changed =
+            crate::workspace_service::set_workspace_default_team(&db, WS, "team_vis", None)
+                .await
+                .expect("set the default team");
+        assert!(changed, "the fixture workspace exists, so the UPDATE matched");
+
+        assert_eq!(
+            visible_entries_after(&db, 0).await,
+            vec![VisibleEntry {
+                entity_type: entity_types::WORKSPACE_SETTINGS.to_string(),
+                entity_id: WS.to_string(),
+                action: "update".to_string(),
+                visibility_user_id: None,
+            }],
+            "exactly one entry, addressed to the workspace: the default team is \
+             workspace-level configuration every member reads, so a \
+             `visibility_user_id` here would replay it to one member and leave \
+             the rest stale"
+        );
+    }
+
     #[tokio::test]
     async fn ownership_transfer_commits_its_three_statements_together() {
         let db = two_user_workspace().await;
@@ -8332,7 +8521,13 @@ mod tests {
 
         assert_eq!(
             workspaces(&db).await,
-            vec![(WS.to_string(), None, None, USER_B.to_string())],
+            vec![WorkspaceFootprint {
+                workspace_id: WS.to_string(),
+                name: None,
+                settings: None,
+                default_team_id: None,
+                owner_user_id: USER_B.to_string(),
+            }],
             "statement 1: the workspace owner moves to B"
         );
         assert_eq!(

@@ -689,8 +689,9 @@ pub async fn delete_team_icon(
 
 /// Delete a team and optionally reassign its issues to another team.
 ///
-/// Steps, in order. Everything up to and including 5 runs on the pool; 6 is one
-/// transaction; 7 follows its commit.
+/// Steps, in order. 1–4 run on the pool; 5 is a transaction of its own that
+/// commits and broadcasts before 6 opens; 6 is one transaction; 7 follows its
+/// commit.
 /// 1. Verify the team exists and belongs to this workspace
 /// 2. Prevent deletion of the last team in a workspace
 /// 3. Refuse to strand issues: a team with issues needs a reassign target
@@ -806,14 +807,32 @@ pub async fn delete_team(
 
     // 5. Optionally set a new workspace default team.
     //
-    // This runs on the pool, so it cannot move inside the transaction below, and
-    // it does not need to: it writes no `sync_log` row of its own, so it is not
-    // part of the atomicity this function owes the sync stream. It stays ahead
-    // of the team delete exactly as it was, and touches only `workspaces` —
-    // disjoint from every table the transaction writes.
+    // Since TRA-9978 this call is its own atomic unit: it opens a transaction,
+    // writes `workspaces.default_team_id` with a WORKSPACE_SETTINGS `sync_log`
+    // entry beside it, commits, and broadcasts — all before the transaction
+    // below opens. So it is no longer true that it writes no sync row; what
+    // remains true is that its row is not part of *this* function's transaction,
+    // and cannot be.
+    //
+    // It cannot move inside step 6 for two reasons. It takes a `&DbPool` and
+    // owns a transaction internally, so calling it from inside an open one would
+    // reach for the pool while step 6 holds SQLite's single connection (see
+    // `DbTx`). And it performs its own commit-and-broadcast, which must not run
+    // while another transaction is open.
+    //
+    // The ordering is therefore unchanged from before: the default-team change
+    // lands first and independently, and touches only `workspaces` — disjoint
+    // from every table step 6 writes. A failure in step 6 leaves the new default
+    // team standing, which was already the case and is the honest outcome: the
+    // workspace default genuinely did change.
     if let Some(new_default_id) = new_workspace_default_id {
-        crate::workspace_service::set_workspace_default_team(db, workspace_id, new_default_id)
-            .await?;
+        crate::workspace_service::set_workspace_default_team(
+            db,
+            workspace_id,
+            new_default_id,
+            ws_manager,
+        )
+        .await?;
     }
 
     // 6. Everything that writes a `sync_log` row is one transaction: the issue
