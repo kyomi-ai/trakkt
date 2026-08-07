@@ -23,8 +23,8 @@ use crate::components::{
     PriorityIndicator, LabelBadge, Select, SelectVariant,
     TeamKeyBadge, ToggleButton,
 };
-use crate::pages::projects::project_board::ProjectBoardContent;
-use crate::pages::projects::project_list_view::ProjectListView;
+use crate::pages::projects::project_board::{BoardViewState, ProjectBoardContent};
+use crate::pages::projects::project_list_view::{ListViewState, ProjectListView};
 use crate::server_fns::projects::{
     archive_project, delete_project,
     get_project, get_project_progress, list_milestones,
@@ -203,6 +203,15 @@ impl MemberEditState {
 /// on a component the router constructs once per route, the signals outlive the
 /// rebuild and the interaction survives it.
 ///
+/// The board and list tabs are in scope for the same reason (TRA-10032). They
+/// sit one level deeper — inside `ProjectDetailContent`'s
+/// `{move || active_view…}` child, whose own closure reads nothing but
+/// `active_view` — which is why they read as unaffected. They are not: a
+/// dynamic child's `rebuild` is an unconditional `build()` of a fresh
+/// `RenderEffect` and `unmount()` of the old one, so reconstructing
+/// `ProjectDetailContent` reconstructs whichever view tab is showing, filters
+/// and all.
+///
 /// This is the standards' "Reactive Primitives" rule — hoist reactive
 /// primitives to component setup level, outside the view closure — applied to
 /// the whole page rather than to one section.
@@ -215,6 +224,10 @@ struct ProjectEditState {
     members: MemberEditState,
     /// Whether the settings tab's delete-project confirmation is open.
     confirming_delete: RwSignal<bool>,
+    /// The board tab's toolbar filters and in-progress drag.
+    board: BoardViewState,
+    /// The list tab's toolbar filters, sort and grouping.
+    list: ListViewState,
 }
 
 impl ProjectEditState {
@@ -226,14 +239,23 @@ impl ProjectEditState {
             update: UpdateDraft::new(),
             members: MemberEditState::new(),
             confirming_delete: RwSignal::new(false),
+            board: BoardViewState::default(),
+            list: ListViewState::default(),
         }
     }
 
-    /// Drop every open editor and draft.
+    /// Drop every open editor and draft, and every view-tab selection.
     ///
     /// Needed because the router matches `/projects/:id` once and reuses this
     /// component across projects: without it, an add form left open on one
-    /// project would appear, still holding its draft, on the next.
+    /// project would appear, still holding its draft, on the next — and, since
+    /// TRA-10032 hoisted them too, a board filter or a list grouping chosen on
+    /// one project would silently narrow the next one's issues.
+    ///
+    /// A *tab* switch deliberately does not go through here. Moving between
+    /// Board and List and back is not an instruction to drop what you had
+    /// filtered to, and the two tabs hold separate state, so neither can
+    /// surprise the other.
     fn reset(&self) {
         self.name.close();
         self.description.close();
@@ -245,6 +267,8 @@ impl ProjectEditState {
         self.members.add_value.set(String::new());
         self.members.removing_id.set(None);
         self.confirming_delete.set(false);
+        self.board.reset();
+        self.list.reset();
     }
 }
 
@@ -989,13 +1013,17 @@ fn ProjectDetailContent(
                 "board" => {
                     let pid_signal = Signal::derive(move || project_id.get());
                     view! {
-                        <ProjectBoardContent project_id=pid_signal/>
+                        <ProjectBoardContent project_id=pid_signal state=edit_state.board/>
                     }.into_any()
                 }
                 "list" => {
                     let pid_signal = Signal::derive(move || project_id.get());
                     view! {
-                        <ProjectListView project_id=pid_signal milestones=milestones_signal/>
+                        <ProjectListView
+                            project_id=pid_signal
+                            milestones=milestones_signal
+                            state=edit_state.list
+                        />
                     }.into_any()
                 }
                 "settings" => {
@@ -2390,5 +2418,261 @@ fn ProjectNotFound() -> impl IntoView {
                 "Back to Projects"
             </Button>
         </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Do the view tabs survive a resource settling?
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The runtime half of TRA-10032's audit.
+///
+/// Reading the code does not settle the question on its own. The closure that
+/// builds the two view tabs is `ProjectDetailContent`'s `{move || …}` at the
+/// "View content" comment above, and its body reads exactly one thing —
+/// `active_view`. Nothing about a resource appears anywhere in it, which reads
+/// as "these tabs re-run when you change tab, and at no other time".
+///
+/// That reading is wrong, and this module is what shows it. `ProjectDetailPage`
+/// builds `ProjectDetailContent` *inside* its six-resource content closure, so
+/// a settling resource reconstructs `ProjectDetailContent`, and a dynamic
+/// child's `Render::rebuild` in `tachys` is
+/// `let new = self.build(); … old.unmount();` — an unconditional fresh build,
+/// not a reuse. So the tab's component function runs again and every signal
+/// declared in its body comes back at its initial value, however few things its
+/// own closure reads.
+///
+/// Each test mounts the real `ProjectBoardContent` / `ProjectListView` in that
+/// nesting and, in the same subtree, a probe that keeps its text in a signal
+/// declared in its own body — the shape the tabs had before this ticket. One
+/// resource settling has to leave the tab's filter box alone and clear the
+/// probe. The probe is not decoration: without it a passing run cannot
+/// distinguish "the state survived the rebuild" from "no rebuild happened", and
+/// the second would make the assertion worthless.
+///
+/// Both were run against a variant that keeps the current signatures and puts
+/// the filters back in the component bodies — the pre-hoist behaviour, isolated
+/// from every other difference. Both failed, on every run, and failed on the
+/// *last* assertion: `content_builds` was 2 and the probe was empty, so the
+/// rebuild was measured and it was the filter alone that did not survive it.
+///
+/// What these do not cover is the nesting itself: `ContentShim` stands where
+/// `ProjectDetailContent` stands, so a refactor that took the view tabs out
+/// from under the content closure would leave them passing and pointless. The
+/// production chain is asserted end-to-end, on a real sync frame between two
+/// windows, by `e2e/tests/sync/project-view-state.spec.ts`.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod view_tab_rebuild_tests {
+    use gloo_timers::future::TimeoutFuture;
+    use leptos::prelude::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use crate::pages::projects::project_board::{BoardViewState, ProjectBoardContent};
+    use crate::pages::projects::project_list_view::{ListViewState, ProjectListView};
+    use crate::wasm_test_support::boot_leptos_executor;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// What gets typed into both boxes.
+    const TYPED: &str = "half-typed filter";
+    /// The probe's placeholder, used to find it in the DOM.
+    const PROBE_PLACEHOLDER: &str = "body-owned probe";
+
+    /// A field that keeps its text in a signal declared in its own body.
+    ///
+    /// This is what `ProjectBoardContent` and `ProjectListView` looked like
+    /// before their filters were hoisted, reduced to the one observable part.
+    #[component]
+    fn BodyOwnedProbe() -> impl IntoView {
+        let text = RwSignal::new(String::new());
+        view! {
+            <input
+                type="text"
+                placeholder=PROBE_PLACEHOLDER
+                prop:value=move || text.get()
+                on:input=move |ev| text.set(event_target_value(&ev))
+            />
+        }
+    }
+
+    /// Stands in for `ProjectDetailContent`: a component built inside the
+    /// resource-reading closure, holding the `{move || active_view…}` dynamic
+    /// child that builds whichever view tab is showing.
+    ///
+    /// Its closure reads `active_view` and nothing else, which is the whole
+    /// point — that is the shape that reads as safe.
+    #[component]
+    fn ContentShim(
+        active_view: Memo<String>,
+        board: BoardViewState,
+        list: ListViewState,
+    ) -> impl IntoView {
+        let project_id = Signal::derive(|| "project-under-test".to_owned());
+        let milestones = Signal::derive(Vec::new);
+        view! {
+            {move || {
+                match active_view.get().as_str() {
+                    "board" => view! {
+                        <ProjectBoardContent project_id=project_id state=board/>
+                        <BodyOwnedProbe/>
+                    }.into_any(),
+                    _ => view! {
+                        <ProjectListView
+                            project_id=project_id
+                            milestones=milestones
+                            state=list
+                        />
+                        <BodyOwnedProbe/>
+                    }.into_any(),
+                }
+            }}
+        }
+    }
+
+    fn make_container() -> web_sys::HtmlElement {
+        let document = web_sys::window()
+            .expect("the browser test runner must provide a window")
+            .document()
+            .expect("the browser test runner must provide a document");
+        let container: web_sys::HtmlElement = document
+            .create_element("div")
+            .expect("creating a container to mount the page shim into")
+            .dyn_into()
+            .expect("the container element is an HtmlElement");
+        document
+            .body()
+            .expect("the document must have a body to attach the container to")
+            .append_child(&container)
+            .expect("attaching the container to the document body");
+        container
+    }
+
+    /// The one `<input>` in `container` carrying `placeholder`.
+    fn input_by_placeholder(
+        container: &web_sys::HtmlElement,
+        placeholder: &str,
+    ) -> web_sys::HtmlInputElement {
+        container
+            .query_selector(&format!("input[placeholder=\"{placeholder}\"]"))
+            .expect("querying the mounted subtree for a filter box")
+            .unwrap_or_else(|| panic!("no input with placeholder {placeholder:?} is rendered"))
+            .dyn_into()
+            .expect("the element found by placeholder is an input")
+    }
+
+    /// Type `text` into `input` the way a user does — set the value, then let
+    /// the `on:input` handler read it back off the event target.
+    ///
+    /// The event has to bubble: Leptos delegates `input` to a listener on the
+    /// document, so a non-bubbling event would reach no handler and the test
+    /// would measure a box nobody had typed into.
+    fn type_into(input: &web_sys::HtmlInputElement, text: &str) {
+        input.set_value(text);
+        let event = web_sys::Event::new("input").expect("constructing an input event");
+        event.init_event_with_bubbles("input", true);
+        input
+            .dispatch_event(&event)
+            .expect("dispatching the input event to the filter box");
+    }
+
+    /// What the two boxes hold after one resource settles under them.
+    struct Outcome {
+        /// The value in the view tab's own filter box.
+        tab_filter: String,
+        /// The value in the body-owned probe beside it.
+        probe: String,
+        /// How many times the resource-reading closure produced content.
+        content_builds: u32,
+    }
+
+    /// Mount the production nesting, type into both boxes, then make the
+    /// resource settle again.
+    ///
+    /// `tab` selects which view tab `ContentShim` builds; `placeholder`
+    /// identifies that tab's filter box.
+    async fn one_resource_settling(tab: &'static str, placeholder: &'static str) -> Outcome {
+        let container = make_container();
+
+        // `ProjectDetailPage` has six of these. One is enough: the closure is
+        // rebuilt by whichever of them moves, so the other five would only
+        // repeat what this one already shows.
+        let version = RwSignal::new(0u32);
+        let resource = Resource::new(move || version.get(), move |v| async move { v });
+        let content_builds = RwSignal::new(0u32);
+
+        let active_view = Memo::new(move |_| tab.to_owned());
+        let board = BoardViewState::default();
+        let list = ListViewState::default();
+
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                {move || match resource.get() {
+                    None => view! { <p>"Loading..."</p> }.into_any(),
+                    Some(_) => {
+                        content_builds.update_untracked(|n| *n += 1);
+                        view! {
+                            <ContentShim active_view=active_view board=board list=list/>
+                        }.into_any()
+                    }
+                }}
+            }
+        });
+
+        // The fetcher resolves on a macrotask, so the first content build has
+        // to be waited for rather than assumed.
+        TimeoutFuture::new(150).await;
+        type_into(&input_by_placeholder(&container, placeholder), TYPED);
+        type_into(&input_by_placeholder(&container, PROBE_PLACEHOLDER), TYPED);
+        TimeoutFuture::new(30).await;
+
+        // A colleague's change lands: the resource re-fetches and settles.
+        version.set(1);
+        TimeoutFuture::new(150).await;
+
+        let outcome = Outcome {
+            tab_filter: input_by_placeholder(&container, placeholder).value(),
+            probe: input_by_placeholder(&container, PROBE_PLACEHOLDER).value(),
+            content_builds: content_builds.get_untracked(),
+        };
+        drop(handle);
+        container.remove();
+        outcome
+    }
+
+    /// Assert the parts every one of these tests shares.
+    fn assert_rebuilt_and_kept(outcome: &Outcome, what: &str) {
+        assert_eq!(
+            outcome.content_builds, 2,
+            "the resource-reading closure did not produce content twice, so no rebuild was \
+             measured and the rest of this test proves nothing"
+        );
+        assert_eq!(
+            outcome.probe, "",
+            "the probe kept its text, which means the view tab beside it was never rebuilt. \
+             Either the nesting changed or the settle did not happen — either way the \
+             assertion below would pass without testing anything"
+        );
+        assert_eq!(
+            outcome.tab_filter, TYPED,
+            "{what} was discarded by a resource settling under it. It has to be owned by \
+             `ProjectDetailPage` — see `ProjectEditState` — because the closure that builds \
+             this tab is inside `ProjectDetailPage`'s six-resource content closure, however \
+             little the tab's own closure reads"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_boards_filter_survives_a_resource_settling() {
+        boot_leptos_executor();
+        let outcome = one_resource_settling("board", "Filter cards...").await;
+        assert_rebuilt_and_kept(&outcome, "the board's card filter");
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_lists_filter_survives_a_resource_settling() {
+        boot_leptos_executor();
+        let outcome = one_resource_settling("list", "Filter issues...").await;
+        assert_rebuilt_and_kept(&outcome, "the list's issue filter");
     }
 }

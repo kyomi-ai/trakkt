@@ -109,6 +109,86 @@ fn default_hidden() -> HashSet<String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Board interaction state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What the user has told the board to do: the four toolbar filters, and the
+/// drag they are part-way through.
+///
+/// Created by `ProjectDetailPage` as part of `ProjectEditState` and passed in,
+/// not created in [`ProjectBoardContent`]'s body, and that is load-bearing
+/// rather than stylistic. `ProjectDetailPage`'s content closure reads six
+/// resources; any one settling re-runs it, which reconstructs
+/// `ProjectDetailContent`, which rebuilds the `{move || active_view…}` child
+/// that builds this component. A dynamic child's `rebuild` is an unconditional
+/// `build()` of a fresh `RenderEffect` followed by `unmount()` of the old one
+/// (`tachys::reactive_graph`), so this component function runs again and every
+/// signal declared in its body is replaced at its initial value.
+///
+/// Three of those six move on workspace-wide counters — `milestones_version`,
+/// `project_updates_version`, `project_members_version` — so a colleague's
+/// milestone, status update or membership change on *any* project re-runs it.
+/// The two that are project-scoped are enough on their own: `project_issues` is
+/// a `Memo` over `SyncStore::issues` filtered to this project, which this
+/// board's own drop handler changes every time a card is moved, since it writes
+/// the moved issue back to the store.
+///
+/// See `ProjectEditState` in `project_detail.rs` for the rest of the reasoning
+/// and for where these are cleared when the router reuses the page for a
+/// different project.
+#[derive(Clone, Copy)]
+pub struct BoardViewState {
+    search: RwSignal<String>,
+    priority_filter: RwSignal<Vec<String>>,
+    label_filter: RwSignal<Vec<String>>,
+    assignee_filter: RwSignal<Vec<String>>,
+    /// Which issue_id is mid-drag, or `None`.
+    ///
+    /// Held here so a sync frame landing mid-drag does not silently drop the
+    /// card's half-opacity and the target column's outline. It does not rescue
+    /// the drag itself: the rebuild detaches the node being dragged, and no
+    /// amount of surviving state puts it back. That half is TRA-10031.
+    ///
+    /// Cleared by `ProjectBoardColumn`'s `on:drop` as well as the card's
+    /// `on:dragend`, because the drop is what triggers the rebuild that detaches
+    /// the card — see the comment at that call.
+    dragging: RwSignal<Option<String>>,
+    /// Which category column the pointer is currently over, or `None`.
+    drag_target: RwSignal<Option<String>>,
+}
+
+impl Default for BoardViewState {
+    fn default() -> Self {
+        Self {
+            search: RwSignal::new(String::new()),
+            priority_filter: RwSignal::new(Vec::new()),
+            label_filter: RwSignal::new(Vec::new()),
+            assignee_filter: RwSignal::new(Vec::new()),
+            dragging: RwSignal::new(None),
+            drag_target: RwSignal::new(None),
+        }
+    }
+}
+
+impl BoardViewState {
+    /// Put every control back to the value it has on a board opened fresh.
+    ///
+    /// Called from `ProjectEditState::reset`, i.e. when the router moves this
+    /// page to a different project. Without it a filter typed on one project
+    /// would still be narrowing the board of the next one, with no visible
+    /// cause — the same leak `ProjectEditState::reset` exists to prevent for
+    /// the inline editors.
+    pub fn reset(&self) {
+        self.search.set(String::new());
+        self.priority_filter.set(Vec::new());
+        self.label_filter.set(Vec::new());
+        self.assignee_filter.set(Vec::new());
+        self.dragging.set(None);
+        self.drag_target.set(None);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Project Board Content
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -119,7 +199,19 @@ fn default_hidden() -> HashSet<String> {
 pub fn ProjectBoardContent(
     /// The project ID to filter issues by.
     project_id: Signal<String>,
+    /// Filter selections and in-progress drag, owned by `ProjectDetailPage` so
+    /// they survive this component being reconstructed. See [`BoardViewState`].
+    state: BoardViewState,
 ) -> impl IntoView {
+    let BoardViewState {
+        search,
+        priority_filter,
+        label_filter,
+        assignee_filter,
+        dragging,
+        drag_target,
+    } = state;
+
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
     // ── Data: issues for this project ────────────────────────────────────
@@ -147,6 +239,25 @@ pub fn ProjectBoardContent(
     });
 
     // ── Hidden columns state ─────────────────────────────────────────────
+    //
+    // Declared here and not in `BoardViewState`, unlike everything else on this
+    // toolbar, and TRA-10032 left it that way deliberately.
+    //
+    // Column visibility is already durable in a stronger sense than hoisting
+    // would make it: the toggle in `ProjectBoardDisplayOptions` writes the whole
+    // set through to localStorage under a per-project key on every change, so
+    // there is never an unsaved value to lose. The rebuild replaces this signal
+    // with an empty set, and the effect below — whose `initialized` guard is
+    // replaced with it — reads the key straight back. Nothing the user chose is
+    // discarded; the residue is one frame in which a column that should be
+    // hidden is shown, and the same rebuild is tearing down and re-creating
+    // every column's DOM either way. That is the render churn TRA-10031 is
+    // about, not state loss, and moving this signal would not shorten it by a
+    // frame.
+    //
+    // It also has a per-project storage key doing the job `ProjectEditState::
+    // reset` does for the hoisted state. Hoisting it would put two mechanisms
+    // on one value and make their order on a project switch matter.
     let hidden_categories: RwSignal<HashSet<String>> = RwSignal::new(HashSet::new());
 
     // Initialize hidden set from localStorage.
@@ -176,12 +287,6 @@ pub fn ProjectBoardContent(
             }
         });
     }
-
-    // ── Filter state ─────────────────────────────────────────────────────
-    let (search, set_search) = signal(String::new());
-    let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
-    let (label_filter, set_label_filter) = signal(Vec::<String>::new());
-    let (assignee_filter, set_assignee_filter) = signal(Vec::<String>::new());
 
     // Filtered issues: search + priority + label + assignee applied before grouping.
     let filtered_issues = Memo::new(move |_| {
@@ -218,10 +323,6 @@ pub fn ProjectBoardContent(
             })
             .collect::<Vec<_>>()
     });
-
-    // ── Drag state ──────────────────────────────────────────────────────
-    let (dragging, set_dragging) = signal(Option::<String>::None);
-    let (drag_target, set_drag_target) = signal(Option::<String>::None);
 
     // ── Drop handler ────────────────────────────────────────────────────
     // Args: (issue_id, target_category)
@@ -307,22 +408,22 @@ pub fn ProjectBoardContent(
             // ── Toolbar ─────────────────────────────────────────────────
             <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0 flex-wrap">
                 <SearchInput
-                    value=Signal::derive(move || search.get())
-                    on_input=Callback::new(move |v: String| set_search.set(v))
+                    value=search
+                    on_input=Callback::new(move |v: String| search.set(v))
                     placeholder="Filter cards..."
                     class="flex-1 max-w-sm"
                 />
                 <PriorityFilterDropdown
                     value=priority_filter
-                    on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))
+                    on_change=Callback::new(move |v: Vec<String>| priority_filter.set(v))
                 />
                 <LabelFilterDropdown
                     value=label_filter
-                    on_change=Callback::new(move |v: Vec<String>| set_label_filter.set(v))
+                    on_change=Callback::new(move |v: Vec<String>| label_filter.set(v))
                 />
                 <AssigneeFilterDropdown
                     value=assignee_filter
-                    on_change=Callback::new(move |v: Vec<String>| set_assignee_filter.set(v))
+                    on_change=Callback::new(move |v: Vec<String>| assignee_filter.set(v))
                 />
                 <ProjectBoardDisplayOptions
                     hidden=hidden_categories
@@ -362,9 +463,7 @@ pub fn ProjectBoardContent(
                                         count=count
                                         issues=col_issues
                                         dragging=dragging
-                                        set_dragging=set_dragging
                                         drag_target=drag_target
-                                        set_drag_target=set_drag_target
                                         on_drop=handle_drop
                                     />
                                 }
@@ -491,14 +590,12 @@ fn ProjectBoardColumn(
     count: usize,
     /// Issues to render in this column.
     issues: Vec<IssueWithDetails>,
-    /// Signal: which issue_id is currently being dragged.
-    dragging: ReadSignal<Option<String>>,
-    /// Setter for the dragging signal.
-    set_dragging: WriteSignal<Option<String>>,
-    /// Signal: which category is the current drag target.
-    drag_target: ReadSignal<Option<String>>,
-    /// Setter for the drag target signal.
-    set_drag_target: WriteSignal<Option<String>>,
+    /// Which issue_id is currently being dragged. Owned by `ProjectDetailPage`
+    /// — see [`BoardViewState`].
+    dragging: RwSignal<Option<String>>,
+    /// Which category is the current drag target. Owned by `ProjectDetailPage`
+    /// — see [`BoardViewState`].
+    drag_target: RwSignal<Option<String>>,
     /// Callback when an issue is dropped on this column.
     /// Args: (issue_id, target_category).
     #[prop(into)]
@@ -526,7 +623,7 @@ fn ProjectBoardColumn(
             class=column_class
             on:dragover=move |ev: web_sys::DragEvent| {
                 ev.prevent_default();
-                set_drag_target.set(Some(category_for_over.clone()));
+                drag_target.set(Some(category_for_over.clone()));
             }
             on:dragleave=move |ev: web_sys::DragEvent| {
                 let should_clear = match (ev.current_target(), ev.related_target()) {
@@ -542,7 +639,7 @@ fn ProjectBoardColumn(
                     _ => true,
                 };
                 if should_clear {
-                    set_drag_target.set(None);
+                    drag_target.set(None);
                 }
             }
             on:drop={
@@ -555,7 +652,16 @@ fn ProjectBoardColumn(
                     {
                         on_drop.run((issue_id, category_drop.clone()));
                     }
-                    set_drag_target.set(None);
+                    // Both halves of the drag end here, not just the target
+                    // highlight. `dragend` on the card says the same thing, but
+                    // `on_drop` above writes the moved issue back to the
+                    // `SyncStore`, which rebuilds this board and detaches the
+                    // card that is about to receive it — so leaving the "which
+                    // issue is being dragged" signal to `dragend` alone would
+                    // make a moved card's half-opacity depend on an event
+                    // reaching a node no longer in the document.
+                    dragging.set(None);
+                    drag_target.set(None);
                 }
             }
         >
@@ -582,7 +688,6 @@ fn ProjectBoardColumn(
                             <ProjectBoardCard
                                 issue=issue
                                 dragging=dragging
-                                set_dragging=set_dragging
                             />
                         }
                     }).collect_view().into_any()
@@ -603,10 +708,9 @@ fn ProjectBoardColumn(
 #[component]
 fn ProjectBoardCard(
     issue: IssueWithDetails,
-    /// Signal: which issue_id is currently being dragged.
-    dragging: ReadSignal<Option<String>>,
-    /// Setter for the dragging signal.
-    set_dragging: WriteSignal<Option<String>>,
+    /// Which issue_id is currently being dragged. Owned by `ProjectDetailPage`
+    /// — see [`BoardViewState`].
+    dragging: RwSignal<Option<String>>,
 ) -> impl IntoView {
     let issue_id = issue.issue_id.clone();
     let issue_id_for_drag = issue_id.clone();
@@ -679,11 +783,11 @@ fn ProjectBoardCard(
                         let _ = dt.set_data("text/plain", &issue_id_ds);
                         dt.set_effect_allowed("move");
                     }
-                    set_dragging.set(Some(issue_id_ds.clone()));
+                    dragging.set(Some(issue_id_ds.clone()));
                 }
             }
             on:dragend=move |_: web_sys::DragEvent| {
-                set_dragging.set(None);
+                dragging.set(None);
                 set_did_drag.set(true);
             }
             on:click=navigate_to_issue
