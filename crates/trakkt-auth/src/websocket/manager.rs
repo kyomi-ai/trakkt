@@ -379,21 +379,61 @@ impl WebSocketManager {
         workspace_id: &str,
         json: &str,
     ) {
-        let members: Vec<(String,)> = match trakkt_core::db_fetch_all!(
-            &self.inner.db,
-            (String,),
+        self.deliver_raw_to_recipients(
             "SELECT user_id FROM workspace_users WHERE workspace_id = $1",
-            workspace_id
-        ) {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::error!("Failed to query workspace members for broadcast: {e}");
-                return;
-            }
-        };
+            workspace_id,
+            "workspace members",
+            json,
+        )
+        .await;
+    }
 
-        for (member_user_id,) in members {
-            self.deliver(&member_user_id, json).await;
+    /// Broadcast a pre-serialized JSON string to the *current* members of one
+    /// team.
+    ///
+    /// The team counterpart of [`Self::broadcast_raw_to_workspace`], and the
+    /// live half of the `team_members` predicate in
+    /// `sync_log_service::ENTRIES_SINCE_SQL`. The recipient set is deliberately
+    /// the same one that predicate admits — `team_members` as it stands right
+    /// now, with no `workspace_users` join — so a member cannot be sent a frame
+    /// live that their next delta would withhold, or the reverse. Changing this
+    /// query without changing that predicate re-opens TRA-10039.
+    ///
+    /// "Current" is resolved here, at delivery time, and delivery runs strictly
+    /// after the mutation's transaction commits (see
+    /// `sync_log_service::SyncBatch::commit_and_deliver`). That ordering is what
+    /// makes membership changes made by the same transaction visible to this
+    /// read — and it is also mandatory, because this read reaches the pool,
+    /// which an open transaction on SQLite is holding the only connection to.
+    pub async fn broadcast_raw_to_team_members(&self, team_id: &str, json: &str) {
+        self.deliver_raw_to_recipients(
+            "SELECT user_id FROM team_members WHERE team_id = $1",
+            team_id,
+            "team members",
+            json,
+        )
+        .await;
+    }
+
+    /// Resolve a recipient set with `sql` and deliver `json` to every user in
+    /// it.
+    ///
+    /// `sql` must select exactly one `user_id` column and take exactly one bind
+    /// parameter, which `scope_id` supplies. `scope` names the recipient set in
+    /// the log line a failed resolve emits, which is the only trace a dropped
+    /// broadcast leaves — delivery is best-effort and nothing here propagates.
+    async fn deliver_raw_to_recipients(&self, sql: &str, scope_id: &str, scope: &str, json: &str) {
+        let recipients: Vec<(String,)> =
+            match trakkt_core::db_fetch_all!(&self.inner.db, (String,), sql, scope_id) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!("Failed to query {scope} for broadcast: {e}");
+                    return;
+                }
+            };
+
+        for (user_id,) in recipients {
+            self.deliver(&user_id, json).await;
         }
     }
 
