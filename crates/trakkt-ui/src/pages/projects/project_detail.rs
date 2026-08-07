@@ -440,7 +440,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
                         None
                     } else {
                         Some(view! {
-                            <crate::components::layout::FavoriteToggle target_type="project" target_id=id/>
+                            <crate::components::layout::FavoriteToggle target_type=trakkt_types::enums::FavoriteTarget::Project target_id=id/>
                         })
                     }
                 }}

@@ -11,6 +11,7 @@ use wasm_bindgen::JsCast;
 use phosphor_leptos::{Icon, IconWeight};
 
 use std::collections::HashMap;
+use trakkt_types::enums::FavoriteTarget;
 use crate::cache::store::SyncStore;
 use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon};
 use crate::components::{Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, FeedbackModal, ProjectCreationModal, Spinner, TeamCreationModal, TeamIcon};
@@ -742,7 +743,7 @@ fn SidebarProjectsSection() -> impl IntoView {
                             let href = format!("/projects/{}", project.project_id);
                             let name = project.name.clone();
                             view! {
-                                <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type="project" favorite_id=fav_id/>
+                                <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type=FavoriteTarget::Project favorite_id=fav_id/>
                             }
                         }).collect_view()}
                     </div>
@@ -969,7 +970,7 @@ fn SidebarWorkspacePresetItem(
 /// `add_favorite` or `remove_favorite` server function.
 #[component]
 pub fn FavoriteToggle(
-    target_type: &'static str,
+    target_type: FavoriteTarget,
     target_id: String,
 ) -> impl IntoView {
     let store = use_context::<SyncStore>();
@@ -980,7 +981,7 @@ pub fn FavoriteToggle(
                 s.favorites()
                     .get()
                     .iter()
-                    .any(|f| f.target_type == target_type && f.target_id == tid)
+                    .any(|f| f.target_type == target_type.as_str() && f.target_id == tid)
             })
             .unwrap_or(false)
     });
@@ -995,7 +996,7 @@ pub fn FavoriteToggle(
             return;
         }
         toggling.set(true);
-        let tt = target_type.to_string();
+        let tt = target_type.as_str().to_string();
         let ti = target_id_click.clone();
         let currently_fav = is_fav.get_untracked();
         leptos::task::spawn_local(async move {
@@ -1040,7 +1041,7 @@ fn SidebarEntityItem(
     href: String,
     name: String,
     icon: phosphor_leptos::IconData,
-    #[prop(optional)] favorite_type: Option<&'static str>,
+    #[prop(optional)] favorite_type: Option<FavoriteTarget>,
     #[prop(optional)] favorite_id: Option<String>,
 ) -> impl IntoView {
     let path = leptos_router::hooks::use_location().pathname;

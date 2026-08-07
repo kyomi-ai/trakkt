@@ -48,7 +48,7 @@ use trakkt_core::{
     db_execute, db_fetch_all, db_fetch_scalar, dual_backend_test, sql_compat, tx_execute,
     tx_fetch_all, tx_fetch_one, tx_fetch_optional, tx_fetch_scalar, tx_with, DbPool,
 };
-use trakkt_types::enums::ActionSource;
+use trakkt_types::enums::{ActionSource, FavoriteTarget};
 use trakkt_types::models::{CreateIssueParams, Issue, IssueUpdate};
 use trakkt_types::sync::{entity_types, SyncActionType};
 
@@ -2527,5 +2527,476 @@ dual_backend_test! {
                  through every reconnect: {recipients_updates:?}"
             );
         }
+    }
+}
+
+// ─── Every favorite goes with its target ─────────────────────────────────────
+//
+// `favorites.target_id` is polymorphic TEXT with no foreign key in either
+// dialect, so no cascade — declared or otherwise — removes a favorite when the
+// thing it pins is deleted. TRA-10025 made each parent's delete path do it
+// instead, which is only sound while every parent is enumerated. These tests are
+// what hold that enumeration to its word.
+//
+// Run on both backends because the *reason* the two dialects behave alike here
+// is worth re-checking rather than assuming: the second-order case below leans
+// on `views.team_id ON DELETE CASCADE`, which Postgres has always had and SQLite
+// only gained in `migrations-sqlite/20260803100000_dual_backend_fk_parity.sql`.
+
+/// The user who pins things alongside [`USER`], so no assertion below can pass
+/// against an implementation that handles one owner and stops.
+const PINNING_USER: &str = "usr_dialect_pinner";
+
+/// A favorite's owner, as the `sync_log` reports it.
+#[derive(sqlx::FromRow)]
+struct FavoriteEntry {
+    entity_id: String,
+    action: String,
+    visibility_user_id: Option<String>,
+}
+
+/// How many favorites still point at `(target, target_id)`.
+async fn favorites_naming(db: &DbPool, target: FavoriteTarget, target_id: &str) -> i64 {
+    db_fetch_scalar!(
+        db,
+        i64,
+        "SELECT COUNT(*) FROM favorites WHERE target_type = $1 AND target_id = $2",
+        target.as_str(),
+        target_id
+    )
+    .expect("count the favorites still naming the deleted target")
+}
+
+/// Every FAVORITE entry written above `watermark`, sorted by owner.
+async fn favorite_entries_above(
+    db: &DbPool,
+    watermark: i64,
+) -> Vec<(String, String, Option<String>)> {
+    let rows: Vec<FavoriteEntry> = db_fetch_all!(
+        db,
+        FavoriteEntry,
+        "SELECT entity_id, action, visibility_user_id FROM sync_log \
+         WHERE sync_id > $1 AND entity_type = $2 ORDER BY sync_id ASC",
+        watermark,
+        entity_types::FAVORITE
+    )
+    .expect("read the FAVORITE entries the delete wrote");
+
+    let mut out: Vec<(String, String, Option<String>)> = rows
+        .into_iter()
+        .map(|r| (r.entity_id, r.action, r.visibility_user_id))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Pin `(target, target_id)` for `user_id` and return the new `favorite_id`.
+async fn pin(db: &DbPool, user_id: &str, target: FavoriteTarget, target_id: &str) -> String {
+    trakkt_auth::favorite_service::add_favorite(db, user_id, WORKSPACE, target, target_id, None)
+        .await
+        .expect("pin the target the delete must unpin")
+        .favorite_id
+}
+
+/// Create one instance of `target`, named `label` so two are distinguishable.
+///
+/// Exhaustive over [`FavoriteTarget`] on purpose — see
+/// `every_favorite_target_is_deleted_with_its_target`.
+async fn create_favoritable(db: &DbPool, target: FavoriteTarget, label: &str) -> String {
+    match target {
+        FavoriteTarget::Issue => create_issue(db, label).await.issue_id,
+        FavoriteTarget::Project => {
+            trakkt_auth::project_service::create_project(
+                db,
+                &trakkt_auth::project_service::CreateProjectParams {
+                    workspace_id: WORKSPACE,
+                    name: label,
+                    description: None,
+                    icon: None,
+                    color: None,
+                    lead_id: None,
+                    start_date: None,
+                    target_date: None,
+                },
+                None,
+            )
+            .await
+            .expect("create the project to be pinned")
+            .project_id
+        }
+        FavoriteTarget::Team => {
+            // A team of its own, never `TEAM`: `delete_team` refuses to remove
+            // the last team in a workspace, so the seeded one has to survive to
+            // let this one go.
+            trakkt_auth::team_service::create_team(
+                db,
+                &trakkt_auth::team_service::CreateTeamParams {
+                    workspace_id: WORKSPACE,
+                    name: label,
+                    key: team_key_for(label),
+                    description: None,
+                    icon: None,
+                    creator_id: None,
+                },
+                None,
+            )
+            .await
+            .expect("create the team to be pinned")
+            .team_id
+        }
+        FavoriteTarget::View => {
+            // `team_id: None` — a workspace-level view. A team-scoped one would
+            // be swept away by the Team case's `delete_team` instead of by
+            // `delete_view`, which is a different cascade with its own test
+            // below.
+            trakkt_auth::view_service::create_view(
+                db,
+                &trakkt_auth::view_service::CreateViewParams {
+                    workspace_id: WORKSPACE,
+                    user_id: USER,
+                    name: label,
+                    icon: None,
+                    filters: "{}",
+                    display_options: "{}",
+                    is_shared: true,
+                    team_id: None,
+                    position: 0,
+                },
+                None,
+            )
+            .await
+            .expect("create the view to be pinned")
+            .view_id
+        }
+    }
+}
+
+/// Delete `target_id` through the real service function for its type.
+///
+/// Exhaustive over [`FavoriteTarget`] on purpose — see
+/// `every_favorite_target_is_deleted_with_its_target`. Going through the service
+/// rather than a `DELETE` statement is the point: a raw statement would prove
+/// only that SQL removes rows, and it is the service layer that owes the
+/// favorites their removal and their `sync_log` entries.
+async fn delete_favoritable(db: &DbPool, target: FavoriteTarget, target_id: &str) {
+    match target {
+        FavoriteTarget::Issue => {
+            let number: i32 = db_fetch_scalar!(
+                db,
+                i32,
+                "SELECT number FROM issues WHERE issue_id = $1",
+                target_id
+            )
+            .expect("read the issue's team-scoped number, which is how it is deleted");
+            trakkt_auth::issue_service::delete_issue(db, WORKSPACE, TEAM_KEY, number, None)
+                .await
+                .expect("delete the pinned issue");
+        }
+        FavoriteTarget::Project => {
+            trakkt_auth::project_service::delete_project(db, target_id, None)
+                .await
+                .expect("delete the pinned project");
+        }
+        FavoriteTarget::Team => {
+            trakkt_auth::team_service::delete_team(db, target_id, WORKSPACE, None, None, None)
+                .await
+                .expect("delete the pinned team");
+        }
+        FavoriteTarget::View => {
+            trakkt_auth::view_service::delete_view(db, target_id, WORKSPACE, None)
+                .await
+                .expect("delete the pinned view");
+        }
+    }
+}
+
+/// A distinct 2-5 character uppercase team key per label.
+fn team_key_for(label: &str) -> &'static str {
+    match label {
+        "doomed" => "DOOM",
+        "survivor" => "SURV",
+        other => panic!("no team key allocated for {other:?}"),
+    }
+}
+
+dual_backend_test! {
+    /// Deleting a favorited entity leaves no favorite behind — for *every* type
+    /// a favorite can name.
+    ///
+    /// # Why this test is shaped like this
+    ///
+    /// `favorites.target_id` carries no foreign key, so nothing in the schema
+    /// removes these rows; each parent's delete path has to, and "each parent"
+    /// is a set that grows. A test naming one type would have passed throughout
+    /// the bug it exists to catch — before TRA-10025 exactly one of the four
+    /// delete paths removed favorites (`delete_team`, and even that wrote no
+    /// `sync_log` entry), so a projects-only test and a teams-only test would
+    /// have disagreed about whether the codebase was correct.
+    ///
+    /// So the loop is over [`FavoriteTarget::ALL`] and the dispatch is an
+    /// exhaustive `match` in [`create_favoritable`] and [`delete_favoritable`].
+    /// Adding a variant to `FavoriteTarget` does not compile until both arms are
+    /// written, and the arm has to name a real service function, because
+    /// everything asserted below is asserted after that function has run. That
+    /// is the mechanism: not a comment asking the next person to remember, but
+    /// a build failure telling them what is missing.
+    ///
+    /// Three things are checked per type, and each kills a different wrong fix:
+    ///
+    /// 1. no favorite still names the deleted target — the defect itself;
+    /// 2. a survivor of the same type keeps its favorites — so "delete
+    ///    everything" cannot pass;
+    /// 3. one FAVORITE `delete` entry per removed row, scoped to that row's own
+    ///    owner — so a server-side delete cannot go unannounced (the row would
+    ///    sit in the owner's IndexedDB through every reconnect, which is
+    ///    TRA-9971/TRA-9957), and cannot be announced to the wrong people (a
+    ///    favorite is private; `SyncAudience::User` is what keeps it that way).
+    async fn every_favorite_target_is_deleted_with_its_target(db) {
+        seed_tenancy(db).await;
+        seed_user(db, PINNING_USER, "dialect-pinner@example.test")
+            .await
+            .expect("seed the second user who pins the same targets");
+        db_execute!(
+            db,
+            "INSERT INTO workspace_users (workspace_id, user_id) VALUES ($1, $2)",
+            WORKSPACE,
+            PINNING_USER
+        )
+        .expect("make the second pinner a member, as add_favorite's callers are");
+
+        for target in FavoriteTarget::ALL {
+            let target = *target;
+
+            let doomed = create_favoritable(db, target, "doomed").await;
+            let survivor = create_favoritable(db, target, "survivor").await;
+
+            // Two owners on the doomed target: one entry that happens to name
+            // the right user is indistinguishable from a per-row scoping until
+            // there are two rows with two different owners.
+            let doomed_by_owner = pin(db, USER, target, &doomed).await;
+            let doomed_by_pinner = pin(db, PINNING_USER, target, &doomed).await;
+            let survivor_fav = pin(db, USER, target, &survivor).await;
+
+            let watermark = sync_watermark(db).await;
+
+            delete_favoritable(db, target, &doomed).await;
+
+            assert_eq!(
+                favorites_naming(db, target, &doomed).await,
+                0,
+                "deleting the {target} left a favorite pointing at {doomed}. The row \
+                 is cached and `sync_bootstrap` streams it, so it comes back after \
+                 every SyncReset — the server still has it. `{target}` needs an arm \
+                 in the parent's delete path calling \
+                 `favorite_service::doomed_favorites_tx`."
+            );
+
+            assert_eq!(
+                favorites_naming(db, target, &survivor).await,
+                1,
+                "the surviving {target} {survivor} lost its favorite {survivor_fav}. \
+                 The cascade must remove the favorites naming the deleted row and no \
+                 others; without this the assertion above would pass against \
+                 `DELETE FROM favorites`."
+            );
+
+            let mut expected = vec![
+                (doomed_by_owner.clone(), "delete".to_string(), Some(USER.to_string())),
+                (doomed_by_pinner.clone(), "delete".to_string(), Some(PINNING_USER.to_string())),
+            ];
+            expected.sort();
+
+            assert_eq!(
+                favorite_entries_above(db, watermark).await,
+                expected,
+                "deleting the {target} must write one FAVORITE delete entry per \
+                 removed row, each scoped to that row's own owner. No entry leaves \
+                 the favorite in that owner's IndexedDB forever with no later delta \
+                 able to evict it. A NULL visibility_user_id publishes who pinned \
+                 what to the whole workspace, which is the leak \
+                 `SyncAudience::User` exists to prevent."
+            );
+        }
+    }
+}
+
+dual_backend_test! {
+    /// Deleting a team takes the favorites of the views it cascades away, not
+    /// just the favorite of the team itself.
+    ///
+    /// This is the second-order case, and it is the one a per-type fix misses.
+    /// `views.team_id` is `ON DELETE CASCADE` in both dialects, so `DELETE FROM
+    /// teams` destroys every view scoped to that team without `delete_view` ever
+    /// running — so whatever `delete_view` does about favorites is never reached,
+    /// and a favorite pinning such a view is stranded exactly as if the view had
+    /// been deleted directly.
+    ///
+    /// `every_favorite_target_is_deleted_with_its_target` cannot catch this: its
+    /// View case deliberately uses a workspace-level view so that the two
+    /// cascades stay separable. This is the test for the other half.
+    async fn deleting_a_team_unpins_the_views_it_cascades_away(db) {
+        seed_tenancy(db).await;
+
+        let doomed_team = trakkt_auth::team_service::create_team(
+            db,
+            &trakkt_auth::team_service::CreateTeamParams {
+                workspace_id: WORKSPACE,
+                name: "doomed",
+                key: team_key_for("doomed"),
+                description: None,
+                icon: None,
+                creator_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("create the team whose views the delete must cascade")
+        .team_id;
+
+        let scoped_view = trakkt_auth::view_service::create_view(
+            db,
+            &trakkt_auth::view_service::CreateViewParams {
+                workspace_id: WORKSPACE,
+                user_id: USER,
+                name: "scoped to the doomed team",
+                icon: None,
+                filters: "{}",
+                display_options: "{}",
+                is_shared: true,
+                team_id: Some(&doomed_team),
+                position: 0,
+            },
+            None,
+        )
+        .await
+        .expect("create the team-scoped view the team delete cascades away")
+        .view_id;
+
+        // A workspace-level view, which the team delete must leave alone —
+        // otherwise "unpinned the right view" and "unpinned every view" are the
+        // same result.
+        let workspace_view = trakkt_auth::view_service::create_view(
+            db,
+            &trakkt_auth::view_service::CreateViewParams {
+                workspace_id: WORKSPACE,
+                user_id: USER,
+                name: "not scoped to any team",
+                icon: None,
+                filters: "{}",
+                display_options: "{}",
+                is_shared: true,
+                team_id: None,
+                position: 0,
+            },
+            None,
+        )
+        .await
+        .expect("create the workspace-level view the team delete must not touch")
+        .view_id;
+
+        let scoped_fav = pin(db, USER, FavoriteTarget::View, &scoped_view).await;
+        pin(db, USER, FavoriteTarget::View, &workspace_view).await;
+
+        let watermark = sync_watermark(db).await;
+
+        trakkt_auth::team_service::delete_team(db, &doomed_team, WORKSPACE, None, None, None)
+            .await
+            .expect("delete the team the view is scoped to");
+
+        // The premise: the view really is gone, cascaded by the schema.
+        assert_eq!(
+            db_fetch_scalar!(db, i64, "SELECT COUNT(*) FROM views WHERE view_id = $1", &scoped_view)
+                .expect("read the cascaded view back"),
+            0,
+            "the team-scoped view must be gone — if it is not, this test is not \
+             exercising the cascade it claims to and every assertion below is \
+             vacuous"
+        );
+
+        assert_eq!(
+            favorites_naming(db, FavoriteTarget::View, &scoped_view).await,
+            0,
+            "the favorite pinning the cascaded view {scoped_view} survived its \
+             view. `delete_view` never ran — `DELETE FROM teams` took the view \
+             through `views.team_id ON DELETE CASCADE` — so `delete_team` is what \
+             owes this favorite its removal."
+        );
+
+        assert_eq!(
+            favorites_naming(db, FavoriteTarget::View, &workspace_view).await,
+            1,
+            "the workspace-level view {workspace_view} is not scoped to the deleted \
+             team, so its favorite must survive. Without this the assertion above \
+             would pass against a cascade that unpinned every view in the workspace."
+        );
+
+        assert!(
+            favorite_entries_above(db, watermark).await.contains(&(
+                scoped_fav.clone(),
+                "delete".to_string(),
+                Some(USER.to_string())
+            )),
+            "the cascaded view's favorite needs a FAVORITE delete entry scoped to \
+             its owner, or it stays in their IndexedDB through every reconnect \
+             while the server no longer has it"
+        );
+    }
+}
+
+dual_backend_test! {
+    /// A FAVORITE entry that cannot be written rolls the whole delete back.
+    ///
+    /// The favorites are removed inside the caller's transaction, so the rows and
+    /// the entries that evict them from their owners' caches commit together or
+    /// not at all. If they could come apart, the favorite would be gone from the
+    /// server and still in the owner's IndexedDB, with no later delta able to
+    /// repair it — which is the whole defect, one table over.
+    ///
+    /// Narrowed with `reject_sync_log_inserts_of_type` rather than the blanket
+    /// trigger: `delete_project` writes a PROJECT entry, then one per cascaded
+    /// member, milestone and update, and only then the FAVORITE entries. A
+    /// blanket trigger would abort the PROJECT entry and the assertion would pass
+    /// without the code under test ever being reached.
+    async fn a_rejected_favorite_entry_rolls_the_project_delete_back(db) {
+        seed_tenancy(db).await;
+
+        let project = create_favoritable(db, FavoriteTarget::Project, "doomed").await;
+        let favorite = pin(db, USER, FavoriteTarget::Project, &project).await;
+
+        reject_sync_log_inserts_of_type(db, entity_types::FAVORITE).await;
+
+        let err = trakkt_auth::project_service::delete_project(db, &project, None)
+            .await
+            .expect_err("the delete must fail when its FAVORITE entry cannot be written");
+
+        clear_sync_log_rejection(db).await;
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the delete must fail for the reason the trigger gives, not some other \
+             error that would make this test pass for the wrong reason: {err}"
+        );
+
+        assert_eq!(
+            favorites_naming(db, FavoriteTarget::Project, &project).await,
+            1,
+            "the favorite {favorite} must be back — a favorite removed without the \
+             entry that announces it is exactly the state this transaction exists \
+             to make unreachable"
+        );
+
+        assert_eq!(
+            db_fetch_scalar!(
+                db,
+                i64,
+                "SELECT COUNT(*) FROM projects WHERE project_id = $1",
+                &project
+            )
+            .expect("read the project back"),
+            1,
+            "the project must be back too: the favorites are removed on the same \
+             transaction, so a rollback that spared them and not the project would \
+             mean they are not"
+        );
     }
 }

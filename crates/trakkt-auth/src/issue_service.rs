@@ -10,7 +10,7 @@
 use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
-use trakkt_types::enums::ActionSource;
+use trakkt_types::enums::{ActionSource, FavoriteTarget};
 use trakkt_types::models::{CreateIssueParams, Issue, IssueFilters, IssueUpdate, IssueWithDetails, Label};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
@@ -1374,6 +1374,16 @@ pub async fn delete_issue(
     //   caching one either. This table therefore stays out of the list read
     //   above rather than joining it later.
 
+    // `favorites` is the one cascaded type the database does not cascade at all:
+    // `target_id` is polymorphic TEXT with no foreign key to `issues` in either
+    // dialect, so the DELETE below leaves a favorite pinning this issue pointing
+    // at nothing (TRA-10025). Read here for the same reason as every id above —
+    // afterwards nothing connects the two — and removed by `delete_and_record`,
+    // which will not part the rows from the entries that evict them.
+    let doomed_favorites =
+        crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::Issue, &issue_id)
+            .await?;
+
     trakkt_core::tx_execute!(
         &mut tx,
         "DELETE FROM issues WHERE issue_id = $1",
@@ -1438,6 +1448,12 @@ pub async fn delete_issue(
             )
             .await?;
     }
+
+    // Private per row, like the notifications above and for the same reason: a
+    // favorite is addressed to the member who pinned it, never to the workspace.
+    doomed_favorites
+        .delete_and_record(&mut tx, &mut batch)
+        .await?;
 
     batch.commit_and_deliver(tx, ws_manager).await
 }
