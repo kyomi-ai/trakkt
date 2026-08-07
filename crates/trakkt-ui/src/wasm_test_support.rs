@@ -37,3 +37,127 @@ pub fn boot_leptos_executor() {
         Ok(()) | Err(any_spawner::ExecutorError::AlreadySet) => {}
     }
 }
+
+// ── Driving a save the test controls ────────────────────────────────────────
+
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
+
+use send_wrapper::SendWrapper;
+
+/// A `!Send` future made nominally `Send` so it can be an `Action`'s body.
+///
+/// `Action::new` requires `Future: Send`, and the fixture bodies below capture
+/// `Rc` counters and a [`Gate`]. WASM is single-threaded, so nothing ever polls
+/// this from another thread — the same reasoning
+/// `pages/settings/live_update.rs`'s `latency_tests::SendTimer` records.
+/// `send_wrapper` has its own `Future` impl but it sits behind a `futures`
+/// feature this crate does not enable, so the impl is written out here.
+pub struct LocalFuture<O>(SendWrapper<Pin<Box<dyn Future<Output = O>>>>);
+
+impl<O> LocalFuture<O> {
+    pub fn new(fut: impl Future<Output = O> + 'static) -> Self {
+        Self(SendWrapper::new(Box::pin(fut)))
+    }
+}
+
+impl<O> Future for LocalFuture<O> {
+    type Output = O;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+#[derive(Default)]
+struct GateInner {
+    open: bool,
+    waker: Option<Waker>,
+}
+
+/// A latch the test opens by hand: the save cannot resolve until it does.
+///
+/// A latch rather than a timer on purpose. "The save was still on the wire when
+/// the component rebuilt" is an ordering, and a timer makes it a race the test
+/// can lose without noticing — which is the shape of failure these tests exist
+/// to stop repeating.
+#[derive(Clone, Default)]
+pub struct Gate {
+    inner: Rc<RefCell<GateInner>>,
+}
+
+impl Gate {
+    /// Let every save waiting on this gate resolve.
+    pub fn open(&self) {
+        let waker = {
+            let mut inner = self.inner.borrow_mut();
+            inner.open = true;
+            inner.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Wait until [`Gate::open`] is called.
+    pub fn wait(&self) -> GateWait {
+        GateWait {
+            gate: self.clone(),
+        }
+    }
+}
+
+/// The future [`Gate::wait`] hands back.
+pub struct GateWait {
+    gate: Gate,
+}
+
+impl Future for GateWait {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut inner = self.get_mut().gate.inner.borrow_mut();
+        if inner.open {
+            Poll::Ready(())
+        } else {
+            inner.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+/// How far each dispatched save got.
+///
+/// Held in `Rc<Cell<_>>` rather than in signals so that the instrument is not
+/// itself an arena item — a probe about disposal must not be measured with
+/// something disposal can reach.
+#[derive(Clone, Default)]
+pub struct SaveLog {
+    started: Rc<Cell<u32>>,
+    finished: Rc<Cell<u32>>,
+}
+
+impl SaveLog {
+    /// Record that a dispatched save has begun running.
+    pub fn record_start(&self) {
+        self.started.set(self.started.get() + 1);
+    }
+
+    /// Record that a dispatched save has run to completion.
+    pub fn record_finish(&self) {
+        self.finished.set(self.finished.get() + 1);
+    }
+
+    /// How many dispatched saves have begun running.
+    pub fn started(&self) -> u32 {
+        self.started.get()
+    }
+
+    /// How many have run to completion.
+    pub fn finished(&self) -> u32 {
+        self.finished.get()
+    }
+}
