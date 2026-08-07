@@ -67,11 +67,13 @@ use trakkt_types::sync::entity_types;
 ///   `list_issue_attachments`. Its rows were written and, before TRA-9966,
 ///   removed by nothing at all: the delete path had no arm for it (traced to
 ///   `be3bfad^`).
-/// * `issue_attachment` — the same list, the same server function. No row is
-///   written today in any case, because `attach_to_issue` in
-///   `crates/trakkt-auth/src/attachment_service.rs` sends a `None` payload; the
-///   entry here is what stops TRA-9979 from silently starting to write one when
-///   it gives that call a real payload.
+/// * `issue_attachment` — the same list, the same server function. Its frames
+///   have carried the junction row since TRA-9979 gave `attach_to_issue`
+///   (`crates/trakkt-auth/src/attachment_service.rs`) a real payload, so from
+///   that release on the generic upsert would have persisted one; this entry is
+///   what stops it. Nothing reads such a row back — the attachment section
+///   refetches through `list_issue_attachments`, which the counter bump in
+///   `apply_action_to_memory` is what makes it do.
 /// * `notification_preferences` — the notification settings page reads
 ///   `get_notification_preferences`.
 /// * `issue_relation` — the relations section reads `list_issue_relations`.

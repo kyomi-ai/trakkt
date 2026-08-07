@@ -1367,12 +1367,11 @@ pub async fn delete_issue(
     //   two schemas disagree, and that disagreement is not this function's to
     //   fix.
     // * `issue_attachments` — same reasoning, and TRA-9966 made it hold whatever
-    //   TRA-9979 does. `attachment_service::attach_to_issue` records the link
-    //   with `None` and the bootstrap does not stream the type, so no junction
-    //   row is cached today; and `issue_attachment` is now on `NOT_CACHED` in
-    //   `cache/cached_types.rs`, so giving that insert a payload will not start
-    //   caching one either. This table therefore stays out of the list read
-    //   above rather than joining it later.
+    //   TRA-9979 did. `attachment_service::attach_to_issue` now sends the
+    //   junction row as its payload, but `issue_attachment` is on `NOT_CACHED`
+    //   in `cache/cached_types.rs` and the bootstrap does not stream the type,
+    //   so no junction row is cached and none ever was. This table therefore
+    //   stays out of the list read above rather than joining it later.
 
     // `favorites` is the one cascaded type the database does not cascade at all:
     // `target_id` is polymorphic TEXT with no foreign key to `issues` in either

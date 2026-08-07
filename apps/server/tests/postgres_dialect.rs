@@ -1457,6 +1457,77 @@ dual_backend_test! {
     }
 }
 
+dual_backend_test! {
+    /// Linking an existing attachment to an issue records the junction row as
+    /// its payload, on both dialects.
+    ///
+    /// `attach_to_issue` re-reads the row it just inserted, on the transaction,
+    /// through a `CAST(created_at AS TEXT)` SELECT — and `issue_attachments.
+    /// created_at` is `TIMESTAMPTZ` on Postgres and TEXT on SQLite while the row
+    /// type declares `String` for both. Without the cast the Postgres decode
+    /// fails and the whole attach fails with it, which is a defect confined to
+    /// the arm every other test in the workspace never executes. The SQLite half
+    /// of this pair would pass either way; that asymmetry is the reason it is
+    /// here rather than only in `sync_log_service`'s own tests.
+    ///
+    /// Asserted on the decoded value, not the stored bytes: Postgres parses JSONB
+    /// and re-serialises it, so `{"a":1}` reads back as `{"a": 1}`.
+    async fn a_link_to_an_existing_attachment_carries_the_junction_row(db) {
+        seed_tenancy(db).await;
+        let issue = create_issue(db, "Holds an attachment").await;
+
+        db_execute!(
+            db,
+            "INSERT INTO attachments \
+                 (attachment_id, workspace_id, filename, content_type, size_bytes, \
+                  storage_path, uploaded_by) \
+             VALUES ($1, $2, 'diagram.png', 'image/png', $3, 'ws/diagram.png', $4)",
+            "att_link", WORKSPACE, 4096_i64, USER
+        )
+        .expect("insert the attachment the link points at");
+
+        // Taken after the issue exists, so the entries below are the attach's
+        // and nothing else — which also states its entry count.
+        let watermark = sync_watermark(db).await;
+
+        trakkt_auth::attachment_service::attach_to_issue(
+            db, WORKSPACE, &issue.issue_id, "att_link", None,
+        )
+        .await
+        .expect("link the existing attachment to the issue");
+
+        let entries = entries_above(db, watermark).await;
+        assert_eq!(
+            triples(&entries),
+            vec![(
+                entity_types::ISSUE_ATTACHMENT.to_owned(),
+                format!("{}:att_link", issue.issue_id),
+                "insert".to_owned(),
+            )],
+            "an attach writes exactly one sync entry, naming the link it made"
+        );
+
+        let data = entries[0].data.as_deref().unwrap_or_else(|| {
+            panic!(
+                "sync entry {} ({} {}) has no payload — `cache/apply.rs` drops a \
+                 data-less insert before its entity match, so the link would reach no \
+                 client at all",
+                entries[0].sync_id, entries[0].entity_type, entries[0].entity_id
+            )
+        });
+        let link: trakkt_types::models::IssueAttachment = serde_json::from_str(data)
+            .unwrap_or_else(|e| panic!("the stored payload is not an IssueAttachment: {e} — {data}"));
+
+        assert_eq!(link.issue_id, issue.issue_id);
+        assert_eq!(link.attachment_id, "att_link");
+        assert!(
+            !link.created_at.is_empty(),
+            "the payload is built from the re-read, so the DB-assigned created_at \
+             has to survive the cast on both dialects; got {link:?}"
+        );
+    }
+}
+
 /// Insert a notification-preferences row for `user_id` in [`WORKSPACE`].
 async fn seed_preferences(db: &DbPool, preference_id: &str, user_id: &str) {
     db_execute!(

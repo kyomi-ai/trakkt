@@ -262,18 +262,22 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) -> StoreDi
                     // same list, so it shares the counter — one counter per
                     // reader, not per entity type.
                     //
-                    // This arm only runs when the frame carries a payload, and
-                    // `attach_to_issue` in
-                    // `crates/trakkt-auth/src/attachment_service.rs` records the
-                    // link with `None`. So the paths that are live today are the
-                    // `Delete` arm below (an unlink) and the attachment insert an
-                    // upload emits alongside its link. Sending the junction row
-                    // here is the server's half — `add_project_member` in
-                    // `project_service.rs` already does exactly that for the
-                    // membership its own arm depends on — and it is tracked as
-                    // TRA-9979. Handling it here is what leaves that a change to
-                    // one service function rather than a second silent gap to
-                    // rediscover.
+                    // This arm only runs when the frame carries a payload, which
+                    // is why TRA-9979 was a change to the server and not to this
+                    // module. Until it, `attach_to_issue` in
+                    // `crates/trakkt-auth/src/attachment_service.rs` recorded the
+                    // link with `None`, so this arm was unreachable for a link
+                    // made against a file that already existed — the live paths
+                    // were the `Delete` arm below (an unlink) and the attachment
+                    // insert an upload emits alongside its link. It now sends the
+                    // junction row, exactly as `add_project_member` in
+                    // `project_service.rs` already did for the membership its own
+                    // arm depends on.
+                    //
+                    // `entity_data` is deliberately not read here, for the same
+                    // reason as the milestone and member arms: the counter is
+                    // what the reader subscribes to, and the payload's job is to
+                    // get execution past the guard above at all.
                     store.bump_attachments_version();
                 }
                 et if et == entity_types::NOTIFICATION_PREFERENCES => {
@@ -1822,8 +1826,9 @@ mod tests {
     /// `match`, so a persisted type with no arm had its row written and removed
     /// by nothing — `attachment`, `issue_relation`, `notification_preferences`
     /// and `workspace_settings` were all in that state, and `issue_attachment`
-    /// would have joined them the moment TRA-9979 gave it a payload. A reset was
-    /// the only thing that ever cleared them.
+    /// would have joined them when TRA-9979 gave it a payload had TRA-9966 not
+    /// put it on `NOT_CACHED` first. A reset was the only thing that ever
+    /// cleared them.
     #[test]
     fn a_delete_removes_every_row_the_write_path_persists() {
         for entity_type in entity_types::ALL {
@@ -2121,18 +2126,23 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     fn a_link_frame_without_a_payload_still_reaches_nothing() {
-        // Not a gap in this module: the data-less guard is deliberate, and it is
-        // what stops a payload-less frame from burning a sync id and advancing
-        // every client's watermark past a change it never delivered.
+        // Kept, and kept asserting the same thing, after TRA-9979 sent the
+        // payload from the server. What changed is the server, not this guard:
+        // the guard is deliberate — it is what stops a payload-less frame from
+        // burning a sync id and advancing every client's watermark past a change
+        // it never delivered — and it is precisely why the payload is
+        // load-bearing rather than decorative. Weakening it to "a link frame now
+        // reaches the counter" would only restate
+        // `linking_an_attachment_to_an_issue_refetches_the_list` above, and would
+        // delete the one assertion that says what a `None` payload costs.
         //
-        // It does mean `attach_to_issue` in `crates/trakkt-auth/src/attachment_service.rs`
-        // has a live gap of its own: it records the link with `None`, so the
-        // link half of the arm above cannot run for a link made through the API
-        // or an agent. Uploads are unaffected — they emit an `attachment` insert
-        // with a payload alongside — and an unlink needs no payload. Sending the
-        // junction row here is the server's half, exactly as `add_project_member`
-        // already does. That is tracked as TRA-9979; this test is what makes the
-        // gap visible rather than silent until it lands.
+        // What this test cannot do is catch the server regressing to `None`
+        // again — nothing on this side of the wire can. That half is
+        // `issue_attach_frame_carries_the_new_link` and
+        // `delta_carries_the_junction_row_for_a_link_to_an_existing_attachment`
+        // in `crates/trakkt-auth/src/sync_log_service.rs`, which assert the live
+        // frame and the persisted entry respectively. The pair is the invariant;
+        // this is the half that says why it matters.
         let observed = observe(&action_with_id(
             entity_types::ISSUE_ATTACHMENT,
             "issue-1:att-1",

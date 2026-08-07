@@ -584,6 +584,26 @@ pub struct Attachment {
     pub created_at: String,
 }
 
+/// The link between one issue and one attachment — a row of the
+/// `issue_attachments` junction table.
+///
+/// Distinct from [`Attachment`], which is the file itself. An upload creates an
+/// attachment and links it in one request, so both frames go out together; but a
+/// link can also be made against a file that already exists, and that change is
+/// this row and nothing else. Without a type of its own there is no value
+/// `attachment_service::attach_to_issue` could put on the wire, and
+/// `cache/apply.rs` drops an insert frame that carries no payload before it
+/// reaches any entity arm — so the link would reach no other client at all.
+///
+/// The junction has a composite primary key and no surrogate id; the sync entity
+/// id is `issue_id:attachment_id`, assembled by the service.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueAttachment {
+    pub issue_id: String,
+    pub attachment_id: String,
+    pub created_at: String,
+}
+
 /// User-submitted feedback (bug report, feature request, or question).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Feedback {
