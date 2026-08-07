@@ -24,49 +24,41 @@ use crate::components::team_icon::{
 /// the user clicks a colour swatch, an icon, or "Remove icon". The caller
 /// is responsible for persisting the change via `update_team_icon` /
 /// `clear_team_icon`.
+///
+/// # Why the selection lives at the caller
+///
+/// `selected_name` and `selected_color` are what the picker paints from, and
+/// they move the moment the user clicks — before the server has been asked. So
+/// they are the values a rejected save has to put back, and the caller is the
+/// only place that can: this component renders inside a `<Popover>`, whose
+/// children are behind a `<Show>` and are therefore built afresh on every open
+/// and disposed on every close. State owned here is disposed with them, so a
+/// save still on the wire when the popover closes would come back to nothing
+/// to revert. `ToggleState` in `pages/settings/notifications.rs` records the
+/// same rule for the same reason.
+///
+/// The consequence for everything below: no closure in this component's view
+/// may read an arena item created *by* this component — no `Memo`, no
+/// `Signal::derive`, no `StoredValue` — over the selection. A disposed render
+/// effect stays subscribed to the caller's signals and is still woken when the
+/// revert writes to them; if it then reads a wrapper that went with the popover
+/// it panics on a disposed reactive value, which is exactly the fault #282
+/// shipped. Read `selected_name` / `selected_color` directly and clone plain
+/// values into the closure instead.
 #[component]
 pub fn TeamIconPicker(
     /// The team being edited. Used to show the current icon state.
     team: Team,
+    /// The preset icon name the picker is showing, optimistically. Must be
+    /// created by the caller, above the popover — see the note above.
+    selected_name: RwSignal<Option<String>>,
+    /// The preset colour the picker is showing, optimistically. Same ownership
+    /// rule as `selected_name`.
+    selected_color: RwSignal<Option<String>>,
     /// Callback fired on every selection change.
     /// Arguments: `(Option<icon_type>, Option<icon_name>, Option<icon_color>)`.
     on_change: Callback<(Option<String>, Option<String>, Option<String>)>,
 ) -> impl IntoView {
-    // Local signals for optimistic preview. Seeded from the team's current
-    // icon state so the preview reflects changes immediately.
-    let initial_name = team.icon_name.clone();
-    let initial_color = team.icon_color.clone();
-    let has_preset = team.icon_type.as_deref() == Some("preset");
-
-    let (selected_name, set_selected_name) = signal(
-        if has_preset { initial_name } else { None },
-    );
-    let (selected_color, set_selected_color) = signal(
-        if has_preset { initial_color } else { None },
-    );
-
-    // Build a derived Team for the preview that reflects local edits.
-    let team_for_preview = team.clone();
-    let preview_team = Memo::new(move |_| {
-        let mut t = team_for_preview.clone();
-        let name = selected_name.get();
-        let color = selected_color.get();
-        if name.is_some() || color.is_some() {
-            t.icon_type = Some("preset".to_string());
-            t.icon_name = Some(
-                name.unwrap_or_else(|| DEFAULT_ICON_NAME.to_string()),
-            );
-            t.icon_color = Some(
-                color.unwrap_or_else(|| DEFAULT_ICON_COLOR.to_string()),
-            );
-        } else {
-            t.icon_type = None;
-            t.icon_name = None;
-            t.icon_color = None;
-        }
-        t
-    });
-
     // ── Handlers ──────────────────────────────────────────────────────────
 
     let on_color_click = move |color: &'static str| {
@@ -74,8 +66,8 @@ pub fn TeamIconPicker(
         // Default to "rocket" if no icon chosen yet.
         let name = selected_name.get_untracked()
             .or_else(|| Some(DEFAULT_ICON_NAME.to_string()));
-        set_selected_color.set(new_color.clone());
-        set_selected_name.set(name.clone());
+        selected_color.set(new_color.clone());
+        selected_name.set(name.clone());
         on_change.run((
             Some("preset".to_string()),
             name,
@@ -88,8 +80,8 @@ pub fn TeamIconPicker(
         // Default to blue if no colour chosen yet.
         let color = selected_color.get_untracked()
             .or_else(|| Some(DEFAULT_ICON_COLOR.to_string()));
-        set_selected_name.set(new_name.clone());
-        set_selected_color.set(color.clone());
+        selected_name.set(new_name.clone());
+        selected_color.set(color.clone());
         on_change.run((
             Some("preset".to_string()),
             new_name,
@@ -98,8 +90,8 @@ pub fn TeamIconPicker(
     };
 
     let on_clear = move |_| {
-        set_selected_name.set(None);
-        set_selected_color.set(None);
+        selected_name.set(None);
+        selected_color.set(None);
         on_change.run((None, None, None));
     };
 
@@ -130,18 +122,16 @@ pub fn TeamIconPicker(
 
         let team_id = team_id_for_upload.clone();
         let set_upload_error = set_upload_error;
-        let set_selected_name = set_selected_name;
-        let set_selected_color = set_selected_color;
 
         leptos::task::spawn_local(async move {
             let result = upload_team_icon_file(&team_id, &file).await;
             match result {
                 Ok(()) => {
-                    // Clear local preset state — the Axum handler already
+                    // Clear the preset selection — the Axum handler already
                     // persisted the upload, so do NOT call on_change here
                     // (that would trigger update_team_icon which wipes icon_data).
-                    set_selected_name.set(None);
-                    set_selected_color.set(None);
+                    selected_name.set(None);
+                    selected_color.set(None);
                 }
                 Err(msg) => {
                     set_upload_error.set(Some(msg));
@@ -157,12 +147,36 @@ pub fn TeamIconPicker(
 
     view! {
         <div class="flex flex-col gap-4 max-h-[400px] overflow-y-auto">
-            // Preview
+            // Preview — the team with the current selection applied.
+            //
+            // Composed inline from a cloned `Team` rather than through a `Memo`
+            // so that this render effect reads nothing this component owns:
+            // once the popover closes it is disposed but still subscribed to
+            // the caller's signals, and a revert arriving then would wake it
+            // into a disposed `Memo`. See this component's docs.
             <div class="flex items-center justify-center py-2">
-                {move || {
-                    let t = preview_team.get();
-                    view! { <TeamIcon team=t size="48px"/> }
-                }}
+                {
+                    let base = team.clone();
+                    move || {
+                        let mut t = base.clone();
+                        let name = selected_name.get();
+                        let color = selected_color.get();
+                        if name.is_some() || color.is_some() {
+                            t.icon_type = Some("preset".to_string());
+                            t.icon_name = Some(
+                                name.unwrap_or_else(|| DEFAULT_ICON_NAME.to_string()),
+                            );
+                            t.icon_color = Some(
+                                color.unwrap_or_else(|| DEFAULT_ICON_COLOR.to_string()),
+                            );
+                        } else {
+                            t.icon_type = None;
+                            t.icon_name = None;
+                            t.icon_color = None;
+                        }
+                        view! { <TeamIcon team=t size="48px"/> }
+                    }
+                }
             </div>
 
             // Colour palette
@@ -170,18 +184,12 @@ pub fn TeamIconPicker(
                 <span class="text-xs text-muted-foreground font-medium">"Color"</span>
                 <div class="grid grid-cols-8 gap-1.5">
                     {ICON_COLORS.iter().map(|&color| {
-                        let is_selected = {
-                            let color = color.to_string();
-                            Signal::derive(move || {
-                                selected_color.get().as_deref() == Some(color.as_str())
-                            })
-                        };
                         view! {
                             <button
                                 type="button"
                                 class=move || {
                                     let base = "w-7 h-7 rounded-md transition-all duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
-                                    if is_selected.get() {
+                                    if selected_color.get().as_deref() == Some(color) {
                                         format!("{base} ring-2 ring-foreground ring-offset-2 ring-offset-background")
                                     } else {
                                         format!("{base} hover:scale-110")
@@ -208,18 +216,12 @@ pub fn TeamIconPicker(
                             <div class="flex flex-wrap gap-1">
                                 {icons.iter().map(|&name| {
                                     let icon_data = get_icon(name);
-                                    let is_selected = {
-                                        let name = name.to_string();
-                                        Signal::derive(move || {
-                                            selected_name.get().as_deref() == Some(name.as_str())
-                                        })
-                                    };
                                     view! {
                                         <button
                                             type="button"
                                             class=move || {
                                                 let base = "w-8 h-8 rounded-md flex items-center justify-center transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
-                                                if is_selected.get() {
+                                                if selected_name.get().as_deref() == Some(name) {
                                                     format!("{base} bg-accent text-accent-foreground")
                                                 } else {
                                                     format!("{base} text-muted-foreground hover:bg-muted hover:text-foreground")

@@ -518,18 +518,21 @@ fn PreferenceToggle(row: ToggleRow) -> impl IntoView {
 /// still on the wire when the row rebuilt" is an ordering, and a timer makes it
 /// a race the test can lose without noticing — which is the shape of failure
 /// this ticket exists to stop repeating.
+///
+/// [`Gate`], [`SaveLog`] and [`LocalFuture`] are the parts of that with nothing
+/// preference-shaped about them, and they live in
+/// [`crate::wasm_test_support`] so the team icon picker's tests drive their
+/// save through the same latch rather than a second copy of it. What stays here
+/// is only what knows about `NotificationPreferences`.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod save_fixture {
-    use std::cell::{Cell, RefCell};
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::rc::Rc;
     use std::sync::Arc;
-    use std::task::{Context, Poll, Waker};
 
     use leptos::prelude::*;
     use send_wrapper::SendWrapper;
     use trakkt_types::models::NotificationPreferences;
+
+    pub use crate::wasm_test_support::{Gate, LocalFuture, SaveLog};
 
     /// What one fixture save resolves to — the shipped `Action`'s output type,
     /// unchanged.
@@ -539,103 +542,6 @@ mod save_fixture {
     /// plain prop instead of being generic over the future's type.
     pub type FixtureSave = Arc<dyn Fn(bool) -> LocalFuture<SaveResult> + Send + Sync>;
 
-    /// A `!Send` future made nominally `Send` so it can be an `Action`'s body.
-    ///
-    /// `Action::new` requires `Future: Send`, and the fixture bodies capture
-    /// `Rc` counters and a [`Gate`]. WASM is single-threaded, so nothing ever
-    /// polls this from another thread — the same reasoning
-    /// `live_update::latency_tests::SendTimer` records. `send_wrapper` has its
-    /// own `Future` impl but it sits behind a `futures` feature this crate does
-    /// not enable, so the impl is written out here.
-    pub struct LocalFuture<O>(SendWrapper<Pin<Box<dyn Future<Output = O>>>>);
-
-    impl<O> LocalFuture<O> {
-        fn new(fut: impl Future<Output = O> + 'static) -> Self {
-            Self(SendWrapper::new(Box::pin(fut)))
-        }
-    }
-
-    impl<O> Future for LocalFuture<O> {
-        type Output = O;
-
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O> {
-            self.get_mut().0.as_mut().poll(cx)
-        }
-    }
-
-    #[derive(Default)]
-    struct GateInner {
-        open: bool,
-        waker: Option<Waker>,
-    }
-
-    /// A latch the test opens by hand: the save cannot resolve until it does.
-    #[derive(Clone, Default)]
-    pub struct Gate {
-        inner: Rc<RefCell<GateInner>>,
-    }
-
-    impl Gate {
-        /// Let every save waiting on this gate resolve.
-        pub fn open(&self) {
-            let waker = {
-                let mut inner = self.inner.borrow_mut();
-                inner.open = true;
-                inner.waker.take()
-            };
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
-
-        fn wait(&self) -> GateWait {
-            GateWait {
-                gate: self.clone(),
-            }
-        }
-    }
-
-    struct GateWait {
-        gate: Gate,
-    }
-
-    impl Future for GateWait {
-        type Output = ();
-
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            let mut inner = self.get_mut().gate.inner.borrow_mut();
-            if inner.open {
-                Poll::Ready(())
-            } else {
-                inner.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
-    }
-
-    /// How far each dispatched save got.
-    ///
-    /// Held in `Rc<Cell<_>>` rather than in signals so that the instrument is
-    /// not itself an arena item — a probe about disposal must not be measured
-    /// with something disposal can reach.
-    #[derive(Clone, Default)]
-    pub struct SaveLog {
-        started: Rc<Cell<u32>>,
-        finished: Rc<Cell<u32>>,
-    }
-
-    impl SaveLog {
-        /// How many dispatched saves have begun running.
-        pub fn started(&self) -> u32 {
-            self.started.get()
-        }
-
-        /// How many have run to completion.
-        pub fn finished(&self) -> u32 {
-            self.finished.get()
-        }
-    }
-
     /// A save that records itself, waits for `gate`, and then either succeeds
     /// or fails.
     pub fn gated_save(gate: Gate, log: SaveLog, succeeds: bool) -> FixtureSave {
@@ -643,9 +549,9 @@ mod save_fixture {
         Arc::new(move |value: bool| {
             let (gate, log) = (*shared).clone();
             LocalFuture::new(async move {
-                log.started.set(log.started.get() + 1);
+                log.record_start();
                 gate.wait().await;
-                log.finished.set(log.finished.get() + 1);
+                log.record_finish();
                 if succeeds {
                     Ok(saved_preferences(value))
                 } else {
