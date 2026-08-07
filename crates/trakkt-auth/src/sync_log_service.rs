@@ -337,6 +337,14 @@ pub async fn write_sync_entry_in_tx(
 /// after the row is written. The audience is therefore derived here, at read
 /// time, from `team_members` as it stands when the delta is served.
 ///
+/// The live frame is derived the same way, from the same table, by
+/// [`SyncAudience::Team`]'s delivery arm —
+/// `WebSocketManager::broadcast_raw_to_team_members` (TRA-10039). The two
+/// recipient sets are meant to be identical, so this predicate and that query
+/// are a pair: narrowing one without the other means either a non-member holds
+/// a private team until they reconnect, or a member never sees a rename until
+/// they do.
+///
 /// It applies only to rows that would **add or refresh** a team, never to rows
 /// that remove one, and that asymmetry is the whole of the design:
 ///
@@ -586,6 +594,37 @@ pub async fn send_sync_action_to_user(
     ws_manager.send_to_user_raw(user_id, &json).await;
 }
 
+/// Send a `SyncResponse::SyncAction` with the full entity data to the current
+/// members of one team only.
+///
+/// The live-broadcast counterpart of a sync entry written with
+/// [`SyncAudience::Team`]. `ENTRIES_SINCE_SQL` hands a TEAM insert or update
+/// only to the users `team_members` lists for that team, so the live frame must
+/// reach exactly that set: wider is TRA-10039's disclosure, narrower is a member
+/// who sees a rename only after reconnecting.
+///
+/// `sync_id` follows the same contract as [`broadcast_sync_action`]: the id
+/// returned by the matching [`write_sync_entry`], or `0` when that write failed.
+///
+/// Best-effort: failures are logged but never propagated.
+pub async fn send_sync_action_to_team_members(
+    ws_manager: &WebSocketManager,
+    team_id: &str,
+    workspace_id: &str,
+    entity_type: &str,
+    entity_id: &str,
+    action: SyncActionType,
+    data: Option<serde_json::Value>,
+    sync_id: i64,
+) {
+    let Some(json) = sync_action_frame(workspace_id, entity_type, entity_id, action, data, sync_id)
+    else {
+        return;
+    };
+
+    ws_manager.broadcast_raw_to_team_members(team_id, &json).await;
+}
+
 /// Serialize one `SyncResponse::SyncAction` frame.
 ///
 /// Returns `None` when the payload cannot be serialized — an unsendable frame
@@ -691,8 +730,8 @@ pub(crate) fn sync_payload<T: serde::Serialize>(
 /// # async fn demo(tx: &mut trakkt_core::db::DbTx) -> trakkt_core::Result<i64> {
 /// write_sync_entry_in_tx(
 ///     tx,
-///     "team",
-///     "team_1",
+///     "issue",
+///     "iss_1",
 ///     "ws_1",
 ///     None, // error[E0308]: expected `SyncAudience<'_>`, found `Option<_>`
 ///     SyncActionType::Update,
@@ -713,8 +752,8 @@ pub(crate) fn sync_payload<T: serde::Serialize>(
 /// # async fn demo(tx: &mut trakkt_core::db::DbTx) -> trakkt_core::Result<i64> {
 /// write_sync_entry_in_tx(
 ///     tx,
-///     "team",
-///     "team_1",
+///     "issue",
+///     "iss_1",
 ///     "ws_1",
 ///     SyncAudience::Workspace,
 ///     SyncActionType::Update,
@@ -724,39 +763,52 @@ pub(crate) fn sync_payload<T: serde::Serialize>(
 /// # }
 /// ```
 ///
-/// # What this type does not cover: TEAM
+/// # How TEAM is covered: the `Team` variant, and why `Delete` is not it
 ///
 /// A team's audience is "its N current members", which no single
 /// `visibility_user_id` value can name and no value written at mutation time
 /// could keep correct as membership changes. TRA-10013 therefore derives it at
-/// **read** time, in `ENTRIES_SINCE_SQL`'s `team_members` predicate, and every
-/// TEAM writer passes [`SyncAudience::Workspace`] here. That is correct at the
-/// writer and narrowed again at the reader, but it makes `Workspace` on a TEAM
-/// write only half a statement about who ends up holding the team:
-/// workspace-visible as persisted, membership-scoped as read.
+/// **read** time, in `ENTRIES_SINCE_SQL`'s `team_members` predicate.
 ///
-/// It says nothing at all about the live frame, and that half is currently
-/// wider. `broadcast_sync_action` resolves its recipients from
-/// `workspace_users`, so the TEAM `Insert` `team_service::create_team` sends and
-/// the TEAM `Update` `team_service::commit_team_update` sends both carry the
-/// team's name, icon and settings to every connected workspace member, and
-/// `apply_action_to_memory`'s TEAM arm (`crates/trakkt-ui/src/cache/apply.rs`)
-/// calls `upsert_team` on whatever arrives. TRA-10013 closed the delta path only.
-/// The three membership mutations are not affected — they take no
-/// `WebSocketManager` and write no live frame — and `delete_team`'s TEAM frame
-/// carries a `None` payload.
+/// That closed the delta path and only the delta path. Until TRA-10039 every
+/// TEAM insert and update passed [`SyncAudience::Workspace`] — the one
+/// exception being the eviction `Delete` in
+/// `team_service::write_membership_sync_entry`, which was already
+/// [`SyncAudience::User`]. `Workspace` on a TEAM write was half a statement:
+/// workspace-visible as persisted, membership-scoped as read — and, on the
+/// live frame, workspace-wide again, because `broadcast_sync_action` resolves
+/// its recipients from `workspace_users`. A connected non-member received a
+/// private team's name, icon and settings the moment it was created or renamed,
+/// and `apply_action_to_memory`'s TEAM arm
+/// (`crates/trakkt-ui/src/cache/apply.rs`) cached whatever arrived.
 ///
-/// There is deliberately no `Team` variant *yet*, and the reason is that today
-/// it could not carry that second half either. Its persisted arm is already
-/// forced: NULL, exactly as `Workspace` writes, because the audience does not
-/// fit in the column. Its delivery arm is the only place it could earn its keep
-/// — by resolving `team_members` and sending to those users — and that is a
-/// change to who receives live frames, with its own blast radius and its own
-/// tests, not something a new variant carries in passing. Added today with the
-/// two arms it can have today, it would be byte-identical to `Workspace`: a
-/// distinction the type system could hold nobody to, reading as enforcement
-/// while enforcing nothing. So the gap is named here rather than papered over,
-/// and `ENTRIES_SINCE_SQL` is where the only narrowing that exists today lives.
+/// [`SyncAudience::Team`] is that missing half. Its persisted arm is forced —
+/// NULL, exactly as `Workspace` writes, because the audience does not fit in
+/// the column — so all of its value is in its delivery arm, which resolves
+/// `team_members` and sends only to those users. TRA-10016 declined to add it
+/// while that delivery arm was out of scope, on the grounds that a variant
+/// byte-identical to `Workspace` reads as enforcement while enforcing nothing.
+/// With the delivery arm it is the enforcement: the same value drives the
+/// column and the send, so a TEAM insert or update cannot be persisted
+/// membership-scoped and pushed workspace-wide.
+///
+/// A TEAM `Delete` is **not** a `Team` audience and must never be given one.
+/// `ENTRIES_SINCE_SQL` exempts `action = 'delete'` from its membership
+/// predicate because `team_members` declares `ON DELETE CASCADE` on
+/// `teams(team_id)`: by the time a delete row is read back, every membership
+/// that would authorise it is gone. `team_service::delete_team`'s audience
+/// genuinely *is* the workspace and [`SyncAudience::Workspace`] says so
+/// truthfully. Both TEAM `Delete` writers pass a `None` payload — that one and
+/// the eviction row, which stays [`SyncAudience::User`] because it addresses a
+/// user who has just stopped being a member — so nothing about the team is
+/// disclosed by letting either through. Narrowing `delete_team` to `Team` would
+/// resolve the membership set the cascade has already emptied, delivering to
+/// nobody and leaving a deleted team in every remaining member's cache with
+/// nothing able to remove it —
+/// `deleting_a_team_reaches_a_non_member_live` (`apps/server/tests/sync_ws.rs`)
+/// covers the live half of that and
+/// [`tests::deleting_a_team_still_evicts_it_from_every_members_cache`] the
+/// delta half.
 #[derive(Clone, Copy, Debug)]
 pub enum SyncAudience<'a> {
     /// Visible to every member of the workspace: `visibility_user_id` is NULL
@@ -770,13 +822,31 @@ pub enum SyncAudience<'a> {
     /// Downgrading one of these to [`SyncAudience::Workspace`] republishes one
     /// member's private rows to the whole workspace.
     User(&'a str),
+    /// Visible to the current members of one team, named by its `team_id`:
+    /// `visibility_user_id` is NULL and the live frame goes only to the users
+    /// `team_members` lists for that team at delivery time.
+    ///
+    /// The NULL is not a downgrade to [`SyncAudience::Workspace`]. The column
+    /// holds one user and the audience is a set, so the row has to be persisted
+    /// unscoped and narrowed by `ENTRIES_SINCE_SQL`'s `team_members` predicate
+    /// when it is read; this variant is what makes the live frame reach that
+    /// same set instead of the whole workspace.
+    ///
+    /// For TEAM inserts and updates only — see this type's docs for why a TEAM
+    /// `Delete` is [`SyncAudience::Workspace`] and has to stay that way.
+    Team(&'a str),
 }
 
 impl<'a> SyncAudience<'a> {
     /// The `visibility_user_id` column value for this audience.
+    ///
+    /// `Team` writes NULL for the reason its own docs give: the column names
+    /// one user and a team is a set. It is not interchangeable with `Workspace`
+    /// — they differ in `SyncBatch::commit_and_deliver`'s delivery arm, which is
+    /// where the whole distinction lives.
     fn visibility_user_id(self) -> Option<&'a str> {
         match self {
-            Self::Workspace => None,
+            Self::Workspace | Self::Team(_) => None,
             Self::User(user_id) => Some(user_id),
         }
     }
@@ -814,7 +884,11 @@ impl<'a> SyncAudience<'a> {
 /// hard-codes the TEAM entity type and the `Update` action, and returns the row
 /// it read to its caller. Generalising it into this signature would take a
 /// read-back callback and a second return type to serve one module — a worse
-/// abstraction, not a shared one. Leave it where it is.
+/// abstraction, not a shared one. So it stays where it is — but since TRA-10039
+/// it *delegates* its tail to this function rather than duplicating it, which is
+/// the part that was worth sharing: the commit-then-deliver ordering and the one
+/// [`SyncAudience`] driving both halves. What is left in `team_service` is only
+/// the read-back and the return.
 pub(crate) async fn commit_and_deliver(
     mut tx: DbTx,
     entity_type: &str,
@@ -971,6 +1045,19 @@ impl<'a> SyncBatch<'a> {
                     send_sync_action_to_user(
                         ws,
                         user_id,
+                        &entry.workspace_id,
+                        &entry.entity_type,
+                        &entry.entity_id,
+                        entry.action,
+                        entry.payload,
+                        entry.sync_id,
+                    )
+                    .await;
+                }
+                SyncAudience::Team(team_id) => {
+                    send_sync_action_to_team_members(
+                        ws,
+                        team_id,
                         &entry.workspace_id,
                         &entry.entity_type,
                         &entry.entity_id,

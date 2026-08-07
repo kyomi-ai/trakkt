@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use trakkt_auth::websocket::manager::{CatchUpFlag, WebSocketManager, WsSender};
+use trakkt_core::test_helpers::channel::recv_soon;
 use trakkt_core::test_helpers::{seed_team, seed_user, seed_workspace, test_pool};
 use trakkt_core::DbPool;
 use trakkt_server::routes::websocket::{handle_sync_bootstrap, handle_sync_delta};
@@ -34,6 +35,13 @@ use trakkt_types::sync::{entity_types, SyncActionType, SyncResponse};
 const USER: &str = "usr_sync";
 const WORKSPACE: &str = "ws_sync";
 const TEAM: &str = "team_sync";
+
+/// A second workspace member who is never put in any team.
+///
+/// Used only by the TEAM live-frame tests below, where the whole property under
+/// test is what a full member of the workspace who is *not* in a team does and
+/// does not receive.
+const OUTSIDER: &str = "usr_workspace_only";
 
 /// Outbound capacity for the hand-built channels used where backpressure is the
 /// point of the test. Connections that come from the manager keep the manager's
@@ -269,12 +277,23 @@ fn watermarks(frames: &[SyncResponse]) -> Vec<i64> {
 
 /// Spawn `handle_sync_delta` against `conn`'s sender.
 fn spawn_delta(db: &DbPool, conn: &TestConnection, last_sync_id: i64) -> JoinHandle<()> {
+    spawn_delta_for(db, conn, USER, last_sync_id)
+}
+
+/// Spawn `handle_sync_delta` for a named user, which is only interesting where
+/// two users' deltas of the same workspace are meant to differ.
+fn spawn_delta_for(
+    db: &DbPool,
+    conn: &TestConnection,
+    user_id: &'static str,
+    last_sync_id: i64,
+) -> JoinHandle<()> {
     let tx = conn.tx.clone();
     let flag = Arc::clone(&conn.catching_up);
     let db = db.clone();
-    tokio::spawn(
-        async move { handle_sync_delta(&tx, &flag, &db, USER, WORKSPACE, last_sync_id).await },
-    )
+    tokio::spawn(async move {
+        handle_sync_delta(&tx, &flag, &db, user_id, WORKSPACE, last_sync_id).await
+    })
 }
 
 /// The entity types carried by the `SyncAction` frames in `frames`.
@@ -717,5 +736,515 @@ async fn unparseable_workspace_settings_end_the_bootstrap_without_a_watermark() 
         watermarks(&frames).is_empty(),
         "a bootstrap that could not read the workspace's settings must not hand \
          out a watermark, got {frames:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (h) A team's live frame reaches its members and nobody else (TRA-10039)
+// ---------------------------------------------------------------------------
+//
+// TRA-10013 gave `sync_log_service::ENTRIES_SINCE_SQL` a `team_members`
+// predicate, so a TEAM insert or update replays only to that team's current
+// members. The live frame was left behind: `create_team` and
+// `commit_team_update` hand-rolled a broadcast that resolved recipients from
+// `workspace_users`, so a connected non-member was handed a private team's
+// name, key, icon and settings the moment it was created or renamed.
+//
+// The fix is `SyncAudience::Team`, whose delivery arm resolves `team_members` —
+// the same table, the same set. These tests exercise that through the real
+// `WebSocketManager` and the real services; nothing here is a mock, and the
+// frames are read off the same channels a socket task would own.
+
+/// A workspace with two members and no teams.
+///
+/// `USER` creates the teams below and is therefore their only member;
+/// `OUTSIDER` is a full `workspace_users` row — the recipient set the old
+/// broadcast resolved — and is never added to any team.
+///
+/// `seeded_workspace` is the wrong fixture here: it seeds a team `USER` is
+/// already in, and every property below is about a team that has exactly one
+/// member and one non-member. The teams are created by `create_team` itself,
+/// which is one of the two writers on trial.
+async fn workspace_with_an_outsider() -> DbPool {
+    let db = test_pool().await.expect("migrated in-memory pool");
+
+    seed_user(&db, USER, "sync@example.test")
+        .await
+        .expect("seed the user who will own the teams");
+    seed_user(&db, OUTSIDER, "outsider@example.test")
+        .await
+        .expect("seed the workspace member who joins no team");
+    seed_workspace(&db, WORKSPACE, USER)
+        .await
+        .expect("seed workspace");
+    trakkt_auth::workspace_service::create_workspace_user(&db, WORKSPACE, OUTSIDER, "member")
+        .await
+        .expect("enrol the outsider in the workspace");
+
+    db
+}
+
+/// Create a team through the real service, with `USER` as its sole member and
+/// the manager wired up so the live frame is actually delivered.
+async fn create_team_owned_by_user(
+    db: &DbPool,
+    manager: &WebSocketManager,
+    name: &str,
+    key: &str,
+) -> String {
+    trakkt_auth::team_service::create_team(
+        db,
+        &trakkt_auth::team_service::CreateTeamParams {
+            workspace_id: WORKSPACE,
+            name,
+            key,
+            description: None,
+            icon: None,
+            creator_id: Some(USER),
+        },
+        Some(manager),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("create the team {name} that only USER belongs to: {e}"))
+    .team_id
+}
+
+/// Everything already queued on `conn`, with a probe proving the queue was read
+/// to its end on a connection that was genuinely reachable.
+///
+/// This is what stops the negative assertions below from passing vacuously.
+/// "No frame arrived" is equally true of a connection that was never
+/// registered, was torn down, or sits behind a delivery path that is broken for
+/// everyone — and a test that only ever asserts an absence cannot tell those
+/// apart from the fix working. The probe travels the same
+/// `WebSocketManager::deliver` path the frames under test travel, so reading it
+/// back rules all of them out, and it is read *after* whatever else is queued,
+/// so nothing can still be in flight behind it.
+///
+/// Every read is `recv_soon`, so a probe that never arrives fails this test
+/// naming the connection instead of hanging the suite.
+async fn drain_live_frames(
+    manager: &WebSocketManager,
+    user_id: &str,
+    conn: &mut TestConnection,
+    probe: &str,
+) -> Vec<SyncResponse> {
+    manager.send_to_user_raw(user_id, probe).await;
+
+    let waiting_for = format!("the {probe:?} probe closing {user_id}'s live queue");
+    let mut frames = Vec::new();
+    loop {
+        let frame = recv_soon(&mut conn.rx, &waiting_for).await;
+        if frame == probe {
+            return frames;
+        }
+        frames.push(parse_frame(&frame));
+    }
+}
+
+/// One TEAM frame, reduced to everything the live path and the delta path have
+/// to agree on.
+///
+/// The `sync_id` is included deliberately: it ties a live frame to the exact
+/// `sync_log` row that replays it, so this is an assertion about one row
+/// reaching one user two ways, not about two similar-looking frames. The
+/// timestamp is excluded because it legitimately differs — the live frame
+/// stamps `Utc::now()`, the replay carries the row's `created_at`.
+type TeamFrame = (i64, String, SyncActionType, Option<serde_json::Value>);
+
+/// The TEAM frames in `frames`, in arrival order.
+fn team_frames(frames: &[SyncResponse]) -> Vec<TeamFrame> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            SyncResponse::SyncAction(action) if action.entity_type == entity_types::TEAM => Some((
+                action.sync_id,
+                action.entity_id.clone(),
+                action.action.clone(),
+                action.data.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `(entity_id, action, carries a payload)` shape of `frames`, which is
+/// what a failure message can be read at a glance.
+fn team_frame_shapes(frames: &[TeamFrame]) -> Vec<(&str, SyncActionType, bool)> {
+    frames
+        .iter()
+        .map(|(_, entity_id, action, data)| (entity_id.as_str(), action.clone(), data.is_some()))
+        .collect()
+}
+
+/// The team name carried by a TEAM frame's payload, or `None` where it carries
+/// no payload.
+fn team_name(frame: &TeamFrame) -> Option<&str> {
+    frame.3.as_ref()?.get("name")?.as_str()
+}
+
+/// A team a private team's name must never appear in the frames of.
+const PRIVATE_NAME: &str = "Members Only";
+
+/// The reported bug, on create. A connected workspace member who is not in the
+/// team must not be handed its name, key, icon or settings.
+///
+/// The member's half is asserted in the same test, against the same call, so
+/// neither half can be satisfied by a broadcast that simply stopped working:
+/// one frame set has to be empty while the other is not.
+#[tokio::test]
+async fn creating_a_team_delivers_its_live_frame_to_members_only() {
+    let db = workspace_with_an_outsider().await;
+    let manager = WebSocketManager::new(None, db.clone());
+    let mut member = register_connections(&manager, USER, 1);
+    let mut outsider = register_connections(&manager, OUTSIDER, 1);
+
+    let team_id = create_team_owned_by_user(&db, &manager, PRIVATE_NAME, "MON").await;
+
+    let member_frames =
+        drain_live_frames(&manager, USER, &mut member[0], "probe-member-after-create").await;
+    let outsider_frames = drain_live_frames(
+        &manager,
+        OUTSIDER,
+        &mut outsider[0],
+        "probe-outsider-after-create",
+    )
+    .await;
+
+    let delivered = team_frames(&member_frames);
+    assert_eq!(
+        team_frame_shapes(&delivered),
+        vec![
+            (team_id.as_str(), SyncActionType::Insert, true),
+            (team_id.as_str(), SyncActionType::Update, true),
+        ],
+        "the creator is the team's only member, so both entries create_team \
+         writes have to reach them live and carry the payload the client's \
+         upsert_team arm needs; got {member_frames:?}"
+    );
+    assert!(
+        delivered
+            .iter()
+            .all(|frame| team_name(frame) == Some(PRIVATE_NAME)),
+        "the frames the member did receive must carry the real team, or the \
+         assertion below is about a payload nobody was ever going to get; \
+         got {delivered:?}"
+    );
+
+    assert_eq!(
+        team_frames(&outsider_frames),
+        Vec::<TeamFrame>::new(),
+        "a workspace member who is not in the team must receive no TEAM frame \
+         for it; got {outsider_frames:?}"
+    );
+    assert!(
+        outsider_frames.is_empty(),
+        "create_team writes nothing but TEAM entries, so the outsider's queue \
+         should hold nothing at all; got {outsider_frames:?}"
+    );
+}
+
+/// The same disclosure on update. Every single-statement team mutation — rename,
+/// key change, icon set/upload/delete, `update_team_settings` — ends in
+/// `commit_team_update`, so pinning the rename pins all of them.
+#[tokio::test]
+async fn renaming_a_team_delivers_its_live_frame_to_members_only() {
+    let db = workspace_with_an_outsider().await;
+    let manager = WebSocketManager::new(None, db.clone());
+    let team_id = create_team_owned_by_user(&db, &manager, "Before", "MON").await;
+
+    let mut member = register_connections(&manager, USER, 1);
+    let mut outsider = register_connections(&manager, OUTSIDER, 1);
+
+    trakkt_auth::team_service::update_team(
+        &db,
+        &team_id,
+        WORKSPACE,
+        Some(PRIVATE_NAME.to_owned()),
+        None,
+        Some(&manager),
+    )
+    .await
+    .expect("rename the team the outsider is not a member of");
+
+    let member_frames =
+        drain_live_frames(&manager, USER, &mut member[0], "probe-member-after-rename").await;
+    let outsider_frames = drain_live_frames(
+        &manager,
+        OUTSIDER,
+        &mut outsider[0],
+        "probe-outsider-after-rename",
+    )
+    .await;
+
+    let delivered = team_frames(&member_frames);
+    assert_eq!(
+        team_frame_shapes(&delivered),
+        vec![(team_id.as_str(), SyncActionType::Update, true)],
+        "the member has to be told about the rename live; got {member_frames:?}"
+    );
+    assert_eq!(
+        delivered.first().and_then(team_name),
+        Some(PRIVATE_NAME),
+        "and the frame has to carry the new name — the thing the outsider must \
+         not be shown; got {delivered:?}"
+    );
+
+    assert_eq!(
+        team_frames(&outsider_frames),
+        Vec::<TeamFrame>::new(),
+        "a rename must not disclose the team to a non-member; got {outsider_frames:?}"
+    );
+    assert!(
+        outsider_frames.is_empty(),
+        "an update_team writes nothing but its TEAM entry; got {outsider_frames:?}"
+    );
+}
+
+/// The trap on the other side of the fix, and the one thing here that is easiest
+/// to break by "tidying up": a TEAM `Delete` deliberately reaches *everyone*.
+///
+/// `delete_team` writes its entry after the `DELETE FROM teams` it describes,
+/// and `team_members` declares `ON DELETE CASCADE` on `teams(team_id)` — so by
+/// delivery time there is no membership row left to resolve. Narrowing this
+/// broadcast to the team's members would deliver it to nobody and leave the
+/// deleted team in every remaining member's cache permanently.
+/// `ENTRIES_SINCE_SQL` exempts `action = 'delete'` from its membership
+/// predicate for the same reason, so the workspace-wide audience here is what
+/// keeps the two paths agreeing.
+///
+/// Reaching a non-member is safe because the frame carries a `None` payload:
+/// a UUID and nothing about the team. That is asserted rather than assumed.
+#[tokio::test]
+async fn deleting_a_team_reaches_a_non_member_live() {
+    let db = workspace_with_an_outsider().await;
+    let manager = WebSocketManager::new(None, db.clone());
+
+    // Two teams: a workspace's last team cannot be deleted.
+    let doomed = create_team_owned_by_user(&db, &manager, PRIVATE_NAME, "MON").await;
+    create_team_owned_by_user(&db, &manager, "Survivor", "SUR").await;
+
+    let mut member = register_connections(&manager, USER, 1);
+    let mut outsider = register_connections(&manager, OUTSIDER, 1);
+
+    trakkt_auth::team_service::delete_team(&db, &doomed, WORKSPACE, None, None, Some(&manager))
+        .await
+        .expect("delete the team");
+
+    let member_frames =
+        drain_live_frames(&manager, USER, &mut member[0], "probe-member-after-delete").await;
+    let outsider_frames = drain_live_frames(
+        &manager,
+        OUTSIDER,
+        &mut outsider[0],
+        "probe-outsider-after-delete",
+    )
+    .await;
+
+    let expected = vec![(doomed.as_str(), SyncActionType::Delete, false)];
+    assert_eq!(
+        team_frame_shapes(&team_frames(&member_frames)),
+        expected,
+        "the member holds the team, so the delete that evicts it has to reach \
+         them; got {member_frames:?}"
+    );
+    assert_eq!(
+        team_frame_shapes(&team_frames(&outsider_frames)),
+        expected,
+        "the delete has to reach a non-member too: the membership rows that \
+         would authorise it cascaded away with the team, so a member-scoped \
+         delivery would reach nobody and the team would never leave any cache; \
+         got {outsider_frames:?}"
+    );
+}
+
+/// The invariant the three tests above are instances of: for one team, over its
+/// whole life, the set of users a live frame reaches is the set of users whose
+/// delta replays that same `sync_log` row.
+///
+/// Compared by `sync_id` and payload, not by shape, so this is an assertion
+/// about one row reaching one user twice — a live frame that agreed only in
+/// action and entity id would not satisfy it. Both users are checked after
+/// every step, so a live path narrowed too far fails here just as loudly as one
+/// left too wide, and the delete's exemption is covered by the same comparison
+/// rather than by a rule written twice.
+///
+/// The delta half runs through `handle_sync_delta`, the production handler,
+/// from the watermark that handler last handed the client — so the cursor
+/// arithmetic is the client's, not the test's.
+#[tokio::test]
+async fn the_live_and_delta_team_audiences_agree_through_a_teams_whole_life() {
+    let db = workspace_with_an_outsider().await;
+    let manager = WebSocketManager::new(None, db.clone());
+    let mut member = register_connections(&manager, USER, 1);
+    let mut outsider = register_connections(&manager, OUTSIDER, 1);
+
+    // Both users start caught up on an empty log, which is what a client holds
+    // straight after a bootstrap of a workspace with nothing in it.
+    let mut member_cursor = 0i64;
+    let mut outsider_cursor = 0i64;
+
+    /// Drain what the live path delivered to both users, then replay the same
+    /// range through the delta handler, and assert each user's two sets match.
+    ///
+    /// Returns the number of rows the member saw, so the caller can refuse to
+    /// pass on a step that delivered nothing to anyone.
+    async fn assert_agree(
+        db: &DbPool,
+        manager: &WebSocketManager,
+        member: &mut TestConnection,
+        member_cursor: &mut i64,
+        outsider: &mut TestConnection,
+        outsider_cursor: &mut i64,
+        step: &str,
+    ) -> usize {
+        let member_live = team_frames(
+            &drain_live_frames(manager, USER, member, &format!("probe-member-{step}")).await,
+        );
+        let outsider_live = team_frames(
+            &drain_live_frames(
+                manager,
+                OUTSIDER,
+                outsider,
+                &format!("probe-outsider-{step}"),
+            )
+            .await,
+        );
+
+        for (user_id, conn, cursor, live) in [
+            (USER, member, member_cursor, &member_live),
+            (OUTSIDER, outsider, outsider_cursor, &outsider_live),
+        ] {
+            let frames =
+                run_and_collect(spawn_delta_for(db, conn, user_id, *cursor), &mut conn.rx).await;
+            assert_eq!(
+                team_frames(&frames),
+                *live,
+                "{step}: what the live path delivered to {user_id} and what \
+                 their delta from {cursor} replays must be the same rows"
+            );
+
+            let watermark = watermarks(&frames);
+            assert_eq!(
+                watermark.len(),
+                1,
+                "{step}: {user_id}'s delta must end in exactly one watermark, \
+                 or the cursor this test carries forward is invented; \
+                 got {frames:?}"
+            );
+            *cursor = watermark[0];
+        }
+
+        member_live.len()
+    }
+
+    let team_id = create_team_owned_by_user(&db, &manager, PRIVATE_NAME, "MON").await;
+    let survivor = create_team_owned_by_user(&db, &manager, "Survivor", "SUR").await;
+    let seen = assert_agree(
+        &db,
+        &manager,
+        &mut member[0],
+        &mut member_cursor,
+        &mut outsider[0],
+        &mut outsider_cursor,
+        "after-two-creates",
+    )
+    .await;
+    assert_eq!(
+        seen, 4,
+        "each create writes an Insert and a member-add Update, so the member \
+         must have seen four TEAM rows — an agreement between two empty sets \
+         would otherwise satisfy every assertion in this test"
+    );
+
+    trakkt_auth::team_service::update_team(
+        &db,
+        &team_id,
+        WORKSPACE,
+        Some("Renamed".to_owned()),
+        None,
+        Some(&manager),
+    )
+    .await
+    .expect("rename the team");
+    let seen = assert_agree(
+        &db,
+        &manager,
+        &mut member[0],
+        &mut member_cursor,
+        &mut outsider[0],
+        &mut outsider_cursor,
+        "after-rename",
+    )
+    .await;
+    assert_eq!(seen, 1, "a rename writes exactly one TEAM row");
+
+    trakkt_auth::team_service::update_team_settings(
+        &db,
+        &team_id,
+        WORKSPACE,
+        &trakkt_types::models::TeamSettings {
+            auto_archive_days: Some(30),
+            ..Default::default()
+        },
+        Some(&manager),
+    )
+    .await
+    .expect("change the team's settings");
+    let seen = assert_agree(
+        &db,
+        &manager,
+        &mut member[0],
+        &mut member_cursor,
+        &mut outsider[0],
+        &mut outsider_cursor,
+        "after-settings",
+    )
+    .await;
+    assert_eq!(seen, 1, "a settings change writes exactly one TEAM row");
+
+    trakkt_auth::team_service::delete_team(&db, &team_id, WORKSPACE, None, None, Some(&manager))
+        .await
+        .expect("delete the team");
+    let seen = assert_agree(
+        &db,
+        &manager,
+        &mut member[0],
+        &mut member_cursor,
+        &mut outsider[0],
+        &mut outsider_cursor,
+        "after-delete",
+    )
+    .await;
+    assert_eq!(seen, 1, "a delete writes exactly one TEAM row");
+
+    // The end state, stated against the real bootstrap read: the outsider holds
+    // nothing, and the member holds the team that was not deleted. Without this
+    // the test above could be satisfied by a delta path that agreed with a live
+    // path which had itself stopped delivering to anyone.
+    let outsider_teams: Vec<String> =
+        trakkt_auth::team_service::list_teams(&db, WORKSPACE, Some(OUTSIDER))
+            .await
+            .expect("read the team set a bootstrap would stream the outsider")
+            .into_iter()
+            .map(|team| team.team_id)
+            .collect();
+    assert_eq!(
+        outsider_teams,
+        Vec::<String>::new(),
+        "the outsider never joined a team, so a re-bootstrap gives them none"
+    );
+    let member_teams: Vec<String> =
+        trakkt_auth::team_service::list_teams(&db, WORKSPACE, Some(USER))
+            .await
+            .expect("read the team set a bootstrap would stream the member")
+            .into_iter()
+            .map(|team| team.team_id)
+            .collect();
+    assert_eq!(
+        member_teams,
+        vec![survivor],
+        "the member created two teams and deleted one, so a re-bootstrap gives \
+         them the survivor"
     );
 }
