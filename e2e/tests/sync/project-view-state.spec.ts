@@ -43,6 +43,25 @@ let projectHref: string;
 let projectName: string;
 const rand = () => crypto.randomBytes(4).toString('hex');
 
+/**
+ * U+25BE, the chevron `DropdownTrigger` renders after its label-or-value text.
+ *
+ * It lives in a `<span>` *inside* the `<button>` and is not `aria-hidden`, so it
+ * is part of the button's accessible name — the group-by trigger is named
+ * "Group ▾" and "Status ▾", never "Group" or "Status" on their own. Naming it
+ * here rather than inlining the glyph gives the next person who changes it one
+ * place to look: an exact-name match is what makes the grouping assertions
+ * below discriminate, so the chevron has to be spelled out rather than matched
+ * around, and a silent change to it would otherwise resurface as a test that
+ * fails at its setup barrier with no hint why.
+ * See `crates/trakkt-ui/src/components/dropdown.rs`.
+ */
+const TRIGGER_CHEVRON = '▾';
+
+/** The `DropdownTrigger` button currently reading `text`, and nothing else. */
+const triggerNamed = (page: Page, text: string) =>
+  page.getByRole('button', { name: `${text} ${TRIGGER_CHEVRON}`, exact: true });
+
 // Signup, two cold WASM boots and an issue created through the real UI all sit
 // inside single tests here.
 test.setTimeout(180_000);
@@ -150,7 +169,7 @@ test("a colleague's new issue does not undo the grouping you chose on the list",
   const title = `List ${token}`;
 
   await pageB.goto(`${projectHref}?view=list`);
-  const groupTrigger = pageB.getByRole('button', { name: 'Group' });
+  const groupTrigger = triggerNamed(pageB, 'Group');
   await expect(groupTrigger).toBeVisible({ timeout: 30_000 });
   await waitForSyncHandshake(probeB, 'B');
 
@@ -158,9 +177,12 @@ test("a colleague's new issue does not undo the grouping you chose on the list",
   await pageB.getByRole('option', { name: 'Status', exact: true }).click();
 
   // `DropdownTrigger` shows the chosen value in place of its label, so the
-  // button is named "Status" exactly while the grouping is in force and "Group"
-  // exactly while it is not. That is the whole assertion, in both directions.
-  const groupedTrigger = pageB.getByRole('button', { name: 'Status', exact: true });
+  // button is named "Status ▾" exactly while the grouping is in force and
+  // "Group ▾" exactly while it is not — `ListViewState::DEFAULT_GROUP_BY` is
+  // `GroupBy::None`, whose label never reaches the trigger. That is the whole
+  // assertion, in both directions: losing the grouping renames this button, so
+  // an exact match on the grouped name cannot pass a rebuilt list.
+  const groupedTrigger = triggerNamed(pageB, 'Status');
   await expect(groupedTrigger, 'the grouping has to be in force before anything is measured')
     .toBeVisible();
 
