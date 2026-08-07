@@ -365,7 +365,7 @@ async fn a_pruned_cursor_resets_only_the_connection_that_presented_it() {
         entity_types::ISSUE,
         "iss_pruned",
         WORKSPACE,
-        None,
+        trakkt_auth::sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         None,
     )

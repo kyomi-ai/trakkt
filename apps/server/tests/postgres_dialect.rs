@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::FutureExt;
 
-use trakkt_auth::sync_log_service::{get_entries_since, write_sync_entry_in_tx};
+use trakkt_auth::sync_log_service::{get_entries_since, write_sync_entry_in_tx, SyncAudience};
 use trakkt_core::db::in_clause_placeholders;
 use trakkt_core::test_helpers::dual_backend::{
     clear_sync_log_rejection, database_exists, on_postgres, reject_sync_log_inserts,
@@ -197,7 +197,7 @@ dual_backend_test! {
             entity_types::ISSUE,
             "iss_first",
             WORKSPACE,
-            None,
+            SyncAudience::Workspace,
             SyncActionType::Insert,
             Some(serde_json::json!({ "title": "first" })),
         )
@@ -208,7 +208,7 @@ dual_backend_test! {
             entity_types::ISSUE,
             "iss_second",
             WORKSPACE,
-            None,
+            SyncAudience::Workspace,
             SyncActionType::Update,
             Some(serde_json::json!({ "title": "second" })),
         )

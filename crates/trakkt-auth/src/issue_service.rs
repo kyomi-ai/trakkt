@@ -406,7 +406,7 @@ pub async fn create_issue(
         entity_types::ISSUE,
         &issue_id,
         &params.workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         payload.clone(),
     )
@@ -998,7 +998,7 @@ pub async fn update_issue(
         entity_types::ISSUE,
         &issue.issue_id,
         workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload.clone(),
     )
@@ -1022,7 +1022,7 @@ pub async fn update_issue(
             entity_types::ISSUE,
             &blocked_id,
             workspace_id,
-            None,
+            sync_log_service::SyncAudience::Workspace,
             SyncActionType::Update,
             data.clone(),
         )
@@ -1493,7 +1493,7 @@ pub async fn set_issue_labels(
         entity_types::ISSUE,
         issue_id,
         &ws_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload.clone(),
     )
@@ -1625,7 +1625,7 @@ pub async fn set_sort_order(
         entity_types::ISSUE,
         &issue_id,
         workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload.clone(),
     )
