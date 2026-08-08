@@ -74,6 +74,21 @@ for (const route of ROUTES) {
 
     await page.close();
     expect(panics, `${route} produced wasm panics`).toEqual([]);
+
+    // The >=400 responses were already being collected and printed here, and
+    // for the whole life of TRA-9985 they printed a 404 for the document of
+    // every route in this list — the SPA fallback was attached with
+    // `ServeDir::not_found_service`, which rewrote the shell's 200 to 404. The
+    // page rendered, so the panic assertion above passed and the printed 404s
+    // read as noise. Collecting without asserting is what let that run green
+    // for months; this closes it.
+    //
+    // Deliberately not scoped to the document response. A missing subresource
+    // is the other half of the same fix — the fallback must keep answering 404
+    // for a static file that is not in `dist`, and if it ever starts answering
+    // the app shell with 200 instead, the browser reports it here as a script
+    // that failed to parse rather than as a clean 404.
+    expect(http4xx, `${route} produced HTTP >=400 responses`).toEqual([]);
   });
 }
 

@@ -115,11 +115,24 @@ pub fn build_router(state: state::AppState) -> Router {
         .route("/", axum::routing::get(leptos_frontend::serve_leptos_shell))
         .route("/login", axum::routing::get(leptos_frontend::serve_leptos_shell))
         .route("/signup", axum::routing::get(leptos_frontend::serve_leptos_shell))
-        .fallback_service(
-            leptos_frontend::static_files_service(tower::service_fn(|_req| async {
-                Ok::<_, std::convert::Infallible>(leptos_frontend::serve().await)
-            })),
-        )
+        .fallback_service({
+            // One resolution of the dist directory feeds both the static file
+            // service and the fallback that serves the SPA shell, so the two
+            // cannot end up reading from different directories.
+            let dist_dir = state.config.dist_dir.clone();
+            let fallback_dist_dir = dist_dir.clone();
+            leptos_frontend::static_files_service(
+                &dist_dir,
+                tower::service_fn(move |req: axum::http::Request<axum::body::Body>| {
+                    let dist_dir = fallback_dist_dir.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            leptos_frontend::serve_spa_fallback(&dist_dir, req.uri().path()).await,
+                        )
+                    }
+                }),
+            )
+        })
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_refresh_middleware,
