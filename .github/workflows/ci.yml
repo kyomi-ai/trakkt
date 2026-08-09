@@ -338,28 +338,35 @@ jobs:
   # whole, so one contained entirely within a single module stays invisible, as
   # docs/CODING_STANDARDS.md and CONTRIBUTING.md both record. See the step's own
   # comment for the mechanism and scripts/wasm-test-isolated.sh for the bug
-  # class. What follows is why the sweep runs the way it does, since the choice
-  # adds roughly 60% to this job's runner minutes (~3.7min to a projected ~6min,
-  # numbers below) and the alternatives were not obviously worse.
+  # class. What follows is why the sweep runs the way it does, since it adds
+  # ~64% to this job's runner minutes (a measured 5m41s against a 208s mean
+  # before it; numbers below) and the alternatives were not obviously worse.
   #
   # It runs on every PR, and as a step in this job rather than a job of its own.
   # A separate job would repay the whole cold build, the apt install, the wasm32
   # toolchain, the wasm-pack download and the Firefox install just to re-test what
   # this job has already built; as a step, every filtered run reuses those
-  # artifacts. Measured locally with the build warm: `--list` 5.3s, the
-  # whole-binary run 25.2s, and the 13 module runs 130.9s (mean 10.1s, range
-  # 9.0-13.6s) — a marginal of ~2m16s. Each module run is ~2.6s of
-  # cargo-up-to-date plus wasm-bindgen and ~7.5s of browser launch, so what the
-  # sweep buys is paid for in browser launches, not in test execution.
+  # artifacts. What a developer running the script locally should expect, with the
+  # build already warm: `--list` 5.3s, the whole-binary run 25.2s, and the 13
+  # module runs 130.9s (mean 10.1s, range 9.0-13.6s) — a marginal of ~2m16s. Each
+  # module run is ~2.6s of cargo-up-to-date plus wasm-bindgen and ~7.5s of browser
+  # launch, so what the sweep buys is paid for in browser launches, not in test
+  # execution.
   #
-  # In CI that projects to a ~6min job against the ~3.7min it takes today. That is
-  # a projection, not a measurement: it scales the local marginal by the 0.99
-  # local:CI ratio observed for the in-browser portion of recent runs (CI executes
-  # the same 74 tests in 8.58s where this machine takes 8.69s), on the grounds
-  # that the marginal is browser and wasm-bindgen work rather than build work,
-  # which is where the ~3x CI/local ratio the build-bound jobs show would apply.
-  # Once this job has run with the sweep, its own recorded durations replace the
-  # projection — prefer them over the estimate above.
+  # On a runner it costs less than that. Measured on the PR that added the sweep
+  # (run 31309373878, job 93234685894): the job took 5m41s, against a 208s mean
+  # over the 13 preceding runs of it (range 149-253s). Of the sweep step's 5m02s,
+  # ~2m45s was the build — carried by the first wasm-pack invocation, which is now
+  # the `--list` pass — 17.3s the whole-binary run, and 2m00s the 13 isolated
+  # runs, a mean of 9.24s each (range 8.61-10.90s). So a module costs slightly
+  # less on a runner than locally, and browser launches are not something CI is
+  # worse at. Note the asymmetry before reusing the ~64%: the new figure is one
+  # run and the baseline is a 13-run mean.
+  #
+  # The estimate this replaced predicted ~6min by scaling the local marginal 1:1
+  # rather than by the ~3x CI/local ratio the build-bound jobs show, on the
+  # grounds that browser and wasm-bindgen work is not build work. That held, and
+  # it is the reasoning to reuse if this job's cost ever has to be predicted again.
   #
   # Nightly or merge-to-main only was rejected: at a ~2min marginal on a job that
   # already runs in parallel with longer ones, moving it off the PR saves almost
@@ -379,34 +386,21 @@ jobs:
   wasm-test:
     name: WASM Browser Tests
     runs-on: ubuntu-latest
-    # Bounds the whole job. This bound no longer needs to be derived from local
-    # timings the way it did when the job was new: it has run enough that the
-    # real numbers are available. Across the six most recent runs the job takes
-    # 202-253s (job-level started_at -> completed_at), of which the single
-    # `wasm-pack test` invocation was 172-189s. That invocation is dominated by
-    # the build — the tests themselves execute in 8.6s, a figure worth restating
-    # because the earlier note here said 0.7s and the suite has since grown from
-    # 12 tests to 74.
+    # Bounds the whole job. The typical case is measured, not derived: with the
+    # sweep in place this job took 5m41s (run 31309373878), against a 208s mean
+    # over the 13 runs preceding it. Its sweep step was 5m02s — ~2m45s of build,
+    # 17.3s of whole-binary run, 2m00s of isolated runs — and the tests themselves
+    # execute in 8.6s, a figure worth restating because the earlier note here said
+    # 0.7s, from when the suite had 12 tests rather than 74.
     #
-    # The isolated sweep below adds 13 more filtered runs and one `--list`.
-    # Measured locally with the build already warm: `--list` 5s, the whole-binary
-    # run 25s, and the 13 module runs 131s (mean 10.1s, range 9.0-13.6s), so the
-    # sweep adds ~136s on top of what this job already did.
-    #
-    # That marginal is projected into CI at roughly 1:1 rather than at the ~3x
-    # CI/local ratio the build-bound jobs show (clippy: 1m38s local, ~5m CI),
-    # because it is not build work: cargo short-circuits as up-to-date and what
-    # remains is 13 wasm-bindgen transforms and 13 Firefox launches. The anchor
-    # for that is direct — CI executes the identical 74 tests in-browser in 8.58s
-    # where this machine takes 8.69s, a ratio of 0.99. So ~222s + ~136s ≈ 6min
-    # typical, against the ~3.7min the job takes today.
-    #
-    # For the bound, the worst legitimate cold run was previously reasoned out at
-    # ~13min (a cold build plus apt, the wasm32 toolchain, cargo update, the
-    # wasm-pack download, the Firefox install, and the geckodriver wasm-pack
-    # fetches on first run). Allowing the sweep's marginal to double on a slow
-    # runner day puts that at ~17.5min. 25 leaves ~1.4x headroom, in line with the
-    # ~1.5x this job used before and Test Suite's 1.7x.
+    # 25 is not sized against that 5m41s, which is the typical case and not what a
+    # timeout is for. It is sized against the worst legitimate cold run, reasoned
+    # out at ~13min for the job before the sweep (a cold build plus apt, the wasm32
+    # toolchain, cargo update, the wasm-pack download, the Firefox install, and the
+    # geckodriver wasm-pack fetches on first run); letting the sweep's measured
+    # 2m00s double on a slow runner day adds 4min, so ~17min, over which 25 leaves
+    # ~1.5x. Against the measured typical it is 4.4x, which is the same shape as
+    # Test Suite's 30 against its ~7m18s (4.1x) rather than an outlier.
     #
     # The failure this actually caps is a headless browser that never reports: if
     # geckodriver hangs, wasm-pack waits forever and GitHub's 6-hour default would
