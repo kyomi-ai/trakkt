@@ -330,6 +330,62 @@ dual_backend_test! {
     }
 }
 
+// ─── The 60 SQLite-only rollback tests: the decision, and the evidence ───────
+//
+// `crates/trakkt-auth/src/sync_log_service.rs` holds 60 tests of the form
+// `*_rolls_back_when_*_sync_entry_cannot_be_written`, all of them SQLite-only.
+// TRA-10001 converted none of them. That is a decision rather than an omission,
+// so here is what it rests on.
+//
+// The contract those 60 assert — the mutation and its `sync_log` entry commit
+// or roll back together — reaches the database in three shapes, and the two
+// dialects behave differently in exactly one place: SQLite's `RAISE(ABORT)`
+// fails one statement and leaves the transaction usable, while Postgres's
+// `RAISE EXCEPTION` poisons it and rejects everything after with `25P02
+// in_failed_sql_transaction` (see `reject_sync_log_inserts`). All three shapes
+// already run on Postgres, in this file:
+//
+//   1. Blanket trigger, rejection on the mutation's *first* entry. 52 of the 60
+//      are this. From the service's point of view the dialects are then
+//      indistinguishable: the error arrives from the first write, `?`
+//      propagates it, and no further statement is issued on the transaction.
+//      `a_rejected_sync_entry_rolls_back_the_issue_update` runs it.
+//   2. Narrowed trigger, rejection after an earlier entry was *accepted* — the
+//      shape where the poisoning above is reachable at all. The other 8 are
+//      this. `a_rejected_favorite_entry_rolls_the_project_delete_back` runs it.
+//   3. Rejection after the statement has already fired `ON DELETE CASCADE`, so
+//      what must unwind includes rows no service names and only the schema
+//      knows about. `a_rejected_entry_of_any_type_rolls_the_whole_project_cascade_back`
+//      runs it, five times over, one per entity type `delete_project` writes,
+//      asserting the cascaded members, milestones and updates are all restored.
+//
+// A converted 61st test would therefore re-execute one of three code paths with
+// a different fixture. `docs/CODING_STANDARDS.md` is explicit that a sweep like
+// that "cannot distinguish 'all six covered' from 'one covered five times'",
+// and the same objection applies whichever way the sweep is pointed.
+//
+// A candidate was written and discarded rather than assumed away: `delete_team`
+// is another write path whose transaction cascades, and its rollback body was
+// built here, passed on both backends, and was then removed because the claim
+// it would have carried — that the cascade unwinds on Postgres — is what (3)
+// above already establishes. What is left over is `delete_team`'s issue
+// reassignment and its `users.default_team_id` clear, which are an UPDATE and a
+// DELETE rolling back, and no dialect disagrees about that.
+//
+// There is a second, independent obstacle worth recording, because it is what
+// makes "convert them all later" more than an afternoon. Every one of the 60
+// hangs off `two_user_workspace()`, which hardcodes
+// `DbPool::connect("sqlite::memory:")` and inserts rows omitting `created_at`,
+// `role` and `active` on the strength of SQLite's column defaults. Porting them
+// means re-seeding through `trakkt_core::test_helpers`, whose helpers ask the
+// pool which dialect it is — 60 fixtures rewritten, to re-run three paths.
+//
+// What would change this: a rollback whose *extent* is decided by something the
+// two dialects can still disagree about. The `ON DELETE` actions are the live
+// example, and the structural check below is what keeps them in step; if it
+// ever has to grow another documented exception, the rollback that depends on
+// that key earns a body here.
+
 // ─── The six tx_* macros ─────────────────────────────────────────────────────
 
 /// A `sync_log` row as the transaction macros read it back.
@@ -514,6 +570,66 @@ dual_backend_test! {
 }
 
 // ─── sql_compat ──────────────────────────────────────────────────────────────
+//
+// Every helper in `crates/trakkt-core/src/sql_compat.rs` returns a different
+// string on the two dialects — there is not one that is byte-identical on both,
+// so "the arms agree, nothing to run" is never the reason a helper is absent
+// here. What each helper's own unit test can assert is the string it returns;
+// what it cannot assert is that a database accepts the string, which is the
+// only thing that distinguishes a working Postgres arm from a broken one.
+//
+// So the criterion for a helper appearing below is that production builds SQL
+// with it. A helper nothing calls has no arm to keep working: a body here would
+// have to invent a query around a fragment, and would then be asserting that
+// the test's own SQL runs. The ledger is stated rather than implied, because
+// "the sql_compat helpers are covered" and "eight of twenty are, and the other
+// twelve are dead" are very different claims to leave a reader holding.
+//
+// Called by production, and executed here on both backends. The figure beside
+// each is `sql_compat::<name>(` call sites outside `apps/server/tests`, so it
+// includes the crates' own `#[cfg(test)]` modules; it is there to show which
+// helpers carry weight, not as an exact production count. What *was* checked
+// exactly, one helper at a time, is the split between this list and the next.
+// Every name below is called from code that ships — seven from `pub` service
+// functions, and `within_seconds` from `activity_service::coalesce_or_insert_activity`,
+// a private helper on the activity write path. Every name in the second list
+// has no call site at all outside `sql_compat.rs`'s own unit tests and this
+// file.
+//
+//   now                  74 call sites  — this section, and every seed helper
+//   bool_true            48             — every_migration_file_is_recorded_as_applied
+//   bool_false           20             — via create_notification and the bulk_*
+//                                         phases of the notification body below
+//   cast_to_json         12             — this section
+//   cast_to_date          6             — project_dates_and_archive_stamp_survive_the_round_trip
+//   ago_days              2             — sync_log_pruning_selects_by_age_on_both_dialects
+//   within_seconds        1             — this section
+//   cast_to_timestamptz   1             — project_dates_and_archive_stamp_survive_the_round_trip
+//
+// Not called by production, and therefore not executed here:
+//
+//   cast_to_text, cast_to_uuid, ilike, coalesce_now, any_in_array, ago_seconds,
+//   ago_seconds_param, add_hours, add_days, json_extract_text,
+//   full_table_name_expr, full_table_name_expr_prefixed
+//
+// Three notes on that second list, because "no caller" is a claim worth being
+// precise about:
+//
+// - `cast_to_text` has no production caller because production spells the cast
+//   out — `CAST(p.start_date AS TEXT)` in `PROJECT_SELECT` and its siblings.
+//   The only caller is this file, which uses it to build the `sync_log` probe
+//   SELECT in the tx-macro body, so it does execute on both backends; it is
+//   listed here rather than above because nothing ships depending on it.
+// - `any_in_array`'s Postgres arm is `$1 = ANY(column)`, which needs a Postgres
+//   array column. There is none: every list in this schema is stored as JSON
+//   TEXT on both dialects. The arm is not merely uncalled, it is unrunnable
+//   against the schema that ships.
+// - `full_table_name_expr` and `full_table_name_expr_prefixed` name
+//   `project_id`, `dataset_id` and `table_id` in one row. No table in either
+//   migration directory has that shape; they are a port from another codebase.
+//
+// Twelve uncalled helpers is a deletion, not a testing gap, and deleting public
+// API is not what this ticket is. TRA-10001 leaves them and says so here.
 
 dual_backend_test! {
     /// `sql_compat::now` and `sql_compat::cast_to_json` produce SQL each
@@ -586,6 +702,722 @@ dual_backend_test! {
             "sql_compat::cast_to_json must round-trip the payload — on Postgres \
              the bound TEXT has to become JSONB on the way in and TEXT again on \
              the way out"
+        );
+    }
+}
+
+/// The dates `project_dates_and_archive_stamp_survive_the_round_trip` writes.
+///
+/// `archived_at` carries a zone offset because the Postgres column is
+/// `TIMESTAMPTZ`; a bare local time would be resolved against the server's
+/// `TimeZone` setting, which is the database's configuration and not something
+/// a test should be asserting through.
+const PROJECT_START_DATE: &str = "2026-01-15";
+const PROJECT_TARGET_DATE: &str = "2026-03-31";
+const PROJECT_ARCHIVED_AT: &str = "2026-02-01 09:30:00+00";
+
+dual_backend_test! {
+    /// `sql_compat::cast_to_date` and `sql_compat::cast_to_timestamptz` produce
+    /// SQL each backend accepts, for a bind that is not NULL.
+    ///
+    /// Both are already in SQL that runs on both backends today —
+    /// `create_project` splices two `cast_to_date`s into its INSERT — but every
+    /// existing body reaches them with `start_date: None`, and a NULL bind is
+    /// exactly the case that works with or without a cast. `docs/CODING_STANDARDS.md`
+    /// records that shape as the reason the JSONB cast bug stayed hidden: "NULL
+    /// values happen to work without the cast, masking the bug until real data
+    /// is written". So the coverage those bodies provide for these two helpers
+    /// is the masked kind, and this is the unmasked one.
+    ///
+    /// `update_project` is the vehicle for the second half because it is where
+    /// all three casts meet the *dynamic* placeholder numbering: the SET clause
+    /// is assembled field by field with a running `${param_idx}`, and the binds
+    /// are then replayed in the same order through `tx_with!`. SQLite accepts
+    /// either numbering, so an off-by-one there is a Postgres-only defect, and
+    /// `archived_at` — the last and highest-numbered of the three — is the one
+    /// it would land on.
+    ///
+    /// `archived_at` is asserted by prefix, not equality. It is `TIMESTAMPTZ` on
+    /// Postgres, which renders the value in the server's own output format, and
+    /// TEXT on SQLite, which hands back the bytes it was given. The date is what
+    /// both must agree on; the rendering is not a thing either backend owes the
+    /// other.
+    async fn project_dates_and_archive_stamp_survive_the_round_trip(db) {
+        seed_tenancy(db).await;
+
+        let created = trakkt_auth::project_service::create_project(
+            db,
+            &trakkt_auth::project_service::CreateProjectParams {
+                workspace_id: WORKSPACE,
+                name: "Dated",
+                description: None,
+                icon: None,
+                color: None,
+                lead_id: None,
+                start_date: Some(PROJECT_START_DATE),
+                target_date: Some(PROJECT_TARGET_DATE),
+            },
+            None,
+        )
+        .await
+        .expect("create a project whose dates are bound through cast_to_date");
+
+        // `create_project` re-reads the row on its own transaction and returns
+        // what it read, so this is the INSERT's cast and the SELECT's
+        // `CAST(... AS TEXT)` both reporting.
+        assert_eq!(
+            (created.start_date.as_deref(), created.target_date.as_deref()),
+            (Some(PROJECT_START_DATE), Some(PROJECT_TARGET_DATE)),
+            "a date bound through cast_to_date must come back as the date that \
+             went in — on Postgres the TEXT bind has to become a DATE on the way \
+             in and TEXT again on the way out"
+        );
+
+        let updated = trakkt_auth::project_service::update_project(
+            db,
+            &trakkt_auth::project_service::UpdateProjectParams {
+                project_id: &created.project_id,
+                name: None,
+                description: None,
+                icon: None,
+                color: None,
+                status: None,
+                lead_id: None,
+                start_date: Some(Some(PROJECT_TARGET_DATE)),
+                target_date: Some(Some(PROJECT_START_DATE)),
+                archived_at: Some(Some(PROJECT_ARCHIVED_AT)),
+            },
+            None,
+        )
+        .await
+        .expect("update the two dates and the archive stamp in one statement");
+
+        // Swapped deliberately: an update that bound the two dates in the wrong
+        // order would be invisible if both were set to the same value.
+        assert_eq!(
+            (updated.start_date.as_deref(), updated.target_date.as_deref()),
+            (Some(PROJECT_TARGET_DATE), Some(PROJECT_START_DATE)),
+            "each date must be written to the column its placeholder names. The \
+             SET clause is numbered at runtime and the binds are replayed \
+             separately, so a numbering that slipped puts each value in the \
+             other's column"
+        );
+
+        let archived_at = updated
+            .archived_at
+            .as_deref()
+            .expect("the archive stamp bound through cast_to_timestamptz must be stored");
+        assert!(
+            archived_at.starts_with("2026-02-01"),
+            "archived_at must round-trip to the instant it was given; got \
+             {archived_at:?}"
+        );
+
+        // Read back off the pool rather than trusting the value the service
+        // returned from inside its own transaction: `cast_to_timestamptz` has to
+        // survive the commit, and this is also the read every client makes.
+        let listed = trakkt_auth::project_service::list_projects(db, WORKSPACE)
+            .await
+            .expect("list the workspace's projects after the update");
+        let listed = listed
+            .iter()
+            .find(|project| project.project_id == created.project_id)
+            .expect("the updated project is in the workspace's list");
+        assert_eq!(
+            (listed.start_date.as_deref(), listed.target_date.as_deref()),
+            (Some(PROJECT_TARGET_DATE), Some(PROJECT_START_DATE)),
+            "the committed dates must match what the update reported"
+        );
+        assert_eq!(
+            listed.archived_at.as_deref(),
+            Some(archived_at),
+            "the committed archive stamp must match what the update reported"
+        );
+
+        // The clear arm: `Some(None)` sets the column to NULL, which is the path
+        // where the cast is applied to a NULL bind. It has to keep working, or
+        // unarchiving fails on Postgres alone.
+        let unarchived = trakkt_auth::project_service::update_project(
+            db,
+            &trakkt_auth::project_service::UpdateProjectParams {
+                project_id: &created.project_id,
+                name: None,
+                description: None,
+                icon: None,
+                color: None,
+                status: None,
+                lead_id: None,
+                start_date: None,
+                target_date: None,
+                archived_at: Some(None),
+            },
+            None,
+        )
+        .await
+        .expect("unarchive the project by binding NULL through cast_to_timestamptz");
+        assert_eq!(
+            unarchived.archived_at, None,
+            "Some(None) must clear archived_at rather than leaving the stamp"
+        );
+    }
+}
+
+/// A `created_at` value `days` in the past, as SQL literal text for this
+/// backend.
+///
+/// Deliberately not built from `sql_compat`. The helper under test is
+/// `sql_compat::ago_days`, and backdating the fixture with it would make the
+/// body assert only that the fragment agrees with itself.
+///
+/// Nor is there another helper to reach for. `sql_compat::add_days` is the
+/// nearest — it yields a shifted timestamp rather than a comparison — but it
+/// cannot express a *negative* shift on SQLite: `add_days(false, "datetime('now')", -90)`
+/// produces `datetime(datetime('now'), '+-90 days')`, and SQLite returns NULL
+/// for that modifier rather than a date. It also has no production caller.
+/// Writing a new helper for one fixture would be adding production API to serve
+/// a test.
+fn days_ago_literal(is_pg: bool, days: i64) -> String {
+    if is_pg {
+        format!("NOW() - INTERVAL '{days} days'")
+    } else {
+        format!("datetime('now', '-{days} days')")
+    }
+}
+
+dual_backend_test! {
+    /// `sql_compat::ago_days` selects the rows that are old enough, on a bind
+    /// each backend accepts.
+    ///
+    /// This is the helper that was broken on Postgres. `make_interval`'s `days`
+    /// argument is `integer`; both callers bind an `i64`, which sqlx sends as
+    /// `INT8`; and `bigint -> integer` is an assignment cast in Postgres, not an
+    /// implicit one. Named-notation resolution therefore found no candidate and
+    /// every call failed with `function make_interval(days => bigint) does not
+    /// exist`, while the whole workspace's SQLite tests passed over it, because
+    /// SQLite concatenates the bind into a string modifier and never sees a
+    /// width at all. TRA-10001 added the `::int` cast; this is what holds it
+    /// there.
+    ///
+    /// The two callers are in very different states, and the difference is worth
+    /// stating precisely rather than rounding up:
+    ///
+    /// - `archive_service::run_archive_sweep` ships and runs. `apps/server/src/main.rs`
+    ///   spawns it on an hourly interval at startup, and it reaches this helper
+    ///   with `i64::from(archive_days)`. It gets there only for a team that has
+    ///   an archive window configured — `get_team_archive_days` returning `None`
+    ///   is a `continue` before the query is built — so the claim that holds
+    ///   without knowing production's team settings is that on Postgres this
+    ///   sweep has never archived an issue. Either some team has a window set,
+    ///   and the first one reached propagates the error with `?` and aborts the
+    ///   whole run; or none has, and the query is never built and nothing is
+    ///   eligible anyway. Neither reaches a user: the first is warned as
+    ///   `Archive sweep failed` and the loop waits for the next hour, and the
+    ///   second returns `Ok(0)`, which the caller logs nothing for.
+    /// - `sync_log_service::prune_old_entries` has never run in production at
+    ///   all. It is `pub`, fully implemented, and called from nowhere — no
+    ///   scheduler, no server function, no CLI subcommand. It cannot have failed
+    ///   in production because it has never executed there, and its `sync_log`
+    ///   rows have never been pruned for the same reason. That is TRA-10027,
+    ///   which is open and is where the missing call site belongs; nothing here
+    ///   fixes it or should be read as having fixed it.
+    ///
+    /// So the body drives `prune_old_entries` even though it is the caller that
+    /// does not ship, because it is the one reachable from a test: the sweep
+    /// takes a `&WebSocketManager` rather than an `Option`. The fragment is the
+    /// same one in both — same helper, same `i64` — so executing it here is what
+    /// covers the sweep's arm, and driving the sweep as well would add a second
+    /// execution of one fragment rather than a second fragment.
+    async fn sync_log_pruning_selects_by_age_on_both_dialects(db) {
+        seed_tenancy(db).await;
+
+        let is_pg = db.is_postgres();
+        let now = sql_compat::now(is_pg);
+
+        let insert = format!(
+            "INSERT INTO sync_log (entity_type, entity_id, workspace_id, action, created_at) \
+             VALUES ($1, $2, $3, 'insert', {now})"
+        );
+        db_execute!(db, &insert, entity_types::ISSUE, "iss_recent", WORKSPACE)
+            .expect("insert the entry that is inside the retention window");
+
+        let backdated = format!(
+            "INSERT INTO sync_log (entity_type, entity_id, workspace_id, action, created_at) \
+             VALUES ($1, $2, $3, 'insert', {})",
+            days_ago_literal(is_pg, 90)
+        );
+        db_execute!(db, &backdated, entity_types::ISSUE, "iss_ancient", WORKSPACE)
+            .expect("insert the entry that is outside the retention window");
+
+        // The premise: both rows are there before the prune, so a prune that
+        // deleted nothing and a fixture that inserted nothing are told apart.
+        assert_eq!(
+            surviving_sync_entity_ids(db).await,
+            vec!["iss_ancient".to_string(), "iss_recent".to_string()],
+            "both probe entries must exist before the prune, or the assertion \
+             after it proves nothing"
+        );
+
+        let pruned = trakkt_auth::sync_log_service::prune_old_entries(db, 30)
+            .await
+            .expect("prune the entries older than the 30-day retention window");
+
+        assert_eq!(
+            pruned, 1,
+            "exactly the one backdated entry is older than 30 days, so the prune \
+             must report removing one row"
+        );
+        assert_eq!(
+            surviving_sync_entity_ids(db).await,
+            vec!["iss_recent".to_string()],
+            "the prune must keep the entry inside the window and drop the one \
+             outside it. Keeping both means the age predicate matched nothing; \
+             dropping both means it matched everything, and a client's delta \
+             cursor would point past entries it never received."
+        );
+    }
+}
+
+/// Every `sync_log` entity id still present, ordered so assertions can compare
+/// directly.
+async fn surviving_sync_entity_ids(db: &DbPool) -> Vec<String> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        entity_id: String,
+    }
+    db_fetch_all!(db, Row, "SELECT entity_id FROM sync_log ORDER BY entity_id")
+        .expect("read the sync entries left after the prune")
+        .into_iter()
+        .map(|row| row.entity_id)
+        .collect()
+}
+
+// ─── sort_order: the column width the row type declares ──────────────────────
+//
+// The defect this suite was built in response to, and the one it could not yet
+// have caught. `apps/server/migrations/20260509000003_projects.sql` declared
+// `sort_order real` — FLOAT4 — while `project_service::ProjectRow` declares it
+// `f64`. sqlx refuses that decode rather than widening it, so every read of the
+// projects table failed on Postgres and passed on SQLite, whose REAL is 8-byte
+// unconditionally.
+//
+// It shipped twice. TRA-216 (c607bb5, 31 May 2026) papered over it with
+// `CAST(p.sort_order AS DOUBLE PRECISION)` in `PROJECT_SELECT` after the
+// projects list page was found blocked on fresh Postgres databases; TRA-9906
+// (1926e08, 10 June 2026) migrated the column to DOUBLE PRECISION and took the
+// cast back out, which is the state the assertions below hold.
+//
+// # Which read path this covers, and why it is one and not two
+//
+// The ticket asks for the projects list, MCP `list_projects`, or both. There is
+// one decode: `PROJECT_SELECT` and `ProjectRow`, in `trakkt_auth::project_service`.
+// `trakkt_api::projects::list_projects` — the handler MCP and the REST route
+// share — is `project_service::list_projects` followed by `serde_json::to_value`,
+// and the Leptos projects list page reaches the same function through the same
+// handler. The two places the bug was seen were two presentations of one query,
+// which is why fixing the SELECT in TRA-216 fixed both at once.
+//
+// So the body below asserts against `project_service::list_projects`, where the
+// decode is, and then again through `trakkt_api::projects::list_projects`. The
+// second is not a second decode; it is there so that giving the API surface a
+// query of its own has to be done in front of an assertion rather than behind
+// one.
+
+/// Two `sort_order` values that are distinct in `f64` and identical in `f32`.
+///
+/// `2^-24` is half a step at 1.0 in `f32`, so `1.0 + 2^-24` rounds to exactly
+/// 1.0 there under round-half-to-even, while `f64` keeps all 24 bits of it with
+/// 28 to spare. Ordinary values like 1.0 and 2.0 would survive a FLOAT4 column
+/// unchanged, and would make the value assertions below pass against precisely
+/// the storage that caused the outage — so the pair is chosen to be one a
+/// 4-byte column cannot keep apart.
+///
+/// This is not a contrived precision: the board reorders by fractional
+/// indexing, taking the midpoint of two neighbours (`crates/trakkt-ui/src/pages/board.rs`),
+/// and repeated bisection between two adjacent cards reaches gaps this size
+/// after about two dozen drags. Collapsing them makes the order the database
+/// returns depend on `created_at` instead, which is to say it stops being the
+/// order the user dragged.
+/// Written as half an `f32` epsilon rather than as a decimal literal, so the
+/// property the pair is chosen for is the expression rather than a comment
+/// beside it: `f32::EPSILON` *is* the step between representable `f32`s at 1.0,
+/// so half of it is by construction the largest offset `f32` must round away
+/// and `f64` keeps exactly.
+const ADJACENT_SORT_ORDER: [f64; 2] = [1.0, 1.0 + (f32::EPSILON as f64) / 2.0];
+
+/// Give `project_id` an explicit `sort_order`.
+///
+/// Written with a statement rather than through a service because no service
+/// writes this column: `create_project` inserts a literal `0` and
+/// `update_project` has no `sort_order` field. That is worth knowing and does
+/// not weaken the body — the defect was in the *read*, which every projects
+/// query performs, and which the assertions below make through the real
+/// service functions.
+async fn set_project_sort_order(db: &DbPool, project_id: &str, sort_order: f64) {
+    db_execute!(
+        db,
+        "UPDATE projects SET sort_order = $1 WHERE project_id = $2",
+        sort_order,
+        project_id
+    )
+    .unwrap_or_else(|e| panic!("set the sort_order of project {project_id}: {e}"));
+}
+
+dual_backend_test! {
+    /// `projects.sort_order` decodes into the `f64` its row type declares, at
+    /// full width.
+    ///
+    /// Two assertions, and each rules out a different wrong state. That the
+    /// reads *succeed* is the FLOAT4 decode itself: sqlx will not widen a
+    /// 4-byte column into `f64`, it errors, and the projects list page returns
+    /// nothing at all. That the two values come back *distinct and in order* is
+    /// the narrowing: a column, cast or row type that is 4 bytes anywhere along
+    /// the path stores both [`ADJACENT_SORT_ORDER`] values as 1.0, and every
+    /// read still succeeds while the ordering the numbers existed to express is
+    /// gone. A test that only checked the call returned `Ok` would pass against
+    /// that.
+    ///
+    /// Both assertions are made through `list_projects`, `get_project_in_workspace`
+    /// and the shared API handler, because `PROJECT_SELECT` is spliced into all
+    /// three and a `WHERE` clause is not what decides how a column decodes.
+    async fn project_sort_order_decodes_at_the_width_its_row_type_declares(db) {
+        seed_tenancy(db).await;
+
+        // Created in the opposite order to the one they must come back in, so
+        // the ORDER BY is doing the work rather than the insertion order.
+        let second = trakkt_auth::project_service::create_project(
+            db,
+            &trakkt_auth::project_service::CreateProjectParams {
+                workspace_id: WORKSPACE,
+                name: "Second by sort order",
+                description: None,
+                icon: None,
+                color: None,
+                lead_id: None,
+                start_date: None,
+                target_date: None,
+            },
+            None,
+        )
+        .await
+        .expect("create the project that sorts second");
+
+        let first = trakkt_auth::project_service::create_project(
+            db,
+            &trakkt_auth::project_service::CreateProjectParams {
+                workspace_id: WORKSPACE,
+                name: "First by sort order",
+                description: None,
+                icon: None,
+                color: None,
+                lead_id: None,
+                start_date: None,
+                target_date: None,
+            },
+            None,
+        )
+        .await
+        .expect("create the project that sorts first");
+
+        set_project_sort_order(db, &first.project_id, ADJACENT_SORT_ORDER[0]).await;
+        set_project_sort_order(db, &second.project_id, ADJACENT_SORT_ORDER[1]).await;
+
+        let listed = trakkt_auth::project_service::list_projects(db, WORKSPACE)
+            .await
+            .expect(
+                "list the workspace's projects — this is the read that failed on \
+                 every Postgres database while sort_order was FLOAT4",
+            );
+
+        assert_eq!(
+            listed.iter().map(|p| p.project_id.as_str()).collect::<Vec<_>>(),
+            vec![first.project_id.as_str(), second.project_id.as_str()],
+            "the projects must come back in sort_order, and the two orders \
+             differ by less than a FLOAT4 can represent — a 4-byte column stores \
+             both as 1.0 and the tie falls to created_at, which is the reverse \
+             of this"
+        );
+        assert_eq!(
+            listed.iter().map(|p| p.sort_order).collect::<Vec<_>>(),
+            ADJACENT_SORT_ORDER.to_vec(),
+            "each sort_order must come back bit-for-bit as it was written. \
+             Anything 4 bytes wide on the path — the column, a CAST, or the row \
+             type — collapses both of these to 1.0 while every read still \
+             succeeds"
+        );
+
+        // The single-row query. Same SELECT, different WHERE; asserted so that
+        // a future divergence between the list and detail reads cannot take the
+        // decode with it.
+        let fetched = trakkt_auth::project_service::get_project_in_workspace(
+            db,
+            &second.project_id,
+            WORKSPACE,
+        )
+        .await
+        .expect("read the second project on its own");
+        assert_eq!(
+            fetched.sort_order, ADJACENT_SORT_ORDER[1],
+            "the single-project read decodes sort_order through the same row \
+             type and must agree with the list"
+        );
+
+        // The API surface MCP `list_projects` and the REST route both call. It
+        // delegates to `project_service::list_projects` and serialises, so this
+        // is not a second decode — it is the assertion that has to be moved,
+        // rather than quietly bypassed, if it ever becomes one.
+        let ctx = trakkt_api::ApiCtx::from_leptos(
+            WORKSPACE.to_owned(),
+            USER.to_owned(),
+            db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        );
+        let payload = trakkt_api::projects::list_projects(
+            &ctx,
+            trakkt_types::api::ListProjectsApiParams {},
+        )
+        .await
+        .expect("list the projects through the handler MCP and the REST route share");
+
+        let orders: Vec<f64> = payload
+            .as_array()
+            .expect("the handler returns a JSON array of projects")
+            .iter()
+            .map(|project| {
+                project
+                    .get("sort_order")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or_else(|| panic!("a project in the handler's output has no numeric sort_order: {project}"))
+            })
+            .collect();
+        assert_eq!(
+            orders,
+            ADJACENT_SORT_ORDER.to_vec(),
+            "the API surface must carry the same orders, in the same sequence, \
+             as the service it delegates to"
+        );
+    }
+}
+
+dual_backend_test! {
+    /// The rest of the `sort_order` family decodes at the width its row type
+    /// declares too.
+    ///
+    /// Four more columns carry this name, and they do not all have the same
+    /// type: `project_milestones.sort_order` is `integer`/`INTEGER` read into
+    /// `i32`, while `issues`, `views` and `favorites` are DOUBLE PRECISION/REAL
+    /// read into `f64` — `issues` nullably, which is a decode of its own.
+    ///
+    /// They are asserted together because what shipped twice was not a mistake
+    /// about `projects` in particular. It was one column in a family of five
+    /// declared a width narrower than the rest, in a schema where the other
+    /// dialect makes every float 8 bytes and cannot report the difference. The
+    /// question worth keeping answered is whether the family still agrees, and
+    /// the only body that keeps answering it is one that reads all of them.
+    ///
+    /// Each read goes through the real list service, because that is what
+    /// decides the row type, and each value is checked as well as each call —
+    /// see `project_sort_order_decodes_at_the_width_its_row_type_declares` for
+    /// why `Ok` alone is not enough.
+    async fn every_sort_order_column_decodes_at_the_width_its_row_type_declares(db) {
+        seed_tenancy(db).await;
+
+        // ── issues: DOUBLE PRECISION / REAL into Option<f64> ──
+        //
+        // One of the two columns in the family a service writes a non-default
+        // value into — `views` below is the other, and `projects`,
+        // `project_milestones` and `favorites` all have a literal `0` in their
+        // INSERT and no update path that touches the column. Here the board's
+        // drag handler calls `update_issue` with a fractional index, so these
+        // are the values a real reorder produces.
+        let ordered = create_issue(db, "Dragged into place").await;
+        let unordered = create_issue(db, "Never dragged").await;
+
+        trakkt_auth::issue_service::update_issue(
+            db,
+            WORKSPACE,
+            TEAM_KEY,
+            ordered.number,
+            &IssueUpdate {
+                sort_order: Some(Some(ADJACENT_SORT_ORDER[1])),
+                ..Default::default()
+            },
+            Some(USER),
+            ActionSource::User,
+            None,
+            None,
+        )
+        .await
+        .expect("give the issue the sort_order a board drag would write");
+
+        let issues = trakkt_auth::issue_service::list_issues(
+            db,
+            WORKSPACE,
+            Some(TEAM),
+            &trakkt_types::models::IssueFilters::default(),
+        )
+        .await
+        .expect("list the team's issues");
+
+        let issue_order = |issue_id: &str| {
+            issues
+                .iter()
+                .find(|issue| issue.issue_id == issue_id)
+                .unwrap_or_else(|| panic!("issue {issue_id} is missing from the list"))
+                .sort_order
+        };
+        assert_eq!(
+            issue_order(&ordered.issue_id),
+            Some(ADJACENT_SORT_ORDER[1]),
+            "issues.sort_order must decode at full width — the board's fractional \
+             indexing writes gaps this size, and a narrower decode either fails \
+             the read or loses the position"
+        );
+        assert_eq!(
+            issue_order(&unordered.issue_id), None,
+            "an issue that was never dragged has a NULL sort_order, and the \
+             nullable decode has to hold as well as the value one. Without this \
+             the assertion above would be satisfied by a row type that could not \
+             decode NULL at all"
+        );
+
+        // ── project_milestones: integer / INTEGER into i32 ──
+        //
+        // The odd one out of the family, and the reason this body reads more
+        // than the floats: a width mistake here would be an integer one, which
+        // no assertion about f64 can see.
+        let project = trakkt_auth::project_service::create_project(
+            db,
+            &trakkt_auth::project_service::CreateProjectParams {
+                workspace_id: WORKSPACE,
+                name: "Holds a milestone",
+                description: None,
+                icon: None,
+                color: None,
+                lead_id: None,
+                start_date: None,
+                target_date: None,
+            },
+            None,
+        )
+        .await
+        .expect("create the project the milestone hangs off");
+
+        let milestone = trakkt_auth::project_service::create_milestone(
+            db,
+            &project.project_id,
+            "Beta",
+            None,
+            None,
+            None,
+            WORKSPACE,
+        )
+        .await
+        .expect("create the milestone whose sort_order is read back below");
+
+        // `create_milestone` inserts a literal 0, as `create_project` does, so
+        // the value is set here to something an all-zeroes read cannot match.
+        db_execute!(
+            db,
+            "UPDATE project_milestones SET sort_order = $1 WHERE milestone_id = $2",
+            7_i32,
+            &milestone.milestone_id
+        )
+        .expect("give the milestone a sort_order no default would produce");
+
+        let milestones = trakkt_auth::project_service::list_milestones(db, &project.project_id)
+            .await
+            .expect("list the project's milestones");
+        assert_eq!(
+            milestones.iter().map(|m| m.sort_order).collect::<Vec<_>>(),
+            vec![7_i32],
+            "project_milestones.sort_order is an integer column read into i32, \
+             and must decode as one"
+        );
+
+        // ── views and favorites: DOUBLE PRECISION / REAL into f64 ──
+        //
+        // Structurally the same decode as `projects`, which is the point: these
+        // are the columns `projects` was supposed to match and did not. A pair
+        // of adjacent orders again, so a narrowing anywhere is visible rather
+        // than absorbed by a round number.
+        let view = trakkt_auth::view_service::create_view(
+            db,
+            &trakkt_auth::view_service::CreateViewParams {
+                workspace_id: WORKSPACE,
+                user_id: USER,
+                name: "Ordered view",
+                icon: None,
+                filters: "{}",
+                display_options: "{}",
+                is_shared: false,
+                team_id: None,
+                position: 0,
+            },
+            None,
+        )
+        .await
+        .expect("create the view whose sort_order is read back below");
+
+        trakkt_auth::view_service::update_view(
+            db,
+            &trakkt_auth::view_service::UpdateViewParams {
+                view_id: &view.view_id,
+                name: None,
+                icon: None,
+                filters: None,
+                display_options: None,
+                is_shared: None,
+                sort_order: Some(ADJACENT_SORT_ORDER[1]),
+                team_id: None,
+                position: None,
+            },
+            None,
+        )
+        .await
+        .expect("set the view's sort_order through the service that owns it");
+
+        let views = trakkt_auth::view_service::list_views(db, WORKSPACE, USER, None)
+            .await
+            .expect("list the user's views");
+        assert_eq!(
+            views.iter().map(|v| v.sort_order).collect::<Vec<_>>(),
+            vec![ADJACENT_SORT_ORDER[1]],
+            "views.sort_order must decode at full width, like every other \
+             DOUBLE PRECISION column in this family"
+        );
+
+        let favorite = trakkt_auth::favorite_service::add_favorite(
+            db,
+            USER,
+            WORKSPACE,
+            FavoriteTarget::Project,
+            &project.project_id,
+            None,
+        )
+        .await
+        .expect("pin the project so there is a favorite row to read");
+
+        // `add_favorite` inserts a literal 0 like the other two writers, so the
+        // value comes from a statement here for the same reason.
+        db_execute!(
+            db,
+            "UPDATE favorites SET sort_order = $1 WHERE favorite_id = $2",
+            ADJACENT_SORT_ORDER[1],
+            &favorite.favorite_id
+        )
+        .expect("give the favorite a sort_order no default would produce");
+
+        let favorites = trakkt_auth::favorite_service::list_favorites(db, USER, WORKSPACE)
+            .await
+            .expect("list the user's favorites");
+        assert_eq!(
+            favorites.iter().map(|f| f.sort_order).collect::<Vec<_>>(),
+            vec![ADJACENT_SORT_ORDER[1]],
+            "favorites.sort_order must decode at full width, like every other \
+             DOUBLE PRECISION column in this family"
         );
     }
 }
