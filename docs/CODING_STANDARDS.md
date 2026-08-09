@@ -224,6 +224,10 @@ merge.
 ### Reactive Primitives
 - Never create `signal()`, `RwSignal::new()`, or `Effect::new()` inside reactive rendering closures (`move || { ... }`). They reset on every re-render and leak. Hoist all reactive primitives to component setup level (outside the view closure).
 
+### WASM Browser Tests
+- A `wasm-bindgen-test` that constructs an `Effect`, `Resource` or `LocalResource` must call `crate::wasm_test_support::boot_leptos_executor()` before it does so. All three spawn the moment they are constructed, and `any_spawner`'s executor is global and initialized once per test binary — in production by `mount_to`, which a test never calls. Without the explicit call the test passes only when some earlier test in the binary happened to initialize it first. That is an ordering dependency, it stays green until a runner picks a different order, and it has done exactly that twice.
+- Enforced in CI by the `WASM Browser Tests` job, which runs the suite as one binary and then once per module in isolation — run `scripts/wasm-test-isolated.sh` locally before pushing. It derives the module list from the source tree, so a new module is swept without anyone editing a list, and it fails rather than passing quietly when a module's filter selects no test or a test is selected by no module. What it cannot see is an ordering dependency *within* one module, since a module is still run as a whole.
+
 ### SSR / Hydration
 - Never use `Resource::new()` inside `#[cfg(target_arch = "wasm32")]` blocks (desyncs hydration IDs).
 - Gate server-only code with `#[cfg(feature = "ssr")]`.

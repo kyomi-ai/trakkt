@@ -64,6 +64,32 @@ scripts/check-migrations.sh
 
 CI runs the same script and fails the build on any mismatch.
 
+### WASM Browser Tests
+
+`crates/trakkt-ui`'s `wasm-bindgen-test` suite runs in a real headless Firefox.
+It needs Firefox and wasm-pack on your PATH; wasm-pack fetches a matching
+geckodriver itself on first run.
+
+```bash
+scripts/wasm-test-isolated.sh
+```
+
+That runs the suite as one binary and then once per module on its own. The
+per-module half is the point: `any_spawner`'s executor is initialized once per
+test binary, so a test that spawns without initializing it passes whenever some
+earlier test happened to do it first. A whole-binary run produces one order and
+only one, so on its own it cannot see that dependency at all — which is how the
+suite stayed green while the dependency was in it.
+
+Running a module by itself takes away the neighbours a test could have been
+leaning on, so a dependency that crosses a module boundary fails the check. A
+dependency contained entirely within one module will not be caught: the
+granularity is per source file, so a module's own tests still run together and
+can still lean on each other. Do not treat a green sweep as proof that a new test
+stands alone — if it spawns, call `crate::wasm_test_support::boot_leptos_executor()`
+in the test itself. See `docs/CODING_STANDARDS.md` for that rule. CI runs the
+same script.
+
 ### E2E Tests
 
 ```bash
