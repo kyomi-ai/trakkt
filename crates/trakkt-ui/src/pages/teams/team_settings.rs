@@ -768,7 +768,7 @@ mod wasm_tests {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-    use crate::wasm_test_support::{boot_leptos_executor, Gate, SaveLog};
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container, Gate, SaveLog};
 
     use super::icon_save_fixture::{gated_icon_save, ChangeLog, FixtureSave};
     use super::*;
@@ -810,26 +810,8 @@ mod wasm_tests {
         view! { <IconTrigger team=team selection=selection/> }
     }
 
-    fn make_container() -> web_sys::HtmlElement {
-        let document = web_sys::window()
-            .expect("no window")
-            .document()
-            .expect("no document");
-        let container: web_sys::HtmlElement = document
-            .create_element("div")
-            .expect("could not create a container")
-            .dyn_into()
-            .expect("container is not an html element");
-        document
-            .body()
-            .expect("no body")
-            .append_child(&container)
-            .expect("could not attach the container");
-        container
-    }
-
     fn mount_probe(saver: FixtureSave) -> (web_sys::HtmlElement, impl Sized) {
-        let container = make_container();
+        let container = mount_container();
         let handle = leptos::mount::mount_to(container.clone(), move || {
             view! {
                 <crate::components::toast::ToastProvider>

@@ -161,3 +161,225 @@ impl SaveLog {
         self.finished.get()
     }
 }
+
+// ── Standing in for the server, so a page can be mounted ────────────────────
+
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
+
+/// A page's server functions, answered from a table the test writes.
+///
+/// # What this is for
+///
+/// Most of what this crate tests is a function that was extracted so it could be
+/// called directly. That leaves the thing nothing calls directly: the page
+/// component, and specifically whether it *wires up* the helpers it is supposed
+/// to. A page cannot be mounted without its server functions resolving, so
+/// covering the wiring means standing in for the server — which is what this
+/// does.
+///
+/// TRA-9994 is the ticket that wanted it: `ActivityPage` called
+/// `refetch_on_live_activity`, three tests covered that function, and deleting
+/// the call from the page left the whole wasm suite green. Only clippy's
+/// `dead_code` noticed, and only for as long as the function had no other
+/// caller.
+///
+/// # How it works
+///
+/// Leptos server functions reach the network through one call: `gloo-net` binds
+/// the global `fetch` (`gloo-net-0.6.0/src/http/request.rs`) and
+/// `server_fn::client::browser::BrowserClient` sends every request through it.
+/// So replacing `globalThis.fetch` for the lifetime of this value intercepts all
+/// of them, without the page or the server function knowing anything has
+/// changed. Dropping it puts the original back — see the `Drop` impl for the
+/// one case that does not cover.
+///
+/// A route matches when the request URL *contains* its key, so the key is just
+/// the server function's name. The full path is not something to hard-code:
+/// `#[server]` builds it as prefix + module path + function name + an xxh64 of
+/// `CARGO_MANIFEST_DIR` and `module_path!()`
+/// (`server_fn_macro-0.8.10/src/lib.rs`), so it moves whenever the function
+/// changes module or the crate changes directory.
+///
+/// The body is the JSON the server function returns on success: for
+/// `Result<Vec<T>, ServerFnError>`, `Ok(vec![])` is the body `[]`. That is the
+/// whole protocol — `server_fn`'s `Http<PostUrl, Json>` treats any 2xx body as
+/// the serialized `Ok` value and only reads status 400–599 as an error
+/// (`server_fn-0.8.12/src/lib.rs`, `Protocol::run_client`).
+///
+/// # Using it
+///
+/// ```ignore
+/// let server = stub_server_fns(&[
+///     ("list_workspace_activities", "[]"),
+///     ("list_teams", "[]"),
+///     ("list_workspace_members", "[]"),
+/// ]);
+///
+/// let handle = leptos::mount::mount_to(container.clone(), || view! { <ActivityPage/> });
+/// TimeoutFuture::new(200).await;
+///
+/// assert_eq!(server.calls_to("list_workspace_activities"), 1);
+/// assert!(server.unmatched().is_empty(), "{:?}", server.unmatched());
+/// ```
+///
+/// Assert on [`StubbedServer::unmatched`]. A request this table has no answer
+/// for is *not* failed here — it is answered with an undecodable body, because a
+/// panic raised inside a `fetch` callback surfaces as a rejected promise, which
+/// the page under test catches and logs, and the test then passes having proven
+/// nothing. Recording it and letting the test assert on it is what makes a
+/// missing route loud.
+pub struct StubbedServer {
+    /// The `fetch` that was installed before this value replaced it, restored on
+    /// drop. Held as a `JsValue` rather than a function type because a page that
+    /// never fetches is entitled to a global with no `fetch` at all.
+    previous_fetch: JsValue,
+    log: Rc<RefCell<CallLog>>,
+    /// Kept alive because JS holds a reference to it. Dropping the `Closure`
+    /// while `globalThis.fetch` still points at it would leave a dangling
+    /// callback.
+    _handler: Closure<dyn FnMut(JsValue) -> js_sys::Promise>,
+}
+
+#[derive(Default)]
+struct CallLog {
+    /// Every URL requested, in order, including unmatched ones.
+    urls: Vec<String>,
+    /// The URLs no route answered.
+    unmatched: Vec<String>,
+}
+
+/// Answer `routes` for as long as the returned value is alive.
+///
+/// Each route is `(substring of the request URL, JSON response body)`. See
+/// [`StubbedServer`] for what the body has to be and why the key is a substring.
+pub fn stub_server_fns(routes: &[(&str, &str)]) -> StubbedServer {
+    let routes: Vec<(String, String)> = routes
+        .iter()
+        .map(|(path, body)| ((*path).to_owned(), (*body).to_owned()))
+        .collect();
+
+    let log = Rc::new(RefCell::new(CallLog::default()));
+    let handler_log = Rc::clone(&log);
+
+    let handler = Closure::wrap(Box::new(move |request: JsValue| -> js_sys::Promise {
+        // `fetch` also accepts a URL string, but every caller that matters here
+        // is `gloo-net`, which always passes a `Request`. Anything else means
+        // the dispatch path changed underneath this harness, so it is recorded
+        // as unmatched rather than guessed at.
+        let url = match request.dyn_ref::<web_sys::Request>() {
+            Some(request) => request.url(),
+            None => "<fetch called with something other than a Request>".to_owned(),
+        };
+
+        let body = routes
+            .iter()
+            .find(|(path, _)| url.contains(path.as_str()))
+            .map(|(_, body)| body.clone());
+
+        {
+            let mut log = handler_log.borrow_mut();
+            log.urls.push(url.clone());
+            if body.is_none() {
+                log.unmatched.push(url);
+            }
+        }
+
+        // An unmatched route falls back to the empty string, which is not a
+        // fallback that lets a missing route pass for a working one: the empty
+        // string is not valid JSON for any server function's output, so the
+        // caller takes its error path immediately instead of waiting on a
+        // request nothing will answer. That keeps the test failing on its own
+        // assertion rather than on a timeout, and `unmatched` — which the caller
+        // is told to assert on — is what names the cause.
+        //
+        // Spelled with `unwrap_or_default` rather than a `match` because
+        // `clippy::manual_unwrap_or_default` rejects the `match`, and this
+        // crate does not suppress lints.
+        let body = body.unwrap_or_default();
+
+        let response = web_sys::Response::new_with_opt_str(Some(&body))
+            .expect("building the canned Response the stubbed fetch resolves to");
+        js_sys::Promise::resolve(&JsValue::from(response))
+    }) as Box<dyn FnMut(JsValue) -> js_sys::Promise>);
+
+    let global = js_sys::global();
+    let key = JsValue::from_str("fetch");
+    let previous_fetch = js_sys::Reflect::get(&global, &key)
+        .expect("reading the global `fetch` this stub is about to replace");
+    js_sys::Reflect::set(&global, &key, handler.as_ref())
+        .expect("installing the stubbed `fetch` on the global object");
+
+    StubbedServer {
+        previous_fetch,
+        log,
+        _handler: handler,
+    }
+}
+
+impl StubbedServer {
+    /// How many requests have been made to the server function whose path
+    /// contains `path`.
+    pub fn calls_to(&self, path: &str) -> usize {
+        self.log
+            .borrow()
+            .urls
+            .iter()
+            .filter(|url| url.contains(path))
+            .count()
+    }
+
+    /// Every request no route answered. Assert this is empty: a route that
+    /// stopped matching turns a page-mount test into one that proves nothing.
+    pub fn unmatched(&self) -> Vec<String> {
+        self.log.borrow().unmatched.clone()
+    }
+}
+
+impl Drop for StubbedServer {
+    fn drop(&mut self) {
+        // Every test in this crate shares one page and therefore one global
+        // object, so a stub left installed would answer the next test's
+        // requests. Restoring here rather than asking each test to is what keeps
+        // that from being something anyone has to remember.
+        //
+        // This covers a test that returns, including one that fails an assertion
+        // it reaches — not one that panics: the workspace sets `panic = "abort"`
+        // and wasm32's own default is the same, so no destructor runs on that
+        // path. The narrower guarantee is enough because a panicking test is
+        // already a failing build, but it does mean a leaked stub is a possible
+        // second symptom of a first failure rather than an independent one.
+        let global = js_sys::global();
+        let key = JsValue::from_str("fetch");
+        js_sys::Reflect::set(&global, &key, &self.previous_fetch)
+            .expect("restoring the global `fetch` this stub replaced");
+    }
+}
+
+// ── Somewhere to mount ──────────────────────────────────────────────────────
+
+/// A fresh `<div>` attached to the document, for `leptos::mount::mount_to`.
+///
+/// Attached rather than detached because a mounted subtree only lays out, and
+/// only receives events, inside the live document.
+///
+/// The caller owns it: drop the mount handle and call `.remove()` when the test
+/// is done, so the next test in the binary does not mount alongside this one's
+/// leftovers.
+pub fn mount_container() -> web_sys::HtmlElement {
+    let document = web_sys::window()
+        .expect("the browser test runner must provide a window")
+        .document()
+        .expect("the browser test runner must provide a document");
+    let container: web_sys::HtmlElement = document
+        .create_element("div")
+        .expect("creating a container to mount into")
+        .dyn_into()
+        .expect("the container element is an HtmlElement");
+    document
+        .body()
+        .expect("the document must have a body to attach the container to")
+        .append_child(&container)
+        .expect("attaching the container to the document body");
+    container
+}

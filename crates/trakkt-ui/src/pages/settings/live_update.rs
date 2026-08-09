@@ -191,7 +191,7 @@ mod latency_tests {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-    use crate::wasm_test_support::boot_leptos_executor;
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
 
     use super::*;
 
@@ -234,24 +234,6 @@ mod latency_tests {
         view! { <input class="probe" prop:value=text/> }
     }
 
-    fn make_container() -> web_sys::HtmlElement {
-        let document = web_sys::window()
-            .expect("no window")
-            .document()
-            .expect("no document");
-        let container: web_sys::HtmlElement = document
-            .create_element("div")
-            .expect("could not create a container")
-            .dyn_into()
-            .expect("container is not an html element");
-        document
-            .body()
-            .expect("no body")
-            .append_child(&container)
-            .expect("could not attach the container");
-        container
-    }
-
     fn field_in(container: &web_sys::HtmlElement) -> web_sys::HtmlInputElement {
         container
             .query_selector("input.probe")
@@ -282,7 +264,7 @@ mod latency_tests {
     /// shape: `Transition` + `Suspend`, a hoisted signal, and the snapshot
     /// folded in from inside the suspended body.
     async fn drive_resource(millis: Option<u32>) -> Outcome {
-        let container = make_container();
+        let container = mount_container();
         let version = RwSignal::new(0u32);
         let resource = Resource::new(
             move || version.get(),

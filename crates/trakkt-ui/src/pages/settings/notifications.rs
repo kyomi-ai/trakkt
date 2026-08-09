@@ -602,42 +602,12 @@ mod wasm_tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     use crate::cache::store::SyncStore;
-    use crate::wasm_test_support::boot_leptos_executor;
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
 
     use super::save_fixture::{FixtureSave, Gate, SaveLog, gated_save};
     use super::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
-
-    /// `LocalResource::new` takes no source argument, unlike the `Resource::new`
-    /// every sibling page uses: it re-runs on whatever its fetcher reads
-    /// synchronously. `NotificationsPage` above rests entirely on that, and a
-    /// fetcher that did not re-track would leave the store's
-    /// `notification_preferences` counter a signal with no subscriber — the
-    /// exact defect the counter exists to fix, and one that every other test in
-    /// this repository would stay green through. So the behaviour is pinned here
-    /// rather than assumed.
-    ///
-    /// `pub(super)` so `row_owned_action_probe` can mount into one too, rather
-    /// than this file growing a second copy of it.
-    pub(super) fn make_container() -> web_sys::HtmlElement {
-        use wasm_bindgen::JsCast;
-        let document = web_sys::window()
-            .expect("no window")
-            .document()
-            .expect("no document");
-        let container: web_sys::HtmlElement = document
-            .create_element("div")
-            .expect("could not create a container")
-            .dyn_into()
-            .expect("container is not an html element");
-        document
-            .body()
-            .expect("no body")
-            .append_child(&container)
-            .expect("could not attach the container");
-        container
-    }
 
     /// What the switch is telling the user and a screen reader.
     fn aria_checked(container: &web_sys::HtmlElement) -> Option<String> {
@@ -673,7 +643,7 @@ mod wasm_tests {
         let owner = Owner::new();
         owner.set();
 
-        let container = make_container();
+        let container = mount_container();
         let version = RwSignal::new(0u32);
         let resource = LocalResource::new(move || {
             let v = version.get();
@@ -774,7 +744,7 @@ mod wasm_tests {
         let owner = Owner::new();
         owner.set();
 
-        let container = make_container();
+        let container = mount_container();
         let version = RwSignal::new(0u32);
         let resource = LocalResource::new(move || {
             let v = version.get();
@@ -843,7 +813,7 @@ mod wasm_tests {
         let owner = Owner::new();
         owner.set();
 
-        let container = make_container();
+        let container = mount_container();
         let row = ToggleRow::build(EVENT_TOGGLES)[0];
         let handle = leptos::mount::mount_to(container.clone(), move || {
             view! { <PreferenceToggle row=row /> }
@@ -938,7 +908,7 @@ mod wasm_tests {
         version: RwSignal<u32>,
         rebuilds: RwSignal<u32>,
     ) -> (web_sys::HtmlElement, impl Sized) {
-        let container = make_container();
+        let container = mount_container();
         let handle = leptos::mount::mount_to(container.clone(), move || {
             view! {
                 <crate::components::toast::ToastProvider>
@@ -1107,6 +1077,14 @@ mod wasm_tests {
         container.remove();
     }
 
+    /// `LocalResource::new` takes no source argument, unlike the `Resource::new`
+    /// every sibling page uses: it re-runs on whatever its fetcher reads
+    /// synchronously. `NotificationsPage` above rests entirely on that, and a
+    /// fetcher that did not re-track would leave the store's
+    /// `notification_preferences` counter a signal with no subscriber — the
+    /// exact defect the counter exists to fix, and one that every other test in
+    /// this repository would stay green through. So the behaviour is pinned here
+    /// rather than assumed.
     #[wasm_bindgen_test]
     async fn a_local_resource_refetches_when_a_signal_its_fetcher_reads_bumps() {
         boot_leptos_executor();
@@ -1241,10 +1219,10 @@ mod row_owned_save_probe {
     use send_wrapper::SendWrapper;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-    use crate::wasm_test_support::boot_leptos_executor;
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
 
     use super::save_fixture::{FixtureSave, Gate, SaveLog, gated_save};
-    use super::wasm_tests::{click, make_container};
+    use super::wasm_tests::click;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -1397,7 +1375,7 @@ mod row_owned_save_probe {
     /// that skipped the dispatch, the rebuild or the disposal would hand back a
     /// tidy-looking [`Outcome`] that measured nothing at all.
     async fn drive(hoist_watcher: bool) -> Outcome {
-        let container = make_container();
+        let container = mount_container();
         let gate = Gate::default();
         let log = SaveLog::default();
         let probe = Instruments::default();

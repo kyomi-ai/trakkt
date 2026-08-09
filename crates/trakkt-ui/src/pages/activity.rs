@@ -1079,7 +1079,7 @@ mod wasm_tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     use crate::cache::store::SyncStore;
-    use crate::wasm_test_support::boot_leptos_executor;
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container, stub_server_fns};
 
     use super::*;
 
@@ -1184,5 +1184,102 @@ mod wasm_tests {
             "with no store there is no counter to subscribe to, so there is nothing to \
              refetch on"
         );
+    }
+
+    // ── The page's own wiring ───────────────────────────────────────────────
+    //
+    // Everything above asks `refetch_on_live_activity` whether it works. This
+    // asks `ActivityPage` whether it uses it, which is a different question and
+    // was the unasked one: deleting the call from the page left the whole suite
+    // green, and only clippy's `dead_code` objected — a guard that evaporates
+    // the moment the function acquires any second caller.
+    //
+    // So this mounts the real `ActivityPage`, with no shim standing in for it,
+    // and watches the wire it actually talks over. See `stub_server_fns` for how
+    // the server functions are answered.
+
+    /// How many times the mounted page asked the server for activities.
+    ///
+    /// The page's own request is the observation on purpose. Every cheaper probe
+    /// — a counting closure, a rebuilt source signal, a shim component — is
+    /// something the *test* wired up, and would keep passing with the page's own
+    /// wiring cut. Counting requests leaves nothing for the test to get right on
+    /// the page's behalf.
+    ///
+    /// What this pins is that a live frame reaches the server at all. It does
+    /// not pin which [`FetchMode`] the page asks in: `Replace` and
+    /// `MergePageOne` differ only in what they do to the rows already held, and
+    /// both send the same request — same filters, `offset` 0 — so no observation
+    /// of the wire can tell them apart. That distinction is covered where it is
+    /// decided, by `apply_fetched_page` in `merge_tests` above.
+    const ACTIVITIES_FN: &str = "list_workspace_activities";
+
+    #[wasm_bindgen_test]
+    async fn the_mounted_page_refetches_when_a_live_activity_frame_arrives() {
+        boot_leptos_executor();
+
+        let server = stub_server_fns(&[
+            // The feed itself, plus the two dropdowns' `Resource`s. All three
+            // answer with an empty list: what the page renders is not what is
+            // under test, and an empty feed still issues every request.
+            (ACTIVITIES_FN, "[]"),
+            ("list_teams", "[]"),
+            ("list_workspace_members", "[]"),
+        ]);
+
+        let container = mount_container();
+        let store = SyncStore::new();
+
+        // `Layout` provides the store to every authenticated route; here the
+        // mount owner does, so `use_context::<SyncStore>()` inside the page
+        // resolves the same way it does in production.
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            provide_context(store);
+            view! { <ActivityPage/> }
+        });
+
+        // Long enough for the initial-load effect to have issued its request and
+        // for the stub to have answered it — the page refuses to start a second
+        // fetch while one is in flight (`loading`), so a bump landing before this
+        // settles would be dropped and the assertion below would blame the
+        // wiring for a race in the test.
+        TimeoutFuture::new(300).await;
+        assert_eq!(
+            server.calls_to(ACTIVITIES_FN),
+            1,
+            "the page did not load its feed on mount, so nothing below this line \
+             measures the live-refetch wiring — fix this first"
+        );
+
+        // Somebody else records an activity: the sync engine bumps this counter
+        // (`cache/apply.rs` discards the frame's payload and bumps), which is the
+        // only signal this page gets that anything happened.
+        store.bump_activities_version();
+        TimeoutFuture::new(300).await;
+
+        assert_eq!(
+            server.calls_to(ACTIVITIES_FN),
+            2,
+            "`ActivityPage` did not refetch when the activity counter moved, so \
+             the feed will sit at whatever it read on mount until the user \
+             navigates away and back — the TRA-9987 bug, restored.\n\
+             The page reads its rows through `list_workspace_activities` rather \
+             than from the sync store, so this counter is the only thing that can \
+             tell it another user, another tab or an agent recorded something. \
+             `refetch_on_live_activity` is what subscribes to it; check that \
+             `ActivityPage` still calls it, and still passes it \
+             `use_context::<SyncStore>()` rather than `None`."
+        );
+
+        assert!(
+            server.unmatched().is_empty(),
+            "the page requested {:?}, which the stub table has no answer for. A \
+             server function that was renamed, or a new one added to this page, \
+             makes the counts above measure something other than what they name",
+            server.unmatched()
+        );
+
+        drop(handle);
+        container.remove();
     }
 }
