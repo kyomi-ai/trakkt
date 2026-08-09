@@ -734,7 +734,8 @@ mod test_support {
 
     /// The snapshot `update_workspace_name`, `update_workspace_settings` and
     /// `set_workspace_default_team` all send — the shape
-    /// `WorkspaceSnapshotRow::into_sync_value` builds.
+    /// `WorkspaceSnapshotRow::into_snapshot` builds, encoded from
+    /// `trakkt_types::models::WorkspaceSettingsSnapshot`.
     #[cfg(target_arch = "wasm32")]
     pub(super) fn workspace_settings_json() -> serde_json::Value {
         serde_json::json!({

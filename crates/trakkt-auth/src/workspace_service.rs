@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sync_log_service;
 use crate::websocket::WebSocketManager;
+use trakkt_types::models::WorkspaceSettingsSnapshot;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 /// Get all active workspace user memberships for a workspace.
@@ -136,21 +137,31 @@ const WORKSPACE_SNAPSHOT_SQL: &str = r#"SELECT workspace_id,
 impl WorkspaceSnapshotRow {
     /// The `workspace_settings` entity as the sync protocol carries it.
     ///
+    /// Returns the typed [`WorkspaceSettingsSnapshot`] rather than the
+    /// `serde_json::json!` literal this used to build. The literal was the
+    /// reason `workspace_settings` was the one bootstrap entity with no Rust
+    /// type behind it, and therefore the one whose `entity_id` could only be
+    /// recovered by looking up a string key — see
+    /// [`trakkt_types::sync::SyncEntity`], which this type now implements.
+    /// [`workspace_settings_snapshot_in_tx`] encodes it back to a
+    /// `serde_json::Value` for the `sync_log` payload, so the shape on the wire
+    /// is unchanged: the same five keys, with the same values.
+    ///
     /// `Err` only for a `settings` column that is not parseable JSON, which is
     /// a corrupt row rather than an absent one.
-    fn into_sync_value(self) -> trakkt_core::Result<serde_json::Value> {
-        let settings_json: Option<serde_json::Value> = match self.settings.as_deref() {
+    fn into_snapshot(self) -> trakkt_core::Result<WorkspaceSettingsSnapshot> {
+        let settings: Option<serde_json::Value> = match self.settings.as_deref() {
             Some(settings) => Some(serde_json::from_str(settings)?),
             None => None,
         };
 
-        Ok(serde_json::json!({
-            "workspace_id": self.workspace_id,
-            "name": self.name,
-            "settings": settings_json,
-            "default_team_id": self.default_team_id,
-            "updated_at": self.updated_at,
-        }))
+        Ok(WorkspaceSettingsSnapshot {
+            workspace_id: self.workspace_id,
+            name: self.name,
+            settings,
+            default_team_id: self.default_team_id,
+            updated_at: self.updated_at,
+        })
     }
 }
 
@@ -210,11 +221,15 @@ async fn workspace_settings_snapshot_in_tx(
         )));
     };
 
-    row.into_sync_value()
+    // The `sync_log` payload column is JSON, so the typed snapshot is encoded
+    // here rather than at each of the three callers. `to_value` on a struct of
+    // strings and an already-parsed `Value` has no failing case, but it is not
+    // an infallible signature, so the error propagates like every other.
+    Ok(serde_json::to_value(row.into_snapshot()?)?)
 }
 
-/// Return a workspace settings snapshot (name, settings, updated_at) as a
-/// JSON value for the sync bootstrap protocol.
+/// Return the workspace's [`WorkspaceSettingsSnapshot`] for the sync bootstrap
+/// protocol.
 ///
 /// `Ok(None)` means the workspace has no row: a real answer, and one the
 /// bootstrap streams as "this workspace has no settings entity". `Err` means
@@ -228,7 +243,7 @@ async fn workspace_settings_snapshot_in_tx(
 pub async fn get_workspace_settings_for_sync(
     pool: &DbPool,
     workspace_id: &str,
-) -> trakkt_core::Result<Option<serde_json::Value>> {
+) -> trakkt_core::Result<Option<WorkspaceSettingsSnapshot>> {
     let row = trakkt_core::db_fetch_optional!(
         pool,
         WorkspaceSnapshotRow,
@@ -236,7 +251,7 @@ pub async fn get_workspace_settings_for_sync(
         workspace_id
     )?;
 
-    row.map(WorkspaceSnapshotRow::into_sync_value).transpose()
+    row.map(WorkspaceSnapshotRow::into_snapshot).transpose()
 }
 
 /// Update workspace display name.
