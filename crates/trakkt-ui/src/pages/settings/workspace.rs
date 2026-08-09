@@ -121,14 +121,14 @@ pub fn WorkspacePage() -> impl IntoView {
     // or changed its auto-archive default. Without it the page shows whatever it
     // read on mount until it is navigated away from and back.
     //
-    // The counter is resolved once, here, and not inside the source closure.
-    // `workspace_settings_version` builds a fresh `Signal` wrapper on every
-    // call, so calling it from a closure that re-runs allocates another
-    // owner-registered arena item per run.
+    // The counter is resolved once, here, and moved into the source closure.
+    // `as_ref` because `workspace_settings_version` returns an `ArcSignal<u32>`,
+    // which is `Clone` and not `Copy` — `Option::map` would consume the capture.
+    // The `get()` inside the closure is what tracks, as it was before.
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let settings_version = sync_store.map(|s| s.workspace_settings_version());
     let settings = Resource::new(
-        move || settings_version.map(|v| v.get()).unwrap_or(0),
+        move || settings_version.as_ref().map(|v| v.get()).unwrap_or(0),
         |_| get_workspace_settings(),
     );
 

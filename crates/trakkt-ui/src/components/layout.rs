@@ -1392,9 +1392,13 @@ fn SidebarInboxNavItem() -> impl IntoView {
 
     let sync_store = use_context::<SyncStore>();
     // Resolved here, at component setup, rather than inside the closure below:
-    // every `SyncStore` getter builds a fresh arena-registered `Signal` wrapper
-    // on each call, so calling one from a closure that re-runs abandons a
-    // wrapper per evaluation. See the getter contract on `SyncStore`.
+    // the eight collection getters build a fresh arena-registered `Signal`
+    // wrapper on each call, so calling one from a closure that re-runs abandons
+    // a wrapper per evaluation and is one refactor from the disposed-value
+    // panic. This is the site TRA-9995 found in that shape. The nine
+    // `*_version()` counters no longer behave this way — TRA-9996 moved them to
+    // `ArcSignal`, which has no owner — so the rule is now specific to the
+    // collections. See the getter notes on `SyncStore`, and [[TRA-9998]].
     let notifications = sync_store.map(|store| store.notifications());
     let unread_count = Signal::derive(move || {
         notifications

@@ -371,16 +371,16 @@ fn group_activities(activities: &[WorkspaceActivity]) -> GroupedActivities {
 /// something. Without it the feed shows what it read on mount until it is
 /// navigated away from and back.
 ///
-/// # The counter is resolved here, never inside the effect
+/// # The counter is resolved here, and owned by the effect
 ///
-/// [`SyncStore::activities_version`] builds a fresh `Signal` wrapper on every
-/// call, and each wrapper is an owner-registered arena item. Calling it from a
-/// closure that re-runs allocates another one per run, under whichever owner
-/// happens to be current at the time — and reading one after its owner is
-/// disposed panics. That is the shape TRA-9977 was reverted for, so the getter
-/// is called once, before the effect exists. The rule is recorded on this
-/// function rather than only at its call site, so it survives an edit made
-/// here in isolation.
+/// [`SyncStore::activities_version`] returns an `ArcSignal<u32>`, which holds
+/// its inner signal directly rather than through the reactive arena, so unlike
+/// the store's collection getters it has no owner and cannot be disposed —
+/// resolving it inside the effect would be correct too. It is still resolved
+/// once, here, because the `let ... else` is how "no store, nothing to wire" is
+/// expressed, and because one resolution reads more plainly than one per run.
+/// See the getter notes on [`SyncStore`] for why this stopped being a rule and
+/// became a preference (TRA-9996).
 ///
 /// # Why `store` is optional
 ///

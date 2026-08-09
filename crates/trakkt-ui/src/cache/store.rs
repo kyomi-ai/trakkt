@@ -95,21 +95,64 @@ struct SyncStoreInner {
 /// Provide at the `Layout` level with [`provide_context`] and access on any
 /// child page with `expect_context::<SyncStore>()`.
 ///
-/// # Contract for every getter on this type
+/// # Two kinds of getter, and only one of them still has a contract
 ///
-/// **Resolve a getter once, at component setup. Never bind one inside a closure
-/// that re-runs.**
+/// Every read-only getter below returns a **newly built** wrapper on each call.
+/// The underlying value is a long-lived `ArcRwSignal` held by this store; what
+/// differs between the two groups is the *wrapper type* handed back, and that
+/// difference is what decides whether a caller has to be careful.
 ///
-/// Every read-only getter below — the eight collection getters, `initialized()`,
-/// and all nine `*_version()` counters — returns a **newly built** [`Signal`] on
-/// each call.
-/// The underlying value is a long-lived `ArcRwSignal` held by this store, but
-/// the `Signal` handed back is a fresh `Signal::derive` wrapper, and a `Signal`
-/// is an arena item registered with **whichever owner is current at the moment
-/// of the call** (`reactive_graph-0.2.14`, `ArenaItem::new_with_storage` →
-/// `Owner::register`). When that owner is cleaned up, the arena slot is removed
-/// (`Owner::cleanup`), and any later read of that wrapper panics with "you tried
-/// to access a reactive value ... but it has already been disposed".
+/// ## The nine `*_version()` counters return [`ArcSignal`] — no contract needed
+///
+/// [`ArcSignal`] holds its `SignalTypes` **inline** (`reactive_graph-0.2.14`,
+/// `wrappers.rs`: `struct ArcSignal { inner: SignalTypes<T, S> }`). There is no
+/// `ArenaItem`, no `Owner::register`, and no `impl Dispose for ArcSignal`
+/// anywhere in the crate, so there is nothing an owner cleanup can take away.
+/// A counter resolved anywhere — inside an effect body, inside a memo, inside a
+/// component a `Suspense` boundary rebuilds — keeps reading correctly for as
+/// long as any clone of it is alive. **Resolve one wherever it is convenient.**
+///
+/// That is the point of TRA-9996. The hazard below used to apply to these too,
+/// and reasoning about which call sites were exposed to it cost five review
+/// cycles (#282 → reverted by #283; TRA-9977; TRA-9987; TRA-9991, whose premise
+/// was wrong and had to be re-derived from `reactive_graph` source twice;
+/// TRA-9995). Changing the type removed the question rather than answering it
+/// again.
+///
+/// Tracking is unaffected by the change. Both wrappers reach the identical
+/// `SignalTypes::DerivedSignal(Arc<dyn Fn() -> T>)` and establish the
+/// dependency by *calling* it — `Track::track` is `DerivedSignal(i) => i()` and
+/// `ReadUntracked::custom_try_read` is `DerivedSignal(i) => Owned(i())` on both
+/// types. The only difference is whether that `Arc` is reached through an arena
+/// slot (`Signal`) or directly (`ArcSignal`). Cloning an `ArcSignal` clones the
+/// `Arc`, not the closure, so every clone tracks the same node; a clone is not
+/// a reactive operation and taking one outside a closure rather than inside it
+/// cannot change what the closure tracks.
+///
+/// `ArcSignal` is `Clone` but **not** `Copy`, which is the one thing call sites
+/// notice. An `Option<ArcSignal<u32>>` held at component setup and read from a
+/// closure wants `as_ref()`, because `Option::map` consumes:
+///
+/// ```ignore
+/// let version = sync_store.map(|s| s.activities_version());
+/// let source = move || (team_key.clone(), version.as_ref().map(|v| v.get()).unwrap_or(0));
+/// ```
+///
+/// That borrows the capture on each run and reads through it. It is not a
+/// correctness requirement — an explicit `.clone()` would track identically —
+/// it is just the form with no allocation and nothing to explain.
+///
+/// ## The eight collection getters and `initialized()` return [`Signal`] — contract applies
+///
+/// **Resolve one of those once, at component setup. Never bind one inside a
+/// closure that re-runs.**
+///
+/// A [`Signal`] holds `inner: ArenaItem<SignalTypes<T, S>, S>` and is registered
+/// with **whichever owner is current at the moment of the call**
+/// (`ArenaItem::new_with_storage` → `Owner::register`). When that owner is
+/// cleaned up the arena slot is removed (`Owner::cleanup`), and any later read
+/// panics with "you tried to access a reactive value ... but it has already been
+/// disposed".
 ///
 /// The owner does not have to be *torn down* for this to happen. `Effect` and
 /// `Memo` both call `Owner::with_cleanup` on **every re-run**
@@ -119,25 +162,40 @@ struct SyncStoreInner {
 /// A wrapper that outlives its resolution point — stored in a struct, captured
 /// by a longer-lived closure, or passed as a component prop — is the shape that
 /// panicked `/settings/notifications` and `/settings/workspace` and forced the
-/// revert of #282.
+/// revert of #282, and the shape TRA-9995 found live in
+/// `components/layout.rs`'s inbox badge.
 ///
-/// Reading a getter *inline* (`store.foo_version().get()`, wrapper built and
-/// consumed in one expression) does not panic, because the wrapper never
-/// outlives the expression — but it abandons one arena item per evaluation and
-/// is one refactor away from the panicking shape, so it is not the form to
-/// reach for either.
+/// Reading one *inline* (`store.projects().get()`, wrapper built and consumed in
+/// one expression) does not panic, because the wrapper never outlives the
+/// expression — but it abandons one arena item per evaluation and is one
+/// refactor away from the panicking shape, so it is not the form to reach for
+/// either.
 ///
-/// The safe form, used by every `*_version()` call site in `pages/` and
-/// enforced there by `no_page_resolves_a_version_counter_inline`:
+/// Giving these the same treatment as the counters is [[TRA-9998]]. Until that
+/// lands, this half of the type is the half a reader has to be careful with.
 ///
-/// ```ignore
-/// // at component setup, outside every closure:
-/// let version = sync_store.map(|s| s.activities_version());
-/// // inside the closure that re-runs, read the already-built Signal:
-/// let source = move || (team_key.clone(), version.map(|v| v.get()).unwrap_or(0));
-/// ```
+/// ## Why nothing scans `pages/` for this any more
 ///
-/// Each claim above is checked by the tests in this module's `wasm_tests`.
+/// TRA-9991 added a source-text guard, `no_page_resolves_a_version_counter_inline`,
+/// that failed the build if a file under `src/pages` or `src/components`
+/// contained `_version().get(` (or `.read(`/`.with(`/`.track(`). TRA-9996
+/// removed it: with [`ArcSignal`] there is nothing left for it to guard on the
+/// counters, and a check that cannot fail reads as coverage without being any.
+///
+/// It is worth being precise about what that removal did **not** cost, because
+/// the obvious worry is that the collections just lost their cover. They never
+/// had it. The guard matched on the literal substring `_version()`, so it only
+/// ever saw the nine counters — never `projects()`, `teams()`, `notifications()`
+/// or the other five, which is recorded as [[TRA-10060]] and is how TRA-9995's
+/// live instance in `components/layout.rs` reached `main` through a green
+/// build. So the collections are exactly as unguarded now as they were before,
+/// and [[TRA-9998]] inherits an honest zero rather than a guard it might have
+/// mistaken for partial protection. If TRA-9998 converts them, no guard needs
+/// writing; if it decides not to, one that actually matches the collection
+/// getters would have to be written from scratch.
+///
+/// Each claim above is checked by the tests in this module's `wasm_tests`,
+/// including the `should_panic` one that holds the collection half to it.
 #[derive(Clone, Copy)]
 pub struct SyncStore {
     inner: StoredValue<SendWrapper<SyncStoreInner>>,
@@ -253,9 +311,9 @@ impl SyncStore {
     ///
     /// The issue timeline component uses this as a reactive dependency to
     /// trigger a refetch of activities from the server.
-    pub fn activities_version(&self) -> Signal<u32> {
+    pub fn activities_version(&self) -> ArcSignal<u32> {
         let sig = self.inner.with_value(|inner| inner.activities_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the activities version counter.
@@ -272,9 +330,9 @@ impl SyncStore {
     ///
     /// The relations section component uses this as a reactive dependency to
     /// trigger a refetch of relations from the server.
-    pub fn relations_version(&self) -> Signal<u32> {
+    pub fn relations_version(&self) -> ArcSignal<u32> {
         let sig = self.inner.with_value(|inner| inner.relations_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the relations version counter.
@@ -291,9 +349,9 @@ impl SyncStore {
     ///
     /// The issue detail page uses this as a reactive dependency to trigger
     /// a re-read of comments from IndexedDB.
-    pub fn comments_version(&self) -> Signal<u32> {
+    pub fn comments_version(&self) -> ArcSignal<u32> {
         let sig = self.inner.with_value(|inner| inner.comments_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the comments version counter.
@@ -313,9 +371,9 @@ impl SyncStore {
     /// issue metadata sidebar both read them straight from the `list_milestones`
     /// server function. This counter is the reactive dependency that tells them
     /// to ask again.
-    pub fn milestones_version(&self) -> Signal<u32> {
+    pub fn milestones_version(&self) -> ArcSignal<u32> {
         let sig = self.inner.with_value(|inner| inner.milestones_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the milestones version counter.
@@ -334,11 +392,11 @@ impl SyncStore {
     /// Memberships are not held in this store: the project detail page reads
     /// them straight from the `list_project_members` server function. This
     /// counter is the reactive dependency that tells it to ask again.
-    pub fn project_members_version(&self) -> Signal<u32> {
+    pub fn project_members_version(&self) -> ArcSignal<u32> {
         let sig = self
             .inner
             .with_value(|inner| inner.project_members_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the project members version counter.
@@ -357,11 +415,11 @@ impl SyncStore {
     /// Posted updates are not held in this store: the project detail page reads
     /// them straight from the `list_project_updates` server function. This
     /// counter is the reactive dependency that tells it to ask again.
-    pub fn project_updates_version(&self) -> Signal<u32> {
+    pub fn project_updates_version(&self) -> ArcSignal<u32> {
         let sig = self
             .inner
             .with_value(|inner| inner.project_updates_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the project updates version counter.
@@ -385,9 +443,9 @@ impl SyncStore {
     /// reader between them — that list changes when an attachment is uploaded or
     /// deleted (`attachment`) and when one is linked to or unlinked from an
     /// issue (`issue_attachment`).
-    pub fn attachments_version(&self) -> Signal<u32> {
+    pub fn attachments_version(&self) -> ArcSignal<u32> {
         let sig = self.inner.with_value(|inner| inner.attachments_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the attachments version counter.
@@ -409,11 +467,11 @@ impl SyncStore {
     /// function. This counter is the reactive dependency that tells it to ask
     /// again — the frames are scoped to a single user, so what it carries is
     /// that user's own change made on another tab or another device.
-    pub fn notification_preferences_version(&self) -> Signal<u32> {
+    pub fn notification_preferences_version(&self) -> ArcSignal<u32> {
         let sig = self
             .inner
             .with_value(|inner| inner.notification_preferences_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the notification preferences version counter.
@@ -433,11 +491,11 @@ impl SyncStore {
     /// `get_workspace_settings` server function rather than from this store, so
     /// this counter is the reactive dependency that tells it to ask again after
     /// another admin renames the workspace or changes its auto-archive default.
-    pub fn workspace_settings_version(&self) -> Signal<u32> {
+    pub fn workspace_settings_version(&self) -> ArcSignal<u32> {
         let sig = self
             .inner
             .with_value(|inner| inner.workspace_settings_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the workspace settings version counter.
@@ -901,7 +959,7 @@ mod wasm_tests {
     // ── Probing what `reset()` wakes ────────────────────────────────────────
 
     /// A `*_version()` getter, as a value so the nine can be walked in a loop.
-    type CounterGetter = fn(&SyncStore) -> Signal<u32>;
+    type CounterGetter = fn(&SyncStore) -> ArcSignal<u32>;
     /// A `bump_*_version()` method, likewise.
     type CounterBump = fn(&SyncStore);
 
@@ -989,7 +1047,7 @@ mod wasm_tests {
         memo: Memo<u32>,
         /// The counter read straight, bypassing the memo, so "was rewound" is
         /// observable independently of "was notified".
-        raw: Signal<u32>,
+        raw: ArcSignal<u32>,
         bump: CounterBump,
     }
 
@@ -1536,21 +1594,34 @@ mod wasm_tests {
         }
     }
 
-    /// A counter resolved under a subtree's owner dies when that subtree does.
+    /// A **collection** getter resolved under a subtree's owner dies with it.
     ///
-    /// This is the whole reason the contract exists, and the mechanism behind
-    /// the `/settings/notifications` and `/settings/workspace` panics that got
-    /// #282 reverted. `Owner::cleanup` is not only a teardown path: `Effect` and
-    /// `Memo` run their bodies through `Owner::with_cleanup`, so an owner is
-    /// cleaned up on **every re-run**. A wrapper resolved inside such a body and
-    /// kept past that run is reading a removed arena slot.
+    /// This is the mechanism behind the `/settings/notifications` and
+    /// `/settings/workspace` panics that got #282 reverted, and behind the live
+    /// instance TRA-9995 found in `components/layout.rs`. `Owner::cleanup` is
+    /// not only a teardown path: `Effect` and `Memo` run their bodies through
+    /// `Owner::with_cleanup`, so an owner is cleaned up on **every re-run**. A
+    /// [`Signal`] wrapper resolved inside such a body and kept past that run is
+    /// reading a removed arena slot.
     ///
-    /// If this test ever stops panicking, the getters no longer hand back an
-    /// owner-scoped wrapper and the contract on [`SyncStore`] is stale — rewrite
-    /// it rather than deleting this.
+    /// # Why this is on `issues()` and not on a version counter
+    ///
+    /// It was on `activities_version()` until TRA-9996. The counters now return
+    /// [`ArcSignal`], which has no arena slot to remove, so on a counter this
+    /// assertion is no longer expressible — the sibling test
+    /// `a_counter_resolved_under_a_subtree_owner_survives_that_subtrees_disposal`
+    /// is the same scenario asserting the opposite, and is what pins that
+    /// change.
+    ///
+    /// Rather than delete the panic, it moved to the eight collection getters,
+    /// which still return [`Signal`] and still carry the hazard verbatim —
+    /// [[TRA-9998]]. So this stays a test that can fail: give the collections
+    /// the `ArcSignal` treatment and it goes red, which is the correct moment to
+    /// delete it and the `Signal` half of the contract on [`SyncStore`]
+    /// together.
     #[wasm_bindgen_test]
     #[should_panic(expected = "already been disposed")]
-    fn a_counter_resolved_under_a_subtree_owner_is_disposed_with_that_subtree() {
+    fn a_collection_resolved_under_a_subtree_owner_is_disposed_with_that_subtree() {
         let root = Owner::new();
         root.set();
         let store = SyncStore::new();
@@ -1558,10 +1629,51 @@ mod wasm_tests {
         // Stands in for an effect/memo body, or a component inside a suspense
         // boundary — anything that runs under an owner it does not outlive.
         let subtree = Owner::new();
+        let collection = subtree.with(|| store.issues());
+
+        subtree.cleanup();
+        let _ = collection.get_untracked();
+    }
+
+    /// A counter resolved under a subtree's owner outlives that subtree.
+    ///
+    /// TRA-9996's fix, asserted directly, and the inverse of the test above:
+    /// same store, same scenario, a counter instead of a collection. Revert the
+    /// nine getters to `Signal<u32>` and this panics with "already been
+    /// disposed" — which is the only thing that makes it a test rather than a
+    /// restatement of the type signature.
+    ///
+    /// This is also the shape no call site has to think about any more. Before
+    /// the change, resolving a counter here and reading it after the cleanup was
+    /// the #283 production panic; the source guard that existed to keep that
+    /// shape out of `pages/` was removed with this ticket because the type now
+    /// does the work.
+    #[wasm_bindgen_test]
+    fn a_counter_resolved_under_a_subtree_owner_survives_that_subtrees_disposal() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+
+        let subtree = Owner::new();
         let counter = subtree.with(|| store.activities_version());
 
         subtree.cleanup();
-        let _ = counter.get_untracked();
+        assert_eq!(
+            counter.get_untracked(),
+            0,
+            "a counter resolved under a disposed owner must still read"
+        );
+
+        // And it is still live, not merely non-panicking: a bump after the
+        // disposal still reaches it. A wrapper that had been severed from the
+        // store would keep answering 0 here.
+        store.bump_activities_version();
+        assert_eq!(
+            counter.get_untracked(),
+            1,
+            "the counter still reads, but no longer tracks the store's signal — it was \
+             severed from its source rather than kept alive by it"
+        );
     }
 
     /// The hoisted form survives every rebuild beneath it — the fix, asserted.
@@ -1597,27 +1709,35 @@ mod wasm_tests {
         );
     }
 
-    /// Reading a getter inline does not panic — recorded so it is not re-derived.
+    /// Resolving a counter inline, per evaluation, costs nothing reactive.
     ///
-    /// `store.foo_version().get()` builds a wrapper and consumes it in the same
-    /// expression, so the wrapper is never read after its owner is cleaned up
-    /// and the panic above cannot occur. What it does do is abandon one arena
-    /// item per evaluation, under whichever owner is current at the time.
+    /// Kept from TRA-9991, where it pinned that the inline form was safe but
+    /// wasteful — it abandoned one owner-registered arena item per evaluation.
+    /// After TRA-9996 the second half is gone too: `ArcSignal::derive` registers
+    /// with no owner, so what an evaluation now leaves behind is an `Arc` that
+    /// drops at the end of the expression.
     ///
-    /// This is worth an explicit test because the inline form reads at a glance
-    /// exactly like the form that *does* panic, and the difference has twice
-    /// been mis-stated in review — in both directions. Being safe today is not a
-    /// reason to write it: binding the result instead of consuming it inline is
-    /// a one-line refactor away from the disposed-value panic, which is why
-    /// `pages/` no longer contains the shape.
+    /// It is worth keeping rather than deleting because "is the inline form
+    /// dangerous?" is the question that cost this family of tickets five cycles,
+    /// twice being answered wrongly in review in opposite directions. The answer
+    /// is now "no, and not even wasteful", and it is recorded here as an
+    /// executable claim instead of a paragraph someone has to re-derive from
+    /// `reactive_graph` source a sixth time.
+    ///
+    /// The corresponding question for the **collection** getters still has the
+    /// old answer — safe inline, one abandoned arena item per evaluation, one
+    /// refactor from the panic that
+    /// `a_collection_resolved_under_a_subtree_owner_is_disposed_with_that_subtree`
+    /// demonstrates. See [[TRA-9998]].
     #[wasm_bindgen_test]
-    fn reading_a_counter_inline_does_not_panic_but_abandons_a_wrapper_per_run() {
+    fn reading_a_counter_inline_is_safe_and_no_longer_abandons_anything() {
         let root = Owner::new();
         root.set();
         let store = SyncStore::new();
         let sync_store = Some(store);
 
-        // The pre-TRA-9991 shape, verbatim.
+        // The pre-TRA-9991 shape, verbatim. `SyncStore` is `Copy`, so the
+        // `map` here still copies the store rather than the counter.
         let inline = Signal::derive(move || {
             sync_store
                 .map(|s| s.activities_version().get())
@@ -1634,9 +1754,230 @@ mod wasm_tests {
         assert_eq!(
             subtree.with(|| inline.get_untracked()),
             1,
-            "the inline form reads correctly; it is a per-evaluation allocation, not a \
-             live panic. Any claim that it panics on its own is wrong and should be \
-             checked against this test before it costs another cycle"
+            "the inline form reads correctly. Any claim that it panics on its own is \
+             wrong and should be checked against this test before it costs another cycle"
+        );
+    }
+
+    // ── The one thing this ticket could have broken: tracking ───────────────
+
+    /// The `Resource`-source shape every page uses tracks its counter.
+    ///
+    /// `ArcSignal` is `Clone`, not `Copy`, so every call site that used to write
+    /// `version.map(|v| v.get())` over an `Option<Signal<u32>>` had to become
+    /// `version.as_ref().map(|v| v.get())` — `Option::map` consumes, and the
+    /// `Option` is now behind a shared capture rather than copied into each
+    /// evaluation.
+    ///
+    /// That rewrite compiles either way, which is the danger: `get_untracked()`,
+    /// a read hoisted out of the closure, or a value snapshotted at setup all
+    /// type-check and all silently stop the page updating. So the property is
+    /// asserted rather than reasoned about — the memo below re-runs **only** if
+    /// the closure registered a dependency on the counter during its last run.
+    ///
+    /// The negative half is the discriminating one: a bump of a *different*
+    /// counter must not move it, so a closure that tracked everything (or
+    /// tracked the store itself) fails here rather than passing vacuously.
+    #[wasm_bindgen_test]
+    fn the_as_ref_source_shape_tracks_its_own_counter_and_only_that_one() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let sync_store = Some(store);
+
+        // `AttachmentsSection`'s source, verbatim in the post-TRA-9996 shape.
+        let ws_version = sync_store.map(|s| s.attachments_version());
+        let runs = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&runs);
+        let source = Memo::new(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            ws_version.as_ref().map(|v| v.get()).unwrap_or(0)
+        });
+
+        assert_eq!(source.get_untracked(), 0);
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "fixture: the source must have run once, or this test watches nothing"
+        );
+
+        store.bump_activities_version();
+        assert_eq!(
+            source.get_untracked(),
+            0,
+            "an activity frame must not move the attachment source"
+        );
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the attachment source re-ran for a counter it does not read. Its dependency \
+             set is wider than the one counter it is meant to key on"
+        );
+
+        store.bump_attachments_version();
+        assert_eq!(
+            source.get_untracked(),
+            1,
+            "an attachment frame must move the attachment source"
+        );
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "the attachment source did not re-run when its own counter bumped, so it \
+             never subscribed to it. `as_ref().map(|v| v.get())` must read through the \
+             borrow on every run — a read hoisted out of the closure, or a \
+             `get_untracked`, compiles and leaves the page never refetching"
+        );
+    }
+
+    /// Where the clone is taken does not change what is tracked.
+    ///
+    /// The specific worry TRA-9996 was written around: `ArcSignal` is `Clone`,
+    /// so a call site has a choice about *when* to clone, and the fear was that
+    /// cloning outside a closure and moving the clone in yields a different
+    /// dependency graph from cloning inside on every run. If that were true,
+    /// this refactor could silently stop a page updating while compiling
+    /// cleanly, which is the exact failure this family of tickets exists to
+    /// prevent.
+    ///
+    /// It is not true, and the reason is structural rather than incidental.
+    /// `ArcSignal::clone` clones its `SignalTypes`, and for a derived signal
+    /// that is `Arc::clone` of the closure — not a new node
+    /// (`reactive_graph-0.2.14`, `wrappers.rs`). The dependency is registered by
+    /// *running* that closure, which both `Track::track` and
+    /// `ReadUntracked::custom_try_read` do via `DerivedSignal(i) => i()`. So the
+    /// subscription is established at read time by the observer that is active
+    /// then, and cloning — whenever it happens — is not a reactive operation at
+    /// all.
+    ///
+    /// All three forms are therefore the same graph, and this asserts it rather
+    /// than leaving the next author to re-derive it: clone-outside,
+    /// clone-inside, and the `as_ref()` borrow the call sites actually use.
+    #[wasm_bindgen_test]
+    fn cloning_a_counter_outside_or_inside_a_closure_tracks_identically() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+
+        /// Count the runs of a memo built over `body`.
+        fn watch(
+            body: impl Fn() -> u32 + Send + Sync + 'static,
+        ) -> (Memo<u32>, Arc<AtomicU32>) {
+            let runs = Arc::new(AtomicU32::new(0));
+            let counted = Arc::clone(&runs);
+            let memo = Memo::new(move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                body()
+            });
+            (memo, runs)
+        }
+
+        // (a) cloned once, outside, and moved in.
+        let outside = store.activities_version().clone();
+        let (memo_outside, runs_outside) = watch(move || outside.get());
+
+        // (b) cloned inside, on every run.
+        let source = store.activities_version();
+        let (memo_inside, runs_inside) = watch(move || {
+            let per_run = source.clone();
+            per_run.get()
+        });
+
+        // (c) the call-site form: borrowed out of an `Option` per run.
+        let borrowed = Some(store.activities_version());
+        let (memo_borrowed, runs_borrowed) =
+            watch(move || borrowed.as_ref().map(|v| v.get()).unwrap_or(0));
+
+        let poll = || {
+            (
+                memo_outside.get_untracked(),
+                memo_inside.get_untracked(),
+                memo_borrowed.get_untracked(),
+            )
+        };
+        let ran = || {
+            (
+                runs_outside.load(Ordering::Relaxed),
+                runs_inside.load(Ordering::Relaxed),
+                runs_borrowed.load(Ordering::Relaxed),
+            )
+        };
+
+        assert_eq!(poll(), (0, 0, 0));
+        assert_eq!(ran(), (1, 1, 1), "fixture: each form must have run once");
+
+        store.bump_activities_version();
+        assert_eq!(poll(), (1, 1, 1), "every form must see the bump");
+        assert_eq!(
+            ran(),
+            (2, 2, 2),
+            "the three clone placements did not produce the same dependency graph. If \
+             they ever diverge, every call site converted by TRA-9996 has to be re-read \
+             one by one, because the choice of where to clone stops being free"
+        );
+
+        store.bump_comments_version();
+        assert_eq!(
+            ran(),
+            (2, 2, 2),
+            "a form re-ran for a counter it does not read — its dependency set is wider \
+             than the one counter it reads"
+        );
+    }
+
+    /// The `track()`-only shape tracks its counter too.
+    ///
+    /// `NotificationsPage`'s `LocalResource` fetcher and `MetadataSidebar`'s
+    /// milestone `Effect` do not read the counter's *value* — they call
+    /// `track()` on it purely for the dependency. That goes down a different
+    /// path inside `reactive_graph` from `get()` (`Track::track` rather than
+    /// `Read::custom_try_read`), so it gets its own assertion rather than being
+    /// assumed to follow from the one above.
+    ///
+    /// The `if let Some(v) = &version` borrow is the part under test: it
+    /// replaced `if let Some(v) = version`, which consumed the `Option` and no
+    /// longer compiles now the payload is not `Copy`.
+    #[wasm_bindgen_test]
+    fn the_borrowed_track_shape_registers_a_dependency() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let sync_store = Some(store);
+
+        let prefs_version = sync_store.map(|s| s.notification_preferences_version());
+        let runs = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&runs);
+        let fetcher = Memo::new(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            if let Some(version) = &prefs_version {
+                version.track();
+            }
+        });
+
+        fetcher.get_untracked();
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "fixture: the fetcher must have run once, or this test watches nothing"
+        );
+
+        store.bump_workspace_settings_version();
+        fetcher.get_untracked();
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the fetcher re-ran for a counter it does not track"
+        );
+
+        store.bump_notification_preferences_version();
+        fetcher.get_untracked();
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "the fetcher did not re-run when the counter it calls `track()` on bumped. \
+             `NotificationsPage` rests entirely on that call establishing the \
+             subscription — without it the counter has no subscriber and the page never \
+             refetches"
         );
     }
 
@@ -1666,11 +2007,11 @@ mod wasm_tests {
 
         let read = move || {
             (
-                milestones.map(|v| v.get_untracked()).unwrap_or(0),
-                relations.map(|v| v.get_untracked()).unwrap_or(0),
-                activities.map(|v| v.get_untracked()).unwrap_or(0),
-                updates.map(|v| v.get_untracked()).unwrap_or(0),
-                members.map(|v| v.get_untracked()).unwrap_or(0),
+                milestones.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
+                relations.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
+                activities.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
+                updates.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
+                members.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
             )
         };
 
@@ -1712,99 +2053,5 @@ mod wasm_tests {
             (1, 1, 1, 1, 1),
             "a project_member frame must move the member-list source, and nothing else"
         );
-    }
-}
-
-/// Source-level guard for the getter contract documented on [`SyncStore`].
-///
-/// Runs on the host (`cargo test --workspace`), not in the browser — it reads
-/// source text rather than executing anything.
-#[cfg(test)]
-mod source_guard {
-    use std::path::{Path, PathBuf};
-
-    /// No page or component may resolve a `*_version()` counter inline.
-    ///
-    /// # Why a source check and not a behavioural one
-    ///
-    /// Because a behavioural one is not possible. The inline form
-    /// (`store.foo_version().get()`) and the hoisted form are
-    /// runtime-indistinguishable at a call site: the inline wrapper is consumed
-    /// in the expression that builds it, so it is never read after its owner is
-    /// cleaned up and it cannot raise the disposed-value panic.
-    /// `reading_a_counter_inline_does_not_panic_but_abandons_a_wrapper_per_run`
-    /// in this file's `wasm_tests` pins that. Reverting any of the six call
-    /// sites TRA-9991 changed leaves the whole browser suite green, which is
-    /// exactly why the shape kept coming back — nothing but review caught it.
-    ///
-    /// So what this enforces is a style rule with teeth: keep the fragile form
-    /// out of `pages/` and `components/` so the safe form is the only one anyone
-    /// copies. The inline form is one refactor away from the panicking shape —
-    /// bind its result instead of consuming it, and the wrapper starts
-    /// outliving the closure that built it.
-    ///
-    /// # What it does not catch
-    ///
-    /// The genuinely dangerous shape: `let v = s.foo_version();` *inside* a
-    /// closure that re-runs. That binds the wrapper under a short-lived owner
-    /// and keeps it, which is the panic
-    /// `a_counter_resolved_under_a_subtree_owner_is_disposed_with_that_subtree`
-    /// demonstrates. Detecting it needs closure-scope tracking over Rust source,
-    /// which a substring scan cannot do; nothing in the tree writes that shape
-    /// today, and the contract on [`SyncStore`] is what stands between it and
-    /// the next author. This check is the cheap half, not the whole guard.
-    #[test]
-    fn no_page_resolves_a_version_counter_inline() {
-        // `store.rs` itself is excluded on purpose: its `wasm_tests` module
-        // keeps a copy of the banned expression as a pinned counter-example.
-        let roots = ["src/pages", "src/components"];
-        let mut offenders = Vec::new();
-
-        for root in roots {
-            let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(root);
-            assert!(
-                dir.is_dir(),
-                "expected {} to exist — this guard scans nothing if the tree moved, and \
-                 a guard that scans nothing passes forever",
-                dir.display()
-            );
-            visit(&dir, &mut offenders);
-        }
-
-        assert!(
-            offenders.is_empty(),
-            "these files resolve a SyncStore version counter inside the expression that \
-             reads it:\n  {}\nEach `*_version()` call builds a fresh owner-registered \
-             `Signal` wrapper (see the getter contract on `SyncStore`). Resolve it once at \
-             component setup instead:\n    let version = sync_store.map(|s| \
-             s.activities_version());\nand read `version.map(|v| v.get()).unwrap_or(0)` \
-             inside the closure.",
-            offenders.join("\n  ")
-        );
-    }
-
-    fn visit(dir: &Path, offenders: &mut Vec<String>) {
-        let entries = std::fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("reading {} while scanning for the inline shape: {e}", dir.display()));
-        for entry in entries {
-            let entry = entry.unwrap_or_else(|e| panic!("reading an entry under {}: {e}", dir.display()));
-            let path = entry.path();
-            if path.is_dir() {
-                visit(&path, offenders);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let source = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| panic!("reading {} while scanning for the inline shape: {e}", path.display()));
-                // Whitespace-stripped so the multi-line form
-                // (`.map(|s| s.project_updates_version()\n.get())`) is caught
-                // too — the pre-TRA-9991 `project_detail.rs` was written that
-                // way, and a line-by-line scan would have missed it.
-                let packed: String = source.split_whitespace().collect();
-                if packed.contains("_version().get(") || packed.contains("_version().read(")
-                    || packed.contains("_version().with(") || packed.contains("_version().track(")
-                {
-                    offenders.push(path.display().to_string());
-                }
-            }
-        }
     }
 }
