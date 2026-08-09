@@ -6,6 +6,8 @@
 //! (Today, Yesterday, This Week, Older). Supports filtering by team,
 //! activity type, action source, and actor, with "Load more" pagination.
 
+use std::collections::HashSet;
+
 use leptos::prelude::*;
 use phosphor_leptos::{Icon, IconWeight};
 
@@ -118,6 +120,213 @@ fn github_activity_description(a: &WorkspaceActivity, verb: &str) -> String {
 }
 
 const PAGE_SIZE: i64 = 50;
+
+// ─── Fetching, filtering and merging ─────────────────────────────────────────
+
+/// What a completed fetch does to the rows the page is already holding.
+///
+/// The three modes exist because the page reads the same server function for
+/// three different reasons and each one owes the loaded list something
+/// different.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchMode {
+    /// Page one replaces everything held: the first load, and every filter
+    /// change. Nothing on screen belongs to the new query.
+    Replace,
+    /// The next page is appended after the rows held — the "Load more" button.
+    Append,
+    /// Page one is re-read and merged into the rows held, so the pages the user
+    /// paged back through survive. What a live activity frame does.
+    MergePageOne,
+}
+
+/// The four filter selections the page's dropdowns hold.
+///
+/// An empty string is the dropdown's "All …" option, which the server is asked
+/// as "no filter on this column" — see [`ActivityQuery::build`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ActivityFilters {
+    team_key: String,
+    action_type: String,
+    actor_id: String,
+    action_source: String,
+}
+
+/// The arguments one `list_workspace_activities` call is made with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActivityQuery {
+    team_key: Option<String>,
+    action_type: Option<String>,
+    actor_id: Option<String>,
+    action_source: Option<String>,
+    offset: i64,
+}
+
+impl ActivityQuery {
+    /// Build the request a fetch in `mode` makes against the filters currently
+    /// selected.
+    ///
+    /// # What a live frame does about the filters
+    ///
+    /// Every mode carries the same four filters, including
+    /// [`FetchMode::MergePageOne`], and that is the answer to what happens when
+    /// a live frame arrives for an activity the user's filters exclude: the
+    /// refetch it triggers is a filtered query, so a non-matching activity is
+    /// simply not in the response and never reaches the feed. Nothing about the
+    /// frame itself is inspected — the client is not told which activity moved,
+    /// only that some activity did (`crates/trakkt-ui/src/cache/apply.rs`
+    /// discards the payload and bumps a counter), and it could not evaluate the
+    /// filters against it if it were: the frame carries no `team_key` and the
+    /// counter carries nothing at all.
+    ///
+    /// That is also why the filters are not re-implemented here as a predicate
+    /// over rows. The server owns the filter semantics
+    /// (`activity_service::list_workspace_activities`), and a second copy on the
+    /// client would be a copy that can disagree with it.
+    fn build(mode: FetchMode, filters: &ActivityFilters, loaded_len: usize) -> Self {
+        // The dropdowns' "All …" option is the empty string; the server takes
+        // `None` for "do not filter on this column".
+        let selected = |value: &str| {
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        };
+
+        Self {
+            team_key: selected(&filters.team_key),
+            action_type: selected(&filters.action_type),
+            actor_id: selected(&filters.actor_id),
+            action_source: selected(&filters.action_source),
+            offset: match mode {
+                FetchMode::Append => loaded_len as i64,
+                // Both of these read the newest page. `Replace` because it is
+                // starting over, `MergePageOne` because the newest page is
+                // where a live change lands: an insert is the newest row, and
+                // `coalesce_or_insert_activity`
+                // (`crates/trakkt-auth/src/activity_service.rs`) moves the row
+                // it coalesces onto to `NOW()`, which moves it to the top too.
+                FetchMode::Replace | FetchMode::MergePageOne => 0,
+            },
+        }
+    }
+}
+
+/// The state a completed fetch leaves the page in.
+struct FetchOutcome {
+    /// The rows to show.
+    activities: Vec<WorkspaceActivity>,
+    /// What this fetch has to say about older rows remaining on the server, or
+    /// `None` when it has nothing to say and the previous answer stands.
+    has_more: Option<bool>,
+}
+
+/// Fold a page of freshly fetched rows into the rows already held.
+fn apply_fetched_page(
+    mode: FetchMode,
+    loaded: Vec<WorkspaceActivity>,
+    fetched: Vec<WorkspaceActivity>,
+) -> FetchOutcome {
+    // A full page means the server had at least as many rows as we asked for,
+    // so there is very likely another page behind it. This is the pre-existing
+    // rule and it is sound for the two modes that read a page boundary the user
+    // is actually sitting on.
+    let full_page = fetched.len() as i64 == PAGE_SIZE;
+
+    match mode {
+        FetchMode::Replace => FetchOutcome {
+            activities: fetched,
+            has_more: Some(full_page),
+        },
+        FetchMode::Append => {
+            let mut activities = loaded;
+            activities.extend(fetched);
+            FetchOutcome {
+                activities,
+                has_more: Some(full_page),
+            }
+        }
+        FetchMode::MergePageOne => FetchOutcome {
+            activities: merge_page_one(loaded, fetched),
+            // Deliberately no answer. "Load more" asks whether anything older
+            // than the oldest row held is still on the server, which is a
+            // property of the tail — and a merge reads page one, which says
+            // nothing about the tail. It is also a question the merge cannot
+            // change the answer to: it removes no row, so the oldest row held
+            // is the same row it was, and every row it adds is newer than that.
+            //
+            // Answering it from this fetch is the specific way this goes wrong:
+            // a user who has paged to the end of a 120-row feed has `has_more`
+            // false, and a full page one would flip it back to true and offer a
+            // "Load more" that fetches nothing.
+            has_more: None,
+        },
+    }
+}
+
+/// Merge a freshly read page one into the rows already loaded.
+///
+/// The page keeps every row it has loaded and takes page one's copy of any row
+/// it already holds. Three things fall out of that, in the order they matter:
+///
+/// - **The loaded pages survive.** This is the whole point: a live frame used to
+///   re-read page one and `set` it over the top, so anyone who had paged back
+///   through history lost every page below the newest on the next thing anybody
+///   in the workspace did.
+/// - **Dedup is by `activity_id` across the whole loaded list, not just page
+///   one.** `coalesce_or_insert_activity` in
+///   `crates/trakkt-auth/src/activity_service.rs` refreshes an existing row's
+///   `created_at` inside a 60s window instead of inserting, which moves that row
+///   to the top of the feed — so a row the client is holding on page three can
+///   reappear in page one. Deduping only within page one would leave the stale
+///   copy sitting further down the list, visibly duplicated.
+/// - **Page one's copy wins.** It is the newer read of the same row: the
+///   coalesced `created_at`, and the current issue title, which the row carries
+///   denormalised.
+///
+/// Rows are ordered by the `created_at` string, descending — the same column and
+/// direction as the server's `ORDER BY a.created_at DESC`, so the merged list
+/// comes out in the order the server would have returned the union in. On SQLite
+/// that is literally the same comparison, the column being TEXT. On Postgres the
+/// column is a `TIMESTAMPTZ` and what arrives here is its `CAST(… AS TEXT)`
+/// rendering, which is fixed-width and most-significant-first
+/// (`2026-08-09 11:50:26.863802+00`), so it orders the same way — including at
+/// the one boundary that is not obvious, a whole second against the same second
+/// carrying a fraction, where `+` sorts ahead of `.`. There is a test for that
+/// case below.
+///
+/// The sort is stable, so rows sharing a timestamp keep page one's ordering
+/// ahead of the tail's rather than shuffling between merges. Sorting rather than
+/// concatenating keeps the ordering a property of this function instead of one
+/// inherited from the two arguments happening to be disjoint and pre-sorted.
+///
+/// What this does not do is drop a held row that page one no longer contains,
+/// which would be the way to notice a deletion. No server path emits a `Delete`
+/// for an activity — `entity_types::ACTIVITY` is written only by
+/// `insert_activity` and `coalesce_or_insert_activity`, as an `Insert` and an
+/// `Update` — so there is no deletion to notice, and inferring one from absence
+/// would instead delete the far-side row of any `created_at` tie that the
+/// server's `LIMIT` happened to cut between.
+fn merge_page_one(
+    loaded: Vec<WorkspaceActivity>,
+    page_one: Vec<WorkspaceActivity>,
+) -> Vec<WorkspaceActivity> {
+    let refetched: HashSet<&str> = page_one
+        .iter()
+        .map(|activity| activity.activity_id.as_str())
+        .collect();
+
+    let retained: Vec<WorkspaceActivity> = loaded
+        .into_iter()
+        .filter(|activity| !refetched.contains(activity.activity_id.as_str()))
+        .collect();
+
+    let mut merged = page_one;
+    merged.extend(retained);
+    merged.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    merged
+}
 
 // ─── Grouped activities ──────────────────────────────────────────────────────
 
@@ -281,46 +490,38 @@ pub fn ActivityPage() -> impl IntoView {
     });
 
     // Fetch function — loads a page of activities and updates state
-    let fetch_activities = move |reset: bool| {
+    let fetch_activities = move |mode: FetchMode| {
         if loading.get_untracked() {
             return;
         }
         loading.set(true);
 
-        let offset = if reset {
-            0
-        } else {
-            loaded_activities.get_untracked().len() as i64
+        let filters = ActivityFilters {
+            team_key: team_filter.get_untracked(),
+            action_type: type_filter.get_untracked(),
+            actor_id: actor_filter.get_untracked(),
+            action_source: source_filter.get_untracked(),
         };
-
-        let tk = team_filter.get_untracked();
-        let team_key = if tk.is_empty() { None } else { Some(tk) };
-
-        let action_type = {
-            let tf = type_filter.get_untracked();
-            if tf.is_empty() { None } else { Some(tf) }
-        };
-
-        let actor_id = {
-            let af = actor_filter.get_untracked();
-            if af.is_empty() { None } else { Some(af) }
-        };
-
-        let action_source = {
-            let sf = source_filter.get_untracked();
-            if sf.is_empty() { None } else { Some(sf) }
-        };
+        let query = ActivityQuery::build(mode, &filters, loaded_activities.with_untracked(|held| held.len()));
 
         leptos::task::spawn_local(async move {
-            match list_workspace_activities(team_key, action_type, actor_id, action_source, None, None, Some(PAGE_SIZE), Some(offset)).await {
-                Ok(activities) => {
-                    let count = activities.len() as i64;
-                    if reset {
-                        loaded_activities.set(activities);
-                    } else {
-                        loaded_activities.update(|list| list.extend(activities));
+            match list_workspace_activities(query.team_key, query.action_type, query.actor_id, query.action_source, None, None, Some(PAGE_SIZE), Some(query.offset)).await {
+                Ok(fetched) => {
+                    // The held rows are taken out of the signal and the result
+                    // put back, rather than cloned out and set over the top: a
+                    // merge rebuilds the list from both sides anyway, and that
+                    // list is every page the user has loaded.
+                    let mut has_more_answer = None;
+                    loaded_activities.update(|held| {
+                        let outcome = apply_fetched_page(mode, std::mem::take(held), fetched);
+                        *held = outcome.activities;
+                        has_more_answer = outcome.has_more;
+                    });
+                    // A fetch with nothing to say about the tail leaves the
+                    // standing answer alone — see `apply_fetched_page`.
+                    if let Some(answer) = has_more_answer {
+                        has_more.set(answer);
                     }
-                    has_more.set(count == PAGE_SIZE);
                     initial_loaded.set(true);
                 }
                 Err(e) => {
@@ -335,21 +536,22 @@ pub fn ActivityPage() -> impl IntoView {
     // Initial load
     let fetch_initial = fetch_activities;
     Effect::new(move |_| {
-        fetch_initial(true);
+        fetch_initial(FetchMode::Replace);
     });
 
-    // Re-fetch on filter change (track both signals)
+    // Re-fetch on filter change (track all four signals)
     let fetch_on_filter = fetch_activities;
-    Effect::new(move |prev: Option<(String, String, String, String)>| {
-        let tk = team_filter.get();
-        let tf = type_filter.get();
-        let sf = source_filter.get();
-        let af = actor_filter.get();
-        let current = (tk.clone(), tf.clone(), sf.clone(), af.clone());
+    Effect::new(move |prev: Option<ActivityFilters>| {
+        let current = ActivityFilters {
+            team_key: team_filter.get(),
+            action_type: type_filter.get(),
+            actor_id: actor_filter.get(),
+            action_source: source_filter.get(),
+        };
 
         // Skip the first fire — the initial load Effect handles that
         if prev.is_some_and(|prev_val| prev_val != current) {
-            fetch_on_filter(true);
+            fetch_on_filter(FetchMode::Replace);
         }
 
         current
@@ -357,16 +559,16 @@ pub fn ActivityPage() -> impl IntoView {
 
     // Re-fetch on a live activity frame from another client.
     //
-    // This restarts at page one rather than merging the new rows into what is
-    // already loaded, which is the same reset a filter change performs above.
-    // The trade is that a frame arriving while the user has paged through the
-    // feed with "Load more" drops them back to the newest page; merging instead
-    // means deduplicating by `activity_id` and handling the coalescing path's
-    // updates to rows already held, which is a larger change than making the
-    // frames arrive at all.
+    // Page one only, merged into what is already loaded rather than replacing
+    // it — a filter change starts over because the rows on screen belong to a
+    // query the user has left, but a live frame means one more row exists under
+    // the query they are still reading, and everything they paged back through
+    // with "Load more" is still theirs. Page one is where a live change lands,
+    // whether it inserted a row or coalesced onto one; `merge_page_one` is where
+    // the rest of that reasoning lives.
     let fetch_on_live_activity = fetch_activities;
     refetch_on_live_activity(use_context::<SyncStore>(), move || {
-        fetch_on_live_activity(true);
+        fetch_on_live_activity(FetchMode::MergePageOne);
     });
 
     let fetch_more = fetch_activities;
@@ -466,7 +668,7 @@ pub fn ActivityPage() -> impl IntoView {
                                 <div class="flex justify-center py-4">
                                     <Button
                                         variant=ButtonVariant::GhostMuted
-                                        on:click=move |_| fetch(false)
+                                        on:click=move |_| fetch(FetchMode::Append)
                                     >
                                         {if is_loading { "Loading..." } else { "Load more" }}
                                     </Button>
@@ -514,6 +716,355 @@ fn ActivityRow(activity: WorkspaceActivity) -> impl IntoView {
     }
 }
 
+// ─── Merge tests ─────────────────────────────────────────────────────────────
+
+/// What a live activity frame does to the loaded feed, tested where it is
+/// decided: [`apply_fetched_page`] and [`ActivityQuery::build`] are the whole of
+/// it, and both are ordinary functions of their arguments. Everything around
+/// them — reading the four filter signals, awaiting the server function, writing
+/// the two signals back — is in `ActivityPage` and needs a browser and a server.
+///
+/// Host-side rather than `wasm_bindgen_test`, so these run under
+/// `cargo test --workspace` and do not add a browser launch to the wasm sweep.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod merge_tests {
+    use super::*;
+    use trakkt_types::enums::ActionSource;
+
+    /// An activity carrying the two things these tests turn on — which row it is
+    /// and where it sits in time — with plausible filler for the rest.
+    ///
+    /// Timestamps are written in the form Postgres renders `TIMESTAMPTZ` in,
+    /// because that is what production sends and what the ordering claim on
+    /// [`merge_page_one`] is about.
+    fn row(activity_id: &str, created_at: &str) -> WorkspaceActivity {
+        WorkspaceActivity {
+            activity_id: activity_id.to_string(),
+            issue_id: format!("issue-for-{activity_id}"),
+            workspace_id: "ws-1".to_string(),
+            actor_id: Some("user-1".to_string()),
+            actor_name: Some("Ada".to_string()),
+            action_type: "status_changed".to_string(),
+            field: Some("status".to_string()),
+            old_value: Some("Backlog".to_string()),
+            new_value: Some("In Progress".to_string()),
+            metadata: None,
+            action_source: ActionSource::User,
+            action_source_label: None,
+            created_at: created_at.to_string(),
+            team_key: "TRA".to_string(),
+            issue_number: 42,
+            issue_title: "Something happened".to_string(),
+        }
+    }
+
+    fn ids(activities: &[WorkspaceActivity]) -> Vec<&str> {
+        activities
+            .iter()
+            .map(|activity| activity.activity_id.as_str())
+            .collect()
+    }
+
+    /// The rows a user who has pressed "Load more" twice is holding, newest
+    /// first.
+    fn six_loaded_rows() -> Vec<WorkspaceActivity> {
+        vec![
+            row("a6", "2026-08-09 11:06:00+00"),
+            row("a5", "2026-08-09 11:05:00+00"),
+            row("a4", "2026-08-09 11:04:00+00"),
+            row("a3", "2026-08-09 11:03:00+00"),
+            row("a2", "2026-08-09 11:02:00+00"),
+            row("a1", "2026-08-09 11:01:00+00"),
+        ]
+    }
+
+    #[test]
+    fn a_live_frame_keeps_the_pages_the_user_paged_back_through() {
+        // Somebody else records an activity while this user is reading history.
+        // The page re-reads page one — which now leads with the new row — and
+        // merges it.
+        let page_one = vec![
+            row("a7", "2026-08-09 11:07:00+00"),
+            row("a6", "2026-08-09 11:06:00+00"),
+            row("a5", "2026-08-09 11:05:00+00"),
+        ];
+
+        let outcome = apply_fetched_page(FetchMode::MergePageOne, six_loaded_rows(), page_one);
+
+        assert_eq!(
+            ids(&outcome.activities),
+            ["a7", "a6", "a5", "a4", "a3", "a2", "a1"],
+            "a live frame must add the new row and leave every page the user \
+             loaded with \"Load more\" where it was — replacing the list with \
+             page one is the regression this test exists for, and it is silent: \
+             the feed simply snaps back to the newest page and the reader loses \
+             their place"
+        );
+    }
+
+    #[test]
+    fn a_coalesced_row_moves_in_place_instead_of_appearing_twice() {
+        // `coalesce_or_insert_activity` refreshes an existing row's `created_at`
+        // instead of inserting when the same actor edits the same field again
+        // within 60s. The row it refreshes can be one the client is holding well
+        // below page one — here `a2`, three pages down — and it comes back at
+        // the top of page one under the same `activity_id`.
+        let mut refreshed = row("a2", "2026-08-09 11:07:00+00");
+        refreshed.new_value = Some("the second edit".to_string());
+
+        let page_one = vec![
+            refreshed,
+            row("a6", "2026-08-09 11:06:00+00"),
+            row("a5", "2026-08-09 11:05:00+00"),
+        ];
+
+        let outcome = apply_fetched_page(FetchMode::MergePageOne, six_loaded_rows(), page_one);
+
+        assert_eq!(
+            ids(&outcome.activities),
+            ["a2", "a6", "a5", "a4", "a3", "a1"],
+            "the coalesced row is one row that moved, not a new one: it must \
+             appear exactly once, at the position its refreshed `created_at` \
+             puts it. Deduplicating only against page one leaves the stale copy \
+             sitting in the tail and the user sees the same entry twice"
+        );
+
+        let held = outcome
+            .activities
+            .first()
+            .expect("the merged feed to still hold the coalesced row");
+        assert_eq!(
+            held.created_at, "2026-08-09 11:07:00+00",
+            "page one's copy of a row the client already held is the newer read \
+             of it, and on this path it is the entire point of the frame — the \
+             coalescing branch's whole effect is moving `created_at` forward"
+        );
+        assert_eq!(
+            held.new_value.as_deref(),
+            Some("the second edit"),
+            "and the rest of page one's copy comes with it, rather than the \
+             fresh timestamp being grafted onto the stale row"
+        );
+    }
+
+    #[test]
+    fn an_activity_excluded_by_the_active_filters_never_reaches_the_feed() {
+        // The user is filtered to one team and has paged back through it.
+        // Someone in another team then changes something, which bumps the same
+        // workspace-wide counter and triggers the same refetch — but the
+        // refetch is filtered (see the test below), so the response is page one
+        // *of this filter*, and the other team's activity is simply not in it.
+        let loaded = vec![
+            row("t3", "2026-08-09 11:03:00+00"),
+            row("t2", "2026-08-09 11:02:00+00"),
+            row("t1", "2026-08-09 11:01:00+00"),
+        ];
+        let page_one = vec![
+            row("t3", "2026-08-09 11:03:00+00"),
+            row("t2", "2026-08-09 11:02:00+00"),
+        ];
+
+        let outcome = apply_fetched_page(FetchMode::MergePageOne, loaded, page_one);
+
+        assert_eq!(
+            ids(&outcome.activities),
+            ["t3", "t2", "t1"],
+            "the feed shows what the filtered query returned and what it had \
+             already loaded under the same filters, and nothing else — a live \
+             frame can never introduce a row the server did not send, which is \
+             what keeps it from bypassing a filter the user set"
+        );
+    }
+
+    #[test]
+    fn a_live_refetch_asks_the_server_with_the_filters_the_user_has_set() {
+        let filters = ActivityFilters {
+            team_key: "TRA".to_string(),
+            action_type: "status_changed".to_string(),
+            actor_id: "user-1".to_string(),
+            action_source: "agent".to_string(),
+        };
+
+        let query = ActivityQuery::build(FetchMode::MergePageOne, &filters, 120);
+
+        assert_eq!(
+            query,
+            ActivityQuery {
+                team_key: Some("TRA".to_string()),
+                action_type: Some("status_changed".to_string()),
+                actor_id: Some("user-1".to_string()),
+                action_source: Some("agent".to_string()),
+                offset: 0,
+            },
+            "the refetch a live frame triggers carries the filters the user is \
+             looking through, which is what makes the server the only thing \
+             deciding whether a live activity belongs in this feed. Dropping \
+             them here would fetch the unfiltered newest page and merge it in, \
+             putting rows the user filtered out on screen"
+        );
+    }
+
+    #[test]
+    fn an_unset_dropdown_is_no_filter_at_all() {
+        let query = ActivityQuery::build(FetchMode::Replace, &ActivityFilters::default(), 0);
+
+        assert_eq!(
+            query,
+            ActivityQuery {
+                team_key: None,
+                action_type: None,
+                actor_id: None,
+                action_source: None,
+                offset: 0,
+            },
+            "each dropdown's \"All …\" option is the empty string, and the \
+             server takes `None` for an inactive filter — sending the empty \
+             string would match no team, no action type and no actor"
+        );
+    }
+
+    #[test]
+    fn load_more_asks_for_the_rows_after_the_ones_already_held() {
+        let filters = ActivityFilters::default();
+
+        assert_eq!(
+            ActivityQuery::build(FetchMode::Append, &filters, 120).offset,
+            120,
+            "\"Load more\" continues from the end of what is loaded"
+        );
+        assert_eq!(
+            ActivityQuery::build(FetchMode::Replace, &filters, 120).offset,
+            0,
+            "a filter change starts over from the newest page"
+        );
+    }
+
+    #[test]
+    fn merging_page_one_leaves_has_more_where_the_tail_left_it() {
+        let full_page: Vec<WorkspaceActivity> = (0..PAGE_SIZE)
+            .map(|i| row(&format!("p{i}"), &format!("2026-08-09 11:00:{i:02}+00")))
+            .collect();
+
+        let outcome = apply_fetched_page(FetchMode::MergePageOne, six_loaded_rows(), full_page);
+
+        assert!(
+            outcome.has_more.is_none(),
+            "whether older rows remain unfetched is a property of the tail the \
+             user has paged to, and page one says nothing about it. A user who \
+             has reached the end of the feed has no \"Load more\" button, and \
+             answering this from a full page one would hand them one that \
+             fetches nothing"
+        );
+    }
+
+    #[test]
+    fn paging_answers_has_more_from_the_size_of_the_page_it_got() {
+        let full_page: Vec<WorkspaceActivity> = (0..PAGE_SIZE)
+            .map(|i| row(&format!("p{i}"), &format!("2026-08-09 11:00:{i:02}+00")))
+            .collect();
+
+        assert_eq!(
+            apply_fetched_page(FetchMode::Replace, Vec::new(), full_page.clone()).has_more,
+            Some(true),
+            "a page as long as the limit means the server had at least that many"
+        );
+        assert_eq!(
+            apply_fetched_page(FetchMode::Replace, Vec::new(), vec![row("a1", "2026-08-09 11:01:00+00")])
+                .has_more,
+            Some(false),
+            "a short page is the end of the feed"
+        );
+        assert_eq!(
+            apply_fetched_page(FetchMode::Append, six_loaded_rows(), full_page).has_more,
+            Some(true),
+            "and \"Load more\" answers it the same way, from the page it just \
+             asked for"
+        );
+    }
+
+    #[test]
+    fn load_more_appends_the_page_it_asked_for() {
+        let older = vec![
+            row("a0", "2026-08-09 11:00:00+00"),
+            row("z9", "2026-08-09 10:59:00+00"),
+        ];
+
+        let outcome = apply_fetched_page(FetchMode::Append, six_loaded_rows(), older);
+
+        assert_eq!(
+            ids(&outcome.activities),
+            ["a6", "a5", "a4", "a3", "a2", "a1", "a0", "z9"],
+            "the next page continues the list"
+        );
+    }
+
+    #[test]
+    fn a_filter_change_replaces_what_is_on_screen() {
+        let outcome = apply_fetched_page(
+            FetchMode::Replace,
+            six_loaded_rows(),
+            vec![row("b1", "2026-08-09 09:00:00+00")],
+        );
+
+        assert_eq!(
+            ids(&outcome.activities),
+            ["b1"],
+            "the rows on screen belong to the query the user has just left, so \
+             a filter change keeps none of them — this is the one mode that is \
+             supposed to discard the loaded pages"
+        );
+    }
+
+    #[test]
+    fn the_merged_list_is_ordered_by_time_not_by_which_fetch_supplied_a_row() {
+        // Constructed, not observed: the server pages contiguously, so page one
+        // and the tail below it do not normally interleave. The ordering of the
+        // feed should not depend on that staying true — of the server keeping
+        // this exact paging, and of no filter narrowing page one to a window
+        // inside the loaded range.
+        let loaded = vec![
+            row("a5", "2026-08-09 11:05:00+00"),
+            row("a4", "2026-08-09 11:04:00+00"),
+            row("a1", "2026-08-09 11:01:00+00"),
+        ];
+        let page_one = vec![
+            row("b7", "2026-08-09 11:07:00+00"),
+            row("b3", "2026-08-09 11:03:00+00"),
+        ];
+
+        let outcome = apply_fetched_page(FetchMode::MergePageOne, loaded, page_one);
+
+        assert_eq!(
+            ids(&outcome.activities),
+            ["b7", "a5", "a4", "b3", "a1"],
+            "each row sits where its `created_at` puts it, not where the fetch \
+             that carried it does — concatenating page one onto the tail is \
+             right only for as long as the two never overlap"
+        );
+    }
+
+    #[test]
+    fn a_whole_second_sorts_behind_the_same_second_carrying_a_fraction() {
+        // The ordering claim on `merge_page_one` is that comparing Postgres's
+        // `TIMESTAMPTZ::TEXT` rendering as a string orders it chronologically.
+        // Every field of that rendering is fixed-width except the fractional
+        // seconds, which Postgres omits entirely at a whole second — so this is
+        // the one place the claim could fail, and it holds because `+` (0x2B)
+        // precedes `.` (0x2E).
+        let outcome = apply_fetched_page(
+            FetchMode::MergePageOne,
+            vec![row("whole", "2026-08-09 11:00:26+00")],
+            vec![row("fraction", "2026-08-09 11:00:26.5+00")],
+        );
+
+        assert_eq!(
+            ids(&outcome.activities),
+            ["fraction", "whole"],
+            "11:00:26.5 is later than 11:00:26 and the feed is newest-first"
+        );
+    }
+}
+
 // ─── Browser tests ───────────────────────────────────────────────────────────
 
 /// Run with:
@@ -535,7 +1086,8 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     /// What [`refetch_on_live_activity`] is wired to in `ActivityPage`, reduced
-    /// to a counter: a closure that reloads the first page of the feed.
+    /// to a counter: a closure that re-reads page one and merges it into the
+    /// pages already loaded.
     ///
     /// `Rc<Cell<u32>>` rather than a signal so the assertions read a plain
     /// value and cannot themselves be the thing that is reactive.
