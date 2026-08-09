@@ -69,12 +69,27 @@ mod tests {
     /// # Why port 6381 and not 6379
     ///
     /// 6381 is deliberate, not a typo.  These projects allocate Redis ports in a
-    /// ladder — 6379 production, 6380 local development, 6381 tests — so that a
-    /// test run can never reach a Redis the developer is using for something
-    /// else.  (Postgres follows the same scheme: 5432/5433/5434, which is why
-    /// `Config::test_config` points at 5434.)  Pointing this at the default 6379
-    /// would make the test talk to whatever Redis happens to be running.  Set
-    /// `REDIS_URL` to override.
+    /// ladder by role — 6379 production, 6380 local development, 6381 tests — so
+    /// that a test run can never reach a Redis the developer is using for
+    /// something else.  Pointing this at the default 6379 would make the test
+    /// talk to whatever Redis happens to be running.  Set `REDIS_URL` to
+    /// override.
+    ///
+    /// Note that the Redis rungs look to be shared *between* projects, unlike
+    /// the Postgres ones: the development rung is held by another project's
+    /// Redis, so 6381 is most likely one shared test Redis rather than Trakkt's
+    /// own.  That is tolerable here only because this test opens a connection
+    /// and PINGs — it reads and writes no key, so two projects landing on it at
+    /// once cannot corrupt each other.  A test that stores anything needs a
+    /// rung of its own established first.
+    ///
+    /// Postgres does **not** follow the same scheme; do not infer its ports
+    /// from these.  It is allocated per project as well as per role, and
+    /// `test_helpers::dual_backend::DEFAULT_PG_TEST_URL` is where those rungs
+    /// are recorded.  Until TRA-10002 this paragraph asserted that Postgres ran
+    /// 5432/5433/5434 "which is why `Config::test_config` points at 5434" — a
+    /// justification for a rung that belongs to another project's test
+    /// database, and that `test_config` no longer names.
     #[tokio::test]
     #[ignore = "requires a live Redis; run with `cargo test -p trakkt-core -- --ignored`"]
     async fn test_redis_connects() {
