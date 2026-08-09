@@ -2470,7 +2470,7 @@ mod view_tab_rebuild_tests {
 
     use crate::pages::projects::project_board::{BoardViewState, ProjectBoardContent};
     use crate::pages::projects::project_list_view::{ListViewState, ProjectListView};
-    use crate::wasm_test_support::boot_leptos_executor;
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -2530,24 +2530,6 @@ mod view_tab_rebuild_tests {
         }
     }
 
-    fn make_container() -> web_sys::HtmlElement {
-        let document = web_sys::window()
-            .expect("the browser test runner must provide a window")
-            .document()
-            .expect("the browser test runner must provide a document");
-        let container: web_sys::HtmlElement = document
-            .create_element("div")
-            .expect("creating a container to mount the page shim into")
-            .dyn_into()
-            .expect("the container element is an HtmlElement");
-        document
-            .body()
-            .expect("the document must have a body to attach the container to")
-            .append_child(&container)
-            .expect("attaching the container to the document body");
-        container
-    }
-
     /// The one `<input>` in `container` carrying `placeholder`.
     fn input_by_placeholder(
         container: &web_sys::HtmlElement,
@@ -2592,7 +2574,7 @@ mod view_tab_rebuild_tests {
     /// `tab` selects which view tab `ContentShim` builds; `placeholder`
     /// identifies that tab's filter box.
     async fn one_resource_settling(tab: &'static str, placeholder: &'static str) -> Outcome {
-        let container = make_container();
+        let container = mount_container();
 
         // `ProjectDetailPage` has six of these. One is enough: the closure is
         // rebuilt by whichever of them moves, so the other five would only
