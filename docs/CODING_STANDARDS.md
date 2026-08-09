@@ -119,6 +119,16 @@ Mutation-test each converted function individually and report per function. A sw
 that reports one aggregate result cannot distinguish "all six covered" from "one
 covered five times".
 
+A new rollback test goes beside its siblings in
+`crates/trakkt-auth/src/sync_log_service.rs`, on SQLite. It belongs in the
+dialect suite instead only if it asserts something the two dialects can still
+disagree about, which in practice means a rollback whose *extent* is decided by
+`ON DELETE` actions rather than by the code. The section of
+`apps/server/tests/postgres_dialect.rs` headed "The 60 SQLite-only rollback
+tests" records where that line was drawn, which three shapes are already run on
+Postgres, and the candidate that was written and then discarded for duplicating
+one of them.
+
 ## The Postgres dialect suite
 
 Production runs Postgres. Every test in the workspace except this suite runs
@@ -130,6 +140,50 @@ twice.
 
 The suite lives in `apps/server/tests/postgres_dialect.rs` and its harness in
 `crates/trakkt-core/src/test_helpers/dual_backend.rs`.
+
+### What it covers, and what it does not
+
+Read this before treating a green `Postgres Dialect Tests` job as a statement
+about the Postgres arms in general. It is not one. It says the bodies in that
+file ran, and nothing about the arms none of them reaches.
+
+As of TRA-10001 the file holds 25 `dual_backend_test!` bodies — 50 tests, one
+pair each — plus three Postgres-only tests that need both backends open at once
+and one SQLite-only test about SQLite's rowid rule. What those bodies execute:
+
+- the six `tx_*` macros, and `write_sync_entry_in_tx`'s `RETURNING sync_id`;
+- the rollback contract, in all three of its shapes — a mutation's first entry
+  rejected, an entry rejected after an earlier one was accepted, and an entry
+  rejected after the statement has already fired `ON DELETE CASCADE`;
+- the eight `sql_compat` helpers production builds SQL with (see the ledger at
+  the head of that file's `sql_compat` section, which also names the twelve it
+  does not and why);
+- the `sort_order` decode — the FLOAT4-versus-`f64` class that shipped twice —
+  across all five columns that carry the name;
+- schema parity: foreign keys and their `ON DELETE`, primary-key nullability,
+  and the runtime behaviour of the four keys whose actions used to differ;
+- the migration chain itself, on both dialects.
+
+What it does not cover, stated so nobody has to infer it:
+
+- **Most `is_pg` branch points.** There are 119 `is_postgres()` call sites
+  outside `apps/server/tests`, and 164 `sql_compat::` call sites. The suite
+  reaches a minority of them, because each body is written for a defect class
+  rather than swept over a list.
+- **All 60 rollback tests** in `crates/trakkt-auth/src/sync_log_service.rs`,
+  which stay on SQLite. TRA-10001 converted none of them and recorded why in
+  that file's own rollback-decision section: 52 install the blanket trigger and
+  8 narrow it, so between them they exercise two of the three shapes the suite
+  already runs on Postgres, and all 60 hang off a fixture that hardcodes
+  `DbPool::connect("sqlite::memory:")` and leans on SQLite column defaults.
+- **`trakkt-auth`'s 178 `#[tokio::test]`s as a whole**, which open an in-memory
+  SQLite pool and are the workspace's main body of service-layer testing.
+- **Twelve `sql_compat` helpers with no production caller** — a deletion to
+  schedule, not a testing gap.
+
+Adding a body is how that list shrinks. Do not let it shrink by editing the
+list: if this section reads as broader than the file, that is a defect in
+whichever change made it so.
 
 ### Running it locally
 
