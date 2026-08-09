@@ -1391,9 +1391,14 @@ fn SidebarInboxNavItem() -> impl IntoView {
     };
 
     let sync_store = use_context::<SyncStore>();
+    // Resolved here, at component setup, rather than inside the closure below:
+    // every `SyncStore` getter builds a fresh arena-registered `Signal` wrapper
+    // on each call, so calling one from a closure that re-runs abandons a
+    // wrapper per evaluation. See the getter contract on `SyncStore`.
+    let notifications = sync_store.map(|store| store.notifications());
     let unread_count = Signal::derive(move || {
-        sync_store
-            .map(|store| store.notifications().get().iter().filter(|n| !n.read).count())
+        notifications
+            .map(|list| list.get().iter().filter(|n| n.is_unread_in_inbox()).count())
             .unwrap_or(0)
     });
 
@@ -1520,5 +1525,206 @@ fn BillingBanner() -> impl IntoView {
                 </Button>
             </div>
         </Show>
+    }
+}
+
+// ── Browser tests ───────────────────────────────────────────────────────────
+
+/// What the sidebar's unread badge counts, asserted on the badge itself.
+///
+/// These mount the real `SidebarInboxNavItem` and read the number out of the
+/// DOM. The alternative — evaluating the count expression from a test — restates
+/// the predicate under test and would agree with it however wrong it is, which
+/// is how TRA-9995 survived a suite that already covered the store this badge
+/// reads from.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use gloo_timers::future::TimeoutFuture;
+    use leptos::prelude::*;
+    use leptos_router::components::Router;
+    use trakkt_types::enums::ActionSource;
+    use trakkt_types::models::Notification;
+    use trakkt_types::sync::{entity_types, SyncAction, SyncActionType};
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use crate::cache::apply::apply_action_to_memory;
+    use crate::cache::store::SyncStore;
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
+
+    use super::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// One unread, undeleted notification.
+    ///
+    /// Built as the model rather than as JSON so that a field renamed on
+    /// [`Notification`] changes this fixture and the payload [`update_frame`]
+    /// serialises together, instead of leaving the two agreeing only by hand.
+    fn unread(notification_id: &str) -> Notification {
+        Notification {
+            notification_id: notification_id.to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            user_id: "usr-alice".to_owned(),
+            issue_id: "issue-1".to_owned(),
+            notification_type: "assigned".to_owned(),
+            read: false,
+            issue_title: Some("A leaky issue".to_owned()),
+            issue_number: Some(42),
+            team_key: Some("TRA".to_owned()),
+            actor_id: Some("usr-bob".to_owned()),
+            actor_name: Some("Bob".to_owned()),
+            action_source: ActionSource::User,
+            action_source_label: None,
+            created_at: "2026-07-26T00:00:00Z".to_owned(),
+            deleted_at: None,
+            context_id: None,
+        }
+    }
+
+    /// The frame the server delivers for one notification it has just changed.
+    ///
+    /// `notification_service::change_notifications` records one `Update` per
+    /// affected row carrying the whole row as `sync_log_service::sync_payload`
+    /// serialised it, and `commit_and_deliver` sends it to every session the
+    /// recipient has open — including the one that asked for the change. A
+    /// soft-delete and a mark-read are the same frame with a different row
+    /// inside it, which is why both tests below build theirs here.
+    fn update_frame(notification: &Notification) -> SyncAction {
+        SyncAction {
+            sync_id: 1,
+            entity_type: entity_types::NOTIFICATION.to_owned(),
+            entity_id: notification.notification_id.clone(),
+            workspace_id: notification.workspace_id.clone(),
+            action: SyncActionType::Update,
+            data: Some(
+                serde_json::to_value(notification)
+                    .expect("serializing a Notification the way `sync_payload` does"),
+            ),
+            timestamp: "2026-07-26T01:00:00Z".to_owned(),
+        }
+    }
+
+    /// Mount the real sidebar item with `store` in context, as `Layout` provides
+    /// it. The caller drops the handle and removes the container when done.
+    ///
+    /// The `<Router>` is not decoration: `SidebarInboxNavItem` calls
+    /// `use_location` to decide whether it is the active item, and that panics
+    /// outside a router context. Nothing here asserts on the active state — the
+    /// router is the price of mounting the component unmodified rather than a
+    /// stand-in that would prove nothing about the badge in the sidebar.
+    fn mount_inbox_nav_item(store: SyncStore) -> (impl Sized, web_sys::HtmlElement) {
+        let container = mount_container();
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            provide_context(store);
+            view! { <Router><SidebarInboxNavItem/></Router> }
+        });
+        (handle, container)
+    }
+
+    /// The number the badge is showing, or `None` when no badge is rendered.
+    ///
+    /// The `<span>` is the only one in the anchor: the tray icon renders an
+    /// `<svg>` and the "Inbox" label is a bare text node. So this selector finds
+    /// the badge or finds nothing, and "nothing" is the count reaching zero
+    /// rather than a selector that stopped matching.
+    fn badge_text(container: &web_sys::HtmlElement) -> Option<String> {
+        container
+            .query_selector("a[href=\"/inbox\"] span")
+            .expect("querying the mounted sidebar item for its unread badge")
+            .map(|span| {
+                span.text_content()
+                    .expect("an element node always has textContent")
+            })
+    }
+
+    /// Deleting an unread notification has to take it off the badge.
+    ///
+    /// Deleting from the inbox is a *soft* delete: `bulk_delete_notifications`
+    /// stamps `deleted_at` and the row stays in this tab's store, arriving as an
+    /// `Update` — `cache::apply`'s
+    /// `a_soft_deleted_notification_frame_keeps_the_row_and_stamps_it` pins that
+    /// half. So a badge that counts `!read` alone goes on counting a row the
+    /// inbox no longer lists, and goes on counting it until the page is
+    /// reloaded. That is TRA-9995.
+    ///
+    /// Two notifications rather than one so the assertion is a count that
+    /// dropped and not a badge that vanished: at zero the badge is not rendered
+    /// at all, and an element missing for some unrelated reason would read the
+    /// same.
+    #[wasm_bindgen_test]
+    async fn the_badge_stops_counting_a_notification_the_user_deleted() {
+        boot_leptos_executor();
+
+        let store = SyncStore::new();
+        store.set_notifications(vec![unread("ntf-1"), unread("ntf-2")]);
+        let (handle, container) = mount_inbox_nav_item(store);
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("2"),
+            "the badge is not showing the two unread notifications the store was \
+             seeded with, so nothing below this line measures what deleting one \
+             does — fix this first"
+        );
+
+        let mut deleted = unread("ntf-1");
+        deleted.deleted_at = Some("2026-07-26T01:00:00Z".to_owned());
+        apply_action_to_memory(&store, &update_frame(&deleted));
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("1"),
+            "the badge still counts a notification the user deleted. The row is \
+             still in the store — the delete stamped `deleted_at` instead of \
+             evicting it — so the count has to exclude it explicitly, the way \
+             `notification_service::count_unread` does with \
+             `read = false AND deleted_at IS NULL`"
+        );
+
+        drop(handle);
+        container.remove();
+    }
+
+    /// Marking an unread notification read has to take it off the badge too.
+    ///
+    /// Same frame, same store, the other half of the predicate — so this is what
+    /// stops a fix for the delete case from being written as `deleted_at
+    /// IS NULL` alone. It arrives here by the sync frame rather than by the
+    /// inbox's optimistic `upsert_notification`, because the frame is the path
+    /// that has to work for the tab the user is *not* looking at.
+    #[wasm_bindgen_test]
+    async fn the_badge_stops_counting_a_notification_the_user_read() {
+        boot_leptos_executor();
+
+        let store = SyncStore::new();
+        store.set_notifications(vec![unread("ntf-1"), unread("ntf-2")]);
+        let (handle, container) = mount_inbox_nav_item(store);
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("2"),
+            "the badge is not showing the two unread notifications the store was \
+             seeded with, so nothing below this line measures what reading one \
+             does — fix this first"
+        );
+
+        let mut read = unread("ntf-1");
+        read.read = true;
+        apply_action_to_memory(&store, &update_frame(&read));
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("1"),
+            "the badge still counts a notification that has been read in this \
+             workspace, so it is no longer the count of things needing attention \
+             that it exists to be"
+        );
+
+        drop(handle);
+        container.remove();
     }
 }
