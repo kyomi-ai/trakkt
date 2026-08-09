@@ -9,7 +9,8 @@
 #   3. tx-pool — blocks pool access inside an open database transaction
 #   4. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
 #   5. test (slowest) — cargo test across the whole workspace, all on SQLite
-#   6. wasm-test (slow) — executes the trakkt-ui wasm-bindgen-test suite in Firefox
+#   6. wasm-test (slow) — executes the trakkt-ui wasm-bindgen-test suite in
+#      Firefox, as one binary and then module-by-module in isolation
 #   7. postgres-dialect (slow) — runs the dual-dialect suite against a real
 #      Postgres service container; the only job that executes an `is_pg` query arm
 #   8. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
@@ -330,26 +331,82 @@ jobs:
   # A separate job rather than extra steps on clippy: jobs run in parallel, so
   # this costs runner minutes but no PR wall-clock (Test Suite is longer).
   #
+  # Running the suite once, as one binary, is also not enough: one run only ever
+  # produces one order, so it cannot see a test that depends on an earlier test
+  # having run first. The sweep step at the bottom of this job covers the case
+  # where that dependency crosses a module boundary; a module is still run as a
+  # whole, so one contained entirely within a single module stays invisible, as
+  # docs/CODING_STANDARDS.md and CONTRIBUTING.md both record. See the step's own
+  # comment for the mechanism and scripts/wasm-test-isolated.sh for the bug
+  # class. What follows is why the sweep runs the way it does, since it adds
+  # ~64% to this job's runner minutes (a measured 5m41s against a 208s mean
+  # before it; numbers below) and the alternatives were not obviously worse.
+  #
+  # It runs on every PR, and as a step in this job rather than a job of its own.
+  # A separate job would repay the whole cold build, the apt install, the wasm32
+  # toolchain, the wasm-pack download and the Firefox install just to re-test what
+  # this job has already built; as a step, every filtered run reuses those
+  # artifacts. What a developer running the script locally should expect, with the
+  # build already warm: `--list` 5.3s, the whole-binary run 25.2s, and the 13
+  # module runs 130.9s (mean 10.1s, range 9.0-13.6s) — a marginal of ~2m16s. Each
+  # module run is ~2.6s of cargo-up-to-date plus wasm-bindgen and ~7.5s of browser
+  # launch, so what the sweep buys is paid for in browser launches, not in test
+  # execution.
+  #
+  # On a runner it costs less than that. Measured on the PR that added the sweep
+  # (run 31309373878, job 93234685894): the job took 5m41s, against a 208s mean
+  # over the 13 preceding runs of it (range 149-253s). Of the sweep step's 5m02s,
+  # ~2m45s was the build — carried by the first wasm-pack invocation, which is now
+  # the `--list` pass — 17.3s the whole-binary run, and 2m00s the 13 isolated
+  # runs, a mean of 9.24s each (range 8.61-10.90s). So a module costs slightly
+  # less on a runner than locally, and browser launches are not something CI is
+  # worse at. Note the asymmetry before reusing the ~64%: the new figure is one
+  # run and the baseline is a 13-run mean.
+  #
+  # The estimate this replaced predicted ~6min by scaling the local marginal 1:1
+  # rather than by the ~3x CI/local ratio the build-bound jobs show, on the
+  # grounds that browser and wasm-bindgen work is not build work. That held, and
+  # it is the reasoning to reuse if this job's cost ever has to be predicted again.
+  #
+  # Nightly or merge-to-main only was rejected: at a ~2min marginal on a job that
+  # already runs in parallel with longer ones, moving it off the PR saves almost
+  # no PR wall-clock and buys late detection instead — and late detection is the
+  # entire failure mode, since this bug class stays invisible until something
+  # reorders, so finding it after merge means finding it in someone else's PR.
+  # Randomising the order within one binary and printing the seed would have been
+  # cheaper still; it was dropped because there is nothing to enable, not because
+  # it was judged inferior. wasm-bindgen-test 0.3.71 has no ordering control: the
+  # runner's full option set is `[FILTER] --bench --include-ignored --ignored
+  # --exact --skip --list --nocapture --format`, with no shuffle or seed behind
+  # any of them. Worth rechecking on a version bump; not worth re-investigating.
+  #
   # Setup mirrors the clippy and test jobs everywhere the workspace forces it to,
   # and deliberately diverges where it does not — see the per-step notes.
   # ---------------------------------------------------------------------------
   wasm-test:
     name: WASM Browser Tests
     runs-on: ubuntu-latest
-    # Bounds the whole job. Measured cold locally at 154-189s wall depending on
-    # machine load, of which the tests themselves are 0.7s — this is a build cost,
-    # not a test cost, and it is ~64% of the workspace `cargo test` cold build
-    # (295s). Two ways to the same bound: scaling Test Suite's real CI time
-    # (7m18s) by that 0.64 plus ~1min for the Firefox install predicts ~6min
-    # typical; applying the CI/local ratio the other jobs exhibit (clippy: 1m38s
-    # local, ~5m CI, ~3x) to a 189s cold build plus ~3-4min of setup (apt,
-    # toolchain with the wasm32 target, cargo update, wasm-pack download, Firefox
-    # install, and the geckodriver that wasm-pack fetches on first run) predicts
-    # ~13min worst legitimate cold. 20 covers the pessimistic case with ~1.5x
-    # headroom, close to Test Suite's 1.7x. The failure this actually caps is a
-    # headless browser that never reports: if geckodriver hangs, wasm-pack waits
-    # forever, and GitHub's 6-hour default would burn a runner-day on it.
-    timeout-minutes: 20
+    # Bounds the whole job. The typical case is measured, not derived: with the
+    # sweep in place this job took 5m41s (run 31309373878), against a 208s mean
+    # over the 13 runs preceding it. Its sweep step was 5m02s — ~2m45s of build,
+    # 17.3s of whole-binary run, 2m00s of isolated runs — and the tests themselves
+    # execute in 8.6s, a figure worth restating because the earlier note here said
+    # 0.7s, from when the suite had 12 tests rather than 74.
+    #
+    # 25 is not sized against that 5m41s, which is the typical case and not what a
+    # timeout is for. It is sized against the worst legitimate cold run, reasoned
+    # out at ~13min for the job before the sweep (a cold build plus apt, the wasm32
+    # toolchain, cargo update, the wasm-pack download, the Firefox install, and the
+    # geckodriver wasm-pack fetches on first run); letting the sweep's measured
+    # 2m00s double on a slow runner day adds 4min, so ~17min, over which 25 leaves
+    # ~1.5x. Against the measured typical it is 4.4x, which is the same shape as
+    # Test Suite's 30 against its ~7m18s (4.1x) rather than an outlier.
+    #
+    # The failure this actually caps is a headless browser that never reports: if
+    # geckodriver hangs, wasm-pack waits forever and GitHub's 6-hour default would
+    # burn a runner-day. The sweep makes that more likely to be worth capping, not
+    # less — it turns one browser launch per run into fourteen.
+    timeout-minutes: 25
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -425,10 +482,31 @@ jobs:
       # in this target's dependency graph at all, and nothing in the workspace
       # include_str!s style/output.css. Verified empirically — the suite passes
       # 12/12 locally with style/output.css absent and dist/ empty.
-      - name: wasm-pack test (trakkt-ui, headless Firefox)
+      # Runs the suite as one binary — what this job did before — and then once
+      # per module in isolation.
+      #
+      # The whole-binary run alone cannot see an ordering dependency between
+      # tests, because it only ever produces one order. `any_spawner`'s executor
+      # is global and initialized once per binary, so a test that spawns before
+      # it mounts anything passes only if some earlier test initialized it. That
+      # shipped green for months, and PR #285 turned it red by adding tests that
+      # changed the order rather than by changing any behaviour. Nothing in this
+      # job noticed either time; running one module on its own was what found it.
+      #
+      # In this job rather than one of its own, and deliberately: a separate job
+      # would repay the whole cold build, the apt install, the wasm32 toolchain,
+      # the wasm-pack download and the Firefox install to run tests this job has
+      # already built. Here every filtered run reuses the artifacts the run above
+      # it produced, so the sweep costs browser launches and nothing else.
+      #
+      # The script derives its module list from the source tree and proves that
+      # list selects every test exactly once before it launches a browser; it is
+      # not a hand-written list that a new module could sit outside of. Run it
+      # locally exactly as it runs here: scripts/wasm-test-isolated.sh
+      - name: wasm-pack test (trakkt-ui, headless Firefox, whole binary + per module)
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
-        run: wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate --locked
+        run: scripts/wasm-test-isolated.sh
 
       - name: sccache stats
         if: always()
