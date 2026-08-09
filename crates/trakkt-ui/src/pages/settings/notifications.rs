@@ -26,18 +26,20 @@ pub fn NotificationsPage() -> impl IntoView {
     // so the store's counter is the only reactive dependency that can tell this
     // page the same user changed a toggle on another tab or another device.
     //
-    // The counter is resolved once, here, and not inside the fetcher.
-    // `notification_preferences_version` builds a fresh `Signal` wrapper on
-    // every call, and each wrapper is an owner-registered arena item — calling
-    // it from a closure that re-runs allocates another one per run, under
-    // whichever owner happens to be current at the time.
+    // The counter is resolved once, here, and moved into the fetcher.
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let prefs_version = sync_store.map(|s| s.notification_preferences_version());
     let prefs_resource = LocalResource::new(move || {
         // Tracked for the dependency, not for the value: `LocalResource` has no
         // separate source argument, so it re-runs on whatever its fetcher reads
-        // synchronously.
-        if let Some(version) = prefs_version {
+        // synchronously. The `&` matters: `notification_preferences_version`
+        // returns an `ArcSignal<u32>`, which is `Clone` and not `Copy`, so
+        // binding by value would move out of the capture and leave the fetcher
+        // `FnOnce`. The borrow is what keeps `track()` running on every fetch,
+        // and `track()` on every fetch is the entire subscription — see
+        // `a_local_resource_refetches_when_a_signal_its_fetcher_reads_bumps`
+        // below.
+        if let Some(version) = &prefs_version {
             version.track();
         }
         get_notification_preferences()

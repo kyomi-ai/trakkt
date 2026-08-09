@@ -335,7 +335,11 @@ fn IssueDetailContent(
         let cv = sync_store.map(|s| s.comments_version());
 
         Effect::new(move || {
-            if let Some(cv) = cv {
+            // Borrowed, not bound by value: `comments_version` returns an
+            // `ArcSignal<u32>` (`Clone`, not `Copy`), so `if let Some(cv) = cv`
+            // would move out of the capture and leave this `FnOnce`. The `get()`
+            // is what subscribes the effect, on every run, as before.
+            if let Some(cv) = &cv {
                 let _ = cv.get();
             }
             let iid = issue_id.clone();
@@ -855,11 +859,8 @@ fn MetadataSidebar(
     // bumped by every project_milestone sync action — is the only thing that
     // can tell this dropdown its names and dates went stale.
     //
-    // Resolved once here, not inside the effect. `milestones_version` builds a
-    // fresh owner-registered `Signal` wrapper on every call — see the getter
-    // contract on `SyncStore` — so calling it from a closure that re-runs
-    // allocates another arena item per run, under whichever owner is current.
-    // Same shape as `ws_version` in `AttachmentsSection`.
+    // Resolved once here and moved into the effect. Same shape as `ws_version`
+    // in `AttachmentsSection`.
     let milestones_version = sync_store.map(|s| s.milestones_version());
     let milestones = RwSignal::new(Vec::<trakkt_types::models::ProjectMilestone>::new());
     Effect::new(move || {
@@ -868,7 +869,12 @@ fn MetadataSidebar(
         // happens to have a project. Reading it inside the branch would pick the
         // dependency up later and less predictably; this keeps the effect's
         // dependency set stable instead of varying with the data.
-        if let Some(v) = milestones_version {
+        //
+        // Borrowed rather than bound by value: `milestones_version` is an
+        // `ArcSignal<u32>` (`Clone`, not `Copy`), so binding it would move out
+        // of the capture. `track()` still runs on every effect run, which is
+        // what "unconditionally" above is claiming.
+        if let Some(v) = &milestones_version {
             v.track();
         }
         let pid = project_id.get();
@@ -1979,11 +1985,9 @@ fn RelationsSection(
     // `version` covers this tab's own adds and removes. The store counter covers
     // everyone else's: an issue_relation frame bumps it.
     //
-    // Resolved once here, not inside the source closure. `relations_version`
-    // builds a fresh owner-registered `Signal` wrapper on every call — see the
-    // getter contract on `SyncStore` — so calling it from a closure that re-runs
-    // allocates another arena item per run. Same shape as `ws_version` in
-    // `AttachmentsSection`.
+    // Resolved once here and moved into the source closure, which borrows it
+    // with `as_ref` because `relations_version` returns an `ArcSignal<u32>`
+    // (`Clone`, not `Copy`). Same shape as `ws_version` in `AttachmentsSection`.
     let ws_version = sync_store.map(|s| s.relations_version());
     let relations_resource = Resource::new(
         move || {
@@ -1991,7 +1995,7 @@ fn RelationsSection(
                 tk.clone(),
                 number,
                 version.get(),
-                ws_version.map(|v| v.get()).unwrap_or(0),
+                ws_version.as_ref().map(|v| v.get()).unwrap_or(0),
             )
         },
         move |(tk, num, _, _)| async move { list_issue_relations(tk, num).await },
@@ -2375,11 +2379,9 @@ fn IssueTimeline(
 
     // Activities version from SyncStore — bumps on WebSocket activity events.
     //
-    // Resolved once here, not inside the source closure. `activities_version`
-    // builds a fresh owner-registered `Signal` wrapper on every call — see the
-    // getter contract on `SyncStore` — so calling it from a closure that re-runs
-    // allocates another arena item per run. Same shape as `ws_version` in
-    // `AttachmentsSection`.
+    // Resolved once here and moved into the source closure, which borrows it
+    // with `as_ref` because `activities_version` returns an `ArcSignal<u32>`
+    // (`Clone`, not `Copy`). Same shape as `ws_version` in `AttachmentsSection`.
     let activities_version = sync_store.map(|s| s.activities_version());
 
     // Fetch activities reactively, re-fetching when version bumps
@@ -2389,7 +2391,7 @@ fn IssueTimeline(
             (
                 tk.clone(),
                 number,
-                activities_version.map(|v| v.get()).unwrap_or(0),
+                activities_version.as_ref().map(|v| v.get()).unwrap_or(0),
             )
         },
         move |(tk, num, _version)| async move {
@@ -3328,10 +3330,11 @@ fn AttachmentsSection(
     // covers everyone else's: an attachment/issue_attachment frame bumps it, and
     // without it a file added or removed elsewhere never appears here.
     //
-    // Resolved once here, not inside the source closure: `attachments_version`
-    // builds a fresh owner-registered `Signal` wrapper on every call, so calling
-    // it from a closure that re-runs allocates another one per run. Same shape
-    // as `comments_version` above.
+    // Resolved once here and moved into the source closure. The `as_ref` is
+    // because `attachments_version` returns an `ArcSignal<u32>`, which is
+    // `Clone` and not `Copy` (see the getter notes on `SyncStore`): `Option::map`
+    // would consume the capture and leave this closure `FnOnce`. The `get()`
+    // inside is what tracks, unchanged. Same shape as `comments_version` above.
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let ws_version = sync_store.map(|s| s.attachments_version());
 
@@ -3341,7 +3344,7 @@ fn AttachmentsSection(
                 tk.clone(),
                 number,
                 version.get(),
-                ws_version.map(|v| v.get()).unwrap_or(0),
+                ws_version.as_ref().map(|v| v.get()).unwrap_or(0),
             )
         },
         move |(tk, num, _, _)| async move { list_issue_attachments(tk, num).await },

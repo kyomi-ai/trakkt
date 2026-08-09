@@ -317,17 +317,19 @@ pub fn ProjectDetailPage() -> impl IntoView {
     // action, so keying the resource on it is what makes another client's
     // create/rename/re-date arrive here without a reload.
     //
-    // Each of the three counters below is resolved once here, not inside the
-    // source closure that reads it. The getters build a fresh owner-registered
-    // `Signal` wrapper on every call — see the getter contract on `SyncStore` — so
-    // calling one from a closure that re-runs allocates another arena item per
-    // run, under whichever owner is current at the time.
+    // Each of the three counters below is resolved once here and moved into the
+    // one source closure that reads it. The `as_ref()` is because the getters
+    // return `ArcSignal<u32>`, which is `Clone` and not `Copy` (see the getter
+    // notes on `SyncStore`): `Option::map` would consume the capture and make
+    // the closure `FnOnce`, so the read borrows it instead. The counter is
+    // tracked by the `get()` inside the closure, exactly as before — borrowing
+    // rather than copying the wrapper is not a reactive operation.
     let milestones_version = sync_store.map(|s| s.milestones_version());
 
     let server_milestones = Resource::new(
         move || (
             project_id.get(),
-            milestones_version.map(|v| v.get()).unwrap_or(0),
+            milestones_version.as_ref().map(|v| v.get()).unwrap_or(0),
         ),
         move |(id, _version)| async move { list_milestones(id).await },
     );
@@ -342,7 +344,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
     let server_updates = Resource::new(
         move || (
             project_id.get(),
-            project_updates_version.map(|v| v.get()).unwrap_or(0),
+            project_updates_version.as_ref().map(|v| v.get()).unwrap_or(0),
         ),
         move |(id, _version)| async move { list_project_updates(id).await },
     );
@@ -352,7 +354,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
     let server_members = Resource::new(
         move || (
             project_id.get(),
-            project_members_version.map(|v| v.get()).unwrap_or(0),
+            project_members_version.as_ref().map(|v| v.get()).unwrap_or(0),
         ),
         move |(id, _version)| async move { list_project_members(id).await },
     );

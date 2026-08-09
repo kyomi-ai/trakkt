@@ -1961,9 +1961,10 @@ mod wasm_tests {
     /// `version` — its uploads and detaches — is held still here, so the only
     /// thing that can move this tuple is a frame from the sync stream.
     /// Each counter is resolved once, outside the closure, exactly as the pages
-    /// do it — the getters build a fresh owner-registered `Signal` wrapper per
-    /// call, so calling one from inside a closure that re-runs is a different
-    /// (and wrong) shape from the one under test.
+    /// do it. Since TRA-9996 the getters return `ArcSignal<u32>`, which has no
+    /// owner, so resolving one inside the closure would behave identically. The
+    /// shape is matched to the pages so this rebuild stays a rebuild of what the
+    /// pages actually do — not because one of the two forms is unsafe.
     fn attachment_list_source(store: SyncStore) -> Signal<(String, i32, u32, u32)> {
         let version = store.attachments_version();
         Signal::derive(move || ("TRA".to_owned(), 42, 0, version.get()))
@@ -1980,8 +1981,8 @@ mod wasm_tests {
     ///
     /// The counter is resolved once here, outside the closure, which is how
     /// `IssueTimeline` reads it too — TRA-9991 hoisted it out of the source
-    /// closure, so this rebuild now matches the page shape for shape. See the
-    /// getter contract on [`SyncStore`].
+    /// closure, so this rebuild matches the page shape for shape. See the getter
+    /// notes on [`SyncStore`].
     fn issue_timeline_source(store: SyncStore) -> Signal<(String, i32, u32)> {
         let version = store.activities_version();
         Signal::derive(move || ("TRA".to_owned(), 42, version.get()))
