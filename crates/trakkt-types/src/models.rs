@@ -595,6 +595,36 @@ pub struct WorkspaceSettings {
     pub default_auto_archive_days: Option<u32>,
 }
 
+/// The `workspace_settings` sync entity: the workspace-level fields clients
+/// cache, as one addressable row.
+///
+/// This is the only entity the bootstrap streams that is not a table row of its
+/// own — it is a projection of the `workspaces` row, assembled by
+/// `workspace_service::WorkspaceSnapshotRow::into_snapshot`. It was also the
+/// only one with no Rust type at all: the projection was a hand-built
+/// `serde_json::json!` literal, so it was the one entity whose id could not be
+/// derived from a type and the one place the next `"workspace_id"` typo would
+/// have landed. Giving it a struct is what lets it implement [`SyncEntity`]
+/// alongside the other ten.
+///
+/// [`SyncEntity`]: crate::sync::SyncEntity
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceSettingsSnapshot {
+    pub workspace_id: String,
+    pub name: Option<String>,
+    /// The `workspaces.settings` column, carried as parsed JSON rather than as
+    /// [`WorkspaceSettings`].
+    ///
+    /// Deliberately untyped: `WorkspaceSettings` does not deny unknown fields,
+    /// so decoding into it and re-encoding would silently drop any key it does
+    /// not declare — a lossy round-trip for a column written as free-form JSON
+    /// by older versions and by `update_workspace_settings`, which takes a
+    /// `serde_json::Value` from its caller. `None` is a NULL column.
+    pub settings: Option<serde_json::Value>,
+    pub default_team_id: Option<String>,
+    pub updated_at: String,
+}
+
 /// A file attachment linked to an issue.
 ///
 /// WASM-safe serializable DTO for file attachment metadata.
@@ -684,4 +714,61 @@ pub struct ReleaseIssue {
     pub title: String,
     pub status_name: String,
     pub status_category: String,
+}
+
+// ---------------------------------------------------------------------------
+// Sync addressing
+// ---------------------------------------------------------------------------
+
+/// Implement [`SyncEntity`] for the models the sync bootstrap streams.
+///
+/// One row per entity: the model, the [`entity_types`] constant its frames are
+/// tagged with, and the field holding its primary key. This table is the whole
+/// of what `handle_sync_bootstrap` used to restate — an `entity_type` constant
+/// and an id-field *string literal* — once per entity at its own call site, with
+/// nothing checking either against the model it was written beside.
+///
+/// What the compiler now checks, and what it still does not:
+///
+/// - `$id_field` is a field access. A field that does not exist, or that is not
+///   a `String`, does not compile. There is no string to mistype.
+/// - `$entity_type` is a path into [`entity_types`], so a type outside the
+///   declared set does not compile either.
+/// - The **pairing** of a model with its constant is still a statement, not a
+///   deduction: `Label => STATUS, label_id` would compile. Nothing in Rust can
+///   derive a wire string from a type, so this has to be said once somewhere.
+///   Said here, it is eleven adjacent rows that read as a table; said at the
+///   call sites, it was eleven separate lines scattered through a handler. A
+///   wrong pairing here is also not silent the way a wrong id literal was — the
+///   client would cache the payload under another type's store and misrender
+///   it, rather than accept it, file it under `""`, and go quietly stale.
+///
+/// [`SyncEntity`]: crate::sync::SyncEntity
+/// [`entity_types`]: crate::sync::entity_types
+macro_rules! impl_sync_entity {
+    ($($model:ident => $entity_type:ident, $id_field:ident;)+) => {
+        $(
+            impl crate::sync::SyncEntity for $model {
+                const ENTITY_TYPE: &'static str = crate::sync::entity_types::$entity_type;
+
+                fn entity_id(&self) -> &str {
+                    &self.$id_field
+                }
+            }
+        )+
+    };
+}
+
+impl_sync_entity! {
+    IssueWithDetails => ISSUE, issue_id;
+    Label => LABEL, label_id;
+    Status => STATUS, status_id;
+    Team => TEAM, team_id;
+    Project => PROJECT, project_id;
+    View => VIEW, view_id;
+    Favorite => FAVORITE, favorite_id;
+    Notification => NOTIFICATION, notification_id;
+    Comment => COMMENT, comment_id;
+    ProjectMilestone => PROJECT_MILESTONE, milestone_id;
+    WorkspaceSettingsSnapshot => WORKSPACE_SETTINGS, workspace_id;
 }

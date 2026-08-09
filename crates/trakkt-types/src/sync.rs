@@ -95,6 +95,47 @@ pub mod entity_types {
     }
 }
 
+/// An entity the sync bootstrap can put on the wire, and the two facts a frame
+/// carrying it needs: what type it is, and how the client addresses it.
+///
+/// Both used to be restated at each entity's call site in
+/// `handle_sync_bootstrap` (`apps/server/src/routes/websocket.rs`) — an
+/// `entity_type` constant, and beside it a bare string naming the JSON key the
+/// id was then looked up under, e.g. `"issue_id"`. That string had to agree
+/// with the entity's serde field name, and nothing checked that it did: a
+/// `#[serde(rename)]`, a renamed field, or a plain typo made the lookup miss,
+/// and before the runtime guard in `stream_entities` (TRA-9960) the entity went
+/// out with an empty `entity_id`, was certified by the trailing `SyncComplete`
+/// watermark, and was never re-sent. Eleven such strings, one per batch, each a
+/// silent workspace-wide staleness bug for its own entity type.
+///
+/// Implementing this instead moves both facts onto the type. `entity_id`
+/// returns a borrow of the id field itself, so the id no longer travels through
+/// the encoded payload at all — which is also why a `#[serde(rename)]` on that
+/// field can no longer break *addressing*, though it still renames the key in
+/// the payload, which the client decodes with this same type and so follows
+/// automatically. A field that does not exist, or is not a `String`, is a
+/// compile error at the impl.
+///
+/// `Serialize` is a supertrait because an entity that cannot be encoded cannot
+/// be streamed; the bootstrap needs both from the same type.
+pub trait SyncEntity: Serialize {
+    /// The `entity_type` tag on every frame carrying this entity.
+    ///
+    /// Always one of the [`entity_types`] constants, never a fresh literal:
+    /// the client's cache is defined against [`entity_types::ALL`] (see
+    /// `cache/cached_types.rs` in `trakkt-ui`), so a string outside that set
+    /// has no mapping on the other end.
+    const ENTITY_TYPE: &'static str;
+
+    /// The entity's primary key, as the client addresses it.
+    ///
+    /// This is what `cache/apply.rs` keys its IndexedDB upsert on, so it must
+    /// be the row's actual identity and not a display field — two rows sharing
+    /// a value here overwrite each other in the client's cache.
+    fn entity_id(&self) -> &str;
+}
+
 #[cfg(test)]
 mod entity_type_tests {
     use std::collections::BTreeSet;

@@ -8660,6 +8660,56 @@ mod tests {
         );
     }
 
+    /// The `workspace_settings` payload carries exactly the five keys it always
+    /// has.
+    ///
+    /// TRA-10004 replaced the `serde_json::json!` literal that built this
+    /// payload with a typed `WorkspaceSettingsSnapshot` that is serialized
+    /// instead, so its keys are now serde field names rather than quoted
+    /// strings. Nothing else in this suite would notice if that conversion had
+    /// dropped, added or respelled one: the assertions above name three keys
+    /// and pass just as well with the other two absent, and on the client side
+    /// `cache/apply.rs`'s two `WORKSPACE_SETTINGS` arms read no field off the
+    /// payload at all — they bump a version counter and let the settings page
+    /// refetch. A payload that quietly lost `workspace_id` would therefore
+    /// travel all the way to IndexedDB before anything disagreed with it.
+    ///
+    /// Keys only, and sorted: the values are what the two tests above are for,
+    /// and `serde_json::Map` is a `BTreeMap` here, so the order is the
+    /// comparison's and not the writer's.
+    #[tokio::test]
+    async fn the_workspace_settings_payload_carries_exactly_its_five_keys() {
+        let db = two_user_workspace().await;
+
+        crate::workspace_service::update_workspace_name(&db, WS, "New Name", None)
+            .await
+            .expect("rename the workspace");
+
+        let payloads: Vec<serde_json::Value> =
+            delta_payloads(&db, USER_A, entity_types::WORKSPACE_SETTINGS).await;
+        let [payload] = payloads.as_slice() else {
+            panic!("one rename is one entry, got {payloads:?}");
+        };
+        let keys: Vec<&str> = payload
+            .as_object()
+            .unwrap_or_else(|| panic!("the payload is a JSON object, got {payload:?}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                "default_team_id",
+                "name",
+                "settings",
+                "updated_at",
+                "workspace_id",
+            ],
+            "the workspace_settings entity's wire shape is fixed; got {payload:?}"
+        );
+    }
+
     // ─── Workspace default team (TRA-9978) ───────────────────────────────────
     //
     // `set_workspace_default_team` writes exactly one entry

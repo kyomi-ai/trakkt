@@ -19,8 +19,9 @@ use trakkt_auth::websocket::manager::{CatchUpFlag, CatchUpGuard, ConnectionHandl
 use trakkt_auth::{jwt, user_service};
 use trakkt_types::models::{
     Comment, Favorite, IssueWithDetails, Label, Notification, Project, ProjectMilestone, Status,
-    Team, View,
+    Team, View, WorkspaceSettingsSnapshot,
 };
+use trakkt_types::sync::SyncEntity;
 
 use crate::state::AppState;
 
@@ -399,8 +400,6 @@ pub async fn handle_sync_bootstrap(
     user_id: &str,
     workspace_id: &str,
 ) {
-    use trakkt_types::sync::entity_types;
-
     // Held for the whole handler, so a live edit arriving while this stream
     // saturates the outbound channel drops its frame instead of killing a
     // connection that is mid-load. Dropped on every return below.
@@ -434,40 +433,47 @@ pub async fn handle_sync_bootstrap(
     // 3. Assemble the batches in the order clients receive them. Nothing is
     //    serialized yet; `stream_bootstrap` converts each batch when its turn
     //    comes, so an abandoned stream never pays for the batches behind it.
+    let batches = bootstrap_batches(&data);
+
+    // 4. Stream them, and close with the watermark read back in step 1 only if
+    //    every one of them made it.
+    stream_bootstrap(conn_tx, user_id, workspace_id, latest_sync_id, batches).await;
+}
+
+/// The batches one bootstrap streams, in the order clients receive them.
+///
+/// Every batch is named only by the list it carries. Its entity type and each
+/// row's `entity_id` come from the element type's [`SyncEntity`] impl (see the
+/// table at the foot of `crates/trakkt-types/src/models.rs`), so there is no
+/// per-entity string here to disagree with the model — which is what the
+/// `"issue_id"`-style literals that used to sit beside each list could do, and
+/// silently.
+///
+/// Split out of [`handle_sync_bootstrap`] so the list itself is testable: the
+/// derivation removes the mistyped-id class, but "a list mentioned twice, and
+/// another not at all" is a plain editing slip that no type can catch, and
+/// `bootstrap_streams_every_entity_type_exactly_once` is what catches it.
+fn bootstrap_batches(data: &BootstrapData) -> Vec<PendingBatch<'_>> {
     let mut batches = vec![
-        PendingBatch::new(entity_types::ISSUE, "issue_id", &data.issues),
-        PendingBatch::new(entity_types::LABEL, "label_id", &data.labels),
-        PendingBatch::new(entity_types::STATUS, "status_id", &data.statuses),
-        PendingBatch::new(entity_types::TEAM, "team_id", &data.teams),
-        PendingBatch::new(entity_types::PROJECT, "project_id", &data.projects),
-        PendingBatch::new(entity_types::VIEW, "view_id", &data.views),
-        PendingBatch::new(entity_types::FAVORITE, "favorite_id", &data.favorites),
-        PendingBatch::new(
-            entity_types::NOTIFICATION,
-            "notification_id",
-            &data.notifications,
-        ),
-        PendingBatch::new(entity_types::COMMENT, "comment_id", &data.comments),
-        PendingBatch::new(
-            entity_types::PROJECT_MILESTONE,
-            "milestone_id",
-            &data.milestones,
-        ),
+        PendingBatch::new(&data.issues),
+        PendingBatch::new(&data.labels),
+        PendingBatch::new(&data.statuses),
+        PendingBatch::new(&data.teams),
+        PendingBatch::new(&data.projects),
+        PendingBatch::new(&data.views),
+        PendingBatch::new(&data.favorites),
+        PendingBatch::new(&data.notifications),
+        PendingBatch::new(&data.comments),
+        PendingBatch::new(&data.milestones),
     ];
 
     // Workspace settings is a single entity, not a list — and a workspace with
     // no row simply has none to stream, which is not a failure.
     if let Some(settings) = &data.workspace_settings {
-        batches.push(PendingBatch::new(
-            entity_types::WORKSPACE_SETTINGS,
-            "workspace_id",
-            std::slice::from_ref(settings),
-        ));
+        batches.push(PendingBatch::new(std::slice::from_ref(settings)));
     }
 
-    // 4. Stream them, and close with the watermark read back in step 1 only if
-    //    every one of them made it.
-    stream_bootstrap(conn_tx, user_id, workspace_id, latest_sync_id, batches).await;
+    batches
 }
 
 /// Everything a bootstrap streams, read before any of it is put on the wire.
@@ -489,7 +495,7 @@ struct BootstrapData {
     /// `None` means the workspace has no row at all — a real answer, streamed
     /// as "no settings entity". A read that *failed* never reaches this field:
     /// it comes back as `Err` from [`fetch_bootstrap_data`].
-    workspace_settings: Option<serde_json::Value>,
+    workspace_settings: Option<WorkspaceSettingsSnapshot>,
 }
 
 /// Await one bootstrap read, naming it in the log if it fails.
@@ -651,7 +657,24 @@ async fn fetch_bootstrap_data(
     })
 }
 
-/// Turn one entity list into the JSON frames it will be streamed as.
+/// One entity ready for the wire: the id the client will address it by, and the
+/// payload that id addresses.
+///
+/// The two are carried side by side, and separately, because the id must not be
+/// recovered from the payload. Reading it back out of the encoded JSON is what
+/// needed a key to read it *under*, and that key was the string literal this
+/// refactor removed. Here `entity_id` is a `String` taken from
+/// [`SyncEntity::entity_id`] before the payload was ever built, so the payload's
+/// key names — including any `#[serde(rename)]` on them — cannot affect
+/// addressing at all.
+struct AddressedEntity {
+    /// Becomes `SyncAction.entity_id`, which the client's cache keys on.
+    entity_id: String,
+    /// Becomes `SyncAction.data`.
+    payload: serde_json::Value,
+}
+
+/// Turn one entity list into the addressed frames it will be streamed as.
 ///
 /// Boxed because the batches differ in element type: erasing that behind a
 /// closure is what lets [`stream_bootstrap`] hold them in one list and write
@@ -659,29 +682,36 @@ async fn fetch_bootstrap_data(
 /// also keeps serialization lazy, so peak memory is one batch of JSON rather
 /// than all eleven at once, and an abandoned stream never encodes the batches
 /// behind it.
+///
+/// The erasure is why [`PendingBatch::entity_type`] is a plain `&'static str`
+/// rather than a `T::ENTITY_TYPE` read at the point of use: once the element
+/// type is behind the closure there is no `T` left to ask. It is copied off the
+/// same `T` in [`PendingBatch::new`], in the same expression that builds the
+/// closure, so the pair cannot be assembled from two different types.
 type BatchSerializer<'a> =
-    Box<dyn FnOnce() -> Result<Vec<serde_json::Value>, serde_json::Error> + Send + 'a>;
+    Box<dyn FnOnce() -> Result<Vec<AddressedEntity>, serde_json::Error> + Send + 'a>;
 
 /// One entity list waiting for its turn on the wire.
 struct PendingBatch<'a> {
-    /// Entity type carried on every frame in the batch.
+    /// Entity type carried on every frame in the batch, from `T::ENTITY_TYPE`.
     entity_type: &'static str,
-    /// JSON key holding each entity's primary key (e.g. `"issue_id"`).
-    id_field: &'static str,
-    /// Encodes the batch, or reports the entity that could not be encoded.
+    /// Encodes and addresses the batch, or reports the entity that could not be
+    /// encoded.
     serialize: BatchSerializer<'a>,
 }
 
 impl<'a> PendingBatch<'a> {
-    fn new<T: serde::Serialize + Sync>(
-        entity_type: &'static str,
-        id_field: &'static str,
-        items: &'a [T],
-    ) -> Self {
+    /// A batch of `items`, typed by what they are.
+    ///
+    /// Takes no `entity_type` and no id field: both come from `T`'s
+    /// [`SyncEntity`] impl. That is the whole of TRA-10004 — a caller cannot
+    /// hand a list of issues the label entity type, or name an id field that
+    /// does not exist on the model, because there is no parameter left to say
+    /// either in.
+    fn new<T: SyncEntity + Sync>(items: &'a [T]) -> Self {
         Self {
-            entity_type,
-            id_field,
-            serialize: Box::new(move || to_sync_values(items)),
+            entity_type: T::ENTITY_TYPE,
+            serialize: Box::new(move || to_addressed_entities(items)),
         }
     }
 }
@@ -703,9 +733,9 @@ async fn stream_bootstrap(
     batches: Vec<PendingBatch<'_>>,
 ) {
     for batch in batches {
-        let values = match (batch.serialize)() {
-            Ok(values) => values,
-            // `to_sync_values` has already logged the entity and the error.
+        let entities = match (batch.serialize)() {
+            Ok(entities) => entities,
+            // `to_addressed_entities` has already logged the entity and error.
             Err(_) => {
                 tracing::error!(
                     user_id,
@@ -717,8 +747,7 @@ async fn stream_bootstrap(
             }
         };
 
-        match stream_entities(conn_tx, workspace_id, batch.entity_type, batch.id_field, values).await
-        {
+        match stream_entities(conn_tx, workspace_id, batch.entity_type, entities).await {
             StreamOutcome::Delivered => {}
             StreamOutcome::ClientGone => {
                 tracing::debug!(
@@ -730,11 +759,11 @@ async fn stream_bootstrap(
                 return;
             }
             StreamOutcome::UnusableEntity => {
-                // `stream_entities` has already logged the id field it expected,
-                // why that field yielded nothing usable, and the key names the
-                // entity did carry. This line records the consequence: the
-                // watermark below is not sent, so the client keeps its old
-                // cursor and asks for the whole dataset again next reconnect.
+                // `stream_entities` has already logged the batch and the
+                // position within it of the row whose stored id is empty. This
+                // line records the consequence: the watermark below is not
+                // sent, so the client keeps its old cursor and asks for the
+                // whole dataset again next reconnect.
                 tracing::error!(
                     user_id,
                     workspace_id,
@@ -989,7 +1018,13 @@ async fn drain_delta(
     DrainOutcome::CapExhausted { cursor }
 }
 
-/// Serialize a batch of entities for streaming.
+/// Serialize a batch of entities for streaming, pairing each with its id.
+///
+/// The id is taken from [`SyncEntity::entity_id`] — the model's own field —
+/// and never from the value `serde_json::to_value` just produced. That is the
+/// single hop where the old design read the id back out of the encoded payload
+/// under a per-call-site string key, and it is the hop this whole refactor
+/// exists to delete.
 ///
 /// An entity that cannot be serialized cannot be put on the wire at all, and
 /// the first one that fails takes the whole bootstrap with it: dropping it
@@ -1000,19 +1035,24 @@ async fn drain_delta(
 ///
 /// The `Err` is the encoding failure itself; the entity type and the underlying
 /// error are logged here, where the concrete `T` is still known.
-fn to_sync_values<T: serde::Serialize>(
+fn to_addressed_entities<T: SyncEntity>(
     items: &[T],
-) -> Result<Vec<serde_json::Value>, serde_json::Error> {
+) -> Result<Vec<AddressedEntity>, serde_json::Error> {
     items
         .iter()
         .map(|item| {
-            serde_json::to_value(item).inspect_err(|e| {
-                tracing::error!(
-                    entity = std::any::type_name::<T>(),
-                    error = %e,
-                    "Failed to serialize entity for bootstrap, aborting the stream"
-                );
-            })
+            serde_json::to_value(item)
+                .map(|payload| AddressedEntity {
+                    entity_id: item.entity_id().to_owned(),
+                    payload,
+                })
+                .inspect_err(|e| {
+                    tracing::error!(
+                        entity = std::any::type_name::<T>(),
+                        error = %e,
+                        "Failed to serialize entity for bootstrap, aborting the stream"
+                    );
+                })
         })
         .collect()
 }
@@ -1029,25 +1069,23 @@ enum StreamOutcome {
     Delivered,
     /// The receiving connection is gone. The remaining items were not sent.
     ClientGone,
-    /// An entity carried no usable value in `id_field`, so it could not be
-    /// addressed. The remaining items were not sent.
+    /// An entity's id was empty, so it could not be addressed. The remaining
+    /// items were not sent.
     UnusableEntity,
 }
 
-/// A bounded, user-data-free description of an entity that could not be
-/// addressed, for the `error!` in [`stream_entities`].
+/// A bounded, user-data-free description of an entity's payload, for the
+/// timestamp `warn!` in [`stream_entities`].
 ///
 /// Reports the entity's *key names* — never any value. Those keys are serde
-/// field names from a fixed struct in `trakkt-types` (or, for workspace
-/// settings, the literal keys of `WorkspaceSnapshotRow::into_sync_value`), so
-/// they are schema, not user records: naming them is what makes an `id_field`
-/// typo or a stray `#[serde(rename)]` diagnosable from an aggregated log,
-/// while a dump of the payload would put issue titles and comment bodies at
-/// `error!` level.
+/// field names from a fixed struct in `trakkt-types`, so they are schema, not
+/// user records: naming them is what makes a missing or renamed timestamp field
+/// diagnosable from an aggregated log, while a dump of the payload would put
+/// issue titles and comment bodies into the log at `warn!` level.
 ///
 /// A value that is not a JSON object has no keys at all, so it reports its JSON
 /// kind instead — also a fixed, finite string.
-fn addressing_shape(item: &serde_json::Value) -> String {
+fn payload_shape(item: &serde_json::Value) -> String {
     match item.as_object() {
         Some(fields) => fields
             .keys()
@@ -1070,21 +1108,11 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Why `id_field` did not yield a usable id, as one of four fixed words.
-fn unusable_id_reason(item: &serde_json::Value, id_field: &str) -> &'static str {
-    match item.get(id_field) {
-        None => "absent",
-        Some(serde_json::Value::Null) => "null",
-        Some(v) if !v.is_string() => "not a string",
-        _ => "empty string",
-    }
-}
-
 /// Stream a batch of entities as individual `SyncAction(Insert)` messages.
 ///
-/// Used by `handle_sync_bootstrap` to avoid copy-pasting the same loop for
-/// each entity type. `id_field` is the JSON key that holds the entity's
-/// primary key (e.g. `"issue_id"`, `"label_id"`).
+/// Used by `handle_sync_bootstrap` to avoid copy-pasting the same loop for each
+/// entity type. Each item arrives already addressed: [`to_addressed_entities`]
+/// took its `entity_id` from the model's [`SyncEntity`] impl before encoding it.
 ///
 /// # The id is mandatory
 ///
@@ -1093,15 +1121,19 @@ fn unusable_id_reason(item: &serde_json::Value, id_field: &str) -> &'static str 
 /// under `""` or not applied at all. Either way the client still counts the
 /// frame as received, and the trailing watermark then certifies a dataset that
 /// entity is missing from — no later `sync_delta` mentions it again, because it
-/// sits below the cursor. So an entity whose `id_field` is absent, `null`,
-/// non-string, or the empty string returns [`StreamOutcome::UnusableEntity`]
-/// and the caller must not send `SyncComplete`. All four cases are the same
-/// defect — `id_field` does not name a usable key on this entity — and all four
-/// produced an empty `entity_id` under the `unwrap_or_default()` this replaces.
+/// sits below the cursor. So an entity with an empty id returns
+/// [`StreamOutcome::UnusableEntity`] and the caller must not send
+/// `SyncComplete`.
 ///
-/// `id_field` is a string literal chosen per call site, so a mismatch with the
-/// entity's real serde field name is not a compile error; this check plus the
-/// `error!` beside it is what makes that mismatch visible instead of silent.
+/// TRA-9960 added this guard against four ways an id could be unusable —
+/// absent, `null`, non-string, or empty — because the id was then looked up in
+/// the encoded payload under a per-call-site string key, and a key that named
+/// no field on the model produced any of the first three. TRA-10004 deleted
+/// that key: the id is now a `String` read off the model itself, so absent,
+/// `null` and non-string are no longer states this function can be handed. The
+/// guard stays for the fourth, which the type system cannot exclude and which
+/// is not a coding error at all — it is a row stored with an empty primary key,
+/// and it would still be certified by a watermark and never re-sent.
 ///
 /// # The timestamp is not
 ///
@@ -1124,35 +1156,48 @@ fn unusable_id_reason(item: &serde_json::Value, id_field: &str) -> &'static str 
 /// whole workspace from the client over a field with no reader. It is logged at
 /// `warn!` instead, because it is still anomalous: every entity type the
 /// bootstrap streams carries `created_at`, `updated_at`, or both.
+///
+/// TRA-10004 asked whether `timestamp` should move onto [`SyncEntity`] beside
+/// `entity_id`, since it has the same stringly-typed shape. It should not, for
+/// three reasons that do not apply to the id:
+///
+/// 1. There is no per-call-site literal to remove. `"updated_at"` and
+///    `"created_at"` are written once, here, for all eleven entity types — so
+///    there is no typo that can affect one entity type and not the others, and
+///    nothing to keep in step with eleven models. The id literals were the
+///    defect class precisely because there were eleven of them.
+/// 2. A wrong answer is inert. The paragraphs above trace every reader of this
+///    field to a discard; a wrong `entity_id` corrupts the client's cache under
+///    a watermark that seals it.
+/// 3. A `sync_timestamp()` on the trait would have to *re-render* the value,
+///    not borrow it: `Comment` stores `chrono::DateTime<Utc>`, so the method
+///    would format it by hand while serde formats the payload's copy its own
+///    way. That trades a divergence nothing reads for a new one between two
+///    renderings of the same instant.
 async fn stream_entities(
     conn_tx: &WsSender,
     workspace_id: &str,
     entity_type: &str,
-    id_field: &str,
-    items: Vec<serde_json::Value>,
+    items: Vec<AddressedEntity>,
 ) -> StreamOutcome {
     use trakkt_types::sync::{SyncAction, SyncActionType, SyncResponse};
 
-    for (index, item) in items.into_iter().enumerate() {
-        let entity_id = match item.get(id_field).and_then(|v| v.as_str()) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => {
-                tracing::error!(
-                    workspace_id,
-                    entity_type,
-                    id_field,
-                    index,
-                    reason = unusable_id_reason(&item, id_field),
-                    entity_keys = %addressing_shape(&item),
-                    "sync_bootstrap: entity has no usable id -- aborting the stream"
-                );
-                return StreamOutcome::UnusableEntity;
-            }
-        };
+    for (index, entity) in items.into_iter().enumerate() {
+        let AddressedEntity { entity_id, payload } = entity;
 
-        let timestamp = match item
+        if entity_id.is_empty() {
+            tracing::error!(
+                workspace_id,
+                entity_type,
+                index,
+                "sync_bootstrap: entity's stored id is empty -- aborting the stream"
+            );
+            return StreamOutcome::UnusableEntity;
+        }
+
+        let timestamp = match payload
             .get("updated_at")
-            .or_else(|| item.get("created_at"))
+            .or_else(|| payload.get("created_at"))
             .and_then(|v| v.as_str())
         {
             Some(ts) => ts.to_string(),
@@ -1161,7 +1206,7 @@ async fn stream_entities(
                     workspace_id,
                     entity_type,
                     entity_id,
-                    entity_keys = %addressing_shape(&item),
+                    entity_keys = %payload_shape(&payload),
                     "sync_bootstrap: entity has neither updated_at nor created_at as a \
                      string -- streaming it with an empty timestamp, which no client \
                      reader consumes"
@@ -1176,7 +1221,7 @@ async fn stream_entities(
             entity_id,
             workspace_id: workspace_id.to_string(),
             action: SyncActionType::Insert,
-            data: Some(item),
+            data: Some(payload),
             timestamp,
         };
         if !send_sync_response(conn_tx, SyncResponse::SyncAction(action)).await {
@@ -1236,14 +1281,51 @@ mod tests {
     use tokio::sync::mpsc;
     use trakkt_types::sync::{entity_types, SyncActionType, SyncResponse};
 
-    /// Minimal issue-shaped JSON — `stream_entities` only reads the id field
-    /// and the timestamp, so no DB round-trip is needed.
-    fn issue_value(issue_id: &str) -> serde_json::Value {
-        serde_json::json!({
-            "issue_id": issue_id,
-            "title": "streamed issue",
-            "updated_at": "2026-07-26T12:00:00Z",
-        })
+    /// A minimal stand-in for a streamed entity.
+    ///
+    /// The real models carry thirty-odd fields and a DB round-trip to build;
+    /// the streaming path reads exactly two things off one — the id its
+    /// [`SyncEntity`] impl returns, and a timestamp key on the encoded payload
+    /// — so three fields exercise it at full fidelity.
+    ///
+    /// This replaces the `serde_json::json!` literal these tests used to stream.
+    /// The literal could not be used any more and should not be: a bare `Value`
+    /// has no `SyncEntity` impl, so it cannot say what it is or what its id is,
+    /// which is the guarantee under test. Going through a typed stand-in means
+    /// the tests exercise the real derivation — `PendingBatch::new` reading
+    /// `T::ENTITY_TYPE`, `to_addressed_entities` reading `entity_id()` — rather
+    /// than a shape that mimics its output.
+    #[derive(serde::Serialize)]
+    struct TestIssue {
+        issue_id: String,
+        title: &'static str,
+        updated_at: &'static str,
+    }
+
+    impl SyncEntity for TestIssue {
+        const ENTITY_TYPE: &'static str = entity_types::ISSUE;
+
+        fn entity_id(&self) -> &str {
+            &self.issue_id
+        }
+    }
+
+    /// A test issue with the given stored id.
+    fn issue(issue_id: &str) -> TestIssue {
+        TestIssue {
+            issue_id: issue_id.to_owned(),
+            title: "streamed issue",
+            updated_at: "2026-07-26T12:00:00Z",
+        }
+    }
+
+    /// Address a batch the way `PendingBatch` does, for the tests that drive
+    /// [`stream_entities`] directly rather than through a batch.
+    ///
+    /// `TestIssue` is three owned fields, so the encode cannot fail and this
+    /// `expect` cannot be what a failing test is reporting.
+    fn addressed(items: &[TestIssue]) -> Vec<AddressedEntity> {
+        to_addressed_entities(items).expect("encoding well-formed test issues")
     }
 
     fn parse_frame(frame: &str) -> SyncResponse {
@@ -1253,14 +1335,10 @@ mod tests {
     #[tokio::test]
     async fn stream_entities_writes_one_frame_per_item_in_order() {
         let (conn_tx, mut conn_rx) = mpsc::channel::<String>(16);
-        let items = vec![
-            issue_value("iss_1"),
-            issue_value("iss_2"),
-            issue_value("iss_3"),
-        ];
+        let items = [issue("iss_1"), issue("iss_2"), issue("iss_3")];
 
         assert_eq!(
-            stream_entities(&conn_tx, "ws_1", entity_types::ISSUE, "issue_id", items).await,
+            stream_entities(&conn_tx, "ws_1", entity_types::ISSUE, addressed(&items)).await,
             StreamOutcome::Delivered,
             "streaming to a live connection must report success"
         );
@@ -1288,13 +1366,12 @@ mod tests {
         // more than one frame, so closing the channel after the first frame
         // lands squarely in the middle of the batch.
         let (conn_tx, mut conn_rx) = mpsc::channel::<String>(1);
-        let items: Vec<serde_json::Value> = (0..50)
-            .map(|i| issue_value(&format!("iss_{i}")))
-            .collect();
+        let items: Vec<TestIssue> = (0..50).map(|i| issue(&format!("iss_{i}"))).collect();
         let item_count = items.len();
+        let items = addressed(&items);
 
         let streamer = tokio::spawn(async move {
-            stream_entities(&conn_tx, "ws_1", entity_types::ISSUE, "issue_id", items).await
+            stream_entities(&conn_tx, "ws_1", entity_types::ISSUE, items).await
         });
 
         // Receiving the first frame proves the stream is under way; closing then
@@ -1337,7 +1414,7 @@ mod tests {
     /// entity model this handler streams can produce one, so the failure has to
     /// be introduced deliberately. This stands in for an *entity*, not for any
     /// production code: everything it is handed to below — `PendingBatch`,
-    /// `to_sync_values`, `stream_bootstrap` — is exactly what
+    /// `to_addressed_entities`, `stream_bootstrap` — is exactly what
     /// `handle_sync_bootstrap` runs.
     struct Unencodable;
 
@@ -1347,6 +1424,17 @@ mod tests {
             _serializer: S,
         ) -> std::result::Result<S::Ok, S::Error> {
             Err(serde::ser::Error::custom("this entity cannot be encoded"))
+        }
+    }
+
+    /// The id here is never reached: `to_addressed_entities` encodes first and
+    /// only asks for the id of an entity that encoded, so the failing batch
+    /// below fails on the `Serialize` impl above rather than on addressing.
+    impl SyncEntity for Unencodable {
+        const ENTITY_TYPE: &'static str = entity_types::LABEL;
+
+        fn entity_id(&self) -> &str {
+            "lbl_1"
         }
     }
 
@@ -1370,7 +1458,7 @@ mod tests {
     #[tokio::test]
     async fn a_batch_that_cannot_be_encoded_ends_the_bootstrap_without_a_watermark() {
         let (conn_tx, mut conn_rx) = mpsc::channel::<String>(16);
-        let issues = [issue_value("iss_1"), issue_value("iss_2")];
+        let issues = [issue("iss_1"), issue("iss_2")];
         let unencodable = [Unencodable];
 
         stream_bootstrap(
@@ -1378,10 +1466,7 @@ mod tests {
             "usr_1",
             "ws_1",
             99,
-            vec![
-                PendingBatch::new(entity_types::ISSUE, "issue_id", &issues),
-                PendingBatch::new(entity_types::LABEL, "label_id", &unencodable),
-            ],
+            vec![PendingBatch::new(&issues), PendingBatch::new(&unencodable)],
         )
         .await;
         drop(conn_tx);
@@ -1413,16 +1498,9 @@ mod tests {
     #[tokio::test]
     async fn a_fully_encodable_stream_ends_with_the_watermark() {
         let (conn_tx, mut conn_rx) = mpsc::channel::<String>(16);
-        let issues = [issue_value("iss_1"), issue_value("iss_2")];
+        let issues = [issue("iss_1"), issue("iss_2")];
 
-        stream_bootstrap(
-            &conn_tx,
-            "usr_1",
-            "ws_1",
-            99,
-            vec![PendingBatch::new(entity_types::ISSUE, "issue_id", &issues)],
-        )
-        .await;
+        stream_bootstrap(&conn_tx, "usr_1", "ws_1", 99, vec![PendingBatch::new(&issues)]).await;
         drop(conn_tx);
 
         let mut frames = Vec::new();
@@ -1449,28 +1527,6 @@ mod tests {
         );
     }
 
-    /// `issue_value` with its `issue_id` replaced by `id`, or removed entirely
-    /// when `id` is `None`.
-    ///
-    /// The four ways `id_field` can fail to name a usable id — absent, `null`,
-    /// non-string, empty string — all reduce to one of these two edits, and all
-    /// four produced the same empty `entity_id` before the guard existed.
-    fn issue_with_id(id: Option<serde_json::Value>) -> serde_json::Value {
-        let mut item = issue_value("replaced below");
-        let fields = item
-            .as_object_mut()
-            .expect("issue_value builds a JSON object");
-        match id {
-            Some(value) => {
-                fields.insert("issue_id".to_owned(), value);
-            }
-            None => {
-                fields.remove("issue_id");
-            }
-        }
-        item
-    }
-
     /// Stream one issue batch to a live receiver, reporting the outcome and the
     /// entity ids that actually reached the wire.
     ///
@@ -1478,10 +1534,10 @@ mod tests {
     /// reachable from here — any abort this reports is an addressing abort.
     /// Channel capacity comfortably exceeds every batch below, so no send can
     /// park and no second task is needed to drain concurrently.
-    async fn stream_issue_batch(items: Vec<serde_json::Value>) -> (StreamOutcome, Vec<String>) {
+    async fn stream_issue_batch(items: &[TestIssue]) -> (StreamOutcome, Vec<String>) {
         let (conn_tx, mut conn_rx) = mpsc::channel::<String>(16);
         let outcome =
-            stream_entities(&conn_tx, "ws_1", entity_types::ISSUE, "issue_id", items).await;
+            stream_entities(&conn_tx, "ws_1", entity_types::ISSUE, addressed(items)).await;
         drop(conn_tx);
 
         let mut streamed = Vec::new();
@@ -1495,53 +1551,64 @@ mod tests {
         (outcome, streamed)
     }
 
-    /// Every shape of unusable id stops the batch at the offending entity.
+    /// An entity whose stored id is empty stops the batch where it stands.
     ///
-    /// All four shapes collapsed to the same empty `entity_id` before this
-    /// guard existed, which is the bug: the client keys its IndexedDB upsert on
-    /// `entity_id`, so the row landed under `""` or was not applied, and the
-    /// watermark that followed put it below the floor of every future delta.
+    /// # Why this used to be four cases
+    ///
+    /// TRA-9960 ran this as a table over four shapes — the id key absent,
+    /// `null`, non-string, and empty — because `stream_entities` looked the id
+    /// up in the encoded payload under a string named at the call site, and a
+    /// string that named no field on the model produced the first three. All
+    /// four collapsed to the same empty `entity_id` before that guard existed.
+    ///
+    /// TRA-10004 deleted the lookup. The id is now a `String` read off the
+    /// model by `SyncEntity::entity_id`, so `stream_entities` cannot be handed
+    /// an absent, `null` or non-string id — there is no code that could
+    /// construct one, and none that could be written. Those three shapes were
+    /// not dropped from this test because they stopped mattering; they were
+    /// dropped because writing them no longer compiles, which is the guarantee
+    /// TRA-10004 exists to provide and is the strongest form this assertion
+    /// could take.
+    ///
+    /// The fourth is a different thing and survives: an empty id is not a
+    /// coding error but a stored row whose primary key is `""`. No type
+    /// excludes it, and it is still fatal for the same reason — the client keys
+    /// its IndexedDB upsert on `entity_id`, so the row lands under `""` or is
+    /// not applied, and the watermark that follows puts it below the floor of
+    /// every future delta.
     ///
     /// The abort is mid-stream, not a rollback — the frame in front of the bad
     /// entity has already been delivered and stays delivered. What the guard
     /// buys is the watermark that never follows it.
-    ///
-    /// Every shape is run and the results compared as one table rather than
-    /// asserted inside the loop, so a regression reports all four shapes
-    /// instead of stopping at whichever happens to be first.
     #[tokio::test]
-    async fn an_entity_with_no_usable_id_aborts_the_batch_whatever_shape_the_id_has() {
-        let shapes = [
-            ("absent", issue_with_id(None)),
-            ("null", issue_with_id(Some(serde_json::Value::Null))),
-            ("non-string", issue_with_id(Some(serde_json::json!(7)))),
-            ("empty string", issue_with_id(Some(serde_json::json!("")))),
-        ];
-
-        let mut observed = Vec::new();
-        for (shape, unaddressable) in shapes {
-            let (outcome, streamed) = stream_issue_batch(vec![
-                issue_value("iss_1"),
-                unaddressable,
-                issue_value("iss_3"),
-            ])
-            .await;
-            observed.push((shape, outcome, streamed));
-        }
+    async fn an_entity_with_an_empty_id_aborts_the_batch() {
+        let (outcome, streamed) =
+            stream_issue_batch(&[issue("iss_1"), issue(""), issue("iss_3")]).await;
 
         // `UnusableEntity` and not merely "not Delivered": an unaddressable
-        // entity is a defect in this server and must stay distinguishable from
-        // the client hanging up, which is routine. `["iss_1"]` and not
-        // `["iss_1", "iss_3"]`: the batch stops where it stands, and the frame
-        // already on the wire is not retracted.
-        let expected: Vec<(&str, StreamOutcome, Vec<String>)> = ["absent", "null", "non-string", "empty string"]
-            .into_iter()
-            .map(|shape| (shape, StreamOutcome::UnusableEntity, vec!["iss_1".to_owned()]))
-            .collect();
+        // entity must stay distinguishable from the client hanging up, which is
+        // routine. `["iss_1"]` and not `["iss_1", "iss_3"]`: the batch stops
+        // where it stands, and the frame already on the wire is not retracted.
+        assert_eq!(
+            (outcome, streamed),
+            (StreamOutcome::UnusableEntity, vec!["iss_1".to_owned()]),
+            "an empty stored id must abort the batch at the offending entity"
+        );
+    }
+
+    /// The same batch with nothing wrong in it. Without this, the assertion
+    /// above is satisfied by a `stream_entities` that aborts on every batch.
+    #[tokio::test]
+    async fn a_batch_of_addressable_entities_streams_to_the_end() {
+        let (outcome, streamed) = stream_issue_batch(&[issue("iss_1"), issue("iss_3")]).await;
 
         assert_eq!(
-            observed, expected,
-            "every shape of unusable id must abort the batch at the offending entity"
+            (outcome, streamed),
+            (
+                StreamOutcome::Delivered,
+                vec!["iss_1".to_owned(), "iss_3".to_owned()]
+            ),
+            "a batch whose entities all carry ids streams in full"
         );
     }
 
@@ -1551,22 +1618,19 @@ mod tests {
     /// Non-vacuity has two halves. The batches ahead of the failure are
     /// asserted to have streamed, so the run reached the failing batch rather
     /// than dying earlier. And the failure can only be the addressing guard:
-    /// these batches are `serde_json::Value`s, and `to_sync_values` calls
-    /// `serde_json::to_value` on them, which for a value that is already a
-    /// `Value` is a clone that cannot fail — so `stream_bootstrap`'s encode
-    /// guard is unreachable here and cannot be what stopped the stream.
+    /// `TestIssue` is three owned fields, so `to_addressed_entities` cannot
+    /// fail to encode it and `stream_bootstrap`'s encode guard is unreachable
+    /// here.
+    ///
+    /// The second batch is another `TestIssue` batch rather than a differently
+    /// typed one because what is under test is the batch *boundary* — that the
+    /// abort happens after an earlier batch has gone out — and not anything
+    /// about which entity type it holds.
     #[tokio::test]
     async fn an_entity_that_cannot_be_addressed_ends_the_bootstrap_without_a_watermark() {
         let (conn_tx, mut conn_rx) = mpsc::channel::<String>(16);
-        let issues = [issue_value("iss_1"), issue_value("iss_2")];
-        // A label-shaped value whose id lives under the wrong key — the typo
-        // class this guard exists to surface, since `id_field` is a string
-        // literal the compiler never checks against the entity's serde names.
-        let labels = [serde_json::json!({
-            "labelId": "lbl_1",
-            "name": "mislabelled key",
-            "created_at": "2026-07-26T12:00:00Z",
-        })];
+        let issues = [issue("iss_1"), issue("iss_2")];
+        let unaddressable = [issue("")];
 
         stream_bootstrap(
             &conn_tx,
@@ -1574,8 +1638,8 @@ mod tests {
             "ws_1",
             99,
             vec![
-                PendingBatch::new(entity_types::ISSUE, "issue_id", &issues),
-                PendingBatch::new(entity_types::LABEL, "label_id", &labels),
+                PendingBatch::new(&issues),
+                PendingBatch::new(&unaddressable),
             ],
         )
         .await;
@@ -1598,6 +1662,109 @@ mod tests {
                 .any(|f| matches!(f, SyncResponse::SyncComplete { .. })),
             "a bootstrap that could not address an entity must not certify what it did \
              send as complete, got {frames:?}"
+        );
+    }
+
+    /// A `BootstrapData` with every list empty, and the settings row the caller
+    /// asks for.
+    ///
+    /// The batch list is built from the *fields*, not their contents, so empty
+    /// lists exercise it exactly as populated ones would — and keep the two
+    /// tests below free of a database.
+    fn empty_bootstrap_data(
+        workspace_settings: Option<WorkspaceSettingsSnapshot>,
+    ) -> BootstrapData {
+        BootstrapData {
+            issues: Vec::new(),
+            labels: Vec::new(),
+            statuses: Vec::new(),
+            teams: Vec::new(),
+            projects: Vec::new(),
+            views: Vec::new(),
+            favorites: Vec::new(),
+            notifications: Vec::new(),
+            comments: Vec::new(),
+            milestones: Vec::new(),
+            workspace_settings,
+        }
+    }
+
+    fn settings_snapshot() -> WorkspaceSettingsSnapshot {
+        WorkspaceSettingsSnapshot {
+            workspace_id: "ws_1".to_owned(),
+            name: Some("Test workspace".to_owned()),
+            settings: None,
+            default_team_id: None,
+            updated_at: "2026-07-26T12:00:00Z".to_owned(),
+        }
+    }
+
+    /// The batch list covers each entity type the bootstrap sends, once.
+    ///
+    /// `PendingBatch::new` now takes only the list, so the entity type is
+    /// derived and cannot be wrong for the list it was given. What it cannot
+    /// catch is a list named twice while another is not named at all — the two
+    /// arguments used to differ, so a duplicated line was visible; now the
+    /// lines differ only in a field name. That slip would stream one type
+    /// twice, omit another entirely, and still end in a `SyncComplete`
+    /// certifying the omission — silent staleness of exactly the kind this
+    /// handler is written to avoid.
+    ///
+    /// The expected list is the bootstrap's own set, which is deliberately
+    /// smaller than `entity_types::ALL`: types not named here reach clients
+    /// through `sync_delta` rather than through a bootstrap batch.
+    #[test]
+    fn bootstrap_streams_every_entity_type_exactly_once() {
+        let data = empty_bootstrap_data(Some(settings_snapshot()));
+
+        let streamed: Vec<&str> = bootstrap_batches(&data)
+            .iter()
+            .map(|batch| batch.entity_type)
+            .collect();
+
+        assert_eq!(
+            streamed,
+            vec![
+                entity_types::ISSUE,
+                entity_types::LABEL,
+                entity_types::STATUS,
+                entity_types::TEAM,
+                entity_types::PROJECT,
+                entity_types::VIEW,
+                entity_types::FAVORITE,
+                entity_types::NOTIFICATION,
+                entity_types::COMMENT,
+                entity_types::PROJECT_MILESTONE,
+                entity_types::WORKSPACE_SETTINGS,
+            ],
+            "the bootstrap must stream each of its entity types exactly once, in order"
+        );
+    }
+
+    /// A workspace with no settings row streams the other ten and nothing in
+    /// place of the eleventh.
+    ///
+    /// This is the half of the conditional the test above cannot see: it would
+    /// pass just as well against a list that always appends the settings batch,
+    /// which for a workspace without a row would put a frame on the wire with
+    /// no entity behind it.
+    #[test]
+    fn a_workspace_with_no_settings_row_contributes_no_batch() {
+        let data = empty_bootstrap_data(None);
+
+        let streamed: Vec<&str> = bootstrap_batches(&data)
+            .iter()
+            .map(|batch| batch.entity_type)
+            .collect();
+
+        assert!(
+            !streamed.contains(&entity_types::WORKSPACE_SETTINGS),
+            "there is no settings row, so there is no settings batch, got {streamed:?}"
+        );
+        assert_eq!(
+            streamed.len(),
+            10,
+            "the other ten batches are unaffected, got {streamed:?}"
         );
     }
 
