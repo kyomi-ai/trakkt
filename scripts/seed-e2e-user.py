@@ -20,7 +20,22 @@ import json
 import psycopg2
 from argon2 import PasswordHasher
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://trakkt:password@localhost:5432/trakkt")
+# Port 5435 is Trakkt's *development* rung. That is the right one for a seeding
+# script: no Playwright config here declares a `webServer`, so the E2E suites
+# point `BASE_URL` at a server the developer started, which is the one running
+# on the development database. Not 5436 — that is the dialect suite's
+# maintenance server, where every test creates and drops its own throwaway
+# `trakkt_test_*` database, so a user seeded there would be read by nobody. The
+# full ladder is recorded on
+# `test_helpers::dual_backend::DEFAULT_PG_TEST_URL`.
+#
+# It read `trakkt:password@localhost:5432` until TRA-10002 — the stock Postgres
+# default, which is on no rung at all and so resolves to whichever server a
+# machine happens to be running. That matters more here than in a config
+# default: this script connects on the next line and then writes, so a wrong
+# port is a user with a published password inserted into someone else's
+# database rather than a value that sits unread.
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://trakkt:trakkt@localhost:5435/trakkt")
 
 EMAIL = "e2e-test@trakkt.dev"
 PASSWORD = "E2eTestPass123!"
