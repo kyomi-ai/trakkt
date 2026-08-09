@@ -1,6 +1,11 @@
 import { test, expect, type Page } from '@playwright/test';
 import * as crypto from 'crypto';
-import { expectNoPanics, launchTwoClients, type TwoClients } from './realtime-harness';
+import {
+  createIssueViaUi,
+  expectNoPanics,
+  launchTwoClients,
+  type TwoClients,
+} from './realtime-harness';
 
 // Standalone two-window sync verification.
 //
@@ -128,28 +133,14 @@ test("an activity in window A reaches window B's issue timeline without a reload
   // activity counter is the only path a new timeline row has.
   const issueTitle = `Sync activity ${crypto.randomBytes(3).toString('hex')}`;
 
-  // `/workspace`, not `/issues`. This case was added with TRA-9992 and never
-  // executed; its first run, under TRA-9964, showed `/issues` redirects to
-  // `/my-issues` — a list of what you are assigned or watching, which has no
-  // create button at all. `/workspace` is the workspace-wide issue list.
-  await pageA.goto('/workspace');
+  // The creation flow, including why it goes via `/workspace` rather than
+  // `/issues`, now lives in `createIssueViaUi` — it was inline here, and in two
+  // other suites, until TRA-9997 extracted it.
+  const issueHref = await createIssueViaUi(pageA, issueTitle);
+
+  await pageA.goto(issueHref);
   await pageA.waitForLoadState('networkidle');
-
-  // A fresh workspace shows the empty state, which carries its own "New Issue"
-  // button alongside the header's — take the first either way.
-  await pageA.getByRole('button', { name: 'New Issue' }).first().click();
-  await pageA.waitForSelector('#issue-title', { timeout: 15_000 });
-  await pageA.fill('#issue-title', issueTitle);
-  await pageA.getByRole('button', { name: 'Create Issue' }).click();
-
-  const createdRow = pageA.locator('a[href*="/issues/"]').filter({ hasText: issueTitle }).first();
-  await expect(createdRow).toBeVisible({ timeout: 20_000 });
-  const issueHref = await createdRow.getAttribute('href');
-  expect(issueHref, 'the new issue needs a detail link both windows can open').toBeTruthy();
-
-  await pageA.goto(issueHref!);
-  await pageA.waitForLoadState('networkidle');
-  await pageB.goto(issueHref!);
+  await pageB.goto(issueHref);
   await pageB.waitForLoadState('networkidle');
 
   // B is on the issue and has the creation activity — so anything missing later
