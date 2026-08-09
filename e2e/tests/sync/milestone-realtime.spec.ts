@@ -2,6 +2,7 @@ import { test, expect, type Locator, type Page } from '@playwright/test';
 import * as crypto from 'crypto';
 import {
   attachSyncProbe,
+  createIssueViaUi,
   expectDeliveredByCounter,
   expectNoPanics,
   goOffline,
@@ -268,20 +269,9 @@ test("a milestone rename reaches window B's issue metadata sidebar without a rel
   await createMilestone(pageA, previous);
 
   // ── Set up an issue in the project, on the milestone ──────────────────────
-  // `/workspace`, not `/issues`: the latter redirects to `/my-issues`, which
-  // lists only what you are assigned or watching and carries no create button.
-  await pageA.goto('/workspace');
-  await pageA.waitForLoadState('networkidle');
-  await pageA.getByRole('button', { name: 'New Issue' }).first().click();
-  await pageA.waitForSelector('#issue-title', { timeout: 15_000 });
-  await pageA.fill('#issue-title', issueTitle);
-  await pageA.getByRole('button', { name: 'Create Issue' }).click();
-
-  const createdRow = pageA.locator('a[href*="/issues/"]').filter({ hasText: issueTitle }).first();
-  await expect(createdRow).toBeVisible({ timeout: 30_000 });
-  const href = await createdRow.getAttribute('href');
-  expect(href, 'the new issue needs a detail link both windows can open').toBeTruthy();
-  const issueHref = href!;
+  // The creation flow, and why it goes via `/workspace`, lives in
+  // `createIssueViaUi` — it was inline here until TRA-9997 extracted it.
+  const issueHref = await createIssueViaUi(pageA, issueTitle);
 
   await pageA.goto(issueHref);
   await pageA.waitForLoadState('networkidle');

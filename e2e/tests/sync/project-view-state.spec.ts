@@ -2,6 +2,7 @@ import { test, expect, type Page } from '@playwright/test';
 import * as crypto from 'crypto';
 import {
   attachSyncProbe,
+  createIssueViaUi,
   expectNoPanics,
   launchTwoClients,
   waitForSyncHandshake,
@@ -85,19 +86,11 @@ test.afterEach(async () => {
  * view tabs, which is what makes the barrier below possible.
  */
 async function createIssueInProject(page: Page, title: string) {
-  await page.goto('/workspace');
-  await page.waitForLoadState('networkidle');
-  await page.getByRole('button', { name: 'New Issue' }).first().click();
-  await page.waitForSelector('#issue-title', { timeout: 15_000 });
-  await page.fill('#issue-title', title);
-  await page.getByRole('button', { name: 'Create Issue' }).click();
+  // The creation half is `createIssueViaUi` — it was inline here until TRA-9997
+  // extracted it. Only the project assignment below is this suite's own.
+  const href = await createIssueViaUi(page, title);
 
-  const createdRow = page.locator('a[href*="/issues/"]').filter({ hasText: title }).first();
-  await expect(createdRow).toBeVisible({ timeout: 30_000 });
-  const href = await createdRow.getAttribute('href');
-  expect(href, 'the new issue needs a detail link to set its project from').toBeTruthy();
-
-  await page.goto(href!);
+  await page.goto(href);
   await page.waitForLoadState('networkidle');
   await page.getByRole('button', { name: /Set project/ }).click();
   // Exact name: a rerun against the same database leaves earlier runs' projects
