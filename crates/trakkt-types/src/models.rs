@@ -281,6 +281,29 @@ pub struct Notification {
     pub context_id: Option<String>,
 }
 
+impl Notification {
+    /// Whether the inbox still lists this notification *and* the user has not
+    /// read it — what the sidebar's unread badge counts.
+    ///
+    /// Both halves are load-bearing. Deleting from the inbox is a soft delete:
+    /// `notification_service::bulk_delete_notifications` stamps `deleted_at` and
+    /// leaves the row in place, and it reaches clients as an `Update` carrying
+    /// the stamped row rather than as a `Delete`, so a dismissed notification is
+    /// still sitting in the client's cache with `read == false`. Counting `!read`
+    /// alone therefore counts rows the inbox no longer shows.
+    ///
+    /// This is the client-side statement of the predicate
+    /// `notification_service::count_unread` runs as SQL —
+    /// `read = false AND deleted_at IS NULL`, the same one
+    /// `list_notifications` applies when it builds the inbox's rows. The two are
+    /// written in different languages and cannot be shared, so the point of
+    /// naming this once here is that the next place needing "unread, as the
+    /// inbox means it" reads it rather than restating it and drifting.
+    pub fn is_unread_in_inbox(&self) -> bool {
+        !self.read && self.deleted_at.is_none()
+    }
+}
+
 /// User-level notification preferences for a workspace.
 ///
 /// Controls which event types generate notifications and whether
