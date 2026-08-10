@@ -795,6 +795,63 @@ async fn stream_bootstrap(
 /// Public for the same reason as [`handle_sync_bootstrap`]: `tests/sync_ws.rs`
 /// asserts that a `SyncReset` reaches only the connection that asked for it,
 /// which needs a real multi-connection `WebSocketManager` to observe.
+///
+/// # Why there is no unaddressable-entity guard here
+///
+/// `stream_entities` aborts a bootstrap batch whose entity has an empty
+/// `entity_id`, because the trailing watermark would otherwise certify a dataset
+/// that entity is missing from. TRA-10005 audited whether this handler needs the
+/// same guard and found it does not. The reasoning is recorded here so the next
+/// reader does not have to redo it, and so that adding one is a decision rather
+/// than an oversight being corrected.
+///
+/// 1. **These ids are a typed column, not a lookup.** `SyncAction.entity_id` on
+///    this path is `sync_log.entity_id`, decoded by `SyncLogRow` as a `String`
+///    from a column declared `NOT NULL` on both dialects — `VARCHAR(100)` on
+///    Postgres, `TEXT` on SQLite. The JSON-field lookup that produced TRA-9960's
+///    empty ids has no counterpart here; nothing between the column and the
+///    frame can substitute a default.
+///
+/// 2. **No writer can put an empty string in that column.** All 60 production
+///    `entity_id` arguments to `write_sync_entry_in_tx`, `commit_and_deliver`
+///    and `SyncBatch::record` are one of three shapes: an id minted in the same
+///    function as `Uuid::new_v4().to_string()`; a primary-key column read back
+///    off a row the same transaction has already proved exists; or a `format!`
+///    composite (`{project_id}:{user_id}`, `{issue_id}:{attachment_id}`) that
+///    always contains its separator. The caller-supplied ids among them reach
+///    the write only past a `NotFound`-returning read or a
+///    `rows_affected() == 0` check. The second shape bottoms out too: every
+///    production `INSERT` into an entity table binds a server-minted id —
+///    `Uuid::new_v4()`, `format!("team-{uuid}")`,
+///    `format!("{workspace_id}::{suffix}")`, or a personal-mode literal — so no
+///    primary key it can read is empty either.
+///
+/// 3. **Neither dialect enforces that**, so (2) is an invariant of this codebase
+///    and not of the schema — which is exactly why it is recorded here rather
+///    than left to a constraint to state. Measured by replaying both migration
+///    chains: the column is `NOT NULL` on both and NULL is rejected on both,
+///    `''` is accepted on both, and the two disagree only on width — Postgres
+///    rejects anything past `VARCHAR(100)` where SQLite's `TEXT` takes any
+///    length. Adding a `CHECK (entity_id <> '')` is schema work, and TRA-10005
+///    opened no migration front for it: TRA-9999, the ticket that would have
+///    carried it, had already shipped (`744f9e0`) by the time this audit ran.
+///
+/// A guard would also not be free. `drain_delta` aborting yields no watermark,
+/// so the client's cursor never advances past the offending `sync_id` and every
+/// reconnect replays the same page into the same abort — one row would deny a
+/// whole workspace its delta stream until retention pruned it. That trade is
+/// right in `stream_entities`, where the trigger is a coding error affecting an
+/// entire entity type for every workspace; it is not right here, where the only
+/// trigger left is a single stored row with an empty primary key.
+///
+/// And such a row would not cost the client its data, which is the last reason
+/// it is not worth aborting over. `cache/apply.rs`'s `apply_action_to_memory`
+/// reads `entity_id` only on `Delete` — every insert/update arm keys the
+/// reactive store off the payload or bumps a version counter — and
+/// `cache/sync_engine.rs`'s `hydrate_store_from_db` rebuilds entities from the
+/// stored JSON while discarding the IndexedDB key. Every column these ids are
+/// read from is a primary key, so at most one row per table can hold `''` and
+/// the cache row it lands under cannot collide with another entity's.
 pub async fn handle_sync_delta(
     conn_tx: &WsSender,
     catching_up: &CatchUpFlag,
