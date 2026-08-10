@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 
 use trakkt_auth::websocket::manager::{CatchUpFlag, WebSocketManager, WsSender};
 use trakkt_core::test_helpers::channel::recv_soon;
+use trakkt_core::test_helpers::task::{JOIN_BOUND, join_soon};
 use trakkt_core::test_helpers::{seed_team, seed_user, seed_workspace, test_pool};
 use trakkt_core::DbPool;
 use trakkt_server::routes::websocket::{handle_sync_bootstrap, handle_sync_delta};
@@ -219,6 +220,18 @@ fn parse_frame(frame: &str) -> SyncResponse {
 /// handler task finishing is the signal instead. `biased` keeps queued frames
 /// ahead of that signal, and the trailing `try_recv` sweep collects anything
 /// buffered in the same poll the handler returned on.
+///
+/// Every iteration is bounded, for the reason [`join_soon`] bounds the plain
+/// joins in this file: a handler that neither sends a frame nor returns — one
+/// parked on the pool's single connection, say — would otherwise leave this
+/// loop polling until the CI job's own timeout killed it, reporting a job that
+/// ran out of time rather than an assertion that failed.
+/// `join_soon` itself cannot be used here because it consumes the handle, while
+/// the `select!` has to keep polling it by reference alongside the receive.
+///
+/// Each step is bounded rather than the loop as a whole, so what has to fit
+/// inside ten seconds is one frame's worth of handler progress and not a whole
+/// bootstrap — and the bound stays the same size however long the stream is.
 async fn run_and_collect(
     mut handler: JoinHandle<()>,
     rx: &mut mpsc::Receiver<String>,
@@ -226,16 +239,29 @@ async fn run_and_collect(
     let mut frames = Vec::new();
 
     loop {
-        tokio::select! {
-            biased;
-            frame = rx.recv() => match frame {
-                Some(frame) => frames.push(parse_frame(&frame)),
-                None => panic!("the manager still holds a sender, so this channel cannot close"),
-            },
-            outcome = &mut handler => {
-                outcome.expect("sync handler task completes without panicking");
-                break;
+        let frame = tokio::time::timeout(JOIN_BOUND, async {
+            tokio::select! {
+                biased;
+                frame = rx.recv() => Some(frame.expect(
+                    "the manager still holds a sender, so this channel cannot close",
+                )),
+                outcome = &mut handler => {
+                    outcome.expect("sync handler task completes without panicking");
+                    None
+                }
             }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the sync handler neither sent a frame nor returned within {JOIN_BOUND:?}: \
+                 it is parked on something that is never going to happen"
+            )
+        });
+
+        match frame {
+            Some(frame) => frames.push(parse_frame(&frame)),
+            None => break,
         }
     }
 
@@ -473,11 +499,17 @@ async fn a_connection_closing_mid_bootstrap_releases_its_catch_up_exemption() {
     let full = tokio::spawn(async move {
         handle_sync_bootstrap(&full_tx, &full_flag, &full_db, USER, WORKSPACE).await
     });
+    // Concurrently: the drain is what lets the handler finish, and the join is
+    // what bounds the drain if it parks on anything but this channel.
     let mut complete_frames = Vec::new();
-    while let Some(frame) = full_rx.recv().await {
-        complete_frames.push(parse_frame(&frame));
-    }
-    full.await.expect("baseline bootstrap task");
+    let ((), ()) = tokio::join!(
+        async {
+            while let Some(frame) = full_rx.recv().await {
+                complete_frames.push(parse_frame(&frame));
+            }
+        },
+        join_soon(full, "the baseline bootstrap"),
+    );
     assert!(
         complete_frames.len() > 2,
         "the baseline bootstrap must be long enough to be interrupted, got {}",
@@ -507,10 +539,10 @@ async fn a_connection_closing_mid_bootstrap_releases_its_catch_up_exemption() {
     conn_rx.close();
 
     // Returning at all is half the point: a handler that panicked on the failed
-    // send, or that parked forever on it, fails here.
-    handler
-        .await
-        .expect("the bootstrap returns cleanly when its connection dies");
+    // send, or that parked forever on it, fails here. The second half of that
+    // is only true because of the bound — a bare `handler.await` reports the
+    // panic but waits out the park.
+    join_soon(handler, "the bootstrap whose connection died mid-stream").await;
 
     assert!(
         !catching_up.load(Ordering::Acquire),

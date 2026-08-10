@@ -1336,6 +1336,7 @@ mod tests {
     use std::sync::Arc;
 
     use tokio::sync::mpsc;
+    use trakkt_core::test_helpers::task::join_soon;
     use trakkt_types::sync::{entity_types, SyncActionType, SyncResponse};
 
     /// A minimal stand-in for a streamed entity.
@@ -1444,7 +1445,7 @@ mod tests {
         // connection is routine and must stay distinguishable from
         // `UnusableEntity`, which is a server defect and is logged at `error!`.
         assert_eq!(
-            streamer.await.expect("stream task completes"),
+            join_soon(streamer, "the stream reacting to the closed receiver").await,
             StreamOutcome::ClientGone,
             "a dead connection must be reported to the caller as ClientGone"
         );
@@ -1893,6 +1894,45 @@ mod tests {
     /// Bootstrap is the stream that provoked this exemption in the first place
     /// — an unpaginated workspace load — so its flag has to hold for the whole
     /// handler, not just around the sends.
+    ///
+    /// # Why the channel is capacity 1 and starts full
+    ///
+    /// Because that is what makes "for the whole handler" checkable, and it is
+    /// load-bearing. With the only slot occupied the handler cannot deliver
+    /// even its first frame, let alone return, so when `wait_until_flagged`
+    /// observes `catching_up` the handler is provably still in flight. Pairing
+    /// that with the assertion at the end — clear once the handler has returned
+    /// — is what makes this a statement about the guard spanning the handler
+    /// rather than about one instant.
+    ///
+    /// Widening the channel destroys the pairing rather than weakening it: the
+    /// handler would be free to run to completion before the test first looks,
+    /// and since `CatchUpGuard::drop` clears the flag on the way out,
+    /// `wait_until_flagged` would then be racing a flag already back to
+    /// `false`. TRA-10007 records the trap; do not widen it.
+    ///
+    /// # Why the drain runs to close, and why the count is asserted
+    ///
+    /// `ws_empty` names a workspace with no rows, so all ten batches are empty
+    /// (`bootstrap_batches` builds eleven only when a settings row exists, and
+    /// there is none) and the whole output is a single frame: the `SyncComplete`
+    /// watermark over an empty `sync_log`, which is `0`.
+    ///
+    /// Draining exactly one item and then joining — which is what this test did
+    /// until TRA-10007 — turns "one frame more than expected" into a permanent
+    /// park. The extra send finds no slot, nothing is left to drain it, and the
+    /// join never returns. Libtest will eventually name this test as having run
+    /// for over sixty seconds, so it is not anonymous — but no message and no
+    /// line ever arrive, and CI reports a job that ran out of time rather than
+    /// the regression that caused it. TRA-9960 hit exactly that by making
+    /// `stream_bootstrap` send its `SyncComplete` twice, and the run had to be
+    /// killed by hand.
+    ///
+    /// Draining to close collects whatever the handler actually sent, so that
+    /// same extra frame now fails the count assertion below and says so.
+    /// [`join_soon`] runs concurrently as the backstop for the parks a frame
+    /// count cannot describe — a task stuck on something other than this
+    /// channel would otherwise leave the drain itself waiting forever.
     #[tokio::test]
     async fn sync_bootstrap_flags_the_connection_for_the_whole_stream() {
         let db = trakkt_core::DbPool::connect("sqlite::memory:")
@@ -1910,10 +1950,30 @@ mod tests {
 
         wait_until_flagged(&catching_up, "the bootstrap to flag the connection").await;
 
-        // Make room so the bootstrap can finish.
+        // Make room so the bootstrap can finish. This receive cannot be the one
+        // that waits: it takes back the item queued before the spawn.
         assert_eq!(conn_rx.recv().await.as_deref(), Some("occupied"));
-        stream.await.expect("bootstrap task");
 
+        // Concurrently, because each needs the other: the drain is what lets
+        // the handler return, and the join is what bounds the drain.
+        let mut frames = Vec::new();
+        let ((), ()) = tokio::join!(
+            async {
+                while let Some(frame) = conn_rx.recv().await {
+                    frames.push(parse_frame(&frame));
+                }
+            },
+            join_soon(stream, "the bootstrap of the empty workspace"),
+        );
+
+        assert!(
+            matches!(
+                frames.as_slice(),
+                [SyncResponse::SyncComplete { last_sync_id: 0 }]
+            ),
+            "an empty workspace's bootstrap is exactly one frame -- the watermark over an \
+             empty sync log -- got {frames:?}"
+        );
         assert!(
             !catching_up.load(Ordering::Acquire),
             "the exemption must not outlive the bootstrap"
@@ -1991,7 +2051,7 @@ mod tests {
         // Hand the baton on. The bootstrap runs one query and releases; the
         // mutation, next in line, commits before the bootstrap's second.
         drop(baton);
-        let mutation_sync_id = mutation.await.expect("mutation task");
+        let mutation_sync_id = join_soon(mutation, "the mid-bootstrap sync_log write").await;
 
         assert!(
             mutation_sync_id > head_before,
@@ -2002,13 +2062,18 @@ mod tests {
             "the mutation must commit while the bootstrap is still in flight"
         );
 
-        // Drain, which is also what lets the bootstrap run to completion.
+        // Drain, which is also what lets the bootstrap run to completion — so
+        // the drain and the join run together, and the join bounds the drain.
         assert_eq!(conn_rx.recv().await.as_deref(), Some("occupied"));
         let mut frames = Vec::new();
-        while let Some(frame) = conn_rx.recv().await {
-            frames.push(parse_frame(&frame));
-        }
-        bootstrap.await.expect("bootstrap task");
+        let ((), ()) = tokio::join!(
+            async {
+                while let Some(frame) = conn_rx.recv().await {
+                    frames.push(parse_frame(&frame));
+                }
+            },
+            join_soon(bootstrap, "the bootstrap that raced the mutation"),
+        );
 
         let watermark = match frames.last().expect("a trailing frame") {
             SyncResponse::SyncComplete { last_sync_id } => *last_sync_id,
@@ -2080,7 +2145,7 @@ mod tests {
         );
 
         drop(conn_rx);
-        stream.await.expect("stream task");
+        join_soon(stream, "the delta stream reacting to the dropped receiver").await;
 
         assert!(
             !catching_up.load(Ordering::Acquire),
@@ -2106,6 +2171,12 @@ mod tests {
     /// `run` takes the sender by value so it is dropped when the stream returns;
     /// that is what closes the channel and ends the drain loop below, which is
     /// why this returns exactly when the stream is over.
+    ///
+    /// The drain and the join run concurrently rather than one after the other.
+    /// Sequentially the join is unreachable while the drain is stuck, and the
+    /// drain only ends when the stream drops its sender — so a stream parked on
+    /// something other than this channel, the pool's single connection say,
+    /// would hang the drain with the bound sitting behind it, unread.
     async fn collect_stream_frames<Fut, T>(
         run: impl FnOnce(WsSender) -> Fut,
     ) -> (T, Vec<SyncResponse>)
@@ -2117,10 +2188,14 @@ mod tests {
         let stream = tokio::spawn(run(conn_tx));
 
         let mut frames = Vec::new();
-        while let Some(frame) = conn_rx.recv().await {
-            frames.push(parse_frame(&frame));
-        }
-        let result = stream.await.expect("sync stream task completes");
+        let ((), result) = tokio::join!(
+            async {
+                while let Some(frame) = conn_rx.recv().await {
+                    frames.push(parse_frame(&frame));
+                }
+            },
+            join_soon(stream, "the sync stream under test"),
+        );
 
         (result, frames)
     }
@@ -2331,7 +2406,7 @@ mod tests {
         // a dead connection does, while still letting us inspect what was
         // already buffered — which is how we can prove no watermark was sent.
         conn_rx.close();
-        handler.await.expect("sync_delta task returns cleanly");
+        join_soon(handler, "the delta handler after the connection closed").await;
         while let Some(frame) = conn_rx.recv().await {
             delivered.push(parse_frame(&frame));
         }
