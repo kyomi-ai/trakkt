@@ -18,14 +18,24 @@
 //! which backend it is, so the same three calls seed either half of a
 //! [`dual_backend_test!`](crate::dual_backend_test) pair.
 //!
-//! So does [`channel`], whose [`recv_soon`](channel::recv_soon) is the bounded
-//! replacement for `rx.recv().await` in tests that wait on a WebSocket or SSE
-//! delivery. Its three callers today are all test modules in `trakkt-auth`; it
-//! lives here rather than there so `apps/server` can reach it too, which its
-//! dev-dependency on this crate's `test-helpers` feature already lets it do.
-//! `trakkt-auth` has no such feature to export a helper through — only
-//! `#[cfg(test)]` modules, which dependents cannot see — and the standards
-//! forbid a second copy per crate.
+//! So do the two bounded waits, which stand in for the unbounded forms that
+//! hang instead of failing.
+//! [`channel`]'s [`recv_soon`](channel::recv_soon) replaces `rx.recv().await`
+//! in tests that wait on a WebSocket or SSE delivery; [`task`]'s
+//! [`join_soon`](task::join_soon) is its send-side complement and replaces
+//! `handle.await` in tests that wait on a spawned task, which a receive bound
+//! cannot reach — see that module for why it is not filed under `channel`.
+//!
+//! Four modules import `recv_soon` today: three `#[cfg(test)]` modules in
+//! `trakkt-auth` (`sync_log_service`, `websocket::manager`,
+//! `mcp_session_manager`) and `apps/server/tests/sync_ws.rs`. Two import
+//! `join_soon`: `apps/server/tests/sync_ws.rs` and the `#[cfg(test)]` module in
+//! `apps/server/src/routes/websocket.rs`. That `apps/server` reaches both is
+//! the placement argument made good — they live here rather than in
+//! `trakkt-auth` so a second crate can use them, which its dev-dependency on
+//! this crate's `test-helpers` feature already lets it do. `trakkt-auth` has no
+//! such feature to export a helper through — only `#[cfg(test)]` modules, which
+//! dependents cannot see — and the standards forbid a second copy per crate.
 //!
 //! # What does not, and why
 //!
@@ -58,6 +68,7 @@
 
 pub mod channel;
 pub mod dual_backend;
+pub mod task;
 
 use crate::db::DbPool;
 use crate::db_execute;
