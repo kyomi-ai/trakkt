@@ -8,6 +8,7 @@ language = "en"
 build-dir = "build"
 
 [output.html]
+site-url = "/docs/"
 additional-css = ["theme/trakkt.css"]
 default-theme = "light"
 preferred-dark-theme = "navy"
