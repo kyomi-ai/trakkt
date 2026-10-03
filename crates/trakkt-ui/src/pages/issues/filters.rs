@@ -20,7 +20,7 @@ use leptos::prelude::*;
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Button, ButtonSize, ButtonVariant, Checkbox,
+    Avatar, Button, ButtonSize, ButtonVariant, Checkbox,
     DropdownItem, DropdownMenu, DropdownTrigger, IssueStatusBadge, IssueStatusVariant,
     PriorityIndicator,
 };
@@ -28,6 +28,7 @@ use crate::pages::views::FilterClause;
 use crate::server_fns::labels::list_labels;
 use crate::server_fns::projects::list_projects;
 use crate::server_fns::statuses::list_statuses;
+use crate::server_fns::team::list_workspace_members;
 use trakkt_types::models::IssueWithDetails;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -41,6 +42,7 @@ pub enum SortField {
     Status,
     CreatedDate,
     UpdatedDate,
+    StartedDate,
     CompletedDate,
     Assignee,
     DueDate,
@@ -54,6 +56,7 @@ impl SortField {
             Self::Status => "Status",
             Self::CreatedDate => "Created date",
             Self::UpdatedDate => "Updated date",
+            Self::StartedDate => "Started date",
             Self::CompletedDate => "Completed date",
             Self::Assignee => "Assignee",
             Self::DueDate => "Due date",
@@ -67,6 +70,7 @@ impl SortField {
             Self::Status => SortDirection::Asc,
             Self::CreatedDate => SortDirection::Desc,
             Self::UpdatedDate => SortDirection::Desc,
+            Self::StartedDate => SortDirection::Desc,
             Self::CompletedDate => SortDirection::Desc,
             Self::Assignee => SortDirection::Asc,
             Self::DueDate => SortDirection::Asc,
@@ -74,11 +78,12 @@ impl SortField {
     }
 
     /// All variants in display order.
-    pub const ALL: [SortField; 7] = [
+    pub const ALL: [SortField; 8] = [
         Self::Priority,
         Self::Status,
         Self::CreatedDate,
         Self::UpdatedDate,
+        Self::StartedDate,
         Self::CompletedDate,
         Self::Assignee,
         Self::DueDate,
@@ -163,6 +168,11 @@ pub fn sort_issues(issues: &mut [IssueWithDetails], field: SortField, direction:
             }
             SortField::CreatedDate => a.created_at.cmp(&b.created_at),
             SortField::UpdatedDate => a.updated_at.cmp(&b.updated_at),
+            SortField::StartedDate => {
+                let ac = a.started_at.as_deref().unwrap_or("\u{ffff}");
+                let bc = b.started_at.as_deref().unwrap_or("\u{ffff}");
+                ac.cmp(bc)
+            }
             SortField::CompletedDate => {
                 let ac = a.completed_at.as_deref().unwrap_or("\u{ffff}");
                 let bc = b.completed_at.as_deref().unwrap_or("\u{ffff}");
@@ -189,6 +199,7 @@ pub fn parse_sort_field(s: &str) -> Option<SortField> {
         "status" => Some(SortField::Status),
         "created_date" => Some(SortField::CreatedDate),
         "updated_date" => Some(SortField::UpdatedDate),
+        "started_date" => Some(SortField::StartedDate),
         "completed_date" => Some(SortField::CompletedDate),
         "assignee" => Some(SortField::Assignee),
         "due_date" => Some(SortField::DueDate),
@@ -203,9 +214,147 @@ pub fn sort_field_to_str(field: SortField) -> &'static str {
         SortField::Status => "status",
         SortField::CreatedDate => "created_date",
         SortField::UpdatedDate => "updated_date",
+        SortField::StartedDate => "started_date",
         SortField::CompletedDate => "completed_date",
         SortField::Assignee => "assignee",
         SortField::DueDate => "due_date",
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group enums and helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Field to group the issue list by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupField {
+    None,
+    Team,
+}
+
+impl GroupField {
+    /// Human-readable label for the dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Team => "Team",
+        }
+    }
+
+    /// Serialize to a stable string for persistence.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Team => "team",
+        }
+    }
+
+    /// Parse from a string, defaulting to `None` for unrecognized input.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "team" => Self::Team,
+            _ => Self::None,
+        }
+    }
+
+    /// All variants in display order.
+    pub const ALL: [GroupField; 2] = [Self::None, Self::Team];
+}
+
+/// Group a slice of issues by the given field.
+///
+/// Returns a vec of `(group_key, group_label, issues_in_group)` tuples.
+/// - `group_key` is a stable identifier used for localStorage persistence keys.
+/// - `group_label` is the human-readable display name.
+///
+/// When `GroupField::None`, returns a single group containing all issues.
+/// When `GroupField::Team`, groups by `team_key`, sorted alphabetically.
+/// The `team_names` map resolves team keys to display names (e.g. "TRA" -> "Trakkt").
+pub fn group_issues<'a>(
+    issues: &'a [IssueWithDetails],
+    field: GroupField,
+    team_names: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String, Vec<&'a IssueWithDetails>)> {
+    match field {
+        GroupField::None => {
+            vec![("all".to_string(), "All Issues".to_string(), issues.iter().collect())]
+        }
+        GroupField::Team => {
+            let mut groups: std::collections::BTreeMap<&str, Vec<&'a IssueWithDetails>> =
+                std::collections::BTreeMap::new();
+            for issue in issues {
+                groups.entry(&issue.team_key).or_default().push(issue);
+            }
+            groups
+                .into_iter()
+                .map(|(key, issues)| {
+                    let label = team_names
+                        .get(key)
+                        .cloned()
+                        .unwrap_or_else(|| key.to_string());
+                    (key.to_string(), label, issues)
+                })
+                .collect()
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group Dropdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dropdown for selecting the group-by field.
+///
+/// Clicking an option calls `on_change` with the new field. The active field
+/// shows a checkmark; the trigger shows the current grouping label.
+#[component]
+pub fn GroupDropdown(
+    /// Current group field.
+    #[prop(into)]
+    field: Signal<GroupField>,
+    /// Called when the user changes the group field.
+    on_change: Callback<GroupField>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Display: "Group: Team" or just the default label.
+    let display = Memo::new(move |_| {
+        let f = field.get();
+        match f {
+            GroupField::None => None,
+            _ => Some(f.label().to_string()),
+        }
+    });
+
+    view! {
+        <div node_ref=trigger_ref>
+            <DropdownTrigger
+                label="Group"
+                value=Signal::derive(move || display.get())
+                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
+            />
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+        >
+            {GroupField::ALL.iter().map(|group_field| {
+                let gf = *group_field;
+                let label = gf.label().to_string();
+                view! {
+                    <DropdownItem
+                        label=label
+                        selected=Signal::derive(move || field.get() == gf)
+                        on_select=Callback::new(move |()| {
+                            on_change.run(gf);
+                            set_open.set(false);
+                        })
+                    />
+                }
+            }).collect_view()}
+        </DropdownMenu>
     }
 }
 
@@ -309,7 +458,7 @@ pub fn StatusFilterDropdown(
                 .get()
                 .iter()
                 .find(|s| s.status_id == v[0])
-                .map(|s| IssueStatusVariant::parse(&s.category))
+                .map(|s| IssueStatusVariant::parse(&s.category, &s.name))
         } else {
             None
         }
@@ -342,7 +491,7 @@ pub fn StatusFilterDropdown(
                 let status_id = status.status_id.clone();
                 let status_id_check = status.status_id.clone();
                 let label = status.name.clone();
-                let variant = IssueStatusVariant::parse(&status.category);
+                let variant = IssueStatusVariant::parse(&status.category, &status.name);
                 view! {
                     <DropdownItem
                         label=label
@@ -565,10 +714,11 @@ pub fn LabelFilterDropdown(
     // Use SyncStore for labels when available (real-time), fall back to server.
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
-    // Fetch labels dynamically from the server.
+    // Fetch labels dynamically from the server, passing team_id when available
+    // so the server returns only workspace-level + team-scoped labels.
     let labels_resource = Resource::new(
-        || (),
-        move |_| async move { list_labels(None).await },
+        move || team_id.and_then(|s| s.get()),
+        move |tid| async move { list_labels(tid).await },
     );
 
     // Resolved labels — prefer SyncStore, fall back to server resource.
@@ -600,6 +750,8 @@ pub fn LabelFilterDropdown(
         };
 
         // Filter by team when a team_id signal is provided and has a value.
+        // The SyncStore contains ALL labels, so client-side filtering is still
+        // needed even though the server resource is already team-scoped.
         if let Some(team_id_signal) = team_id
             && let Some(ref tid) = team_id_signal.get()
         {
@@ -675,17 +827,160 @@ pub fn LabelFilterDropdown(
                 selected=Signal::derive(move || value.get().is_empty())
                 on_select=Callback::new(move |()| { on_change.run(Vec::new()); })
             />
-            {move || labels.get().into_iter().map(|label| {
-                let label_id = label.label_id.clone();
-                let label_id_check = label.label_id.clone();
-                let label_name = label.name.clone();
-                let label_color = label.color.clone();
+            {move || {
+                let all = labels.get();
+                let team_labels: Vec<_> = all.iter().filter(|l| l.team_id.is_some()).cloned().collect();
+                let workspace_labels: Vec<_> = all.iter().filter(|l| l.team_id.is_none()).cloned().collect();
+                let has_team_labels = !team_labels.is_empty();
+
+                let render_item = |label: trakkt_types::models::Label| {
+                    let label_id = label.label_id.clone();
+                    let label_id_check = label.label_id.clone();
+                    let label_name = label.name.clone();
+                    let label_color = label.color.clone();
+                    view! {
+                        <DropdownItem
+                            label=label_name
+                            selected=Signal::derive(move || value.get().contains(&label_id_check))
+                            on_select=Callback::new({
+                                let id = label_id.clone();
+                                move |()| {
+                                    let mut current = value.get_untracked();
+                                    if let Some(pos) = current.iter().position(|s| s == &id) {
+                                        current.remove(pos);
+                                    } else {
+                                        current.push(id.clone());
+                                    }
+                                    on_change.run(current);
+                                }
+                            })
+                            icon=Arc::new(move || {
+                                view! {
+                                    <span
+                                        class="inline-block w-2.5 h-2.5 rounded-full shrink-0"
+                                        style=format!("background-color: {}", label_color)
+                                    />
+                                }.into_any()
+                            }) as ChildrenFn
+                        />
+                    }
+                };
+
+                if has_team_labels {
+                    // Show grouped: team labels first, then workspace labels.
+                    let team_items = team_labels.into_iter().map(render_item).collect_view();
+                    let workspace_items = workspace_labels.into_iter().map(render_item).collect_view();
+                    view! {
+                        <div class="px-2 py-1 text-xs text-muted-foreground font-medium">"Team"</div>
+                        {team_items}
+                        <div class="px-2 py-1 text-xs text-muted-foreground font-medium mt-1">"Workspace"</div>
+                        {workspace_items}
+                    }.into_any()
+                } else {
+                    // No team labels — flat list, no visual change from current.
+                    all.into_iter().map(render_item).collect_view().into_any()
+                }
+            }}
+        </DropdownMenu>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Assignee Filter Dropdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dropdown filter for issue assignees.
+///
+/// Loads workspace members via `list_workspace_members()` server function.
+/// Multi-select: issues are matched by `assignee_id`.
+#[component]
+pub fn AssigneeFilterDropdown(
+    #[prop(into)] value: Signal<Vec<String>>,
+    on_change: Callback<Vec<String>>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let trigger_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Fetch workspace members from the server.
+    let members_resource = Resource::new(
+        || (),
+        move |_| async move { list_workspace_members().await },
+    );
+
+    // Resolved members list.
+    let members = Memo::new(move |_| {
+        match members_resource.get() {
+            Some(Ok(items)) => items,
+            Some(Err(e)) => {
+                tracing::warn!("Failed to load members for filter dropdown: {e}");
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    });
+
+    // Display name for the current selection (multi-select).
+    // 0 selected -> None (shows "All assignees" default label)
+    // 1 selected -> look up name from loaded members
+    // 2+ selected -> "Assignee (N)"
+    let display = Memo::new(move |_| {
+        let v = value.get();
+        match v.len() {
+            0 => None,
+            1 => {
+                let id = &v[0];
+                members
+                    .get()
+                    .iter()
+                    .find(|m| &m.user_id == id)
+                    .map(|m| {
+                        m.name.clone().unwrap_or_else(|| m.email.clone())
+                    })
+            }
+            n => Some(format!("Assignee ({n})")),
+        }
+    });
+
+    view! {
+        <div node_ref=trigger_ref>
+            <DropdownTrigger
+                label="All assignees"
+                value=Signal::derive(move || display.get())
+                icon=Arc::new(move || {
+                    let v = value.get();
+                    if v.len() == 1 {
+                        let name: Option<String> = members.get().iter()
+                            .find(|m| m.user_id == v[0])
+                            .and_then(|m| m.name.clone());
+                        view! { <Avatar name=name.unwrap_or_default()/> }.into_any()
+                    } else {
+                        view! { <span/> }.into_any()
+                    }
+                }) as ChildrenFn
+                on_click=Callback::new(move |()| set_open.update(|o| *o = !*o))
+            />
+        </div>
+        <DropdownMenu
+            trigger_ref=trigger_ref
+            open=Signal::derive(move || open.get())
+            on_close=Callback::new(move |()| set_open.set(false))
+        >
+            <DropdownItem
+                label="All assignees"
+                selected=Signal::derive(move || value.get().is_empty())
+                on_select=Callback::new(move |()| { on_change.run(Vec::new()); })
+            />
+            {move || members.get().into_iter().map(|member| {
+                let user_id = member.user_id.clone();
+                let user_id_check = member.user_id.clone();
+                let display_name = member.name.clone().unwrap_or_else(|| member.email.clone());
+                let avatar_name = member.name.clone();
                 view! {
                     <DropdownItem
-                        label=label_name
-                        selected=Signal::derive(move || value.get().contains(&label_id_check))
+                        label=display_name
+                        selected=Signal::derive(move || value.get().contains(&user_id_check))
                         on_select=Callback::new({
-                            let id = label_id.clone();
+                            let id = user_id.clone();
                             move |()| {
                                 let mut current = value.get_untracked();
                                 if let Some(pos) = current.iter().position(|s| s == &id) {
@@ -697,12 +992,8 @@ pub fn LabelFilterDropdown(
                             }
                         })
                         icon=Arc::new(move || {
-                            view! {
-                                <span
-                                    class="inline-block w-2.5 h-2.5 rounded-full shrink-0"
-                                    style=format!("background-color: {}", label_color)
-                                />
-                            }.into_any()
+                            let n = avatar_name.clone().unwrap_or_default();
+                            view! { <Avatar name=n/> }.into_any()
                         }) as ChildrenFn
                     />
                 }
@@ -1053,6 +1344,10 @@ pub fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
         ("is_blocking", "none_of") => !issue.is_blocking,
         ("has_relations", "any_of") => issue.has_relations,
         ("has_relations", "none_of") => !issue.has_relations,
+        // Issue ID set filter — used by the "Starred" view to restrict to
+        // a specific set of issue IDs fetched from the server.
+        ("issue_id", "any_of") => clause.values.contains(&issue.issue_id),
+        ("issue_id", "none_of") => !clause.values.contains(&issue.issue_id),
         // Unknown field/operator — pass through (don't block issues).
         _ => true,
     }
@@ -1393,10 +1688,10 @@ fn StatusValuePicker(
             let status_id = status.status_id.clone();
             let status_id_for_check = status.status_id.clone();
             let label = status.name.clone();
-            let variant = IssueStatusVariant::parse(&status.category);
+            let variant = IssueStatusVariant::parse(&status.category, &status.name);
             view! {
                 <div
-                    class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
+                    class="flex items-center gap-2 cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
                 >
                     <Checkbox
                         checked=Signal::derive(move || selected_values.get().contains(&status_id_for_check))
@@ -1449,7 +1744,7 @@ fn PriorityValuePicker(
             let priority_val = *priority_val;
             view! {
                 <div
-                    class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
+                    class="flex items-center gap-2 cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
                 >
                     <Checkbox
                         checked=Signal::derive(move || selected_values.get().contains(&key_for_check))
@@ -1569,7 +1864,7 @@ fn DynamicSelectPicker(
             let value_for_toggle = value_id.clone();
             view! {
                 <div
-                    class="flex items-center gap-2 w-full cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
+                    class="flex items-center gap-2 cursor-default select-none text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] transition-colors duration-100 hover:bg-secondary"
                 >
                     <Checkbox
                         checked=Signal::derive(move || selected.get().contains(&value_for_check))
@@ -1604,9 +1899,11 @@ fn LabelValuePicker(
 ) -> impl IntoView {
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
+    // Fetch labels from server, passing team_id when available so the server
+    // returns only workspace-level + team-scoped labels.
     let labels_resource = Resource::new(
-        || (),
-        move |_| async move { list_labels(None).await },
+        move || team_id.get(),
+        move |tid| async move { list_labels(tid).await },
     );
 
     let options = Memo::new(move |_| {
@@ -1635,6 +1932,7 @@ fn LabelValuePicker(
             }
         };
 
+        // SyncStore contains ALL labels — still need client-side filtering.
         let filtered = if let Some(ref tid) = team_id.get() {
             all.into_iter()
                 .filter(|l| l.team_id.is_none() || l.team_id.as_deref() == Some(tid.as_str()))

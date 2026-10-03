@@ -3,6 +3,14 @@
 
 //! trakkt-ui — Leptos frontend for Trakkt.
 
+// Arborium provides its own Rust allocator, but its parser's debug C code
+// also needs the canonical sysroot stdio archive (including `stderr`). Link
+// only that native archive: importing the sysroot Rust crate would duplicate
+// Arborium's malloc/free/abort exports.
+#[cfg(target_arch = "wasm32")]
+#[link(name = "arborium_sysroot", kind = "static")]
+unsafe extern "C" {}
+
 pub mod app;
 pub mod cache;
 pub mod components;
@@ -10,6 +18,11 @@ pub mod pages;
 pub mod server_fns;
 pub mod types;
 pub mod utils;
+
+/// Setup shared by the browser tests in `cache/` and `pages/`. Test-only, and
+/// wasm-only because `any_spawner` is a `wasm32`-gated dev-dependency.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_test_support;
 
 pub use app::App;
 
@@ -101,6 +114,7 @@ pub fn register_server_functions() {
     use server_fns::workspace::*;
     register_explicit::<GetWorkspaceSettings>();
     register_explicit::<UpdateWorkspaceName>();
+    register_explicit::<UpdateWorkspaceAutoArchive>();
 
     // Issues
     use server_fns::issues::*;
@@ -153,4 +167,8 @@ pub fn register_server_functions() {
     register_explicit::<CreateBillingPortalSession>();
     register_explicit::<GetBillingInvoices>();
     register_explicit::<GetStripePublishableKey>();
+
+    // Feedback
+    use server_fns::feedback::*;
+    register_explicit::<SubmitFeedback>();
 }

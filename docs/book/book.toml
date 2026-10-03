@@ -1,0 +1,15 @@
+[book]
+title = "Trakkt Documentation"
+description = "Documentation for Trakkt — the open-source issue tracker"
+authors = ["Trakkt Contributors"]
+language = "en"
+
+[build]
+build-dir = "build"
+
+[output.html]
+additional-css = ["theme/trakkt.css"]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/kyomi-ai/trakkt"
+edit-url-template = "https://github.com/kyomi-ai/trakkt/edit/main/docs/book/{path}"

@@ -42,10 +42,12 @@ impl ResolvedAuth {
 /// Internal row type for the `api_tokens` lookup query.
 #[derive(sqlx::FromRow)]
 struct ApiTokenLookupRow {
+    token_id: String,
     user_id: String,
     workspace_id: Option<String>,
     scopes: Option<String>,
     name: String,
+    last_used: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Try to authenticate via JWT (OAuth 2.0) or legacy API token.
@@ -136,7 +138,7 @@ async fn authenticate_bearer_token(
     let bt = trakkt_core::sql_compat::bool_true(is_pg);
 
     let sql = format!(
-        "SELECT user_id, workspace_id, scopes, name FROM api_tokens \
+        "SELECT token_id, user_id, workspace_id, scopes, name, last_used FROM api_tokens \
          WHERE token_hash = $1 AND active = {bt} \
          AND (expires_at IS NULL OR expires_at > $2)"
     );
@@ -152,6 +154,27 @@ async fn authenticate_bearer_token(
     .ok()?;
 
     let row = row?;
+
+    // Debounced last_used update (background, non-blocking).
+    // Only write if never used or stale by more than 60 seconds.
+    let should_update = match row.last_used {
+        None => true,
+        Some(ts) => (now - ts).num_seconds() > 60,
+    };
+
+    if should_update {
+        let db = db.clone();
+        let token_id = row.token_id.clone();
+        let now_fn = trakkt_core::sql_compat::now(is_pg);
+        tokio::spawn(async move {
+            let sql = format!(
+                "UPDATE api_tokens SET last_used = {now_fn} WHERE token_id = $1"
+            );
+            if let Err(e) = trakkt_core::db_execute!(&db, &sql, &token_id) {
+                tracing::warn!(error = %e, token_id = %token_id, "failed to update api_token last_used");
+            }
+        });
+    }
 
     let scopes: Vec<String> = match row.scopes.as_deref() {
         None => vec![],

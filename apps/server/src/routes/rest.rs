@@ -214,11 +214,12 @@ async fn add_comment_handler(
 async fn list_labels_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(params): Query<trakkt_types::api::ListLabelsApiParams>,
 ) -> Result<Json<serde_json::Value>, RestError> {
     let auth = authenticate(&headers, &state).await?;
     check_scope(&auth, "labels:read")?;
     let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage, state.github_client.as_deref(), Some(&*state.encryption_key), &state.config.frontend_url, auth.action_source, auth.action_source_label);
-    let result = labels::list_labels(&ctx, trakkt_types::api::ListLabelsApiParams {}).await?;
+    let result = labels::list_labels(&ctx, params).await?;
     Ok(Json(result))
 }
 
@@ -337,6 +338,19 @@ async fn list_issue_activities_handler(
         issue_number: None,
     };
     let result = activities::list_issue_activities(&ctx, params).await?;
+    Ok(Json(result))
+}
+
+/// `GET /activities` — list workspace-level activities across all teams.
+async fn list_workspace_activities_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<trakkt_types::api::ListWorkspaceActivitiesApiParams>,
+) -> Result<Json<serde_json::Value>, RestError> {
+    let auth = authenticate(&headers, &state).await?;
+    check_scope(&auth, "issues:read")?;
+    let ctx = ApiCtx::from_bearer(auth.workspace_id, auth.user_id, &state.db, &state.ws_manager, &*state.attachment_storage, state.github_client.as_deref(), Some(&*state.encryption_key), &state.config.frontend_url, auth.action_source, auth.action_source_label);
+    let result = activities::list_workspace_activities(&ctx, params).await?;
     Ok(Json(result))
 }
 
@@ -765,6 +779,7 @@ pub fn rest_router() -> Router<AppState> {
         )
         .route("/relations/{id}", delete(remove_relation_handler))
         // Activities
+        .route("/activities", get(list_workspace_activities_handler))
         .route("/issues/{identifier}/activities", get(list_issue_activities_handler))
         // GitHub Links
         .route("/issues/{identifier}/github-links", get(list_issue_github_links_handler))

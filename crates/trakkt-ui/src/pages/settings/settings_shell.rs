@@ -36,11 +36,11 @@ struct SettingsTab {
 /// All settings tabs (visibility filtered at render time based on user context).
 const TABS: &[SettingsTab] = &[
     SettingsTab { id: "profile", name: "Profile", icon: phosphor_leptos::USER, path: "profile" },
+    SettingsTab { id: "notifications", name: "Notifications", icon: phosphor_leptos::BELL, path: "notifications" },
     SettingsTab { id: "security", name: "Security", icon: phosphor_leptos::SHIELD, path: "security" },
     SettingsTab { id: "workspace", name: "Workspace", icon: phosphor_leptos::GEAR, path: "workspace" },
     SettingsTab { id: "team", name: "Team", icon: phosphor_leptos::USERS, path: "team" },
     SettingsTab { id: "labels", name: "Labels", icon: phosphor_leptos::TAG, path: "labels" },
-    SettingsTab { id: "teams", name: "Teams", icon: phosphor_leptos::USERS_FOUR, path: "teams" },
     SettingsTab { id: "integrations", name: "Integrations", icon: phosphor_leptos::PLUGS_CONNECTED, path: "integrations" },
     SettingsTab { id: "billing", name: "Billing", icon: phosphor_leptos::CREDIT_CARD, path: "billing" },
 ];
@@ -54,6 +54,7 @@ fn visible_tabs(ctx: &UserContext) -> Vec<&'static str> {
     let mut tabs = Vec::new();
 
     tabs.push("profile");
+    tabs.push("notifications");
 
     if !ctx.is_personal_mode {
         tabs.push("security");
@@ -67,9 +68,8 @@ fn visible_tabs(ctx: &UserContext) -> Vec<&'static str> {
         tabs.push("team");
     }
 
-    // Labels and teams are always visible — even personal mode needs them
+    // Labels are always visible — even personal mode needs them
     tabs.push("labels");
-    tabs.push("teams");
 
     if is_admin && !ctx.is_personal_mode {
         tabs.push("integrations");

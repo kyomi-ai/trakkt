@@ -11,11 +11,10 @@ use wasm_bindgen::JsCast;
 use phosphor_leptos::{Icon, IconWeight};
 
 use std::collections::HashMap;
-use std::sync::Arc;
-
+use trakkt_types::enums::FavoriteTarget;
 use crate::cache::store::SyncStore;
 use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon};
-use crate::components::{Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, Modal, ModalSize, SearchInput, Spinner, TeamIcon, INPUT_CLASS};
+use crate::components::{Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, FeedbackModal, ProjectCreationModal, Spinner, TeamCreationModal, TeamIcon};
 use crate::components::popover::{Popover, Placement};
 use crate::server_fns::context::UserContext;
 use crate::server_fns::sidebar::{get_sidebar_user, list_user_workspaces, switch_workspace, SidebarUser};
@@ -32,13 +31,38 @@ pub fn Layout() -> impl IntoView {
     let (user_menu_open, set_user_menu_open) = signal(false);
     let (mobile_sidebar_open, set_mobile_sidebar_open) = signal(false);
     let (show_palette, set_show_palette) = signal(false);
+    let (show_feedback, set_show_feedback) = signal(false);
 
     // Provide SyncStore on all targets so page components can reference it.
     // On SSR it remains empty; on WASM the sync engine populates it.
     let sync_store = SyncStore::new();
     provide_context(sync_store);
+
+    // Initialize console.error interceptor for feedback context collection.
+    #[cfg(target_arch = "wasm32")]
+    crate::utils::feedback_context::init();
     provide_context(CreateIssueTrigger(RwSignal::new(false)));
-    provide_context(SidebarExpandState(RwSignal::new(HashMap::new())));
+    let initial_expand_state: HashMap<String, bool> = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::window()
+                .and_then(|w| w.local_storage().ok().flatten())
+                .and_then(|storage| storage.get_item("trakkt:sidebar:teams").ok().flatten())
+                .and_then(|json| match serde_json::from_str::<HashMap<String, bool>>(&json) {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse sidebar expand state from localStorage: {e}");
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            HashMap::new()
+        }
+    };
+    provide_context(SidebarExpandState(RwSignal::new(initial_expand_state)));
 
     let auth_confirmed = RwSignal::new(false);
     let nav = leptos_router::hooks::use_navigate();
@@ -54,85 +78,268 @@ pub fn Layout() -> impl IntoView {
     });
 
     // ── Sync engine wiring (WASM only) ────────────────────────────────────
-    // Once auth is confirmed and user context is available:
-    // 1. Hydrate the store from IndexedDB for instant UI
-    // 2. Connect the WebSocket
-    // 3. Start the sync engine to keep data current
+    // Every tab of a browser shares one IndexedDB cache, so only one of them —
+    // the tab holding the sync leadership lock — may run a sync engine against
+    // it. Two tabs writing entities and the shared cursor concurrently is what
+    // let a throttled tab's stale writes land on top of a live tab's newer
+    // ones. See `cache::tab_leader`.
+    //
+    // Every tab:      set workspace, hydrate from IndexedDB, subscribe to the
+    //                 leader's broadcast, request leadership.
+    // The leader tab: additionally start the engine and dial the WebSocket —
+    //                 immediately if it wins the lock, or later on promotion
+    //                 when the previous leader's tab closes.
+    //
+    // Both live-update paths wait on `hydration_gate`. Hydration replaces whole
+    // store lists at once, so anything applied while it is still in flight gets
+    // wiped by the `set_*` that lands after it — and the leader's cursor has
+    // already moved past, so nothing re-delivers it.
+    //
+    // The two wait differently because their transports differ. The socket is
+    // simply not dialed until hydration finishes: nothing has been received
+    // yet, so delaying it only reorders. The cross-tab channel cannot be
+    // treated the same way — it has no replay, so a late subscription would
+    // *drop* whatever other tabs posted in that window rather than delay it.
+    // So the subscription goes up immediately and its messages are held in a
+    // FIFO until the gate opens. See `cache::broadcast_queue`.
     #[cfg(target_arch = "wasm32")]
     {
-        use crate::cache::websocket;
+        use crate::cache::broadcast_queue::BroadcastQueue;
+        use crate::cache::delete_route::DeleteRoute;
+        use crate::cache::hydration_gate::HydrationGate;
+        use crate::cache::idb_writer::IdbWriter;
         use crate::cache::sync_engine;
+        use crate::cache::tab_leader::{self, Leadership, SyncBroadcast};
+        use crate::cache::websocket;
         use crate::server_fns::context::UserContext;
 
         let user_ctx = expect_context::<LocalResource<Result<UserContext, ServerFnError>>>();
 
-        // Track whether we've already started the sync engine to avoid
-        // re-connecting on every reactive re-fire.
+        // The WebSocket handle is built here, at component setup, and dialed
+        // later — only by the leader, and only once hydration has finished.
+        // Building it up front is what lets `provide_context` run synchronously
+        // in the reactive scope, where pages resolving `WebSocketClient` can
+        // actually see it: context is a setup-time snapshot, so a handle
+        // provided from inside the effect below would be invisible to every
+        // page. One handle for the tab's whole life also means a page mounted
+        // before this tab is promoted observes the real `connection_state`
+        // afterwards, instead of holding a stale disconnected handle.
+        let ws_client = websocket::disconnected();
+        provide_context(ws_client.clone());
+        {
+            let ws_for_cleanup = ws_client.clone();
+            on_cleanup(move || websocket::disconnect(&ws_for_cleanup));
+        }
+
+        // Latch that hydration opens, and that both the dial and the cross-tab
+        // message queue wait on. Lives at setup because its halves can run in
+        // different executions of the effect below: a promoted follower
+        // hydrated long ago, while the first tab hydrates and takes leadership
+        // in a single pass.
+        let hydration_gate = HydrationGate::new();
+
+        // The owner the sync engine's connection-state watcher is registered
+        // under. It has to be this one — created here, at setup — rather than
+        // whichever owner is current when the leader half below runs.
+        //
+        // That half runs inside the effect body, and an `Effect` re-run calls
+        // `Owner::with_cleanup` on its own owner: everything the previous run
+        // created is disposed. A watcher registered from in there would be torn
+        // down by the next re-run, leaving the socket reconnecting on its own
+        // backoff with nothing left to notice it reaching `Connected` — so no
+        // `sync_bootstrap` or `sync_delta` would ever go out again and the tab
+        // would look connected while it had silently stopped syncing.
+        //
+        // A child of the component's owner, so the watcher is disposed with the
+        // Layout and not before. Same reasoning as the handles above; this one
+        // is a reactive scope rather than a browser handle.
+        let engine_owner = Owner::new();
+
+        // Track what has already been done so neither half re-runs when the
+        // effect re-fires (it re-fires on promotion, by design).
         let sync_started = std::rc::Rc::new(std::cell::Cell::new(false));
+        let leader_started = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        // Set once the leadership lock is granted. A plain signal is all the
+        // promotion machinery needs: the grant callback sets it, this effect
+        // re-runs and starts the engine — no polling, and the work happens
+        // under the reactive owner rather than inside a bare JS callback.
+        let is_leader = RwSignal::new(false);
+
+        // Non-Send browser handles that must outlive the effect run that
+        // created them. Hoisted to component setup so they are created once.
+        let broadcast: StoredValue<send_wrapper::SendWrapper<Option<SyncBroadcast>>> =
+            StoredValue::new(send_wrapper::SendWrapper::new(None));
+        let leadership: StoredValue<send_wrapper::SendWrapper<Option<tab_leader::LeadershipRequest>>> =
+            StoredValue::new(send_wrapper::SendWrapper::new(None));
+        // The cache writer, set only once this tab holds the leadership lock. A
+        // follower never has one — which is the whole reason its deletes travel
+        // over the broadcast channel instead. The message handler below reads it
+        // on every message, so a tab promoted after the handler was installed
+        // starts servicing other tabs' deletes without re-registering anything.
+        let cache_writer: StoredValue<send_wrapper::SendWrapper<Option<IdbWriter>>> =
+            StoredValue::new(send_wrapper::SendWrapper::new(None));
 
         Effect::new(move |_| {
-            web_sys::console::log_1(&"[trakkt-sync] Effect fired, checking user_ctx".into());
+            // Re-runs when leadership is granted; both halves below are guarded.
+            let leader_now = is_leader.get();
+
             // Wait for user context to resolve successfully.
             let Some(Ok(ctx)) = user_ctx.get() else {
-                web_sys::console::log_1(&"[trakkt-sync] user_ctx not ready yet".into());
                 return;
             };
-
-            if sync_started.get() {
-                web_sys::console::log_1(&"[trakkt-sync] already started, skipping".into());
-                return;
-            }
-            sync_started.set(true);
 
             let user_id = ctx.user_id.clone();
             let workspace_id = ctx
                 .workspace_id
                 .clone()
                 .unwrap_or_else(|| "workspace-local".to_string());
-            web_sys::console::log_1(&format!("[trakkt-sync] starting sync for {user_id} / {workspace_id}").into());
-            sync_store.set_workspace_id(workspace_id.clone());
 
-            // 1. Hydrate from IDB (instant cached data)
-            let wid_hydrate = workspace_id.clone();
-            leptos::task::spawn_local(async move {
-                match crate::cache::db::init_cache_db(&wid_hydrate).await {
-                    Ok(cache_db) => {
-                        sync_engine::hydrate_store_from_db(&cache_db, &wid_hydrate, &sync_store)
-                            .await;
+            // ── Every tab ───────────────────────────────────────────────────
+            if !sync_started.get() {
+                sync_started.set(true);
+
+                // 1. Hydrate from IDB (instant cached data), then open the gate
+                //    the leader's dial is waiting on.
+                leptos::task::spawn_local(sync_engine::hydrate_then_open_gate(
+                    workspace_id.clone(),
+                    sync_store,
+                    hydration_gate.clone(),
+                ));
+
+                // 2. Subscribe to the cross-tab channel. A follower's entire
+                //    live-update path runs through here; the leader opens the
+                //    same channel to publish on (it never receives its own
+                //    messages back) and to service the cache deletes follower
+                //    tabs ask it to perform.
+                //
+                //    The subscription is registered now and its messages are
+                //    queued, rather than the subscription itself being delayed
+                //    until hydration finishes. That ordering matters both ways:
+                //    delaying it would lose messages outright, and applying
+                //    them on arrival would hand them to lists hydration is
+                //    about to replace.
+                //
+                //    The queue is created here, in the same synchronous block
+                //    that spawned hydration above — so there is no arrangement
+                //    in which a queue exists to fill but no hydration exists to
+                //    release it, and the backlog is bounded by hydration
+                //    finishing.
+                match SyncBroadcast::open(&workspace_id) {
+                    Ok(channel) => {
+                        let queue = BroadcastQueue::new(move |message| {
+                            cache_writer.with_value(|writer| {
+                                crate::cache::apply::apply_broadcast(
+                                    &sync_store,
+                                    (**writer).as_ref(),
+                                    message,
+                                );
+                            });
+                        });
+                        leptos::task::spawn_local(sync_engine::release_when_hydrated(
+                            hydration_gate.clone(),
+                            queue.clone(),
+                        ));
+                        channel.set_on_message(move |message| queue.deliver(message));
+                        // Until this tab wins the lock it owns no cache writer,
+                        // so its own deletes go to the tab that does.
+                        sync_store.set_delete_route(DeleteRoute::delegated(channel.clone()));
+                        *broadcast.write_value() =
+                            send_wrapper::SendWrapper::new(Some(channel));
                     }
-                    Err(e) => {
-                        web_sys::console::warn_1(&format!("Failed to open IDB: {e}").into());
-                        // Mark initialized even on IDB failure — an empty store is
-                        // valid state (the sync engine bootstrap will populate it).
-                        // Without this, the sidebar stays in skeleton state forever.
-                        sync_store.set_initialized(true);
+                    Err(e) => tracing::warn!(
+                        "sync: no BroadcastChannel ({e:?}) — this tab will not see the \
+                         leader's updates until it reloads, and cannot ask the leader to \
+                         delete anything from the shared cache"
+                    ),
+                }
+
+                // 3. Stand for election. The callback fires immediately if no
+                //    other tab holds the lock, or when the leader's tab closes.
+                match tab_leader::acquire_leadership(&workspace_id, move || {
+                    is_leader.set(true);
+                }) {
+                    Leadership::Requested(request) => {
+                        *leadership.write_value() =
+                            send_wrapper::SendWrapper::new(Some(request));
+                    }
+                    Leadership::Unsupported => {
+                        // Documented capability fallback: a browser with no Web
+                        // Locks cannot elect anyone, so every tab syncs as it
+                        // did before this change.
+                        tracing::info!(
+                            "sync: no Web Locks in this browser — running without a tab \
+                             leader, as every tab did previously"
+                        );
+                        is_leader.set(true);
                     }
                 }
-            });
+            }
 
-            // 2. Connect WebSocket — start with empty token (connects immediately
-            //    so provide_context works in the reactive scope). Then fetch a
-            //    JWT asynchronously and reconnect with it for multi-user mode.
-            let ws_client = websocket::connect(&user_id, &workspace_id, "");
+            // ── Leader tab only ─────────────────────────────────────────────
+            if !leader_now || leader_started.get() {
+                return;
+            }
+            leader_started.set(true);
+            tracing::info!(%workspace_id, "sync: this tab is the sync leader");
 
-            sync_engine::start_sync_engine(&ws_client, &sync_store, &workspace_id);
+            // Registering the message callback and the connection-state watcher
+            // before the socket exists is safe — and required: the dial below
+            // happens on a later turn of the event loop, so the engine is
+            // listening well before the first byte can arrive.
+            //
+            // The watcher goes under `engine_owner` rather than this effect
+            // run's own owner, which is what keeps it alive across any later
+            // re-run of this effect. See where `engine_owner` is created.
+            let writer = sync_engine::start_sync_engine(
+                &engine_owner,
+                &ws_client,
+                &sync_store,
+                &workspace_id,
+                broadcast.with_value(|channel| (**channel).clone()),
+            );
 
-            let ws_for_cleanup = ws_client.clone();
-            provide_context(ws_client.clone());
+            // This tab now owns every write to the shared cache. Its own deletes
+            // go straight onto the queue rather than round-tripping through the
+            // channel to itself, and the handler installed above starts
+            // enqueueing the deletes other tabs ask for.
+            sync_store.set_delete_route(DeleteRoute::owned(writer.clone()));
+            *cache_writer.write_value() = send_wrapper::SendWrapper::new(Some(writer));
 
-            on_cleanup(move || {
-                websocket::disconnect(&ws_for_cleanup);
-            });
-
-            // Fetch JWT and reconnect with auth (multi-user mode only).
-            let ws_for_reconnect = ws_client;
-            let uid_reconnect = user_id.clone();
-            let wid_reconnect = workspace_id.clone();
-            leptos::task::spawn_local(async move {
-                if let Ok(token) = crate::server_fns::auth::get_ws_token().await && !token.is_empty() {
-                    ws_for_reconnect.reconnect(&uid_reconnect, &wid_reconnect, &token);
-                }
-            });
+            // Dial once hydration is done, with a token already in hand.
+            //
+            // The token is a JWT in both deployment modes: personal mode issues
+            // one like any other (the server bypasses auth for the WebSocket, so
+            // it is simply ignored there), multi-user mode requires it. Fetching
+            // it *before* the first dial is what removes the old
+            // connect-with-nothing → 4001 close → reconnect-with-a-JWT churn on
+            // every multi-user page load.
+            //
+            // If the token cannot be fetched we still dial. In personal mode the
+            // connection succeeds regardless; in multi-user mode the server
+            // closes it, which is precisely the event that drives the existing
+            // backoff loop — and that loop re-fetches the token on every
+            // attempt. Refusing to dial would instead leave the tab with no
+            // socket and no path back to one.
+            leptos::task::spawn_local(sync_engine::dial_when_hydrated(
+                hydration_gate.clone(),
+                ws_client.clone(),
+                user_id,
+                workspace_id,
+                async {
+                    match crate::server_fns::auth::get_ws_token().await {
+                        Ok(token) => token,
+                        Err(e) => {
+                            tracing::warn!(
+                                "sync: could not fetch a WebSocket token — dialing without one; \
+                                 an unauthenticated close will trigger the reconnect loop, which \
+                                 fetches a fresh token per attempt: {e}"
+                            );
+                            String::new()
+                        }
+                    }
+                },
+            ));
         });
     }
 
@@ -173,7 +380,7 @@ pub fn Layout() -> impl IntoView {
             <div class="h-dvh flex bg-background">
                 // Desktop sidebar
                 <div class="hidden md:block">
-                    <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open/>
+                    <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open set_show_feedback=set_show_feedback/>
                 </div>
 
                 // Mobile sidebar overlay
@@ -184,7 +391,7 @@ pub fn Layout() -> impl IntoView {
                             on:click=move |_| set_mobile_sidebar_open.set(false)
                         />
                         <div class="fixed inset-y-0 left-0 z-50 w-[220px]">
-                            <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open/>
+                            <Sidebar user_info=user_info user_menu_open=user_menu_open set_user_menu_open=set_user_menu_open set_show_feedback=set_show_feedback/>
                         </div>
                     </div>
                 </Show>
@@ -227,6 +434,12 @@ pub fn Layout() -> impl IntoView {
                 show=Signal::derive(move || show_palette.get())
                 on_close=Callback::new(move |()| set_show_palette.set(false))
             />
+
+            // Feedback modal — rendered at the app level, triggered from user menu.
+            <FeedbackModal
+                show=Signal::derive(move || show_feedback.get())
+                on_open_change=Callback::new(move |open: bool| set_show_feedback.set(open))
+            />
         </Show>
     }
 }
@@ -237,6 +450,7 @@ fn Sidebar(
     user_info: LocalResource<Result<SidebarUser, ServerFnError>>,
     user_menu_open: ReadSignal<bool>,
     set_user_menu_open: WriteSignal<bool>,
+    set_show_feedback: WriteSignal<bool>,
 ) -> impl IntoView {
     let user_menu_trigger_ref = NodeRef::<leptos::html::Div>::new();
 
@@ -256,12 +470,14 @@ fn Sidebar(
             // Navigation
             <nav class="flex-1 p-3 space-y-1 overflow-y-auto">
                 <SidebarInboxNavItem/>
+                <SidebarNavItem href="/activity" icon=phosphor_leptos::LIGHTNING label="Activity"/>
                 <SidebarNavItem href="/my-issues" icon=phosphor_leptos::LIST_CHECKS label="My Issues"/>
 
-                <SidebarFavoritesSection/>
+                <SidebarWorkspaceSection/>
+
+                <SidebarProjectsSection/>
 
                 <SidebarTeamsSection/>
-                <SidebarProjectsSection/>
             </nav>
 
             // User menu at bottom
@@ -273,30 +489,34 @@ fn Sidebar(
                         match result {
                             Ok(ref user) => {
                             let display_name = user.name.clone().unwrap_or_else(|| user.email.clone());
-                            let avatar_char = user.name.as_ref().and_then(|n| n.chars().next()).unwrap_or('?').to_uppercase().to_string();
                             let ws_name = user.workspace_name.clone().unwrap_or_default();
+                            let email = user.email.clone();
+                            let header_name = display_name.clone();
+                            let header_email = email.clone();
+                            let is_personal = user.is_personal_mode;
                             view! {
                                 <div node_ref=user_menu_trigger_ref>
                                     <button
-                                        class="w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm hover:bg-[var(--color-sidebar-hover)] transition-colors text-left"
+                                        class="w-full flex items-center gap-3 pl-2 pr-3 py-1 min-h-[44px] rounded-lg text-sm hover:bg-[var(--color-sidebar-hover)] transition-colors text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                         on:click=move |_| set_user_menu_open.update(|v| *v = !*v)
                                     >
                                         // Avatar
-                                        <div class="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-xs font-semibold flex-shrink-0">
-                                            {avatar_char.clone()}
-                                        </div>
+                                        <Avatar name=display_name.clone() size=AvatarSize::Md/>
                                         <div class="flex-1 min-w-0">
-                                            <div class="text-[var(--color-sidebar-foreground)] font-medium truncate text-sm">
+                                            <div class="text-sm font-medium text-[var(--color-sidebar-foreground)] truncate">
                                                 {display_name.clone()}
                                             </div>
-                                            <div class="text-[var(--color-sidebar-foreground-muted)] text-xs truncate">
+                                            <div class="text-xs text-[var(--color-sidebar-foreground-muted)] truncate">
                                                 {ws_name.clone()}
                                             </div>
                                         </div>
-                                        // Chevron
-                                        <svg class="w-4 h-4 text-[var(--color-sidebar-foreground-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
-                                        </svg>
+                                        // Animated chevron — rotates 180deg when menu is open
+                                        <span
+                                            class="text-[var(--color-sidebar-foreground-muted)] flex-shrink-0 transition-transform duration-200"
+                                            style=move || if user_menu_open.get() { "transform: rotate(180deg)" } else { "transform: rotate(0deg)" }
+                                        >
+                                            <Icon icon=phosphor_leptos::CARET_DOWN weight=IconWeight::Light size="16px"/>
+                                        </span>
                                     </button>
                                 </div>
 
@@ -307,15 +527,37 @@ fn Sidebar(
                                     on_close=Callback::new(move |()| set_user_menu_open.set(false))
                                     placement=Placement::TOP_START
                                     match_width=true
-                                    class="bg-popover border border-border rounded-lg shadow-lg py-1"
+                                    class="bg-[var(--color-sidebar)] border border-[var(--color-sidebar-border)] rounded-lg shadow-[0_8px_24px_rgba(0,0,0,0.3)] py-1"
                                 >
+                                    // User info header
+                                    <div class="px-3 py-2 border-b border-[var(--color-sidebar-border)]">
+                                        <div class="text-sm font-medium text-[var(--color-sidebar-foreground)]">{header_name.clone()}</div>
+                                        <div class="text-xs text-[var(--color-sidebar-foreground-muted)] truncate">{header_email.clone()}</div>
+                                    </div>
                                     // Workspace switcher (includes separator only when shown)
                                     <WorkspaceSwitcher set_user_menu_open=set_user_menu_open/>
-                                    <a href="/settings/profile" class="block px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors">
-                                        "Settings"
+                                    <a
+                                        href="/settings/profile"
+                                        on:click=move |_| set_user_menu_open.set(false)
+                                        class="w-full text-left px-4 py-2 text-sm text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors flex items-center space-x-3"
+                                    >
+                                        <Icon icon=phosphor_leptos::GEAR weight=IconWeight::Light size="16px"/>
+                                        <span>"Settings"</span>
                                     </a>
+                                    {(!is_personal).then(|| view! {
+                                        <button
+                                            class="w-full text-left px-4 py-2 text-sm text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors flex items-center space-x-3"
+                                            on:click=move |_| {
+                                                set_user_menu_open.set(false);
+                                                set_show_feedback.set(true);
+                                            }
+                                        >
+                                            <Icon icon=phosphor_leptos::CHAT_CIRCLE weight=IconWeight::Light size="16px"/>
+                                            <span>"Send Feedback"</span>
+                                        </button>
+                                    })}
                                     <button
-                                        class="w-full text-left px-4 py-2 text-sm text-foreground hover:bg-secondary transition-colors"
+                                        class="w-full text-left px-4 py-2 text-sm text-error-foreground hover:bg-error/10 transition-colors flex items-center space-x-3"
                                         on:click=move |_| {
                                             set_user_menu_open.set(false);
                                             leptos::task::spawn_local(async move {
@@ -325,7 +567,8 @@ fn Sidebar(
                                             });
                                         }
                                     >
-                                        "Sign Out"
+                                        <Icon icon=phosphor_leptos::SIGN_OUT weight=IconWeight::Light size="16px"/>
+                                        <span>"Sign Out"</span>
                                     </button>
                                 </Popover>
                             }.into_any()
@@ -395,6 +638,121 @@ fn WorkspaceSwitcher(set_user_menu_open: WriteSignal<bool>) -> impl IntoView {
     }
 }
 
+/// Section header for "Projects" with dynamic project list from SyncStore.
+///
+/// Lists all workspace projects as `SidebarEntityItem` entries with a "+"
+/// button to create new projects. The section expand/collapse state is
+/// persisted to localStorage under `trakkt:sidebar:projects`.
+#[component]
+fn SidebarProjectsSection() -> impl IntoView {
+    let store = use_context::<SyncStore>();
+    let (show_create, set_show_create) = signal(false);
+
+    // ── Expand/collapse state persisted to localStorage ──────────────────
+    let initial_expanded: bool = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::window()
+                .and_then(|w| w.local_storage().ok().flatten())
+                .and_then(|storage| storage.get_item("trakkt:sidebar:projects").ok().flatten())
+                .map(|v| v == "true")
+                .unwrap_or(true)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            true
+        }
+    };
+    let (expanded, set_expanded) = signal(initial_expanded);
+
+    let persist_expanded = move |value: bool| {
+        set_expanded.set(value);
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(storage) = web_sys::window()
+                .and_then(|w| w.local_storage().ok().flatten())
+                && let Err(e) = storage.set_item("trakkt:sidebar:projects", if value { "true" } else { "false" })
+            {
+                tracing::warn!("Failed to persist sidebar projects state to localStorage: {e:?}");
+            }
+        }
+    };
+
+    view! {
+        {move || {
+            let Some(store) = store else { return view! { <span/> }.into_any() };
+
+            // Show skeleton placeholders while the sync store is hydrating.
+            if !store.initialized().get() {
+                return view! {
+                    <div class="px-3 pt-4 pb-1">
+                        <span class="text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
+                            "Projects"
+                        </span>
+                    </div>
+                    <div class="space-y-1 px-2">
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse"/>
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse w-3/4"/>
+                    </div>
+                }.into_any();
+            }
+
+            let projects: Vec<_> = store.projects().get()
+                .into_iter()
+                .filter(|p| p.archived_at.is_none())
+                .collect();
+
+            view! {
+                <div class="group flex items-center justify-between px-3 pt-4 pb-1">
+                    <button
+                        class="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded"
+                        on:click=move |_| persist_expanded(!expanded.get_untracked())
+                    >
+                        <Icon
+                            icon=phosphor_leptos::CARET_DOWN
+                            weight=IconWeight::Bold
+                            size="10px"
+                            attr:class=move || {
+                                if expanded.get() {
+                                    "transition-transform duration-150"
+                                } else {
+                                    "transition-transform duration-150 -rotate-90"
+                                }
+                            }
+                        />
+                        "Projects"
+                    </button>
+                    <button
+                        class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors duration-200 opacity-0 group-hover:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        on:click=move |_| set_show_create.set(true)
+                        title="Create a project"
+                    >
+                        <Icon icon=phosphor_leptos::PLUS weight=IconWeight::Bold size="12px"/>
+                    </button>
+                </div>
+
+                <ProjectCreationModal
+                    show=Signal::derive(move || show_create.get())
+                    on_close=Callback::new(move |()| set_show_create.set(false))
+                />
+
+                {expanded.get().then(|| view! {
+                    <div class="space-y-0.5">
+                        {projects.into_iter().map(|project| {
+                            let fav_id = project.project_id.clone();
+                            let href = format!("/projects/{}", project.project_id);
+                            let name = project.name.clone();
+                            view! {
+                                <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type=FavoriteTarget::Project favorite_id=fav_id/>
+                            }
+                        }).collect_view()}
+                    </div>
+                })}
+            }.into_any()
+        }}
+    }
+}
+
 /// Section header for "Teams" with dynamic team list from SyncStore.
 /// Teams are collapsible and the section includes create/join actions.
 #[component]
@@ -438,9 +796,10 @@ fn SidebarTeamsSection() -> impl IntoView {
                     </button>
                 </div>
 
-                <Show when=move || show_create.get()>
-                    <SidebarCreateOrJoinTeam on_done=Callback::new(move |()| set_show_create.set(false))/>
-                </Show>
+                <TeamCreationModal
+                    show=Signal::derive(move || show_create.get())
+                    on_close=Callback::new(move |()| set_show_create.set(false))
+                />
 
                 <div class="space-y-0.5">
                     {teams.into_iter().map(|team| {
@@ -455,75 +814,153 @@ fn SidebarTeamsSection() -> impl IntoView {
     }
 }
 
-/// Section for "Favorites" — shows user-pinned teams, projects, and views.
+/// Section for "Workspace" — shows preset views (Issues, Active, Backlog)
+/// and user-saved workspace-scoped views.
 ///
-/// Only renders when favorites exist. Each favorite resolves its name, icon,
-/// and link from the corresponding entity in SyncStore.
+/// Workspace-scoped views are those with `team_id == None`.
 #[component]
-fn SidebarFavoritesSection() -> impl IntoView {
+fn SidebarWorkspaceSection() -> impl IntoView {
     let store = use_context::<SyncStore>();
+    let location = leptos_router::hooks::use_location();
+    let path = location.pathname;
+    let search = location.search;
+
+    // Active state for the three workspace presets — match pathname AND query param.
+    let issues_active = Signal::derive(move || {
+        let p = path.get();
+        let s = search.get();
+        p == "/workspace"
+            && (s.split('&').any(|seg| seg == "view=issues")
+                || !s.split('&').any(|seg| seg.starts_with("view=")))
+    });
+    let active_active = Signal::derive(move || {
+        path.get() == "/workspace"
+            && search.get().split('&').any(|p| p == "view=active")
+    });
+    let backlog_active = Signal::derive(move || {
+        path.get() == "/workspace"
+            && search.get().split('&').any(|p| p == "view=backlog")
+    });
+    let archived_active = Signal::derive(move || {
+        path.get() == "/archived"
+    });
+    let starred_active = Signal::derive(move || {
+        path.get() == "/workspace"
+            && search.get().split('&').any(|p| p == "view=starred")
+    });
 
     view! {
         {move || {
             let Some(store) = store else { return view! { <span/> }.into_any() };
 
             // Show skeleton placeholders while the sync store is hydrating.
-            // Without this, the favorites section disappears entirely after
-            // client-side login until bootstrap completes.
             if !store.initialized().get() {
                 return view! {
                     <div class="px-3 pt-4 pb-1">
                         <span class="text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
-                            "Favorites"
+                            "Workspace"
                         </span>
                     </div>
                     <div class="space-y-1 px-2">
                         <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse"/>
                         <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse w-3/4"/>
+                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse w-2/3"/>
                     </div>
                 }.into_any();
             }
 
-            let favorites = store.favorites().get();
-            if favorites.is_empty() {
-                return view! { <span/> }.into_any();
-            }
-            let teams = store.teams().get();
-            let projects = store.projects().get();
-            // Limit to 10 items.
-            let items: Vec<_> = favorites.into_iter().take(10).collect();
+            // Workspace-scoped views (team_id is None), excluding any whose
+            // name collides with the hardcoded preset views above.
+            const PRESET_NAMES: &[&str] = &["Issues", "Active", "Backlog", "Starred"];
+            let mut workspace_views: Vec<trakkt_types::models::View> = store
+                .views()
+                .get()
+                .into_iter()
+                .filter(|v| {
+                    v.team_id.is_none()
+                        && !PRESET_NAMES.iter().any(|p| p.eq_ignore_ascii_case(&v.name))
+                })
+                .collect();
+            workspace_views.sort_by_key(|v| v.position);
+
             view! {
-                <SidebarSectionHeader label="Favorites"/>
+                <SidebarSectionHeader label="Workspace"/>
                 <div class="space-y-0.5">
-                    {items.into_iter().filter_map(|fav| {
-                        match fav.target_type.as_str() {
-                            "team" => {
-                                let team = teams.iter().find(|t| t.team_id == fav.target_id)?.clone();
-                                let key = team.key.to_lowercase();
-                                let href = format!("/teams/{key}/issues");
-                                let name = team.name.clone();
-                                Some(view! {
-                                    <SidebarFavoriteTeamItem team=team href=href name=name/>
-                                }.into_any())
-                            }
-                            "project" => {
-                                let project = projects.iter().find(|p| p.project_id == fav.target_id)?;
-                                let href = format!("/projects/{}", project.project_id);
-                                let name = project.name.clone();
-                                Some(view! {
-                                    <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER/>
-                                }.into_any())
-                            }
-                            // View favorites are skipped for now — the view model
-                            // doesn't include the team key needed to build the URL
-                            // to the team issues page where the view tab lives.
-                            "view" => None,
-                            _ => None,
+                    <SidebarWorkspacePresetItem
+                        href="/workspace?view=issues"
+                        label="Issues"
+                        is_active=issues_active
+                    >
+                        <Icon icon=phosphor_leptos::LIST_BULLETS weight=IconWeight::Light size="14px"/>
+                    </SidebarWorkspacePresetItem>
+                    <SidebarWorkspacePresetItem
+                        href="/workspace?view=active"
+                        label="Active"
+                        is_active=active_active
+                    >
+                        {view_status_icon(IssueStatusVariant::Started, "14px".to_string())}
+                    </SidebarWorkspacePresetItem>
+                    <SidebarWorkspacePresetItem
+                        href="/workspace?view=backlog"
+                        label="Backlog"
+                        is_active=backlog_active
+                    >
+                        {view_status_icon(IssueStatusVariant::Backlog, "14px".to_string())}
+                    </SidebarWorkspacePresetItem>
+                    <SidebarWorkspacePresetItem
+                        href="/archived"
+                        label="Archived"
+                        is_active=archived_active
+                    >
+                        <Icon icon=phosphor_leptos::ARCHIVE weight=IconWeight::Light size="14px"/>
+                    </SidebarWorkspacePresetItem>
+                    <SidebarWorkspacePresetItem
+                        href="/workspace?view=starred"
+                        label="Starred"
+                        is_active=starred_active
+                    >
+                        <Icon icon=phosphor_leptos::STAR weight=IconWeight::Light size="14px"/>
+                    </SidebarWorkspacePresetItem>
+
+                    // User-saved workspace views
+                    {workspace_views.into_iter().map(|v| {
+                        let href = format!("/views/{}", v.view_id);
+                        let name = v.name.clone();
+                        view! {
+                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FUNNEL/>
                         }
                     }).collect_view()}
                 </div>
             }.into_any()
         }}
+    }
+}
+
+/// Preset workspace view item with custom active-state detection.
+///
+/// Unlike `SidebarNavItem` which only checks pathname, this component checks
+/// both pathname and query string to differentiate between `/workspace?view=active`
+/// and `/workspace?view=backlog`.
+#[component]
+fn SidebarWorkspacePresetItem(
+    href: &'static str,
+    label: &'static str,
+    is_active: Signal<bool>,
+    children: Children,
+) -> impl IntoView {
+    let class = move || {
+        let base = "flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-colors";
+        if is_active.get() {
+            format!("{base} bg-[var(--color-sidebar-active)] text-[var(--color-sidebar-foreground)] font-medium")
+        } else {
+            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)]")
+        }
+    };
+    view! {
+        <a href=href class=class>
+            {children()}
+            {label}
+        </a>
     }
 }
 
@@ -533,7 +970,7 @@ fn SidebarFavoritesSection() -> impl IntoView {
 /// `add_favorite` or `remove_favorite` server function.
 #[component]
 pub fn FavoriteToggle(
-    target_type: &'static str,
+    target_type: FavoriteTarget,
     target_id: String,
 ) -> impl IntoView {
     let store = use_context::<SyncStore>();
@@ -544,7 +981,7 @@ pub fn FavoriteToggle(
                 s.favorites()
                     .get()
                     .iter()
-                    .any(|f| f.target_type == target_type && f.target_id == tid)
+                    .any(|f| f.target_type == target_type.as_str() && f.target_id == tid)
             })
             .unwrap_or(false)
     });
@@ -559,7 +996,7 @@ pub fn FavoriteToggle(
             return;
         }
         toggling.set(true);
-        let tt = target_type.to_string();
+        let tt = target_type.as_str().to_string();
         let ti = target_id_click.clone();
         let currently_fav = is_fav.get_untracked();
         leptos::task::spawn_local(async move {
@@ -604,7 +1041,7 @@ fn SidebarEntityItem(
     href: String,
     name: String,
     icon: phosphor_leptos::IconData,
-    #[prop(optional)] favorite_type: Option<&'static str>,
+    #[prop(optional)] favorite_type: Option<FavoriteTarget>,
     #[prop(optional)] favorite_id: Option<String>,
 ) -> impl IntoView {
     let path = leptos_router::hooks::use_location().pathname;
@@ -649,76 +1086,6 @@ fn SidebarEntityItem(
     }
 }
 
-/// A team item in the favorites list — uses TeamIcon instead of a static Phosphor icon.
-#[component]
-fn SidebarFavoriteTeamItem(team: trakkt_types::models::Team, href: String, name: String) -> impl IntoView {
-    let path = leptos_router::hooks::use_location().pathname;
-    let href_match = href.clone();
-    let is_active = Signal::derive(move || path.get().starts_with(&href_match));
-    let wrapper_class = move || {
-        let base = "group flex items-center rounded-md transition-colors";
-        if is_active.get() {
-            format!("{base} bg-[var(--color-sidebar-active)]")
-        } else {
-            format!("{base} hover:bg-[var(--color-sidebar-hover)]")
-        }
-    };
-    let link_class = move || {
-        let base = "flex-1 min-w-0 flex items-center gap-3 px-3 py-1.5 text-sm";
-        if is_active.get() {
-            format!("{base} text-[var(--color-sidebar-foreground)] font-medium")
-        } else {
-            format!("{base} text-[var(--color-sidebar-foreground-secondary)] hover:text-[var(--color-sidebar-foreground)]")
-        }
-    };
-    view! {
-        <div class=wrapper_class>
-            <a href=href class=link_class>
-                <TeamIcon team=team size="16px"/>
-                <span class="truncate">{name}</span>
-            </a>
-        </div>
-    }
-}
-
-/// Section header for "Projects" with dynamic project list from SyncStore.
-#[component]
-fn SidebarProjectsSection() -> impl IntoView {
-    let store = use_context::<SyncStore>();
-
-    view! {
-        {move || {
-            let Some(store) = store else { return view! { <span/> }.into_any() };
-
-            // Show skeleton placeholders while the sync store is hydrating.
-            if !store.initialized().get() {
-                return view! {
-                    <div class="space-y-1 px-2 pt-4">
-                        <div class="h-7 bg-[var(--color-sidebar-hover)] rounded animate-pulse"/>
-                    </div>
-                }.into_any();
-            }
-
-            let projects = store.projects().get();
-            if projects.is_empty() {
-                return view! { <span/> }.into_any();
-            }
-            view! {
-                <SidebarSectionHeader label="Projects"/>
-                <div class="space-y-0.5">
-                    {projects.into_iter().map(|project| {
-                        let fav_id = project.project_id.clone();
-                        let href = format!("/projects/{}", project.project_id);
-                        let name = project.name.clone();
-                        view! {
-                            <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type="project" favorite_id=fav_id/>
-                        }
-                    }).collect_view()}
-                </div>
-            }.into_any()
-        }}
-    }
-}
 
 
 /// Small, uppercase, muted section header (Linear-style).
@@ -728,197 +1095,6 @@ fn SidebarSectionHeader(label: &'static str) -> impl IntoView {
         <div class="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-sidebar-foreground-muted)]">
             {label}
         </div>
-    }
-}
-
-/// Modal for creating a new team or joining an existing one.
-#[component]
-fn SidebarCreateOrJoinTeam(on_done: Callback<()>) -> impl IntoView {
-    let store = use_context::<SyncStore>();
-
-    let (name, set_name) = signal(String::new());
-    let (error, set_error) = signal(Option::<String>::None);
-    let (submitting, set_submitting) = signal(false);
-    let input_ref = NodeRef::<leptos::html::Input>::new();
-
-    let (search, set_search) = signal(String::new());
-    let (joining, set_joining) = signal(Option::<String>::None);
-
-    let joinable_teams = LocalResource::new(crate::server_fns::teams::list_joinable_teams);
-
-    Effect::new(move || {
-        if let Some(input) = input_ref.get() {
-            let _ = input.focus();
-        }
-    });
-
-    let on_submit = move |ev: web_sys::SubmitEvent| {
-        ev.prevent_default();
-        let name_val = name.get_untracked().trim().to_string();
-        if name_val.is_empty() { return; }
-
-        let key: String = name_val
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .take(3)
-            .collect::<String>()
-            .to_uppercase();
-
-        if key.len() < 2 {
-            set_error.set(Some("Name too short for a team key".into()));
-            return;
-        }
-
-        set_submitting.set(true);
-        set_error.set(None);
-
-        leptos::task::spawn_local(async move {
-            match crate::server_fns::teams::create_team(name_val, key, None, None).await {
-                Ok(_) => {
-                    on_done.run(());
-                }
-                Err(e) => {
-                    set_error.set(Some(format!("{e}")));
-                    set_submitting.set(false);
-                }
-            }
-        });
-    };
-
-    let on_close = Callback::new(move |()| on_done.run(()));
-
-    let modal_body: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
-        view! {
-            <div class="space-y-4">
-                <div>
-                    <label class="block text-sm font-medium text-foreground mb-2">"Create new team"</label>
-                    <form class="flex gap-2" on:submit=on_submit>
-                        <input
-                            node_ref=input_ref
-                            type="text"
-                            placeholder="Team name..."
-                            class=INPUT_CLASS
-                            prop:value=move || name.get()
-                            on:input=move |ev| set_name.set(event_target_value(&ev))
-                            prop:disabled=move || submitting.get()
-                        />
-                        <Button
-                            disabled=Signal::derive(move || submitting.get() || name.get().trim().is_empty())
-                        >
-                            {move || if submitting.get() { "Creating..." } else { "Create" }}
-                        </Button>
-                    </form>
-                    <Show when=move || error.get().is_some()>
-                        <p class="mt-1 text-sm text-red-400">
-                            {move || error.get().unwrap_or_default()}
-                        </p>
-                    </Show>
-                </div>
-
-                <div class="flex items-center gap-3">
-                    <div class="flex-1 h-px bg-border"/>
-                    <span class="text-xs text-muted-foreground">"or"</span>
-                    <div class="flex-1 h-px bg-border"/>
-                </div>
-
-                <div>
-                    <label class="block text-sm font-medium text-foreground mb-2">"Join existing team"</label>
-                    <SearchInput
-                        value=Signal::derive(move || search.get())
-                        on_input=Callback::new(move |v: String| set_search.set(v))
-                        placeholder="Search teams..."
-                    />
-                    <div class="mt-2 max-h-48 overflow-y-auto rounded-md border border-border">
-                        <Suspense fallback=|| view! {
-                            <div class="px-4 py-3 text-sm text-muted-foreground">"Loading teams..."</div>
-                        }>
-                            {move || joinable_teams.get().map(|result| {
-                                match result {
-                                    Ok(ref teams) => {
-                                        let query = search.get().to_lowercase();
-                                        let filtered: Vec<_> = teams.iter()
-                                            .filter(|t| query.is_empty() || t.name.to_lowercase().contains(&query))
-                                            .cloned()
-                                            .collect();
-                                        if filtered.is_empty() {
-                                            view! {
-                                                <div class="px-4 py-3 text-sm text-muted-foreground">
-                                                    "No teams available to join"
-                                                </div>
-                                            }.into_any()
-                                        } else {
-                                            filtered.into_iter().map(|team| {
-                                                let team_id = team.team_id.clone();
-                                                let team_name = team.name.clone();
-                                                let member_count = team.member_count;
-                                                let is_joining = Signal::derive(move || {
-                                                    joining.get().as_deref() == Some(team_id.as_str())
-                                                });
-                                                let team_for_upsert = team.clone();
-                                                let tid = team.team_id.clone();
-                                                view! {
-                                                    <button
-                                                        class="w-full flex items-center justify-between px-4 py-2.5 text-sm text-foreground hover:bg-secondary transition-colors disabled:opacity-50"
-                                                        disabled=move || joining.get().is_some()
-                                                        on:click=move |_| {
-                                                            let tid = tid.clone();
-                                                            let team_for_upsert = team_for_upsert.clone();
-                                                            set_joining.set(Some(tid.clone()));
-                                                            leptos::task::spawn_local(async move {
-                                                                match crate::server_fns::teams::join_team(tid).await {
-                                                                    Ok(()) => {
-                                                                        if let Some(store) = store {
-                                                                            store.upsert_team(team_for_upsert);
-                                                                        }
-                                                                        on_done.run(());
-                                                                    }
-                                                                    Err(e) => {
-                                                                        web_sys::console::warn_1(&format!("join_team failed: {e}").into());
-                                                                        set_joining.set(None);
-                                                                    }
-                                                                }
-                                                            });
-                                                        }
-                                                    >
-                                                        <span class="truncate">{team_name}</span>
-                                                        <span class="text-xs text-muted-foreground flex-shrink-0 ml-2">
-                                                            {move || if is_joining.get() {
-                                                                "Joining...".to_string()
-                                                            } else {
-                                                                let n = member_count;
-                                                                if n == 1 { "1 member".to_string() } else { format!("{n} members") }
-                                                            }}
-                                                        </span>
-                                                    </button>
-                                                }
-                                            }).collect_view().into_any()
-                                        }
-                                    }
-                                    Err(ref e) => {
-                                        view! {
-                                            <div class="px-4 py-3 text-sm text-red-400">
-                                                {format!("Failed to load teams: {e}")}
-                                            </div>
-                                        }.into_any()
-                                    }
-                                }
-                            })}
-                        </Suspense>
-                    </div>
-                </div>
-            </div>
-        }.into_any()
-    });
-
-    view! {
-        <Modal
-            show=Signal::derive(move || true)
-            on_close=on_close
-            title="Add Team"
-            size=ModalSize::Sm
-        >
-            {modal_body()}
-        </Modal>
     }
 }
 
@@ -940,9 +1116,13 @@ fn SidebarTeamSubNav(
     let settings_href = format!("/teams/{}/settings", team_key.to_lowercase());
     let settings_href_match = settings_href.clone();
 
+    let archived_href = format!("/teams/{}/archived", team_key.to_lowercase());
+    let archived_href_match_for_team = archived_href.clone();
+
     let issues_active = Signal::derive(move || path.get().starts_with(&issues_href_match));
     let settings_active = Signal::derive(move || path.get().starts_with(&settings_href_match));
-    let team_active = Signal::derive(move || issues_active.get() || settings_active.get());
+    let team_archived_active = Signal::derive(move || path.get().starts_with(&archived_href_match_for_team));
+    let team_active = Signal::derive(move || issues_active.get() || settings_active.get() || team_archived_active.get());
 
     // Raw query string WITHOUT the leading '?' (leptos_router strips it).
     let search = leptos_router::hooks::use_location().search;
@@ -956,30 +1136,20 @@ fn SidebarTeamSubNav(
         if issues_active.get() { IconWeight::Fill } else { IconWeight::Light }
     });
 
-    // Active state for Active/Backlog — match path + query param.
-    // Check BOTH the new `view=active` format and the legacy `status=in_progress`
-    // format for backward compatibility.
     let issues_href_match_for_active = issues_href.clone();
     let started_active = Signal::derive(move || {
         path.get().starts_with(&issues_href_match_for_active)
-            && search.get().split('&').any(|p| {
-                p == "view=active" || p == "status=in_progress"
-            })
+            && search.get().split('&').any(|p| p == "view=active")
     });
     let issues_href_match_for_backlog = issues_href.clone();
     let backlog_active = Signal::derive(move || {
         path.get().starts_with(&issues_href_match_for_backlog)
-            && search.get().split('&').any(|p| {
-                p == "view=backlog" || p == "status=backlog"
-            })
+            && search.get().split('&').any(|p| p == "view=backlog")
     });
 
-    // Issues "plain" active: on the issues page but WITHOUT a view/status query param
     let issues_no_filter_active = Signal::derive(move || {
         issues_active.get()
-            && !search.get().split('&').any(|p| {
-                p.starts_with("view=") || p.starts_with("status=")
-            })
+            && !search.get().split('&').any(|p| p.starts_with("view="))
     });
 
     // ── Expand/collapse state from shared context ──────────────────────────
@@ -999,6 +1169,18 @@ fn SidebarTeamSubNav(
         move |value: bool| {
             if let Some(ref ctx) = expand_ctx {
                 ctx.0.update(|map| { map.insert(team_key_for_set.clone(), value); });
+                // Persist to localStorage
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let map = ctx.0.get_untracked();
+                    if let Ok(json) = serde_json::to_string(&map)
+                        && let Some(storage) = web_sys::window()
+                            .and_then(|w| w.local_storage().ok().flatten())
+                        && let Err(e) = storage.set_item("trakkt:sidebar:teams", &json)
+                    {
+                        tracing::warn!("Failed to persist sidebar state to localStorage: {e:?}");
+                    }
+                }
             }
         }
     };
@@ -1063,7 +1245,6 @@ fn SidebarTeamSubNav(
                 </button>
                 // Right zone: actions (hover-reveal)
                 <div class="flex items-center gap-1 pr-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <FavoriteToggle target_type="team" target_id=team_id.clone()/>
                     <div node_ref=menu_trigger_ref>
                         <button
                             class="p-0.5 rounded text-[var(--color-sidebar-foreground-muted)] hover:text-[var(--color-sidebar-foreground)] hover:bg-[var(--color-sidebar-hover)] transition-colors"
@@ -1107,6 +1288,7 @@ fn SidebarTeamSubNav(
                 let ih = issues_href.clone();
                 let ah = active_href.clone();
                 let bh = backlog_href.clone();
+                let arch_h = archived_href.clone();
                 view! {
                     <div class="ml-4">
                         <SidebarSubNavItem href=ih label="Issues" is_active=issues_no_filter_active>
@@ -1117,6 +1299,9 @@ fn SidebarTeamSubNav(
                         </SidebarSubNavItem>
                         <SidebarSubNavItem href=bh label="Backlog" is_active=backlog_active>
                             {view_status_icon(IssueStatusVariant::Backlog, "14px".to_string())}
+                        </SidebarSubNavItem>
+                        <SidebarSubNavItem href=arch_h label="Archived" is_active=team_archived_active>
+                            <Icon icon=phosphor_leptos::ARCHIVE weight=IconWeight::Light size="14px"/>
                         </SidebarSubNavItem>
                     </div>
                 }
@@ -1206,9 +1391,18 @@ fn SidebarInboxNavItem() -> impl IntoView {
     };
 
     let sync_store = use_context::<SyncStore>();
+    // Resolved here, at component setup, rather than inside the closure below:
+    // the eight collection getters build a fresh arena-registered `Signal`
+    // wrapper on each call, so calling one from a closure that re-runs abandons
+    // a wrapper per evaluation and is one refactor from the disposed-value
+    // panic. This is the site TRA-9995 found in that shape. The nine
+    // `*_version()` counters no longer behave this way — TRA-9996 moved them to
+    // `ArcSignal`, which has no owner — so the rule is now specific to the
+    // collections. See the getter notes on `SyncStore`, and [[TRA-9998]].
+    let notifications = sync_store.map(|store| store.notifications());
     let unread_count = Signal::derive(move || {
-        sync_store
-            .map(|store| store.notifications().get().iter().filter(|n| !n.read).count())
+        notifications
+            .map(|list| list.get().iter().filter(|n| n.is_unread_in_inbox()).count())
             .unwrap_or(0)
     });
 
@@ -1335,5 +1529,205 @@ fn BillingBanner() -> impl IntoView {
                 </Button>
             </div>
         </Show>
+    }
+}
+
+// ── Browser tests ───────────────────────────────────────────────────────────
+
+/// What the sidebar's unread badge counts, asserted on the badge itself.
+///
+/// These mount the real `SidebarInboxNavItem` and read the number out of the
+/// DOM. The alternative — evaluating the count expression from a test — restates
+/// the predicate under test and would agree with it however wrong it is, which
+/// is how TRA-9995 survived a suite that already covered the store this badge
+/// reads from.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use gloo_timers::future::TimeoutFuture;
+    use leptos_router::components::Router;
+    use trakkt_types::enums::ActionSource;
+    use trakkt_types::models::Notification;
+    use trakkt_types::sync::{entity_types, SyncAction, SyncActionType};
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use crate::cache::apply::apply_action_to_memory;
+    use crate::cache::store::SyncStore;
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
+
+    use super::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// One unread, undeleted notification.
+    ///
+    /// Built as the model rather than as JSON so that a field renamed on
+    /// [`Notification`] changes this fixture and the payload [`update_frame`]
+    /// serialises together, instead of leaving the two agreeing only by hand.
+    fn unread(notification_id: &str) -> Notification {
+        Notification {
+            notification_id: notification_id.to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            user_id: "usr-alice".to_owned(),
+            issue_id: "issue-1".to_owned(),
+            notification_type: "assigned".to_owned(),
+            read: false,
+            issue_title: Some("A leaky issue".to_owned()),
+            issue_number: Some(42),
+            team_key: Some("TRA".to_owned()),
+            actor_id: Some("usr-bob".to_owned()),
+            actor_name: Some("Bob".to_owned()),
+            action_source: ActionSource::User,
+            action_source_label: None,
+            created_at: "2026-07-26T00:00:00Z".to_owned(),
+            deleted_at: None,
+            context_id: None,
+        }
+    }
+
+    /// The frame the server delivers for one notification it has just changed.
+    ///
+    /// `notification_service::change_notifications` records one `Update` per
+    /// affected row carrying the whole row as `sync_log_service::sync_payload`
+    /// serialised it, and `commit_and_deliver` sends it to every session the
+    /// recipient has open — including the one that asked for the change. A
+    /// soft-delete and a mark-read are the same frame with a different row
+    /// inside it, which is why both tests below build theirs here.
+    fn update_frame(notification: &Notification) -> SyncAction {
+        SyncAction {
+            sync_id: 1,
+            entity_type: entity_types::NOTIFICATION.to_owned(),
+            entity_id: notification.notification_id.clone(),
+            workspace_id: notification.workspace_id.clone(),
+            action: SyncActionType::Update,
+            data: Some(
+                serde_json::to_value(notification)
+                    .expect("serializing a Notification the way `sync_payload` does"),
+            ),
+            timestamp: "2026-07-26T01:00:00Z".to_owned(),
+        }
+    }
+
+    /// Mount the real sidebar item with `store` in context, as `Layout` provides
+    /// it. The caller drops the handle and removes the container when done.
+    ///
+    /// The `<Router>` is not decoration: `SidebarInboxNavItem` calls
+    /// `use_location` to decide whether it is the active item, and that panics
+    /// outside a router context. Nothing here asserts on the active state — the
+    /// router is the price of mounting the component unmodified rather than a
+    /// stand-in that would prove nothing about the badge in the sidebar.
+    fn mount_inbox_nav_item(store: SyncStore) -> (impl Sized, web_sys::HtmlElement) {
+        let container = mount_container();
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            provide_context(store);
+            view! { <Router><SidebarInboxNavItem/></Router> }
+        });
+        (handle, container)
+    }
+
+    /// The number the badge is showing, or `None` when no badge is rendered.
+    ///
+    /// The `<span>` is the only one in the anchor: the tray icon renders an
+    /// `<svg>` and the "Inbox" label is a bare text node. So this selector finds
+    /// the badge or finds nothing, and "nothing" is the count reaching zero
+    /// rather than a selector that stopped matching.
+    fn badge_text(container: &web_sys::HtmlElement) -> Option<String> {
+        container
+            .query_selector("a[href=\"/inbox\"] span")
+            .expect("querying the mounted sidebar item for its unread badge")
+            .map(|span| {
+                span.text_content()
+                    .expect("an element node always has textContent")
+            })
+    }
+
+    /// Deleting an unread notification has to take it off the badge.
+    ///
+    /// Deleting from the inbox is a *soft* delete: `bulk_delete_notifications`
+    /// stamps `deleted_at` and the row stays in this tab's store, arriving as an
+    /// `Update` — `cache::apply`'s
+    /// `a_soft_deleted_notification_frame_keeps_the_row_and_stamps_it` pins that
+    /// half. So a badge that counts `!read` alone goes on counting a row the
+    /// inbox no longer lists, and goes on counting it until the page is
+    /// reloaded. That is TRA-9995.
+    ///
+    /// Two notifications rather than one so the assertion is a count that
+    /// dropped and not a badge that vanished: at zero the badge is not rendered
+    /// at all, and an element missing for some unrelated reason would read the
+    /// same.
+    #[wasm_bindgen_test]
+    async fn the_badge_stops_counting_a_notification_the_user_deleted() {
+        boot_leptos_executor();
+
+        let store = SyncStore::new();
+        store.set_notifications(vec![unread("ntf-1"), unread("ntf-2")]);
+        let (handle, container) = mount_inbox_nav_item(store);
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("2"),
+            "the badge is not showing the two unread notifications the store was \
+             seeded with, so nothing below this line measures what deleting one \
+             does — fix this first"
+        );
+
+        let mut deleted = unread("ntf-1");
+        deleted.deleted_at = Some("2026-07-26T01:00:00Z".to_owned());
+        apply_action_to_memory(&store, &update_frame(&deleted));
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("1"),
+            "the badge still counts a notification the user deleted. The row is \
+             still in the store — the delete stamped `deleted_at` instead of \
+             evicting it — so the count has to exclude it explicitly, the way \
+             `notification_service::count_unread` does with \
+             `read = false AND deleted_at IS NULL`"
+        );
+
+        drop(handle);
+        container.remove();
+    }
+
+    /// Marking an unread notification read has to take it off the badge too.
+    ///
+    /// Same frame, same store, the other half of the predicate — so this is what
+    /// stops a fix for the delete case from being written as `deleted_at
+    /// IS NULL` alone. It arrives here by the sync frame rather than by the
+    /// inbox's optimistic `upsert_notification`, because the frame is the path
+    /// that has to work for the tab the user is *not* looking at.
+    #[wasm_bindgen_test]
+    async fn the_badge_stops_counting_a_notification_the_user_read() {
+        boot_leptos_executor();
+
+        let store = SyncStore::new();
+        store.set_notifications(vec![unread("ntf-1"), unread("ntf-2")]);
+        let (handle, container) = mount_inbox_nav_item(store);
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("2"),
+            "the badge is not showing the two unread notifications the store was \
+             seeded with, so nothing below this line measures what reading one \
+             does — fix this first"
+        );
+
+        let mut read = unread("ntf-1");
+        read.read = true;
+        apply_action_to_memory(&store, &update_frame(&read));
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("1"),
+            "the badge still counts a notification that has been read in this \
+             workspace, so it is no longer the count of things needing attention \
+             that it exists to be"
+        );
+
+        drop(handle);
+        container.remove();
     }
 }

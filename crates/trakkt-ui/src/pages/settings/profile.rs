@@ -8,10 +8,13 @@
 use leptos::prelude::*;
 
 use crate::components::{
-    ActionStatus, Card, CardContent, CardDescription, CardHeader, CardTitle, Label,
-    SettingsPageSkeleton, INPUT_CLASS,
+    ActionStatus, Card, CardContent, CardDescription, CardHeader, CardTitle, Label, Select,
+    SelectVariant, SettingsPageSkeleton, Skeleton, INPUT_CLASS,
 };
 use crate::server_fns::profile::*;
+use crate::server_fns::teams::{
+    get_my_default_team_id, get_workspace_default_team_id, list_teams, set_my_default_team,
+};
 use crate::types::ProfileData;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,6 +50,9 @@ pub fn ProfilePage() -> impl IntoView {
                                 <div class="space-y-6">
                                     <Show when=move || !is_personal>
                                         <ProfileInfoCard data=data_profile.clone()/>
+                                    </Show>
+                                    <Show when=move || !is_personal>
+                                        <DefaultTeamCard/>
                                     </Show>
                                     <AppearanceCard data=data_appearance/>
                                     <McpConnectionCard is_personal=is_personal/>
@@ -126,6 +132,98 @@ fn ProfileInfoCard(data: ProfileData) -> impl IntoView {
                         <p class="text-xs text-muted-foreground">"Email cannot be changed"</p>
                     </div>
                 </div>
+            </CardContent>
+        </Card>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Default Team Card
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[component]
+fn DefaultTeamCard() -> impl IntoView {
+    let teams = Resource::new(|| (), |_| list_teams());
+    let my_default_id = Resource::new(|| (), |_| get_my_default_team_id());
+    let ws_default_id = Resource::new(|| (), |_| get_workspace_default_team_id());
+
+    let save_action = Action::new(|team_id: &Option<String>| {
+        let team_id = team_id.clone();
+        async move { set_my_default_team(team_id).await }
+    });
+
+    view! {
+        <Card>
+            <CardHeader>
+                <div class="flex items-center justify-between">
+                    <div>
+                        <CardTitle>"Default Team"</CardTitle>
+                        <CardDescription>
+                            "Choose which team is selected by default when creating issues."
+                        </CardDescription>
+                    </div>
+                    <ActionStatus action=save_action/>
+                </div>
+            </CardHeader>
+            <CardContent>
+                <Transition fallback=move || view! { <Skeleton class="h-10 w-full max-w-sm"/> }>
+                    {move || Suspend::new(async move {
+                        let team_list = teams.await.unwrap_or_default();
+                        let personal_id = my_default_id.await.ok().flatten();
+                        let workspace_id = ws_default_id.await.ok().flatten();
+
+                        if team_list.is_empty() {
+                            return view! {
+                                <p class="text-sm text-muted-foreground">"No teams available."</p>
+                            }.into_any();
+                        }
+
+                        // Build select options: first is "Use workspace default", then each team.
+                        let ws_default_name = workspace_id
+                            .as_ref()
+                            .and_then(|wid| team_list.iter().find(|t| t.team_id == *wid))
+                            .map(|t| t.name.clone())
+                            .unwrap_or_else(|| "none set".to_string());
+
+                        let mut options: Vec<(String, String)> = Vec::with_capacity(team_list.len() + 1);
+                        options.push(("".to_string(), format!("Workspace default ({})", ws_default_name)));
+                        for team in &team_list {
+                            options.push((team.team_id.clone(), team.name.clone()));
+                        }
+
+                        // Empty string means "use workspace default" (no personal override).
+                        let current_value = personal_id.clone().unwrap_or_default();
+                        let (selected, set_selected) = signal(current_value);
+                        let options_signal = Signal::derive(move || options.clone());
+
+                        let on_change = move |val: String| {
+                            set_selected.set(val.clone());
+                            let team_id = if val.is_empty() { None } else { Some(val) };
+                            save_action.dispatch(team_id);
+                        };
+
+                        let explanation = move || {
+                            if selected.get().is_empty() {
+                                "Using workspace default (no personal override)."
+                            } else {
+                                "Your personal default \u{2014} overrides the workspace setting."
+                            }
+                        };
+
+                        view! {
+                            <div class="space-y-3 max-w-sm">
+                                <Select
+                                    value=selected
+                                    options=options_signal
+                                    on_change=Callback::new(on_change)
+                                    variant=SelectVariant::Form
+                                    placeholder="Select a team"
+                                />
+                                <p class="text-xs text-muted-foreground">{explanation}</p>
+                            </div>
+                        }.into_any()
+                    })}
+                </Transition>
             </CardContent>
         </Card>
     }

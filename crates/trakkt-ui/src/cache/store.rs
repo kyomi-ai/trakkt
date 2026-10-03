@@ -11,16 +11,22 @@
 //! read from it compile on both SSR and CSR targets; they receive empty vectors
 //! on SSR and wait for `initialized()` to become `true` on the client. Only the
 //! IndexedDB hydration call-site is wasm32-only.
+//!
+//! The store holds no IndexedDB handle and performs no cache write. A UI delete
+//! removes the entity from memory here and hands the durable half to
+//! [`DeleteRoute`], which reaches the one tab that owns every cache write. See
+//! [`crate::cache::delete_route`].
+
+use std::cell::RefCell;
 
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 
-use trakkt_types::models::{Comment, Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
-
-#[cfg(target_arch = "wasm32")]
-use leptos::task::spawn_local;
-#[cfg(target_arch = "wasm32")]
+use trakkt_types::models::{Favorite, IssueWithDetails, Label, Notification, Project, Status, Team, View};
 use trakkt_types::sync::entity_types;
+
+use crate::cache::delete_route::DeleteRoute;
+use crate::cache::tab_leader::CachedEntity;
 
 // ── Inner storage ─────────────────────────────────────────────────────────────
 
@@ -38,7 +44,6 @@ struct SyncStoreInner {
     views: ArcRwSignal<Vec<View>>,
     favorites: ArcRwSignal<Vec<Favorite>>,
     notifications: ArcRwSignal<Vec<Notification>>,
-    comments: ArcRwSignal<Vec<Comment>>,
     initialized: ArcRwSignal<bool>,
     /// Version counter bumped when an activity sync action arrives.
     /// Used by the timeline component to trigger a refetch.
@@ -46,12 +51,40 @@ struct SyncStoreInner {
     /// Version counter bumped when an issue_relation sync action arrives.
     /// Used by the relations section to trigger a refetch.
     relations_version: ArcRwSignal<u32>,
-    /// Workspace ID for IndexedDB operations.
+    /// Version counter bumped when a comment sync action arrives.
+    /// Used by the detail page to trigger a re-read from IndexedDB.
+    comments_version: ArcRwSignal<u32>,
+    /// Version counter bumped when a project_milestone sync action arrives.
+    /// Used by the project detail page and the issue metadata sidebar to
+    /// trigger a refetch of the milestone list from the server.
+    milestones_version: ArcRwSignal<u32>,
+    /// Version counter bumped when a project_member sync action arrives.
+    /// Used by the project detail page to trigger a refetch of the member list
+    /// from the server.
+    project_members_version: ArcRwSignal<u32>,
+    /// Version counter bumped when a project_update sync action arrives.
+    /// Used by the project detail page to trigger a refetch of the posted
+    /// status updates from the server.
+    project_updates_version: ArcRwSignal<u32>,
+    /// Version counter bumped when an attachment or issue_attachment sync
+    /// action arrives. Used by the issue detail page's attachment list to
+    /// trigger a refetch from the server.
+    attachments_version: ArcRwSignal<u32>,
+    /// Version counter bumped when a notification_preferences sync action
+    /// arrives. Used by the notification settings page to trigger a refetch
+    /// from the server.
+    notification_preferences_version: ArcRwSignal<u32>,
+    /// Version counter bumped when a workspace_settings sync action arrives.
+    /// Used by the workspace settings page to trigger a refetch from the
+    /// server.
+    workspace_settings_version: ArcRwSignal<u32>,
+    /// Where this tab's `remove_*` methods send the matching cache delete.
     ///
-    /// Set once after the user context resolves. `remove_*` methods use this
-    /// to delete the corresponding IDB entry so stale data is not hydrated
-    /// on page refresh.
-    workspace_id: ArcRwSignal<Option<String>>,
+    /// Set by the Layout once the tab's sync role is known, and set again if a
+    /// follower is promoted to leader. Not a signal: nothing renders from it,
+    /// and the deletes that read it run from event handlers, not from reactive
+    /// closures. See [`DeleteRoute`].
+    delete_route: RefCell<DeleteRoute>,
 }
 
 // ── Public handle ─────────────────────────────────────────────────────────────
@@ -61,6 +94,108 @@ struct SyncStoreInner {
 /// Cheaply `Copy`able — the actual data lives behind a `StoredValue`.
 /// Provide at the `Layout` level with [`provide_context`] and access on any
 /// child page with `expect_context::<SyncStore>()`.
+///
+/// # Two kinds of getter, and only one of them still has a contract
+///
+/// Every read-only getter below returns a **newly built** wrapper on each call.
+/// The underlying value is a long-lived `ArcRwSignal` held by this store; what
+/// differs between the two groups is the *wrapper type* handed back, and that
+/// difference is what decides whether a caller has to be careful.
+///
+/// ## The nine `*_version()` counters return [`ArcSignal`] — no contract needed
+///
+/// [`ArcSignal`] holds its `SignalTypes` **inline** (`reactive_graph-0.2.14`,
+/// `wrappers.rs`: `struct ArcSignal { inner: SignalTypes<T, S> }`). There is no
+/// `ArenaItem`, no `Owner::register`, and no `impl Dispose for ArcSignal`
+/// anywhere in the crate, so there is nothing an owner cleanup can take away.
+/// A counter resolved anywhere — inside an effect body, inside a memo, inside a
+/// component a `Suspense` boundary rebuilds — keeps reading correctly for as
+/// long as any clone of it is alive. **Resolve one wherever it is convenient.**
+///
+/// That is the point of TRA-9996. The hazard below used to apply to these too,
+/// and reasoning about which call sites were exposed to it cost five review
+/// cycles (#282 → reverted by #283; TRA-9977; TRA-9987; TRA-9991, whose premise
+/// was wrong and had to be re-derived from `reactive_graph` source twice;
+/// TRA-9995). Changing the type removed the question rather than answering it
+/// again.
+///
+/// Tracking is unaffected by the change. Both wrappers reach the identical
+/// `SignalTypes::DerivedSignal(Arc<dyn Fn() -> T>)` and establish the
+/// dependency by *calling* it — `Track::track` is `DerivedSignal(i) => i()` and
+/// `ReadUntracked::custom_try_read` is `DerivedSignal(i) => Owned(i())` on both
+/// types. The only difference is whether that `Arc` is reached through an arena
+/// slot (`Signal`) or directly (`ArcSignal`). Cloning an `ArcSignal` clones the
+/// `Arc`, not the closure, so every clone tracks the same node; a clone is not
+/// a reactive operation and taking one outside a closure rather than inside it
+/// cannot change what the closure tracks.
+///
+/// `ArcSignal` is `Clone` but **not** `Copy`, which is the one thing call sites
+/// notice. An `Option<ArcSignal<u32>>` held at component setup and read from a
+/// closure wants `as_ref()`, because `Option::map` consumes:
+///
+/// ```ignore
+/// let version = sync_store.map(|s| s.activities_version());
+/// let source = move || (team_key.clone(), version.as_ref().map(|v| v.get()).unwrap_or(0));
+/// ```
+///
+/// That borrows the capture on each run and reads through it. It is not a
+/// correctness requirement — an explicit `.clone()` would track identically —
+/// it is just the form with no allocation and nothing to explain.
+///
+/// ## The eight collection getters and `initialized()` return [`Signal`] — contract applies
+///
+/// **Resolve one of those once, at component setup. Never bind one inside a
+/// closure that re-runs.**
+///
+/// A [`Signal`] holds `inner: ArenaItem<SignalTypes<T, S>, S>` and is registered
+/// with **whichever owner is current at the moment of the call**
+/// (`ArenaItem::new_with_storage` → `Owner::register`). When that owner is
+/// cleaned up the arena slot is removed (`Owner::cleanup`), and any later read
+/// panics with "you tried to access a reactive value ... but it has already been
+/// disposed".
+///
+/// The owner does not have to be *torn down* for this to happen. `Effect` and
+/// `Memo` both call `Owner::with_cleanup` on **every re-run**
+/// (`effect/effect.rs`, `computed/inner.rs`), so a wrapper resolved inside an
+/// effect or memo body is disposed the next time that body runs. So is one
+/// resolved inside a component that a `Transition`/`Suspense` boundary rebuilds.
+/// A wrapper that outlives its resolution point — stored in a struct, captured
+/// by a longer-lived closure, or passed as a component prop — is the shape that
+/// panicked `/settings/notifications` and `/settings/workspace` and forced the
+/// revert of #282, and the shape TRA-9995 found live in
+/// `components/layout.rs`'s inbox badge.
+///
+/// Reading one *inline* (`store.projects().get()`, wrapper built and consumed in
+/// one expression) does not panic, because the wrapper never outlives the
+/// expression — but it abandons one arena item per evaluation and is one
+/// refactor away from the panicking shape, so it is not the form to reach for
+/// either.
+///
+/// Giving these the same treatment as the counters is [[TRA-9998]]. Until that
+/// lands, this half of the type is the half a reader has to be careful with.
+///
+/// ## Why nothing scans `pages/` for this any more
+///
+/// TRA-9991 added a source-text guard, `no_page_resolves_a_version_counter_inline`,
+/// that failed the build if a file under `src/pages` or `src/components`
+/// contained `_version().get(` (or `.read(`/`.with(`/`.track(`). TRA-9996
+/// removed it: with [`ArcSignal`] there is nothing left for it to guard on the
+/// counters, and a check that cannot fail reads as coverage without being any.
+///
+/// It is worth being precise about what that removal did **not** cost, because
+/// the obvious worry is that the collections just lost their cover. They never
+/// had it. The guard matched on the literal substring `_version()`, so it only
+/// ever saw the nine counters — never `projects()`, `teams()`, `notifications()`
+/// or the other five, which is recorded as [[TRA-10060]] and is how TRA-9995's
+/// live instance in `components/layout.rs` reached `main` through a green
+/// build. So the collections are exactly as unguarded now as they were before,
+/// and [[TRA-9998]] inherits an honest zero rather than a guard it might have
+/// mistaken for partial protection. If TRA-9998 converts them, no guard needs
+/// writing; if it decides not to, one that actually matches the collection
+/// getters would have to be written from scratch.
+///
+/// Each claim above is checked by the tests in this module's `wasm_tests`,
+/// including the `should_panic` one that holds the collection half to it.
 #[derive(Clone, Copy)]
 pub struct SyncStore {
     inner: StoredValue<SendWrapper<SyncStoreInner>>,
@@ -89,11 +224,17 @@ impl SyncStore {
                 views: ArcRwSignal::new(Vec::new()),
                 favorites: ArcRwSignal::new(Vec::new()),
                 notifications: ArcRwSignal::new(Vec::new()),
-                comments: ArcRwSignal::new(Vec::new()),
                 initialized: ArcRwSignal::new(false),
                 activities_version: ArcRwSignal::new(0),
                 relations_version: ArcRwSignal::new(0),
-                workspace_id: ArcRwSignal::new(None),
+                comments_version: ArcRwSignal::new(0),
+                milestones_version: ArcRwSignal::new(0),
+                project_members_version: ArcRwSignal::new(0),
+                project_updates_version: ArcRwSignal::new(0),
+                attachments_version: ArcRwSignal::new(0),
+                notification_preferences_version: ArcRwSignal::new(0),
+                workspace_settings_version: ArcRwSignal::new(0),
+                delete_route: RefCell::new(DeleteRoute::default()),
             })),
         }
     }
@@ -148,12 +289,6 @@ impl SyncStore {
         Signal::derive(move || sig.get())
     }
 
-    /// Reactive signal over the current comments list.
-    pub fn comments(&self) -> Signal<Vec<Comment>> {
-        let sig = self.inner.with_value(|inner| inner.comments.clone());
-        Signal::derive(move || sig.get())
-    }
-
     /// `true` once the store has been hydrated from IndexedDB.
     ///
     /// Pages that read from this store should show a loading state until this
@@ -163,26 +298,22 @@ impl SyncStore {
         Signal::derive(move || sig.get())
     }
 
-    /// Set the workspace ID used for IndexedDB operations.
+    /// Set where this tab's `remove_*` cache deletes are routed.
     ///
-    /// Called once from the Layout after the user context resolves. Until
-    /// this is set, `remove_*` methods skip the IDB delete.
-    pub fn set_workspace_id(&self, id: String) {
-        self.inner.with_value(|inner| inner.workspace_id.set(Some(id)));
-    }
-
-    /// Read the current workspace ID, if set.
-    pub fn workspace_id(&self) -> Option<String> {
-        self.inner.with_value(|inner| inner.workspace_id.get_untracked())
+    /// Called by the Layout: to the broadcast channel while this tab is a
+    /// follower, and to the writer queue once it holds the leadership lock.
+    pub fn set_delete_route(&self, route: DeleteRoute) {
+        self.inner
+            .with_value(|inner| *inner.delete_route.borrow_mut() = route);
     }
 
     /// Version counter for activities — bumped on each activity sync action.
     ///
     /// The issue timeline component uses this as a reactive dependency to
     /// trigger a refetch of activities from the server.
-    pub fn activities_version(&self) -> Signal<u32> {
+    pub fn activities_version(&self) -> ArcSignal<u32> {
         let sig = self.inner.with_value(|inner| inner.activities_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the activities version counter.
@@ -199,9 +330,9 @@ impl SyncStore {
     ///
     /// The relations section component uses this as a reactive dependency to
     /// trigger a refetch of relations from the server.
-    pub fn relations_version(&self) -> Signal<u32> {
+    pub fn relations_version(&self) -> ArcSignal<u32> {
         let sig = self.inner.with_value(|inner| inner.relations_version.clone());
-        Signal::derive(move || sig.get())
+        ArcSignal::derive(move || sig.get())
     }
 
     /// Bump the relations version counter.
@@ -211,6 +342,169 @@ impl SyncStore {
     pub fn bump_relations_version(&self) {
         self.inner.with_value(|inner| {
             inner.relations_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for comments — bumped on each comment sync action.
+    ///
+    /// The issue detail page uses this as a reactive dependency to trigger
+    /// a re-read of comments from IndexedDB.
+    pub fn comments_version(&self) -> ArcSignal<u32> {
+        let sig = self.inner.with_value(|inner| inner.comments_version.clone());
+        ArcSignal::derive(move || sig.get())
+    }
+
+    /// Bump the comments version counter.
+    ///
+    /// Called by the sync engine when a "comment" entity type arrives via
+    /// WebSocket, signaling that the detail page should re-read from IDB.
+    pub fn bump_comments_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.comments_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for milestones — bumped on each project_milestone sync
+    /// action.
+    ///
+    /// Milestones are not held in this store: the project detail page and the
+    /// issue metadata sidebar both read them straight from the `list_milestones`
+    /// server function. This counter is the reactive dependency that tells them
+    /// to ask again.
+    pub fn milestones_version(&self) -> ArcSignal<u32> {
+        let sig = self.inner.with_value(|inner| inner.milestones_version.clone());
+        ArcSignal::derive(move || sig.get())
+    }
+
+    /// Bump the milestones version counter.
+    ///
+    /// Called by the sync engine when a "project_milestone" entity type arrives
+    /// via WebSocket, signaling that the milestone lists should refetch.
+    pub fn bump_milestones_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.milestones_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for project members — bumped on each project_member sync
+    /// action.
+    ///
+    /// Memberships are not held in this store: the project detail page reads
+    /// them straight from the `list_project_members` server function. This
+    /// counter is the reactive dependency that tells it to ask again.
+    pub fn project_members_version(&self) -> ArcSignal<u32> {
+        let sig = self
+            .inner
+            .with_value(|inner| inner.project_members_version.clone());
+        ArcSignal::derive(move || sig.get())
+    }
+
+    /// Bump the project members version counter.
+    ///
+    /// Called by the sync engine when a "project_member" entity type arrives via
+    /// WebSocket, signaling that the member list should refetch.
+    pub fn bump_project_members_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.project_members_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for project status updates — bumped on each
+    /// project_update sync action.
+    ///
+    /// Posted updates are not held in this store: the project detail page reads
+    /// them straight from the `list_project_updates` server function. This
+    /// counter is the reactive dependency that tells it to ask again.
+    pub fn project_updates_version(&self) -> ArcSignal<u32> {
+        let sig = self
+            .inner
+            .with_value(|inner| inner.project_updates_version.clone());
+        ArcSignal::derive(move || sig.get())
+    }
+
+    /// Bump the project updates version counter.
+    ///
+    /// Called by the sync engine when a "project_update" entity type arrives via
+    /// WebSocket, signaling that the posted update list should refetch.
+    pub fn bump_project_updates_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.project_updates_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for attachments — bumped on each attachment and
+    /// issue_attachment sync action.
+    ///
+    /// Attachments are not held in this store: the issue detail page reads them
+    /// straight from the `list_issue_attachments` server function. This counter
+    /// is the reactive dependency that tells it to ask again.
+    ///
+    /// One counter covers both entity types because they invalidate exactly one
+    /// reader between them — that list changes when an attachment is uploaded or
+    /// deleted (`attachment`) and when one is linked to or unlinked from an
+    /// issue (`issue_attachment`).
+    pub fn attachments_version(&self) -> ArcSignal<u32> {
+        let sig = self.inner.with_value(|inner| inner.attachments_version.clone());
+        ArcSignal::derive(move || sig.get())
+    }
+
+    /// Bump the attachments version counter.
+    ///
+    /// Called by the sync engine when an "attachment" or "issue_attachment"
+    /// entity type arrives via WebSocket, signaling that the issue's attachment
+    /// list should refetch.
+    pub fn bump_attachments_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.attachments_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for notification preferences — bumped on each
+    /// notification_preferences sync action.
+    ///
+    /// Preferences are not held in this store: the notification settings page
+    /// reads them straight from the `get_notification_preferences` server
+    /// function. This counter is the reactive dependency that tells it to ask
+    /// again — the frames are scoped to a single user, so what it carries is
+    /// that user's own change made on another tab or another device.
+    pub fn notification_preferences_version(&self) -> ArcSignal<u32> {
+        let sig = self
+            .inner
+            .with_value(|inner| inner.notification_preferences_version.clone());
+        ArcSignal::derive(move || sig.get())
+    }
+
+    /// Bump the notification preferences version counter.
+    ///
+    /// Called by the sync engine when a "notification_preferences" entity type
+    /// arrives via WebSocket, signaling that the settings page should refetch.
+    pub fn bump_notification_preferences_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.notification_preferences_version.update(|v| *v += 1);
+        });
+    }
+
+    /// Version counter for workspace settings — bumped on each
+    /// workspace_settings sync action.
+    ///
+    /// The workspace settings page reads its data through its own
+    /// `get_workspace_settings` server function rather than from this store, so
+    /// this counter is the reactive dependency that tells it to ask again after
+    /// another admin renames the workspace or changes its auto-archive default.
+    pub fn workspace_settings_version(&self) -> ArcSignal<u32> {
+        let sig = self
+            .inner
+            .with_value(|inner| inner.workspace_settings_version.clone());
+        ArcSignal::derive(move || sig.get())
+    }
+
+    /// Bump the workspace settings version counter.
+    ///
+    /// Called by the sync engine when a "workspace_settings" entity type
+    /// arrives via WebSocket, signaling that the settings page should refetch.
+    pub fn bump_workspace_settings_version(&self) {
+        self.inner.with_value(|inner| {
+            inner.workspace_settings_version.update(|v| *v += 1);
         });
     }
 
@@ -254,11 +548,6 @@ impl SyncStore {
     /// Replace the entire notifications list (called during IDB hydration).
     pub fn set_notifications(&self, items: Vec<Notification>) {
         self.inner.with_value(|inner| inner.notifications.set(items));
-    }
-
-    /// Replace the entire comments list (called during IDB hydration).
-    pub fn set_comments(&self, items: Vec<Comment>) {
-        self.inner.with_value(|inner| inner.comments.set(items));
     }
 
     // ── Single-item upserts (live sync) ───────────────────────────────────────
@@ -367,147 +656,125 @@ impl SyncStore {
         });
     }
 
-    /// Insert or update a comment by `comment_id`.
-    pub fn upsert_comment(&self, item: Comment) {
-        self.inner.with_value(|inner| {
-            inner.comments.update(|list| {
-                if let Some(existing) = list.iter_mut().find(|c| c.comment_id == item.comment_id) {
-                    *existing = item;
-                } else {
-                    list.push(item);
-                }
-            });
-        });
-    }
-
-    /// Spawn an async task to delete an entity from IndexedDB.
+    /// Route the removal of `entities` to the tab that owns the shared cache.
     ///
-    /// No-op when `workspace_id` has not been set yet (SSR or pre-auth).
-    /// On WASM, opens the IDB cache and deletes the key. The delete is
-    /// idempotent — removing a non-existent key is a silent no-op.
-    #[cfg(target_arch = "wasm32")]
-    fn delete_from_idb(&self, entity_type: &'static str, entity_id: &str) {
-        let Some(wid) = self.workspace_id() else {
-            return;
-        };
-        let eid = entity_id.to_owned();
-        spawn_local(async move {
-            match super::db::init_cache_db(&wid).await {
-                Ok(cache_db) => {
-                    if let Err(e) = super::db::delete(&cache_db, entity_type, &eid, &wid).await {
-                        tracing::warn!(
-                            entity_type,
-                            entity_id = %eid,
-                            "SyncStore: IDB delete failed: {e}"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("SyncStore: failed to open cache db for delete: {e}");
-                }
-            }
-        });
+    /// The store never writes IndexedDB itself: one tab per browser owns every
+    /// cache write, and it may not be this one. See [`DeleteRoute`].
+    fn delete_from_cache(&self, entities: Vec<CachedEntity>) {
+        // Cloned out before dispatching so the route cannot be borrowed across
+        // the call — the sink reaches transports this store knows nothing about.
+        let route = self
+            .inner
+            .with_value(|inner| inner.delete_route.borrow().clone());
+        route.delete(entities);
     }
 
-    // ── Single-item removes (delete sync) ────────────────────────────────────
+    // ── Single-item removes, memory only (sync engine) ───────────────────────
+    //
+    // The sync engine enqueues the matching cache deletes on the writer queue
+    // itself, so they stay ordered against the cursor that claims to cover them.
+    // It calls these memory-only variants for the other half.
+    //
+    // Followers call them too, from the leader's broadcast: a follower updates
+    // memory and nothing else.
 
-    /// Remove an issue by `issue_id`.
-    pub fn remove_issue(&self, issue_id: &str) {
+    /// Remove an issue from the in-memory list only.
+    pub fn remove_issue_in_memory(&self, issue_id: &str) {
         self.inner.with_value(|inner| {
             inner.issues.update(|list| {
                 list.retain(|i| i.issue_id != issue_id);
             });
         });
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::ISSUE, issue_id);
     }
 
-    /// Remove a label by `label_id`.
-    pub fn remove_label(&self, label_id: &str) {
+    /// Remove a label from the in-memory list only.
+    pub fn remove_label_in_memory(&self, label_id: &str) {
         self.inner.with_value(|inner| {
             inner.labels.update(|list| {
                 list.retain(|l| l.label_id != label_id);
             });
         });
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::LABEL, label_id);
     }
 
-    /// Remove a status by `status_id`.
-    pub fn remove_status(&self, status_id: &str) {
+    /// Remove a status from the in-memory list only.
+    pub fn remove_status_in_memory(&self, status_id: &str) {
         self.inner.with_value(|inner| {
             inner.statuses.update(|list| {
                 list.retain(|s| s.status_id != status_id);
             });
         });
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::STATUS, status_id);
     }
 
-    /// Remove a team by `team_id`.
-    pub fn remove_team(&self, team_id: &str) {
+    /// Remove a team from the in-memory list only.
+    pub fn remove_team_in_memory(&self, team_id: &str) {
         self.inner.with_value(|inner| {
             inner.teams.update(|list| {
                 list.retain(|t| t.team_id != team_id);
             });
         });
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::TEAM, team_id);
     }
 
-    /// Remove a project by `project_id`.
-    pub fn remove_project(&self, project_id: &str) {
+    /// Remove a project from the in-memory list only.
+    pub fn remove_project_in_memory(&self, project_id: &str) {
         self.inner.with_value(|inner| {
             inner.projects.update(|list| {
                 list.retain(|p| p.project_id != project_id);
             });
         });
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::PROJECT, project_id);
     }
 
-    /// Remove a view by `view_id`.
-    pub fn remove_view(&self, view_id: &str) {
+    /// Remove a view from the in-memory list only.
+    pub fn remove_view_in_memory(&self, view_id: &str) {
         self.inner.with_value(|inner| {
             inner.views.update(|list| {
                 list.retain(|v| v.view_id != view_id);
             });
         });
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::VIEW, view_id);
     }
 
-    /// Remove a favorite by `favorite_id`.
-    pub fn remove_favorite(&self, favorite_id: &str) {
+    /// Remove a favorite from the in-memory list only.
+    pub fn remove_favorite_in_memory(&self, favorite_id: &str) {
         self.inner.with_value(|inner| {
             inner.favorites.update(|list| {
                 list.retain(|f| f.favorite_id != favorite_id);
             });
         });
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::FAVORITE, favorite_id);
     }
 
-    /// Remove a notification by `notification_id`.
-    pub fn remove_notification(&self, notification_id: &str) {
+    /// Remove a notification from the in-memory list only.
+    pub fn remove_notification_in_memory(&self, notification_id: &str) {
         self.inner.with_value(|inner| {
             inner.notifications.update(|list| {
                 list.retain(|n| n.notification_id != notification_id);
             });
         });
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::NOTIFICATION, notification_id);
     }
 
-    /// Remove a comment by `comment_id`.
-    pub fn remove_comment(&self, comment_id: &str) {
-        self.inner.with_value(|inner| {
-            inner.comments.update(|list| {
-                list.retain(|c| c.comment_id != comment_id);
-            });
-        });
-        #[cfg(target_arch = "wasm32")]
-        self.delete_from_idb(entity_types::COMMENT, comment_id);
+    // ── Single-item removes (UI-initiated deletes) ───────────────────────────
+    //
+    // Both halves of a delete the user just clicked: the in-memory removal
+    // lands here and now, so the list updates without waiting on anything, and
+    // the cache delete is routed to the tab that owns the shared cache.
+    //
+    // Only entity types the UI actually deletes have a method here. The sync
+    // stream's own deletes do not come through these — they are applied by
+    // `cache::apply`, which pairs `remove_*_in_memory` above with a write it
+    // enqueues on the leader's queue itself.
+
+    /// Remove a team by `team_id`, from memory and from the shared cache.
+    ///
+    /// Used by both "delete team" and "leave team". The latter is why the cache
+    /// delete has to be durable: leaving a team emits a `TEAM`/`Update` sync
+    /// action, never a delete, so nothing else will ever evict the row.
+    pub fn remove_team(&self, team_id: &str) {
+        self.remove_team_in_memory(team_id);
+        self.delete_from_cache(vec![CachedEntity::new(entity_types::TEAM, team_id)]);
+    }
+
+    /// Remove a project by `project_id`, from memory and from the shared cache.
+    pub fn remove_project(&self, project_id: &str) {
+        self.remove_project_in_memory(project_id);
+        self.delete_from_cache(vec![CachedEntity::new(entity_types::PROJECT, project_id)]);
     }
 
     // ── State transitions ─────────────────────────────────────────────────────
@@ -524,22 +791,1267 @@ impl SyncStore {
     /// Clear all lists and reset initialized to false.
     ///
     /// Called before hydrating from a different workspace's cache so stale
-    /// data from the previous workspace doesn't leak into the new one.
+    /// data from the previous workspace doesn't leak into the new one, and on
+    /// the cursor-less connect path in [`crate::cache::sync_engine`] before
+    /// every fresh bootstrap.
+    ///
+    /// That second caller is why the eight collections go through
+    /// [`clear_if_populated`] and the nine version counters through
+    /// [`rewind_to_zero`], rather than `set`: on a fresh bootstrap they are
+    /// already empty and already `0`, and `set` notifies whether or not the
+    /// value moved. See [`rewind_to_zero`] for the mechanism and for what an
+    /// unchanged-value notification costs the pages subscribed to one.
+    ///
+    /// `initialized` is the one write here still on `set`. On the cursor-less
+    /// bootstrap path it genuinely moves: hydration sets it `true`
+    /// (`sync_engine::hydrate_store_from_db`, called by
+    /// `sync_engine::hydrate_then_open_gate`, which opens the gate only on its
+    /// way out) and the socket is not dialled until that gate opens
+    /// (`sync_engine::dial_when_hydrated`), so `reset` always finds it `true`
+    /// there. It is reachable as a no-op only through a `SyncReset` or a
+    /// follower `Reset` arriving while it is already `false`.
     pub fn reset(&self) {
         self.inner.with_value(|inner| {
-            inner.issues.set(Vec::new());
-            inner.labels.set(Vec::new());
-            inner.statuses.set(Vec::new());
-            inner.teams.set(Vec::new());
-            inner.projects.set(Vec::new());
-            inner.views.set(Vec::new());
-            inner.favorites.set(Vec::new());
-            inner.notifications.set(Vec::new());
-            inner.comments.set(Vec::new());
+            clear_if_populated(&inner.issues);
+            clear_if_populated(&inner.labels);
+            clear_if_populated(&inner.statuses);
+            clear_if_populated(&inner.teams);
+            clear_if_populated(&inner.projects);
+            clear_if_populated(&inner.views);
+            clear_if_populated(&inner.favorites);
+            clear_if_populated(&inner.notifications);
             inner.initialized.set(false);
-            inner.activities_version.set(0);
-            inner.relations_version.set(0);
-            inner.workspace_id.set(None);
+            rewind_to_zero(&inner.activities_version);
+            rewind_to_zero(&inner.relations_version);
+            rewind_to_zero(&inner.comments_version);
+            rewind_to_zero(&inner.milestones_version);
+            rewind_to_zero(&inner.project_members_version);
+            rewind_to_zero(&inner.project_updates_version);
+            rewind_to_zero(&inner.attachments_version);
+            rewind_to_zero(&inner.notification_preferences_version);
+            rewind_to_zero(&inner.workspace_settings_version);
         });
+    }
+}
+
+/// Rewind a version counter to zero, waking its subscribers only if it moved.
+///
+/// # Why not `set(0)`
+///
+/// `set` notifies unconditionally — it never compares against the value already
+/// there. In `reactive_graph-0.2.14`, `Set::set` is `try_update(|n| *n = value)`,
+/// `try_update` is `try_maybe_update(|val| (true, fun(val)))`, and that `true`
+/// leaves the write guard's `triggerable` in place, so `WriteGuard::drop` calls
+/// `notify()` (`traits.rs`, `signal/guards.rs`).
+///
+/// `maybe_update` is the same write with the notification made conditional: a
+/// `false` return calls `untrack()` on the guard, which *takes* the triggerable,
+/// and `Drop` then finds nothing to notify. The nine counters are `u32`, so
+/// "did it move" is a comparison against `0`.
+///
+/// # What an unchanged-value notification costs
+///
+/// Two things, both measured against this tree rather than assumed:
+///
+/// - A `LocalResource` has no separate source argument, so it subscribes
+///   directly to whatever its fetcher reads and its `AsyncDerived` is marked
+///   *dirty* by the notification — it refetches. `NotificationsPage`
+///   (`pages/settings/notifications.rs`) tracks
+///   `notification_preferences_version` inside its fetcher, so an unchanged
+///   notification there is a real `get_notification_preferences` round trip.
+/// - An `Effect` re-runs its whole body on notification, value unchanged or
+///   not. `IssueDetailContent`'s comments effect (`pages/issues/issue_detail.rs`)
+///   opens IndexedDB and re-reads every comment of the issue from it.
+///
+/// `Resource::new` is the case that does *not* refetch, and this is the part to
+/// keep rather than round off: `ArcResource::new_with_options`
+/// (`leptos_server-0.8.7`) wraps the caller's source closure in an `ArcMemo`,
+/// and a memo whose recomputed value compares equal stops the propagation there
+/// — `update_if_necessary` returns `false` (`reactive_graph-0.2.14`,
+/// `computed/inner.rs`), so the `AsyncDerived` woken by the notification finds
+/// nothing to do. The memo's body still re-runs and the async task still wakes;
+/// the fetcher does not. That covers the `Resource::new` call sites in
+/// `pages/settings/workspace.rs`, `pages/projects/project_detail.rs` and
+/// `pages/issues/issue_detail.rs`.
+///
+/// So TRA-9984's "a wasted server round trip per subscribed page per bootstrap"
+/// holds for the two shapes above and overstates the third. Do not simplify this
+/// back into the blanket claim: the reason to guard the write is not that every
+/// subscriber pays a round trip, it is that the store cannot know which shape is
+/// listening.
+fn rewind_to_zero(counter: &ArcRwSignal<u32>) {
+    counter.maybe_update(|value| {
+        let moved = *value != 0;
+        *value = 0;
+        moved
+    });
+}
+
+/// Empty one of the store's collections, waking its subscribers only if there
+/// was something in it.
+///
+/// The counterpart to [`rewind_to_zero`] for the eight collections
+/// [`SyncStore::reset`] clears, and it exists for exactly the same reason: on
+/// the cursor-less connect path `reset` runs before every fresh bootstrap, and
+/// on a first page load the lists are already empty when it does — hydration
+/// finishes before the socket is dialled, and an empty cache hydrates to empty
+/// lists. `set(Vec::new())` notified every list page anyway. See
+/// [`rewind_to_zero`] for the `maybe_update` mechanism and for the measured
+/// cost of an unchanged-value notification, including the part that is *not*
+/// true of every subscriber:
+///
+/// - A `LocalResource` subscribes directly to what its fetcher reads and is
+///   marked dirty by the notification, so it really does refetch from the
+///   server (`leptos_server-0.8.7`, `ArcLocalResource::new`, which passes the
+///   fetcher to `ArcAsyncDerived::new_unsync` with no separate source).
+/// - An `Effect` re-runs its whole body on notification regardless of value.
+/// - A `Resource::new` does **not** refetch: `ArcResource::new_with_options`
+///   (`leptos_server-0.8.7`) wraps the caller's source closure in an `ArcMemo`,
+///   and a memo whose recomputed value compares equal stops the propagation
+///   there (`reactive_graph-0.2.14`, `computed/inner.rs`, `update_if_necessary`
+///   returns `false`). Its body re-runs and its async task wakes; the fetcher
+///   does not. The ticket's "a wasted server round trip per subscribed page"
+///   is therefore true of the first two shapes and an overstatement for the
+///   third — do not restore it to the blanket claim.
+///
+/// # Why `!is_empty()` and not `PartialEq`
+///
+/// The value written is always an empty `Vec`, so "did it move" is exactly "was
+/// it non-empty". That needs no `PartialEq` on the element type — which matters,
+/// because comparing the old and new lists would mean an element-wise compare of
+/// every issue in the workspace on a path whose whole point is to do less work.
+///
+/// The write is `*list = Vec::new()` rather than `list.clear()` so the old
+/// allocation is dropped exactly as `set(Vec::new())` dropped it. `clear` would
+/// retain the capacity, which is a different memory profile across a workspace
+/// switch than the code this replaced.
+fn clear_if_populated<T>(collection: &ArcRwSignal<Vec<T>>)
+where
+    T: Send + Sync + 'static,
+{
+    collection.maybe_update(|list| {
+        let moved = !list.is_empty();
+        *list = Vec::new();
+        moved
+    });
+}
+
+/// Checks for the getter contract documented on [`SyncStore`].
+///
+/// That contract is the reason `pages/` resolves every `*_version()` counter at
+/// component setup rather than inside the closure that reads it. It has now cost
+/// three review cycles (#282/#283, TRA-9977, TRA-9991) while living only in
+/// review logs and call-site comments, so the claims it makes are checked here,
+/// next to the getters they are about.
+///
+/// Run with:
+/// `wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate`
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    // ── Probing what `reset()` wakes ────────────────────────────────────────
+
+    /// A `*_version()` getter, as a value so the nine can be walked in a loop.
+    type CounterGetter = fn(&SyncStore) -> ArcSignal<u32>;
+    /// A `bump_*_version()` method, likewise.
+    type CounterBump = fn(&SyncStore);
+
+    /// The nine version counters [`SyncStore::reset`] rewinds.
+    ///
+    /// Each entry is the getter a page resolves at setup and the bump the sync
+    /// engine calls when that entity's frame arrives. All nine are listed so a
+    /// fix applied to eight of them fails, naming the one that was missed.
+    const COUNTERS: [(&str, CounterGetter, CounterBump); 9] = [
+        (
+            "activities_version",
+            SyncStore::activities_version,
+            SyncStore::bump_activities_version,
+        ),
+        (
+            "relations_version",
+            SyncStore::relations_version,
+            SyncStore::bump_relations_version,
+        ),
+        (
+            "comments_version",
+            SyncStore::comments_version,
+            SyncStore::bump_comments_version,
+        ),
+        (
+            "milestones_version",
+            SyncStore::milestones_version,
+            SyncStore::bump_milestones_version,
+        ),
+        (
+            "project_members_version",
+            SyncStore::project_members_version,
+            SyncStore::bump_project_members_version,
+        ),
+        (
+            "project_updates_version",
+            SyncStore::project_updates_version,
+            SyncStore::bump_project_updates_version,
+        ),
+        (
+            "attachments_version",
+            SyncStore::attachments_version,
+            SyncStore::bump_attachments_version,
+        ),
+        (
+            "notification_preferences_version",
+            SyncStore::notification_preferences_version,
+            SyncStore::bump_notification_preferences_version,
+        ),
+        (
+            "workspace_settings_version",
+            SyncStore::workspace_settings_version,
+            SyncStore::bump_workspace_settings_version,
+        ),
+    ];
+
+    /// One subscriber attached to one counter, plus a way to read that counter
+    /// without going through it.
+    struct Probe {
+        name: &'static str,
+        /// How many times the subscriber's body has run.
+        ///
+        /// Not a signal: an instrument that is itself an arena item is
+        /// reachable by the very notifications under test. `SaveLog` in
+        /// `wasm_test_support` keeps its counts in `Rc<Cell<_>>` for that
+        /// reason; this is `Arc<AtomicU32>` only because `Memo::new` requires
+        /// `Send + Sync`, which `Rc` is not. WASM is single-threaded, so the
+        /// ordering is immaterial.
+        runs: Arc<AtomicU32>,
+        /// A `Memo` over the counter — the subscriber.
+        ///
+        /// This is the node `Resource::new` interposes itself:
+        /// `ArcResource::new_with_options` (`leptos_server-0.8.7`) wraps the
+        /// page's source closure in an `ArcMemo`, so on a page keyed to a
+        /// counter this body is the first thing a notification reaches. It
+        /// re-runs on notification alone, whatever the value — which is exactly
+        /// what these tests need to see, since the value is `0` either way.
+        ///
+        /// A memo is lazy, so a notification does not run the body on the spot;
+        /// it marks the memo dirty and the body runs on the next read. That is
+        /// what production does too — the `AsyncDerived` woken by the notify
+        /// calls `update_if_necessary`, which forces the memo. So [`Probe::read`]
+        /// below is the poll, not the observation: the observation is whether
+        /// the body ran during it.
+        memo: Memo<u32>,
+        /// The counter read straight, bypassing the memo, so "was rewound" is
+        /// observable independently of "was notified".
+        raw: ArcSignal<u32>,
+        bump: CounterBump,
+    }
+
+    impl Probe {
+        /// Poll the subscriber. Its body runs during this call if, and only if,
+        /// something notified the counter since the last poll.
+        fn read(&self) -> u32 {
+            self.memo.get_untracked()
+        }
+
+        fn runs(&self) -> u32 {
+            self.runs.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Attach a subscriber to every counter in [`COUNTERS`].
+    ///
+    /// Both getters are resolved here, at "component setup" and under the
+    /// caller's owner, which is the form the getter contract on [`SyncStore`]
+    /// requires and the form `pages/` uses.
+    fn probe_every_counter(store: &SyncStore) -> Vec<Probe> {
+        COUNTERS
+            .iter()
+            .map(|&(name, getter, bump)| {
+                let runs = Arc::new(AtomicU32::new(0));
+                let version = getter(store);
+                let memo = {
+                    let runs = Arc::clone(&runs);
+                    Memo::new(move |_| {
+                        runs.fetch_add(1, Ordering::Relaxed);
+                        version.get()
+                    })
+                };
+                Probe {
+                    name,
+                    runs,
+                    memo,
+                    raw: getter(store),
+                    bump,
+                }
+            })
+            .collect()
+    }
+
+    /// `reset()` on a store whose counters are already zero must wake nobody.
+    ///
+    /// The cursor-less connect path in `cache/sync_engine.rs` calls `reset()`
+    /// immediately before every `sync_bootstrap`, so on a plain page load it
+    /// runs against counters that have never been bumped. `set(0)` notified
+    /// there anyway, and each of those notifications is a page's subscriber
+    /// re-running for a value that did not change.
+    ///
+    /// **This asserts on the subscriber running, not on the counter's value,
+    /// and that is the whole point of the test.** The values are `0` before and
+    /// after either way, so a value assertion passes against the unfixed
+    /// `set(0)` and proves nothing. The run count is the only thing that tells
+    /// the two apart. Note the read below happens in both this test and
+    /// `resetting_a_bumped_store_…`: identical polls, different body-run
+    /// counts, so the difference is the notification and not the poll.
+    #[wasm_bindgen_test]
+    fn resetting_an_already_zero_store_wakes_no_subscriber() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let probes = probe_every_counter(&store);
+
+        // Prime. A memo is lazy, so until it is read its body has never run and
+        // "did not run again" would be true of a subscriber that was never
+        // wired up at all.
+        for probe in &probes {
+            assert_eq!(probe.read(), 0, "fixture: {} starts at zero", probe.name);
+            assert_eq!(
+                probe.runs(),
+                1,
+                "fixture: the subscriber on {} must have run once by now, or the rest of \
+                 this test is watching nothing",
+                probe.name
+            );
+        }
+
+        store.reset();
+
+        for probe in &probes {
+            assert_eq!(
+                probe.read(),
+                0,
+                "{} must still read zero after a reset that found it at zero",
+                probe.name
+            );
+            assert_eq!(
+                probe.runs(),
+                1,
+                "the subscriber on {} re-ran for a reset that changed nothing. Every page \
+                 keyed to that counter woke on a fresh bootstrap for a value that did not \
+                 move — a `LocalResource` refetches from the server, an `Effect` re-reads \
+                 IndexedDB. Rewind the counter with `rewind_to_zero`, not `set(0)`",
+                probe.name
+            );
+        }
+    }
+
+    /// `reset()` on a store that has been bumped must still rewind **and**
+    /// still notify.
+    ///
+    /// The other direction of the same guard. Without this, the fix could
+    /// degrade to "never notify" — a `rewind_to_zero` that always returned
+    /// `false`, or one that skipped the write — and
+    /// `resetting_an_already_zero_store_wakes_no_subscriber` would stay green
+    /// while a workspace switch left every page showing the previous
+    /// workspace's data.
+    ///
+    /// The two halves are asserted through different paths on purpose: the
+    /// rewind through `raw`, which reads the counter itself, and the
+    /// notification through the subscriber's run count. A guard that stopped
+    /// notifying would still pass the rewind half, so the failure names which
+    /// half broke.
+    #[wasm_bindgen_test]
+    fn resetting_a_bumped_store_rewinds_the_counters_and_wakes_their_subscribers() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let probes = probe_every_counter(&store);
+
+        for probe in &probes {
+            assert_eq!(probe.read(), 0, "fixture: {} starts at zero", probe.name);
+        }
+
+        // A frame for each entity type arrives, as it does over the sync
+        // stream.
+        for probe in &probes {
+            (probe.bump)(&store);
+        }
+        for probe in &probes {
+            assert_eq!(
+                probe.read(),
+                1,
+                "fixture: {} must move when its own bump runs",
+                probe.name
+            );
+            assert_eq!(
+                probe.runs(),
+                2,
+                "fixture: the subscriber on {} must have re-run for the bump, or this test \
+                 cannot tell a missing notification from a subscriber that never worked",
+                probe.name
+            );
+        }
+
+        store.reset();
+
+        for probe in &probes {
+            assert_eq!(
+                probe.raw.get_untracked(),
+                0,
+                "{} was not rewound by reset(). A workspace switch leaves the new \
+                 workspace's pages keyed to the previous one's counter",
+                probe.name
+            );
+            let through_subscriber = probe.read();
+            assert_eq!(
+                probe.runs(),
+                3,
+                "the subscriber on {} did not re-run for a reset that moved it from 1 to \
+                 0. The guard has become an unconditional skip: the counter rewinds and \
+                 nothing subscribed to it ever hears about it",
+                probe.name
+            );
+            assert_eq!(
+                through_subscriber,
+                0,
+                "the subscriber on {} re-ran but did not see the rewind",
+                probe.name
+            );
+        }
+    }
+
+    // ── Probing what `reset()` wakes: the collections ───────────────────────
+
+    /// One subscriber attached to one of the store's collections.
+    ///
+    /// The same instrument as [`Probe`], reading the collection's **length**
+    /// rather than its contents: `reset` writes an empty `Vec`, so the length is
+    /// all the assertions need, and reading it with `with` avoids cloning the
+    /// whole list on every poll.
+    struct CollectionProbe {
+        name: &'static str,
+        /// Runs of the subscriber's body. Not a signal — see [`Probe::runs`].
+        runs: Arc<AtomicU32>,
+        memo: Memo<usize>,
+        /// The length read straight off the collection, bypassing the memo, so
+        /// "was cleared" is observable independently of "was notified".
+        raw: Signal<usize>,
+        /// Put one entity into the collection, as a sync frame does.
+        seed: Box<dyn Fn()>,
+    }
+
+    impl CollectionProbe {
+        /// Poll the subscriber. Its body runs during this call if, and only if,
+        /// something notified the collection since the last poll.
+        fn read(&self) -> usize {
+            self.memo.get_untracked()
+        }
+
+        fn runs(&self) -> u32 {
+            self.runs.load(Ordering::Relaxed)
+        }
+    }
+
+    fn probe_collection<T>(
+        name: &'static str,
+        items: Signal<Vec<T>>,
+        seed: impl Fn() + 'static,
+    ) -> CollectionProbe
+    where
+        T: Send + Sync + 'static,
+    {
+        let runs = Arc::new(AtomicU32::new(0));
+        let memo = {
+            let runs = Arc::clone(&runs);
+            Memo::new(move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                items.with(|list| list.len())
+            })
+        };
+        CollectionProbe {
+            name,
+            runs,
+            memo,
+            raw: Signal::derive(move || items.with(|list| list.len())),
+            seed: Box::new(seed),
+        }
+    }
+
+    /// Attach a subscriber to every collection [`SyncStore::reset`] clears.
+    ///
+    /// All eight are listed for the same reason all nine counters are: a guard
+    /// applied to seven of them must fail, naming the one left on `set`.
+    fn probe_every_collection(store: &SyncStore) -> Vec<CollectionProbe> {
+        let store = *store;
+        vec![
+            probe_collection("issues", store.issues(), move || {
+                store.upsert_issue(an_issue())
+            }),
+            probe_collection("labels", store.labels(), move || {
+                store.upsert_label(a_label())
+            }),
+            probe_collection("statuses", store.statuses(), move || {
+                store.upsert_status(a_status())
+            }),
+            probe_collection("teams", store.teams(), move || store.upsert_team(a_team())),
+            probe_collection("projects", store.projects(), move || {
+                store.upsert_project(a_project())
+            }),
+            probe_collection("views", store.views(), move || store.upsert_view(a_view())),
+            probe_collection("favorites", store.favorites(), move || {
+                store.upsert_favorite(a_favorite())
+            }),
+            probe_collection("notifications", store.notifications(), move || {
+                store.upsert_notification(a_notification())
+            }),
+        ]
+    }
+
+    // ── Fixtures ────────────────────────────────────────────────────────────
+    //
+    // One entity per collection. Nothing reads a field of any of them: the
+    // guard's predicate is `!list.is_empty()`, so all these exist to do is make
+    // a list non-empty. They are written out in full rather than built from
+    // JSON because the models carry no `Default`, and a fixture that stops
+    // compiling when a field is added is the cheaper failure.
+
+    fn a_label() -> Label {
+        Label {
+            label_id: "lbl-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            team_id: None,
+            name: "bug".to_owned(),
+            color: "#0D9488".to_owned(),
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn an_issue() -> IssueWithDetails {
+        IssueWithDetails {
+            issue_id: "iss-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            team_id: "tea-1".to_owned(),
+            team_key: "TRA".to_owned(),
+            number: 42,
+            title: "An issue the reset has to drop".to_owned(),
+            description: None,
+            status_id: "sta-1".to_owned(),
+            status_name: "Todo".to_owned(),
+            status_category: "unstarted".to_owned(),
+            priority: 0,
+            assignee_id: None,
+            assignee_name: None,
+            creator_id: "usr-alice".to_owned(),
+            creator_name: None,
+            due_date: None,
+            project_id: None,
+            project_name: None,
+            milestone_id: None,
+            estimate: None,
+            parent_identifier: None,
+            parent_title: None,
+            sort_order: None,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+            updated_at: "2026-08-07T00:00:00Z".to_owned(),
+            started_at: None,
+            completed_at: None,
+            released_at: None,
+            archived_at: None,
+            has_children: false,
+            is_blocked: false,
+            is_blocking: false,
+            has_relations: false,
+            labels: Vec::new(),
+        }
+    }
+
+    fn a_status() -> Status {
+        Status {
+            status_id: "sta-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            team_id: None,
+            name: "Todo".to_owned(),
+            category: "unstarted".to_owned(),
+            position: 0,
+            color: None,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn a_team() -> Team {
+        Team {
+            team_id: "tea-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            name: "Engineering".to_owned(),
+            key: "TRA".to_owned(),
+            description: None,
+            icon: None,
+            icon_type: None,
+            icon_name: None,
+            icon_color: None,
+            member_count: 1,
+            settings: None,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn a_project() -> Project {
+        Project {
+            project_id: "prj-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            name: "Q3 Launch".to_owned(),
+            description: None,
+            icon: None,
+            color: None,
+            status: "planned".to_owned(),
+            lead_id: None,
+            lead_name: None,
+            start_date: None,
+            target_date: None,
+            sort_order: 0.0,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+            updated_at: "2026-08-07T00:00:00Z".to_owned(),
+            archived_at: None,
+        }
+    }
+
+    fn a_view() -> View {
+        View {
+            view_id: "viw-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            team_id: None,
+            created_by: "usr-alice".to_owned(),
+            name: "My open issues".to_owned(),
+            icon: None,
+            filters: "{}".to_owned(),
+            display_options: "{}".to_owned(),
+            sort_order: 0.0,
+            position: 0,
+            is_shared: false,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+            updated_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn a_favorite() -> Favorite {
+        Favorite {
+            favorite_id: "fav-1".to_owned(),
+            user_id: "usr-alice".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            target_type: "issue".to_owned(),
+            target_id: "iss-1".to_owned(),
+            sort_order: 0.0,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn a_notification() -> Notification {
+        Notification {
+            notification_id: "ntf-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            user_id: "usr-alice".to_owned(),
+            issue_id: "iss-1".to_owned(),
+            notification_type: "assigned".to_owned(),
+            read: false,
+            issue_title: None,
+            issue_number: None,
+            team_key: None,
+            actor_id: None,
+            actor_name: None,
+            action_source: trakkt_types::enums::ActionSource::User,
+            action_source_label: None,
+            created_at: "2026-08-07T00:00:00Z".to_owned(),
+            deleted_at: None,
+            context_id: None,
+        }
+    }
+
+    /// `reset()` on a store whose collections are already empty must wake
+    /// nobody.
+    ///
+    /// The collections half of
+    /// `resetting_an_already_zero_store_wakes_no_subscriber`, and the same trap
+    /// applies: on the cursor-less bootstrap path the lists are already empty
+    /// when `reset` runs — hydration finishes before the socket is dialled and
+    /// an empty cache hydrates to empty lists — so **the lists are empty before
+    /// and after either way**. Asserting they are empty passes against `main`'s
+    /// `set(Vec::new())`. Only the subscriber's run count tells the two apart.
+    ///
+    /// This is the assertion that catches a collection left on `set` when the
+    /// other seven were converted, which is why all eight are probed.
+    #[wasm_bindgen_test]
+    fn resetting_an_already_empty_store_wakes_no_subscriber() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let probes = probe_every_collection(&store);
+
+        // Prime. A memo is lazy, so until it is read its body has never run.
+        for probe in &probes {
+            assert_eq!(probe.read(), 0, "fixture: {} starts empty", probe.name);
+            assert_eq!(
+                probe.runs(),
+                1,
+                "fixture: the subscriber on {} must have run once by now, or the rest of \
+                 this test is watching nothing",
+                probe.name
+            );
+        }
+
+        store.reset();
+
+        for probe in &probes {
+            assert_eq!(
+                probe.read(),
+                0,
+                "{} must still be empty after a reset that found it empty",
+                probe.name
+            );
+            assert_eq!(
+                probe.runs(),
+                1,
+                "the subscriber on {} re-ran for a reset that changed nothing. Every list \
+                 page reading that collection woke on a fresh bootstrap for a value that \
+                 did not move — which is the `Transition` rebuild with no data behind it \
+                 that TRA-9984 is about. Clear it with `clear_if_populated`, not \
+                 `set(Vec::new())`",
+                probe.name
+            );
+        }
+    }
+
+    /// `reset()` on a populated store must still clear **and** still notify.
+    ///
+    /// The other direction, as for the counters. Without it the guard could
+    /// degrade to "never notify" and
+    /// `resetting_an_already_empty_store_wakes_no_subscriber` would stay green
+    /// while a workspace switch left every list page rendering the previous
+    /// workspace's issues.
+    ///
+    /// The two halves go through different paths on purpose — the clear through
+    /// `raw`, which reads the collection itself, the notification through the
+    /// subscriber's run count — so a mutation can fail one without the other.
+    #[wasm_bindgen_test]
+    fn resetting_a_populated_store_clears_the_collections_and_wakes_their_subscribers() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let probes = probe_every_collection(&store);
+
+        for probe in &probes {
+            assert_eq!(probe.read(), 0, "fixture: {} starts empty", probe.name);
+        }
+
+        // One entity of each type arrives, as it does over the sync stream.
+        for probe in &probes {
+            (probe.seed)();
+        }
+        for probe in &probes {
+            assert_eq!(
+                probe.read(),
+                1,
+                "fixture: {} must hold the entity that was just upserted into it",
+                probe.name
+            );
+            assert_eq!(
+                probe.runs(),
+                2,
+                "fixture: the subscriber on {} must have re-run for the upsert, or this \
+                 test cannot tell a missing notification from a subscriber that never \
+                 worked",
+                probe.name
+            );
+        }
+
+        store.reset();
+
+        for probe in &probes {
+            assert_eq!(
+                probe.raw.get_untracked(),
+                0,
+                "{} was not cleared by reset(). The previous workspace's entities are \
+                 still in memory for the next one's pages to render",
+                probe.name
+            );
+            let through_subscriber = probe.read();
+            assert_eq!(
+                probe.runs(),
+                3,
+                "the subscriber on {} did not re-run for a reset that emptied it. The \
+                 guard has become an unconditional skip: the collection is cleared and \
+                 every page still showing its contents is never told",
+                probe.name
+            );
+            assert_eq!(
+                through_subscriber, 0,
+                "the subscriber on {} re-ran but did not see the clear",
+                probe.name
+            );
+        }
+    }
+
+    /// A **collection** getter resolved under a subtree's owner dies with it.
+    ///
+    /// This is the mechanism behind the `/settings/notifications` and
+    /// `/settings/workspace` panics that got #282 reverted, and behind the live
+    /// instance TRA-9995 found in `components/layout.rs`. `Owner::cleanup` is
+    /// not only a teardown path: `Effect` and `Memo` run their bodies through
+    /// `Owner::with_cleanup`, so an owner is cleaned up on **every re-run**. A
+    /// [`Signal`] wrapper resolved inside such a body and kept past that run is
+    /// reading a removed arena slot.
+    ///
+    /// # Why this is on `issues()` and not on a version counter
+    ///
+    /// It was on `activities_version()` until TRA-9996. The counters now return
+    /// [`ArcSignal`], which has no arena slot to remove, so on a counter this
+    /// assertion is no longer expressible — the sibling test
+    /// `a_counter_resolved_under_a_subtree_owner_survives_that_subtrees_disposal`
+    /// is the same scenario asserting the opposite, and is what pins that
+    /// change.
+    ///
+    /// Rather than delete the panic, it moved to the eight collection getters,
+    /// which still return [`Signal`] and still carry the hazard verbatim —
+    /// [[TRA-9998]]. So this stays a test that can fail: give the collections
+    /// the `ArcSignal` treatment and it goes red, which is the correct moment to
+    /// delete it and the `Signal` half of the contract on [`SyncStore`]
+    /// together.
+    #[wasm_bindgen_test]
+    #[should_panic(expected = "already been disposed")]
+    fn a_collection_resolved_under_a_subtree_owner_is_disposed_with_that_subtree() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+
+        // Stands in for an effect/memo body, or a component inside a suspense
+        // boundary — anything that runs under an owner it does not outlive.
+        let subtree = Owner::new();
+        let collection = subtree.with(|| store.issues());
+
+        subtree.cleanup();
+        let _ = collection.get_untracked();
+    }
+
+    /// A counter resolved under a subtree's owner outlives that subtree.
+    ///
+    /// TRA-9996's fix, asserted directly, and the inverse of the test above:
+    /// same store, same scenario, a counter instead of a collection. Revert the
+    /// nine getters to `Signal<u32>` and this panics with "already been
+    /// disposed" — which is the only thing that makes it a test rather than a
+    /// restatement of the type signature.
+    ///
+    /// This is also the shape no call site has to think about any more. Before
+    /// the change, resolving a counter here and reading it after the cleanup was
+    /// the #283 production panic; the source guard that existed to keep that
+    /// shape out of `pages/` was removed with this ticket because the type now
+    /// does the work.
+    #[wasm_bindgen_test]
+    fn a_counter_resolved_under_a_subtree_owner_survives_that_subtrees_disposal() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+
+        let subtree = Owner::new();
+        let counter = subtree.with(|| store.activities_version());
+
+        subtree.cleanup();
+        assert_eq!(
+            counter.get_untracked(),
+            0,
+            "a counter resolved under a disposed owner must still read"
+        );
+
+        // And it is still live, not merely non-panicking: a bump after the
+        // disposal still reaches it. A wrapper that had been severed from the
+        // store would keep answering 0 here.
+        store.bump_activities_version();
+        assert_eq!(
+            counter.get_untracked(),
+            1,
+            "the counter still reads, but no longer tracks the store's signal — it was \
+             severed from its source rather than kept alive by it"
+        );
+    }
+
+    /// The hoisted form survives every rebuild beneath it — the fix, asserted.
+    ///
+    /// Same store, same getter, same reads; the only difference from the test
+    /// above is *where* the getter was called. This is what
+    /// `sync_store.map(|s| s.activities_version())` at component setup buys.
+    #[wasm_bindgen_test]
+    fn a_counter_resolved_at_setup_still_reads_after_the_subtrees_beneath_it_rebuild() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+
+        // Resolved once, at "page setup".
+        let counter = store.activities_version();
+
+        // Three rebuilds of a subtree that reads it.
+        let subtree = Owner::new();
+        for _ in 0..3 {
+            subtree.cleanup();
+            subtree.with(|| {
+                let _ = counter.get_untracked();
+            });
+        }
+
+        store.bump_activities_version();
+        assert_eq!(
+            counter.get_untracked(),
+            1,
+            "a counter resolved at component setup must keep reading after the subtrees \
+             below it are rebuilt. If it does not, every page that keys a Resource on a \
+             sync counter stops refetching the moment its suspense boundary rebuilds"
+        );
+    }
+
+    /// Resolving a counter inline, per evaluation, costs nothing reactive.
+    ///
+    /// Kept from TRA-9991, where it pinned that the inline form was safe but
+    /// wasteful — it abandoned one owner-registered arena item per evaluation.
+    /// After TRA-9996 the second half is gone too: `ArcSignal::derive` registers
+    /// with no owner, so what an evaluation now leaves behind is an `Arc` that
+    /// drops at the end of the expression.
+    ///
+    /// It is worth keeping rather than deleting because "is the inline form
+    /// dangerous?" is the question that cost this family of tickets five cycles,
+    /// twice being answered wrongly in review in opposite directions. The answer
+    /// is now "no, and not even wasteful", and it is recorded here as an
+    /// executable claim instead of a paragraph someone has to re-derive from
+    /// `reactive_graph` source a sixth time.
+    ///
+    /// The corresponding question for the **collection** getters still has the
+    /// old answer — safe inline, one abandoned arena item per evaluation, one
+    /// refactor from the panic that
+    /// `a_collection_resolved_under_a_subtree_owner_is_disposed_with_that_subtree`
+    /// demonstrates. See [[TRA-9998]].
+    #[wasm_bindgen_test]
+    fn reading_a_counter_inline_is_safe_and_no_longer_abandons_anything() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let sync_store = Some(store);
+
+        // The pre-TRA-9991 shape, verbatim. `SyncStore` is `Copy`, so the
+        // `map` here still copies the store rather than the counter.
+        let inline = Signal::derive(move || {
+            sync_store
+                .map(|s| s.activities_version().get())
+                .unwrap_or(0)
+        });
+
+        let subtree = Owner::new();
+        for _ in 0..3 {
+            subtree.cleanup();
+            assert_eq!(subtree.with(|| inline.get_untracked()), 0);
+        }
+
+        store.bump_activities_version();
+        assert_eq!(
+            subtree.with(|| inline.get_untracked()),
+            1,
+            "the inline form reads correctly. Any claim that it panics on its own is \
+             wrong and should be checked against this test before it costs another cycle"
+        );
+    }
+
+    // ── The one thing this ticket could have broken: tracking ───────────────
+
+    /// The `Resource`-source shape every page uses tracks its counter.
+    ///
+    /// `ArcSignal` is `Clone`, not `Copy`, so every call site that used to write
+    /// `version.map(|v| v.get())` over an `Option<Signal<u32>>` had to become
+    /// `version.as_ref().map(|v| v.get())` — `Option::map` consumes, and the
+    /// `Option` is now behind a shared capture rather than copied into each
+    /// evaluation.
+    ///
+    /// That rewrite compiles either way, which is the danger: `get_untracked()`,
+    /// a read hoisted out of the closure, or a value snapshotted at setup all
+    /// type-check and all silently stop the page updating. So the property is
+    /// asserted rather than reasoned about — the memo below re-runs **only** if
+    /// the closure registered a dependency on the counter during its last run.
+    ///
+    /// The negative half is the discriminating one: a bump of a *different*
+    /// counter must not move it, so a closure that tracked everything (or
+    /// tracked the store itself) fails here rather than passing vacuously.
+    #[wasm_bindgen_test]
+    fn the_as_ref_source_shape_tracks_its_own_counter_and_only_that_one() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let sync_store = Some(store);
+
+        // `AttachmentsSection`'s source, verbatim in the post-TRA-9996 shape.
+        let ws_version = sync_store.map(|s| s.attachments_version());
+        let runs = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&runs);
+        let source = Memo::new(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            ws_version.as_ref().map(|v| v.get()).unwrap_or(0)
+        });
+
+        assert_eq!(source.get_untracked(), 0);
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "fixture: the source must have run once, or this test watches nothing"
+        );
+
+        store.bump_activities_version();
+        assert_eq!(
+            source.get_untracked(),
+            0,
+            "an activity frame must not move the attachment source"
+        );
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the attachment source re-ran for a counter it does not read. Its dependency \
+             set is wider than the one counter it is meant to key on"
+        );
+
+        store.bump_attachments_version();
+        assert_eq!(
+            source.get_untracked(),
+            1,
+            "an attachment frame must move the attachment source"
+        );
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "the attachment source did not re-run when its own counter bumped, so it \
+             never subscribed to it. `as_ref().map(|v| v.get())` must read through the \
+             borrow on every run — a read hoisted out of the closure, or a \
+             `get_untracked`, compiles and leaves the page never refetching"
+        );
+    }
+
+    /// Where the clone is taken does not change what is tracked.
+    ///
+    /// The specific worry TRA-9996 was written around: `ArcSignal` is `Clone`,
+    /// so a call site has a choice about *when* to clone, and the fear was that
+    /// cloning outside a closure and moving the clone in yields a different
+    /// dependency graph from cloning inside on every run. If that were true,
+    /// this refactor could silently stop a page updating while compiling
+    /// cleanly, which is the exact failure this family of tickets exists to
+    /// prevent.
+    ///
+    /// It is not true, and the reason is structural rather than incidental.
+    /// `ArcSignal::clone` clones its `SignalTypes`, and for a derived signal
+    /// that is `Arc::clone` of the closure — not a new node
+    /// (`reactive_graph-0.2.14`, `wrappers.rs`). The dependency is registered by
+    /// *running* that closure, which both `Track::track` and
+    /// `ReadUntracked::custom_try_read` do via `DerivedSignal(i) => i()`. So the
+    /// subscription is established at read time by the observer that is active
+    /// then, and cloning — whenever it happens — is not a reactive operation at
+    /// all.
+    ///
+    /// All three forms are therefore the same graph, and this asserts it rather
+    /// than leaving the next author to re-derive it: clone-outside,
+    /// clone-inside, and the `as_ref()` borrow the call sites actually use.
+    #[wasm_bindgen_test]
+    fn cloning_a_counter_outside_or_inside_a_closure_tracks_identically() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+
+        /// Count the runs of a memo built over `body`.
+        fn watch(
+            body: impl Fn() -> u32 + Send + Sync + 'static,
+        ) -> (Memo<u32>, Arc<AtomicU32>) {
+            let runs = Arc::new(AtomicU32::new(0));
+            let counted = Arc::clone(&runs);
+            let memo = Memo::new(move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                body()
+            });
+            (memo, runs)
+        }
+
+        // (a) cloned once, outside, and moved in.
+        let outside = store.activities_version().clone();
+        let (memo_outside, runs_outside) = watch(move || outside.get());
+
+        // (b) cloned inside, on every run.
+        let source = store.activities_version();
+        let (memo_inside, runs_inside) = watch(move || {
+            let per_run = source.clone();
+            per_run.get()
+        });
+
+        // (c) the call-site form: borrowed out of an `Option` per run.
+        let borrowed = Some(store.activities_version());
+        let (memo_borrowed, runs_borrowed) =
+            watch(move || borrowed.as_ref().map(|v| v.get()).unwrap_or(0));
+
+        let poll = || {
+            (
+                memo_outside.get_untracked(),
+                memo_inside.get_untracked(),
+                memo_borrowed.get_untracked(),
+            )
+        };
+        let ran = || {
+            (
+                runs_outside.load(Ordering::Relaxed),
+                runs_inside.load(Ordering::Relaxed),
+                runs_borrowed.load(Ordering::Relaxed),
+            )
+        };
+
+        assert_eq!(poll(), (0, 0, 0));
+        assert_eq!(ran(), (1, 1, 1), "fixture: each form must have run once");
+
+        store.bump_activities_version();
+        assert_eq!(poll(), (1, 1, 1), "every form must see the bump");
+        assert_eq!(
+            ran(),
+            (2, 2, 2),
+            "the three clone placements did not produce the same dependency graph. If \
+             they ever diverge, every call site converted by TRA-9996 has to be re-read \
+             one by one, because the choice of where to clone stops being free"
+        );
+
+        store.bump_comments_version();
+        assert_eq!(
+            ran(),
+            (2, 2, 2),
+            "a form re-ran for a counter it does not read — its dependency set is wider \
+             than the one counter it reads"
+        );
+    }
+
+    /// The `track()`-only shape tracks its counter too.
+    ///
+    /// `NotificationsPage`'s `LocalResource` fetcher and `MetadataSidebar`'s
+    /// milestone `Effect` do not read the counter's *value* — they call
+    /// `track()` on it purely for the dependency. That goes down a different
+    /// path inside `reactive_graph` from `get()` (`Track::track` rather than
+    /// `Read::custom_try_read`), so it gets its own assertion rather than being
+    /// assumed to follow from the one above.
+    ///
+    /// The `if let Some(v) = &version` borrow is the part under test: it
+    /// replaced `if let Some(v) = version`, which consumed the `Option` and no
+    /// longer compiles now the payload is not `Copy`.
+    #[wasm_bindgen_test]
+    fn the_borrowed_track_shape_registers_a_dependency() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let sync_store = Some(store);
+
+        let prefs_version = sync_store.map(|s| s.notification_preferences_version());
+        let runs = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&runs);
+        let fetcher = Memo::new(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            if let Some(version) = &prefs_version {
+                version.track();
+            }
+        });
+
+        fetcher.get_untracked();
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "fixture: the fetcher must have run once, or this test watches nothing"
+        );
+
+        store.bump_workspace_settings_version();
+        fetcher.get_untracked();
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the fetcher re-ran for a counter it does not track"
+        );
+
+        store.bump_notification_preferences_version();
+        fetcher.get_untracked();
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "the fetcher did not re-run when the counter it calls `track()` on bumped. \
+             `NotificationsPage` rests entirely on that call establishing the \
+             subscription — without it the counter has no subscriber and the page never \
+             refetches"
+        );
+    }
+
+    /// Every counter a page keys a `Resource` on moves when its entity syncs.
+    ///
+    /// TRA-9991 rewrote the source closures of six such resources
+    /// (`MetadataSidebar`, `RelationsSection`, `IssueTimeline` in
+    /// `pages/issues/issue_detail.rs`; the milestone, update and member
+    /// resources in `pages/projects/project_detail.rs`) to read a counter
+    /// resolved at setup instead of resolving one inline. That is meant to be
+    /// behaviour-preserving, and this is what says so: each source is rebuilt in
+    /// the post-fix shape, and a bump of its own counter — and only its own —
+    /// must move it.
+    #[wasm_bindgen_test]
+    fn each_hoisted_page_source_still_moves_when_its_own_counter_bumps() {
+        let root = Owner::new();
+        root.set();
+        let store = SyncStore::new();
+        let sync_store = Some(store);
+
+        // The post-fix shape, one per rewritten call site.
+        let milestones = sync_store.map(|s| s.milestones_version());
+        let relations = sync_store.map(|s| s.relations_version());
+        let activities = sync_store.map(|s| s.activities_version());
+        let updates = sync_store.map(|s| s.project_updates_version());
+        let members = sync_store.map(|s| s.project_members_version());
+
+        let read = move || {
+            (
+                milestones.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
+                relations.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
+                activities.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
+                updates.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
+                members.as_ref().map(|v| v.get_untracked()).unwrap_or(0),
+            )
+        };
+
+        assert_eq!(read(), (0, 0, 0, 0, 0));
+
+        store.bump_milestones_version();
+        assert_eq!(
+            read(),
+            (1, 0, 0, 0, 0),
+            "a project_milestone frame must move the milestone sources on the issue \
+             sidebar and the project page, and nothing else"
+        );
+
+        store.bump_relations_version();
+        assert_eq!(
+            read(),
+            (1, 1, 0, 0, 0),
+            "an issue_relation frame must move the relations section's source, and \
+             nothing else"
+        );
+
+        store.bump_activities_version();
+        assert_eq!(
+            read(),
+            (1, 1, 1, 0, 0),
+            "an activity frame must move the issue timeline's source, and nothing else"
+        );
+
+        store.bump_project_updates_version();
+        assert_eq!(
+            read(),
+            (1, 1, 1, 1, 0),
+            "a project_update frame must move the posted-updates source, and nothing else"
+        );
+
+        store.bump_project_members_version();
+        assert_eq!(
+            read(),
+            (1, 1, 1, 1, 1),
+            "a project_member frame must move the member-list source, and nothing else"
+        );
     }
 }

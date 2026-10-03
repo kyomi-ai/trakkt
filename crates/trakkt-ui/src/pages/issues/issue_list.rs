@@ -18,6 +18,7 @@
 //! board views. The preference is persisted to localStorage per team (or
 //! globally for the workspace-level page).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use leptos::prelude::*;
@@ -30,56 +31,96 @@ use wasm_bindgen::JsCast;
 
 use crate::components::{
     Alert, AlertVariant,
-    Button, ButtonSize, ButtonVariant, ConfirmDialog, EmptyState,
+    Button, ButtonSize, ButtonVariant, Checkbox, ConfirmDialog, EmptyState,
+    IssueStatusBadge, IssueStatusVariant, PriorityIndicator,
     Modal, ModalSize,
-    SearchInput, StyledSelect, TeamIcon, INPUT_CLASS,
+    SearchInput, Select, SelectVariant, TeamIcon, INPUT_CLASS,
 };
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{
-    apply_clause, parse_sort_field, sort_field_to_str, sort_issues, FilterBar, SortDirection,
-    SortDropdown, SortField,
+    apply_clause, group_issues, parse_sort_field, sort_field_to_str, sort_issues, FilterBar,
+    GroupDropdown, GroupField, SortDirection, SortDropdown, SortField,
 };
 use crate::pages::issues::issue_row::IssueRow;
-use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
+use crate::pages::issues::{is_archived, resolve_archive_days};
 use crate::pages::views::{FilterClause, LegacyViewFilters, ViewFilters};
-use crate::server_fns::issues::{create_issue, get_archived_issues, list_issues};
+use crate::server_fns::issues::{create_issue, list_issues, search_issues, SearchResultItem};
+use crate::server_fns::stars::list_starred_issue_ids;
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::views::{create_view, delete_view, update_view};
 use crate::types::IssueNavState;
 use crate::utils::keyboard::is_input_focused;
-use trakkt_types::models::{IssueWithDetails, Status, Team};
+use trakkt_types::models::{Status, Team};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// localStorage helpers for view mode
+// Search snippet rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Read the saved view mode from localStorage.
+/// Convert search snippet with `**highlighted**` markers into HTML with `<mark>` tags.
+///
+/// HTML-escapes user content character-by-character while preserving the
+/// generated `<mark>` tags, preventing XSS from search result snippets.
+fn render_snippet_html(snippet: &str) -> String {
+    let mut result = String::with_capacity(snippet.len() + 50);
+    let mut in_highlight = false;
+    let mut chars = snippet.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '*' && chars.peek() == Some(&'*') {
+            chars.next();
+            if in_highlight {
+                result.push_str("</mark>");
+            } else {
+                result.push_str("<mark class=\"bg-accent text-accent-foreground rounded px-0.5\">");
+            }
+            in_highlight = !in_highlight;
+        } else {
+            match ch {
+                '<' => result.push_str("&lt;"),
+                '>' => result.push_str("&gt;"),
+                '&' => result.push_str("&amp;"),
+                '"' => result.push_str("&quot;"),
+                _ => result.push(ch),
+            }
+        }
+    }
+    if in_highlight {
+        result.push_str("</mark>");
+    }
+    result
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// localStorage helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read a string value from localStorage by key.
 #[cfg(target_arch = "wasm32")]
-fn read_view_mode(key: &str) -> Option<String> {
+fn ls_read(key: &str) -> Option<String> {
     let storage = web_sys::window()?.local_storage().ok()??;
     storage.get_item(key).ok()?
 }
 
-/// Write the view mode to localStorage.
+/// Write a string value to localStorage by key.
 #[cfg(target_arch = "wasm32")]
-fn write_view_mode(key: &str, mode: &str) {
+fn ls_write(key: &str, value: &str) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.set_item(key, mode);
+        let _ = storage.set_item(key, value);
     }
 }
 
-/// Build the localStorage key for the view mode.
-fn view_mode_storage_key(team_key: &Option<Signal<String>>) -> String {
+/// Build a team-scoped localStorage key with the given prefix.
+fn ls_scoped_key(prefix: &str, team_key: &Option<Signal<String>>) -> String {
     match team_key {
         Some(sig) => {
             let key = sig.get_untracked();
             if key.is_empty() {
-                "trakkt-view-mode-global".to_string()
+                format!("{prefix}-global")
             } else {
-                format!("trakkt-view-mode-{key}")
+                format!("{prefix}-{key}")
             }
         }
-        None => "trakkt-view-mode-global".to_string(),
+        None => format!("{prefix}-global"),
     }
 }
 
@@ -89,7 +130,7 @@ fn view_mode_storage_key(team_key: &Option<Signal<String>>) -> String {
 
 /// Parsed view state from URL query parameters.
 struct ParsedViewState {
-    /// Active tab: "all", "active", "backlog", or "view:<uuid>"
+    /// Active tab: "issues", "active", "backlog", or "view:<uuid>"
     view: String,
     /// Filter clauses deserialized from the `filters` JSON param.
     filters: Vec<FilterClause>,
@@ -163,7 +204,7 @@ fn parse_query_params(query: &str) -> ParsedViewState {
     let sort_dir = sort_dir_raw.as_deref().and_then(SortDirection::parse);
 
     ParsedViewState {
-        view: view.unwrap_or_else(|| "all".to_string()),
+        view: view.unwrap_or_else(|| "issues".to_string()),
         filters,
         sort,
         sort_dir,
@@ -173,7 +214,7 @@ fn parse_query_params(query: &str) -> ParsedViewState {
 /// Build a URL query string from the current view state.
 ///
 /// Only includes parameters that differ from defaults (clean URL = no params).
-/// Defaults: view=all, no filters, sort=priority, sort_dir=asc.
+/// Defaults: view=issues, no filters, sort=priority, sort_dir=asc.
 fn build_query_string(
     view: &str,
     clauses: &[FilterClause],
@@ -182,17 +223,9 @@ fn build_query_string(
 ) -> String {
     let mut params = Vec::<String>::new();
 
-    // View param — omit when "all" (default).
-    if view != "all" {
+    // View param — omit when "issues" (default).
+    if view != "issues" {
         params.push(format!("view={view}"));
-    }
-
-    // For backward compat: when view=active, also include status=in_progress
-    // so old sidebar active-state detection still works.
-    if view == "active" {
-        params.push("status=in_progress".to_string());
-    } else if view == "backlog" {
-        params.push("status=backlog".to_string());
     }
 
     // Filters — omit when empty.
@@ -262,14 +295,20 @@ fn apply_view_filters_from_store(
     filter_clauses: &RwSignal<Vec<FilterClause>>,
     set_sort_field: &WriteSignal<SortField>,
     set_sort_direction: &WriteSignal<SortDirection>,
+    set_group_by: &WriteSignal<GroupField>,
 ) {
     let Some(store) = sync_store else { return };
-    let Some(t) = team else { return };
     let view = store
         .views()
         .get_untracked()
         .into_iter()
-        .find(|v| v.view_id == view_id && v.team_id.as_deref() == Some(t.team_id.as_str()));
+        .find(|v| {
+            v.view_id == view_id
+                && match team {
+                    Some(t) => v.team_id.as_deref() == Some(t.team_id.as_str()),
+                    None => v.team_id.is_none(),
+                }
+        });
     let Some(v) = view else {
         tracing::warn!("View {view_id} not found in SyncStore");
         return;
@@ -294,6 +333,13 @@ fn apply_view_filters_from_store(
                         .and_then(SortDirection::parse)
                         .unwrap_or(SortDirection::Asc),
                 );
+                set_group_by.set(
+                    filters
+                        .group_by
+                        .as_deref()
+                        .map(GroupField::parse)
+                        .unwrap_or(GroupField::None),
+                );
             }
             Err(e) => tracing::warn!("Failed to parse view filters: {e}"),
         }
@@ -316,6 +362,8 @@ fn apply_view_filters_from_store(
                         .and_then(SortDirection::parse)
                         .unwrap_or(SortDirection::Asc),
                 );
+                // Legacy views have no group_by; reset to None.
+                set_group_by.set(GroupField::None);
             }
             Err(e) => tracing::warn!("Failed to parse legacy view filters: {e}"),
         }
@@ -347,20 +395,23 @@ pub fn IssueListForTeam() -> impl IntoView {
     view! { <IssueListInner team_key=team_key/> }
 }
 
-/// Inner implementation shared by `IssueListPage` (no team) and
-/// `IssueListForTeam` (team-scoped). All filtering, title, and create-issue
-/// logic lives here.
+/// Inner implementation shared by `IssueListPage` (no team),
+/// `IssueListForTeam` (team-scoped), and `WorkspaceViewPage` (saved view).
+/// All filtering, title, and create-issue logic lives here.
 #[component]
-fn IssueListInner(
+pub(crate) fn IssueListInner(
     /// Optional reactive team key. When `Some`, filters issues and statuses by team.
     #[prop(optional, into)]
     team_key: Option<Signal<String>>,
+    /// When set, the component loads this view on mount (used by /views/:view_id route).
+    #[prop(optional, into)]
+    initial_view_id: Option<Signal<String>>,
 ) -> impl IntoView {
     // ── View mode state ────────────────────────────────────────────────────
-    let storage_key = view_mode_storage_key(&team_key);
+    let storage_key = ls_scoped_key("trakkt-view-mode", &team_key);
     let initial_mode = {
         #[cfg(target_arch = "wasm32")]
-        { read_view_mode(&storage_key).unwrap_or_else(|| "list".to_string()) }
+        { ls_read(&storage_key).unwrap_or_else(|| "list".to_string()) }
         #[cfg(not(target_arch = "wasm32"))]
         { "list".to_string() }
     };
@@ -369,26 +420,47 @@ fn IssueListInner(
     Effect::new(move |_| {
         let mode = view_mode.get();
         #[cfg(target_arch = "wasm32")]
-        write_view_mode(&storage_key_for_effect, &mode);
+        ls_write(&storage_key_for_effect, &mode);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = (&storage_key_for_effect, &mode);
     });
 
     // ── Filter state ────────────────────────────────────────────────────────
     let (search, set_search) = signal(String::new());
+    let debounced_search = RwSignal::new(String::new());
+    let include_archived_search = RwSignal::new(false);
     let filter_clauses = RwSignal::new(Vec::<FilterClause>::new());
-    let (show_archived, set_show_archived) = signal(false);
-
-    // ── Server-fetched archived issues (fetched on demand when toggle is ON) ──
-    let archived_issues_signal = RwSignal::new(Vec::<IssueWithDetails>::new());
 
     // ── Sort state ─────────────────────────────────────────────────────────
     let (sort_field, set_sort_field) = signal(SortField::Priority);
     let (sort_direction, set_sort_direction) = signal(SortDirection::Asc);
 
+    // ── Group-by state ────────────────────────────────────────────────────
+    let group_by_key = ls_scoped_key("trakkt-group-by", &team_key);
+    let initial_group_by = {
+        #[cfg(target_arch = "wasm32")]
+        { ls_read(&group_by_key).map(|s| GroupField::parse(&s)).unwrap_or(GroupField::None) }
+        #[cfg(not(target_arch = "wasm32"))]
+        { GroupField::None }
+    };
+    let (group_by, set_group_by) = signal(initial_group_by);
+    let group_by_key_for_effect = group_by_key.clone();
+    Effect::new(move |_| {
+        let field = group_by.get();
+        #[cfg(target_arch = "wasm32")]
+        ls_write(&group_by_key_for_effect, field.as_str());
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (&group_by_key_for_effect, &field);
+    });
+
+    // ── Group collapse state (hoisted to avoid recreation on re-render) ──
+    // Maps group_key → collapsed boolean. Initialized lazily from localStorage
+    // when a group key is first encountered during rendering.
+    let group_collapse_state: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
+
     // ── Active tab state (team-scoped pages only) ─────────────────────────
-    // Values: "all", "active", "backlog", "view:{view_id}"
-    let (active_tab, set_active_tab) = signal("all".to_string());
+    // Values: "issues", "active", "backlog", "view:{view_id}"
+    let (active_tab, set_active_tab) = signal("issues".to_string());
 
     // ── URL state persistence ───────────────────────────────────────────
     // Prevents circular Effect loops: init reads URL → sets signals →
@@ -428,38 +500,141 @@ fn IssueListInner(
             .find(|t| t.key.to_lowercase() == key_lower)
     });
 
-    // ── Fetch archived issues from server when toggle is ON ─────────────
+    // ── Debounced full-text search ─────────────────────────────────────────
+    #[cfg(target_arch = "wasm32")]
+    {
+        let debounce_gen = RwSignal::new(0u64);
+        Effect::new(move || {
+            let val = search.get();
+            let generation = debounce_gen.get_untracked().wrapping_add(1);
+            debounce_gen.set(generation);
+
+            if val.trim().is_empty() {
+                debounced_search.set(String::new());
+                return;
+            }
+
+            leptos::task::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(300).await;
+                if debounce_gen.get_untracked() == generation {
+                    debounced_search.set(val);
+                }
+            });
+        });
+    }
+
+    // ── Starred issue IDs ───────────────────────────────────────────────
+    // Fetches starred issue IDs when the active tab is "starred". The
+    // version counter allows re-fetching after star/unstar toggles.
+    let starred_version = RwSignal::new(0u32);
+    let starred_resource = Resource::new(
+        move || (active_tab.get(), starred_version.get()),
+        move |(tab, _)| async move {
+            if tab == "starred" {
+                match list_starred_issue_ids().await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to fetch starred issue IDs");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        },
+    );
+
+    // When starred IDs arrive and we're on the "starred" tab, update filters.
     Effect::new(move |_| {
-        let showing = show_archived.get();
-        if !showing {
-            archived_issues_signal.set(Vec::new());
+        let tab = active_tab.get();
+        if tab != "starred" {
             return;
         }
-        let team_id = match resolved_team.get() {
-            Some(t) => t.team_id.clone(),
-            None => return,
-        };
-        leptos::task::spawn_local(async move {
-            match get_archived_issues(team_id, None, None).await {
-                Ok(issues) => archived_issues_signal.set(issues),
-                Err(e) => {
-                    tracing::warn!("Failed to fetch archived issues: {e}");
-                    archived_issues_signal.set(Vec::new());
-                }
-            }
-        });
+        let Some(ids) = starred_resource.get() else { return };
+        filter_clauses.set(vec![FilterClause {
+            field: "issue_id".to_string(),
+            operator: "any_of".to_string(),
+            values: ids,
+        }]);
     });
 
-    // ── Team-scoped views (custom tabs) ──────────────────────────────────
-    let team_views = Memo::new(move |_| {
-        let team = resolved_team.get();
+    let search_resource = Resource::new(
+        move || (
+            debounced_search.get(),
+            resolved_team.get().map(|t| t.team_id.clone()),
+            include_archived_search.get(),
+        ),
+        move |(query, team_id, include_archived)| async move {
+            if query.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            search_issues(
+                query,
+                team_id,
+                Some(false),
+                Some(include_archived),
+                Some(true),
+                Some(50),
+            ).await
+        },
+    );
+
+    let is_search_active = Signal::derive(move || !debounced_search.get().trim().is_empty());
+    let is_searching = Signal::derive(move || {
+        !search.get().trim().is_empty() && search_resource.get().is_none()
+    });
+    let search_error = RwSignal::new(Option::<String>::None);
+
+    let grouped_search_results = Memo::new(move |_| {
+        if !is_search_active.get() {
+            search_error.set(None);
+            return Vec::new();
+        }
+        let results = match search_resource.get() {
+            Some(Ok(items)) => {
+                search_error.set(None);
+                items
+            }
+            Some(Err(e)) => {
+                search_error.set(Some(format!("Search failed: {e}")));
+                return Vec::new();
+            }
+            None => return Vec::new(),
+        };
+        let mut groups: Vec<(String, Vec<SearchResultItem>)> = Vec::new();
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for item in results {
+            if let Some(&idx) = seen.get(&item.issue_id) {
+                groups[idx].1.push(item);
+            } else {
+                seen.insert(item.issue_id.clone(), groups.len());
+                groups.push((item.issue_id.clone(), vec![item]));
+            }
+        }
+        groups
+    });
+
+    // ── Custom views (team-scoped or workspace-scoped) ─────────────────
+    // Exclude views whose names collide with the hardcoded preset tabs
+    // (Issues, Active, Backlog) to prevent duplicates.
+    const PRESET_TAB_NAMES: &[&str] = &["Issues", "Active", "Backlog", "Starred"];
+    let custom_views = Memo::new(move |_| {
         let Some(store) = sync_store else { return Vec::new() };
-        let Some(ref t) = team else { return Vec::new() };
+        let team = resolved_team.get();
         let mut views: Vec<trakkt_types::models::View> = store
             .views()
             .get()
             .into_iter()
-            .filter(|v| v.team_id.as_deref() == Some(t.team_id.as_str()))
+            .filter(|v| {
+                let scope_match = match &team {
+                    Some(t) => v.team_id.as_deref() == Some(t.team_id.as_str()),
+                    None => v.team_id.is_none(),
+                };
+                scope_match
+                    && !PRESET_TAB_NAMES
+                        .iter()
+                        .any(|p| p.eq_ignore_ascii_case(&v.name))
+            })
             .collect();
         views.sort_by_key(|v| v.position);
         views
@@ -486,10 +661,10 @@ fn IssueListInner(
     let handle_tab_delete = move || {
         let Some(vid) = confirm_delete_view_id.get_untracked() else { return };
         set_confirm_delete_view_id.set(None);
-        // If the deleted view was the active tab, reset to "All Issues".
+        // If the deleted view was the active tab, reset to "Issues".
         let current_tab = active_tab.get_untracked();
         if current_tab == format!("view:{vid}") {
-            set_active_tab.set("all".to_string());
+            set_active_tab.set("issues".to_string());
             set_search.set(String::new());
             filter_clauses.set(Vec::new());
             set_sort_field.set(SortField::Priority);
@@ -527,22 +702,39 @@ fn IssueListInner(
             set_sort_direction.set(parsed.sort_dir.unwrap_or(SortDirection::Asc));
 
             match parsed.view.as_str() {
-                "active" => {
-                    set_active_tab.set("active".to_string());
-                    // If the URL carried explicit filter clauses, use them.
-                    // Otherwise, compute status filter IDs from SyncStore
-                    // (same logic as the on_active click handler).
+                "issues" => {
+                    set_active_tab.set("issues".to_string());
                     if !parsed.filters.is_empty() {
                         filter_clauses.set(parsed.filters);
                     } else {
                         let status_ids = compute_status_ids(
                             sync_store,
                             &resolved_team.get_untracked(),
-                            &["started"],
+                            &["backlog", "unstarted", "started"],
                         );
-                        // If store isn't initialized yet (cold deep-link), the
-                        // tracked read on `store.initialized()` will re-run
-                        // this Effect once data arrives.
+                        if let Some(store) = sync_store
+                            && !store.initialized().get()
+                        {
+                            skip_url_update.set(false);
+                            return;
+                        }
+                        filter_clauses.set(vec![FilterClause {
+                            field: "status".to_string(),
+                            operator: "any_of".to_string(),
+                            values: status_ids,
+                        }]);
+                    }
+                }
+                "active" => {
+                    set_active_tab.set("active".to_string());
+                    if !parsed.filters.is_empty() {
+                        filter_clauses.set(parsed.filters);
+                    } else {
+                        let status_ids = compute_status_ids(
+                            sync_store,
+                            &resolved_team.get_untracked(),
+                            &["unstarted", "started"],
+                        );
                         if let Some(store) = sync_store
                             && !store.initialized().get()
                         {
@@ -564,7 +756,7 @@ fn IssueListInner(
                         let status_ids = compute_status_ids(
                             sync_store,
                             &resolved_team.get_untracked(),
-                            &["backlog", "unstarted"],
+                            &["backlog"],
                         );
                         if let Some(store) = sync_store
                             && !store.initialized().get()
@@ -579,13 +771,26 @@ fn IssueListInner(
                         }]);
                     }
                 }
+                "starred" => {
+                    set_active_tab.set("starred".to_string());
+                    // Clear filters immediately to avoid flashing previous tab's
+                    // results. The starred_resource Effect will repopulate once
+                    // the starred IDs arrive.
+                    filter_clauses.set(if parsed.filters.is_empty() {
+                        vec![FilterClause {
+                            field: "issue_id".to_string(),
+                            operator: "any_of".to_string(),
+                            values: Vec::new(),
+                        }]
+                    } else {
+                        parsed.filters
+                    });
+                    // Bump version to trigger a fresh fetch of starred IDs.
+                    starred_version.set(starred_version.get_untracked().wrapping_add(1));
+                }
                 view_str if view_str.starts_with("view:") => {
                     let view_id = &view_str[5..];
                     set_active_tab.set(view_str.to_string());
-                    // Load filters from the saved view's JSON (same logic as
-                    // the custom view click handler). If the URL also carried
-                    // explicit filter params, prefer those (user may have
-                    // tweaked filters after switching to the view).
                     if !parsed.filters.is_empty() {
                         filter_clauses.set(parsed.filters);
                     } else {
@@ -596,17 +801,75 @@ fn IssueListInner(
                             &filter_clauses,
                             &set_sort_field,
                             &set_sort_direction,
+                            &set_group_by,
                         );
                     }
                 }
                 _ => {
-                    // "all" or any unrecognized value — default state.
-                    set_active_tab.set("all".to_string());
-                    filter_clauses.set(parsed.filters);
+                    set_active_tab.set("issues".to_string());
+                    if !parsed.filters.is_empty() {
+                        filter_clauses.set(parsed.filters);
+                    } else {
+                        let status_ids = compute_status_ids(
+                            sync_store,
+                            &resolved_team.get_untracked(),
+                            &["backlog", "unstarted", "started"],
+                        );
+                        if let Some(store) = sync_store
+                            && !store.initialized().get()
+                        {
+                            skip_url_update.set(false);
+                            return;
+                        }
+                        filter_clauses.set(vec![FilterClause {
+                            field: "status".to_string(),
+                            operator: "any_of".to_string(),
+                            values: status_ids,
+                        }]);
+                    }
                 }
             }
 
             skip_url_update.set(false);
+        });
+    }
+
+    // ── Initial view loading (from /views/:view_id route) ───────────────
+    // Uses a signal guard instead of prev.is_some() because the store may not
+    // be initialized on first run — the effect must re-fire when initialized
+    // flips to true, but only apply the view once.
+    let init_view_applied = RwSignal::new(false);
+    if let Some(ref init_view) = initial_view_id {
+        let init_view = *init_view;
+        Effect::new(move |_| {
+            if init_view_applied.get_untracked() {
+                return;
+            }
+            let vid = init_view.get();
+            if vid.is_empty() {
+                return;
+            }
+            if let Some(store) = sync_store {
+                if !store.initialized().get() {
+                    return;
+                }
+                let views = store.views().get();
+                if views.iter().any(|v| v.view_id == vid) {
+                    init_view_applied.set(true);
+                    skip_url_update.set(true);
+                    apply_view_filters_from_store(
+                        sync_store,
+                        &resolved_team.get_untracked(),
+                        &vid,
+                        &filter_clauses,
+                        &set_sort_field,
+                        &set_sort_direction,
+                        &set_group_by,
+                    );
+                    set_active_tab.set(format!("view:{vid}"));
+                    skip_url_update.set(false);
+                }
+            }
         });
     }
 
@@ -628,8 +891,8 @@ fn IssueListInner(
                 return;
             }
 
-            // Only update URL on team-scoped pages.
-            if team_key.is_none() {
+            // Update URL on team-scoped pages and workspace view pages.
+            if team_key.is_none() && initial_view_id.is_none() {
                 return;
             }
 
@@ -733,54 +996,32 @@ fn IssueListInner(
             .collect::<Vec<_>>()
     });
 
-    // Filtered issue list for list view — applies archive, search, and composable
-    // filter clauses. When show_archived is ON, merges in server-fetched archived
-    // issues (deduplicating by issue_id).
+    // Filtered issue list for list view — excludes archived issues, applies
+    // search and composable filter clauses. Archived issues are shown on
+    // the dedicated /archived page instead.
     let filtered_issues = Memo::new(move |_| {
         let raw = team_issues.get();
-        let search_val = search.get().to_lowercase();
         let clauses = filter_clauses.get();
-        let archived_visible = show_archived.get();
+        let team = resolved_team.get();
+        // TODO: pass workspace-level default_auto_archive_days once workspace
+        // settings are part of the SyncStore bootstrap.
+        let archive_days = resolve_archive_days(team.as_ref(), None);
 
-        let passes_filters = |issue: &IssueWithDetails| -> bool {
-            // Search filter (not a clause — always visible in toolbar).
-            if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
-                return false;
-            }
-            // Apply each composable filter clause.
-            for clause in &clauses {
-                if !apply_clause(clause, issue) {
-                    return false;
-                }
-            }
-            true
-        };
-
-        let mut result: Vec<IssueWithDetails> = raw
-            .into_iter()
+        raw.into_iter()
             .filter(|issue| {
-                // Archive filter: hide locally-archived issues unless the toggle is on.
-                if !archived_visible && is_archived(issue, ARCHIVE_DAYS) {
+                // Exclude archived issues — they have their own dedicated page.
+                if archive_days > 0 && is_archived(issue, archive_days) {
                     return false;
                 }
-                passes_filters(issue)
-            })
-            .collect();
-
-        // When showing archived, merge in server-fetched archived issues
-        // (deduplicating by issue_id against what's already in the list).
-        if archived_visible {
-            let existing_ids: std::collections::HashSet<String> =
-                result.iter().map(|i| i.issue_id.clone()).collect();
-            let server_archived = archived_issues_signal.get();
-            for issue in server_archived {
-                if !existing_ids.contains(&issue.issue_id) && passes_filters(&issue) {
-                    result.push(issue);
+                // Apply each composable filter clause.
+                for clause in &clauses {
+                    if !apply_clause(clause, issue) {
+                        return false;
+                    }
                 }
-            }
-        }
-
-        result
+                true
+            })
+            .collect::<Vec<_>>()
     });
 
     // Sorted issue list — applies the selected sort field and direction on
@@ -880,6 +1121,44 @@ fn IssueListInner(
 
     // ── Save View modal state ──────────────────────────────────────────────
     let (show_save_view, set_show_save_view) = signal(false);
+
+    // Auto-open save-view modal when ?new_view=1 is in URL.
+    // Strips the param after opening so refresh/share doesn't re-trigger.
+    {
+        let loc = use_location();
+        let nav_cleanup = use_navigate();
+        let opened = RwSignal::new(false);
+        Effect::new(move |_| {
+            if opened.get_untracked() {
+                return;
+            }
+            let query = loc.search.get();
+            let has_new_view = query
+                .split('&')
+                .any(|p| p == "new_view=1");
+            if has_new_view {
+                opened.set(true);
+                set_show_save_view.set(true);
+                let clean_query: String = query
+                    .split('&')
+                    .filter(|p| *p != "new_view=1")
+                    .collect::<Vec<_>>()
+                    .join("&");
+                let path = loc.pathname.get_untracked();
+                let url = if clean_query.is_empty() {
+                    path
+                } else {
+                    format!("{path}?{clean_query}")
+                };
+                nav_cleanup(&url, NavigateOptions {
+                    resolve: false,
+                    replace: true,
+                    scroll: false,
+                    ..Default::default()
+                });
+            }
+        });
+    }
 
     // ── Keyboard navigation state ──────────────────────────────────────────
     let (selected_index, set_selected_index) = signal(Option::<usize>::None);
@@ -981,6 +1260,18 @@ fn IssueListInner(
         })
     });
 
+    // ── Issue count for the header ────────────────────────────────────────
+    // Total = all non-archived issues in scope (team or workspace).
+    // Filtered = issues after search + filter clauses (what's displayed).
+    let total_count = Memo::new(move |_| {
+        let team = resolved_team.get();
+        // TODO: pass workspace-level default_auto_archive_days once workspace
+        // settings are part of the SyncStore bootstrap.
+        let archive_days = resolve_archive_days(team.as_ref(), None);
+        team_issues.get().iter().filter(|i| archive_days == 0 || !is_archived(i, archive_days)).count()
+    });
+    let filtered_count = Memo::new(move |_| filtered_issues.get().len());
+
     // ── Render ──────────────────────────────────────────────────────────────
     view! {
         <div class="bg-background flex flex-col h-full">
@@ -994,10 +1285,39 @@ fn IssueListInner(
                                 <TeamIcon team=team size="20px"/>
                                 <span>{name}</span>
                             }.into_any()
+                        } else if initial_view_id.is_some() {
+                            // On /views/:view_id — show the view's name from the store.
+                            let view_name = move || {
+                                let vid = initial_view_id.as_ref().map(|s| s.get()).unwrap_or_default();
+                                if vid.is_empty() {
+                                    return "Issues".to_string();
+                                }
+                                sync_store
+                                    .and_then(|store| {
+                                        store.views().get().into_iter().find(|v| v.view_id == vid)
+                                    })
+                                    .map(|v| v.name.clone())
+                                    .unwrap_or_else(|| "Issues".to_string())
+                            };
+                            view! { <span>{view_name}</span> }.into_any()
                         } else {
                             view! { <span>"Issues"</span> }.into_any()
                         }
                     }}
+                    <span class="text-sm font-normal text-muted-foreground">
+                        {move || {
+                            let filtered = filtered_count.get();
+                            let total = total_count.get();
+                            if total == 0 {
+                                return String::new();
+                            }
+                            if filtered == total {
+                                format!("({})", total)
+                            } else {
+                                format!("{} of {} issues", filtered, total)
+                            }
+                        }}
+                    </span>
                 </h1>
                 <div class="flex items-center gap-3">
                     // View toggle (segmented control)
@@ -1029,13 +1349,32 @@ fn IssueListInner(
             {move || {
                 team_key?;
 
-                let on_all = move |_: web_sys::MouseEvent| {
+                let on_issues = move |_: web_sys::MouseEvent| {
                     push_next_nav.set(true);
-                    set_active_tab.set("all".to_string());
+                    set_active_tab.set("issues".to_string());
                     set_search.set(String::new());
-                    filter_clauses.set(Vec::new());
                     set_sort_field.set(SortField::Priority);
                     set_sort_direction.set(SortDirection::Asc);
+                    let team = resolved_team.get();
+                    let status_ids: Vec<String> = if let (Some(store), Some(t)) = (sync_store, &team) {
+                        store
+                            .statuses()
+                            .get()
+                            .into_iter()
+                            .filter(|s| {
+                                (s.category == "backlog" || s.category == "unstarted" || s.category == "started")
+                                    && (s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
+                            })
+                            .map(|s| s.status_id)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    filter_clauses.set(vec![FilterClause {
+                        field: "status".to_string(),
+                        operator: "any_of".to_string(),
+                        values: status_ids,
+                    }]);
                 };
 
                 let on_active = move |_: web_sys::MouseEvent| {
@@ -1051,7 +1390,7 @@ fn IssueListInner(
                             .get()
                             .into_iter()
                             .filter(|s| {
-                                s.category == "started"
+                                (s.category == "unstarted" || s.category == "started")
                                     && (s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
                             })
                             .map(|s| s.status_id)
@@ -1079,7 +1418,7 @@ fn IssueListInner(
                             .get()
                             .into_iter()
                             .filter(|s| {
-                                (s.category == "backlog" || s.category == "unstarted")
+                                s.category == "backlog"
                                     && (s.team_id.is_none() || s.team_id.as_ref() == Some(&t.team_id))
                             })
                             .map(|s| s.status_id)
@@ -1099,11 +1438,11 @@ fn IssueListInner(
                         // Default tabs
                         {move || {
                             let tab = active_tab.get();
-                            let all_v = if tab == "all" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
+                            let issues_v = if tab == "issues" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
                             let active_v = if tab == "active" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
                             let backlog_v = if tab == "backlog" { ButtonVariant::PillActive } else { ButtonVariant::Pill };
                             view! {
-                                <Button variant=all_v size=ButtonSize::Pill on:click=on_all>"All Issues"</Button>
+                                <Button variant=issues_v size=ButtonSize::Pill on:click=on_issues>"Issues"</Button>
                                 <Button variant=active_v size=ButtonSize::Pill on:click=on_active>"Active"</Button>
                                 <Button variant=backlog_v size=ButtonSize::Pill on:click=on_backlog>"Backlog"</Button>
                             }
@@ -1111,7 +1450,7 @@ fn IssueListInner(
 
                         // Custom view tabs
                         {move || {
-                            let views = team_views.get();
+                            let views = custom_views.get();
                             let current_tab = active_tab.get();
                             let open_menu_id = context_menu_view_id.get();
                             let current_renaming = renaming_view_id.get();
@@ -1150,6 +1489,11 @@ fn IssueListInner(
                                                         .and_then(SortDirection::parse)
                                                         .unwrap_or(SortDirection::Asc)
                                                 );
+                                                set_group_by.set(
+                                                    filters.group_by.as_deref()
+                                                        .map(GroupField::parse)
+                                                        .unwrap_or(GroupField::None)
+                                                );
                                             }
                                             Err(e) => tracing::warn!("Failed to parse view filters: {e}"),
                                         }
@@ -1168,6 +1512,8 @@ fn IssueListInner(
                                                         .and_then(SortDirection::parse)
                                                         .unwrap_or(SortDirection::Asc)
                                                 );
+                                                // Legacy views have no group_by; reset to None.
+                                                set_group_by.set(GroupField::None);
                                             }
                                             Err(e) => tracing::warn!("Failed to parse legacy view filters: {e}"),
                                         }
@@ -1310,8 +1656,18 @@ fn IssueListInner(
                         value=Signal::derive(move || search.get())
                         on_input=Callback::new(move |v: String| set_search.set(v))
                         placeholder="Search issues..."
+                        searching=is_searching
                         class="flex-1 max-w-sm"
                     />
+                    <Show when=move || { !search.get().trim().is_empty() }>
+                        <label class="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none shrink-0">
+                            <Checkbox
+                                checked=Signal::derive(move || include_archived_search.get())
+                                on_change=Callback::new(move |v: bool| include_archived_search.set(v))
+                            />
+                            "Include archived"
+                        </label>
+                    </Show>
                     <FilterBar
                         clauses=filter_clauses
                         team_id=Signal::derive(move || resolved_team.get().map(|t| t.team_id.clone()))
@@ -1324,20 +1680,16 @@ fn IssueListInner(
                             set_sort_direction.set(d);
                         })
                     />
-                    <button
-                        class=move || {
-                            if show_archived.get() {
-                                "px-2 py-1 text-xs rounded-md border border-primary bg-primary/10 text-primary transition-colors flex items-center gap-1"
-                            } else {
-                                "px-2 py-1 text-xs rounded-md border border-border text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
-                            }
-                        }
-                        on:click=move |_| set_show_archived.update(|v| *v = !*v)
-                        title="Show archived issues"
-                    >
-                        <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
-                        {move || if show_archived.get() { "Hide archived" } else { "Show archived" }}
-                    </button>
+                    // Group-by dropdown — only shown for workspace-scoped views
+                    // (grouping by team only makes sense when viewing issues across teams).
+                    <Show when=move || resolved_team.get().is_none()>
+                        <GroupDropdown
+                            field=Signal::derive(move || group_by.get())
+                            on_change=Callback::new(move |f: GroupField| {
+                                set_group_by.set(f);
+                            })
+                        />
+                    </Show>
                     // "Save view" — always visible, disabled when no filters active
                     <Button
                         variant=ButtonVariant::Ghost
@@ -1384,13 +1736,108 @@ fn IssueListInner(
                             />
                         }.into_any()
                     }
+                } else if is_search_active.get() {
+                    view! {
+                        <div class="flex-1 overflow-y-auto">
+                            {move || {
+                                let groups = grouped_search_results.get();
+                                let query = debounced_search.get();
+
+                                if !query.trim().is_empty() && search_resource.get().is_none() && groups.is_empty() {
+                                    view! {
+                                        <div class="p-8 text-center text-muted-foreground text-sm">
+                                            "Searching..."
+                                        </div>
+                                    }.into_any()
+                                } else if let Some(err) = search_error.get() {
+                                    view! {
+                                        <div class="mx-4 mt-4">
+                                            <Alert variant=AlertVariant::Error>
+                                                {err}
+                                            </Alert>
+                                        </div>
+                                    }.into_any()
+                                } else if groups.is_empty() && !query.trim().is_empty() {
+                                    view! {
+                                        <div class="p-8 text-center">
+                                            <p class="text-muted-foreground text-sm">
+                                                {format!("No results for \"{query}\"")}
+                                            </p>
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    let total_matches: usize = groups.iter().map(|(_, m)| m.len()).sum();
+                                    view! {
+                                        <div>
+                                            <div class="px-5 py-2 text-xs text-muted-foreground border-b border-border">
+                                                {format!("{} {} found", total_matches, if total_matches == 1 { "result" } else { "results" })}
+                                            </div>
+                                            <div role="list">
+                                                {groups.into_iter().map(|(_, matches)| {
+                                                    let issue_key = format!("{}-{}", matches[0].team_key, matches[0].number);
+                                                    let issue_href = format!("/issues/{issue_key}");
+                                                    let status = IssueStatusVariant::parse(&matches[0].status_category, &matches[0].status_name);
+                                                    let title = matches[0].title.clone();
+                                                    let priority = matches[0].priority;
+
+                                                    let snippet_views = matches.into_iter().map(|m| {
+                                                        let field_label = match m.match_field.as_str() {
+                                                            "title" => "Title",
+                                                            "description" => "Description",
+                                                            "comment" => "Comment",
+                                                            _ => "Match",
+                                                        };
+                                                        let snippet_html = m.snippet.as_deref()
+                                                            .map(render_snippet_html)
+                                                            .unwrap_or_default();
+                                                        view! {
+                                                            <div class="flex items-start gap-1.5 text-xs">
+                                                                <span class="shrink-0 px-1 py-0.5 rounded bg-surface-alt text-muted-foreground font-medium">
+                                                                    {field_label}
+                                                                </span>
+                                                                <span
+                                                                    class="text-muted-foreground truncate"
+                                                                    inner_html=snippet_html
+                                                                />
+                                                            </div>
+                                                        }
+                                                    }).collect_view();
+
+                                                    view! {
+                                                        <a
+                                                            href=issue_href
+                                                            class="block px-3 py-2 border-b border-border hover:bg-surface-alt transition-colors cursor-pointer no-underline text-inherit"
+                                                            role="listitem"
+                                                        >
+                                                            <div class="flex items-center gap-2.5">
+                                                                <PriorityIndicator priority=priority/>
+                                                                <IssueStatusBadge status=status/>
+                                                                <span class="font-mono text-xs text-muted-foreground shrink-0">
+                                                                    {issue_key}
+                                                                </span>
+                                                                <span class="text-sm font-medium text-foreground truncate">
+                                                                    {title}
+                                                                </span>
+                                                            </div>
+                                                            <div class="ml-[52px] mt-1 space-y-0.5">
+                                                                {snippet_views}
+                                                            </div>
+                                                        </a>
+                                                    }
+                                                }).collect_view()}
+                                            </div>
+                                        </div>
+                                    }.into_any()
+                                }
+                            }}
+                        </div>
+                    }.into_any()
                 } else {
                     view! {
                         <div class="flex-1 overflow-y-auto">
                             {move || {
                                 let list = sorted_issues.get();
 
-                                // Update keyboard navigation bounds.
                                 issue_count.set(list.len());
                                 issue_identifiers.set(list.iter().map(|i| format!("{}-{}", i.team_key, i.number)).collect());
                                 if let Some(idx) = selected_index.get_untracked()
@@ -1399,40 +1846,159 @@ fn IssueListInner(
                                     set_selected_index.set(if list.is_empty() { None } else { Some(list.len() - 1) });
                                 }
 
+                                let team_ref = resolved_team.get();
+                                // TODO: pass workspace-level default_auto_archive_days once workspace
+                                // settings are part of the SyncStore bootstrap.
+                                let ad = resolve_archive_days(team_ref.as_ref(), None);
+
                                 if list.is_empty() {
-                                    let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                    // Distinguish first-run (truly no issues in the team) from
+                                    // filtered view with no matches.
+                                    let has_team_issues = team_issues.get().iter().any(|i| ad == 0 || !is_archived(i, ad));
+
+                                    if has_team_issues {
+                                        // Filtered view — issues exist but none match the current filters.
+                                        let tab = active_tab.get();
+                                        let (title, description) = match tab.as_str() {
+                                            "active" => (
+                                                "No active issues".to_string(),
+                                                "There are no issues with an active status".to_string(),
+                                            ),
+                                            "backlog" => (
+                                                "No backlog issues".to_string(),
+                                                "There are no issues in the backlog".to_string(),
+                                            ),
+                                            _ => (
+                                                "No issues match the current filters".to_string(),
+                                                "Try adjusting or clearing your filters".to_string(),
+                                            ),
+                                        };
+                                        let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                            view! {
+                                                <Icon icon=phosphor_leptos::FUNNEL weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+                                            }.into_any()
+                                        });
                                         view! {
-                                            <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+                                            <div class="p-4 md:p-6">
+                                                <EmptyState
+                                                    icon=empty_icon
+                                                    title=title
+                                                    description=description
+                                                />
+                                            </div>
                                         }.into_any()
-                                    });
-                                    let empty_action: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                    } else {
+                                        // First-run — truly no issues in this team/workspace.
+                                        let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                            view! {
+                                                <Icon icon=phosphor_leptos::CLIPBOARD_TEXT weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
+                                            }.into_any()
+                                        });
+                                        let empty_action: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
+                                            view! {
+                                                <Button on:click=move |_| set_show_new_issue.set(true)>
+                                                    <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                                                    "New Issue"
+                                                </Button>
+                                            }.into_any()
+                                        });
                                         view! {
-                                            <Button on:click=move |_| set_show_new_issue.set(true)>
-                                                <Icon icon=phosphor_leptos::PLUS size="14px"/>
-                                                "New Issue"
-                                            </Button>
+                                            <div class="p-4 md:p-6">
+                                                <EmptyState
+                                                    icon=empty_icon
+                                                    title="No issues yet"
+                                                    description="Create your first issue to get started"
+                                                    action=empty_action
+                                                />
+                                            </div>
                                         }.into_any()
-                                    });
-                                    view! {
-                                        <div class="p-4 md:p-6">
-                                            <EmptyState
-                                                icon=empty_icon
-                                                title="No issues yet"
-                                                description="Create your first issue to get started"
-                                                action=empty_action
-                                            />
-                                        </div>
-                                    }.into_any()
+                                    }
                                 } else {
-                                    let rows = list.iter().enumerate().map(|(idx, issue)| {
-                                        let archived = is_archived(issue, ARCHIVE_DAYS);
-                                        view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index archived=archived/> }
-                                    }).collect_view();
-                                    view! {
-                                        <div role="list">
-                                            {rows}
-                                        </div>
-                                    }.into_any()
+                                    let current_group_by = group_by.get();
+                                    // Only apply grouping when workspace-scoped (not on team pages).
+                                    let effective_group = if resolved_team.get().is_some() {
+                                        GroupField::None
+                                    } else {
+                                        current_group_by
+                                    };
+
+                                    if effective_group == GroupField::None {
+                                        // Flat list — no grouping.
+                                        let rows = list.iter().enumerate().map(|(idx, issue)| {
+                                            let archived = ad > 0 && is_archived(issue, ad);
+                                            view! { <IssueRow issue=issue.clone() index=idx selected_index=selected_index archived=archived/> }
+                                        }).collect_view();
+                                        view! {
+                                            <div role="list">
+                                                {rows}
+                                            </div>
+                                        }.into_any()
+                                    } else {
+                                        // Build team_names map for display labels.
+                                        let team_names: HashMap<String, String> = sync_store
+                                            .map(|s| s.teams().get_untracked().into_iter().map(|t| (t.key.clone(), t.name.clone())).collect())
+                                            .unwrap_or_default();
+
+                                        // Grouped rendering — collapsible sections per group.
+                                        let groups = group_issues(&list, effective_group, &team_names);
+                                        let mut global_offset = 0usize;
+                                        let group_views = groups.into_iter().map(|(group_key, label, group_issues_ref)| {
+                                            let count = group_issues_ref.len();
+                                            let offset = global_offset;
+
+                                            // Lazily initialize collapse state from localStorage
+                                            // on first encounter of this group key.
+                                            if !group_collapse_state.with_untracked(|m| m.contains_key(&group_key)) {
+                                                let storage_key = format!("trakkt-group-collapsed-{}", group_key);
+                                                #[cfg(target_arch = "wasm32")]
+                                                let initial = ls_read(&storage_key).map(|v| v == "true").unwrap_or(false);
+                                                #[cfg(not(target_arch = "wasm32"))]
+                                                let initial = { let _ = &storage_key; false };
+                                                group_collapse_state.update(|m| { m.insert(group_key.clone(), initial); });
+                                            }
+
+                                            let collapsed_signal = Signal::derive({
+                                                let key = group_key.clone();
+                                                move || group_collapse_state.with(|m| *m.get(&key).unwrap_or(&false))
+                                            });
+
+                                            let on_toggle = Callback::new({
+                                                let key = group_key.clone();
+                                                move |()| {
+                                                    group_collapse_state.update(|m| {
+                                                        let v = m.entry(key.clone()).or_insert(false);
+                                                        *v = !*v;
+                                                        #[cfg(target_arch = "wasm32")]
+                                                        ls_write(&format!("trakkt-group-collapsed-{}", key), if *v { "true" } else { "false" });
+                                                    });
+                                                }
+                                            });
+
+                                            global_offset += count;
+
+                                            let issue_rows = group_issues_ref.iter().enumerate().map(|(idx, issue)| {
+                                                let archived = ad > 0 && is_archived(issue, ad);
+                                                view! { <IssueRow issue=(*issue).clone() index=offset+idx selected_index=selected_index archived=archived/> }
+                                            }).collect_view();
+
+                                            view! {
+                                                <GroupCollapsibleSection
+                                                    title=label
+                                                    count=count
+                                                    collapsed=collapsed_signal
+                                                    on_toggle=on_toggle
+                                                >
+                                                    {issue_rows}
+                                                </GroupCollapsibleSection>
+                                            }
+                                        }).collect_view();
+
+                                        view! {
+                                            <div role="list">
+                                                {group_views}
+                                            </div>
+                                        }.into_any()
+                                    }
                                 }
                             }}
                         </div>
@@ -1458,6 +2024,7 @@ fn IssueListInner(
             view_mode=Signal::derive(move || view_mode.get())
             sort_field=Signal::derive(move || sort_field.get())
             sort_direction=Signal::derive(move || sort_direction.get())
+            group_by=Signal::derive(move || group_by.get())
         />
 
         // ── Delete View confirmation dialog ────────────────────────────────
@@ -1471,6 +2038,49 @@ fn IssueListInner(
             })
             on_cancel=Callback::new(move |()| set_confirm_delete_view_id.set(None))
         />
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group Collapsible Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A collapsible section for grouped issue lists. Renders a header with team
+/// name, issue count badge, and a chevron toggle.
+///
+/// Modeled after the `CollapsibleSection` in `my_issues.rs` (lines 599-623)
+/// but accepts a `String` title for dynamic group labels.
+///
+/// Uses `Signal<bool>` + `Callback<()>` instead of `ReadSignal`/`WriteSignal`
+/// so the caller can back the state with a shared `RwSignal<HashMap>` — avoiding
+/// per-group signal/effect creation inside reactive closures.
+#[component]
+fn GroupCollapsibleSection(
+    title: String,
+    count: usize,
+    #[prop(into)]
+    collapsed: Signal<bool>,
+    on_toggle: Callback<()>,
+    children: Children,
+) -> impl IntoView {
+    view! {
+        <div class="border-b border-border">
+            <button
+                class="w-full px-5 py-2 flex items-center gap-2 text-sm font-medium text-foreground hover:bg-surface-alt transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                on:click=move |_| on_toggle.run(())
+            >
+                <span class="text-muted-foreground transition-transform" class:rotate-90=move || !collapsed.get()>
+                    <Icon icon=phosphor_leptos::CARET_RIGHT size="14px"/>
+                </span>
+                <span>{title}</span>
+                <span class="text-xs text-muted-foreground bg-surface-alt rounded-full px-1.5 py-0.5 min-w-[20px] text-center">
+                    {count}
+                </span>
+            </button>
+            <div class="overflow-hidden" class:hidden=move || collapsed.get()>
+                {children()}
+            </div>
+        </div>
     }
 }
 
@@ -1507,7 +2117,7 @@ pub(crate) fn NewIssueModal(
     let (error_msg, set_error_msg) = signal(Option::<String>::None);
 
     // Reset form state when modal opens — signals are reset synchronously
-    // before StyledSelect reconstructs, ensuring clean state on every open.
+    // before Select reconstructs, ensuring clean state on every open.
     Effect::new(move || {
         if show.get() {
             set_title.set(String::new());
@@ -1670,16 +2280,17 @@ pub(crate) fn NewIssueModal(
                     <label class="text-sm font-medium text-foreground">
                         "Priority"
                     </label>
-                    <StyledSelect
-                        value=priority.get_untracked()
-                        options=vec![
-                            ("0", "None"),
-                            ("1", "Urgent"),
-                            ("2", "High"),
-                            ("3", "Medium"),
-                            ("4", "Low"),
-                        ]
-                        on_change=move |v: String| set_priority.set(v)
+                    <Select
+                        value=priority
+                        options=Signal::derive(|| vec![
+                            ("0".to_string(), "None".to_string()),
+                            ("1".to_string(), "Urgent".to_string()),
+                            ("2".to_string(), "High".to_string()),
+                            ("3".to_string(), "Medium".to_string()),
+                            ("4".to_string(), "Low".to_string()),
+                        ])
+                        on_change=Callback::new(move |v: String| set_priority.set(v))
+                        variant=SelectVariant::Form
                     />
                 </div>
             </form>
@@ -1712,6 +2323,9 @@ pub(crate) fn SaveViewModal(
     /// Current sort direction.
     #[prop(optional, into)]
     sort_direction: Option<Signal<SortDirection>>,
+    /// Current group-by field.
+    #[prop(optional, into)]
+    group_by: Option<Signal<GroupField>>,
 ) -> impl IntoView {
     let (name, set_name) = signal(String::new());
     let (submitting, set_submitting) = signal(false);
@@ -1735,10 +2349,14 @@ pub(crate) fn SaveViewModal(
         let team_id_val = team_id.get_untracked().unwrap_or_default();
 
         // Serialize using the new ViewFilters format.
+        let group_by_val = group_by.map(|s| s.get_untracked());
         let filters = ViewFilters {
             clauses: filter_clauses.get_untracked(),
             sort_field: sort_field.map(|s| sort_field_to_str(s.get_untracked()).to_string()),
             sort_direction: sort_direction.map(|s| s.get_untracked().as_str().to_string()),
+            group_by: group_by_val
+                .filter(|g| *g != GroupField::None)
+                .map(|g| g.as_str().to_string()),
         };
         let filters_str = match serde_json::to_string(&filters) {
             Ok(s) => s,
@@ -1751,6 +2369,7 @@ pub(crate) fn SaveViewModal(
 
         let display_options = serde_json::json!({
             "view_type": view_mode.get_untracked(),
+            "group_by": group_by_val.map(|g| g.as_str()).unwrap_or("none"),
         });
         let display_str = display_options.to_string();
 

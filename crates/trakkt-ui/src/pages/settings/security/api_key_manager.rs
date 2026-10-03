@@ -14,7 +14,7 @@ use phosphor_leptos::Icon;
 use crate::components::{
     Alert, AlertDescription, AlertVariant, Badge, BadgeVariant, Button, ButtonSize, ButtonVariant,
     Card, CardContent, CardDescription, CardHeader, CardTitle, ConfirmDialog, EmptyState,
-    Checkbox, Modal, ModalSize,
+    Checkbox, Modal, ModalSize, Select, SelectVariant,
 };
 use crate::components::INPUT_CLASS;
 use crate::server_fns::security::{
@@ -27,9 +27,12 @@ const AVAILABLE_SCOPES: &[(&str, &str)] = &[
     ("issues:read", "Read issues"),
     ("issues:write", "Create/update issues"),
     ("comments:write", "Add comments"),
+    ("attachments:read", "Download/list attachments"),
+    ("attachments:write", "Manage issue attachments"),
     ("labels:read", "Read labels"),
     ("labels:write", "Create/update labels"),
     ("teams:read", "Read teams"),
+    ("teams:write", "Update team settings"),
     ("projects:read", "Read projects"),
     ("projects:write", "Create/update projects"),
 ];
@@ -63,9 +66,12 @@ pub fn ApiKeyManager() -> impl IntoView {
     let create_name = RwSignal::new(String::new());
     let create_scopes = RwSignal::new(Vec::<String>::new());
     let create_expires = RwSignal::new(Option::<i32>::None);
+    let (expiry_str, set_expiry_str) = signal(String::new());
     let creating = RwSignal::new(false);
     let created_token = RwSignal::new(Option::<CreateApiKeyResult>::None);
     let copied = RwSignal::new(false);
+    let copied_curl = RwSignal::new(false);
+    let copied_mcp = RwSignal::new(false);
 
     // ── Confirm dialog state ─────────────────────────────────────────────
     let dialog_open = RwSignal::new(false);
@@ -93,8 +99,11 @@ pub fn ApiKeyManager() -> impl IntoView {
         create_name.set(String::new());
         create_scopes.set(Vec::new());
         create_expires.set(None);
+        set_expiry_str.set(String::new());
         created_token.set(None);
         copied.set(false);
+        copied_curl.set(false);
+        copied_mcp.set(false);
         create_modal_open.set(true);
     };
 
@@ -103,7 +112,19 @@ pub fn ApiKeyManager() -> impl IntoView {
         // If a token was just created, refresh the list
         if created_token.get_untracked().is_some() {
             loading.set(true);
-            keys_resource.refetch();
+            error.set(None);
+            leptos::task::spawn_local(async move {
+                match list_api_keys().await {
+                    Ok(data) => {
+                        keys.set(data);
+                        loading.set(false);
+                    }
+                    Err(e) => {
+                        error.set(Some(format!("Failed to reload API keys: {e}")));
+                        loading.set(false);
+                    }
+                }
+            });
         }
     });
 
@@ -129,23 +150,27 @@ pub fn ApiKeyManager() -> impl IntoView {
         });
     };
 
+    // Copy `text` to the clipboard and flash the given `flag` signal for 2 s.
+    let copy_text = move |text: String, flag: RwSignal<bool>| {
+        leptos::task::spawn_local(async move {
+            #[cfg(target_arch = "wasm32")]
+            {
+                if copy_to_clipboard(&text).await {
+                    flag.set(true);
+                    gloo_timers::future::TimeoutFuture::new(2000).await;
+                    flag.set(false);
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = (text, flag);
+            }
+        });
+    };
+
     let handle_copy = move |_| {
         if let Some(token_result) = created_token.get_untracked() {
-            let token = token_result.token.clone();
-            leptos::task::spawn_local(async move {
-                #[cfg(target_arch = "wasm32")]
-                {
-                    if copy_to_clipboard(&token).await {
-                        copied.set(true);
-                        gloo_timers::future::TimeoutFuture::new(2000).await;
-                        copied.set(false);
-                    }
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let _ = token;
-                }
-            });
+            copy_text(token_result.token, copied);
         }
     };
 
@@ -181,7 +206,16 @@ pub fn ApiKeyManager() -> impl IntoView {
             match revoke_api_key(token_id).await {
                 Ok(_) => {
                     loading.set(true);
-                    keys_resource.refetch();
+                    match list_api_keys().await {
+                        Ok(data) => {
+                            keys.set(data);
+                            loading.set(false);
+                        }
+                        Err(e) => {
+                            error.set(Some(format!("Failed to reload API keys: {e}")));
+                            loading.set(false);
+                        }
+                    }
                 }
                 Err(e) => {
                     error.set(Some(format!("Failed to revoke API key: {e}")));
@@ -320,23 +354,58 @@ pub fn ApiKeyManager() -> impl IntoView {
             show=Signal::from(create_modal_open)
             on_close=close_create_modal
             title="Create API Key"
-            size=ModalSize::Md
+            size=ModalSize::Lg
         >
             <Show
                 when=move || created_token.get().is_none()
                 fallback=move || {
-                    // Success state — show the token
+                    // Success state — show the token + usage instructions
                     let token_display = move || {
                         created_token.get().map(|r| r.token).unwrap_or_default()
                     };
+                    #[cfg(target_arch = "wasm32")]
+                    let origin = web_sys::window()
+                        .and_then(|w| w.location().origin().ok())
+                        .unwrap_or_else(|| "https://trakkt.app".to_string());
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let origin = "https://trakkt.app".to_string();
+                    let origin_a = origin.clone();
+                    let origin_b = origin.clone();
+                    let origin_c = origin.clone();
+                    let origin_d = origin;
+                    let curl_snippet = move || {
+                        let tok = created_token.get().map(|r| r.token).unwrap_or_default();
+                        format!("curl -H \"Authorization: Bearer {tok}\" {origin_a}/api/v1/issues")
+                    };
+                    let curl_snippet_copy = move || {
+                        let tok = created_token.get().map(|r| r.token).unwrap_or_default();
+                        format!("curl -H \"Authorization: Bearer {tok}\" {origin_b}/api/v1/issues")
+                    };
+                    let mcp_snippet = move || {
+                        let tok = created_token.get().map(|r| r.token).unwrap_or_default();
+                        format!(
+                            "{{\n  \"mcpServers\": {{\n    \"trakkt\": {{\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"@anthropic-ai/mcp-remote\", \"{origin_c}/mcp\"],\n      \"env\": {{\n        \"TRAKKT_API_KEY\": \"{tok}\"\n      }}\n    }}\n  }}\n}}"
+                        )
+                    };
+                    let mcp_snippet_copy = move || {
+                        let tok = created_token.get().map(|r| r.token).unwrap_or_default();
+                        format!(
+                            "{{\n  \"mcpServers\": {{\n    \"trakkt\": {{\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"@anthropic-ai/mcp-remote\", \"{origin_d}/mcp\"],\n      \"env\": {{\n        \"TRAKKT_API_KEY\": \"{tok}\"\n      }}\n    }}\n  }}\n}}"
+                        )
+                    };
+                    let scopes_snapshot = create_scopes.get_untracked();
+
                     view! {
-                        <div class="space-y-4">
+                        <div class="space-y-5">
+                            // Warning — always at the top
                             <Alert variant=AlertVariant::Warning>
                                 <AlertDescription>
                                     <strong>"Important:"</strong>
-                                    " Make sure to copy your API key now. You won't be able to see it again!"
+                                    " Make sure to copy your API key now. You won\u{2019}t be able to see it again!"
                                 </AlertDescription>
                             </Alert>
+
+                            // ── Token ────────────────────────────────────────
                             <div class="space-y-2">
                                 <label class="text-sm font-medium text-foreground">"Your API Key"</label>
                                 <div class="flex items-center gap-2">
@@ -345,12 +414,77 @@ pub fn ApiKeyManager() -> impl IntoView {
                                     </code>
                                     <Button
                                         variant=ButtonVariant::Secondary
+                                        size=ButtonSize::Sm
                                         on:click=handle_copy
                                     >
                                         {move || if copied.get() { "Copied!" } else { "Copy" }}
                                     </Button>
                                 </div>
                             </div>
+
+                            // ── Usage instructions ───────────────────────────
+                            <div class="space-y-4 border-t border-border pt-4">
+                                <h3 class="text-sm font-medium text-foreground">"Usage"</h3>
+
+                                // curl example
+                                <div class="space-y-1.5">
+                                    <div class="flex items-center justify-between">
+                                        <label class="text-xs font-medium text-muted-foreground">"REST API (curl)"</label>
+                                        <Button
+                                            variant=ButtonVariant::Ghost
+                                            size=ButtonSize::Sm
+                                            on:click=move |_| copy_text(curl_snippet_copy(), copied_curl)
+                                        >
+                                            {move || if copied_curl.get() { "Copied!" } else { "Copy" }}
+                                        </Button>
+                                    </div>
+                                    <pre class="px-3 py-2 bg-muted border border-border rounded-md text-xs font-mono whitespace-pre-wrap break-all select-all overflow-x-auto">
+                                        {curl_snippet}
+                                    </pre>
+                                </div>
+
+                                // MCP config
+                                <div class="space-y-1.5">
+                                    <div class="flex items-center justify-between">
+                                        <label class="text-xs font-medium text-muted-foreground">"MCP Setup (Claude Code)"</label>
+                                        <Button
+                                            variant=ButtonVariant::Ghost
+                                            size=ButtonSize::Sm
+                                            on:click=move |_| copy_text(mcp_snippet_copy(), copied_mcp)
+                                        >
+                                            {move || if copied_mcp.get() { "Copied!" } else { "Copy" }}
+                                        </Button>
+                                    </div>
+                                    <pre class="px-3 py-2 bg-muted border border-border rounded-md text-xs font-mono whitespace-pre-wrap break-all select-all overflow-x-auto">
+                                        {mcp_snippet}
+                                    </pre>
+                                </div>
+                            </div>
+
+                            // ── Scope summary ────────────────────────────────
+                            <div class="space-y-2 border-t border-border pt-4">
+                                <h3 class="text-sm font-medium text-foreground">"Scopes"</h3>
+                                {if scopes_snapshot.is_empty() {
+                                    view! {
+                                        <p class="text-xs text-muted-foreground">"No scopes selected \u{2014} this key has no permissions."</p>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <div class="flex flex-wrap gap-1.5">
+                                            {scopes_snapshot
+                                                .into_iter()
+                                                .map(|scope| view! {
+                                                    <Badge variant=BadgeVariant::Secondary>
+                                                        <span class="text-xs font-mono">{scope}</span>
+                                                    </Badge>
+                                                })
+                                                .collect_view()}
+                                        </div>
+                                    }.into_any()
+                                }}
+                            </div>
+
+                            // ── Done button ──────────────────────────────────
                             <div class="flex justify-end pt-2">
                                 <Button
                                     variant=ButtonVariant::Default
@@ -413,10 +547,17 @@ pub fn ApiKeyManager() -> impl IntoView {
                     // Expiry
                     <div class="space-y-2">
                         <label class="text-sm font-medium text-foreground">"Expiration"</label>
-                        <select
-                            class=INPUT_CLASS
-                            on:change=move |ev| {
-                                let val = event_target_value(&ev);
+                        <Select
+                            value=expiry_str
+                            options=Signal::derive(|| vec![
+                                ("".to_string(), "No expiration".to_string()),
+                                ("30".to_string(), "30 days".to_string()),
+                                ("60".to_string(), "60 days".to_string()),
+                                ("90".to_string(), "90 days".to_string()),
+                                ("365".to_string(), "1 year".to_string()),
+                            ])
+                            on_change=Callback::new(move |val: String| {
+                                set_expiry_str.set(val.clone());
                                 create_expires.set(match val.as_str() {
                                     "30" => Some(30),
                                     "60" => Some(60),
@@ -424,14 +565,10 @@ pub fn ApiKeyManager() -> impl IntoView {
                                     "365" => Some(365),
                                     _ => None,
                                 });
-                            }
-                        >
-                            <option value="">"No expiration"</option>
-                            <option value="30">"30 days"</option>
-                            <option value="60">"60 days"</option>
-                            <option value="90">"90 days"</option>
-                            <option value="365">"1 year"</option>
-                        </select>
+                            })
+                            variant=SelectVariant::Form
+                            placeholder="No expiration"
+                        />
                     </div>
 
                     // Actions

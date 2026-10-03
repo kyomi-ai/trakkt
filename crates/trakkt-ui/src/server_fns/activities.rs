@@ -6,7 +6,7 @@
 //! resolve issue identifiers, call handler, return.
 
 use leptos::prelude::*;
-use trakkt_types::models::IssueActivity;
+use trakkt_types::models::{IssueActivity, WorkspaceActivity};
 
 #[cfg(feature = "ssr")]
 use super::{AuthenticatedContext, IntoServerFnError};
@@ -27,6 +27,36 @@ pub async fn list_issue_activities(
         issue_number: None,
     };
     let result = trakkt_api::activities::list_issue_activities(&ctx, params)
+        .await
+        .into_sfn()?;
+    serde_json::from_value(result).into_sfn()
+}
+
+/// List activity entries across all teams in the workspace, ordered by most recent first.
+#[server(prefix = "/leptos-api")]
+pub async fn list_workspace_activities(
+    team_key: Option<String>,
+    action_type: Option<String>,
+    actor_id: Option<String>,
+    action_source: Option<String>,
+    created_after: Option<String>,
+    created_before: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<WorkspaceActivity>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::ListWorkspaceActivitiesApiParams {
+        team_key,
+        action_type,
+        actor_id,
+        action_source,
+        created_after,
+        created_before,
+        limit,
+        offset,
+    };
+    let result = trakkt_api::activities::list_workspace_activities(&ctx, params)
         .await
         .into_sfn()?;
     serde_json::from_value(result).into_sfn()

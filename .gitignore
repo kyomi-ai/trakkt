@@ -16,3 +16,4 @@ e2e/.auth-cookies.json
 crates/trakkt-ui/style/output.css
 .claude/
 files.zip
+docs/book/build/

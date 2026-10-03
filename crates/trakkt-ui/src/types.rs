@@ -34,6 +34,8 @@ pub struct InvitationData {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSettingsData {
     pub workspace_name: String,
+    /// Workspace-level default auto-archive days. `None` means not configured.
+    pub default_auto_archive_days: Option<u32>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -112,6 +114,17 @@ impl IssueNavState {
 fn derive_back_label(path: &str) -> String {
     if path == "/my-issues" {
         return "My Issues".to_string();
+    }
+    // /archived → "Archived"
+    if path == "/archived" {
+        return "Archived".to_string();
+    }
+    // /teams/TRA/archived → "TRA Archived"
+    if let Some(rest) = path.strip_prefix("/teams/")
+        && rest.ends_with("/archived")
+        && let Some(key) = rest.split('/').next()
+    {
+        return format!("{key} Archived");
     }
     // /teams/TRA/issues → "TRA Issues"
     if let Some(rest) = path.strip_prefix("/teams/")

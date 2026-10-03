@@ -3,11 +3,13 @@
 pub mod billing;
 pub mod integrations;
 pub mod labels;
+pub mod live_update;
+pub mod notifications;
 pub mod profile;
 pub mod security;
 pub mod settings_shell;
 pub mod team;
-pub mod teams_settings;
+pub mod team_labels;
 pub mod workspace;
 
 pub use settings_shell::SettingsShell;

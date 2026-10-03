@@ -51,6 +51,7 @@ struct IssueRelationDetailRow {
     number: i32,
     title: String,
     status_category: String,
+    status_name: String,
     direction: String,
 }
 
@@ -64,6 +65,7 @@ impl IssueRelationDetailRow {
             number: self.number,
             title: self.title,
             status_category: self.status_category,
+            status_name: self.status_name,
             direction: self.direction,
         }
     }
@@ -75,7 +77,13 @@ struct WorkspaceIdRow {
     workspace_id: String,
 }
 
-const VALID_RELATION_TYPES: &[&str] = &["blocks", "parent", "duplicate"];
+/// Internal row type for single-column ID queries.
+#[derive(sqlx::FromRow)]
+struct IdRow {
+    target_issue_id: String,
+}
+
+const VALID_RELATION_TYPES: &[&str] = &["blocks", "parent", "duplicate", "relates_to"];
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -102,15 +110,7 @@ async fn validate_no_circular_blocking(
                 "Circular blocking chain: this would create a cycle".to_string(),
             ));
         }
-        let blocked: Vec<String> = trakkt_core::db_with_pool!(db, |p| {
-            sqlx::query_scalar::<_, String>(
-                "SELECT target_issue_id FROM issue_relations \
-                 WHERE source_issue_id = $1 AND relation_type = 'blocks'",
-            )
-            .bind(&current_id)
-            .fetch_all(p)
-            .await
-        })?;
+        let blocked = find_blocked_issue_ids(db, &current_id).await?;
         for next in blocked {
             queue.push_back(next);
         }
@@ -184,6 +184,26 @@ async fn validate_single_duplicate(
     Ok(())
 }
 
+// ─── Blocked-issue lookup ──────────────────────────────────────────────────
+
+/// Returns the IDs of all issues that `blocker_issue_id` is blocking.
+///
+/// Queries the `issue_relations` table for rows where the source (blocker) is
+/// `blocker_issue_id` and the relation type is "blocks".
+pub async fn find_blocked_issue_ids(
+    db: &DbPool,
+    blocker_issue_id: &str,
+) -> trakkt_core::Result<Vec<String>> {
+    let rows: Vec<IdRow> = trakkt_core::db_fetch_all!(
+        db,
+        IdRow,
+        "SELECT target_issue_id FROM issue_relations \
+         WHERE source_issue_id = $1 AND relation_type = 'blocks'",
+        blocker_issue_id
+    )?;
+    Ok(rows.into_iter().map(|r| r.target_issue_id).collect())
+}
+
 // ─── Service functions ──────────────────────────────────────────────────────
 
 /// Fetch a single relation by ID and workspace (returns `None` if not found).
@@ -211,6 +231,21 @@ pub async fn get_relation_by_id(
 /// - The source and target are different issues
 /// - Both issues exist and belong to the same workspace
 /// - No circular blocking chain would be created
+///
+/// Every validation above runs on the pool, before the transaction opens, and
+/// has to stay there: they walk the relation graph with `&DbPool` queries, and
+/// the SQLite pool is pinned to a single connection which the transaction holds
+/// for its whole lifetime. A validation moved inside it would block waiting for
+/// a connection only the transaction can release, until the pool's acquire
+/// timeout elapsed — 30s, the sqlx default, which the SQLite branch of
+/// `DbPool::connect` does not override — and then fail with `PoolTimedOut` (see
+/// `DbTx`). So the cost is a request that stalls for half a minute and then
+/// errors, not one that never returns. They are also pure reads of state that
+/// predates the INSERT, so there is nothing to gain by moving them.
+///
+/// The INSERT and its `sync_log` entry are one transaction: a relation that
+/// commits without its sync row is invisible to every future delta, so a failed
+/// log write rolls the relation back rather than leaving it stranded.
 pub async fn create_relation(
     db: &DbPool,
     workspace_id: &str,
@@ -218,6 +253,8 @@ pub async fn create_relation(
     target_issue_id: &str,
     relation_type: &str,
     created_by: Option<&str>,
+    action_source: trakkt_types::enums::ActionSource,
+    action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<IssueRelation> {
     // Self-relation check.
@@ -291,8 +328,20 @@ pub async fn create_relation(
             (relation_id, workspace_id, source_issue_id, target_issue_id, relation_type, created_by, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, {now})"
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    // The UNIQUE(source, target, type) violation is a user-visible "you already
+    // have this relation", not a server fault, so it is mapped before the `?`.
+    // The mapping survives the move off `db_execute!` because both macros leave
+    // the error as `sqlx::Error` and the driver builds it, not the executor: the
+    // violation still arrives as `Error::Database` carrying the backend's code
+    // and message. Pinned by
+    // `sync_log_service::tests::a_duplicate_relation_is_rejected_as_a_bad_request`,
+    // which asserts the variant; on SQLite the error it observes is code 2067,
+    // message "UNIQUE constraint failed: …". Returning here drops `tx`, which
+    // queues a rollback (see `DbTx`).
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &relation_id,
         workspace_id,
@@ -317,9 +366,10 @@ pub async fn create_relation(
         trakkt_core::Error::from(e)
     })?;
 
-    // Re-fetch to get DB-assigned timestamps.
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    // Re-fetch to get DB-assigned timestamps. The row does not exist outside the
+    // transaction yet, so the read runs on it.
+    let row = trakkt_core::tx_fetch_one!(
+        &mut tx,
         IssueRelationRow,
         "SELECT relation_id, workspace_id, source_issue_id, target_issue_id, \
                 relation_type, created_by, \
@@ -329,31 +379,111 @@ pub async fn create_relation(
     )?;
     let relation = row.into_dto();
 
-    // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
+    // One payload for the persisted entry and the live frame alike. The stored
+    // entry used to be `None` while the broadcast carried the serialized
+    // relation, so a client that reconnected replayed a payload-less insert —
+    // which `cache/apply.rs` drops at its data-less guard, leaving issue
+    // relations permanently absent from delta sync.
+    let payload = sync_log_service::sync_payload(
+        &relation,
+        entity_types::ISSUE_RELATION,
+        &relation.relation_id,
+    );
+
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::ISSUE_RELATION,
         &relation.relation_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
-        None,
+        payload,
+        ws_manager,
     )
-    .await
-    {
-        tracing::warn!(error = %e, relation_id = %relation.relation_id, "Failed to write sync log for relation create");
-    }
+    .await?;
 
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::ISSUE_RELATION,
-            &relation.relation_id,
-            SyncActionType::Insert,
-            serde_json::to_value(&relation).ok(),
-        )
-        .await;
+    // ── Notification trigger for relation_added (best-effort) ────────
+    // Runs on the pool, strictly after the commit above released it.
+    if let Some(actor_id) = created_by {
+        // Gather watchers from both source and target issues.
+        let source_watchers = crate::watcher_service::list_watchers_of_issue(db, source_issue_id).await;
+        let target_watchers = crate::watcher_service::list_watchers_of_issue(db, target_issue_id).await;
+
+        let mut all_watcher_ids = std::collections::HashSet::new();
+        if let Ok(ref ids) = source_watchers {
+            for id in ids {
+                all_watcher_ids.insert(id.clone());
+            }
+        } else if let Err(ref e) = source_watchers {
+            tracing::warn!(error = %e, "Failed to list watchers for source issue in relation notification");
+        }
+        if let Ok(ref ids) = target_watchers {
+            for id in ids {
+                all_watcher_ids.insert(id.clone());
+            }
+        } else if let Err(ref e) = target_watchers {
+            tracing::warn!(error = %e, "Failed to list watchers for target issue in relation notification");
+        }
+
+        if !all_watcher_ids.is_empty() {
+            let all_watcher_vec: Vec<String> = all_watcher_ids.iter().cloned().collect();
+            let prefs_map = match crate::notification_service::batch_get_preferences(
+                db, &all_watcher_vec, workspace_id,
+            )
+            .await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to fetch notification preferences for relation notification");
+                    std::collections::HashMap::new()
+                }
+            };
+
+            // Notify watchers of both issues about the relation.
+            // Source issue watchers get notified on the source issue,
+            // target issue watchers get notified on the target issue.
+            // Build (issue_id, watcher_ids) pairs to iterate.
+            let mut notify_pairs: Vec<(&str, &[String])> = Vec::new();
+            if let Ok(ref ids) = source_watchers {
+                notify_pairs.push((source_issue_id, ids));
+            }
+            if let Ok(ref ids) = target_watchers {
+                notify_pairs.push((target_issue_id, ids));
+            }
+
+            for (issue_id, watcher_ids) in notify_pairs {
+                for watcher_id in watcher_ids {
+                    if crate::notification_service::should_suppress_self_notification(
+                        watcher_id, actor_id, action_source, &prefs_map,
+                    ) {
+                        continue;
+                    }
+
+                    let type_enabled = prefs_map
+                        .get(watcher_id.as_str())
+                        .is_none_or(|p| p.notify_relation_changes);
+                    if !type_enabled {
+                        continue;
+                    }
+
+                    if let Err(e) = crate::notification_service::create_notification(
+                        db,
+                        workspace_id,
+                        watcher_id,
+                        issue_id,
+                        crate::notification_service::TYPE_RELATION_ADDED,
+                        Some(actor_id),
+                        None,
+                        action_source,
+                        action_source_label,
+                        ws_manager,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "Failed to create relation_added notification");
+                    }
+                }
+            }
+        }
     }
 
     Ok(relation)
@@ -362,53 +492,46 @@ pub async fn create_relation(
 /// Delete a relation by ID.
 ///
 /// Verifies the relation belongs to the specified workspace before deleting.
+///
+/// The DELETE and its `sync_log` entry are one transaction: a delete that
+/// commits without its sync row leaves the relation on every other client
+/// forever, and no later delta can repair it — the row it would have to re-read
+/// is gone.
 pub async fn delete_relation(
     db: &DbPool,
     relation_id: &str,
     workspace_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM issue_relations WHERE relation_id = $1 AND workspace_id = $2",
         relation_id,
         workspace_id
     )?;
 
     if result.rows_affected() == 0 {
+        // `tx` is dropped here, which rolls it back (see `DbTx`).
         return Err(trakkt_core::Error::NotFound(
             "Relation not found".to_string(),
         ));
     }
 
-    // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
+    // The sync entry follows the DELETE it describes; a delete carries no
+    // payload, since there is no row left to send.
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::ISSUE_RELATION,
         relation_id,
         workspace_id,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Delete,
         None,
+        ws_manager,
     )
     .await
-    {
-        tracing::warn!(error = %e, relation_id = %relation_id, "Failed to write sync log for relation delete");
-    }
-
-    // WebSocket broadcast — delete has no entity data.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::ISSUE_RELATION,
-            relation_id,
-            SyncActionType::Delete,
-            None,
-        )
-        .await;
-    }
-
-    Ok(())
 }
 
 /// List all relations for an issue, from both perspectives.
@@ -438,6 +561,7 @@ pub async fn list_relations_for_issue(
             other_i.number, \
             other_i.title, \
             s.category AS status_category, \
+            s.name AS status_name, \
             CASE \
                 WHEN r.source_issue_id = $1 AND r.relation_type = 'blocks' THEN 'blocks' \
                 WHEN r.target_issue_id = $1 AND r.relation_type = 'blocks' THEN 'blocked_by' \
@@ -445,6 +569,8 @@ pub async fn list_relations_for_issue(
                 WHEN r.target_issue_id = $1 AND r.relation_type = 'parent' THEN 'child_of' \
                 WHEN r.source_issue_id = $1 AND r.relation_type = 'duplicate' THEN 'duplicate' \
                 WHEN r.target_issue_id = $1 AND r.relation_type = 'duplicate' THEN 'has_duplicate' \
+                WHEN r.source_issue_id = $1 AND r.relation_type = 'relates_to' THEN 'relates_to' \
+                WHEN r.target_issue_id = $1 AND r.relation_type = 'relates_to' THEN 'relates_to' \
                 ELSE r.relation_type \
             END AS direction \
          FROM issue_relations r \
@@ -494,6 +620,8 @@ pub async fn set_parent(
     child_issue_id: &str,
     parent_issue_id: &str,
     created_by: Option<&str>,
+    action_source: trakkt_types::enums::ActionSource,
+    action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<IssueRelation> {
     // Clear any existing parent first (idempotent).
@@ -507,6 +635,8 @@ pub async fn set_parent(
         child_issue_id,
         "parent",
         created_by,
+        action_source,
+        action_source_label,
         ws_manager,
     )
     .await

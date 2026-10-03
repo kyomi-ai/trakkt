@@ -22,10 +22,10 @@ use leptos_router::hooks::{use_location, use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
+    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CopyLinkButton,
     DatePicker, DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
-    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Skeleton, StyledSelect,
+    LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Select, SelectVariant, Skeleton,
     ToggleButton,
 };
 use crate::pages::issues::issue_list::NewIssueModal;
@@ -39,65 +39,20 @@ use crate::server_fns::projects::list_milestones;
 use crate::server_fns::relations::{add_relation, list_issue_relations, remove_relation};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::team::list_workspace_members;
+use crate::server_fns::stars::{is_starred, star_issue, unstar_issue};
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
 use crate::types::{IssueNavState, WorkspaceMember};
+use crate::utils::github::github_author_login_from_metadata;
 use crate::utils::relative_time::{format_datetime, relative_time};
 use trakkt_types::models::{Comment, IssueActivity, IssueWithDetails};
+#[cfg(target_arch = "wasm32")]
+use leptos::task::spawn_local;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared kode theme builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a kode `Theme` matching Trakkt's design system (warm light palette).
-///
-/// Since kode's `Theme` is `#[non_exhaustive]`, we start from `Theme::light()`
-/// and override the fields we need.
-pub(crate) fn trakkt_kode_theme() -> kode_leptos::Theme {
-    let mut t = kode_leptos::Theme::light();
-    // Colors use CSS var() references so they follow Trakkt's light/dark
-    // mode automatically. The actual values live in main.css :root block
-    // which maps --kode-* vars to --color-* design tokens.
-    t.bg = "var(--color-card)";
-    t.fg = "var(--color-foreground)";
-    t.fg_bright = "var(--color-foreground)";
-    t.fg_dim = "var(--color-muted-foreground)";
-    t.cursor = "var(--color-foreground)";
-    t.selection = "rgba(13, 148, 136, 0.15)";
-    t.current_line = "transparent";
-    t.gutter_fg = "var(--color-muted-foreground)";
-    t.gutter_border = "var(--color-border)";
-    t.border = "var(--color-border)";
-    t.accent = "var(--color-primary)";
-    t.bg_highlight = "var(--color-accent)";
-    t.bg_hover = "var(--color-accent)";
-    t.marker_error = "#DC2626";
-    t.marker_warning = "#CA8A04";
-    t.marker_info = "#2563EB";
-    t.marker_hint = "var(--color-muted-foreground)";
-    t.code_fg = "var(--color-primary)";
-    t.link = "var(--color-primary)";
-    t.syntax = kode_leptos::SyntaxTheme::GithubLight;
-    // Typography — DESIGN.md fonts
-    t.content_font_family = Some("'DM Sans', sans-serif");
-    t.heading_font_family = Some("'Instrument Serif', serif");
-    t.code_font_family = Some("'Geist Mono', monospace");
-    t.font_family = Some("'Geist Mono', monospace");
-    // Content layout
-    t.content_max_width = Some("100%");
-    t.container_padding = Some("0");
-    // Toolbar styling — also uses CSS vars for dark mode
-    t.toolbar_bg = Some("var(--color-card)");
-    t.toolbar_border_color = Some("var(--color-border)");
-    t.toolbar_button_border_radius = Some("6px");
-    t.toolbar_button_hover_bg = Some("var(--color-accent)");
-    t.toolbar_button_selected_bg = Some("var(--color-primary)");
-    t.toolbar_button_selected_color = Some("#FFFFFF");
-    // Heading styling
-    t.heading_font_weight = Some("600");
-    t.h1_border_width = Some("0");
-    t.h2_border_width = Some("0");
-    t
-}
+pub(crate) use crate::components::description::trakkt_kode_theme;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue Detail Page
@@ -149,6 +104,16 @@ pub fn IssueDetailPage() -> impl IntoView {
         server_issue.get()
     });
 
+    let copy_path = Signal::derive(move || {
+        let issue = issue_data.get()?.ok()??;
+        crate::components::copy_link::issue_link_path(
+            &team_key.get(),
+            number.get(),
+            &issue.team_key,
+            issue.number,
+        )
+    });
+
     // Only tracks load-state transitions (Loading → Loaded, etc.),
     // not SyncStore data changes. Prevents IssueDetailContent from being
     // recreated on every WebSocket update.
@@ -183,10 +148,6 @@ pub fn IssueDetailPage() -> impl IntoView {
                 }
             })
     };
-    let back_path = nav_state
-        .as_ref()
-        .map(|s| s.back_path.clone())
-        .unwrap_or_else(|| "/my-issues".to_string());
     let back_label = nav_state
         .as_ref()
         .map(|s| s.back_label.clone())
@@ -195,21 +156,35 @@ pub fn IssueDetailPage() -> impl IntoView {
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Header ─────────────────────────────────────────────────────
-            <div class="page-header h-14 px-5 flex items-center gap-3 shrink-0">
+            <div class="page-header min-h-14 px-5 py-2 flex flex-wrap items-center gap-3 shrink-0">
                 <Button
                     variant=ButtonVariant::GhostMuted
                     size=ButtonSize::IconSm
                     aria_label=format!("Back to {back_label}")
-                    on:click={
-                        let back_path = back_path.clone();
-                        move |_| {
+                    on:click=move |_| {
+                        let Some(win) = web_sys::window() else {
+                            tracing::warn!("back button: no window object");
+                            return;
+                        };
+                        let Ok(history) = win.history() else {
+                            tracing::warn!("back button: window.history() unavailable");
                             let nav = use_navigate();
-                            nav(&back_path, Default::default());
+                            nav("/my-issues", Default::default());
+                            return;
+                        };
+                        if history.length().unwrap_or(0) > 1 {
+                            if let Err(e) = history.back() {
+                                tracing::warn!("history.back() failed: {e:?}");
+                            }
+                        } else {
+                            let nav = use_navigate();
+                            nav("/my-issues", Default::default());
                         }
                     }
                 >
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>
                 </Button>
+                <CopyLinkButton path=copy_path/>
                 <span class="font-mono text-sm text-muted-foreground">
                     {move || format!("{}-{}", team_key.get(), number.get())}
                 </span>
@@ -217,34 +192,42 @@ pub fn IssueDetailPage() -> impl IntoView {
 
             // ── Content ────────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto p-4 md:p-6">
+                // Non-loaded states: loading, not-found, error
                 {move || {
                     match page_state.get() {
-                        PageState::Loaded(_, _) => {
-                            let issue = match issue_data.get_untracked() {
-                                Some(Ok(Some(i))) => i,
-                                _ => return view! { <IssueDetailSkeleton/> }.into_any(),
-                            };
-                            view! {
-                                <IssueDetailContent
-                                    initial_issue=issue
-                                />
-                            }.into_any()
-                        }
-                        PageState::NotFound => {
-                            view! { <IssueNotFound identifier=format!("{}-{}", team_key.get(), number.get())/> }.into_any()
-                        }
-                        PageState::Error => {
-                            view! {
-                                <div class="max-w-[860px] mx-auto w-full text-center py-16">
-                                    <p class="text-muted-foreground">"Failed to load issue. Please try again."</p>
-                                </div>
-                            }.into_any()
-                        }
-                        PageState::Loading => {
-                            view! { <IssueDetailSkeleton/> }.into_any()
-                        }
+                        PageState::Loading => Some(view! { <IssueDetailSkeleton/> }.into_any()),
+                        PageState::NotFound => Some(view! { <IssueNotFound identifier=format!("{}-{}", team_key.get(), number.get())/> }.into_any()),
+                        PageState::Error => Some(view! {
+                            <div class="max-w-[860px] mx-auto w-full text-center py-16">
+                                <p class="text-muted-foreground">"Failed to load issue. Please try again."</p>
+                            </div>
+                        }.into_any()),
+                        PageState::Loaded(_, _) => None,
                     }
                 }}
+                // Loaded state: <For> uses (team_key, number) as key so navigating
+                // between issues (e.g. TRA-5 → TRA-7) destroys the old component
+                // and creates a new one with the correct initial_issue data.
+                // Real-time SyncStore updates within the same issue do NOT change
+                // the key, so the component is reused (no unnecessary recreation).
+                <For
+                    each=move || {
+                        match page_state.get() {
+                            PageState::Loaded(tk, num) => vec![(tk, num)],
+                            _ => vec![],
+                        }
+                    }
+                    key=|(tk, num)| (tk.clone(), *num)
+                    children=move |_| {
+                        let issue = match issue_data.get() {
+                            Some(Ok(Some(i))) => i,
+                            _ => return view! { <IssueDetailSkeleton/> }.into_any(),
+                        };
+                        view! {
+                            <IssueDetailContent initial_issue=issue />
+                        }.into_any()
+                    }
+                />
             </div>
         </div>
     }
@@ -265,40 +248,133 @@ fn IssueDetailContent(
     initial_issue: IssueWithDetails,
 ) -> impl IntoView {
     let number = initial_issue.number;
-    let issue_team_key_for_lookup = initial_issue.team_key.clone();
     let initial_team_key = initial_issue.team_key.clone();
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let initial = RwSignal::new(initial_issue);
 
+    // Defense-in-depth: read route params reactively so the SyncStore lookup
+    // targets the correct issue even if the component is somehow reused across
+    // navigations (the <For> key in IssueDetailPage should prevent this, but
+    // this provides a second layer of safety).
+    let params = use_params_map();
+    let route_identity = Memo::new(move |_| {
+        let raw = params.get().get("identifier").unwrap_or_default();
+        let parts: Vec<&str> = raw.splitn(2, '-').collect();
+        if parts.len() == 2 {
+            (parts[0].to_string(), parts[1].parse::<i32>().unwrap_or(0))
+        } else {
+            (String::new(), 0)
+        }
+    });
+
     let issue = Memo::new(move |_| {
+        let (tk, num) = route_identity.get();
+        // Use reactive route params if valid, fall back to initial_issue
+        let (lookup_tk, lookup_num) = if !tk.is_empty() && num > 0 {
+            (tk, num)
+        } else {
+            let init = initial.get_untracked();
+            (init.team_key.clone(), init.number)
+        };
+
         if let Some(store) = sync_store {
             let items = store.issues().get();
-            if let Some(found) = items.iter().find(|i| i.team_key == issue_team_key_for_lookup && i.number == number) {
+            if let Some(found) = items.iter().find(|i| i.team_key == lookup_tk && i.number == lookup_num) {
                 return found.clone();
             }
         }
-        initial.get()
+        initial.get_untracked()
     });
 
-    // ── Comments: derived from SyncStore (real-time via WebSocket) ────
-    let issue_id_for_comments = initial.get_untracked().issue_id.clone();
-    let comments = Memo::new(move |_| {
-        sync_store.map(|store| {
-            let mut filtered: Vec<Comment> = store.comments().get()
-                .into_iter()
-                .filter(|c| c.issue_id == issue_id_for_comments)
-                .collect();
-            filtered.sort_by_key(|a| a.created_at);
-            filtered
-        }).unwrap_or_default()
-    });
+    // ── Comments: loaded on-demand from IndexedDB (reactive via version counter) ──
+    let comments: RwSignal<Vec<Comment>> = RwSignal::new(Vec::new());
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let issue_id = initial.get_untracked().issue_id.clone();
+        let ws_id = initial.get_untracked().workspace_id.clone();
+        let comments_sig = comments;
+        let cv = sync_store.map(|s| s.comments_version());
+
+        Effect::new(move || {
+            // Borrowed, not bound by value: `comments_version` returns an
+            // `ArcSignal<u32>` (`Clone`, not `Copy`), so `if let Some(cv) = cv`
+            // would move out of the capture and leave this `FnOnce`. The `get()`
+            // is what subscribes the effect, on every run, as before.
+            if let Some(cv) = &cv {
+                let _ = cv.get();
+            }
+            let iid = issue_id.clone();
+            let wid = ws_id.clone();
+            spawn_local(async move {
+                if let Ok(cache_db) = crate::cache::db::init_cache_db(&wid).await
+                    && let Ok(entries) = crate::cache::db::read_all(
+                        &cache_db,
+                        trakkt_types::sync::entity_types::COMMENT,
+                        &wid,
+                    ).await
+                {
+                    let mut filtered: Vec<Comment> = entries.iter()
+                        .filter_map(|(_, json, _)| {
+                            match serde_json::from_str::<Comment>(json) {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    tracing::warn!("Failed to deserialize comment from IDB: {e}");
+                                    None
+                                }
+                            }
+                        })
+                        .filter(|c| c.issue_id == iid)
+                        .collect();
+                    filtered.sort_by_key(|c| c.created_at);
+                    comments_sig.set(filtered);
+                }
+            });
+        });
+    }
 
     // No-op callback for components that need on_change but don't need parent notification
     let noop = Callback::new(|()| {});
 
     // ── Fine-grained memos: only re-render when the specific field changes ──
     let title = Memo::new(move |_| issue.get().title.clone());
-    let description = Memo::new(move |_| issue.get().description.clone().unwrap_or_default());
+    let description = RwSignal::new(initial.get_untracked().description.clone().unwrap_or_default());
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let issue_id = initial.get_untracked().issue_id.clone();
+        let ws_id = initial.get_untracked().workspace_id.clone();
+        let desc_sig = description;
+        let issue_updated_at = Memo::new(move |_| issue.get().updated_at.clone());
+
+        Effect::new(move || {
+            let _ = issue_updated_at.get();
+            let iid = issue_id.clone();
+            let wid = ws_id.clone();
+            spawn_local(async move {
+                if let Ok(cache_db) = crate::cache::db::init_cache_db(&wid).await
+                    && let Ok(Some((json, _))) = crate::cache::db::read_one(
+                        &cache_db,
+                        trakkt_types::sync::entity_types::ISSUE_CONTENT,
+                        &iid,
+                        &wid,
+                    ).await
+                {
+                    match serde_json::from_str::<serde_json::Value>(&json) {
+                        Ok(content) => {
+                            let desc = content.get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or_default();
+                            desc_sig.set(desc.to_owned());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse issue_content from IDB: {e}");
+                        }
+                    }
+                }
+            });
+        });
+    }
     let parent_identifier = Memo::new(move |_| issue.get().parent_identifier.clone());
     let timestamps = Memo::new(move |_| {
         let i = issue.get();
@@ -357,6 +433,7 @@ fn IssueDetailContent(
                     number=number
                     issue_id=initial.get_untracked().issue_id.clone()
                     lightbox_state=lightbox_state
+                    description=Signal::from(description)
                 />
 
                 // ── GitHub activity (PRs, branches, commits linked to this issue) ──
@@ -512,6 +589,7 @@ fn MetadataSidebar(
     let team_id = Memo::new(move |_| issue.get().team_id.clone());
     let status_id = Memo::new(move |_| issue.get().status_id.clone());
     let status_category = Memo::new(move |_| issue.get().status_category.clone());
+    let status_name = Memo::new(move |_| issue.get().status_name.clone());
     let priority = Memo::new(move |_| issue.get().priority);
     let assignee_id = Memo::new(move |_| issue.get().assignee_id.clone());
     let assignee_name = Memo::new(move |_| issue.get().assignee_name.clone());
@@ -694,7 +772,7 @@ fn MetadataSidebar(
     let (estimate_open, set_estimate_open) = signal(false);
     let estimate_trigger_ref = NodeRef::<leptos::html::Div>::new();
 
-    let status_variant = Memo::new(move |_| IssueStatusVariant::parse(&status_category.get()));
+    let status_variant = Memo::new(move |_| IssueStatusVariant::parse(&status_category.get(), &status_name.get()));
     let (status_open, set_status_open) = signal(false);
     let (priority_open, set_priority_open) = signal(false);
     let status_trigger_ref = NodeRef::<leptos::html::Div>::new();
@@ -737,9 +815,30 @@ fn MetadataSidebar(
     let milestone_trigger_ref = NodeRef::<leptos::html::Div>::new();
     let (milestone_search, set_milestone_search) = signal(String::new());
 
-    // Milestones: reactive resource that refetches when project_id changes
+    // Milestones: refetched when the issue's project changes, and when another
+    // client creates, renames or re-dates one. The list is read straight from
+    // the server function rather than the SyncStore, so `milestones_version` —
+    // bumped by every project_milestone sync action — is the only thing that
+    // can tell this dropdown its names and dates went stale.
+    //
+    // Resolved once here and moved into the effect. Same shape as `ws_version`
+    // in `AttachmentsSection`.
+    let milestones_version = sync_store.map(|s| s.milestones_version());
     let milestones = RwSignal::new(Vec::<trakkt_types::models::ProjectMilestone>::new());
     Effect::new(move || {
+        // Read unconditionally so the subscription is established on every run
+        // regardless of which branch is taken, not just on runs where the issue
+        // happens to have a project. Reading it inside the branch would pick the
+        // dependency up later and less predictably; this keeps the effect's
+        // dependency set stable instead of varying with the data.
+        //
+        // Borrowed rather than bound by value: `milestones_version` is an
+        // `ArcSignal<u32>` (`Clone`, not `Copy`), so binding it would move out
+        // of the capture. `track()` still runs on every effect run, which is
+        // what "unconditionally" above is claiming.
+        if let Some(v) = &milestones_version {
+            v.track();
+        }
         let pid = project_id.get();
         if let Some(pid) = pid {
             leptos::task::spawn_local(async move {
@@ -785,7 +884,7 @@ fn MetadataSidebar(
                             let sid = status.status_id.clone();
                             let sid_check = status.status_id.clone();
                             let label = status.name.clone();
-                            let variant = IssueStatusVariant::parse(&status.category);
+                            let variant = IssueStatusVariant::parse(&status.category, &status.name);
                             view! {
                                 <DropdownItem
                                     label=label
@@ -1218,6 +1317,9 @@ fn MetadataSidebar(
             // ── Watch toggle ──────────────────────────────────────────────
             <WatchToggle team_key=stored_tk.get_value() number=stored_number/>
 
+            // ── Star toggle ──────────────────────────────────────────────
+            <StarToggle team_key=stored_tk.get_value() number=stored_number/>
+
             // ── Team ──────────────────────────────────────────────────────
             <div>
                 <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Team"</div>
@@ -1301,6 +1403,79 @@ fn WatchToggle(team_key: String, number: i32) -> impl IntoView {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Star Toggle
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Star icon button that toggles star/unstar state for an issue.
+#[component]
+fn StarToggle(team_key: String, number: i32) -> impl IntoView {
+    let tk = team_key.clone();
+    let (version, set_version) = signal(0u32);
+    let starred_resource = Resource::new(
+        move || (tk.clone(), number, version.get()),
+        move |(tk, num, _)| async move { is_starred(tk, num).await },
+    );
+
+    let (loading, set_loading) = signal(false);
+
+    let toggle = move |_| {
+        if loading.get_untracked() {
+            return;
+        }
+        let currently_starred = starred_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or(false);
+
+        set_loading.set(true);
+        let tk = team_key.clone();
+        leptos::task::spawn_local(async move {
+            let result = if currently_starred {
+                unstar_issue(tk, number).await
+            } else {
+                star_issue(tk, number).await
+            };
+            if let Err(e) = result {
+                tracing::warn!("Failed to toggle star: {e}");
+            }
+            // Guard: component may have been destroyed while the future was in flight.
+            let _ = set_loading.try_set(false);
+            let _ = set_version.try_update(|v| *v += 1);
+        });
+    };
+
+    view! {
+        <div>
+            <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Star"</div>
+            <button
+                class="flex items-center gap-1.5 px-2 py-1 rounded text-sm text-muted-foreground hover:text-foreground hover:bg-surface-alt transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                on:click=toggle
+                disabled=move || loading.get()
+                title=move || {
+                    let s = starred_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                    if s { "Unstar this issue" } else { "Star this issue" }
+                }
+            >
+                {move || {
+                    let s = starred_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                    if s {
+                        view! { <span class="text-warning-foreground"><Icon icon=phosphor_leptos::STAR weight=phosphor_leptos::IconWeight::Fill size="16px"/></span> }.into_any()
+                    } else {
+                        view! { <Icon icon=phosphor_leptos::STAR weight=phosphor_leptos::IconWeight::Light size="16px"/> }.into_any()
+                    }
+                }}
+                <span class="text-xs">
+                    {move || {
+                        let s = starred_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                        if s { "Starred" } else { "Star" }
+                    }}
+                </span>
+            </button>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Description Editor (kode WYSIWYG)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1317,7 +1492,9 @@ fn LabelPicker(
     current_labels: Memo<Vec<trakkt_types::models::Label>>,
     on_change: Callback<()>,
 ) -> impl IntoView {
-    let (show_picker, set_show_picker) = signal(false);
+    let (label_open, set_label_open) = signal(false);
+    let (label_search, set_label_search) = signal(String::new());
+    let label_trigger_ref = NodeRef::<leptos::html::Div>::new();
     let initial = current_labels.get_untracked();
     let current_ids = RwSignal::new(
         initial.iter().map(|l| l.label_id.clone()).collect::<Vec<_>>()
@@ -1363,9 +1540,9 @@ fn LabelPicker(
     };
 
     view! {
-        <div class="relative">
+        <div>
             <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Labels"</div>
-            <div class="flex flex-wrap items-center gap-1">
+            <div node_ref=label_trigger_ref class="flex flex-wrap items-center gap-1">
                 {move || {
                     let labels = current_display.get();
                     if labels.is_empty() {
@@ -1389,62 +1566,83 @@ fn LabelPicker(
                 }}
                 <button
                     class="w-5 h-5 rounded flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition-colors text-xs"
-                    on:click=move |_| set_show_picker.update(|v| *v = !*v)
+                    on:click=move |_| set_label_open.update(|v| *v = !*v)
                     title="Edit labels"
                 >
                     "+"
                 </button>
             </div>
+            <DropdownMenu
+                trigger_ref=label_trigger_ref
+                open=Signal::derive(move || label_open.get())
+                on_close=Callback::new(move |()| { set_label_open.set(false); set_label_search.set(String::new()); })
+                search_placeholder="Filter labels..."
+                on_search=Callback::new(move |text: String| set_label_search.set(text))
+            >
+                {move || {
+                    let search = label_search.get().to_lowercase();
+                    match all_labels.get() {
+                        Some(Ok(labels)) => {
+                            if labels.is_empty() {
+                                view! {
+                                    <div class="px-3 py-2 text-sm text-muted-foreground">"No labels. Create one in Settings → Labels."</div>
+                                }.into_any()
+                            } else {
+                                let filtered: Vec<_> = labels.iter()
+                                    .filter(|l| search.is_empty() || l.name.to_lowercase().contains(&search))
+                                    .cloned()
+                                    .collect();
+                                let team_labels: Vec<_> = filtered.iter().filter(|l| l.team_id.is_some()).cloned().collect();
+                                let workspace_labels: Vec<_> = filtered.iter().filter(|l| l.team_id.is_none()).cloned().collect();
+                                let has_team_labels = !team_labels.is_empty();
 
-            // Dropdown picker
-            <Show when=move || show_picker.get()>
-                <div class="absolute top-full left-0 mt-1 z-50 bg-popover border border-border rounded-lg shadow-lg py-1 min-w-[200px]">
-                    <Suspense fallback=|| view! { <div class="px-3 py-2 text-sm text-muted-foreground">"Loading..."</div> }>
-                        {move || all_labels.get().map(|result| {
-                            match result {
-                                Ok(labels) => {
-                                    if labels.is_empty() {
-                                        view! {
-                                            <div class="px-3 py-2 text-sm text-muted-foreground">"No labels. Create one in Settings → Labels."</div>
-                                        }.into_any()
-                                    } else {
-                                        let items = labels.clone();
-                                        view! {
-                                            <div>
-                                                {items.into_iter().map(|label| {
-                                                    let label_for_click = label.clone();
-                                                    let label_id = label.label_id.clone();
-                                                    let is_selected = move || current_ids.get().contains(&label_id);
-                                                    view! {
-                                                        <button
-                                                            class="w-full text-left px-3 py-1.5 text-sm hover:bg-muted transition-colors flex items-center gap-2"
-                                                            on:click=move |_| toggle_label(label_for_click.clone())
-                                                        >
-                                                            <span
-                                                                class="w-3 h-3 rounded-sm shrink-0"
-                                                                style=format!("background-color: {}", label.color)
-                                                            />
-                                                            <span class="flex-1">{label.name.clone()}</span>
-                                                            {move || if is_selected() {
-                                                                view! { <span class="text-primary text-xs">"✓"</span> }.into_any()
-                                                            } else {
-                                                                ().into_any()
-                                                            }}
-                                                        </button>
-                                                    }
-                                                }).collect_view()}
-                                            </div>
-                                        }.into_any()
+                                let render_item = |label: trakkt_types::models::Label| {
+                                    let label_for_click = label.clone();
+                                    let label_id = label.label_id.clone();
+                                    let color = label.color.clone();
+                                    view! {
+                                        <DropdownItem
+                                            label=label.name.clone()
+                                            selected=Signal::derive(move || current_ids.get().contains(&label_id))
+                                            on_select=Callback::new(move |()| toggle_label(label_for_click.clone()))
+                                            icon=Arc::new(move || {
+                                                let c = color.clone();
+                                                view! {
+                                                    <span
+                                                        class="inline-block w-2.5 h-2.5 rounded-sm shrink-0"
+                                                        style=format!("background-color: {c}")
+                                                    />
+                                                }.into_any()
+                                            }) as ChildrenFn
+                                        />
                                     }
-                                },
-                                Err(_) => view! {
-                                    <div class="px-3 py-2 text-sm text-destructive-foreground">"Failed to load labels"</div>
-                                }.into_any(),
+                                };
+
+                                if has_team_labels {
+                                    let team_items = team_labels.into_iter().map(render_item).collect_view();
+                                    let ws_items = workspace_labels.into_iter().map(render_item).collect_view();
+                                    view! {
+                                        <div>
+                                            <div class="px-2 py-1 text-xs text-muted-foreground font-medium">"Team"</div>
+                                            {team_items}
+                                            <div class="px-2 py-1 text-xs text-muted-foreground font-medium mt-1">"Workspace"</div>
+                                            {ws_items}
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    filtered.into_iter().map(render_item).collect_view().into_any()
+                                }
                             }
-                        })}
-                    </Suspense>
-                </div>
-            </Show>
+                        },
+                        Some(Err(_)) => view! {
+                            <div class="px-3 py-2 text-sm text-destructive-foreground">"Failed to load labels"</div>
+                        }.into_any(),
+                        None => view! {
+                            <div class="px-3 py-2 text-sm text-muted-foreground">"Loading..."</div>
+                        }.into_any(),
+                    }
+                }}
+            </DropdownMenu>
         </div>
     }
 }
@@ -1466,7 +1664,7 @@ fn DescriptionEditor(
     /// Issue ID for auto-linking inline uploads to this issue.
     issue_id: String,
 ) -> impl IntoView {
-    use kode_leptos::TreeWysiwygEditor;
+    use crate::components::description::MarkdownDescription;
 
     let latest_text = RwSignal::new(String::new());
     let edit_version = RwSignal::new(0u32);
@@ -1548,9 +1746,10 @@ fn DescriptionEditor(
     });
 
     // Attachment callbacks — pass issue_id so uploads are auto-linked.
+    let error_toast = crate::components::toast::capture_error_toast();
     let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
-    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()));
-    let on_delete = crate::components::attachment_hooks::make_delete_callback();
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()), error_toast.clone());
+    let on_delete = crate::components::attachment_hooks::make_delete_callback(error_toast.clone());
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
     // ── "Attach file" slash command extension ───────────────────────────
@@ -1581,9 +1780,11 @@ fn DescriptionEditor(
     // When a file is selected via the extension's file picker, read, validate,
     // upload, and inject the resulting markdown into the editor content.
     let stored_issue_id = StoredValue::new(issue_id);
+    let error_toast_for_attach = error_toast.clone();
     let on_attach_file_selected = move |_ev: leptos::ev::Event| {
         let _stored_issue_id = stored_issue_id;
         let _on_change_for_attach = on_change_for_attach.clone();
+        let _error_toast = error_toast_for_attach.clone();
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -1611,6 +1812,7 @@ fn DescriptionEditor(
 
             if size > MAX_FILE_SIZE {
                 tracing::warn!("Attach file: too large ({size} bytes)");
+                _error_toast("File exceeds 10 MB size limit".to_string());
                 input.set_value("");
                 return;
             }
@@ -1620,11 +1822,13 @@ fn DescriptionEditor(
                 && !ALLOWED_CONTENT_TYPES.contains(&content_type.as_str())
             {
                 tracing::warn!("Attach file: type not allowed (ext={ext}, content_type={content_type})");
+                _error_toast("File type not allowed".to_string());
                 input.set_value("");
                 return;
             }
 
             let issue_id = _stored_issue_id.get_value();
+            let error_toast_spawn = _error_toast.clone();
 
             leptos::task::spawn_local(async move {
                 let data = {
@@ -1634,6 +1838,7 @@ fn DescriptionEditor(
                         Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
                         Err(_) => {
                             tracing::warn!("Attach file: failed to read file bytes");
+                            error_toast_spawn("Failed to read file".to_string());
                             return;
                         }
                     }
@@ -1641,11 +1846,13 @@ fn DescriptionEditor(
 
                 match upload_file(&data, &name, &content_type, Some(&issue_id)).await {
                     Ok(resp) => {
-                        // Build inline markdown for the uploaded attachment.
+                        // Build block-level markdown for the uploaded attachment.
+                        // Double newline ensures a paragraph break so the parser
+                        // promotes the image to an ImageBlock (with hover delete button).
                         let markdown_snippet = if content_type.starts_with("image/") {
-                            format!("\n![{}]({})\n", name, resp.url)
+                            format!("\n\n![{}]({})\n", name, resp.url)
                         } else {
-                            format!("\n[{}]({})\n", name, resp.url)
+                            format!("\n\n[{}]({})\n", name, resp.url)
                         };
                         // Append the snippet to the current editor content.
                         // This triggers the content sync Effect in TreeWysiwygEditor,
@@ -1659,6 +1866,7 @@ fn DescriptionEditor(
                     }
                     Err(e) => {
                         tracing::warn!("Attach file: upload failed: {e}");
+                        error_toast_spawn(format!("Upload failed: {e}"));
                     }
                 }
                 if let Some(input_el) = attach_file_input_ref.get() {
@@ -1668,19 +1876,6 @@ fn DescriptionEditor(
             });
         }
     };
-
-    let theme_state = use_context::<crate::components::theme::ThemeState>();
-    let theme_signal = Signal::derive(move || {
-        let mut theme = trakkt_kode_theme();
-        theme.content_padding = Some("0");
-        theme.bg = "var(--color-background)";
-        if let Some(ts) = theme_state
-            && ts.effective.get() == "dark"
-        {
-            theme.syntax = kode_leptos::SyntaxTheme::OneDark;
-        }
-        theme
-    });
 
     view! {
         <div class="mt-6" style="min-height: 120px;">
@@ -1692,12 +1887,9 @@ fn DescriptionEditor(
                 accept=".png,.jpg,.jpeg,.gif,.webp,.svg,.pdf,.csv,.txt,.json,.log"
                 on:change=on_attach_file_selected
             />
-            <TreeWysiwygEditor
+            <MarkdownDescription
                 content=auto_linked_content
                 on_change=on_change
-                show_fixed_toolbar=false
-                show_floating_toolbar=true
-                theme=theme_signal
                 on_upload=on_upload
                 on_delete_attachment=on_delete
                 on_click_attachment=on_click
@@ -1736,11 +1928,22 @@ fn RelationsSection(
     let tk = team_key.clone();
     let (version, set_version) = signal(0u32);
     let sync_store = use_context::<crate::cache::store::SyncStore>();
-    let ws_version = Signal::derive(move || {
-        sync_store.map(|s| s.relations_version().get()).unwrap_or(0)
-    });
+    // `version` covers this tab's own adds and removes. The store counter covers
+    // everyone else's: an issue_relation frame bumps it.
+    //
+    // Resolved once here and moved into the source closure, which borrows it
+    // with `as_ref` because `relations_version` returns an `ArcSignal<u32>`
+    // (`Clone`, not `Copy`). Same shape as `ws_version` in `AttachmentsSection`.
+    let ws_version = sync_store.map(|s| s.relations_version());
     let relations_resource = Resource::new(
-        move || (tk.clone(), number, version.get(), ws_version.get()),
+        move || {
+            (
+                tk.clone(),
+                number,
+                version.get(),
+                ws_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
         move |(tk, num, _, _)| async move { list_issue_relations(tk, num).await },
     );
 
@@ -1769,6 +1972,7 @@ fn RelationsSection(
             "blocks" => (current, selected_ident, "blocks".to_string()),
             "blocked_by" => (selected_ident, current, "blocks".to_string()),
             "duplicate" => (current, selected_ident, "duplicate".to_string()),
+            "relates_to" => (current, selected_ident, "relates_to".to_string()),
             _ => return,
         };
 
@@ -1799,6 +2003,7 @@ fn RelationsSection(
             "blocks" => "Add issue this blocks".to_string(),
             "blocked_by" => "Add issue that blocks this".to_string(),
             "duplicate" => "Add duplicate relation".to_string(),
+            "relates_to" => "Add related issue".to_string(),
             _ => "Add relation".to_string(),
         }
     });
@@ -1813,9 +2018,10 @@ fn RelationsSection(
             "duplicate" => 1,
             "blocked_by" => 2,
             "blocks" => 3,
-            "has_duplicate" => 4,
-            "parent" => 5,
-            _ => 6,
+            "relates_to" => 4,
+            "has_duplicate" => 5,
+            "parent" => 6,
+            _ => 7,
         }
     }
 
@@ -1826,6 +2032,7 @@ fn RelationsSection(
             "blocked_by" => "Blocked by",
             "blocks" => "Blocks",
             "has_duplicate" => "Has duplicate",
+            "relates_to" => "Related to",
             "parent" => "Sub-issue",
             _ => "Related",
         }
@@ -1880,7 +2087,7 @@ fn RelationsSection(
                                 let rel_title = rel.title.clone();
                                 let direction = rel.direction.clone();
                                 let label = direction_label(&direction);
-                                let status_variant = IssueStatusVariant::parse(&rel.status_category);
+                                let status_variant = IssueStatusVariant::parse(&rel.status_category, &rel.status_name);
 
                                 view! {
                                     <div class="group flex items-center gap-2 px-3 py-1.5 hover:bg-secondary/50 rounded-md transition-colors">
@@ -1943,16 +2150,18 @@ fn RelationsSection(
         >
             // Relation type selector
             <div class="mb-3">
-                <StyledSelect
-                    value=add_relation_type.get_untracked()
-                    options=vec![
-                        ("child_of", "Sub-issue"),
-                        ("parent", "Parent"),
-                        ("blocks", "Blocks"),
-                        ("blocked_by", "Blocked by"),
-                        ("duplicate", "Duplicate of"),
-                    ]
-                    on_change=move |val| set_add_relation_type.set(val)
+                <Select
+                    value=add_relation_type
+                    options=Signal::derive(|| vec![
+                        ("child_of".to_string(), "Sub-issue".to_string()),
+                        ("parent".to_string(), "Parent".to_string()),
+                        ("blocks".to_string(), "Blocks".to_string()),
+                        ("blocked_by".to_string(), "Blocked by".to_string()),
+                        ("duplicate".to_string(), "Duplicate of".to_string()),
+                        ("relates_to".to_string(), "Related to".to_string()),
+                    ])
+                    on_change=Callback::new(move |val| set_add_relation_type.set(val))
+                    variant=SelectVariant::Form
                 />
             </div>
             // Inline issue picker (search + results)
@@ -2031,7 +2240,7 @@ fn AddRelationPicker(
                                     <div class="space-y-0.5">
                                         {filtered.into_iter().map(|issue| {
                                             let issue_for_click = issue.clone();
-                                            let status_variant = IssueStatusVariant::parse(&issue.status_category);
+                                            let status_variant = IssueStatusVariant::parse(&issue.status_category, &issue.status_name);
                                             let issue_key = format!("{}-{}", issue.team_key, issue.number);
                                             let issue_title = issue.title.clone();
                                             view! {
@@ -2114,15 +2323,23 @@ fn IssueTimeline(
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (filter, set_filter) = signal(TimelineFilter::All);
 
-    // Activities version from SyncStore — bumps on WebSocket activity events
-    let activities_version = Signal::derive(move || {
-        sync_store.map(|s| s.activities_version().get()).unwrap_or(0)
-    });
+    // Activities version from SyncStore — bumps on WebSocket activity events.
+    //
+    // Resolved once here and moved into the source closure, which borrows it
+    // with `as_ref` because `activities_version` returns an `ArcSignal<u32>`
+    // (`Clone`, not `Copy`). Same shape as `ws_version` in `AttachmentsSection`.
+    let activities_version = sync_store.map(|s| s.activities_version());
 
     // Fetch activities reactively, re-fetching when version bumps
     let tk = team_key.clone();
     let activities_resource = Resource::new(
-        move || (tk.clone(), number, activities_version.get()),
+        move || {
+            (
+                tk.clone(),
+                number,
+                activities_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
         move |(tk, num, _version)| async move {
             list_issue_activities(tk, num).await
         },
@@ -2130,6 +2347,47 @@ fn IssueTimeline(
 
     let tk_for_form = team_key.clone();
     let issue_id_for_comment_form = issue_id;
+
+    // ── Scroll to comment on deep-link (e.g. #comment-{id}) ─────────
+    // Watches the comments signal so it fires after async comment data
+    // arrives via SyncStore. Uses a `scrolled` flag to run only once.
+    let scrolled = RwSignal::new(false);
+    #[cfg(target_arch = "wasm32")]
+    let location = use_location();
+    Effect::new(move || {
+        let current_comments = comments.get();
+        if !current_comments.is_empty() && !scrolled.get_untracked() {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let hash = location.hash.get_untracked();
+            if !hash.starts_with("#comment-") {
+                return;
+            }
+            let target_id = &hash[1..]; // strip leading '#'
+            let Some(window) = web_sys::window() else { return };
+            let Some(document) = window.document() else { return };
+            let Some(element) = document.get_element_by_id(target_id) else { return };
+
+            // Scroll the comment into view (smooth, centered)
+            let opts = web_sys::ScrollIntoViewOptions::new();
+            opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+            opts.set_block(web_sys::ScrollLogicalPosition::Center);
+            element.scroll_into_view_with_scroll_into_view_options(&opts);
+
+            // Apply highlight flash animation class
+            let _ = element.class_list().add_1("comment-highlight-flash");
+
+            scrolled.set(true);
+
+            // Remove the highlight class after the animation completes (2s)
+            let el_clone = element.clone();
+            gloo_timers::callback::Timeout::new(2_000, move || {
+                let _ = el_clone.class_list().remove_1("comment-highlight-flash");
+            })
+            .forget();
+        }
+        }
+    });
 
     view! {
         <div>
@@ -2236,8 +2494,7 @@ fn IssueTimeline(
                                 }.into_any()
                             }
                             TimelineEntry::Activity(activity) => {
-                                let name = activity.actor_name.clone()
-                                    .unwrap_or_else(|| "Someone".to_string());
+                                let name = activity_actor_display(&activity);
                                 view! {
                                     <ActivityEntry
                                         activity=activity
@@ -2287,6 +2544,21 @@ fn ActivityEntry(
     }
 }
 
+/// Determine the display name for an activity's actor.
+///
+/// Prefers the resolved Trakkt user name. For GitHub-sourced activities (which
+/// frequently have no matching Trakkt user) it falls back to the `author_login`
+/// stored in the activity metadata, rendered as `@login`. Finally falls back to
+/// `"Someone"`.
+fn activity_actor_display(activity: &IssueActivity) -> String {
+    if let Some(name) = activity.actor_name.clone() {
+        return name;
+    }
+
+    github_author_login_from_metadata(activity.metadata.as_deref())
+        .unwrap_or_else(|| "Someone".to_string())
+}
+
 /// Map activity action_type to a phosphor icon view.
 fn activity_icon(action_type: &str) -> leptos::prelude::AnyView {
     match action_type {
@@ -2304,6 +2576,11 @@ fn activity_icon(action_type: &str) -> leptos::prelude::AnyView {
         "parent_changed" => view! { <Icon icon=phosphor_leptos::TREE_STRUCTURE size="14px"/> }.into_any(),
         "moved_to_team" => view! { <Icon icon=phosphor_leptos::ARROWS_LEFT_RIGHT size="14px"/> }.into_any(),
         "estimate_changed" => view! { <Icon icon=phosphor_leptos::GAUGE size="14px"/> }.into_any(),
+        "commit_pushed" => view! { <Icon icon=phosphor_leptos::GIT_COMMIT size="14px"/> }.into_any(),
+        "pr_opened" => view! { <Icon icon=phosphor_leptos::GIT_PULL_REQUEST size="14px"/> }.into_any(),
+        "pr_merged" => view! { <Icon icon=phosphor_leptos::GIT_MERGE size="14px"/> }.into_any(),
+        "pr_closed" => view! { <Icon icon=phosphor_leptos::GIT_PULL_REQUEST size="14px"/> }.into_any(),
+        "branch_created" => view! { <Icon icon=phosphor_leptos::GIT_BRANCH size="14px"/> }.into_any(),
         _ => view! { <Icon icon=phosphor_leptos::CLOCK_COUNTER_CLOCKWISE size="14px"/> }.into_any(),
     }
 }
@@ -2385,11 +2662,149 @@ fn format_activity_description(activity: &IssueActivity) -> leptos::prelude::Any
             }
             view! { <span>"removed a relation"</span> }.into_any()
         }
+        "commit_pushed" | "pr_opened" | "pr_merged" | "pr_closed" | "branch_created" => {
+            format_github_activity_description(activity)
+        }
         _ => {
             let text = format_activity_text(activity);
             auto_link_view(&text)
         }
     }
+}
+
+/// CSS classes for an external GitHub link rendered inside an activity row.
+const GITHUB_ACTIVITY_LINK_CLASS: &str = "text-accent-foreground hover:underline font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm";
+
+/// Render the description for a GitHub-sourced activity (commit/PR/branch).
+///
+/// Parses the activity metadata to build a compact, single-line description
+/// with a clickable external link to GitHub. Falls back to a plain message
+/// (and a warning) when metadata is missing or malformed.
+fn format_github_activity_description(activity: &IssueActivity) -> leptos::prelude::AnyView {
+    let meta = match activity.metadata {
+        Some(ref meta_str) => match serde_json::from_str::<serde_json::Value>(meta_str) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!(error = %e, action_type = %activity.action_type, "Failed to parse GitHub activity metadata");
+                return github_activity_fallback(&activity.action_type);
+            }
+        },
+        None => {
+            tracing::warn!(action_type = %activity.action_type, "GitHub activity missing metadata");
+            return github_activity_fallback(&activity.action_type);
+        }
+    };
+
+    let url = meta.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    match activity.action_type.as_str() {
+        "commit_pushed" => {
+            // commit_count is a reasonable-to-default field; a single commit is
+            // the sensible fallback when it is absent.
+            let commit_count = meta.get("commit_count").and_then(|v| v.as_i64()).unwrap_or(1);
+
+            // commit_sha provides the anchor text; an empty sha would render a
+            // broken empty link, so a missing/empty sha forces the plain-text
+            // fallback below alongside a missing url.
+            let short_sha = meta
+                .get("commit_sha")
+                .and_then(|v| v.as_str())
+                .filter(|sha| !sha.is_empty())
+                .map(|sha| sha[..7.min(sha.len())].to_string());
+
+            let commit_message = meta
+                .get("commit_message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let branch = meta.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            match (url, short_sha) {
+                (Some(url), Some(short_sha)) if commit_count > 1 => view! {
+                    <span>
+                        {format!("pushed {commit_count} commits to {branch} \u{2014} ")}
+                        <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{short_sha}</a>
+                        {format!(" {commit_message}")}
+                    </span>
+                }
+                .into_any(),
+                (Some(url), Some(short_sha)) => view! {
+                    <span>
+                        "pushed commit "
+                        <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{short_sha}</a>
+                        {format!(" {commit_message}")}
+                    </span>
+                }
+                .into_any(),
+                _ => {
+                    tracing::warn!("commit_pushed activity missing url or commit_sha");
+                    github_activity_fallback("commit_pushed")
+                }
+            }
+        }
+        "pr_opened" | "pr_merged" | "pr_closed" => {
+            let pr_number = meta.get("pr_number").and_then(|v| v.as_i64());
+            let pr_title = meta
+                .get("pr_title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let verb = match activity.action_type.as_str() {
+                "pr_opened" => "opened",
+                "pr_merged" => "merged",
+                _ => "closed",
+            };
+            match (url, pr_number) {
+                (Some(url), Some(pr_number)) => {
+                    let link_text = format!("#{pr_number}: {pr_title}");
+                    view! {
+                        <span>
+                            {format!("{verb} PR ")}
+                            <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{link_text}</a>
+                        </span>
+                    }
+                    .into_any()
+                }
+                _ => {
+                    tracing::warn!(action_type = %activity.action_type, "PR activity missing url or pr_number");
+                    github_activity_fallback(&activity.action_type)
+                }
+            }
+        }
+        "branch_created" => {
+            let branch = meta.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            match url {
+                Some(url) => view! {
+                    <span>
+                        "created branch "
+                        <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{branch}</a>
+                    </span>
+                }
+                .into_any(),
+                None => {
+                    tracing::warn!("branch_created activity missing url");
+                    github_activity_fallback("branch_created")
+                }
+            }
+        }
+        other => {
+            tracing::warn!(action_type = %other, "Unexpected GitHub activity type");
+            github_activity_fallback(other)
+        }
+    }
+}
+
+/// Plain-text fallback description for a GitHub activity with bad metadata.
+fn github_activity_fallback(action_type: &str) -> leptos::prelude::AnyView {
+    let text = match action_type {
+        "commit_pushed" => "pushed a commit",
+        "pr_opened" => "opened a pull request",
+        "pr_merged" => "merged a pull request",
+        "pr_closed" => "closed a pull request",
+        "branch_created" => "created a branch",
+        _ => "performed a GitHub action",
+    };
+    view! { <span>{text}</span> }.into_any()
 }
 
 /// Build the plain-text description for non-relation activity types.
@@ -2465,11 +2880,15 @@ fn format_activity_text(activity: &IssueActivity) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A single comment with avatar, author name, timestamp, and body.
+///
+/// Each comment gets an `id="comment-{comment_id}"` attribute for deep-linking
+/// via URL fragment (e.g. `/issues/TRA-111#comment-{id}`).
 #[component]
 fn CommentItem(
     comment: Comment,
     lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
 ) -> impl IntoView {
+    let anchor_id = format!("comment-{}", comment.comment_id);
     let author = comment
         .author_name
         .clone()
@@ -2483,7 +2902,7 @@ fn CommentItem(
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
     view! {
-        <div class="flex gap-3">
+        <div id=anchor_id class="flex gap-3">
             <Avatar name=author.clone() size=AvatarSize::Md/>
             <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2">
@@ -2568,9 +2987,10 @@ fn NewCommentForm(
     });
 
     // Attachment callbacks — pass issue_id so uploads are auto-linked.
+    let error_toast = crate::components::toast::capture_error_toast();
     let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
-    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()));
-    let on_delete = crate::components::attachment_hooks::make_delete_callback();
+    let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()), error_toast.clone());
+    let on_delete = crate::components::attachment_hooks::make_delete_callback(error_toast.clone());
     let on_click = crate::components::attachment_hooks::make_click_callback(lightbox_state);
 
     // ── "Attach file" slash command extension ───────────────────────────
@@ -2601,9 +3021,11 @@ fn NewCommentForm(
     // When a file is selected via the extension's file picker, read, validate,
     // upload, and inject the resulting markdown into the editor content.
     let stored_issue_id = StoredValue::new(issue_id);
+    let error_toast_for_attach = error_toast.clone();
     let on_attach_file_selected = move |_ev: leptos::ev::Event| {
         let _stored_issue_id = stored_issue_id;
         let _on_change_for_attach = on_change_for_attach.clone();
+        let _error_toast = error_toast_for_attach.clone();
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -2631,6 +3053,7 @@ fn NewCommentForm(
 
             if size > MAX_FILE_SIZE {
                 tracing::warn!("Attach file: too large ({size} bytes)");
+                _error_toast("File exceeds 10 MB size limit".to_string());
                 input.set_value("");
                 return;
             }
@@ -2640,11 +3063,13 @@ fn NewCommentForm(
                 && !ALLOWED_CONTENT_TYPES.contains(&content_type.as_str())
             {
                 tracing::warn!("Attach file: type not allowed (ext={ext}, content_type={content_type})");
+                _error_toast("File type not allowed".to_string());
                 input.set_value("");
                 return;
             }
 
             let issue_id = _stored_issue_id.get_value();
+            let error_toast_spawn = _error_toast.clone();
 
             leptos::task::spawn_local(async move {
                 let data = {
@@ -2654,6 +3079,7 @@ fn NewCommentForm(
                         Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
                         Err(_) => {
                             tracing::warn!("Attach file: failed to read file bytes");
+                            error_toast_spawn("Failed to read file".to_string());
                             return;
                         }
                     }
@@ -2661,11 +3087,13 @@ fn NewCommentForm(
 
                 match upload_file(&data, &name, &content_type, Some(&issue_id)).await {
                     Ok(resp) => {
-                        // Build inline markdown for the uploaded attachment.
+                        // Build block-level markdown for the uploaded attachment.
+                        // Double newline ensures a paragraph break so the parser
+                        // promotes the image to an ImageBlock (with hover delete button).
                         let markdown_snippet = if content_type.starts_with("image/") {
-                            format!("\n![{}]({})\n", name, resp.url)
+                            format!("\n\n![{}]({})\n", name, resp.url)
                         } else {
-                            format!("\n[{}]({})\n", name, resp.url)
+                            format!("\n\n[{}]({})\n", name, resp.url)
                         };
                         // Append the snippet to the current comment content.
                         let Some(current) = content.try_get_untracked() else {
@@ -2677,6 +3105,7 @@ fn NewCommentForm(
                     }
                     Err(e) => {
                         tracing::warn!("Attach file: upload failed: {e}");
+                        error_toast_spawn(format!("Upload failed: {e}"));
                     }
                 }
                 // Reset the file input so the same file can be re-selected.
@@ -2835,26 +3264,51 @@ fn AttachmentsSection(
     /// The current issue's ID (used for upload auto-linking).
     issue_id: String,
     lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
+    /// Current description markdown — used to filter out attachments that are
+    /// already rendered inline (images/files referenced in the description).
+    description: Signal<String>,
 ) -> impl IntoView {
     let tk = team_key.clone();
     let tk_for_detach = team_key.clone();
     let (version, set_version) = signal(0u32);
 
+    // `version` covers this tab's own uploads and detaches. The store counter
+    // covers everyone else's: an attachment/issue_attachment frame bumps it, and
+    // without it a file added or removed elsewhere never appears here.
+    //
+    // Resolved once here and moved into the source closure. The `as_ref` is
+    // because `attachments_version` returns an `ArcSignal<u32>`, which is
+    // `Clone` and not `Copy` (see the getter notes on `SyncStore`): `Option::map`
+    // would consume the capture and leave this closure `FnOnce`. The `get()`
+    // inside is what tracks, unchanged. Same shape as `comments_version` above.
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+    let ws_version = sync_store.map(|s| s.attachments_version());
+
     let attachments_resource = Resource::new(
-        move || (tk.clone(), number, version.get()),
-        move |(tk, num, _)| async move { list_issue_attachments(tk, num).await },
+        move || {
+            (
+                tk.clone(),
+                number,
+                version.get(),
+                ws_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
+        move |(tk, num, _, _)| async move { list_issue_attachments(tk, num).await },
     );
 
     // ── Upload via hidden file input ────────────────────────────────────
     let file_input_ref: NodeRef<leptos::html::Input> = NodeRef::new();
     let (uploading, set_uploading) = signal(false);
+    let error_toast = crate::components::toast::capture_error_toast();
     let stored_issue_id = StoredValue::new(issue_id);
 
     // Upload handler: reads the selected file from the input, uploads via
     // fetch to `/api/v1/attachments?issue_id=...`, then bumps version.
+    let error_toast_for_upload = error_toast.clone();
     let on_file_selected = move |_ev: leptos::ev::Event| {
         let _set_uploading = set_uploading;
         let _stored_issue_id = stored_issue_id;
+        let _error_toast = error_toast_for_upload.clone();
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -2882,6 +3336,7 @@ fn AttachmentsSection(
 
             if size > MAX_FILE_SIZE {
                 tracing::warn!("File too large: {size} bytes");
+                _error_toast("File exceeds 10 MB size limit".to_string());
                 input.set_value("");
                 return;
             }
@@ -2891,45 +3346,24 @@ fn AttachmentsSection(
                 && !ALLOWED_CONTENT_TYPES.contains(&content_type.as_str())
             {
                 tracing::warn!("File type not allowed: ext={ext}, content_type={content_type}");
+                _error_toast("File type not allowed".to_string());
                 input.set_value("");
                 return;
             }
 
             let issue_id = _stored_issue_id.get_value();
             _set_uploading.set(true);
+            let error_toast_spawn = _error_toast.clone();
 
             leptos::task::spawn_local(async move {
                 let data = {
-                    use js_sys::Uint8Array;
-                    use wasm_bindgen::JsCast;
                     use wasm_bindgen_futures::JsFuture;
-                    let reader = match web_sys::FileReader::new() {
-                        Ok(r) => r,
-                        Err(_) => { _set_uploading.set(false); return; }
-                    };
-                    if reader.read_as_array_buffer(&file).is_err() {
-                        _set_uploading.set(false);
-                        return;
-                    }
-                    let promise = js_sys::Promise::new(&mut |resolve, reject| {
-                        let r = reader.clone();
-                        let reject_clone = reject.clone();
-                        let onload = wasm_bindgen::closure::Closure::once_into_js(move || {
-                            match r.result() {
-                                Ok(val) => { let _ = resolve.call1(&wasm_bindgen::JsValue::NULL, &val); }
-                                Err(_) => { let _ = reject_clone.call0(&wasm_bindgen::JsValue::NULL); }
-                            }
-                        });
-                        let onerror = wasm_bindgen::closure::Closure::once_into_js(move || {
-                            let _ = reject.call0(&wasm_bindgen::JsValue::NULL);
-                        });
-                        reader.set_onload(Some(onload.unchecked_ref()));
-                        reader.set_onerror(Some(onerror.unchecked_ref()));
-                    });
+                    let promise = file.array_buffer();
                     match JsFuture::from(promise).await {
-                        Ok(result) => Uint8Array::new(&result).to_vec(),
+                        Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
                         Err(_) => {
                             tracing::warn!("Failed to read file");
+                            error_toast_spawn("Failed to read file".to_string());
                             _set_uploading.set(false);
                             return;
                         }
@@ -2941,6 +3375,7 @@ fn AttachmentsSection(
                     }
                     Err(e) => {
                         tracing::warn!("Attachment upload failed: {e}");
+                        error_toast_spawn(format!("Upload failed: {e}"));
                     }
                 }
                 _set_uploading.set(false);
@@ -2965,11 +3400,18 @@ fn AttachmentsSection(
 
             <Suspense fallback=|| ()>
                 {move || {
-                    let attachments = match attachments_resource.get() {
+                    let all_attachments = match attachments_resource.get() {
                         Some(Ok(v)) => v,
                         Some(Err(e)) => { tracing::warn!("Failed to load attachments: {e}"); vec![] }
                         None => vec![],
                     };
+                    // Filter out attachments already referenced inline in the description.
+                    // Inline images/files use URLs like `/api/v1/attachments/{id}/download`.
+                    let desc = description.get();
+                    let attachments: Vec<_> = all_attachments
+                        .into_iter()
+                        .filter(|att| !desc.contains(&att.attachment_id))
+                        .collect();
                     let total = attachments.len();
 
                     view! {
@@ -3004,7 +3446,8 @@ fn AttachmentsSection(
                         // ── Attachment rows ────────────────────────────────
                         {if total > 0 {
                             let tk_for_rows = tk_for_detach.clone();
-                            let rows = attachments.into_iter().map(|att| {
+                            let error_toast_for_rows = error_toast.clone();
+                            let rows = attachments.into_iter().map(move |att| {
                                 let att_id_for_detach = att.attachment_id.clone();
                                 let download_url = format!("/api/v1/attachments/{}/download", att.attachment_id);
                                 let download_url_click = download_url.clone();
@@ -3013,6 +3456,7 @@ fn AttachmentsSection(
                                 let size_str = format_bytes(att.size_bytes);
                                 let filename = att.filename.clone();
                                 let tk_row = tk_for_rows.clone();
+                                let error_toast_row = error_toast_for_rows.clone();
 
                                 view! {
                                     <div
@@ -3072,10 +3516,14 @@ fn AttachmentsSection(
                                                 ev.stop_propagation();
                                                 let aid = att_id_for_detach.clone();
                                                 let tk = tk_row.clone();
+                                                let error_toast_detach = error_toast_row.clone();
                                                 leptos::task::spawn_local(async move {
                                                     match detach_attachment_from_issue(tk, number, aid).await {
                                                         Ok(_) => { let _ = set_version.try_update(|v| *v += 1); },
-                                                        Err(e) => tracing::warn!("Failed to detach attachment: {e}"),
+                                                        Err(e) => {
+                                                            tracing::warn!("Failed to detach attachment: {e}");
+                                                            error_toast_detach(format!("Failed to remove attachment: {e}"));
+                                                        }
                                                     }
                                                 });
                                             }

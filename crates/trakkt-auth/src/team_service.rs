@@ -6,12 +6,15 @@
 //! issues. Each team has a short `key` used as a prefix in issue identifiers
 //! (e.g. ENG-42).
 
+use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::FavoriteTarget;
 use trakkt_types::models::{IssueTeamMember, Team, TeamSettings, WorkspaceSettings};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::sync_log_service::CascadedIdRow;
 use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
@@ -59,6 +62,19 @@ impl TeamRow {
     }
 }
 
+/// Base SELECT for single-team reads.
+///
+/// `member_count` is not computed here — only the list queries join
+/// `team_members` to count it. Every single-team read has always reported 0,
+/// and the sync payloads built from these reads carry that same 0.
+const TEAM_SELECT: &str = "\
+    SELECT team_id, workspace_id, name, key, description, icon, \
+           icon_type, icon_name, icon_color, \
+           CAST(0 AS BIGINT) AS member_count, \
+           CAST(settings AS TEXT) AS settings, \
+           CAST(created_at AS TEXT) AS created_at \
+    FROM teams";
+
 /// Internal row type for deserialising `team_members` JOIN query results.
 #[derive(sqlx::FromRow)]
 struct TeamMemberRow {
@@ -83,6 +99,82 @@ impl TeamMemberRow {
     }
 }
 
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Read a team by id on an open transaction.
+///
+/// Transaction-scoped [`get_team`], narrowed to the case every mutation below
+/// needs: the team was just written, so a missing row is an error rather than
+/// `None`. The read has to run on the transaction — the new state is not
+/// visible on the pool until the commit, and on SQLite the pool is not
+/// reachable at all while the transaction is open (see [`DbTx`]).
+async fn get_team_tx(tx: &mut DbTx, team_id: &str) -> trakkt_core::Result<Team> {
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1");
+    let row: TeamRow = trakkt_core::tx_fetch_one!(&mut *tx, TeamRow, &sql, team_id)?;
+    Ok(row.into_dto())
+}
+
+/// Finish a team mutation that has already run its UPDATE on `tx`: read the
+/// team back, then hand the transaction to
+/// [`sync_log_service::commit_and_deliver`], which logs the change, commits and
+/// delivers it.
+///
+/// Every single-statement team update ends this way — rename, key change, icon
+/// set/upload/delete and `update_team_settings` all land here — so the read-back
+/// is what this function is for. The ordering that has to be right every time is
+/// not: `commit_and_deliver` owns it, and owns the pairing of the persisted
+/// `visibility_user_id` column with the live frame's recipients. Before
+/// TRA-10039 this hand-rolled its own `write_sync_entry_in_tx` and broadcast,
+/// which is how the audience came to disagree: the entry persisted
+/// membership-scoped (narrowed at read time by `ENTRIES_SINCE_SQL`) while the
+/// broadcast went to every member of the workspace.
+///
+/// The read has to run on the transaction — the new state is not visible on the
+/// pool until the commit — and both the stored entry and the live frame carry
+/// the full team, which the client skips either of without.
+///
+/// Takes the transaction by value: committing it is part of the job, and no
+/// caller has anything left to do on it.
+async fn commit_team_update(
+    mut tx: DbTx,
+    team_id: &str,
+    workspace_id: &str,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<Team> {
+    let team = get_team_tx(&mut tx, team_id).await?;
+
+    sync_log_service::commit_and_deliver(
+        tx,
+        entity_types::TEAM,
+        team_id,
+        workspace_id,
+        sync_log_service::SyncAudience::Team(team_id),
+        SyncActionType::Update,
+        team_payload_value(&team),
+        ws_manager,
+    )
+    .await?;
+
+    Ok(team)
+}
+
+/// Serialise a team into its sync payload.
+///
+/// A payload that cannot be serialised is logged and dropped: the sync entry is
+/// still written, so the change keeps its place in the sequence. (The client
+/// skips a TEAM entry with no payload, so the change itself is lost either way
+/// — but the sequence stays intact and the next full read repairs it.)
+fn team_payload_value(team: &Team) -> Option<serde_json::Value> {
+    match serde_json::to_value(team) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(error = %e, team_id = %team.team_id,
+                "Failed to serialize team for sync payload");
+            None
+        }
+    }
+}
+
 // ─── Service functions ──────────────────────────────────────────────────────
 
 /// Parameters for creating a new team.
@@ -98,6 +190,11 @@ pub struct CreateTeamParams<'a> {
 /// Create a new team in a workspace.
 ///
 /// If `params.creator_id` is provided, the creator is automatically added as a `lead` member.
+///
+/// The team INSERT, the member INSERT and both `sync_log` entries are one
+/// transaction: a partial failure can neither leave an orphaned team row with
+/// no creator membership, nor a team that exists with no sync row to carry it
+/// to any other client.
 pub async fn create_team(
     db: &DbPool,
     params: &CreateTeamParams<'_>,
@@ -117,56 +214,94 @@ pub async fn create_team(
     let now = sql_compat::now(is_pg);
     let team_id = uuid::Uuid::new_v4().to_string();
 
-    let sql = format!(
+    let insert_team_sql = format!(
         "INSERT INTO teams (team_id, workspace_id, name, key, description, icon, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, {now})"
     );
-    trakkt_core::db_execute!(db, &sql, &team_id, params.workspace_id, params.name, params.key, params.description, params.icon)?;
 
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
+    let insert_member_sql = if is_pg {
+        format!(
+            "INSERT INTO team_members (team_id, user_id, role, created_at) \
+             VALUES ($1, $2, $3, {now}) \
+             ON CONFLICT DO NOTHING"
+        )
+    } else {
+        format!(
+            "INSERT OR IGNORE INTO team_members (team_id, user_id, role, created_at) \
+             VALUES ($1, $2, $3, {now})"
+        )
+    };
+
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
+        &insert_team_sql,
         &team_id,
         params.workspace_id,
-        SyncActionType::Insert,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team create");
-    }
-
-    // Auto-add creator as lead member if provided.
-    if let Some(uid) = params.creator_id {
-        add_team_member(db, &team_id, uid, "lead", params.workspace_id).await?;
-    }
-
-    // Re-fetch to get the DB-assigned created_at.
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        &team_id
+        params.name,
+        params.key,
+        params.description,
+        params.icon
     )?;
-    let team = row.into_dto();
 
-    // WebSocket broadcast — send full entity data so clients update immediately.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            params.workspace_id,
+    if let Some(uid) = params.creator_id {
+        trakkt_core::tx_execute!(&mut tx, &insert_member_sql, &team_id, uid, "lead")?;
+    }
+
+    // Read the team back for the DB-assigned created_at. This has to happen
+    // before the sync log writes: both stored entries and the live frame carry
+    // the full team, and the client cannot apply any of them without it. The
+    // row does not exist outside the transaction yet, so the read runs on it.
+    let team = get_team_tx(&mut tx, &team_id).await?;
+    let payload = team_payload_value(&team);
+
+    // Two entries, one commit, so this is a `SyncBatch` rather than a
+    // `commit_and_deliver`. Both are audienced to the team: the batch resolves
+    // `team_members` after the commit that inserted the creator, so the creator
+    // is the one recipient. Every other workspace member is a non-member of a
+    // team that may be private, which is TRA-10039.
+    //
+    // With no `creator_id` the team has no members and these frames reach
+    // nobody, which is right rather than a hole: a memberless team is invisible
+    // to `list_teams(.., Some(user))` on bootstrap and to `ENTRIES_SINCE_SQL`'s
+    // membership predicate on delta, so there is no user who would have kept it.
+    //
+    // Both entries are delivered, where the hand-rolled broadcast this replaces
+    // sent only the `Insert`. That is the point of routing through the batch: a
+    // persisted entry with no live frame is the same audience disagreement in
+    // the other direction. The two carry the same payload and the client's TEAM
+    // arm is an `upsert_team`, so the second is idempotent — and a client
+    // catching up on delta has always received both.
+    let mut batch = sync_log_service::SyncBatch::new();
+
+    batch
+        .record(
+            &mut tx,
             entity_types::TEAM,
             &team_id,
+            params.workspace_id,
+            sync_log_service::SyncAudience::Team(&team_id),
             SyncActionType::Insert,
-            serde_json::to_value(&team).ok(),
+            payload.clone(),
         )
-        .await;
+        .await?;
+
+    if params.creator_id.is_some() {
+        batch
+            .record(
+                &mut tx,
+                entity_types::TEAM,
+                &team_id,
+                params.workspace_id,
+                sync_log_service::SyncAudience::Team(&team_id),
+                SyncActionType::Update,
+                payload,
+            )
+            .await?;
     }
+
+    batch.commit_and_deliver(tx, ws_manager).await?;
 
     Ok(team)
 }
@@ -189,7 +324,7 @@ pub async fn list_teams(
                 "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                         t.icon_type, t.icon_name, t.icon_color, \
                         COUNT(tm2.user_id) AS member_count, \
-                        t.settings, \
+                        CAST(t.settings AS TEXT) AS settings, \
                         CAST(t.created_at AS TEXT) AS created_at \
                  FROM teams t \
                  INNER JOIN team_members tm ON tm.team_id = t.team_id AND tm.user_id = $2 \
@@ -210,7 +345,7 @@ pub async fn list_teams(
                 "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                         t.icon_type, t.icon_name, t.icon_color, \
                         COUNT(tm.user_id) AS member_count, \
-                        t.settings, \
+                        CAST(t.settings AS TEXT) AS settings, \
                         CAST(t.created_at AS TEXT) AS created_at \
                  FROM teams t \
                  LEFT JOIN team_members tm ON tm.team_id = t.team_id \
@@ -239,7 +374,7 @@ pub async fn list_joinable_teams(
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                 t.icon_type, t.icon_name, t.icon_color, \
                 COUNT(tm.user_id) AS member_count, \
-                t.settings, \
+                CAST(t.settings AS TEXT) AS settings, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
          LEFT JOIN team_members tm ON tm.team_id = t.team_id \
@@ -259,18 +394,30 @@ pub async fn get_team(
     db: &DbPool,
     team_id: &str,
 ) -> trakkt_core::Result<Option<Team>> {
-    let row = trakkt_core::db_fetch_optional!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1");
+    let row = trakkt_core::db_fetch_optional!(db, TeamRow, &sql, team_id)?;
     Ok(row.map(TeamRow::into_dto))
+}
+
+/// Get a team by ID, requiring it to belong to `workspace_id`.
+///
+/// Use this wherever the `team_id` came from the caller. [`get_team`] looks up
+/// a team id across every workspace, so on its own it cannot tell a team the
+/// caller owns from one they merely named — the caller has to compare
+/// `workspace_id` afterwards, and forgetting to is silent.
+///
+/// A team in another workspace is reported as `NotFound`, not `Forbidden`: the
+/// caller cannot see that workspace, and an error distinguishing "wrong
+/// workspace" from "no such team" turns any team id into an existence oracle.
+pub async fn get_team_in_workspace(
+    db: &DbPool,
+    team_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<Team> {
+    let sql = format!("{TEAM_SELECT} WHERE team_id = $1 AND workspace_id = $2");
+    let row = trakkt_core::db_fetch_optional!(db, TeamRow, &sql, team_id, workspace_id)?;
+    row.map(TeamRow::into_dto)
+        .ok_or_else(|| trakkt_core::Error::NotFound(format!("team {team_id} not found")))
 }
 
 /// Get a team by its unique workspace + key combination.
@@ -279,18 +426,8 @@ pub async fn get_team_by_key(
     workspace_id: &str,
     key: &str,
 ) -> trakkt_core::Result<Option<Team>> {
-    let row = trakkt_core::db_fetch_optional!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE workspace_id = $1 AND key = $2",
-        workspace_id,
-        key
-    )?;
+    let sql = format!("{TEAM_SELECT} WHERE workspace_id = $1 AND key = $2");
+    let row = trakkt_core::db_fetch_optional!(db, TeamRow, &sql, workspace_id, key)?;
     Ok(row.map(TeamRow::into_dto))
 }
 
@@ -301,17 +438,8 @@ pub async fn get_default_team(
     db: &DbPool,
     workspace_id: &str,
 ) -> trakkt_core::Result<Team> {
-    let row = trakkt_core::db_fetch_optional!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1",
-        workspace_id
-    )?;
+    let sql = format!("{TEAM_SELECT} WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1");
+    let row = trakkt_core::db_fetch_optional!(db, TeamRow, &sql, workspace_id)?;
     match row {
         Some(r) => Ok(r.into_dto()),
         None => Err(trakkt_core::Error::NotFound(format!(
@@ -374,8 +502,10 @@ pub async fn update_team(
         ));
     }
 
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "UPDATE teams SET name = COALESCE($1, name), key = COALESCE($2, key) \
          WHERE team_id = $3 AND workspace_id = $4",
         name,
@@ -402,50 +532,13 @@ pub async fn update_team(
     })?;
 
     if result.rows_affected() == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "team {team_id} not found"
         )));
     }
 
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team update");
-    }
-
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
-    let team = row.into_dto();
-
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::TEAM,
-            team_id,
-            SyncActionType::Update,
-            serde_json::to_value(&team).ok(),
-        )
-        .await;
-    }
-
-    Ok(team)
+    commit_team_update(tx, team_id, workspace_id, ws_manager).await
 }
 
 // ─── Icon management ────────────────────────────────────────────────────────
@@ -462,9 +555,11 @@ pub async fn update_team_icon(
     icon_color: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Team> {
+    let mut tx = db.begin().await?;
+
     // When setting a preset, clear any custom upload data.
-    let result = trakkt_core::db_execute!(
-        db,
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "UPDATE teams SET icon_type = $1, icon_name = $2, icon_color = $3, \
          icon_data = NULL, icon_mime = NULL \
          WHERE team_id = $4 AND workspace_id = $5",
@@ -476,50 +571,13 @@ pub async fn update_team_icon(
     )?;
 
     if result.rows_affected() == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "team {team_id} not found"
         )));
     }
 
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon update");
-    }
-
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
-    let team = row.into_dto();
-
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::TEAM,
-            team_id,
-            SyncActionType::Update,
-            serde_json::to_value(&team).ok(),
-        )
-        .await;
-    }
-
-    Ok(team)
+    commit_team_update(tx, team_id, workspace_id, ws_manager).await
 }
 
 /// Upload a custom image as a team icon.
@@ -534,8 +592,10 @@ pub async fn upload_team_icon(
     mime: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Team> {
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "UPDATE teams SET icon_type = 'custom', icon_name = NULL, icon_color = NULL, \
          icon_data = $1, icon_mime = $2 \
          WHERE team_id = $3 AND workspace_id = $4",
@@ -546,58 +606,30 @@ pub async fn upload_team_icon(
     )?;
 
     if result.rows_affected() == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "team {team_id} not found"
         )));
     }
 
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon upload");
-    }
-
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
-    let team = row.into_dto();
-
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::TEAM,
-            team_id,
-            SyncActionType::Update,
-            serde_json::to_value(&team).ok(),
-        )
-        .await;
-    }
-
-    Ok(team)
+    commit_team_update(tx, team_id, workspace_id, ws_manager).await
 }
 
 /// Fetch a team's custom icon binary data and MIME type.
 ///
-/// Returns `None` if no custom icon is uploaded (`icon_data` is NULL).
+/// The lookup is workspace-scoped: the row must match *both* `team_id` and
+/// `workspace_id`, mirroring `upload_team_icon` and `delete_team_icon`. A team
+/// id belonging to another workspace therefore reads as absent rather than
+/// returning that workspace's bytes, so a caller that has authenticated a user
+/// but passes the wrong `workspace_id` cannot leak across tenants.
+///
+/// Returns `Ok(None)` when the team exists in `workspace_id` but has no custom
+/// icon uploaded (`icon_data` / `icon_mime` are NULL), and `Err(NotFound)` when
+/// no row matches the `(team_id, workspace_id)` pair.
 pub async fn get_team_icon_data(
     db: &DbPool,
     team_id: &str,
+    workspace_id: &str,
 ) -> trakkt_core::Result<Option<(Vec<u8>, String)>> {
     #[derive(sqlx::FromRow)]
     struct IconDataRow {
@@ -608,8 +640,9 @@ pub async fn get_team_icon_data(
     let row = trakkt_core::db_fetch_optional!(
         db,
         IconDataRow,
-        "SELECT icon_data, icon_mime FROM teams WHERE team_id = $1",
-        team_id
+        "SELECT icon_data, icon_mime FROM teams WHERE team_id = $1 AND workspace_id = $2",
+        team_id,
+        workspace_id
     )?;
 
     match row {
@@ -630,8 +663,10 @@ pub async fn delete_team_icon(
     workspace_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Team> {
-    let result = trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "UPDATE teams SET icon_type = NULL, icon_name = NULL, icon_color = NULL, \
          icon_data = NULL, icon_mime = NULL \
          WHERE team_id = $1 AND workspace_id = $2",
@@ -640,63 +675,31 @@ pub async fn delete_team_icon(
     )?;
 
     if result.rows_affected() == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "team {team_id} not found"
         )));
     }
 
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log for team icon delete");
-    }
-
-    let row = trakkt_core::db_fetch_one!(
-        db,
-        TeamRow,
-        "SELECT team_id, workspace_id, name, key, description, icon, \
-                icon_type, icon_name, icon_color, \
-                CAST(0 AS BIGINT) AS member_count, \
-                settings, \
-                CAST(created_at AS TEXT) AS created_at \
-         FROM teams WHERE team_id = $1",
-        team_id
-    )?;
-    let team = row.into_dto();
-
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::TEAM,
-            team_id,
-            SyncActionType::Update,
-            serde_json::to_value(&team).ok(),
-        )
-        .await;
-    }
-
-    Ok(team)
+    commit_team_update(tx, team_id, workspace_id, ws_manager).await
 }
 
 /// Delete a team and optionally reassign its issues to another team.
 ///
-/// Steps:
+/// Steps, in order. 1–4 run on the pool; 5 is a transaction of its own that
+/// commits and broadcasts before 6 opens; 6 is one transaction; 7 follows its
+/// commit.
 /// 1. Verify the team exists and belongs to this workspace
 /// 2. Prevent deletion of the last team in a workspace
-/// 3. Reassign issues to target team (with new team-scoped numbers) if requested
-/// 4. Delete favorites referencing this team
-/// 5. Clear `default_team_id` on users who had this team as default
-/// 6. Optionally set a new workspace default team
-/// 7. Write sync log + delete the team (cascades team_members, labels, statuses)
-/// 8. Broadcast delete via WebSocket
+/// 3. Refuse to strand issues: a team with issues needs a reassign target
+/// 4. Read what the reassignment needs (target team, issue ids, backlog status)
+/// 5. Optionally set a new workspace default team
+/// 6. In one transaction: reassign the issues to the target team with new
+///    team-scoped numbers and a workspace-scoped status, one ISSUE sync entry
+///    each; delete this team's `favorites` rows; clear `users.default_team_id`;
+///    delete the team, which cascades `team_members` and its team-scoped
+///    `statuses` and `labels`; write the TEAM delete sync entry
+/// 7. Broadcast the reassignments and the delete via WebSocket
 pub async fn delete_team(
     db: &DbPool,
     team_id: &str,
@@ -742,145 +745,232 @@ pub async fn delete_team(
         )));
     }
 
-    if let Some(target_team_id) = reassign_to_team_id {
-        // Verify target team exists in this workspace
-        let target = get_team(db, target_team_id).await?.ok_or_else(|| {
-            trakkt_core::Error::NotFound(format!(
-                "reassign target team {target_team_id} not found"
-            ))
-        })?;
-        if target.workspace_id != workspace_id {
-            return Err(trakkt_core::Error::BadRequest(
-                "Target team does not belong to this workspace".into(),
-            ));
-        }
+    // 4. Resolve everything the reassignment needs *before* the transaction
+    //    opens. These are pool reads, and once a transaction is open the pool is
+    //    unreachable on SQLite (see `DbTx`).
+    let reassignment: Option<(&str, Vec<String>, String)> = match reassign_to_team_id {
+        Some(target_team_id) => {
+            // Verify target team exists in this workspace
+            let target = get_team(db, target_team_id).await?.ok_or_else(|| {
+                trakkt_core::Error::NotFound(format!(
+                    "reassign target team {target_team_id} not found"
+                ))
+            })?;
+            if target.workspace_id != workspace_id {
+                return Err(trakkt_core::Error::BadRequest(
+                    "Target team does not belong to this workspace".into(),
+                ));
+            }
 
-        // Fetch issue IDs belonging to the team being deleted.
-        #[derive(sqlx::FromRow)]
-        struct IssueIdRow {
-            issue_id: String,
-        }
-        let issue_rows: Vec<IssueIdRow> = trakkt_core::db_fetch_all!(
-            db,
-            IssueIdRow,
-            "SELECT issue_id FROM issues WHERE team_id = $1 ORDER BY number ASC",
-            team_id
-        )?;
-
-        // Find the default (backlog) status in the workspace for reassigned issues.
-        // Team-scoped statuses will be cascaded when the team is deleted, so we
-        // must move issues to a workspace-scoped status to avoid FK violations.
-        #[derive(sqlx::FromRow)]
-        struct StatusIdRow {
-            status_id: String,
-        }
-        let default_status = trakkt_core::db_fetch_optional!(
-            db,
-            StatusIdRow,
-            "SELECT status_id FROM statuses \
-             WHERE workspace_id = $1 AND team_id IS NULL AND category = 'backlog' \
-             ORDER BY position ASC LIMIT 1",
-            workspace_id
-        )?
-        .ok_or_else(|| {
-            trakkt_core::Error::Internal("no workspace-scoped backlog status found".into())
-        })?;
-
-        // Reassign each issue one at a time so team-scoped numbers are sequential.
-        let is_pg = db.is_postgres();
-        let now = sql_compat::now(is_pg);
-        for row in &issue_rows {
-            let sql = format!(
-                "UPDATE issues SET team_id = $1, \
-                 number = (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = $1), \
-                 status_id = $3, \
-                 updated_at = {now} \
-                 WHERE issue_id = $2"
-            );
-            trakkt_core::db_execute!(db, &sql, target_team_id, &row.issue_id, &default_status.status_id)?;
-
-            // Sync log for each moved issue — best-effort.
-            if let Err(e) = sync_log_service::write_sync_entry(
+            // Fetch issue IDs belonging to the team being deleted.
+            #[derive(sqlx::FromRow)]
+            struct IssueIdRow {
+                issue_id: String,
+            }
+            let issue_rows: Vec<IssueIdRow> = trakkt_core::db_fetch_all!(
                 db,
-                entity_types::ISSUE,
-                &row.issue_id,
-                workspace_id,
-                SyncActionType::Update,
-                None,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, issue_id = %row.issue_id, "Failed to write sync log for issue reassignment");
-            }
+                IssueIdRow,
+                "SELECT issue_id FROM issues WHERE team_id = $1 ORDER BY number ASC",
+                team_id
+            )?;
 
-            // Broadcast issue update
-            if let Some(ws) = ws_manager {
-                sync_log_service::broadcast_sync_action(
-                    ws,
-                    workspace_id,
-                    entity_types::ISSUE,
-                    &row.issue_id,
-                    SyncActionType::Update,
-                    None,
-                )
-                .await;
+            // Find the default (backlog) status in the workspace for reassigned issues.
+            // Team-scoped statuses will be cascaded when the team is deleted, so we
+            // must move issues to a workspace-scoped status to avoid FK violations.
+            #[derive(sqlx::FromRow)]
+            struct StatusIdRow {
+                status_id: String,
             }
+            let default_status = trakkt_core::db_fetch_optional!(
+                db,
+                StatusIdRow,
+                "SELECT status_id FROM statuses \
+                 WHERE workspace_id = $1 AND team_id IS NULL AND category = 'backlog' \
+                 ORDER BY position ASC LIMIT 1",
+                workspace_id
+            )?
+            .ok_or_else(|| {
+                trakkt_core::Error::Internal("no workspace-scoped backlog status found".into())
+            })?;
+
+            Some((
+                target_team_id,
+                issue_rows.into_iter().map(|r| r.issue_id).collect(),
+                default_status.status_id,
+            ))
         }
+        None => None,
+    };
+
+    // 5. Optionally set a new workspace default team.
+    //
+    // Since TRA-9978 this call is its own atomic unit: it opens a transaction,
+    // writes `workspaces.default_team_id` with a WORKSPACE_SETTINGS `sync_log`
+    // entry beside it, commits, and broadcasts — all before the transaction
+    // below opens. So it is no longer true that it writes no sync row; what
+    // remains true is that its row is not part of *this* function's transaction,
+    // and cannot be.
+    //
+    // It cannot move inside step 6 for two reasons. It takes a `&DbPool` and
+    // owns a transaction internally, so calling it from inside an open one would
+    // reach for the pool while step 6 holds SQLite's single connection (see
+    // `DbTx`). And it performs its own commit-and-broadcast, which must not run
+    // while another transaction is open.
+    //
+    // The ordering is therefore unchanged from before: the default-team change
+    // lands first and independently, and touches only `workspaces` — disjoint
+    // from every table step 6 writes. A failure in step 6 leaves the new default
+    // team standing, which was already the case and is the honest outcome: the
+    // workspace default genuinely did change.
+    if let Some(new_default_id) = new_workspace_default_id {
+        crate::workspace_service::set_workspace_default_team(
+            db,
+            workspace_id,
+            new_default_id,
+            ws_manager,
+        )
+        .await?;
     }
 
-    // 4. Delete favorites referencing this team
-    trakkt_core::db_execute!(
-        db,
-        "DELETE FROM favorites WHERE target_type = 'team' AND target_id = $1",
+    // 6. Everything that writes a `sync_log` row is one transaction: the issue
+    //    reassignments, the cascade, and the two kinds of sync entry that report
+    //    them. A cascade that half-commits leaves issues on a team that no
+    //    longer exists, or a deleted team no client is ever told about.
+    let mut tx = db.begin().await?;
+
+    // Every favorite this delete strands, read before anything is removed —
+    // afterwards nothing connects a favorite to what it named. Two sources, and
+    // the second is the one that is easy to miss:
+    //
+    // * the team itself, pinned as `('team', team_id)`;
+    // * every view scoped to this team. `views.team_id` is `ON DELETE CASCADE`
+    //   in both dialects — Postgres always had it and
+    //   `migrations-sqlite/20260803100000_dual_backend_fk_parity.sql` gave
+    //   SQLite the same, which `deleting_a_team_deletes_the_views_scoped_to_it`
+    //   (`apps/server/tests/postgres_dialect.rs`) holds — so the `DELETE FROM
+    //   teams` below takes those views with it. A favorite pinning one is
+    //   stranded exactly as if the view had been deleted directly, and
+    //   `delete_view` is never reached to notice.
+    //
+    // Nothing is removed here; `delete_and_record` below does the DELETE and
+    // writes the entry that evicts each row from its owner's cache, so the two
+    // cannot come apart. Before TRA-10025 this was a bare `DELETE FROM favorites
+    // WHERE target_type = 'team'` with no entry at all and no view arm — the
+    // rows vanished server-side and stayed in every owner's IndexedDB.
+    let team_scoped_view_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        CascadedIdRow,
+        "SELECT view_id AS id FROM views WHERE team_id = $1",
         team_id
     )?;
 
-    // 5. Clear default_team_id on any users who had this team as default
-    trakkt_core::db_execute!(
-        db,
+    let mut doomed_favorites = vec![
+        crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::Team, team_id)
+            .await?,
+    ];
+    for view in &team_scoped_view_ids {
+        doomed_favorites.push(
+            crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::View, &view.id)
+                .await?,
+        );
+    }
+
+    // One issue entry per reassignment plus the team's own delete, against a
+    // single commit — `SyncBatch`'s exact shape. It holds every entry until the
+    // commit, which is not a convenience: `broadcast_raw_to_workspace` resolves
+    // its recipients from the pool, and on SQLite this transaction is holding
+    // the only connection (see `DbTx`). `record` takes no `WebSocketManager`, so
+    // inside the loop below there is nothing to deliver with.
+    let mut batch = sync_log_service::SyncBatch::new();
+
+    if let Some((target_team_id, issue_ids, status_id)) = &reassignment {
+        // Reassign each issue one at a time so team-scoped numbers are sequential.
+        // Dialect comes from the transaction, not the pool: nothing inside this
+        // span should have to reach for `db` at all (see `DbTx`).
+        let now = sql_compat::now(tx.is_postgres());
+        let sql = format!(
+            "UPDATE issues SET team_id = $1, \
+             number = (SELECT COALESCE(MAX(number), 0) + 1 FROM issues WHERE team_id = $1), \
+             status_id = $3, \
+             updated_at = {now} \
+             WHERE issue_id = $2"
+        );
+        for issue_id in issue_ids {
+            trakkt_core::tx_execute!(&mut tx, &sql, *target_team_id, issue_id, status_id)?;
+
+            // Read the issue back before the sync log write. The reassignment
+            // changed its team, number and status, and none of that reaches a
+            // client without the payload — on the live frame or on delta. The
+            // read runs on the transaction: the new state is not visible
+            // anywhere else yet.
+            let payload = crate::issue_service::issue_sync_payload_tx(&mut tx, issue_id).await?;
+
+            batch
+                .record(
+                    &mut tx,
+                    entity_types::ISSUE,
+                    issue_id,
+                    workspace_id,
+                    sync_log_service::SyncAudience::Workspace,
+                    SyncActionType::Update,
+                    payload,
+                )
+                .await?;
+        }
+    }
+
+    // Delete the favorites read above, each with the entry that evicts it from
+    // its owner's cache. Ahead of the `DELETE FROM teams` below only for
+    // symmetry with the other three delete paths; `favorites.target_id` carries
+    // no foreign key, so the order does not matter to the database.
+    for doomed in &doomed_favorites {
+        doomed.delete_and_record(&mut tx, &mut batch).await?;
+    }
+
+    // Clear default_team_id on any users who had this team as default.
+    // `users.default_team_id` is a plain column with no foreign key either.
+    trakkt_core::tx_execute!(
+        &mut tx,
         "UPDATE users SET default_team_id = NULL WHERE default_team_id = $1",
         team_id
     )?;
 
-    // 6. Optionally set a new workspace default team
-    if let Some(new_default_id) = new_workspace_default_id {
-        crate::workspace_service::set_workspace_default_team(db, workspace_id, new_default_id)
-            .await?;
-    }
+    // Delete the team. The schema cascades from here: `team_members`,
+    // team-scoped `statuses` and team-scoped `labels` all declare
+    // `ON DELETE CASCADE` on `teams(team_id)`. `issues` does not — which is why
+    // the reassignment above is mandatory rather than a convenience.
+    trakkt_core::tx_execute!(&mut tx, "DELETE FROM teams WHERE team_id = $1", team_id)?;
 
-    // 7. Sync log for team delete — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        SyncActionType::Delete,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team delete");
-    }
-
-    // Delete the team (cascades team_members, team-scoped labels, team-scoped statuses)
-    trakkt_core::db_execute!(
-        db,
-        "DELETE FROM teams WHERE team_id = $1",
-        team_id
-    )?;
-
-    // 8. Broadcast delete via WebSocket
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
+    // Sync log for the team delete, after the DELETE it describes — the same
+    // order as `issue_service::delete_issue`.
+    //
+    // `Workspace`, not `Team`, and that is not an oversight left over from
+    // TRA-10039. `teams` has just been deleted and `team_members` declares
+    // `ON DELETE CASCADE` on `teams(team_id)`, so the membership rows a `Team`
+    // audience would resolve are already gone — it would deliver this to nobody
+    // and leave the deleted team in every remaining member's cache with nothing
+    // able to remove it. `ENTRIES_SINCE_SQL` exempts `action = 'delete'` from
+    // its membership predicate for exactly that reason, so the workspace-wide
+    // audience here is what makes the live frame and the delta agree. The
+    // payload is `None`, so reaching a non-member discloses a UUID and nothing
+    // else. `deleting_a_team_reaches_a_non_member_live`
+    // (`apps/server/tests/sync_ws.rs`) fails if this is narrowed.
+    batch
+        .record(
+            &mut tx,
             entity_types::TEAM,
             team_id,
+            workspace_id,
+            sync_log_service::SyncAudience::Workspace,
             SyncActionType::Delete,
             None,
         )
-        .await;
-    }
+        .await?;
+
+    // 7. Commit, then deliver every entry recorded above — the batch owns that
+    //    ordering, and the `SyncAudience` values above are what decide who each
+    //    frame reaches. Nothing is delivered if the commit fails.
+    batch.commit_and_deliver(tx, ws_manager).await?;
 
     Ok(())
 }
@@ -906,7 +996,209 @@ pub async fn list_team_members(
     Ok(rows.into_iter().map(TeamMemberRow::into_dto).collect())
 }
 
+/// Which of the three membership edits [`write_membership_sync_entry`] is
+/// reporting.
+///
+/// Carried as an enum rather than the free-text label it used to take because
+/// the entry written depends on it: only [`MembershipChange::Removed`] adds the
+/// user-scoped eviction row below. A `&str` would let a caller spell "member
+/// remove" any of several ways and silently get the add behaviour.
+#[derive(Clone, Copy)]
+enum MembershipChange {
+    /// `user_id` was added to the team (or already was a member — the INSERT is
+    /// idempotent).
+    Added,
+    /// `user_id`'s role changed. They were a member before and still are.
+    RoleChanged,
+    /// `user_id` was removed from the team.
+    Removed,
+}
+
+impl MembershipChange {
+    /// The phrase naming this edit in the errors below.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Added => "member add",
+            Self::RoleChanged => "member role update",
+            Self::Removed => "member remove",
+        }
+    }
+}
+
+/// Record a team membership change on the sync log.
+///
+/// `team_members` is not a synced entity type of its own, so a membership change
+/// is reported as an update to the parent team and has to carry the team row —
+/// the shape the client's TEAM arm deserializes. An entry with no payload is
+/// skipped outright by the client on both the live and the delta path.
+///
+/// The team is resolved by the caller before it mutates anything, so it is
+/// passed in rather than read again here.
+///
+/// Written on the caller's transaction, alongside the `team_members` statement
+/// it reports: a membership change with no sync row never reaches another
+/// client, and no later delta can repair it because `team_members` is not a
+/// synced entity type that a delta could re-read. Each of the three callers
+/// therefore owns a transaction and hands it in — failing here rolls their
+/// statement back.
+///
+/// Note the payload cannot express *what* changed. `Team` carries no member
+/// list, and its `member_count` is reported as 0 by every single-team read. A
+/// client applying this entry learns that the team changed, not how — the same
+/// gap TRA-9940 records for project members.
+///
+/// # Why a removal writes two entries (TRA-9963, revised by TRA-10013)
+///
+/// A membership change has two audiences and `sync_log` has one
+/// `visibility_user_id` per row, so one row cannot serve both:
+///
+/// * the members who stayed need a TEAM `Update` — the member list changed, and
+///   the team still exists, so a `Delete` would be a lie to them;
+/// * the member who left needs the team to leave their dataset, and no
+///   workspace-visible row can carry that instruction without carrying it to
+///   the members who stayed as well.
+///
+/// So a removal writes the workspace-visible `Update` **and then** a
+/// `TEAM`/`Delete` scoped to the departing user.
+///
+/// ## What TRA-10013 changed, and why this row is still load-bearing
+///
+/// TRA-10013 made `get_entries_since` derive TEAM visibility from
+/// `team_members` at read time: a TEAM row that would add or refresh a team now
+/// reaches only that team's current members. So the `Update` above is no longer
+/// replayed to the departing user at all, and the original reason for the
+/// `Delete` — that the `Update` would re-add the team through
+/// `apply_action_to_memory`'s `upsert_team` arm — no longer applies.
+///
+/// The `Delete` is still required, for a different reason: it is now the *only*
+/// row that can evict the team from the client of a user who already holds it.
+/// The filter suppresses rows; it cannot retract what a client cached while the
+/// user was still a member, `team_members` is not a synced entity type a delta
+/// could re-read, and nothing re-runs `list_teams` for a connected client. Drop
+/// this write and a departing member keeps the team in memory and in IndexedDB
+/// until their next full re-bootstrap — TRA-9963's exact bug, reached by a
+/// different route.
+/// `sync_log_service::tests::a_departed_member_is_not_handed_the_team_back_by_a_later_write`
+/// pins that: it bootstraps the client as a member first, so the assertion is
+/// about a team that was really cached.
+///
+/// The `Delete` is exempt from the membership filter because that filter covers
+/// only rows that add or refresh a team — see `ENTRIES_SINCE_SQL` in
+/// `sync_log_service`, which records why removals cannot be filtered by a
+/// membership row the removal has already deleted.
+///
+/// ## Ordering: no longer load-bearing
+///
+/// The `Delete` is still inserted after the `Update` on the same transaction, so
+/// `sync_log.sync_id` (Postgres BIGSERIAL, SQLite AUTOINCREMENT) is strictly
+/// higher on it, and `team_service::tests::membership_mutations_still_work_within_the_workspace`
+/// pins that order. Under TRA-9963 that order was what made the two rows resolve
+/// to the right end state instead of to whichever landed last. It no longer is,
+/// and the previous version of this comment claimed otherwise:
+///
+/// * for the departing user, the read-time filter suppresses every TEAM
+///   `Update`, so the `Delete` is the only row of the pair they receive;
+/// * for the members who stayed, the `Delete` is scoped to someone else, so the
+///   `Update` is the only row of the pair *they* receive;
+/// * for a user who left and rejoined, the rejoin's `Update` is a later
+///   transaction and so carries a higher `sync_id` than either row here — it is
+///   applied last whichever way round these two go.
+///
+/// Swapping the two writes was tried: it breaks the row-order assertion above
+/// and no behavioural test at all. The order is kept because the log then reads
+/// in the order the events happened, not because any current consumer depends
+/// on it.
+///
+/// What *is* still load-bearing is that nothing between here and the client
+/// reorders by anything but `sync_id`: `get_entries_since` is
+/// `ORDER BY sync_id ASC`; `drain_delta` (`apps/server/src/routes/websocket.rs`)
+/// sends one frame per entry in that order and pages forward from the last id
+/// delivered; and `set_on_message` (`crates/trakkt-ui/src/cache/sync_engine.rs`)
+/// calls `apply_sync_action` per frame in arrival order, its memory half
+/// synchronous and its IndexedDB half appended to the single FIFO `IdbWriter`
+/// queue. That is what makes the rejoin case end with the team cached, which
+/// `sync_log_service::tests::rejoining_a_team_after_leaving_leaves_it_cached`
+/// asserts.
+///
+/// The `Delete` carries no payload, matching `delete_team`'s: neither the
+/// memory nor the cache half of the client's `Delete` arm reads `action.data`.
+///
+/// ## Audiences
+///
+/// The `Update` is [`sync_log_service::SyncAudience::Team`] and the `Delete` is
+/// [`sync_log_service::SyncAudience::User`]. Neither is a behaviour change from
+/// the `Workspace`/`User` pair this used to pass: `Team` and `Workspace` persist
+/// the same NULL `visibility_user_id`, and the three callers below take no
+/// `WebSocketManager`, so nothing here delivers a live frame either way. What it
+/// changes is that the value now says what the read-time filter already does —
+/// this `Update` reaches the team's members, not the workspace — so if a live
+/// frame is ever wired up here it starts out addressed to the right people
+/// instead of re-opening TRA-10039 by default.
+///
+/// The `Delete` stays `User`: it is the departing member's eviction row, it is
+/// exempt from the membership filter (they are no longer a member), and a `Team`
+/// audience would resolve a set that by construction excludes them.
+async fn write_membership_sync_entry(
+    tx: &mut DbTx,
+    team: &Team,
+    user_id: &str,
+    change: MembershipChange,
+) -> trakkt_core::Result<()> {
+    let operation = change.label();
+
+    sync_log_service::write_sync_entry_in_tx(
+        tx,
+        entity_types::TEAM,
+        &team.team_id,
+        &team.workspace_id,
+        sync_log_service::SyncAudience::Team(&team.team_id),
+        SyncActionType::Update,
+        team_payload_value(team),
+    )
+    .await
+    // The underlying error names neither the team nor which membership change
+    // was being reported, and the caller propagates rather than logs.
+    .map_err(|e| {
+        trakkt_core::Error::Internal(format!(
+            "failed to write sync log for {operation} of user {user_id} on team {}: {e}",
+            team.team_id
+        ))
+    })?;
+
+    if matches!(change, MembershipChange::Removed) {
+        sync_log_service::write_sync_entry_in_tx(
+            tx,
+            entity_types::TEAM,
+            &team.team_id,
+            &team.workspace_id,
+            sync_log_service::SyncAudience::User(user_id),
+            SyncActionType::Delete,
+            None,
+        )
+        .await
+        .map_err(|e| {
+            trakkt_core::Error::Internal(format!(
+                "failed to write the departing member's eviction sync log for \
+                 {operation} of user {user_id} on team {}: {e}",
+                team.team_id
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
+// `team_members` has no `workspace_id` column of its own — the only thing tying
+// a membership row to a workspace is the `teams` row it points at. So each of
+// the three mutations below resolves the team within `workspace_id` first and
+// mutates nothing if that lookup fails. Filtering the statement alone would not
+// do: a caller-supplied `team_id` names a row in *some* workspace, and without
+// the resolve there is nothing in the statement to compare it against.
+
 /// Add a user to a team. No-op if the user is already a member.
+///
+/// The team must belong to `workspace_id`; if it does not, this is `NotFound`
+/// and nothing is written.
 pub async fn add_team_member(
     db: &DbPool,
     team_id: &str,
@@ -914,6 +1206,8 @@ pub async fn add_team_member(
     role: &str,
     workspace_id: &str,
 ) -> trakkt_core::Result<()> {
+    let team = get_team_in_workspace(db, team_id, workspace_id).await?;
+
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
 
@@ -929,55 +1223,45 @@ pub async fn add_team_member(
              VALUES ($1, $2, $3, {now})"
         )
     };
-    trakkt_core::db_execute!(db, &sql, team_id, user_id, role)?;
-
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to write sync log for team member add");
-    }
+    // The team resolve above ran on the pool; from here the insert and the sync
+    // entry that reports it commit together or not at all.
+    let mut tx = db.begin().await?;
+    trakkt_core::tx_execute!(&mut tx, &sql, team_id, user_id, role)?;
+    write_membership_sync_entry(&mut tx, &team, user_id, MembershipChange::Added).await?;
+    tx.commit().await?;
 
     Ok(())
 }
 
 /// Remove a user from a team.
+///
+/// The team must belong to `workspace_id`; if it does not, this is `NotFound`
+/// and nothing is deleted. Removing a user who is not a member remains a no-op.
 pub async fn remove_team_member(
     db: &DbPool,
     team_id: &str,
     user_id: &str,
     workspace_id: &str,
 ) -> trakkt_core::Result<()> {
-    trakkt_core::db_execute!(
-        db,
+    let team = get_team_in_workspace(db, team_id, workspace_id).await?;
+
+    let mut tx = db.begin().await?;
+    trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM team_members WHERE team_id = $1 AND user_id = $2",
         team_id,
         user_id
     )?;
-
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to write sync log for team member remove");
-    }
+    write_membership_sync_entry(&mut tx, &team, user_id, MembershipChange::Removed).await?;
+    tx.commit().await?;
 
     Ok(())
 }
 
 /// Update a team member's role.
+///
+/// The team must belong to `workspace_id`; if it does not, this is `NotFound`
+/// and no role is changed.
 pub async fn update_team_member_role(
     db: &DbPool,
     team_id: &str,
@@ -985,26 +1269,18 @@ pub async fn update_team_member_role(
     role: &str,
     workspace_id: &str,
 ) -> trakkt_core::Result<()> {
-    trakkt_core::db_execute!(
-        db,
+    let team = get_team_in_workspace(db, team_id, workspace_id).await?;
+
+    let mut tx = db.begin().await?;
+    trakkt_core::tx_execute!(
+        &mut tx,
         "UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id = $3",
         role,
         team_id,
         user_id
     )?;
-
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        SyncActionType::Update,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, team_id = %team_id, user_id = %user_id, "Failed to write sync log for team member role update");
-    }
+    write_membership_sync_entry(&mut tx, &team, user_id, MembershipChange::RoleChanged).await?;
+    tx.commit().await?;
 
     Ok(())
 }
@@ -1021,7 +1297,7 @@ pub async fn get_user_teams(
         "SELECT t.team_id, t.workspace_id, t.name, t.key, t.description, t.icon, \
                 t.icon_type, t.icon_name, t.icon_color, \
                 CAST(0 AS BIGINT) AS member_count, \
-                t.settings, \
+                CAST(t.settings AS TEXT) AS settings, \
                 CAST(t.created_at AS TEXT) AS created_at \
          FROM teams t \
          JOIN team_members tm ON tm.team_id = t.team_id \
@@ -1053,48 +1329,23 @@ pub async fn update_team_settings(
     let sql = format!(
         "UPDATE teams SET settings = {json_cast} WHERE team_id = $2 AND workspace_id = $3"
     );
-    let result = trakkt_core::db_execute!(db, &sql, &settings_str, team_id, workspace_id)?;
+    let mut tx = db.begin().await?;
+    let result = trakkt_core::tx_execute!(&mut tx, &sql, &settings_str, team_id, workspace_id)?;
 
-    if result.rows_affected() > 0 {
-        let team_data = match get_team(db, team_id).await {
-            Ok(Some(t)) => serde_json::to_value(&t).ok(),
-            Ok(None) => {
-                tracing::warn!(team_id, "update_team_settings: team not found after write");
-                None
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, team_id, "update_team_settings: re-fetch failed");
-                None
-            }
-        };
-
-        if let Err(e) = sync_log_service::write_sync_entry(
-            db,
-            entity_types::TEAM,
-            team_id,
-            workspace_id,
-            SyncActionType::Update,
-            team_data.clone(),
-        )
-        .await
-        {
-            tracing::warn!(error = %e, team_id = %team_id, "Failed to write sync log entry for team settings update");
-        }
-
-        if let Some(ws) = ws_manager {
-            sync_log_service::broadcast_sync_action(
-                ws,
-                workspace_id,
-                entity_types::TEAM,
-                team_id,
-                SyncActionType::Update,
-                team_data,
-            )
-            .await;
-        }
+    // No row matched — the team is not in this workspace. Nothing was written,
+    // so there is nothing to report and nothing to commit.
+    if result.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(false);
     }
 
-    Ok(result.rows_affected() > 0)
+    // The re-fetch is a plain read of a row this transaction just updated, so a
+    // miss is no longer a case to warn past: it can only mean the read itself
+    // failed, and continuing would commit a settings change with a sync entry
+    // the client skips for having no payload.
+    commit_team_update(tx, team_id, workspace_id, ws_manager).await?;
+
+    Ok(true)
 }
 
 /// Resolve the effective auto-archive-days for a team.
@@ -1173,4 +1424,360 @@ pub async fn get_team_archive_days(
     }
 
     Ok(None)
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trakkt_core::db_execute;
+
+    const WS_A: &str = "ws_alpha";
+    const WS_B: &str = "ws_beta";
+    const USER_A: &str = "usr_alpha";
+    const USER_B: &str = "usr_beta";
+    const TEAM_A: &str = "team_alpha";
+    const TEAM_B: &str = "team_beta";
+
+    /// Two separate workspaces, one team and one member each.
+    ///
+    /// `USER_A` belongs to workspace A only, and is the attacker in the
+    /// cross-workspace cases below: `TEAM_B` is a team they can name but must
+    /// not be able to touch. `USER_B` is seeded into `TEAM_B` so the remove and
+    /// role-update cases have a real membership row to try to disturb.
+    async fn two_workspaces() -> DbPool {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+
+        for user_id in [USER_A, USER_B] {
+            db_execute!(
+                &db,
+                "INSERT INTO users (user_id, email, name) VALUES ($1, $2, $3)",
+                user_id,
+                format!("{user_id}@example.test"),
+                user_id
+            )
+            .expect("insert user");
+        }
+
+        for (ws, owner) in [(WS_A, USER_A), (WS_B, USER_B)] {
+            db_execute!(
+                &db,
+                "INSERT INTO workspaces (workspace_id, owner_user_id) VALUES ($1, $2)",
+                ws,
+                owner
+            )
+            .expect("insert workspace");
+            db_execute!(
+                &db,
+                "INSERT INTO workspace_users (workspace_id, user_id) VALUES ($1, $2)",
+                ws,
+                owner
+            )
+            .expect("insert workspace membership");
+        }
+
+        db_execute!(
+            &db,
+            "INSERT INTO teams (team_id, workspace_id, name, key) VALUES ($1, $2, $3, $4)",
+            TEAM_A,
+            WS_A,
+            "Alpha",
+            "ALP"
+        )
+        .expect("insert team A");
+        db_execute!(
+            &db,
+            "INSERT INTO teams (team_id, workspace_id, name, key) VALUES ($1, $2, $3, $4)",
+            TEAM_B,
+            WS_B,
+            "Beta",
+            "BET"
+        )
+        .expect("insert team B");
+
+        db_execute!(
+            &db,
+            "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)",
+            TEAM_B,
+            USER_B,
+            "member"
+        )
+        .expect("seed the existing membership in workspace B");
+
+        db
+    }
+
+    /// Number of `team_members` rows for a team. Read straight from the table:
+    /// the whole point is not to take the mutation's return value for it.
+    async fn member_count(db: &DbPool, team_id: &str) -> i64 {
+        trakkt_core::db_fetch_scalar!(
+            db,
+            i64,
+            "SELECT COUNT(*) FROM team_members WHERE team_id = $1",
+            team_id
+        )
+        .expect("count team members")
+    }
+
+    async fn member_role(db: &DbPool, team_id: &str, user_id: &str) -> Option<String> {
+        #[derive(sqlx::FromRow)]
+        struct RoleRow {
+            role: Option<String>,
+        }
+        let row = trakkt_core::db_fetch_optional!(
+            db,
+            RoleRow,
+            "SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2",
+            team_id,
+            user_id
+        )
+        .expect("read member role");
+        row.and_then(|r| r.role)
+    }
+
+    async fn sync_rows_for_workspace(db: &DbPool, workspace_id: &str) -> i64 {
+        trakkt_core::db_fetch_scalar!(
+            db,
+            i64,
+            "SELECT COUNT(*) FROM sync_log WHERE workspace_id = $1",
+            workspace_id
+        )
+        .expect("count sync log rows")
+    }
+
+    /// Every `sync_log` row of a workspace as `(action, visibility_user_id)`, in
+    /// the `sync_id` order `get_entries_since` replays them in.
+    async fn sync_rows_in_order(db: &DbPool, workspace_id: &str) -> Vec<(String, Option<String>)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            action: String,
+            visibility_user_id: Option<String>,
+        }
+        let rows: Vec<Row> = trakkt_core::db_fetch_all!(
+            db,
+            Row,
+            "SELECT action, visibility_user_id FROM sync_log \
+             WHERE workspace_id = $1 ORDER BY sync_id ASC",
+            workspace_id
+        )
+        .expect("read the sync log rows the membership writes produced");
+        rows.into_iter()
+            .map(|r| (r.action, r.visibility_user_id))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn add_team_member_refuses_a_team_in_another_workspace() {
+        let db = two_workspaces().await;
+        let before = member_count(&db, TEAM_B).await;
+
+        let result = add_team_member(&db, TEAM_B, USER_A, "member", WS_A).await;
+
+        assert!(
+            matches!(result, Err(trakkt_core::Error::NotFound(_))),
+            "a team id from another workspace must be indistinguishable from a \
+             team id that does not exist, got {result:?}"
+        );
+        assert_eq!(
+            member_count(&db, TEAM_B).await,
+            before,
+            "the foreign team's membership must be untouched"
+        );
+        assert_eq!(
+            member_role(&db, TEAM_B, USER_A).await,
+            None,
+            "the caller must not have inserted themselves into the foreign team"
+        );
+        assert_eq!(
+            sync_rows_for_workspace(&db, WS_B).await,
+            0,
+            "no sync_log row may be written into a workspace the caller cannot see"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_team_member_refuses_a_team_in_another_workspace() {
+        let db = two_workspaces().await;
+
+        let result = remove_team_member(&db, TEAM_B, USER_B, WS_A).await;
+
+        assert!(
+            matches!(result, Err(trakkt_core::Error::NotFound(_))),
+            "expected NotFound, got {result:?}"
+        );
+        assert_eq!(
+            member_count(&db, TEAM_B).await,
+            1,
+            "the seeded membership in the other workspace must survive"
+        );
+        assert_eq!(
+            member_role(&db, TEAM_B, USER_B).await.as_deref(),
+            Some("member"),
+            "the seeded membership must survive intact"
+        );
+        assert_eq!(sync_rows_for_workspace(&db, WS_B).await, 0);
+    }
+
+    #[tokio::test]
+    async fn update_team_member_role_refuses_a_team_in_another_workspace() {
+        let db = two_workspaces().await;
+
+        let result = update_team_member_role(&db, TEAM_B, USER_B, "lead", WS_A).await;
+
+        assert!(
+            matches!(result, Err(trakkt_core::Error::NotFound(_))),
+            "expected NotFound, got {result:?}"
+        );
+        assert_eq!(
+            member_role(&db, TEAM_B, USER_B).await.as_deref(),
+            Some("member"),
+            "the role in the other workspace must be unchanged"
+        );
+        assert_eq!(sync_rows_for_workspace(&db, WS_B).await, 0);
+    }
+
+    #[tokio::test]
+    async fn membership_mutations_still_work_within_the_workspace() {
+        let db = two_workspaces().await;
+        assert_eq!(member_count(&db, TEAM_A).await, 0);
+
+        add_team_member(&db, TEAM_A, USER_A, "member", WS_A)
+            .await
+            .expect("adding a member to a team in the caller's own workspace");
+        assert_eq!(member_count(&db, TEAM_A).await, 1);
+        assert_eq!(member_role(&db, TEAM_A, USER_A).await.as_deref(), Some("member"));
+
+        update_team_member_role(&db, TEAM_A, USER_A, "lead", WS_A)
+            .await
+            .expect("promoting a member of a team in the caller's own workspace");
+        assert_eq!(member_role(&db, TEAM_A, USER_A).await.as_deref(), Some("lead"));
+
+        remove_team_member(&db, TEAM_A, USER_A, WS_A)
+            .await
+            .expect("removing a member of a team in the caller's own workspace");
+        assert_eq!(member_count(&db, TEAM_A).await, 0);
+
+        assert_eq!(
+            sync_rows_in_order(&db, WS_A).await,
+            vec![
+                ("update".to_string(), None),
+                ("update".to_string(), None),
+                ("update".to_string(), None),
+                ("delete".to_string(), Some(USER_A.to_string())),
+            ],
+            "each of the three membership changes reports itself as a \
+             workspace-visible team update, and the removal writes one more row: \
+             the eviction scoped to the user who left, after the update it \
+             corrects, so a client replaying both in sync_id order ends with the \
+             team gone (TRA-9963)"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_team_member_is_idempotent_within_the_workspace() {
+        let db = two_workspaces().await;
+
+        for _ in 0..2 {
+            add_team_member(&db, TEAM_A, USER_A, "member", WS_A)
+                .await
+                .expect("re-adding an existing member stays a no-op, not an error");
+        }
+        assert_eq!(member_count(&db, TEAM_A).await, 1);
+    }
+
+    #[tokio::test]
+    async fn get_team_in_workspace_hides_a_team_from_another_workspace() {
+        let db = two_workspaces().await;
+
+        assert!(
+            get_team(&db, TEAM_B).await.expect("unscoped read").is_some(),
+            "the team really does exist — the scoped read below has to be what hides it"
+        );
+        assert!(
+            matches!(
+                get_team_in_workspace(&db, TEAM_B, WS_A).await,
+                Err(trakkt_core::Error::NotFound(_))
+            ),
+            "a team in another workspace must read as missing"
+        );
+
+        let team = get_team_in_workspace(&db, TEAM_A, WS_A)
+            .await
+            .expect("a team in the caller's own workspace resolves");
+        assert_eq!(team.team_id, TEAM_A);
+        assert_eq!(team.workspace_id, WS_A);
+    }
+
+    // ─── Icon reads ─────────────────────────────────────────────────────────
+
+    /// A PNG magic-byte prefix plus a marker, so a leak is recognisable in a
+    /// failure message.
+    const ICON_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nalpha-team-icon-bytes";
+    const ICON_MIME: &str = "image/png";
+
+    /// Write icon bytes straight onto the team row.
+    ///
+    /// Deliberately not via `upload_team_icon`: these tests are about the WHERE
+    /// clause of the *read*, so the write side must not be able to mask a
+    /// missing scope by refusing to store the row in the first place.
+    async fn seed_icon(db: &DbPool, team_id: &str, data: &[u8], mime: &str) {
+        db_execute!(
+            db,
+            "UPDATE teams SET icon_type = 'custom', icon_data = $1, icon_mime = $2 \
+             WHERE team_id = $3",
+            data,
+            mime,
+            team_id
+        )
+        .expect("seed icon bytes");
+    }
+
+    #[tokio::test]
+    async fn get_team_icon_data_returns_the_icon_for_its_own_workspace() {
+        let db = two_workspaces().await;
+        seed_icon(&db, TEAM_A, ICON_BYTES, ICON_MIME).await;
+
+        let (data, mime) = get_team_icon_data(&db, TEAM_A, WS_A)
+            .await
+            .expect("a team read with its own workspace id resolves")
+            .expect("the seeded icon is present");
+
+        assert_eq!(data, ICON_BYTES, "the stored bytes come back verbatim");
+        assert_eq!(mime, ICON_MIME);
+    }
+
+    #[tokio::test]
+    async fn get_team_icon_data_hides_an_icon_from_another_workspace() {
+        let db = two_workspaces().await;
+        seed_icon(&db, TEAM_A, ICON_BYTES, ICON_MIME).await;
+
+        // Prove the fixture really stores readable bytes first, so the negative
+        // assertion below can only be the workspace scope hiding them rather
+        // than an icon that was never written.
+        assert!(
+            get_team_icon_data(&db, TEAM_A, WS_A)
+                .await
+                .expect("own-workspace read")
+                .is_some(),
+            "fixture must store an icon for the cross-workspace case to mean anything"
+        );
+
+        // Workspace B naming workspace A's team: the id is real and guessable,
+        // which is exactly the case an auth check alone would still let through.
+        match get_team_icon_data(&db, TEAM_A, WS_B).await {
+            Err(trakkt_core::Error::NotFound(_)) => {}
+            Ok(Some((data, mime))) => panic!(
+                "cross-workspace read leaked {} bytes of team A's icon (mime {mime})",
+                data.len()
+            ),
+            Ok(None) => panic!(
+                "cross-workspace read must be NotFound — Ok(None) would tell the \
+                 caller the team exists in their workspace but has no icon"
+            ),
+            Err(e) => panic!("expected NotFound for a team in another workspace, got {e:?}"),
+        }
+    }
 }

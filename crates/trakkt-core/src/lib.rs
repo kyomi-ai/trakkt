@@ -12,6 +12,8 @@ pub mod models;
 pub mod redis;
 pub mod retry;
 pub mod sql_compat;
+#[cfg(feature = "test-helpers")]
+pub mod test_helpers;
 pub mod websocket_types;
 
 pub use config::Config;

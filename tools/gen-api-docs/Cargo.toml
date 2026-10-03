@@ -1,0 +1,9 @@
+[package]
+name = "gen-api-docs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+trakkt-api = { path = "../../crates/trakkt-api" }
+serde_json = "1"

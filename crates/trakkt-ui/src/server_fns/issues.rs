@@ -326,6 +326,99 @@ pub async fn get_archived_issues(
     Ok(issues)
 }
 
+/// Unarchive an issue by clearing its `archived_at` timestamp.
+///
+/// Uses `update_issue` with an empty update — the service layer always sets
+/// `archived_at = NULL` on any update (see issue_service.rs ~line 635).
+#[server(prefix = "/leptos-api")]
+pub async fn unarchive_issue(team_key: String, number: i32) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let ctx = ac.api_ctx();
+    let params = trakkt_types::api::UpdateIssueApiParams {
+        issue_identifier: Some(format!("{team_key}-{number}")),
+        team_key: None,
+        issue_number: None,
+        title: None,
+        description: None,
+        status_id: None,
+        priority: None,
+        assignee: None,
+        labels: None,
+        due_date: None,
+        move_to_team_key: None,
+        move_to_team_id: None,
+        project_id: None,
+        milestone_id: None,
+        parent_issue_id: None,
+        estimate: None,
+        sort_order: None,
+    };
+    trakkt_api::issues::update_issue(&ctx, params).await.into_sfn()?;
+    Ok(())
+}
+
+// ─── Search ───────────────────────────────────────────────────────────────
+
+/// DTO for search results passed between server and client.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SearchResultItem {
+    pub issue_id: String,
+    pub number: i64,
+    pub team_key: String,
+    pub title: String,
+    pub status_name: String,
+    pub status_category: String,
+    pub priority: i32,
+    pub snippet: Option<String>,
+    pub match_field: String,
+    pub rank: f64,
+}
+
+/// Full-text search across issues and comments.
+///
+/// Delegates to `trakkt_auth::search_service::search` which uses tsvector/GIN
+/// on Postgres and LIKE fallback on SQLite.
+#[server(prefix = "/leptos-api")]
+pub async fn search_issues(
+    query: String,
+    team_id: Option<String>,
+    include_closed: Option<bool>,
+    include_archived: Option<bool>,
+    include_comments: Option<bool>,
+    limit: Option<i64>,
+) -> Result<Vec<SearchResultItem>, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let params = trakkt_auth::search_service::SearchParams {
+        query,
+        workspace_id: ac.ws_id.clone(),
+        team_id,
+        include_archived: include_archived.unwrap_or(false),
+        include_closed: include_closed.unwrap_or(false),
+        include_comments: include_comments.unwrap_or(true),
+        limit: limit.unwrap_or(50),
+        offset: 0,
+    };
+    let response = trakkt_auth::search_service::search(ac.db(), &params)
+        .await
+        .into_sfn()?;
+    Ok(response
+        .results
+        .into_iter()
+        .map(|r| SearchResultItem {
+            issue_id: r.issue_id,
+            number: r.number,
+            team_key: r.team_key,
+            title: r.title,
+            status_name: r.status_name,
+            status_category: r.status_category,
+            priority: r.priority,
+            snippet: r.snippet,
+            match_field: r.match_field,
+            rank: r.rank,
+        })
+        .collect())
+}
+
 /// Replace all labels on an issue.
 ///
 /// `label_ids` is a comma-separated string of label UUIDs.
@@ -342,8 +435,16 @@ pub async fn set_issue_labels(
 
     let parsed_label_ids = parse_label_ids(&label_ids);
 
-    trakkt_auth::issue_service::set_issue_labels(ac.db(), &issue_id, &parsed_label_ids, ac.ctx.ws_manager.as_ref())
-        .await
-        .into_sfn()?;
+    trakkt_auth::issue_service::set_issue_labels(
+        ac.db(),
+        &issue_id,
+        &parsed_label_ids,
+        Some(&ac.auth.user_id),
+        trakkt_types::enums::ActionSource::User,
+        None,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }

@@ -4,19 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Composable filter clause — the new data model (TRA-103)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A single filter clause: a `(field, operator, values)` triple.
-///
-/// Example: `{ field: "status", operator: "any_of", values: ["uuid-1", "uuid-2"] }`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FilterClause {
-    pub field: String,
-    pub operator: String,
-    pub values: Vec<String>,
-}
+// Re-export from the canonical definition in trakkt-types.
+pub use trakkt_types::api::FilterClause;
 
 /// New composable view filters — replaces the old flat field-per-filter struct.
 ///
@@ -32,6 +21,9 @@ pub struct ViewFilters {
     /// Persisted sort direction ("asc" or "desc").
     #[serde(default)]
     pub sort_direction: Option<String>,
+    /// Persisted group-by field (e.g. "none", "team").
+    #[serde(default)]
+    pub group_by: Option<String>,
 }
 
 // ───────────────────────────────────────────────���─────────────────────────────
@@ -96,6 +88,7 @@ impl LegacyViewFilters {
             clauses,
             sort_field: self.sort_field,
             sort_direction: self.sort_direction,
+            group_by: None,
         }
     }
 }

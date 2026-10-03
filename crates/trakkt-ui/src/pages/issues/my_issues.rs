@@ -33,10 +33,10 @@ use crate::pages::issues::filters::{
 };
 use crate::pages::issues::issue_list::SaveViewModal;
 use crate::pages::issues::issue_row::IssueRow;
-use crate::pages::issues::{is_archived, ARCHIVE_DAYS};
+use crate::pages::issues::{is_archived, resolve_archive_days};
 use crate::pages::views::FilterClause;
 use crate::server_fns::context::UserContext;
-use crate::server_fns::issues::{get_archived_issues, list_issues};
+use crate::server_fns::issues::list_issues;
 use crate::server_fns::watchers::list_watched_issue_ids;
 use crate::types::IssueNavState;
 use crate::utils::keyboard::is_input_focused;
@@ -64,29 +64,7 @@ pub fn MyIssuesPage() -> impl IntoView {
     let (search, set_search) = signal(String::new());
     let (status_filter, set_status_filter) = signal(Vec::<String>::new());
     let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
-    let (show_archived, set_show_archived) = signal(false);
     let (show_save_view, set_show_save_view) = signal(false);
-
-    // ── Server-fetched archived issues (fetched on demand when toggle is ON) ──
-    let archived_issues_signal = RwSignal::new(Vec::<IssueWithDetails>::new());
-
-    Effect::new(move |_| {
-        let showing = show_archived.get();
-        if !showing {
-            archived_issues_signal.set(Vec::new());
-            return;
-        }
-        // My Issues page is cross-team, so fetch all archived issues (empty team_id).
-        leptos::task::spawn_local(async move {
-            match get_archived_issues(String::new(), None, None).await {
-                Ok(issues) => archived_issues_signal.set(issues),
-                Err(e) => {
-                    tracing::warn!("Failed to fetch archived issues: {e}");
-                    archived_issues_signal.set(Vec::new());
-                }
-            }
-        });
-    });
 
     // ── Sort state (default: updated date, newest first for My Issues) ────
     let (sort_field, set_sort_field) = signal(SortField::UpdatedDate);
@@ -115,10 +93,8 @@ pub fn MyIssuesPage() -> impl IntoView {
     );
 
     // ── All issues (raw, unfiltered) ──────────────────────────────────────
-    // Merges SyncStore / server fallback issues with server-fetched archived
-    // issues (when show_archived is ON), deduplicating by issue_id.
     let all_issues = Memo::new(move |_| {
-        let base = if let Some(store) = sync_store {
+        if let Some(store) = sync_store {
             let issues = store.issues().get();
             if !issues.is_empty() || store.initialized().get() {
                 issues
@@ -147,27 +123,19 @@ pub fn MyIssuesPage() -> impl IntoView {
                 }
                 None => Vec::new(),
             }
-        };
-
-        // Merge server-fetched archived issues (deduplicating by issue_id).
-        let server_archived = archived_issues_signal.get();
-        if server_archived.is_empty() {
-            return base;
         }
-        let existing_ids: HashSet<String> = base.iter().map(|i| i.issue_id.clone()).collect();
-        let mut merged = base;
-        for issue in server_archived {
-            if !existing_ids.contains(&issue.issue_id) {
-                merged.push(issue);
-            }
-        }
-        merged
     });
 
-    // ── Filter helper (closure over search/status/priority/archive signals) ─
+    // ── Archive days (workspace-scoped, no team context on My Issues) ────
+    // My Issues shows issues across all teams so team is always None.
+    // TODO: pass workspace-level default_auto_archive_days once workspace
+    // settings are part of the SyncStore bootstrap.
+    let archive_days = resolve_archive_days(None, None);
+
+    // ── Filter helper (closure over search/status/priority signals) ────────
     let passes_filters = move |issue: &IssueWithDetails| -> bool {
-        // Archive filter: hide archived issues unless the toggle is on.
-        if !show_archived.get() && is_archived(issue, ARCHIVE_DAYS) {
+        // Exclude archived issues — they have their own dedicated page.
+        if archive_days > 0 && is_archived(issue, archive_days) {
             return false;
         }
 
@@ -337,6 +305,36 @@ pub fn MyIssuesPage() -> impl IntoView {
         });
     });
 
+    // ── Issue count for the header ────────────────────────────────────────
+    // Total = all non-archived issues belonging to the user (assigned + created + watching),
+    // before search/status/priority filters are applied.
+    let total_my_issues = Memo::new(move |_| {
+        let Some(uid) = current_user_id.get() else { return 0 };
+        let issues = all_issues.get();
+        let watched = watched_ids_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        let watched_set: HashSet<String> = watched.into_iter().collect();
+
+        let mut seen = HashSet::new();
+        for i in &issues {
+            if archive_days > 0 && is_archived(i, archive_days) {
+                continue;
+            }
+            if i.assignee_id.as_ref() == Some(&uid)
+                || i.creator_id == uid
+                || watched_set.contains(&i.issue_id)
+            {
+                seen.insert(i.issue_id.clone());
+            }
+        }
+        seen.len()
+    });
+    let filtered_my_issues = Memo::new(move |_| {
+        assigned_issues.get().len() + created_issues.get().len() + watching_issues.get().len()
+    });
+
     // ── Section collapse state (persisted in localStorage) ────────────────
     let (assigned_collapsed, set_assigned_collapsed) =
         signal(load_collapsed_state("trakkt-myissues-assigned-collapsed"));
@@ -361,7 +359,23 @@ pub fn MyIssuesPage() -> impl IntoView {
         <div class="bg-background flex flex-col h-full">
             // ── Page header ─────────────────────────────────────────────────
             <div class="page-header h-14 px-5 flex items-center justify-between shrink-0">
-                <h1 class="text-sm font-semibold text-foreground">"My Issues"</h1>
+                <h1 class="flex items-center gap-2 text-sm font-semibold text-foreground">
+                    "My Issues"
+                    <span class="text-sm font-normal text-muted-foreground">
+                        {move || {
+                            let filtered = filtered_my_issues.get();
+                            let total = total_my_issues.get();
+                            if total == 0 {
+                                return String::new();
+                            }
+                            if filtered == total {
+                                format!("({})", total)
+                            } else {
+                                format!("{} of {} issues", filtered, total)
+                            }
+                        }}
+                    </span>
+                </h1>
             </div>
 
             // ── Toolbar ─────────────────────────────────────────────────────
@@ -382,20 +396,6 @@ pub fn MyIssuesPage() -> impl IntoView {
                         set_sort_direction.set(d);
                     })
                 />
-                <button
-                    class=move || {
-                        if show_archived.get() {
-                            "px-2 py-1 text-xs rounded-md border border-primary bg-primary/10 text-primary transition-colors flex items-center gap-1"
-                        } else {
-                            "px-2 py-1 text-xs rounded-md border border-border text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
-                        }
-                    }
-                    on:click=move |_| set_show_archived.update(|v| *v = !*v)
-                    title="Show archived issues"
-                >
-                    <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
-                    {move || if show_archived.get() { "Hide archived" } else { "Show archived" }}
-                </button>
                 // "Save view" — always visible, disabled when no filters active
                 <Button
                     variant=ButtonVariant::Ghost
@@ -486,7 +486,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                             >
                                 {if !assigned_collapsed.get() {
                                     assigned.iter().enumerate().map(|(idx, issue)| {
-                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        let archived = archive_days > 0 && is_archived(issue, archive_days);
                                         view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
@@ -513,7 +513,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                             >
                                 {if !created_collapsed.get() {
                                     created.iter().enumerate().map(|(idx, issue)| {
-                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        let archived = archive_days > 0 && is_archived(issue, archive_days);
                                         view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {
@@ -537,7 +537,7 @@ pub fn MyIssuesPage() -> impl IntoView {
                             >
                                 {if !watching_collapsed.get() {
                                     watching.iter().enumerate().map(|(idx, issue)| {
-                                        let archived = is_archived(issue, ARCHIVE_DAYS);
+                                        let archived = archive_days > 0 && is_archived(issue, archive_days);
                                         view! { <IssueRow issue=issue.clone() index=offset+idx selected_index=selected_index archived=archived/> }
                                     }).collect_view().into_any()
                                 } else {

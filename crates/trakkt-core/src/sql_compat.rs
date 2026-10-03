@@ -34,11 +34,29 @@ pub fn bool_false(is_pg: bool) -> &'static str {
 
 /// Interval subtraction: column < NOW() - N days.
 /// The `param` argument is a SQL bind parameter placeholder (e.g. `$1`).
-/// Postgres: `column < NOW() - make_interval(days => $1)`
+/// Postgres: `column < NOW() - make_interval(days => $1::int)`
 /// SQLite: `column < datetime('now', '-' || $1 || ' days')`
+///
+/// # Why the Postgres arm casts the bind
+///
+/// `make_interval`'s `days` argument is `integer`, and both callers bind an
+/// `i64` — `sync_log_service::prune_old_entries` takes `retention_days: i64`
+/// and `archive_service::run_archive_sweep` widens a `u32` with `i64::from`.
+/// sqlx sends an `i64` as `INT8`, and `bigint -> integer` is an *assignment*
+/// cast in Postgres, not an implicit one, so named-notation resolution finds no
+/// candidate and the statement is rejected outright with
+/// `function make_interval(days => bigint) does not exist`. Without the cast
+/// every Postgres caller of this helper fails at runtime; SQLite concatenates
+/// the bind into a string modifier and never notices the width, which is why
+/// the whole workspace's SQLite tests passed over it. TRA-10001.
+///
+/// `::int` narrows rather than widening the argument, which is the right way
+/// round here: `interval` cannot represent a day count beyond `i32`'s range in
+/// the first place, so a value that would overflow the cast had no meaning to
+/// begin with.
 pub fn ago_days(is_pg: bool, column: &str, param: &str) -> String {
     if is_pg {
-        format!("{column} < NOW() - make_interval(days => {param})")
+        format!("{column} < NOW() - make_interval(days => {param}::int)")
     } else {
         format!("{column} < datetime('now', '-' || {param} || ' days')")
     }
@@ -59,6 +77,16 @@ pub fn cast_to_uuid(is_pg: bool, param: &str) -> String {
 pub fn cast_to_date(is_pg: bool, param: &str) -> String {
     if is_pg {
         format!("{param}::date")
+    } else {
+        param.to_string()
+    }
+}
+
+/// Timestamptz type cast.
+/// Postgres: `$1::timestamptz`, SQLite: `$1` (timestamps stored as TEXT)
+pub fn cast_to_timestamptz(is_pg: bool, param: &str) -> String {
+    if is_pg {
+        format!("{param}::timestamptz")
     } else {
         param.to_string()
     }
@@ -98,6 +126,17 @@ pub fn any_in_array(is_pg: bool, param: &str, column: &str) -> String {
         format!("{param} = ANY({column})")
     } else {
         format!("{param} IN (SELECT value FROM json_each({column}))")
+    }
+}
+
+/// Timestamp comparison: is the column within the last N seconds?
+/// Postgres: `column > NOW() - INTERVAL 'N seconds'`
+/// SQLite: `column > datetime('now', '-N seconds')`
+pub fn within_seconds(is_pg: bool, column: &str, seconds: i64) -> String {
+    if is_pg {
+        format!("{column} > NOW() - INTERVAL '{seconds} seconds'")
+    } else {
+        format!("{column} > datetime('now', '-{seconds} seconds')")
     }
 }
 
@@ -226,11 +265,16 @@ mod tests {
         assert_eq!(bool_false(false), "0");
     }
 
+    /// The `::int` is the whole reason this arm works — see [`ago_days`]. Both
+    /// callers bind an `i64`, which Postgres will not implicitly narrow to
+    /// `make_interval`'s `integer` argument, so dropping the cast makes every
+    /// Postgres call fail. `apps/server/tests/postgres_dialect.rs` proves that
+    /// against a live server; this pins the fragment so the two cannot drift.
     #[test]
     fn test_ago_days_postgres() {
         assert_eq!(
             ago_days(true, "created_at", "$1"),
-            "created_at < NOW() - make_interval(days => $1)"
+            "created_at < NOW() - make_interval(days => $1::int)"
         );
     }
 
@@ -294,6 +338,18 @@ mod tests {
     fn test_coalesce_now() {
         assert_eq!(coalesce_now(true, "col"), "COALESCE(col, NOW())");
         assert_eq!(coalesce_now(false, "col"), "COALESCE(col, datetime('now'))");
+    }
+
+    #[test]
+    fn test_within_seconds() {
+        assert_eq!(
+            within_seconds(true, "created_at", 60),
+            "created_at > NOW() - INTERVAL '60 seconds'"
+        );
+        assert_eq!(
+            within_seconds(false, "created_at", 60),
+            "created_at > datetime('now', '-60 seconds')"
+        );
     }
 
     #[test]

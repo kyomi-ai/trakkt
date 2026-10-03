@@ -21,10 +21,13 @@ use crate::pages::auth::{
     signup_complete::SignupCompletePage,
 };
 use crate::pages::accept_ownership::AcceptOwnershipPage;
+use crate::pages::activity::ActivityPage;
 use crate::pages::inbox::InboxPage;
+use crate::pages::issues::archived::{ArchivedIssuesForTeam, ArchivedIssuesPage};
 use crate::pages::issues::issue_detail::IssueDetailPage;
-use crate::pages::issues::issue_list::IssueListForTeam;
+use crate::pages::issues::issue_list::{IssueListForTeam, IssueListPage};
 use crate::pages::issues::my_issues::MyIssuesPage;
+use crate::pages::issues::workspace_view::WorkspaceViewPage;
 use crate::pages::onboarding::OnboardingPage;
 use crate::pages::projects::project_detail::ProjectDetailPage;
 use crate::pages::projects::project_list::ProjectListPage;
@@ -33,11 +36,11 @@ use crate::pages::settings::{
     billing::BillingPage,
     integrations::IntegrationsPage,
     labels::LabelsPage,
+    notifications::NotificationsPage,
     profile::ProfilePage,
     security::security_tab::SecurityTab,
     settings_shell::SettingsShell,
     team::TeamPage,
-    teams_settings::TeamsSettingsPage,
     workspace::WorkspacePage,
 };
 use crate::pages::teams::team_settings::TeamSettingsPage;
@@ -78,6 +81,7 @@ pub fn App() -> impl IntoView {
 
     view! {
         <crate::components::theme::ThemeProvider initial_preference="system".to_string()>
+        <crate::components::toast::ToastProvider>
         <Router>
             <Routes fallback=|| view! {
                 <div class="min-h-screen bg-background flex items-center justify-center p-8">
@@ -111,12 +115,25 @@ pub fn App() -> impl IntoView {
                     // Inbox — notification feed
                     <Route path=path!("/inbox") view=InboxPage/>
 
+                    // Activity — workspace-wide activity stream
+                    <Route path=path!("/activity") view=ActivityPage/>
+
                     // My Issues — cross-team view of issues assigned to the current user
                     <Route path=path!("/my-issues") view=MyIssuesPage/>
+
+                    // Archived issues — workspace-wide
+                    <Route path=path!("/archived") view=ArchivedIssuesPage/>
+
+                    // Workspace-level issue list (cross-team)
+                    <Route path=path!("/workspace") view=IssueListPage/>
+
+                    // Saved workspace view — loads view by ID, renders cross-team issue list
+                    <Route path=path!("/views/:view_id") view=WorkspaceViewPage/>
 
                     // Team-scoped views — components read :key from route params internally
                     <Route path=path!("/teams/:key/settings") view=TeamSettingsPage/>
                     <Route path=path!("/teams/:key/issues") view=IssueListForTeam/>
+                    <Route path=path!("/teams/:key/archived") view=ArchivedIssuesForTeam/>
 
                     // Legacy /issues redirect — send to /my-issues
                     <Route path=path!("/issues") view=|| view! { <Redirect path="/my-issues"/> }/>
@@ -152,17 +169,18 @@ pub fn App() -> impl IntoView {
                     }>
                         <Route path=path!("") view=|| view! { <Redirect path="/settings/profile"/> }/>
                         <Route path=path!("/profile") view=ProfilePage/>
+                        <Route path=path!("/notifications") view=NotificationsPage/>
                         <Route path=path!("/security") view=SecurityTab/>
                         <Route path=path!("/workspace") view=WorkspacePage/>
                         <Route path=path!("/team") view=TeamPage/>
                         <Route path=path!("/labels") view=LabelsPage/>
-                        <Route path=path!("/teams") view=TeamsSettingsPage/>
                         <Route path=path!("/integrations") view=IntegrationsPage/>
                         <Route path=path!("/billing") view=BillingPage/>
                     </ParentRoute>
                 </ParentRoute>
             </Routes>
         </Router>
+        </crate::components::toast::ToastProvider>
         </crate::components::theme::ThemeProvider>
     }
 }
