@@ -17,7 +17,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
-    "otplib": "^13.4.0"
+    "otplib": "^13.4.1"
   },
   "dependencies": {
     "argon2": "^0.44.0"
