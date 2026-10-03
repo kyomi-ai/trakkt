@@ -6,13 +6,14 @@
 //! status change, etc.). They are user-scoped and support read/unread
 //! tracking.
 
+use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use trakkt_types::enums::ActionSource;
 use trakkt_types::models::{Notification, NotificationPreferences};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
-use crate::sync_log_service::{self, SyncAudience};
+use crate::sync_log_service::{self, SyncAudience, SyncBatch};
 use crate::websocket::WebSocketManager;
 
 pub const DEFAULT_NOTIFICATION_LIMIT: i64 = 50;
@@ -83,6 +84,32 @@ impl NotificationRow {
     }
 }
 
+/// Base SELECT for every query that reads a whole notification.
+///
+/// Shared by the create path, the list path and the state-change paths below so
+/// the column list cannot drift between them — the same role
+/// [`PREFERENCES_SELECT`] plays for preferences. The three LEFT JOINs are what
+/// fill in `issue_title`, `issue_number`, `team_key` and `actor_name`; a payload
+/// built without them hands the client ids it has nothing to render.
+///
+/// Callers append their own `WHERE`, and the aliases (`n`, `i`, `t`, `u_actor`)
+/// are part of the contract because they do.
+const NOTIFICATION_SELECT: &str = "\
+    SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
+           n.type AS notification_type, n.read, \
+           i.title AS issue_title, i.number AS issue_number, \
+           t.key AS team_key, \
+           n.actor_id, \
+           u_actor.name AS actor_name, \
+           n.action_source, n.action_source_label, \
+           CAST(n.created_at AS TEXT) AS created_at, \
+           CAST(n.deleted_at AS TEXT) AS deleted_at, \
+           n.context_id \
+    FROM notifications n \
+    LEFT JOIN issues i ON i.issue_id = n.issue_id \
+    LEFT JOIN teams t ON t.team_id = i.team_id \
+    LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id";
+
 // ─── Service functions ──────────────────────────────────────────────────────
 
 /// Create a notification for a user about an issue event.
@@ -147,21 +174,7 @@ pub async fn create_notification(
     let notification: Option<NotificationRow> = trakkt_core::tx_fetch_optional!(
         &mut tx,
         NotificationRow,
-        "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
-                n.type AS notification_type, n.read, \
-                i.title AS issue_title, i.number AS issue_number, \
-                t.key AS team_key, \
-                n.actor_id, \
-                u_actor.name AS actor_name, \
-                n.action_source, n.action_source_label, \
-                CAST(n.created_at AS TEXT) AS created_at, \
-                CAST(n.deleted_at AS TEXT) AS deleted_at, \
-                n.context_id \
-         FROM notifications n \
-         LEFT JOIN issues i ON i.issue_id = n.issue_id \
-         LEFT JOIN teams t ON t.team_id = i.team_id \
-         LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id \
-         WHERE n.notification_id = $1",
+        &format!("{NOTIFICATION_SELECT} WHERE n.notification_id = $1"),
         &notification_id
     )?;
     let notification_data = notification.map(|r| r.into_dto());
@@ -222,20 +235,7 @@ pub async fn list_notifications(
 
     // $1 = user_id, $2 = notification_type, $3 = team_key, $4 = search pattern
     let sql = format!(
-        "SELECT n.notification_id, n.workspace_id, n.user_id, n.issue_id, \
-                n.type AS notification_type, n.read, \
-                i.title AS issue_title, i.number AS issue_number, \
-                t.key AS team_key, \
-                n.actor_id, \
-                u_actor.name AS actor_name, \
-                n.action_source, n.action_source_label, \
-                CAST(n.created_at AS TEXT) AS created_at, \
-                CAST(n.deleted_at AS TEXT) AS deleted_at, \
-                n.context_id \
-         FROM notifications n \
-         LEFT JOIN issues i ON i.issue_id = n.issue_id \
-         LEFT JOIN teams t ON t.team_id = i.team_id \
-         LEFT JOIN users u_actor ON u_actor.user_id = n.actor_id \
+        "{NOTIFICATION_SELECT} \
          WHERE n.user_id = $1 {deleted_filter} {unread_filter} \
            AND ($2{cast_text} IS NULL OR n.type = $2) \
            AND ($3{cast_text} IS NULL OR t.key = $3) \
@@ -329,29 +329,260 @@ pub async fn count_notifications(
     Ok(count)
 }
 
+// ─── Notification state changes ─────────────────────────────────────────────
+//
+// The six entry points below (`mark_as_read`, `mark_all_as_read` and the four
+// `bulk_*` functions) all have the same shape: change some state on a subset of
+// one user's notifications, and log one `sync_log` entry per row that subset
+// names. They share the three helpers here.
+//
+// "Per row the subset names" and not "per row whose state moved": five of the
+// six select on the very state they are about to change, so for them the two
+// coincide. `mark_as_read` does not — its only predicate is
+// `deleted_at IS NULL` — so re-marking an already-read notification read writes
+// an entry for a row nothing moved. Asserted on both backends by
+// `apps/server/tests/postgres_dialect.rs`.
+//
+// Granularity is one entry per notification rather than one entry describing
+// the batch. An aggregate entry would carry only the request — "mark these read"
+// — leaving every client to re-derive the server's WHERE clause locally against
+// its own possibly-stale cache, and to diverge silently whenever it got a
+// different answer. A row per row says what actually changed.
+
+/// The ids of the notifications a change is about to touch, read inside the
+/// transaction that will make it.
+///
+/// The five entry points that select on state pass a predicate the change
+/// itself falsifies: `mark_all_as_read` and `bulk_mark_as_read` select on
+/// `read = false` and then set `read = true`; `bulk_delete_notifications`
+/// selects on `deleted_at IS NULL` and then stamps it. After the UPDATE those
+/// rows no longer match, so the set cannot be recovered afterwards — it has to
+/// be read first. That is what makes "one entry per row the predicate selected"
+/// expressible; the alternative, one entry per row *requested*, announces
+/// changes to rows the predicate excluded and leaves other clients applying
+/// updates that never happened.
+///
+/// `mark_as_read` is the exception, and it does not weaken the rule. Its
+/// predicate is only `deleted_at IS NULL`, which setting `read` leaves standing,
+/// so its set would survive a read-back. It reads first anyway because it needs
+/// the same `user_id` scoping and the same not-found-versus-not-owned
+/// distinction as the other five, and a second shape here would be one more
+/// thing to keep in step for no gain. The observable consequence is that marking
+/// an already-read notification read writes an entry where the five
+/// state-selecting callers write none —
+/// `postgres_dialect.rs::notification_state_changes_log_one_recipient_scoped_update_each`
+/// asserts it on both backends.
+///
+/// `RETURNING` would collapse the select and the update into one statement, and
+/// is deliberately not used. The one place this workspace reaches for it —
+/// `sync_log_service::sync_entry_insert_sql` — appends it on the Postgres arm
+/// only and uses `last_insert_rowid()` on the SQLite arm, so a `RETURNING`
+/// read-back here would need a dialect split of its own and two SQL shapes to
+/// keep in step, for no gain over the plain select below.
+///
+/// `$1` is `user_id`, so a caller can never address another user's rows.
+/// `restrict_to` narrows to an explicit id set for the `bulk_*` entry points;
+/// `None` lets `state_predicate` select on its own, which is `mark_all_as_read`.
+///
+/// `restrict_to` must be `None` or a *non-empty* slice. `Some(&[])` builds
+/// `IN ()`, which is a syntax error in both dialects. No caller can reach that
+/// today — `change_notifications` returns early on an empty set and
+/// `mark_as_read` passes exactly one id — but the constraint belongs to the SQL
+/// built here, so a new caller has to read it here rather than infer it from the
+/// existing ones.
+async fn affected_notification_ids(
+    tx: &mut DbTx,
+    user_id: &str,
+    state_predicate: &str,
+    restrict_to: Option<&[String]>,
+) -> trakkt_core::Result<Vec<String>> {
+    #[derive(sqlx::FromRow)]
+    struct IdRow {
+        notification_id: String,
+    }
+
+    let mut sql = format!(
+        "SELECT notification_id FROM notifications \
+         WHERE user_id = $1 AND {state_predicate}"
+    );
+    if let Some(ids) = restrict_to {
+        let (in_clause, _) = trakkt_core::db::in_clause_placeholders(ids.len(), 2);
+        sql.push_str(" AND notification_id IN ");
+        sql.push_str(&in_clause);
+    }
+
+    // The bind count is decided at runtime, so this needs the runtime-bind form.
+    // `tx_with!` is the transaction-scoped `db_with_pool!`; running the pool
+    // form here would read outside the transaction that is about to write.
+    let rows: Vec<IdRow> = trakkt_core::tx_with!(&mut *tx, |e| {
+        let mut query = sqlx::query_as::<_, IdRow>(&sql).bind(user_id);
+        for id in restrict_to.unwrap_or(&[]) {
+            query = query.bind(id);
+        }
+        query.fetch_all(e).await
+    })?;
+
+    Ok(rows.into_iter().map(|r| r.notification_id).collect())
+}
+
+/// Apply `set_clause` to exactly `ids`, then record one `Update` entry per row.
+///
+/// Updating by id rather than by re-stating the predicate is what keeps the
+/// entries and the rows in step: the predicate could match a row that arrived
+/// between the select and the update, and that row would then be changed with
+/// nothing on the wire to announce it.
+///
+/// The read-back runs on the transaction because the new state is not visible on
+/// the pool until the commit — and on SQLite the pool is not reachable at all
+/// while the transaction is open. Each entry takes its `workspace_id` from its
+/// own row: the `bulk_*` entry points take a bare id list, which nothing
+/// constrains to a single workspace.
+///
+/// The action is [`SyncActionType::Update`] for all six, soft-delete and restore
+/// included. `Delete` means the row has ceased to exist, which is what
+/// `issue_service::delete_issue` reports when its cascade physically destroys a
+/// notification; a soft-deleted row is still there, and the two have to stay
+/// distinguishable on the wire.
+///
+/// `ids` must be non-empty. It is interpolated into two `IN` clauses, and an
+/// empty slice builds `IN ()`, which is a syntax error in both dialects. Both
+/// callers pass a non-empty [`affected_notification_ids`] result, having
+/// returned early when it came back empty; the constraint is recorded here
+/// because it is a property of the SQL below and not of those two call sites.
+async fn update_and_record_notifications<'a>(
+    tx: &mut DbTx,
+    batch: &mut SyncBatch<'a>,
+    user_id: &'a str,
+    set_clause: &str,
+    ids: &[String],
+) -> trakkt_core::Result<()> {
+    let (in_clause, _) = trakkt_core::db::in_clause_placeholders(ids.len(), 1);
+
+    let update_sql =
+        format!("UPDATE notifications SET {set_clause} WHERE notification_id IN {in_clause}");
+    trakkt_core::tx_with!(&mut *tx, |e| {
+        let mut query = sqlx::query(&update_sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+        // Mapped to `()` so both backend arms agree on a type; the row count is
+        // not consulted — `ids` already names exactly the rows to change.
+        query.execute(e).await.map(|_| ())
+    })?;
+
+    let select_sql = format!("{NOTIFICATION_SELECT} WHERE n.notification_id IN {in_clause}");
+    let rows: Vec<NotificationRow> = trakkt_core::tx_with!(&mut *tx, |e| {
+        let mut query = sqlx::query_as::<_, NotificationRow>(&select_sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+        query.fetch_all(e).await
+    })?;
+
+    for row in rows {
+        let notification = row.into_dto();
+        let payload = sync_log_service::sync_payload(
+            &notification,
+            entity_types::NOTIFICATION,
+            &notification.notification_id,
+        );
+
+        batch
+            .record(
+                &mut *tx,
+                entity_types::NOTIFICATION,
+                &notification.notification_id,
+                &notification.workspace_id,
+                // A notification belongs to its recipient alone. Downgrading
+                // this to `SyncAudience::Workspace` is the TRA-9920 leak.
+                SyncAudience::User(user_id),
+                SyncActionType::Update,
+                payload,
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Open a transaction, apply `set_clause` to the notifications of `user_id` that
+/// `state_predicate` selects, log an entry for each, then commit and deliver.
+///
+/// Delivery happens through [`SyncBatch`] and therefore strictly after the
+/// commit. It cannot be moved next to the writes in
+/// [`update_and_record_notifications`]: resolving a frame's recipients reads the
+/// pool, and on SQLite this transaction is holding the only connection.
+async fn change_notifications(
+    db: &DbPool,
+    user_id: &str,
+    set_clause: &str,
+    state_predicate: &str,
+    restrict_to: Option<&[String]>,
+    ws_manager: Option<&WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    // An empty id set would build `IN ()`, which is a syntax error in both
+    // dialects, and asks for nothing anyway.
+    if matches!(restrict_to, Some(ids) if ids.is_empty()) {
+        return Ok(());
+    }
+
+    let mut tx = db.begin().await?;
+
+    let affected =
+        affected_notification_ids(&mut tx, user_id, state_predicate, restrict_to).await?;
+    if affected.is_empty() {
+        // Nothing matched, so there is nothing to change and nothing to
+        // announce. End the transaction rather than committing an empty one —
+        // on SQLite it holds the only connection until it does.
+        tx.rollback().await?;
+        return Ok(());
+    }
+
+    let mut batch = SyncBatch::new();
+    update_and_record_notifications(&mut tx, &mut batch, user_id, set_clause, &affected).await?;
+    batch.commit_and_deliver(tx, ws_manager).await
+}
+
 /// Mark a single notification as read. Verifies the user owns it.
+///
+/// The UPDATE and its `sync_log` entry are one transaction: a read state that
+/// commits without its entry leaves the user's other tabs showing the
+/// notification unread through every reconnect, since only a full bootstrap
+/// would correct them.
+///
+/// Note this has no read-state predicate, so marking an already-read
+/// notification read succeeds rather than erroring — which is the behaviour
+/// before this became transactional — and now also writes an entry. Only the
+/// success is prior behaviour; the entry is new, because nothing here wrote
+/// `sync_log` entries at all before this change.
 pub async fn mark_as_read(
     db: &DbPool,
     notification_id: &str,
     user_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let is_pg = db.is_postgres();
     let bt = sql_compat::bool_true(is_pg);
+    let requested = [notification_id.to_string()];
 
-    let sql = format!(
-        "UPDATE notifications SET read = {bt} \
-         WHERE notification_id = $1 AND user_id = $2 AND deleted_at IS NULL"
-    );
-    let result = trakkt_core::db_execute!(db, &sql, notification_id, user_id)?;
+    let mut tx = db.begin().await?;
 
-    if result.rows_affected() == 0 {
-        // Distinguish between "not found" and "not owned by user".
-        let exists: i64 = trakkt_core::db_fetch_scalar!(
-            db,
+    let affected =
+        affected_notification_ids(&mut tx, user_id, "deleted_at IS NULL", Some(&requested)).await?;
+
+    if affected.is_empty() {
+        // Distinguish "not found" from "not owned by user". This probe runs on
+        // the transaction, not the pool: the transaction is already open and on
+        // SQLite it holds the only connection, so a `db_fetch_scalar!` here
+        // would block until sqlx's acquire timeout and then fail.
+        let exists: i64 = trakkt_core::tx_fetch_scalar!(
+            &mut tx,
             i64,
             "SELECT COUNT(*) FROM notifications WHERE notification_id = $1",
             notification_id
         )?;
+        tx.rollback().await?;
+
         if exists == 0 {
             return Err(trakkt_core::Error::NotFound(format!(
                 "notification {notification_id} not found"
@@ -362,25 +593,40 @@ pub async fn mark_as_read(
         ));
     }
 
-    Ok(())
+    let mut batch = SyncBatch::new();
+    update_and_record_notifications(
+        &mut tx,
+        &mut batch,
+        user_id,
+        &format!("read = {bt}"),
+        &affected,
+    )
+    .await?;
+    batch.commit_and_deliver(tx, ws_manager).await
 }
 
 /// Mark all of a user's notifications as read.
+///
+/// One entry per notification actually flipped — the already-read ones are
+/// excluded by the predicate and get none.
 pub async fn mark_all_as_read(
     db: &DbPool,
     user_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let is_pg = db.is_postgres();
     let bt = sql_compat::bool_true(is_pg);
     let bf = sql_compat::bool_false(is_pg);
 
-    let sql = format!(
-        "UPDATE notifications SET read = {bt} \
-         WHERE user_id = $1 AND read = {bf} AND deleted_at IS NULL"
-    );
-    trakkt_core::db_execute!(db, &sql, user_id)?;
-
-    Ok(())
+    change_notifications(
+        db,
+        user_id,
+        &format!("read = {bt}"),
+        &format!("read = {bf} AND deleted_at IS NULL"),
+        None,
+        ws_manager,
+    )
+    .await
 }
 
 /// Count unread notifications for a user.
@@ -399,50 +645,28 @@ pub async fn count_unread(
     Ok(count)
 }
 
-/// Execute a bulk UPDATE on notifications by ID. `$1` is always `user_id`;
-/// `$2..$N+1` are the notification IDs.
-async fn bulk_update_notifications(
-    db: &DbPool,
-    user_id: &str,
-    notification_ids: &[String],
-    set_and_where: &str,
-) -> trakkt_core::Result<()> {
-    if notification_ids.is_empty() {
-        return Ok(());
-    }
-
-    let (in_clause, _) = trakkt_core::db::in_clause_placeholders(notification_ids.len(), 2);
-    let sql = format!(
-        "UPDATE notifications SET {set_and_where} \
-           AND notification_id IN {in_clause}"
-    );
-
-    trakkt_core::db_with_pool!(db, |p| {
-        let mut query = sqlx::query(&sql).bind(user_id);
-        for id in notification_ids {
-            query = query.bind(id);
-        }
-        query.execute(p).await?;
-        Ok::<(), sqlx::Error>(())
-    })?;
-
-    Ok(())
-}
-
 /// Bulk mark specific notifications as read. Only affects the given user's
-/// non-deleted, currently-unread notifications.
+/// non-deleted, currently-unread notifications — the already-read ones among
+/// `notification_ids` are excluded by the predicate and get no entry.
 pub async fn bulk_mark_as_read(
     db: &DbPool,
     notification_ids: &[String],
     user_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let is_pg = db.is_postgres();
     let bt = sql_compat::bool_true(is_pg);
     let bf = sql_compat::bool_false(is_pg);
-    let clause = format!(
-        "read = {bt} WHERE user_id = $1 AND read = {bf} AND deleted_at IS NULL"
-    );
-    bulk_update_notifications(db, user_id, notification_ids, &clause).await
+
+    change_notifications(
+        db,
+        user_id,
+        &format!("read = {bt}"),
+        &format!("read = {bf} AND deleted_at IS NULL"),
+        Some(notification_ids),
+        ws_manager,
+    )
+    .await
 }
 
 /// Bulk mark specific notifications as unread. Only affects the given user's
@@ -451,29 +675,48 @@ pub async fn bulk_mark_as_unread(
     db: &DbPool,
     notification_ids: &[String],
     user_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let is_pg = db.is_postgres();
     let bt = sql_compat::bool_true(is_pg);
     let bf = sql_compat::bool_false(is_pg);
-    let clause = format!(
-        "read = {bf} WHERE user_id = $1 AND read = {bt} AND deleted_at IS NULL"
-    );
-    bulk_update_notifications(db, user_id, notification_ids, &clause).await
+
+    change_notifications(
+        db,
+        user_id,
+        &format!("read = {bf}"),
+        &format!("read = {bt} AND deleted_at IS NULL"),
+        Some(notification_ids),
+        ws_manager,
+    )
+    .await
 }
 
 /// Soft-delete specific notifications. Only affects the given user's
 /// non-deleted notifications.
+///
+/// The entry is an `Update`, not a `Delete`: the row is still there with
+/// `deleted_at` stamped, and `issue_service::delete_issue` uses `Delete` for
+/// notifications its cascade physically destroys. Keeping the two apart is what
+/// lets a client tell "hidden from my inbox" from "gone".
 pub async fn bulk_delete_notifications(
     db: &DbPool,
     notification_ids: &[String],
     user_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
-    let clause = format!(
-        "deleted_at = {now} WHERE user_id = $1 AND deleted_at IS NULL"
-    );
-    bulk_update_notifications(db, user_id, notification_ids, &clause).await
+
+    change_notifications(
+        db,
+        user_id,
+        &format!("deleted_at = {now}"),
+        "deleted_at IS NULL",
+        Some(notification_ids),
+        ws_manager,
+    )
+    .await
 }
 
 /// Restore soft-deleted notifications. Only affects the given user's
@@ -482,10 +725,18 @@ pub async fn bulk_restore_notifications(
     db: &DbPool,
     notification_ids: &[String],
     user_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
     // NULL is dialect-neutral; no sql_compat call needed.
-    let clause = "deleted_at = NULL WHERE user_id = $1 AND deleted_at IS NOT NULL";
-    bulk_update_notifications(db, user_id, notification_ids, clause).await
+    change_notifications(
+        db,
+        user_id,
+        "deleted_at = NULL",
+        "deleted_at IS NOT NULL",
+        Some(notification_ids),
+        ws_manager,
+    )
+    .await
 }
 
 // ─── Notification Preferences ─────────────────────────────────────────────

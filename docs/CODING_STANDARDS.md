@@ -44,6 +44,9 @@ Standards learned from code reviews. All implementers MUST follow these rules.
 ### Comment and Doc Accuracy
 - A comment that makes a checkable claim must be checked. Reviews repeatedly find comments asserting a consequence that does not hold ("would hang forever" when the real outcome is a 30s `PoolTimedOut`; "replaces 11 copy-pasted blocks" when it was 10; a `Drop` guard "covers panics" when `panic = "abort"` is set in the release profile). If you cannot verify a claim, state the narrower thing you can verify.
 - Prefer documenting the invariant a caller depends on at the callee, not only at the caller. A guarantee recorded only at the call site is silently invalidated the next time the callee is edited in isolation.
+- **Write a derived number next to the inputs it came from.** A bare result — a percentage, a ratio, a timeout headroom, a "this replaces N sites" summary — has nothing beside it to check, so it survives the change that invalidates it. TRA-9986 carried a stale `17.5min`/`~1.4x` through a whole review cycle for exactly this reason; the fix was to restate the addend (`2m00s doubled adds 4min, so ~17min, over which 25 leaves ~1.5x`), which makes the arithmetic re-checkable at a glance. The same applies to counts: TRA-9996's summary of 11 call sites broke down into 9, and its "6 files" was 5. If you write a total, write the parts.
+- **A claim about what another file says is a checkable claim.** "As `CONTRIBUTING.md` also records" and "see the ledger in X" are assertions about a second file's current contents, and they rot independently of the file they sit in. Open the file and confirm the sentence is actually there before citing it — TRA-9986 shipped a cross-reference to a caveat `CONTRIBUTING.md` did not contain. Either add the text so the claim becomes true, or narrow the citation to the file that does record it.
+- **Distinguish "runs and fails" from "never runs."** Do not fold dead code and a silently-failing production path into one sentence. TRA-10001 claimed two functions "have never once succeeded against the database production runs on"; one was wired hourly and genuinely broken, the other had no caller anywhere. State each separately — the remedies are different, and conflating them misdirects whoever reads the comment next.
 
 ### No Banned Patterns
 - No `#[allow(dead_code)]`, `#[allow(unused_variables)]`, `#[allow(unused_imports)]`
@@ -89,6 +92,46 @@ Filler messages — `expect("unwrap")`, `expect("should work")`, `expect("failed
 
 Do not silence a clippy finding with `#[allow(...)]`, and never with a crate-level `#![allow(clippy::unwrap_used)]`. The `Lint Suppression Policy` job fails any PR whose diff adds `#[allow(` to a `.rs` file or `= "allow"` to a `Cargo.toml`. Fix the finding instead: `clippy::type_complexity` wants a `type` alias, `dead_code` wants the field genuinely read or removed.
 
+### Rollback tests for sync_log writes
+
+A converted write needs a test proving the mutation rolls back when its `sync_log`
+insert fails. Inject the failure with a real trigger on `sync_log` — no mocks, no
+`#[cfg(test)]` branch in production control flow — and assert **both** an error
+return and that prior state is intact, compared as ordered `Vec`s.
+
+Two helpers exist in `crates/trakkt-core/src/test_helpers/dual_backend.rs`:
+
+- `reject_sync_log_inserts` — a blanket trigger. Correct only for a mutation that
+  writes exactly one entry.
+- `reject_sync_log_inserts_of_type` — narrows with a `WHEN NEW.entity_type = …`
+  clause so entries written *before* the probed type are accepted. Pair with
+  `clear_sync_log_rejection` to probe several types against one database.
+
+A blanket trigger on a function that writes several entries aborts the *first* one,
+so the assertion passes without the code under test ever being reached. TRA-9950 hit
+this in `notification_service::update_preference`, where `get_or_default_preferences`
+emits an `Insert` first; TRA-9971's cascade had the same shape across four loops.
+
+Narrowing by entity type does not discriminate when every entry a function writes
+shares one type — a bulk mark-read writing N `NOTIFICATION` entries is the case.
+There, seed the prior state and let it commit *before* installing the trigger, so the
+trigger only sees the entries the function under test writes. Say which of the two
+you used and why; a rollback test that cannot fail is worse than none.
+
+Mutation-test each converted function individually and report per function. A sweep
+that reports one aggregate result cannot distinguish "all six covered" from "one
+covered five times".
+
+A new rollback test goes beside its siblings in
+`crates/trakkt-auth/src/sync_log_service.rs`, on SQLite. It belongs in the
+dialect suite instead only if it asserts something the two dialects can still
+disagree about, which in practice means a rollback whose *extent* is decided by
+`ON DELETE` actions rather than by the code. The section of
+`apps/server/tests/postgres_dialect.rs` headed "The 60 SQLite-only rollback
+tests" records where that line was drawn, which three shapes are already run on
+Postgres, and the candidate that was written and then discarded for duplicating
+one of them.
+
 ## The Postgres dialect suite
 
 Production runs Postgres. Every test in the workspace except this suite runs
@@ -100,6 +143,50 @@ twice.
 
 The suite lives in `apps/server/tests/postgres_dialect.rs` and its harness in
 `crates/trakkt-core/src/test_helpers/dual_backend.rs`.
+
+### What it covers, and what it does not
+
+Read this before treating a green `Postgres Dialect Tests` job as a statement
+about the Postgres arms in general. It is not one. It says the bodies in that
+file ran, and nothing about the arms none of them reaches.
+
+As of TRA-10001 the file holds 25 `dual_backend_test!` bodies — 50 tests, one
+pair each — plus three Postgres-only tests that need both backends open at once
+and one SQLite-only test about SQLite's rowid rule. What those bodies execute:
+
+- the six `tx_*` macros, and `write_sync_entry_in_tx`'s `RETURNING sync_id`;
+- the rollback contract, in all three of its shapes — a mutation's first entry
+  rejected, an entry rejected after an earlier one was accepted, and an entry
+  rejected after the statement has already fired `ON DELETE CASCADE`;
+- the eight `sql_compat` helpers production builds SQL with (see the ledger at
+  the head of that file's `sql_compat` section, which also names the twelve it
+  does not and why);
+- the `sort_order` decode — the FLOAT4-versus-`f64` class that shipped twice —
+  across all five columns that carry the name;
+- schema parity: foreign keys and their `ON DELETE`, primary-key nullability,
+  and the runtime behaviour of the four keys whose actions used to differ;
+- the migration chain itself, on both dialects.
+
+What it does not cover, stated so nobody has to infer it:
+
+- **Most `is_pg` branch points.** There are 119 `is_postgres()` call sites
+  outside `apps/server/tests`, and 164 `sql_compat::` call sites. The suite
+  reaches a minority of them, because each body is written for a defect class
+  rather than swept over a list.
+- **All 60 rollback tests** in `crates/trakkt-auth/src/sync_log_service.rs`,
+  which stay on SQLite. TRA-10001 converted none of them and recorded why in
+  that file's own rollback-decision section: 52 install the blanket trigger and
+  8 narrow it, so between them they exercise two of the three shapes the suite
+  already runs on Postgres, and all 60 hang off a fixture that hardcodes
+  `DbPool::connect("sqlite::memory:")` and leans on SQLite column defaults.
+- **`trakkt-auth`'s 178 `#[tokio::test]`s as a whole**, which open an in-memory
+  SQLite pool and are the workspace's main body of service-layer testing.
+- **Twelve `sql_compat` helpers with no production caller** — a deletion to
+  schedule, not a testing gap.
+
+Adding a body is how that list shrinks. Do not let it shrink by editing the
+list: if this section reads as broader than the file, that is a defect in
+whichever change made it so.
 
 ### Running it locally
 
@@ -193,6 +280,10 @@ merge.
 
 ### Reactive Primitives
 - Never create `signal()`, `RwSignal::new()`, or `Effect::new()` inside reactive rendering closures (`move || { ... }`). They reset on every re-render and leak. Hoist all reactive primitives to component setup level (outside the view closure).
+
+### WASM Browser Tests
+- A `wasm-bindgen-test` that constructs an `Effect`, `Resource` or `LocalResource` must call `crate::wasm_test_support::boot_leptos_executor()` before it does so. All three spawn the moment they are constructed, and `any_spawner`'s executor is global and initialized once per test binary — in production by `mount_to`, which a test never calls. Without the explicit call the test passes only when some earlier test in the binary happened to initialize it first. That is an ordering dependency, it stays green until a runner picks a different order, and it has done exactly that twice.
+- Enforced in CI by the `WASM Browser Tests` job, which runs the suite as one binary and then once per module in isolation — run `scripts/wasm-test-isolated.sh` locally before pushing. It derives the module list from the source tree, so a new module is swept without anyone editing a list, and it fails rather than passing quietly when a module's filter selects no test or a test is selected by no module. What it cannot see is an ordering dependency *within* one module, since a module is still run as a whole.
 
 ### SSR / Hydration
 - Never use `Resource::new()` inside `#[cfg(target_arch = "wasm32")]` blocks (desyncs hydration IDs).

@@ -379,21 +379,61 @@ impl WebSocketManager {
         workspace_id: &str,
         json: &str,
     ) {
-        let members: Vec<(String,)> = match trakkt_core::db_fetch_all!(
-            &self.inner.db,
-            (String,),
+        self.deliver_raw_to_recipients(
             "SELECT user_id FROM workspace_users WHERE workspace_id = $1",
-            workspace_id
-        ) {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::error!("Failed to query workspace members for broadcast: {e}");
-                return;
-            }
-        };
+            workspace_id,
+            "workspace members",
+            json,
+        )
+        .await;
+    }
 
-        for (member_user_id,) in members {
-            self.deliver(&member_user_id, json).await;
+    /// Broadcast a pre-serialized JSON string to the *current* members of one
+    /// team.
+    ///
+    /// The team counterpart of [`Self::broadcast_raw_to_workspace`], and the
+    /// live half of the `team_members` predicate in
+    /// `sync_log_service::ENTRIES_SINCE_SQL`. The recipient set is deliberately
+    /// the same one that predicate admits — `team_members` as it stands right
+    /// now, with no `workspace_users` join — so a member cannot be sent a frame
+    /// live that their next delta would withhold, or the reverse. Changing this
+    /// query without changing that predicate re-opens TRA-10039.
+    ///
+    /// "Current" is resolved here, at delivery time, and delivery runs strictly
+    /// after the mutation's transaction commits (see
+    /// `sync_log_service::SyncBatch::commit_and_deliver`). That ordering is what
+    /// makes membership changes made by the same transaction visible to this
+    /// read — and it is also mandatory, because this read reaches the pool,
+    /// which an open transaction on SQLite is holding the only connection to.
+    pub async fn broadcast_raw_to_team_members(&self, team_id: &str, json: &str) {
+        self.deliver_raw_to_recipients(
+            "SELECT user_id FROM team_members WHERE team_id = $1",
+            team_id,
+            "team members",
+            json,
+        )
+        .await;
+    }
+
+    /// Resolve a recipient set with `sql` and deliver `json` to every user in
+    /// it.
+    ///
+    /// `sql` must select exactly one `user_id` column and take exactly one bind
+    /// parameter, which `scope_id` supplies. `scope` names the recipient set in
+    /// the log line a failed resolve emits, which is the only trace a dropped
+    /// broadcast leaves — delivery is best-effort and nothing here propagates.
+    async fn deliver_raw_to_recipients(&self, sql: &str, scope_id: &str, scope: &str, json: &str) {
+        let recipients: Vec<(String,)> =
+            match trakkt_core::db_fetch_all!(&self.inner.db, (String,), sql, scope_id) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!("Failed to query {scope} for broadcast: {e}");
+                    return;
+                }
+            };
+
+        for (user_id,) in recipients {
+            self.deliver(&user_id, json).await;
         }
     }
 
@@ -551,6 +591,7 @@ impl std::fmt::Debug for WebSocketManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trakkt_core::test_helpers::channel::recv_soon;
 
     /// Single-instance manager (no Redis) backed by a throwaway in-memory DB.
     /// None of the paths exercised here run a query; the pool only satisfies
@@ -566,8 +607,12 @@ mod tests {
     /// starts with one frame per connect that happened after it registered.
     /// Drain them so the assertions below only observe test traffic.
     async fn drain_heartbeats(rx: &mut mpsc::Receiver<String>, expected: usize) {
-        for _ in 0..expected {
-            let frame = rx.recv().await.expect("heartbeat frame");
+        for drained in 0..expected {
+            let frame = recv_soon(
+                rx,
+                &format!("connect heartbeat {} of {expected}", drained + 1),
+            )
+            .await;
             let parsed: WebSocketMessage =
                 serde_json::from_str(&frame).expect("heartbeat frame is a WebSocketMessage");
             assert!(
@@ -596,8 +641,8 @@ mod tests {
             .expect("send to the first connection");
 
         assert_eq!(
-            first.rx.recv().await.as_deref(),
-            Some("bootstrap-for-first")
+            recv_soon(&mut first.rx, "the first connection's own bootstrap frame").await,
+            "bootstrap-for-first"
         );
         assert!(
             matches!(second.rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
@@ -618,8 +663,14 @@ mod tests {
 
         manager.deliver_to_local_user(user_id, "workspace-broadcast");
 
-        assert_eq!(first.rx.recv().await.as_deref(), Some("workspace-broadcast"));
-        assert_eq!(second.rx.recv().await.as_deref(), Some("workspace-broadcast"));
+        assert_eq!(
+            recv_soon(&mut first.rx, "the broadcast reaching the first connection").await,
+            "workspace-broadcast"
+        );
+        assert_eq!(
+            recv_soon(&mut second.rx, "the broadcast reaching the second connection").await,
+            "workspace-broadcast"
+        );
     }
 
     /// Queue messages until the connection's outbound channel refuses more.
@@ -731,8 +782,12 @@ mod tests {
         manager.deliver_to_local_user(user_id, "workspace-broadcast");
 
         assert_eq!(
-            healthy.rx.recv().await.as_deref(),
-            Some("workspace-broadcast"),
+            recv_soon(
+                &mut healthy.rx,
+                "the broadcast reaching the connection that is keeping up"
+            )
+            .await,
+            "workspace-broadcast",
             "a healthy connection must still get the frame"
         );
         assert_eq!(

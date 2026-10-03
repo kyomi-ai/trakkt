@@ -135,6 +135,49 @@ export async function launchTwoClients(): Promise<TwoClients> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Fixtures created through the real UI
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Create an issue from `page` through the real UI and return its detail path.
+ *
+ * Extracted under TRA-9997, when a fourth copy of this block was about to be
+ * written. It was already inline in three suites — `two-window-sync.spec.ts`,
+ * `milestone-realtime.spec.ts` and, wrapped in project assignment,
+ * `project-view-state.spec.ts` — with the same six selectors and the same
+ * comment about `/issues` in each.
+ *
+ * `/workspace`, not `/issues`: the latter redirects to `/my-issues`, which lists
+ * only what you are assigned or watching and carries no create button at all.
+ * That was found the hard way — the case in `two-window-sync.spec.ts` was
+ * written against `/issues` under TRA-9992 and never executed until TRA-9964.
+ *
+ * The one thing that is not identical across the three call sites is the wait
+ * for the created row: 20s in `two-window-sync.spec.ts`, 30s in the other two.
+ * This uses 30s, so that suite now waits 10s longer before giving up. It cannot
+ * turn a pass into a failure, only the reverse, and picking the shorter number
+ * to preserve it exactly would make the other two suites *less* tolerant than
+ * they were written to be.
+ */
+export async function createIssueViaUi(page: Page, title: string): Promise<string> {
+  await page.goto('/workspace');
+  await page.waitForLoadState('networkidle');
+
+  // A fresh workspace shows the empty state, which carries its own "New Issue"
+  // button alongside the header's — take the first either way.
+  await page.getByRole('button', { name: 'New Issue' }).first().click();
+  await page.waitForSelector('#issue-title', { timeout: 15_000 });
+  await page.fill('#issue-title', title);
+  await page.getByRole('button', { name: 'Create Issue' }).click();
+
+  const createdRow = page.locator('a[href*="/issues/"]').filter({ hasText: title }).first();
+  await expect(createdRow).toBeVisible({ timeout: 30_000 });
+  const href = await createdRow.getAttribute('href');
+  expect(href, 'the new issue needs a detail link the test can open').toBeTruthy();
+  return href!;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Sync probe
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -422,6 +465,57 @@ export function expectDeliveredByCounter(
   );
 
   return { frame, call: after[0] };
+}
+
+/**
+ * Wait until a sync frame for `entityType` carrying `payloadMustContain` has
+ * reached this window, and return the `entity_id` that frame was addressed to.
+ *
+ * This exists because `expectDeliveredByCounter`'s discriminating string has to
+ * appear in the frame's *payload*, and not every payload names something a test
+ * chose. `IssueRelation` is the case that forced it: every field on it —
+ * `relation_id`, `source_issue_id`, `target_issue_id` — is a UUID the server
+ * minted (`crates/trakkt-types/src/models.rs:368-376`), so the only way to say
+ * "the frame for THIS relation, not some other row of the same type" is to know
+ * one of the two issue ids first. The server has already told this window what
+ * it is: the `issue` frame for that issue's creation carries the id as its
+ * `entity_id` and the title the test chose in its `data`. So this reads the id
+ * back off the wire rather than adding a second channel — a direct API call or a
+ * database read — that could disagree with what the browser was actually sent.
+ *
+ * Every frame the probe holds is searched, not only those after some mark, and
+ * that is deliberate: `handle_sync_bootstrap` streams rows as
+ * `SyncResponse::SyncAction` as well (`apps/server/src/routes/websocket.rs`,
+ * `stream_entities`), so a window that connected *after* the entity was created
+ * learns the same id from its bootstrap. The lookup therefore does not constrain
+ * the order a test has to create things in.
+ */
+export async function waitForEntityId(
+  probe: SyncProbe,
+  entityType: string,
+  payloadMustContain: string,
+  timeoutMs = 30_000,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const match = inboundActionsSince(probe, { t: 0 }).find(
+      (f) =>
+        f.body?.type === 'sync_action' &&
+        f.body?.entity_type === entityType &&
+        JSON.stringify(f.body?.data ?? null).includes(payloadMustContain),
+    );
+    const id = match?.body?.entity_id;
+    if (typeof id === 'string' && id.length > 0) return id;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `no ${entityType} sync_action frame carrying ${JSON.stringify(payloadMustContain)} ` +
+          `reached this window within ${timeoutMs}ms (${probe.frames.length} frames seen). ` +
+          `Without it there is no id to identify the frame under test by, so the assertion ` +
+          `that depends on it would be weaker than it reads.`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
 }
 
 /**
