@@ -2593,6 +2593,8 @@ dependencies = [
 [[package]]
 name = "kode-core"
 version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "816eade3855e6272c61142dd000f30e39c41db459f420f877be8d1f63182c377"
 dependencies = [
  "ropey",
 ]
@@ -2600,6 +2602,8 @@ dependencies = [
 [[package]]
 name = "kode-doc"
 version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "499c9ed6ba9963b1a14c14db5f035da6274f96dae5474122112383c9081071dc"
 dependencies = [
  "arborium-markdown",
  "arborium-tree-sitter",
@@ -2609,6 +2613,8 @@ dependencies = [
 [[package]]
 name = "kode-leptos"
 version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "278ee072799d54f10c2e7d9e5aa741e4997b84652d4c30535fb1166a9c5ad2c7"
 dependencies = [
  "arborium",
  "arborium-theme",
@@ -2629,6 +2635,8 @@ dependencies = [
 [[package]]
 name = "kode-markdown"
 version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "437913b1bb868d04ce0ac5a26a7430fcd8e4bb5bc03a51033c02f2f8a27d9656"
 dependencies = [
  "arborium-markdown",
  "arborium-tree-sitter",

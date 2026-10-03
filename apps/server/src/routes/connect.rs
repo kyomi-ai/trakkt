@@ -17,7 +17,7 @@
 //! output to all subscribed browsers.
 
 use axum::{
-    extract::{ws, Query, State},
+    extract::{Query, State, ws},
     http::HeaderMap,
     response::IntoResponse,
 };
@@ -75,6 +75,13 @@ async fn handle_agent_ws(socket: ws::WebSocket, state: AppState, headers: Header
         }
     };
 
+    if !state.config.is_personal()
+        && (!auth.has_scope("write")
+            || !active_membership(&state, &auth.workspace_id, &auth.user_id).await)
+    {
+        close_with_code(socket, CLOSE_AUTH_REQUIRED, "Workspace access denied").await;
+        return;
+    }
     let agent_id = Uuid::new_v4().to_string();
 
     // Register agent and get the outbound channel receiver.
@@ -94,7 +101,7 @@ async fn handle_agent_ws(socket: ws::WebSocket, state: AppState, headers: Header
 
     // Outbound task: drain mpsc receiver, send to WebSocket.
     let agent_id_for_send = agent_id.clone();
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
         ping_interval.tick().await; // consume immediate tick
 
@@ -103,7 +110,7 @@ async fn handle_agent_ws(socket: ws::WebSocket, state: AppState, headers: Header
                 msg = agent_rx.recv() => {
                     match msg {
                         Some(json) => {
-                            if ws_sender.send(ws::Message::text(json)).await.is_err() {
+                            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(10), ws_sender.send(ws::Message::text(json))).await, Ok(Ok(()))) {
                                 break;
                             }
                         }
@@ -123,7 +130,7 @@ async fn handle_agent_ws(socket: ws::WebSocket, state: AppState, headers: Header
                     let ping_msg = ServerMessage::Ping { ts };
                     match serde_json::to_string(&ping_msg) {
                         Ok(json) => {
-                            if ws_sender.send(ws::Message::text(json)).await.is_err() {
+                            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(10), ws_sender.send(ws::Message::text(json))).await, Ok(Ok(()))) {
                                 break;
                             }
                         }
@@ -135,14 +142,19 @@ async fn handle_agent_ws(socket: ws::WebSocket, state: AppState, headers: Header
             }
         }
 
-        let _ = ws_sender.close().await;
+        if !matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), ws_sender.close()).await,
+            Ok(Ok(()))
+        ) {
+            tracing::debug!("Connect WebSocket close failed or timed out");
+        }
         tracing::debug!(agent_id = %agent_id_for_send, "Agent WS send task ended");
     });
 
     // Inbound task: parse AgentMessage JSON from agent, handle routing.
     let connect_mgr = state.connect_manager.clone();
     let agent_id_for_recv = agent_id.clone();
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 ws::Message::Text(text) => {
@@ -158,9 +170,12 @@ async fn handle_agent_ws(socket: ws::WebSocket, state: AppState, headers: Header
 
     // Wait for either side to finish.
     tokio::select! {
-        _ = send_task => {}
-        _ = recv_task => {}
+        _ = &mut send_task => {}
+        _ = &mut recv_task => {}
     }
+
+    send_task.abort();
+    recv_task.abort();
 
     // Cleanup: unregister agent and all its sessions.
     state.connect_manager.unregister_agent(&agent_id);
@@ -170,7 +185,11 @@ async fn handle_agent_ws(socket: ws::WebSocket, state: AppState, headers: Header
 /// Handle an inbound message from the agent.
 ///
 /// Routes agent output to the appropriate browser subscribers.
-fn handle_agent_message(text: &str, agent_id: &str, connect_mgr: &trakkt_auth::connect_manager::ConnectManager) {
+fn handle_agent_message(
+    text: &str,
+    agent_id: &str,
+    connect_mgr: &trakkt_auth::connect_manager::ConnectManager,
+) {
     let msg: AgentMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
@@ -179,53 +198,7 @@ fn handle_agent_message(text: &str, agent_id: &str, connect_mgr: &trakkt_auth::c
         }
     };
 
-    match &msg {
-        AgentMessage::SessionOutput { session_id, .. } => {
-            // Broadcast terminal output to all watching browsers.
-            connect_mgr.broadcast_to_browsers(session_id, text);
-        }
-        AgentMessage::SessionEvent { session_id, event } => {
-            // Broadcast lifecycle event to browsers.
-            connect_mgr.broadcast_to_browsers(session_id, text);
-
-            // If the session ended, clean up the mapping.
-            match event {
-                trakkt_connect_protocol::wire::SessionEventKind::Exited { .. }
-                | trakkt_connect_protocol::wire::SessionEventKind::Killed
-                | trakkt_connect_protocol::wire::SessionEventKind::SpawnFailed { .. } => {
-                    connect_mgr.unregister_session(session_id);
-                }
-                trakkt_connect_protocol::wire::SessionEventKind::Started => {}
-            }
-        }
-        AgentMessage::ScrollbackDump { session_id, .. } => {
-            // Broadcast scrollback to all watching browsers.
-            connect_mgr.broadcast_to_browsers(session_id, text);
-        }
-        AgentMessage::SessionList { sessions } => {
-            // Reconcile the session registry with the agent's reported sessions.
-            for info in sessions {
-                connect_mgr.register_session(&info.session_id, agent_id);
-            }
-        }
-        AgentMessage::Ready {
-            agent_version,
-            hostname,
-            os,
-        } => {
-            tracing::info!(
-                agent_id,
-                agent_version,
-                hostname,
-                os,
-                "Agent reported ready"
-            );
-        }
-        AgentMessage::Pong { .. } => {
-            // Keepalive acknowledged. Could update last-seen timestamp in the
-            // future for agent health monitoring.
-        }
-    }
+    connect_mgr.agent_message(agent_id, &msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,23 +250,11 @@ async fn handle_terminal_ws(socket: ws::WebSocket, state: AppState, params: Term
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Track which sessions this browser is subscribed to, so we can clean
-    // up on disconnect.
-    let subscribed_sessions: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-
     let connect_mgr = state.connect_manager.clone();
-    let subscribed_for_recv = subscribed_sessions.clone();
-    let workspace_for_recv = workspace_id.clone();
-
-    // We need a way to forward session output from the ConnectManager to
-    // the browser. Each time the browser subscribes to a session, we get
-    // an mpsc::Receiver. We merge all of these into a single stream using
-    // an mpsc channel that aggregates output from all subscribed sessions.
-    let (aggregate_tx, mut aggregate_rx) = tokio::sync::mpsc::channel::<String>(2048);
+    let mut aggregate_rx = connect_mgr.register_browser(browser_conn_id, &workspace_id, &user_id);
 
     // Outbound task: forward aggregated session output to browser WebSocket.
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(45));
         ping_interval.tick().await;
 
@@ -302,7 +263,7 @@ async fn handle_terminal_ws(socket: ws::WebSocket, state: AppState, params: Term
                 msg = aggregate_rx.recv() => {
                     match msg {
                         Some(json) => {
-                            if ws_sender.send(ws::Message::text(json)).await.is_err() {
+                            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(10), ws_sender.send(ws::Message::text(json))).await, Ok(Ok(()))) {
                                 break;
                             }
                         }
@@ -310,28 +271,26 @@ async fn handle_terminal_ws(socket: ws::WebSocket, state: AppState, params: Term
                     }
                 }
                 _ = ping_interval.tick() => {
-                    if ws_sender.send(ws::Message::Ping(vec![].into())).await.is_err() {
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(10), ws_sender.send(ws::Message::Ping(vec![].into()))).await, Ok(Ok(()))) {
                         break;
                     }
                 }
             }
         }
-        let _ = ws_sender.close().await;
+        if !matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), ws_sender.close()).await,
+            Ok(Ok(()))
+        ) {
+            tracing::debug!("Connect WebSocket close failed or timed out");
+        }
     });
 
     // Inbound task: parse browser commands, relay to agents.
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 ws::Message::Text(text) => {
-                    handle_browser_message(
-                        &text,
-                        &workspace_for_recv,
-                        browser_conn_id,
-                        &connect_mgr,
-                        &subscribed_for_recv,
-                        &aggregate_tx,
-                    );
+                    handle_browser_message(&text, browser_conn_id, &connect_mgr);
                 }
                 ws::Message::Pong(_) => {}
                 ws::Message::Close(_) => break,
@@ -341,20 +300,13 @@ async fn handle_terminal_ws(socket: ws::WebSocket, state: AppState, params: Term
     });
 
     tokio::select! {
-        _ = send_task => {}
-        _ = recv_task => {}
+        _ = &mut send_task => {}
+        _ = &mut recv_task => {}
     }
 
-    // Cleanup: unsubscribe from all sessions.
-    let sessions = subscribed_sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    for session_id in &sessions {
-        state
-            .connect_manager
-            .unsubscribe_browser(session_id, browser_conn_id);
-    }
+    send_task.abort();
+    recv_task.abort();
+    state.connect_manager.unregister_browser(browser_conn_id);
     tracing::info!(
         browser_conn_id,
         user_id = %user_id,
@@ -408,6 +360,9 @@ async fn authenticate_terminal_ws(
         }
     };
 
+    if !active_membership(state, &workspace_id, &user_id).await {
+        return None;
+    }
     Some((user_id, workspace_id))
 }
 
@@ -417,164 +372,27 @@ async fn authenticate_terminal_ws(
 /// permissions and relays to the correct agent.
 fn handle_browser_message(
     text: &str,
-    workspace_id: &str,
     browser_conn_id: u64,
-    connect_mgr: &trakkt_auth::connect_manager::ConnectManager,
-    subscribed_sessions: &std::sync::Mutex<Vec<String>>,
-    aggregate_tx: &tokio::sync::mpsc::Sender<String>,
+    manager: &trakkt_auth::connect_manager::ConnectManager,
 ) {
     let msg: ServerMessage = match serde_json::from_str(text) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(browser_conn_id, error = %e, "Failed to parse browser ServerMessage");
+        Ok(msg) => msg,
+        Err(error) => {
+            tracing::warn!(%error, "Invalid Connect command");
             return;
         }
     };
-
-    match msg {
-        ServerMessage::SpawnSession { ref session_id, .. } => {
-            // Find an agent in this workspace to handle the spawn.
-            let agent_id = match connect_mgr.find_agent_for_workspace(workspace_id) {
-                Some(id) => id,
-                None => {
-                    tracing::warn!(
-                        workspace_id,
-                        browser_conn_id,
-                        "No agent connected for workspace"
-                    );
-                    return;
-                }
-            };
-
-            // Register the session mapping before sending to agent.
-            connect_mgr.register_session(session_id, &agent_id);
-
-            // Subscribe this browser to the session output.
-            let session_rx = connect_mgr.subscribe_browser(session_id, browser_conn_id);
-            subscribed_sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(session_id.clone());
-
-            spawn_session_forwarder(session_rx, aggregate_tx.clone(), session_id.clone());
-
-            // Relay the spawn command to the agent.
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to serialize SpawnSession for relay");
-                    return;
-                }
-            };
-            if !connect_mgr.send_to_agent(session_id, &json) {
-                tracing::warn!(session_id, "Failed to relay SpawnSession to agent");
-            }
-        }
-
-        ServerMessage::SessionInput { ref session_id, .. }
-        | ServerMessage::SessionResize { ref session_id, .. }
-        | ServerMessage::SessionKill { ref session_id, .. }
-        | ServerMessage::ScrollbackRequest { ref session_id } => {
-            // Verify the session belongs to this browser's workspace.
-            match connect_mgr.get_session_workspace(session_id) {
-                Some(ref session_ws) if session_ws == workspace_id => {}
-                Some(_) => {
-                    tracing::warn!(
-                        browser_conn_id,
-                        session_id,
-                        workspace_id,
-                        "Cross-workspace session access denied"
-                    );
-                    return;
-                }
-                None => {
-                    tracing::warn!(browser_conn_id, session_id, "Unknown session");
-                    return;
-                }
-            }
-
-            // For ScrollbackRequest, also subscribe the browser if not already.
-            if matches!(msg, ServerMessage::ScrollbackRequest { .. }) {
-                let already_subscribed = subscribed_sessions
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains(session_id);
-
-                if !already_subscribed {
-                    let session_rx = connect_mgr.subscribe_browser(session_id, browser_conn_id);
-                    subscribed_sessions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(session_id.clone());
-                    spawn_session_forwarder(session_rx, aggregate_tx.clone(), session_id.clone());
-                }
-            }
-
-            // Relay to the agent owning this session.
-            // Re-serialize to ensure clean JSON (text may have extra whitespace etc).
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to serialize message for relay");
-                    return;
-                }
-            };
-            if !connect_mgr.send_to_agent(session_id, &json) {
-                tracing::warn!(session_id = %session_id, "Failed to relay message to agent");
-            }
-        }
-
-        ServerMessage::ListSessions => {
-            // Find the agent for this workspace and send directly.
-            let agent_id = match connect_mgr.find_agent_for_workspace(workspace_id) {
-                Some(id) => id,
-                None => {
-                    tracing::warn!(workspace_id, "No agent connected for ListSessions");
-                    return;
-                }
-            };
-
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to serialize ListSessions");
-                    return;
-                }
-            };
-
-            if let Some(sender) = connect_mgr.get_agent_sender(&agent_id)
-                && let Err(e) = sender.try_send(json)
-            {
-                tracing::warn!(agent_id, error = %e, "Failed to send ListSessions to agent");
-            }
-        }
-
-        ServerMessage::Ping { .. } => {
-            // Browser shouldn't send pings, but harmless to ignore.
-        }
+    if let Err(error) = manager.browser_command(browser_conn_id, &msg) {
+        let session_id = match &msg {
+            ServerMessage::SpawnSession { session_id, .. }
+            | ServerMessage::SessionInput { session_id, .. }
+            | ServerMessage::SessionResize { session_id, .. }
+            | ServerMessage::SessionKill { session_id, .. }
+            | ServerMessage::ScrollbackRequest { session_id } => session_id.as_str(),
+            ServerMessage::ListSessions | ServerMessage::Ping { .. } => "",
+        };
+        manager.browser_error(browser_conn_id, session_id, error);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Spawn a task that forwards session output from a per-session receiver to the
-/// browser's aggregate output channel.
-fn spawn_session_forwarder(
-    session_rx: tokio::sync::mpsc::Receiver<String>,
-    agg_tx: tokio::sync::mpsc::Sender<String>,
-    session_id: String,
-) {
-    tokio::spawn(async move {
-        let mut rx = session_rx;
-        while let Some(json) = rx.recv().await {
-            if agg_tx.send(json).await.is_err() {
-                break;
-            }
-        }
-        tracing::debug!(session_id = %session_id, "Session output forwarder ended");
-    });
 }
 
 /// Close a WebSocket with a custom close code and reason.
@@ -584,5 +402,22 @@ async fn close_with_code(socket: ws::WebSocket, code: u16, reason: &str) {
         code,
         reason: reason.to_string().into(),
     };
-    let _ = sender.send(ws::Message::Close(Some(close_frame))).await;
+    if !matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sender.send(ws::Message::Close(Some(close_frame)))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        tracing::debug!("Connect authentication close failed or timed out");
+    }
+}
+
+async fn active_membership(state: &AppState, workspace: &str, user: &str) -> bool {
+    if !matches!(trakkt_auth::user_service::get_user_by_id(&state.db, user).await, Ok(Some(record)) if record.active)
+    {
+        return false;
+    }
+    matches!(trakkt_auth::user_service::get_workspace_user(&state.db, workspace, user).await, Ok(Some(member)) if member.active)
 }

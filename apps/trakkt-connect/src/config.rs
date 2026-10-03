@@ -22,7 +22,7 @@ const DEFAULT_HEALTH_PORT: u16 = 9090;
 pub struct ConnectConfig {
     /// Bearer token for authenticating with the Trakkt server.
     pub token: String,
-    /// WebSocket URL of the Trakkt server (e.g. `wss://app.trakkt.dev/api/connect/ws`).
+    /// WebSocket URL of the Trakkt server (e.g. `wss://trakkt.app/ws/connect/agent`).
     pub server_url: String,
     /// Default working directory for spawned PTY sessions.
     pub working_dir: PathBuf,
@@ -46,13 +46,7 @@ impl ConnectConfig {
     /// - `TRAKKT_HEALTH_PORT` — health check port
     /// - `TRAKKT_SCROLLBACK_SIZE` — scrollback buffer size in bytes
     pub fn load() -> anyhow::Result<Self> {
-        let file_config = match ConfigFile::load() {
-            Ok(cf) => cf,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to load config file, using env vars only");
-                None
-            }
-        };
+        let file_config = ConfigFile::load()?;
 
         // Token — required
         let token = std::env::var("TRAKKT_TOKEN")
@@ -76,20 +70,28 @@ impl ConnectConfig {
                 )
             })?;
 
+        if token.trim().is_empty() {
+            anyhow::bail!("TRAKKT_TOKEN must not be empty");
+        }
+        if !server_url.starts_with("wss://") && !server_url.starts_with("ws://") {
+            anyhow::bail!("TRAKKT_SERVER_URL must use ws:// or wss://");
+        }
         // Working directory — defaults to current directory
         let working_dir = std::env::var("TRAKKT_WORKING_DIR")
             .ok()
             .or_else(|| file_config.as_ref().and_then(|cf| cf.working_dir.clone()))
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
-            });
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp")));
 
         // Allowed commands (comma-separated env var)
         let allowed_commands = std::env::var("TRAKKT_ALLOWED_COMMANDS")
             .ok()
             .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
-            .or_else(|| file_config.as_ref().and_then(|cf| cf.allowed_commands.clone()))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|cf| cf.allowed_commands.clone())
+            })
             .unwrap_or_else(|| {
                 DEFAULT_ALLOWED_COMMANDS
                     .iter()
@@ -111,6 +113,9 @@ impl ConnectConfig {
             .or_else(|| file_config.as_ref().and_then(|cf| cf.scrollback_size))
             .unwrap_or(DEFAULT_SCROLLBACK_SIZE);
 
+        if scrollback_size > 128 * 1024 {
+            anyhow::bail!("TRAKKT_SCROLLBACK_SIZE must be at most 131072 bytes");
+        }
         Ok(Self {
             token,
             server_url,

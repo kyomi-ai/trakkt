@@ -73,6 +73,8 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMessage {
+    /// Server-reported presence of an authenticated owner's agent.
+    AgentStatus { connected: bool },
     /// PTY output bytes (base64-encoded) from a running session.
     SessionOutput {
         session_id: String,
@@ -168,7 +170,7 @@ mod tests {
             rows: 40,
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "spawn_session");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["command"], json!(["bash", "-l"]));
@@ -189,7 +191,7 @@ mod tests {
             rows: 24,
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert!(json.get("working_dir").is_none());
         assert!(json.get("env").is_none());
     }
@@ -201,7 +203,7 @@ mod tests {
             data: "bHMgLWxhCg==".into(),
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "session_input");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["data"], "bHMgLWxhCg==");
@@ -215,7 +217,7 @@ mod tests {
             rows: 50,
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "session_resize");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["cols"], 200);
@@ -229,7 +231,7 @@ mod tests {
             force: true,
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "session_kill");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["force"], true);
@@ -238,7 +240,7 @@ mod tests {
     #[test]
     fn server_session_kill_force_defaults_to_false() {
         let raw = r#"{"type": "session_kill", "session_id": "sess-1"}"#;
-        let msg: ServerMessage = serde_json::from_str(raw).unwrap();
+        let msg: ServerMessage = serde_json::from_str(raw).expect("valid protocol test fixture");
         match msg {
             ServerMessage::SessionKill { force, .. } => assert!(!force),
             other => panic!("expected SessionKill, got {other:?}"),
@@ -251,7 +253,7 @@ mod tests {
             session_id: "sess-1".into(),
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "scrollback_request");
         assert_eq!(json["session_id"], "sess-1");
     }
@@ -260,7 +262,7 @@ mod tests {
     fn server_list_sessions_serializes_correctly() {
         let msg = ServerMessage::ListSessions;
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "list_sessions");
     }
 
@@ -268,7 +270,7 @@ mod tests {
     fn server_ping_serializes_correctly() {
         let msg = ServerMessage::Ping { ts: 1718200000000 };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "ping");
         assert_eq!(json["ts"], 1718200000000u64);
     }
@@ -292,8 +294,9 @@ mod tests {
             rows: 30,
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::SpawnSession {
                 session_id,
@@ -322,8 +325,9 @@ mod tests {
             data: "dGVzdA==".into(),
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::SessionInput { session_id, data } => {
                 assert_eq!(session_id, "rt-2");
@@ -341,8 +345,9 @@ mod tests {
             rows: 48,
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::SessionResize {
                 session_id,
@@ -364,8 +369,9 @@ mod tests {
             force: true,
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::SessionKill { session_id, force } => {
                 assert_eq!(session_id, "rt-4");
@@ -381,8 +387,9 @@ mod tests {
             session_id: "rt-5".into(),
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::ScrollbackRequest { session_id } => {
                 assert_eq!(session_id, "rt-5");
@@ -395,19 +402,19 @@ mod tests {
     fn server_list_sessions_roundtrip() {
         let msg = ServerMessage::ListSessions;
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         assert!(matches!(parsed, ServerMessage::ListSessions));
     }
 
     #[test]
     fn server_ping_roundtrip() {
-        let msg = ServerMessage::Ping {
-            ts: 1718200000000,
-        };
+        let msg = ServerMessage::Ping { ts: 1718200000000 };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::Ping { ts } => assert_eq!(ts, 1718200000000),
             other => panic!("expected Ping, got {other:?}"),
@@ -427,7 +434,7 @@ mod tests {
             "cols": 80,
             "rows": 24
         }"#;
-        let msg: ServerMessage = serde_json::from_str(raw).unwrap();
+        let msg: ServerMessage = serde_json::from_str(raw).expect("valid protocol test fixture");
         match msg {
             ServerMessage::SpawnSession {
                 session_id,
@@ -451,14 +458,14 @@ mod tests {
     #[test]
     fn server_list_sessions_from_raw_json() {
         let raw = r#"{"type": "list_sessions"}"#;
-        let msg: ServerMessage = serde_json::from_str(raw).unwrap();
+        let msg: ServerMessage = serde_json::from_str(raw).expect("valid protocol test fixture");
         assert!(matches!(msg, ServerMessage::ListSessions));
     }
 
     #[test]
     fn server_ping_from_raw_json() {
         let raw = r#"{"type": "ping", "ts": 42}"#;
-        let msg: ServerMessage = serde_json::from_str(raw).unwrap();
+        let msg: ServerMessage = serde_json::from_str(raw).expect("valid protocol test fixture");
         match msg {
             ServerMessage::Ping { ts } => assert_eq!(ts, 42),
             other => panic!("expected Ping, got {other:?}"),
@@ -473,14 +480,20 @@ mod tests {
     fn server_unknown_type_tag_fails() {
         let raw = r#"{"type": "drop_tables"}"#;
         let result: Result<ServerMessage, _> = serde_json::from_str(raw);
-        assert!(result.is_err(), "expected deserialization to fail for unknown type tag");
+        assert!(
+            result.is_err(),
+            "expected deserialization to fail for unknown type tag"
+        );
     }
 
     #[test]
     fn server_missing_type_tag_fails() {
         let raw = r#"{"session_id": "no-type"}"#;
         let result: Result<ServerMessage, _> = serde_json::from_str(raw);
-        assert!(result.is_err(), "expected deserialization to fail for missing type tag");
+        assert!(
+            result.is_err(),
+            "expected deserialization to fail for missing type tag"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -494,7 +507,7 @@ mod tests {
             data: "SGVsbG8gV29ybGQ=".into(),
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "session_output");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["data"], "SGVsbG8gV29ybGQ=");
@@ -507,7 +520,7 @@ mod tests {
             event: SessionEventKind::Started,
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "session_event");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["event"]["kind"], "started");
@@ -520,7 +533,7 @@ mod tests {
             event: SessionEventKind::Exited { exit_code: 0 },
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "session_event");
         assert_eq!(json["event"]["kind"], "exited");
         assert_eq!(json["event"]["exit_code"], 0);
@@ -533,7 +546,7 @@ mod tests {
             event: SessionEventKind::Killed,
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["event"]["kind"], "killed");
     }
 
@@ -546,7 +559,7 @@ mod tests {
             },
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["event"]["kind"], "spawn_failed");
         assert_eq!(json["event"]["error"], "command not found: zsh");
     }
@@ -558,7 +571,7 @@ mod tests {
             data: "c2Nyb2xsYmFjaw==".into(),
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "scrollback_dump");
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["data"], "c2Nyb2xsYmFjaw==");
@@ -578,7 +591,7 @@ mod tests {
             }],
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "session_list");
         assert_eq!(json["sessions"][0]["session_id"], "sess-1");
         assert_eq!(json["sessions"][0]["command"], json!(["bash"]));
@@ -591,11 +604,9 @@ mod tests {
 
     #[test]
     fn agent_session_list_empty_serializes_correctly() {
-        let msg = AgentMessage::SessionList {
-            sessions: vec![],
-        };
+        let msg = AgentMessage::SessionList { sessions: vec![] };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "session_list");
         assert_eq!(json["sessions"], json!([]));
     }
@@ -608,7 +619,7 @@ mod tests {
             os: "linux".into(),
         };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "ready");
         assert_eq!(json["agent_version"], "0.1.0");
         assert_eq!(json["hostname"], "agent-host");
@@ -619,7 +630,7 @@ mod tests {
     fn agent_pong_serializes_correctly() {
         let msg = AgentMessage::Pong { ts: 1718200000000 };
 
-        let json = serde_json::to_value(&msg).unwrap();
+        let json = serde_json::to_value(&msg).expect("valid protocol test fixture");
         assert_eq!(json["type"], "pong");
         assert_eq!(json["ts"], 1718200000000u64);
     }
@@ -635,8 +646,9 @@ mod tests {
             data: "YWJj".into(),
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::SessionOutput { session_id, data } => {
                 assert_eq!(session_id, "rt-1");
@@ -653,8 +665,9 @@ mod tests {
             event: SessionEventKind::Started,
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::SessionEvent { session_id, event } => {
                 assert_eq!(session_id, "rt-2");
@@ -671,8 +684,9 @@ mod tests {
             event: SessionEventKind::Exited { exit_code: 127 },
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::SessionEvent { session_id, event } => {
                 assert_eq!(session_id, "rt-3");
@@ -692,8 +706,9 @@ mod tests {
             event: SessionEventKind::Killed,
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::SessionEvent { event, .. } => {
                 assert!(matches!(event, SessionEventKind::Killed));
@@ -711,8 +726,9 @@ mod tests {
             },
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::SessionEvent { session_id, event } => {
                 assert_eq!(session_id, "rt-5");
@@ -734,8 +750,9 @@ mod tests {
             data: "ZHVtcA==".into(),
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::ScrollbackDump { session_id, data } => {
                 assert_eq!(session_id, "rt-6");
@@ -760,8 +777,9 @@ mod tests {
             sessions: vec![info],
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::SessionList { sessions } => {
                 assert_eq!(sessions.len(), 1);
@@ -785,8 +803,9 @@ mod tests {
             os: "linux".into(),
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::Ready {
                 agent_version,
@@ -803,12 +822,11 @@ mod tests {
 
     #[test]
     fn agent_pong_roundtrip() {
-        let msg = AgentMessage::Pong {
-            ts: 1718200000000,
-        };
+        let msg = AgentMessage::Pong { ts: 1718200000000 };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::Pong { ts } => assert_eq!(ts, 1718200000000),
             other => panic!("expected Pong, got {other:?}"),
@@ -822,7 +840,7 @@ mod tests {
     #[test]
     fn agent_session_output_from_raw_json() {
         let raw = r#"{"type": "session_output", "session_id": "raw-1", "data": "AAAA"}"#;
-        let msg: AgentMessage = serde_json::from_str(raw).unwrap();
+        let msg: AgentMessage = serde_json::from_str(raw).expect("valid protocol test fixture");
         match msg {
             AgentMessage::SessionOutput { session_id, data } => {
                 assert_eq!(session_id, "raw-1");
@@ -839,7 +857,7 @@ mod tests {
             "session_id": "raw-2",
             "event": {"kind": "exited", "exit_code": 1}
         }"#;
-        let msg: AgentMessage = serde_json::from_str(raw).unwrap();
+        let msg: AgentMessage = serde_json::from_str(raw).expect("valid protocol test fixture");
         match msg {
             AgentMessage::SessionEvent { session_id, event } => {
                 assert_eq!(session_id, "raw-2");
@@ -860,7 +878,7 @@ mod tests {
             "hostname": "test-box",
             "os": "macos"
         }"#;
-        let msg: AgentMessage = serde_json::from_str(raw).unwrap();
+        let msg: AgentMessage = serde_json::from_str(raw).expect("valid protocol test fixture");
         match msg {
             AgentMessage::Ready {
                 agent_version,
@@ -878,7 +896,7 @@ mod tests {
     #[test]
     fn agent_pong_from_raw_json() {
         let raw = r#"{"type": "pong", "ts": 99}"#;
-        let msg: AgentMessage = serde_json::from_str(raw).unwrap();
+        let msg: AgentMessage = serde_json::from_str(raw).expect("valid protocol test fixture");
         match msg {
             AgentMessage::Pong { ts } => assert_eq!(ts, 99),
             other => panic!("expected Pong, got {other:?}"),
@@ -899,7 +917,7 @@ mod tests {
                 "pid": 1
             }]
         }"#;
-        let msg: AgentMessage = serde_json::from_str(raw).unwrap();
+        let msg: AgentMessage = serde_json::from_str(raw).expect("valid protocol test fixture");
         match msg {
             AgentMessage::SessionList { sessions } => {
                 assert_eq!(sessions.len(), 1);
@@ -918,14 +936,20 @@ mod tests {
     fn agent_unknown_type_tag_fails() {
         let raw = r#"{"type": "unknown_event"}"#;
         let result: Result<AgentMessage, _> = serde_json::from_str(raw);
-        assert!(result.is_err(), "expected deserialization to fail for unknown type tag");
+        assert!(
+            result.is_err(),
+            "expected deserialization to fail for unknown type tag"
+        );
     }
 
     #[test]
     fn agent_missing_type_tag_fails() {
         let raw = r#"{"session_id": "no-type"}"#;
         let result: Result<AgentMessage, _> = serde_json::from_str(raw);
-        assert!(result.is_err(), "expected deserialization to fail for missing type tag");
+        assert!(
+            result.is_err(),
+            "expected deserialization to fail for missing type tag"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -935,16 +959,18 @@ mod tests {
     #[test]
     fn session_event_kind_started_roundtrip() {
         let kind = SessionEventKind::Started;
-        let json = serde_json::to_string(&kind).unwrap();
-        let parsed: SessionEventKind = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&kind).expect("valid protocol test fixture");
+        let parsed: SessionEventKind =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         assert!(matches!(parsed, SessionEventKind::Started));
     }
 
     #[test]
     fn session_event_kind_exited_roundtrip() {
         let kind = SessionEventKind::Exited { exit_code: -1 };
-        let json = serde_json::to_string(&kind).unwrap();
-        let parsed: SessionEventKind = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&kind).expect("valid protocol test fixture");
+        let parsed: SessionEventKind =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             SessionEventKind::Exited { exit_code } => assert_eq!(exit_code, -1),
             other => panic!("expected Exited, got {other:?}"),
@@ -954,8 +980,9 @@ mod tests {
     #[test]
     fn session_event_kind_killed_roundtrip() {
         let kind = SessionEventKind::Killed;
-        let json = serde_json::to_string(&kind).unwrap();
-        let parsed: SessionEventKind = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&kind).expect("valid protocol test fixture");
+        let parsed: SessionEventKind =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         assert!(matches!(parsed, SessionEventKind::Killed));
     }
 
@@ -964,8 +991,9 @@ mod tests {
         let kind = SessionEventKind::SpawnFailed {
             error: "No such file".into(),
         };
-        let json = serde_json::to_string(&kind).unwrap();
-        let parsed: SessionEventKind = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&kind).expect("valid protocol test fixture");
+        let parsed: SessionEventKind =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             SessionEventKind::SpawnFailed { error } => {
                 assert_eq!(error, "No such file");
@@ -978,7 +1006,10 @@ mod tests {
     fn session_event_kind_unknown_fails() {
         let raw = r#"{"kind": "crashed"}"#;
         let result: Result<SessionEventKind, _> = serde_json::from_str(raw);
-        assert!(result.is_err(), "expected deserialization to fail for unknown kind");
+        assert!(
+            result.is_err(),
+            "expected deserialization to fail for unknown kind"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -997,8 +1028,8 @@ mod tests {
             pid: 54321,
         };
 
-        let json = serde_json::to_string(&info).unwrap();
-        let parsed: SessionInfo = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&info).expect("valid protocol test fixture");
+        let parsed: SessionInfo = serde_json::from_str(&json).expect("valid protocol test fixture");
         assert_eq!(parsed.session_id, "si-1");
         assert_eq!(parsed.command, vec!["cargo", "run"]);
         assert_eq!(parsed.working_dir, Some("/home/user/project".into()));
@@ -1019,7 +1050,7 @@ mod tests {
             "rows": 24,
             "pid": 1
         }"#;
-        let info: SessionInfo = serde_json::from_str(raw).unwrap();
+        let info: SessionInfo = serde_json::from_str(raw).expect("valid protocol test fixture");
         assert_eq!(info.session_id, "si-raw");
         assert_eq!(info.command, vec!["sh", "-c", "sleep 10"]);
         assert_eq!(info.working_dir, Some("/".into()));
@@ -1036,7 +1067,7 @@ mod tests {
             "rows": 24,
             "pid": 42
         }"#;
-        let info: SessionInfo = serde_json::from_str(raw).unwrap();
+        let info: SessionInfo = serde_json::from_str(raw).expect("valid protocol test fixture");
         assert_eq!(info.session_id, "si-no-wd");
         assert!(info.working_dir.is_none());
     }
@@ -1070,8 +1101,9 @@ mod tests {
             rows: 24,
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::SpawnSession { command, .. } => {
                 assert!(command.is_empty());
@@ -1087,8 +1119,9 @@ mod tests {
             data: String::new(),
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::SessionInput { data, .. } => {
                 assert!(data.is_empty());
@@ -1104,8 +1137,9 @@ mod tests {
             data: String::new(),
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::SessionOutput { data, .. } => {
                 assert!(data.is_empty());
@@ -1116,12 +1150,11 @@ mod tests {
 
     #[test]
     fn agent_session_list_empty_roundtrip() {
-        let msg = AgentMessage::SessionList {
-            sessions: vec![],
-        };
+        let msg = AgentMessage::SessionList { sessions: vec![] };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::SessionList { sessions } => {
                 assert!(sessions.is_empty());
@@ -1133,8 +1166,9 @@ mod tests {
     #[test]
     fn session_event_exited_with_negative_exit_code() {
         let kind = SessionEventKind::Exited { exit_code: -9 };
-        let json = serde_json::to_string(&kind).unwrap();
-        let parsed: SessionEventKind = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&kind).expect("valid protocol test fixture");
+        let parsed: SessionEventKind =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             SessionEventKind::Exited { exit_code } => assert_eq!(exit_code, -9),
             other => panic!("expected Exited, got {other:?}"),
@@ -1146,8 +1180,9 @@ mod tests {
         let kind = SessionEventKind::SpawnFailed {
             error: String::new(),
         };
-        let json = serde_json::to_string(&kind).unwrap();
-        let parsed: SessionEventKind = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&kind).expect("valid protocol test fixture");
+        let parsed: SessionEventKind =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             SessionEventKind::SpawnFailed { error } => {
                 assert!(error.is_empty());
@@ -1167,8 +1202,9 @@ mod tests {
             rows: 24,
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::SpawnSession { session_id, .. } => {
                 assert!(session_id.is_empty());
@@ -1185,8 +1221,9 @@ mod tests {
             os: String::new(),
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::Ready {
                 agent_version,
@@ -1204,16 +1241,18 @@ mod tests {
     #[test]
     fn ping_pong_ts_zero() {
         let ping = ServerMessage::Ping { ts: 0 };
-        let json = serde_json::to_string(&ping).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&ping).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::Ping { ts } => assert_eq!(ts, 0),
             other => panic!("expected Ping, got {other:?}"),
         }
 
         let pong = AgentMessage::Pong { ts: 0 };
-        let json = serde_json::to_string(&pong).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&pong).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::Pong { ts } => assert_eq!(ts, 0),
             other => panic!("expected Pong, got {other:?}"),
@@ -1223,8 +1262,9 @@ mod tests {
     #[test]
     fn ping_pong_ts_max() {
         let ping = ServerMessage::Ping { ts: u64::MAX };
-        let json = serde_json::to_string(&ping).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&ping).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::Ping { ts } => assert_eq!(ts, u64::MAX),
             other => panic!("expected Ping, got {other:?}"),
@@ -1247,8 +1287,9 @@ mod tests {
             rows: 24,
         };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: ServerMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             ServerMessage::SpawnSession { env, .. } => {
                 assert_eq!(env.len(), 100);
@@ -1283,8 +1324,9 @@ mod tests {
         ];
         let msg = AgentMessage::SessionList { sessions };
 
-        let json = serde_json::to_string(&msg).unwrap();
-        let parsed: AgentMessage = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&msg).expect("valid protocol test fixture");
+        let parsed: AgentMessage =
+            serde_json::from_str(&json).expect("valid protocol test fixture");
         match parsed {
             AgentMessage::SessionList { sessions } => {
                 assert_eq!(sessions.len(), 2);
