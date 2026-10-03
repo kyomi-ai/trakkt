@@ -2,10 +2,18 @@
 # Trakkt — CI (Pull Request Checks)
 # =============================================================================
 # Runs on every PR to main, including new pushes to existing PRs.
-# Three jobs:
+# Eight jobs, all independent — they run in parallel, so PR wall-clock is the
+# slowest job, not the sum:
 #   1. lint-suppression — blocks new #[allow(...)] and = "allow" in Cargo.toml
-#   2. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
-#   3. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
+#   2. migration-consistency — blocks duplicate/diverging migration versions
+#   3. tx-pool — blocks pool access inside an open database transaction
+#   4. clippy (slow, ~2-5min) — full workspace clippy + WASM compilation check
+#   5. test (slowest) — cargo test across the whole workspace, all on SQLite
+#   6. wasm-test (slow) — executes the trakkt-ui wasm-bindgen-test suite in
+#      Firefox, as one binary and then module-by-module in isolation
+#   7. postgres-dialect (slow) — runs the dual-dialect suite against a real
+#      Postgres service container; the only job that executes an `is_pg` query arm
+#   8. trivy-scan (~30s) — Trivy filesystem vulnerability scanner (HIGH/CRITICAL)
 # =============================================================================
 
 name: CI
@@ -25,6 +33,15 @@ jobs:
   lint-suppression:
     name: Lint Suppression Policy
     runs-on: ubuntu-latest
+    # A full-history checkout plus a `git diff | grep` over the PR diff.
+    # Measured at 4-7s across the 12 most recent PR runs (job-level
+    # started_at -> completed_at). Sized as a floor the same way `tx-pool` below
+    # is: 5 is ~43x the observed maximum, cannot plausibly fire on a slow-runner
+    # day, and still caps the runner-day that GitHub's 6-hour default would burn
+    # if the checkout or the grep wedged. Note the `fetch-depth: 0` below — this
+    # job's cost grows with repository history, so the margin does real work over
+    # time rather than only covering noise.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
         with:
@@ -44,11 +61,88 @@ jobs:
           echo "✅ No new lint suppressions."
 
   # ---------------------------------------------------------------------------
+  # Fast check: migration versions are unique and matched across both dialects
+  #
+  # A duplicate version prefix passes on a fresh CI database and fails at boot on
+  # a database that has already applied one of the pair — i.e. production. PR #244
+  # took prod down exactly this way. Same script developers run locally.
+  # ---------------------------------------------------------------------------
+  migration-consistency:
+    name: Migration Consistency
+    runs-on: ubuntu-latest
+    # checkout plus scripts/check-migrations.sh, which reads the migration
+    # directories and compares version prefixes — no build, no network.
+    # Measured at 4-7s across the 12 most recent PR runs. Floor at 5 for the
+    # same reason as `lint-suppression` above.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check migration versions
+        run: scripts/check-migrations.sh
+
+  # ---------------------------------------------------------------------------
+  # Fast check: no pool access while a database transaction is open
+  #
+  # SQLite runs with max_connections(1), so an open DbTx holds the only
+  # connection. A db_*! macro or a &DbPool-taking helper called before the commit
+  # waits on a connection the transaction cannot release: the request stalls for
+  # sqlx's 30s acquire_timeout and then fails with PoolTimedOut. It compiles and
+  # clippy passes, so nothing else in CI can see it. Same script developers run
+  # locally; its header documents what it deliberately cannot detect.
+  # ---------------------------------------------------------------------------
+  tx-pool:
+    name: Transaction Pool Safety
+    runs-on: ubuntu-latest
+    # Text analysis over the workspace sources, 3.3s locally, no build. The
+    # failure this caps is not a slow check but a stuck one — pathological regex
+    # backtracking on a source file — where GitHub's 6-hour default would burn a
+    # runner-day. 5 gives ~90x headroom over the measured run and still fails
+    # fast. (This job was bounded ahead of TRA-9961, which has since bounded
+    # every remaining job in this file and in the other three workflows.)
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      # python3 is preinstalled on the ubuntu-latest image (3.12.3 on
+      # ubuntu-24.04, 3.14.4 on 26.04); the script needs only 3.9+. Probed in its
+      # own step so that an image which ever drops it fails here, unambiguously,
+      # rather than as a confusing "command not found" on the check itself.
+      - name: Verify python3 is available
+        run: python3 --version
+
+      # First, that the guard still works. It fails silently when it breaks — a
+      # bug in span detection or in the signature parser makes it report nothing,
+      # which against a clean tree is indistinguishable from success. The
+      # fixtures in scripts/tests/tx-pool make that observable.
+      - name: Self-test the check
+        run: scripts/check-tx-pool.py --self-test
+
+      - name: Check for pool access inside open transactions
+        run: scripts/check-tx-pool.py
+
+  # ---------------------------------------------------------------------------
   # Slow check: cargo clippy (compiles + lints the entire workspace)
   # ---------------------------------------------------------------------------
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    # Bounds the whole job; this job had no bound at all before (TRA-9961 tracks
+    # that generally). Measured locally cold — `cargo clean` plus a private empty
+    # SCCACHE_DIR per run, so both start at a 0% hit rate — the two clippy steps
+    # total 318s either way: 206s+112s without --all-targets, 201s+117s with it.
+    # The flag is free at this scale because ~700 dependency crates dominate and
+    # both forms compile them identically; it adds 18 compile units (1454 -> 1472,
+    # +1.2%), all of them workspace test targets. Scaling 318s by the one explicit
+    # CI/local ratio this file records (Test Suite: 295s local cold, 7m18s real CI
+    # = ~1.5x) gives ~8min of clippy, plus ~3-4min of setup (apt, toolchain with
+    # the wasm32 target, cargo update, tailwind) = ~12min realistic worst cold.
+    # The pessimistic ~3x ratio the other comments use gives ~20min. 25 covers the
+    # pessimistic case with 1.25x headroom and the realistic one with ~2x, and
+    # stays under Test Suite's 30 — this job does strictly less, it never runs a
+    # test. What it caps is a compile that wedges, which unbounded would burn a
+    # runner-day against GitHub's 6-hour default.
+    timeout-minutes: 25
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -64,7 +158,7 @@ jobs:
           components: clippy
           targets: wasm32-unknown-unknown
 
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify sccache can reach GHA cache
         run: |
@@ -97,15 +191,477 @@ jobs:
         working-directory: crates/trakkt-ui
         run: tailwindcss --input style/main.css --output style/output.css
 
+      # --all-targets is what makes clippy lint test code at all. Without it only
+      # the lib/bin targets are compiled, and those are built without cfg(test),
+      # so #[cfg(test)] modules, tests/, benches and examples are never linted.
+      # 108 violations had accumulated behind that hole (TRA-9956): 106 unwrap_used,
+      # one type_complexity, one dead_code.
+      # Keep this identical to the command recorded in docs/CODING_STANDARDS.md.
       - name: cargo clippy (workspace)
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
-        run: cargo clippy --locked --workspace -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # Not redundant with the step above: that one compiles for the host, where
+      # cfg(target_arch = "wasm32") is false, so it cannot see trakkt-ui's
+      # #[cfg(all(test, target_arch = "wasm32"))] wasm-bindgen-test modules —
+      # 48 tests across cache/ and pages/settings/. This step is the only thing
+      # that lints them. --all-targets rather than --tests: trakkt-ui declares no
+      # bin/test/example/bench targets today so the two are equivalent, and
+      # --all-targets matches the host command and covers a future one for free.
       - name: cargo clippy (trakkt-ui, wasm32)
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
-        run: cargo clippy --locked -p trakkt-ui --target wasm32-unknown-unknown --features hydrate -- -D warnings
+        run: cargo clippy --locked -p trakkt-ui --target wasm32-unknown-unknown --features hydrate --all-targets -- -D warnings
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  # ---------------------------------------------------------------------------
+  # Slowest check: cargo test across the whole workspace
+  #
+  # Until this job existed CI never ran the test suite at all, so a failing test
+  # could sit on main indefinitely with zero signal — which is exactly what
+  # happened to the OpenAPI operation-set test.
+  #
+  # No service containers: every test uses in-memory SQLite. Do not add Postgres
+  # or Redis here.
+  #
+  # Setup mirrors the clippy job. The build dependencies, sccache wiring and local
+  # dev patch stripping are required — the workspace does not compile without
+  # them. The asset-prep steps (dist/, Tailwind) are not required by any test
+  # today and are kept deliberately for parity; see the note on those steps
+  # below. The one deliberate difference is the wasm32 target, which is
+  # omitted: it is only needed for clippy's wasm compilation check. This job runs
+  # `cargo test` on the host target only, so wasm32 would cost an extra toolchain
+  # download for nothing. (The wasm-bindgen-test suite needs a browser runner and
+  # is tracked separately in TRA-9932.)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    # Bounds the whole job, not just the test step: setup (apt, toolchain, cargo
+    # update, tailwind) burns ~2-3min before compilation starts. Worst legitimate
+    # cold run is ~18min — 295s local cold x ~3 (the CI/local ratio clippy shows:
+    # 1m38s local, ~5m CI) plus setup. 30 leaves ~1.7x headroom there while capping
+    # a hung test at 30min instead of GitHub's 6-hour default. TRA-9930 was a test
+    # that hung for eight minutes with no output; unbounded, that costs a runner-day.
+    timeout-minutes: 30
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Verify sccache can reach GHA cache
+        run: |
+          echo 'fn main(){}' > /tmp/sccache_test.rs
+          if sccache $(rustc --print sysroot)/bin/rustc /tmp/sccache_test.rs --crate-type bin -o /tmp/sccache_test_out; then
+            echo "SCCACHE_AVAILABLE=true" >> $GITHUB_ENV
+            sccache --show-stats 2>&1 | head -5
+          else
+            echo "::warning::sccache GHA cache probe failed (see above), building without cache"
+            echo "SCCACHE_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+          rm -f /tmp/sccache_test.rs /tmp/sccache_test_out
+
+      - name: Strip local dev patches (path overrides not available in CI)
+        run: sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
+
+      # Stripping the patches invalidates the committed lockfile. Regenerating it
+      # here is what lets the `--locked` test run below succeed: it validates
+      # against this regenerated file, not the committed one.
+      - name: Regenerate lockfile after stripping local patches
+        run: cargo update --workspace
+
+      # The next three steps mirror the clippy job's asset prep. No workspace
+      # test currently requires them: `ServeDir::new(dist_dir())` is only wired
+      # up in `build_router()`, which runs from apps/server/src/main.rs and never
+      # from a test, and nothing in the workspace include_str!s style/output.css.
+      # They are kept on purpose, not by accident — they cost a few seconds, they
+      # keep this job's setup a faithful mirror of clippy's (which does need
+      # them), and they mean nothing here has to change the day a test does touch
+      # dist/ or the built CSS.
+      - name: Ensure trakkt-ui/dist/ exists for ServeDir
+        run: mkdir -p crates/trakkt-ui/dist
+
+      - name: Install tailwindcss
+        run: |
+          curl -sLO https://github.com/tailwindlabs/tailwindcss/releases/download/v4.2.2/tailwindcss-linux-x64
+          chmod +x tailwindcss-linux-x64
+          sudo mv tailwindcss-linux-x64 /usr/local/bin/tailwindcss
+
+      - name: Build Tailwind CSS
+        working-directory: crates/trakkt-ui
+        run: tailwindcss --input style/main.css --output style/output.css
+
+      - name: cargo test (workspace)
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: cargo test --workspace --locked
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  # ---------------------------------------------------------------------------
+  # Slow check: the trakkt-ui wasm-bindgen-test suite, executed in a real browser
+  #
+  # The clippy job's wasm32 step is a *compile* check. It proves the IndexedDB
+  # cache, the Web Locks leader-election shim and the hydration gate typecheck. It
+  # proves nothing about whether they work, and until this job existed nothing in
+  # CI ever executed them.
+  #
+  # That gap is unusually expensive for this particular crate. web-sys keeps the
+  # Web Locks API behind `web_sys_unstable_apis`, and enabling that cfg breaks
+  # kode-leptos, so `cache/tab_leader.rs` binds the API with a hand-written
+  # `#[wasm_bindgen] extern "C"` block. A wrong hand-written FFI signature
+  # compiles perfectly and fails at the first call — a compile pass is
+  # structurally incapable of catching it. Only running the tests does.
+  #
+  # A separate job rather than extra steps on clippy: jobs run in parallel, so
+  # this costs runner minutes but no PR wall-clock (Test Suite is longer).
+  #
+  # Running the suite once, as one binary, is also not enough: one run only ever
+  # produces one order, so it cannot see a test that depends on an earlier test
+  # having run first. The sweep step at the bottom of this job covers the case
+  # where that dependency crosses a module boundary; a module is still run as a
+  # whole, so one contained entirely within a single module stays invisible, as
+  # docs/CODING_STANDARDS.md and CONTRIBUTING.md both record. See the step's own
+  # comment for the mechanism and scripts/wasm-test-isolated.sh for the bug
+  # class. What follows is why the sweep runs the way it does, since it adds
+  # ~64% to this job's runner minutes (a measured 5m41s against a 208s mean
+  # before it; numbers below) and the alternatives were not obviously worse.
+  #
+  # It runs on every PR, and as a step in this job rather than a job of its own.
+  # A separate job would repay the whole cold build, the apt install, the wasm32
+  # toolchain, the wasm-pack download and the Firefox install just to re-test what
+  # this job has already built; as a step, every filtered run reuses those
+  # artifacts. What a developer running the script locally should expect, with the
+  # build already warm: `--list` 5.3s, the whole-binary run 25.2s, and the 13
+  # module runs 130.9s (mean 10.1s, range 9.0-13.6s) — a marginal of ~2m16s. Each
+  # module run is ~2.6s of cargo-up-to-date plus wasm-bindgen and ~7.5s of browser
+  # launch, so what the sweep buys is paid for in browser launches, not in test
+  # execution.
+  #
+  # On a runner it costs less than that. Measured on the PR that added the sweep
+  # (run 31309373878, job 93234685894): the job took 5m41s, against a 208s mean
+  # over the 13 preceding runs of it (range 149-253s). Of the sweep step's 5m02s,
+  # ~2m45s was the build — carried by the first wasm-pack invocation, which is now
+  # the `--list` pass — 17.3s the whole-binary run, and 2m00s the 13 isolated
+  # runs, a mean of 9.24s each (range 8.61-10.90s). So a module costs slightly
+  # less on a runner than locally, and browser launches are not something CI is
+  # worse at. Note the asymmetry before reusing the ~64%: the new figure is one
+  # run and the baseline is a 13-run mean.
+  #
+  # The estimate this replaced predicted ~6min by scaling the local marginal 1:1
+  # rather than by the ~3x CI/local ratio the build-bound jobs show, on the
+  # grounds that browser and wasm-bindgen work is not build work. That held, and
+  # it is the reasoning to reuse if this job's cost ever has to be predicted again.
+  #
+  # Nightly or merge-to-main only was rejected: at a ~2min marginal on a job that
+  # already runs in parallel with longer ones, moving it off the PR saves almost
+  # no PR wall-clock and buys late detection instead — and late detection is the
+  # entire failure mode, since this bug class stays invisible until something
+  # reorders, so finding it after merge means finding it in someone else's PR.
+  # Randomising the order within one binary and printing the seed would have been
+  # cheaper still; it was dropped because there is nothing to enable, not because
+  # it was judged inferior. wasm-bindgen-test 0.3.71 has no ordering control: the
+  # runner's full option set is `[FILTER] --bench --include-ignored --ignored
+  # --exact --skip --list --nocapture --format`, with no shuffle or seed behind
+  # any of them. Worth rechecking on a version bump; not worth re-investigating.
+  #
+  # Setup mirrors the clippy and test jobs everywhere the workspace forces it to,
+  # and deliberately diverges where it does not — see the per-step notes.
+  # ---------------------------------------------------------------------------
+  wasm-test:
+    name: WASM Browser Tests
+    runs-on: ubuntu-latest
+    # Bounds the whole job. The typical case is measured, not derived: with the
+    # sweep in place this job took 5m41s (run 31309373878), against a 208s mean
+    # over the 13 runs preceding it. Its sweep step was 5m02s — ~2m45s of build,
+    # 17.3s of whole-binary run, 2m00s of isolated runs — and the tests themselves
+    # execute in 8.6s, a figure worth restating because the earlier note here said
+    # 0.7s, from when the suite had 12 tests rather than 74.
+    #
+    # 25 is not sized against that 5m41s, which is the typical case and not what a
+    # timeout is for. It is sized against the worst legitimate cold run, reasoned
+    # out at ~13min for the job before the sweep (a cold build plus apt, the wasm32
+    # toolchain, cargo update, the wasm-pack download, the Firefox install, and the
+    # geckodriver wasm-pack fetches on first run); letting the sweep's measured
+    # 2m00s double on a slow runner day adds 4min, so ~17min, over which 25 leaves
+    # ~1.5x. Against the measured typical it is 4.4x, which is the same shape as
+    # Test Suite's 30 against its ~7m18s (4.1x) rather than an outlier.
+    #
+    # The failure this actually caps is a headless browser that never reports: if
+    # geckodriver hangs, wasm-pack waits forever and GitHub's 6-hour default would
+    # burn a runner-day. The sweep makes that more likely to be worth capping, not
+    # less — it turns one browser launch per run into fourteen.
+    timeout-minutes: 25
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      # Required, not cargo-culted: `cc` is in this target's build-dependency
+      # graph (`cargo tree -p trakkt-ui --target wasm32-unknown-unknown
+      # --features hydrate -e build`), so a build script here shells out to a C
+      # compiler. Kept as one apt invocation identical to clippy's rather than
+      # trimmed to the exact subset — a divergence here would cost more to
+      # explain later than the two seconds it saves.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Firefox rather than Chrome. Both support Web Locks, and `--chrome` would
+      # work — but every local verification of this suite has been on Firefox, and
+      # this job exists specifically to validate hand-written browser FFI. Running
+      # CI on an engine no one has ever run these tests against would mean a first
+      # red build tells you nothing about whether the code or the browser is at
+      # fault. Installed explicitly rather than relying on the runner image:
+      # GitHub has removed preinstalled browsers from images before, and that
+      # removal would surface here as a confusing wasm-pack failure.
+      #
+      # Deliberately unpinned. Pinning a browser freezes the one variable this
+      # suite is meant to exercise; a Firefox release that breaks the Locks shim
+      # is a finding, not a CI fault.
+      - uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: latest
+
+      # Released binary, not `cargo install` — installing from source compiles
+      # wasm-pack and its dependency tree on every run for no benefit. Version is
+      # pinned; `curl` of a tagged release asset matches how this workflow already
+      # installs tailwindcss. geckodriver is not installed here on purpose:
+      # wasm-pack fetches a matching one itself on first run.
+      - name: Install wasm-pack
+        run: |
+          curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.14.0/wasm-pack-v0.14.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.14.0-x86_64-unknown-linux-musl/wasm-pack
+          wasm-pack --version
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Verify sccache can reach GHA cache
+        run: |
+          echo 'fn main(){}' > /tmp/sccache_test.rs
+          if sccache $(rustc --print sysroot)/bin/rustc /tmp/sccache_test.rs --crate-type bin -o /tmp/sccache_test_out; then
+            echo "SCCACHE_AVAILABLE=true" >> $GITHUB_ENV
+            sccache --show-stats 2>&1 | head -5
+          else
+            echo "::warning::sccache GHA cache probe failed (see above), building without cache"
+            echo "SCCACHE_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+          rm -f /tmp/sccache_test.rs /tmp/sccache_test_out
+
+      - name: Strip local dev patches (path overrides not available in CI)
+        run: sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
+
+      # Stripping the patches invalidates the committed lockfile. Regenerating it
+      # here is what lets the `--locked` run below succeed: it validates against
+      # this regenerated file, not the committed one.
+      - name: Regenerate lockfile after stripping local patches
+        run: cargo update --workspace
+
+      # No dist/ or Tailwind steps here, unlike clippy and test. They would be
+      # inert: `ServeDir::new(dist_dir())` lives only in apps/server, which is not
+      # in this target's dependency graph at all, and nothing in the workspace
+      # include_str!s style/output.css. Verified empirically — the suite passes
+      # 12/12 locally with style/output.css absent and dist/ empty.
+      # Runs the suite as one binary — what this job did before — and then once
+      # per module in isolation.
+      #
+      # The whole-binary run alone cannot see an ordering dependency between
+      # tests, because it only ever produces one order. `any_spawner`'s executor
+      # is global and initialized once per binary, so a test that spawns before
+      # it mounts anything passes only if some earlier test initialized it. That
+      # shipped green for months, and PR #285 turned it red by adding tests that
+      # changed the order rather than by changing any behaviour. Nothing in this
+      # job noticed either time; running one module on its own was what found it.
+      #
+      # In this job rather than one of its own, and deliberately: a separate job
+      # would repay the whole cold build, the apt install, the wasm32 toolchain,
+      # the wasm-pack download and the Firefox install to run tests this job has
+      # already built. Here every filtered run reuses the artifacts the run above
+      # it produced, so the sweep costs browser launches and nothing else.
+      #
+      # The script derives its module list from the source tree and proves that
+      # list selects every test exactly once before it launches a browser; it is
+      # not a hand-written list that a new module could sit outside of. Run it
+      # locally exactly as it runs here: scripts/wasm-test-isolated.sh
+      - name: wasm-pack test (trakkt-ui, headless Firefox, whole binary + per module)
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: scripts/wasm-test-isolated.sh
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  # ---------------------------------------------------------------------------
+  # Slow check: the dual-dialect suite, executed against a real Postgres
+  #
+  # Production runs Postgres. Every other job here runs SQLite — the Test Suite
+  # job says so explicitly — so until this existed, a defect confined to an
+  # `is_pg` query arm compiled, passed clippy, passed `cargo test`, and shipped
+  # without anything having executed it. `sort_order` decoded as `f64` from a
+  # FLOAT4 column shipped that way twice.
+  #
+  # A separate job rather than service containers on Test Suite: that job's
+  # comment is a standing instruction not to add Postgres or Redis to it, and
+  # jobs run in parallel, so this costs runner minutes but no PR wall-clock.
+  #
+  # It runs one test binary — apps/server/tests/postgres_dialect.rs — because
+  # that is the only one whose Postgres halves exist. Everything else in the
+  # workspace is SQLite-only and already covered by Test Suite; running it again
+  # here would double the cost for no extra signal.
+  # ---------------------------------------------------------------------------
+  postgres-dialect:
+    name: Postgres Dialect Tests
+    runs-on: ubuntu-latest
+    # Bounds the whole job. It compiles the same dependency graph as Test Suite
+    # (trakkt-server's test targets pull in the whole workspace) but runs one
+    # test binary rather than all of them, and the run itself is ~3s locally
+    # against a live Postgres. So the cost is Test Suite's build minus its test
+    # execution: Test Suite is bounded at 30 for a ~18min worst cold run, and 20
+    # here leaves comparable headroom over the same build plus ~3min of setup.
+    # What it caps is a database that never becomes healthy: without a bound the
+    # service-container wait plus GitHub's 6-hour default would burn a runner-day.
+    timeout-minutes: 20
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      # Published on 5436 — the same port DEFAULT_PG_TEST_URL names, so CI
+      # exercises the configuration a developer gets by default rather than an
+      # untested fallback. Set explicitly anyway: an empty TEST_DATABASE_URL
+      # falling back to a default that someone later edits would silently point
+      # this job somewhere else.
+      TEST_DATABASE_URL: postgres://trakkt:trakkt@localhost:5436/postgres
+    services:
+      postgres:
+        # Pinned to the major version production runs. Unlike the browser in
+        # wasm-test, the point here is not to discover what a new release breaks
+        # — it is to reproduce production's dialect, so drifting to a newer major
+        # than production would test the wrong thing.
+        image: postgres:16
+        env:
+          POSTGRES_USER: trakkt
+          POSTGRES_PASSWORD: trakkt
+          # The maintenance database. No test reads or writes a table in it; it
+          # is connected to only to CREATE and DROP throwaway `trakkt_test_*`
+          # databases, one per test.
+          POSTGRES_DB: postgres
+        ports:
+          - 5436:5432
+        # Without this the job would start `cargo test` while the server is still
+        # initialising, and the suite would fail on a connection refused that has
+        # nothing to do with the code under test.
+        options: >-
+          --health-cmd "pg_isready -U trakkt"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Verify sccache can reach GHA cache
+        run: |
+          echo 'fn main(){}' > /tmp/sccache_test.rs
+          if sccache $(rustc --print sysroot)/bin/rustc /tmp/sccache_test.rs --crate-type bin -o /tmp/sccache_test_out; then
+            echo "SCCACHE_AVAILABLE=true" >> $GITHUB_ENV
+            sccache --show-stats 2>&1 | head -5
+          else
+            echo "::warning::sccache GHA cache probe failed (see above), building without cache"
+            echo "SCCACHE_AVAILABLE=false" >> $GITHUB_ENV
+          fi
+          rm -f /tmp/sccache_test.rs /tmp/sccache_test_out
+
+      - name: Strip local dev patches (path overrides not available in CI)
+        run: sed -i '/# BEGIN_LOCAL_DEV_PATCHES/,/# END_LOCAL_DEV_PATCHES/{ /# BEGIN_LOCAL_DEV_PATCHES/!{ /# END_LOCAL_DEV_PATCHES/!d } }' Cargo.toml
+
+      - name: Regenerate lockfile after stripping local patches
+        run: cargo update --workspace
+
+      # Same reasoning as Test Suite: not required by anything this job runs,
+      # kept so the setup stays a faithful mirror of the other cargo jobs.
+      - name: Ensure trakkt-ui/dist/ exists for ServeDir
+        run: mkdir -p crates/trakkt-ui/dist
+
+      - name: Install tailwindcss
+        run: |
+          curl -sLO https://github.com/tailwindlabs/tailwindcss/releases/download/v4.2.2/tailwindcss-linux-x64
+          chmod +x tailwindcss-linux-x64
+          sudo mv tailwindcss-linux-x64 /usr/local/bin/tailwindcss
+
+      - name: Build Tailwind CSS
+        working-directory: crates/trakkt-ui
+        run: tailwindcss --input style/main.css --output style/output.css
+
+      # Proves the service container is reachable from the job before anything is
+      # compiled. Without it, an unreachable database surfaces ~10 minutes later
+      # as a test failure that reads like a code defect.
+      - name: Verify Postgres is reachable
+        run: |
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          PGPASSWORD=trakkt psql -h localhost -p 5436 -U trakkt -d postgres -c 'SELECT version()'
+
+      # --include-ignored is what makes the Postgres halves run. The #[ignore] on
+      # them is a *local* affordance: it lets `cargo test` on a laptop with no
+      # database report `ignored` instead of a green tick for a path it never
+      # touched. In CI there is a database, so `ignored` would mean the opposite
+      # — a Postgres arm quietly not exercised on a PR that is about to merge.
+      #
+      # Two things enforce that, because --include-ignored alone does not.
+      #
+      # First, the harness fails rather than skips: with --include-ignored and no
+      # reachable server, `on_postgres` panics with instructions (verified
+      # locally by pointing TEST_DATABASE_URL at a dead port — 6 failures, exit 101).
+      # So an unreachable database is a red job, never a quiet pass.
+      #
+      # Second, the ignored count is asserted below. --include-ignored is a flag
+      # someone can drop in an edit, and dropping it turns the six Postgres tests
+      # into six `ignored` lines under an otherwise green `test result: ok`.
+      # Asserting `0 ignored` makes that edit fail the job it weakened.
+      - name: cargo test (Postgres dialect suite)
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: |
+          set -o pipefail
+          cargo test --locked -p trakkt-server --test postgres_dialect \
+            -- --include-ignored | tee postgres-dialect.log
+
+      - name: Assert no test was skipped
+        run: |
+          if ! grep -qE 'test result: ok\..*; 0 ignored' postgres-dialect.log; then
+            echo "::error::The Postgres dialect suite reported ignored tests. In CI a \
+          live Postgres is present, so 'ignored' means a Postgres query arm was not \
+          exercised on a PR that is about to merge — see the summary line below."
+            grep 'test result:' postgres-dialect.log || true
+            exit 1
+          fi
+          echo "✅ Every Postgres dialect test ran; none were skipped."
 
       - name: sccache stats
         if: always()
@@ -117,6 +673,14 @@ jobs:
   trivy-scan:
     name: Trivy Security Scan
     runs-on: ubuntu-latest
+    # Measured at 15-26s across the 12 most recent PR runs — the slowest of this
+    # file's three fast jobs, and the only one with a hard external dependency:
+    # the action pulls Trivy's vulnerability database over the network before it
+    # can scan anything. That download is both the realistic slow path and the
+    # plausible hang, which is why this gets 10 rather than the 5 the other two
+    # fast jobs use. 10 is ~23x the observed maximum and leaves ample room for a
+    # slow or rate-limited database fetch.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
 

@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { authenticator } from 'otplib';
+import { generateSync } from 'otplib';
 import { gotoAuthenticated, waitForWasm, db, isPersonalMode } from '../../helpers/test-helpers';
 
 const SECURITY_URL = '/settings/security';
@@ -73,7 +73,7 @@ test.describe('TC-012: Security - TOTP Two-Factor Authentication', () => {
 
     const secret = await extractTotpSecret(page);
 
-    const totpCode = authenticator.generate(secret);
+    const totpCode = generateSync({ secret });
 
     await page.locator('#verification-code').fill(totpCode);
     await page.getByRole('button', { name: 'Enable 2FA' }).click();
@@ -120,7 +120,7 @@ test.describe('TC-012: Security - TOTP Two-Factor Authentication', () => {
     await expect(page.getByText('Setup Two-Factor Authentication')).toBeVisible({ timeout: 10000 });
 
     const secret = await extractTotpSecret(page);
-    const totpCode = authenticator.generate(secret);
+    const totpCode = generateSync({ secret });
 
     await page.locator('#verification-code').fill(totpCode);
     await page.getByRole('button', { name: 'Enable 2FA' }).click();
@@ -144,7 +144,7 @@ test.describe('TC-012: Security - TOTP Two-Factor Authentication', () => {
     await page.locator('button:has-text("Setup 2FA")').click();
     await expect(page.getByText('Setup Two-Factor Authentication')).toBeVisible({ timeout: 10000 });
     const totpSecret = await extractTotpSecret(page);
-    const code = authenticator.generate(totpSecret);
+    const code = generateSync({ secret: totpSecret });
     await page.locator('#verification-code').fill(code);
     await page.getByRole('button', { name: 'Enable 2FA' }).click();
     await expect(page.getByText('2FA has been successfully enabled')).toBeVisible({ timeout: 10000 });
@@ -165,7 +165,7 @@ test.describe('TC-012: Security - TOTP Two-Factor Authentication', () => {
     await expect(loginPage.locator('#totp-code')).toBeVisible({ timeout: 10000 });
     await expect(loginPage.getByText('Two-Factor Authentication')).toBeVisible();
 
-    const loginTotpCode = authenticator.generate(totpSecret);
+    const loginTotpCode = generateSync({ secret: totpSecret });
     await loginPage.locator('#totp-code').fill(loginTotpCode);
     await loginPage.getByRole('button', { name: /Verify|Sign In/ }).click();
 

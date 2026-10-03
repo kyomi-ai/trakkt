@@ -277,19 +277,24 @@ mod tests {
     /// for that pattern.
     #[test]
     fn schemars_double_option_generates_valid_schema() {
-        #[derive(Debug, schemars::JsonSchema)]
+        #[derive(schemars::JsonSchema)]
         struct TestUpdateParams {
             id: String,
             title: Option<Option<String>>,
             priority: Option<Option<i32>>,
         }
 
-        let params = TestUpdateParams {
+        // `schema_for!` derives the schema from the field *types* and never
+        // touches an instance, so nothing else here reads these fields and
+        // `dead_code` fires. Destructure one instance to read them for real —
+        // suppressing the lint is not permitted. This also pins the shape the
+        // assertions below describe: an absent update field is the outer `None`.
+        let TestUpdateParams { id, title, priority } = TestUpdateParams {
             id: "x".into(),
             title: None,
             priority: None,
         };
-        let _ = format!("{params:?}");
+        assert_eq!((id.as_str(), title, priority), ("x", None, None));
 
         let schema = schemars::schema_for!(TestUpdateParams);
         let json = serde_json::to_value(&schema).expect("schema should serialize to JSON");

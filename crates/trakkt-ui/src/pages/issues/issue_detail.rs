@@ -22,7 +22,7 @@ use leptos_router::hooks::{use_location, use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
+    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CopyLinkButton,
     DatePicker, DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
     LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Select, SelectVariant, Skeleton,
@@ -52,56 +52,7 @@ use leptos::task::spawn_local;
 // Shared kode theme builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a kode `Theme` matching Trakkt's design system (warm light palette).
-///
-/// Since kode's `Theme` is `#[non_exhaustive]`, we start from `Theme::light()`
-/// and override the fields we need.
-pub(crate) fn trakkt_kode_theme() -> kode_leptos::Theme {
-    let mut t = kode_leptos::Theme::light();
-    // Colors use CSS var() references so they follow Trakkt's light/dark
-    // mode automatically. The actual values live in main.css :root block
-    // which maps --kode-* vars to --color-* design tokens.
-    t.bg = "var(--color-card)";
-    t.fg = "var(--color-foreground)";
-    t.fg_bright = "var(--color-foreground)";
-    t.fg_dim = "var(--color-muted-foreground)";
-    t.cursor = "var(--color-foreground)";
-    t.selection = "rgba(13, 148, 136, 0.15)";
-    t.current_line = "transparent";
-    t.gutter_fg = "var(--color-muted-foreground)";
-    t.gutter_border = "var(--color-border)";
-    t.border = "var(--color-border)";
-    t.accent = "var(--color-primary)";
-    t.bg_highlight = "var(--color-accent)";
-    t.bg_hover = "var(--color-accent)";
-    t.marker_error = "#DC2626";
-    t.marker_warning = "#CA8A04";
-    t.marker_info = "#2563EB";
-    t.marker_hint = "var(--color-muted-foreground)";
-    t.code_fg = "var(--color-primary)";
-    t.link = "var(--color-primary)";
-    t.syntax = kode_leptos::SyntaxTheme::GithubLight;
-    // Typography — DESIGN.md fonts
-    t.content_font_family = Some("'DM Sans', sans-serif");
-    t.heading_font_family = Some("'Instrument Serif', serif");
-    t.code_font_family = Some("'Geist Mono', monospace");
-    t.font_family = Some("'Geist Mono', monospace");
-    // Content layout
-    t.content_max_width = Some("100%");
-    t.container_padding = Some("0");
-    // Toolbar styling — also uses CSS vars for dark mode
-    t.toolbar_bg = Some("var(--color-card)");
-    t.toolbar_border_color = Some("var(--color-border)");
-    t.toolbar_button_border_radius = Some("6px");
-    t.toolbar_button_hover_bg = Some("var(--color-accent)");
-    t.toolbar_button_selected_bg = Some("var(--color-primary)");
-    t.toolbar_button_selected_color = Some("#FFFFFF");
-    // Heading styling
-    t.heading_font_weight = Some("600");
-    t.h1_border_width = Some("0");
-    t.h2_border_width = Some("0");
-    t
-}
+pub(crate) use crate::components::description::trakkt_kode_theme;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue Detail Page
@@ -153,6 +104,16 @@ pub fn IssueDetailPage() -> impl IntoView {
         server_issue.get()
     });
 
+    let copy_path = Signal::derive(move || {
+        let issue = issue_data.get()?.ok()??;
+        crate::components::copy_link::issue_link_path(
+            &team_key.get(),
+            number.get(),
+            &issue.team_key,
+            issue.number,
+        )
+    });
+
     // Only tracks load-state transitions (Loading → Loaded, etc.),
     // not SyncStore data changes. Prevents IssueDetailContent from being
     // recreated on every WebSocket update.
@@ -195,7 +156,7 @@ pub fn IssueDetailPage() -> impl IntoView {
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Header ─────────────────────────────────────────────────────
-            <div class="page-header h-14 px-5 flex items-center gap-3 shrink-0">
+            <div class="page-header min-h-14 px-5 py-2 flex flex-wrap items-center gap-3 shrink-0">
                 <Button
                     variant=ButtonVariant::GhostMuted
                     size=ButtonSize::IconSm
@@ -223,6 +184,7 @@ pub fn IssueDetailPage() -> impl IntoView {
                 >
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>
                 </Button>
+                <CopyLinkButton path=copy_path/>
                 <span class="font-mono text-sm text-muted-foreground">
                     {move || format!("{}-{}", team_key.get(), number.get())}
                 </span>
@@ -335,7 +297,11 @@ fn IssueDetailContent(
         let cv = sync_store.map(|s| s.comments_version());
 
         Effect::new(move || {
-            if let Some(cv) = cv {
+            // Borrowed, not bound by value: `comments_version` returns an
+            // `ArcSignal<u32>` (`Clone`, not `Copy`), so `if let Some(cv) = cv`
+            // would move out of the capture and leave this `FnOnce`. The `get()`
+            // is what subscribes the effect, on every run, as before.
+            if let Some(cv) = &cv {
                 let _ = cv.get();
             }
             let iid = issue_id.clone();
@@ -849,9 +815,30 @@ fn MetadataSidebar(
     let milestone_trigger_ref = NodeRef::<leptos::html::Div>::new();
     let (milestone_search, set_milestone_search) = signal(String::new());
 
-    // Milestones: reactive resource that refetches when project_id changes
+    // Milestones: refetched when the issue's project changes, and when another
+    // client creates, renames or re-dates one. The list is read straight from
+    // the server function rather than the SyncStore, so `milestones_version` —
+    // bumped by every project_milestone sync action — is the only thing that
+    // can tell this dropdown its names and dates went stale.
+    //
+    // Resolved once here and moved into the effect. Same shape as `ws_version`
+    // in `AttachmentsSection`.
+    let milestones_version = sync_store.map(|s| s.milestones_version());
     let milestones = RwSignal::new(Vec::<trakkt_types::models::ProjectMilestone>::new());
     Effect::new(move || {
+        // Read unconditionally so the subscription is established on every run
+        // regardless of which branch is taken, not just on runs where the issue
+        // happens to have a project. Reading it inside the branch would pick the
+        // dependency up later and less predictably; this keeps the effect's
+        // dependency set stable instead of varying with the data.
+        //
+        // Borrowed rather than bound by value: `milestones_version` is an
+        // `ArcSignal<u32>` (`Clone`, not `Copy`), so binding it would move out
+        // of the capture. `track()` still runs on every effect run, which is
+        // what "unconditionally" above is claiming.
+        if let Some(v) = &milestones_version {
+            v.track();
+        }
         let pid = project_id.get();
         if let Some(pid) = pid {
             leptos::task::spawn_local(async move {
@@ -1677,7 +1664,7 @@ fn DescriptionEditor(
     /// Issue ID for auto-linking inline uploads to this issue.
     issue_id: String,
 ) -> impl IntoView {
-    use kode_leptos::TreeWysiwygEditor;
+    use crate::components::description::MarkdownDescription;
 
     let latest_text = RwSignal::new(String::new());
     let edit_version = RwSignal::new(0u32);
@@ -1890,19 +1877,6 @@ fn DescriptionEditor(
         }
     };
 
-    let theme_state = use_context::<crate::components::theme::ThemeState>();
-    let theme_signal = Signal::derive(move || {
-        let mut theme = trakkt_kode_theme();
-        theme.content_padding = Some("0");
-        theme.bg = "var(--color-background)";
-        if let Some(ts) = theme_state
-            && ts.effective.get() == "dark"
-        {
-            theme.syntax = kode_leptos::SyntaxTheme::OneDark;
-        }
-        theme
-    });
-
     view! {
         <div class="mt-6" style="min-height: 120px;">
             // Hidden file input for the "Attach file" slash command extension
@@ -1913,12 +1887,9 @@ fn DescriptionEditor(
                 accept=".png,.jpg,.jpeg,.gif,.webp,.svg,.pdf,.csv,.txt,.json,.log"
                 on:change=on_attach_file_selected
             />
-            <TreeWysiwygEditor
+            <MarkdownDescription
                 content=auto_linked_content
                 on_change=on_change
-                show_fixed_toolbar=false
-                show_floating_toolbar=true
-                theme=theme_signal
                 on_upload=on_upload
                 on_delete_attachment=on_delete
                 on_click_attachment=on_click
@@ -1957,11 +1928,22 @@ fn RelationsSection(
     let tk = team_key.clone();
     let (version, set_version) = signal(0u32);
     let sync_store = use_context::<crate::cache::store::SyncStore>();
-    let ws_version = Signal::derive(move || {
-        sync_store.map(|s| s.relations_version().get()).unwrap_or(0)
-    });
+    // `version` covers this tab's own adds and removes. The store counter covers
+    // everyone else's: an issue_relation frame bumps it.
+    //
+    // Resolved once here and moved into the source closure, which borrows it
+    // with `as_ref` because `relations_version` returns an `ArcSignal<u32>`
+    // (`Clone`, not `Copy`). Same shape as `ws_version` in `AttachmentsSection`.
+    let ws_version = sync_store.map(|s| s.relations_version());
     let relations_resource = Resource::new(
-        move || (tk.clone(), number, version.get(), ws_version.get()),
+        move || {
+            (
+                tk.clone(),
+                number,
+                version.get(),
+                ws_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
         move |(tk, num, _, _)| async move { list_issue_relations(tk, num).await },
     );
 
@@ -2341,15 +2323,23 @@ fn IssueTimeline(
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (filter, set_filter) = signal(TimelineFilter::All);
 
-    // Activities version from SyncStore — bumps on WebSocket activity events
-    let activities_version = Signal::derive(move || {
-        sync_store.map(|s| s.activities_version().get()).unwrap_or(0)
-    });
+    // Activities version from SyncStore — bumps on WebSocket activity events.
+    //
+    // Resolved once here and moved into the source closure, which borrows it
+    // with `as_ref` because `activities_version` returns an `ArcSignal<u32>`
+    // (`Clone`, not `Copy`). Same shape as `ws_version` in `AttachmentsSection`.
+    let activities_version = sync_store.map(|s| s.activities_version());
 
     // Fetch activities reactively, re-fetching when version bumps
     let tk = team_key.clone();
     let activities_resource = Resource::new(
-        move || (tk.clone(), number, activities_version.get()),
+        move || {
+            (
+                tk.clone(),
+                number,
+                activities_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
         move |(tk, num, _version)| async move {
             list_issue_activities(tk, num).await
         },
@@ -3282,9 +3272,28 @@ fn AttachmentsSection(
     let tk_for_detach = team_key.clone();
     let (version, set_version) = signal(0u32);
 
+    // `version` covers this tab's own uploads and detaches. The store counter
+    // covers everyone else's: an attachment/issue_attachment frame bumps it, and
+    // without it a file added or removed elsewhere never appears here.
+    //
+    // Resolved once here and moved into the source closure. The `as_ref` is
+    // because `attachments_version` returns an `ArcSignal<u32>`, which is
+    // `Clone` and not `Copy` (see the getter notes on `SyncStore`): `Option::map`
+    // would consume the capture and leave this closure `FnOnce`. The `get()`
+    // inside is what tracks, unchanged. Same shape as `comments_version` above.
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+    let ws_version = sync_store.map(|s| s.attachments_version());
+
     let attachments_resource = Resource::new(
-        move || (tk.clone(), number, version.get()),
-        move |(tk, num, _)| async move { list_issue_attachments(tk, num).await },
+        move || {
+            (
+                tk.clone(),
+                number,
+                version.get(),
+                ws_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
+        move |(tk, num, _, _)| async move { list_issue_attachments(tk, num).await },
     );
 
     // ── Upload via hidden file input ────────────────────────────────────

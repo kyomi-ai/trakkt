@@ -63,7 +63,24 @@ const DB_VERSION: u8 = 1;
 ///
 /// Bump this when: fields added/removed from list item structs, server-side
 /// sync queries change shape, entity types added/removed from bootstrap.
-pub const SCHEMA_HASH: &str = "trakkt-2026-06-v3";
+/// `v4` (TRA-9920): delta sync used to replay every workspace member's
+/// notifications, favorites and personal views to everyone. Caches written
+/// before the fix already hold those foreign rows, and the server-side filter
+/// only stops new ones arriving — it cannot retract what a client already
+/// stored. Bumping the hash wipes the cache and forces a re-bootstrap, which is
+/// the only thing that evicts them.
+/// `v5` (TRA-9966): four entity types nothing in this client reads back —
+/// `attachment`, `issue_attachment`, `issue_relation` and
+/// `notification_preferences` — stopped being persisted, and `release` had
+/// already stopped in TRA-9977 without a bump. Rows written before those changes
+/// are evicted by nothing at all once the type is off the reset wipe: the
+/// per-entity delete no longer names it either, so no reset and no `Delete`
+/// action can reach them. This wipe is what actually removes them, and it is why
+/// dropping a type from persistence and bumping this constant are one change.
+pub const SCHEMA_HASH: &str = "trakkt-2026-08-v5";
+
+/// Key under which [`SCHEMA_HASH`] is stored in the `_meta` object store.
+pub const SCHEMA_HASH_KEY: &str = "schemaHash";
 
 /// Handle to the open IndexedDB database.
 ///
@@ -125,7 +142,7 @@ pub async fn init_cache_db(_workspace_id: &str) -> Result<CacheDb, CacheDbError>
 
     // Check schema hash — mismatch means cached data was written by a
     // different code version and may not deserialize. Wipe everything.
-    let needs_wipe = match get_meta_raw(&cache_db.inner, "schemaHash").await {
+    let needs_wipe = match get_meta_raw(&cache_db.inner, SCHEMA_HASH_KEY).await {
         Some(stored) => stored != SCHEMA_HASH,
         None => false,
     };
