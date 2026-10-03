@@ -3,6 +3,14 @@
 
 //! trakkt-ui — Leptos frontend for Trakkt.
 
+// Arborium provides its own Rust allocator, but its parser's debug C code
+// also needs the canonical sysroot stdio archive (including `stderr`). Link
+// only that native archive: importing the sysroot Rust crate would duplicate
+// Arborium's malloc/free/abort exports.
+#[cfg(target_arch = "wasm32")]
+#[link(name = "arborium_sysroot", kind = "static")]
+unsafe extern "C" {}
+
 pub mod app;
 pub mod cache;
 pub mod components;
