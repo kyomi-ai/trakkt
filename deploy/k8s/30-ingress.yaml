@@ -20,8 +20,8 @@ metadata:
   namespace: trakkt
 spec:
   redirectRegex:
-    regex: "^(https?://[^/]+/docs)$"
-    replacement: "${1}/"
+    regex: "^(https?://[^/]+/docs)(\\?.*)?$"
+    replacement: "${1}/${2}"
     permanent: false
 ---
 apiVersion: traefik.io/v1alpha1
@@ -44,7 +44,7 @@ spec:
     - web
   routes:
     - kind: Rule
-      match: Host(`trakkt.app`) && PathPrefix(`/docs`)
+      match: Host(`trakkt.app`) && (Path(`/docs`) || PathPrefix(`/docs/`))
       priority: 100
       middlewares:
         - name: docs-trailing-slash
@@ -60,8 +60,8 @@ metadata:
   namespace: trakkt
 spec:
   redirectRegex:
-    regex: "^https?://docs\\.trakkt\\.app(.*)"
-    replacement: "https://trakkt.app/docs${1}"
+    regex: "^https?://docs\\.trakkt\\.app/(.*)$"
+    replacement: "https://trakkt.app/docs/${1}"
     permanent: true
 ---
 apiVersion: traefik.io/v1alpha1

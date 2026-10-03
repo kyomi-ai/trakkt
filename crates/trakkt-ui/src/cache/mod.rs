@@ -19,6 +19,59 @@
 
 pub mod store;
 
+/// What the local cache is allowed to hold: one mapping from entity type to the
+/// cache rows it owns, which the write path, the per-entity delete and the reset
+/// wipe are all derived from.
+///
+/// Not target-gated: it is pure Rust over string constants, so the membership
+/// rules — and the invariants that used to be checked by parsing source in a
+/// `wasm32`-only test — are unit tested natively.
+pub mod cached_types;
+
+/// Single FIFO writer that orders every cache write against the sync cursor.
+///
+/// Not target-gated: the queue and its ordering rules are pure Rust and unit
+/// tested natively, while only the IndexedDB-backed sink is `wasm32`-only.
+pub mod idb_writer;
+
+/// The two halves of applying one `SyncAction`: the in-memory store update
+/// every tab performs, and the cache writes only the leader tab performs.
+///
+/// Not target-gated: both halves are pure Rust over the store and the writer
+/// queue, so which entity type bumps which version counter is tested natively.
+pub mod apply;
+
+/// The one-shot latch that keeps the leader tab's WebSocket dial behind
+/// hydration, so no sync action can be applied to a store that is about to be
+/// bulk-replaced.
+///
+/// Not target-gated: the latch is pure Rust and unit tested natively, while the
+/// two halves it orders are `wasm32`-only.
+pub mod hydration_gate;
+
+/// The FIFO that holds cross-tab broadcast messages while the store is
+/// hydrating, so none of them is applied to a list that is about to be
+/// bulk-replaced — and none of them is lost, which deferring the subscription
+/// instead would guarantee.
+///
+/// Not target-gated: the queue is pure Rust over the message type and unit
+/// tested natively, while the channel that feeds it is `wasm32`-only.
+pub mod broadcast_queue;
+
+/// Where a tab sends the cache deletes its own UI initiates: onto the writer
+/// queue if it owns the cache, or over the broadcast channel to the tab that
+/// does.
+///
+/// Not target-gated: the leader's route is pure Rust over the writer queue and
+/// unit tested natively, while the follower's transport is `wasm32`-only.
+pub mod delete_route;
+
+/// Cross-tab leader election and the leader→follower broadcast channel.
+///
+/// Not target-gated: the wire format is pure Rust and tested natively, while
+/// the Web Locks and `BroadcastChannel` bindings are `wasm32`-only.
+pub mod tab_leader;
+
 #[cfg(target_arch = "wasm32")]
 pub mod db;
 

@@ -522,7 +522,10 @@ mod tests {
     fn calendar_grid_starts_on_monday() {
         let grid = calendar_grid(2026, 5);
         // May 2026 starts on a Friday → grid should start on Monday April 27
-        assert_eq!(grid[0], NaiveDate::from_ymd_opt(2026, 4, 27).unwrap());
+        assert_eq!(
+            grid[0],
+            NaiveDate::from_ymd_opt(2026, 4, 27).expect("2026-04-27 to be a real calendar date")
+        );
         assert_eq!(grid[0].weekday(), Weekday::Mon);
     }
 
@@ -543,9 +546,13 @@ mod tests {
         // 2024 is a leap year
         let grid = calendar_grid(2024, 2);
         // Feb 1, 2024 is a Thursday → grid starts Monday Jan 29
-        assert_eq!(grid[0], NaiveDate::from_ymd_opt(2024, 1, 29).unwrap());
+        assert_eq!(
+            grid[0],
+            NaiveDate::from_ymd_opt(2024, 1, 29).expect("2024-01-29 to be a real calendar date")
+        );
         // Feb 29 should be in the grid
-        let feb29 = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
+        let feb29 =
+            NaiveDate::from_ymd_opt(2024, 2, 29).expect("2024-02-29 to exist because 2024 is a leap year");
         assert!(grid.contains(&feb29));
     }
 
@@ -553,18 +560,21 @@ mod tests {
     fn calendar_grid_month_starting_monday() {
         // June 2026 starts on a Monday → grid should start on June 1
         let grid = calendar_grid(2026, 6);
-        assert_eq!(grid[0], NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+        assert_eq!(
+            grid[0],
+            NaiveDate::from_ymd_opt(2026, 6, 1).expect("2026-06-01 to be a real calendar date")
+        );
     }
 
     #[test]
     fn format_display_date_works() {
-        let date = NaiveDate::from_ymd_opt(2026, 5, 13).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 13).expect("2026-05-13 to be a real calendar date");
         assert_eq!(format_display_date(&date), "May 13, 2026");
     }
 
     #[test]
     fn format_display_date_single_digit_day() {
-        let date = NaiveDate::from_ymd_opt(2026, 1, 3).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 3).expect("2026-01-03 to be a real calendar date");
         assert_eq!(format_display_date(&date), "Jan 3, 2026");
     }
 

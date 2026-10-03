@@ -36,6 +36,7 @@ use crate::pages::settings::{
     billing::BillingPage,
     integrations::IntegrationsPage,
     labels::LabelsPage,
+    notifications::NotificationsPage,
     profile::ProfilePage,
     security::security_tab::SecurityTab,
     settings_shell::SettingsShell,
@@ -168,6 +169,7 @@ pub fn App() -> impl IntoView {
                     }>
                         <Route path=path!("") view=|| view! { <Redirect path="/settings/profile"/> }/>
                         <Route path=path!("/profile") view=ProfilePage/>
+                        <Route path=path!("/notifications") view=NotificationsPage/>
                         <Route path=path!("/security") view=SecurityTab/>
                         <Route path=path!("/workspace") view=WorkspacePage/>
                         <Route path=path!("/team") view=TeamPage/>

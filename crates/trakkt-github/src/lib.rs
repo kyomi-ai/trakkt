@@ -505,8 +505,9 @@ mod tests {
 
     #[test]
     fn jwt_generation_produces_valid_token() {
-        let client = GitHubClient::new(12345, &TEST_KEYS.private_pem, "test-app").unwrap();
-        let jwt = client.app_jwt().unwrap();
+        let client = GitHubClient::new(12345, &TEST_KEYS.private_pem, "test-app")
+            .expect("constructing a client from the generated RSA private key PEM");
+        let jwt = client.app_jwt().expect("signing a GitHub App JWT with the client's private key");
 
         // Decode and validate with the public key
         let mut validation = Validation::new(Algorithm::RS256);
@@ -514,9 +515,10 @@ mod tests {
         // Allow some clock skew for test stability
         validation.leeway = 120;
 
-        let key = DecodingKey::from_rsa_pem(&TEST_KEYS.public_pem).unwrap();
-        let token_data =
-            jsonwebtoken::decode::<GitHubAppClaims>(&jwt, &key, &validation).unwrap();
+        let key = DecodingKey::from_rsa_pem(&TEST_KEYS.public_pem)
+            .expect("building an RS256 decoding key from the matching public PEM");
+        let token_data = jsonwebtoken::decode::<GitHubAppClaims>(&jwt, &key, &validation)
+            .expect("the signed JWT to verify against the matching public key and issuer 12345");
 
         assert_eq!(token_data.claims.iss, "12345");
         // exp should be 600 seconds after iat
@@ -539,7 +541,7 @@ mod tests {
     fn new_rejects_invalid_pem_data() {
         let result = GitHubClient::new(12345, b"not-a-valid-pem-key", "test-app");
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("constructing a client from non-PEM bytes must be rejected");
         let msg = format!("{err}");
         assert!(
             msg.contains("invalid RSA private key PEM"),
@@ -551,14 +553,17 @@ mod tests {
     fn new_accepts_valid_pem() {
         let result = GitHubClient::new(99999, &TEST_KEYS.private_pem, "my-app");
         assert!(result.is_ok());
-        let client = result.unwrap();
+        let client = result.expect("constructing a client from a well-formed RSA private key PEM");
         assert_eq!(client.app_name(), "my-app");
     }
 
     #[test]
     fn jwt_claims_have_correct_timing() {
-        let client = GitHubClient::new(42, &TEST_KEYS.private_pem, "timing-test").unwrap();
-        let jwt = client.app_jwt().unwrap();
+        let client = GitHubClient::new(42, &TEST_KEYS.private_pem, "timing-test")
+            .expect("constructing a client for app id 42 from the generated private key PEM");
+        let jwt = client
+            .app_jwt()
+            .expect("signing a GitHub App JWT whose iat/exp claims this test inspects");
 
         // Decode with full signature validation using the public key
         let mut validation = Validation::new(Algorithm::RS256);
@@ -567,9 +572,10 @@ mod tests {
         // Allow generous leeway since we're testing timing, not expiry
         validation.leeway = 120;
 
-        let key = DecodingKey::from_rsa_pem(&TEST_KEYS.public_pem).unwrap();
-        let token_data =
-            jsonwebtoken::decode::<GitHubAppClaims>(&jwt, &key, &validation).unwrap();
+        let key = DecodingKey::from_rsa_pem(&TEST_KEYS.public_pem)
+            .expect("building an RS256 decoding key from the matching public PEM");
+        let token_data = jsonwebtoken::decode::<GitHubAppClaims>(&jwt, &key, &validation)
+            .expect("the signed JWT to verify against the matching public key and issuer 42");
 
         let now = chrono::Utc::now().timestamp();
         // iat should be now - 60 (within a few seconds tolerance)

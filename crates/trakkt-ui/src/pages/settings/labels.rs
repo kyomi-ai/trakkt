@@ -20,7 +20,7 @@ use trakkt_types::models::Label;
 
 // ─── Preset colors ────────────────────────────────────────────────────────
 
-const PRESET_COLORS: &[(&str, &str)] = &[
+pub(crate) const PRESET_COLORS: &[(&str, &str)] = &[
     ("#DC2626", "Red"),
     ("#EA580C", "Orange"),
     ("#CA8A04", "Yellow"),
@@ -39,7 +39,7 @@ const PRESET_COLORS: &[(&str, &str)] = &[
 
 /// A grid of preset color circles plus a custom hex input.
 #[component]
-fn ColorPicker(
+pub(crate) fn ColorPicker(
     /// The currently selected color hex (e.g. "#DC2626").
     #[prop(into)]
     value: Signal<String>,

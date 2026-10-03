@@ -15,13 +15,13 @@
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use trakkt_core::{DbPool, RedisPool, WebSocketMessage};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
 /// Maximum number of WebSocket connections allowed per user.
@@ -29,22 +29,72 @@ use tokio::task::JoinHandle;
 const MAX_CONNECTIONS_PER_USER: usize = 10;
 
 /// Capacity of the bounded mpsc channel between the WebSocket manager
-/// and each connection's outbound task. If the client can't keep up and
-/// the buffer fills, new messages are dropped (back-pressure).
-const WS_CHANNEL_CAPACITY: usize = 8192;
+/// and each connection's outbound task. A client that lets this fill is not
+/// keeping up; its connection is terminated rather than served a message with
+/// a hole in it (see [`WebSocketManager::deliver_to_local_user`]).
+const WS_CHANNEL_CAPACITY: usize = 1024;
 
 /// Sender half of an mpsc channel — the WS endpoint writes received
 /// `axum::extract::ws::Message` items to this.
 pub type WsSender = mpsc::Sender<String>;
 
+/// Signal that asks a connection's socket tasks to shut down.
+///
+/// Firing it is the only way the manager can close a socket: since the
+/// connection's own `tx` lives in its receive task for the connection's whole
+/// lifetime, dropping the manager's sender (or removing the connection from
+/// the map) never closes the outbound channel.
+pub type KillSignal = Arc<Notify>;
+
+/// Marks a connection as mid-catch-up (a bootstrap or delta stream in flight).
+///
+/// A catch-up stream writes with `send().await`, so it keeps the outbound
+/// channel at capacity for as long as it runs — on a large workspace that is
+/// thousands of frames. Every live edit landing in that window would otherwise
+/// see a full buffer and kill a connection that is working exactly as intended.
+/// Set it with [`CatchUpGuard`], never by hand.
+pub type CatchUpFlag = Arc<AtomicBool>;
+
+/// Marks a connection as catching up for as long as the guard is alive.
+///
+/// The flag has to be cleared on *every* exit path — a connection left flagged
+/// would be permanently exempt from disconnect-on-full, silently reinstating
+/// the message loss this whole mechanism exists to prevent. `Drop` covers the
+/// early returns, the `?`s and a task aborted mid-stream; a manual reset does
+/// not. It does not cover a panic here: the release profile sets
+/// `panic = "abort"`, so the process dies before any destructor runs — which
+/// clears the flag anyway, along with everything else.
+///
+/// One connection is never catching up twice at once: its socket task awaits
+/// each client message before reading the next, so the streams are sequential.
+pub struct CatchUpGuard(CatchUpFlag);
+
+impl CatchUpGuard {
+    /// Flag `flag`'s connection as catching up until the returned guard drops.
+    pub fn new(flag: &CatchUpFlag) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(Arc::clone(flag))
+    }
+}
+
+impl Drop for CatchUpGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Monotonically increasing ID for connection deduplication.
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// A tracked WebSocket connection (sender + unique ID).
+/// A tracked WebSocket connection (sender + unique ID + kill signal).
 #[derive(Debug, Clone)]
 pub struct TrackedConnection {
     pub id: u64,
     pub sender: WsSender,
+    /// Fired to tear this connection down; see [`KillSignal`].
+    pub kill: KillSignal,
+    /// Set while this connection is being caught up; see [`CatchUpFlag`].
+    pub catching_up: CatchUpFlag,
 }
 
 impl PartialEq for TrackedConnection {
@@ -59,6 +109,29 @@ impl Hash for TrackedConnection {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
+}
+
+/// Everything a caller needs to drive one registered WebSocket connection.
+///
+/// `rx` feeds the connection's outbound socket task. `tx` addresses *this*
+/// connection alone — request/response traffic (sync bootstrap, delta,
+/// complete, reset) must use it so a response is never fanned out to the
+/// user's other connections, which would corrupt their sync watermarks.
+pub struct ConnectionHandle {
+    /// Unique ID of this connection, required to `disconnect()` it later.
+    pub id: u64,
+    /// Receiving end of the connection's outbound queue.
+    pub rx: mpsc::Receiver<String>,
+    /// Sending end of the connection's outbound queue.
+    pub tx: WsSender,
+    /// Fired by the manager when this connection must be torn down. The caller
+    /// owns the teardown: it has to stop driving the socket when this fires,
+    /// otherwise the connection lives on unregistered and deaf.
+    pub kill: KillSignal,
+    /// The caller must hold a [`CatchUpGuard`] on this for the whole of any
+    /// bootstrap or delta stream it writes to `tx`, or that stream's own
+    /// backpressure will get the connection killed.
+    pub catching_up: CatchUpFlag,
 }
 
 /// Redis pub/sub channel prefix for user messages.
@@ -107,12 +180,13 @@ impl WebSocketManager {
 
     /// Register a new WebSocket connection for a user.
     ///
-    /// Returns `Ok((connection_id, Receiver))` on success, or `Err(())` if the
-    /// user has reached `MAX_CONNECTIONS_PER_USER`. The caller should forward
-    /// items from the receiver to the actual WebSocket sink.
+    /// Returns a [`ConnectionHandle`] on success, or `Err` if the user has
+    /// reached `MAX_CONNECTIONS_PER_USER`. The caller should forward items from
+    /// `handle.rx` to the actual WebSocket sink, and use `handle.tx` to address
+    /// this connection alone.
     ///
     /// Starts a Redis subscriber if this is the first connection for the user.
-    pub fn connect(&self, user_id: &str) -> Result<(u64, mpsc::Receiver<String>), String> {
+    pub fn connect(&self, user_id: &str) -> Result<ConnectionHandle, String> {
         // Prune stale connections before checking the limit.
         // A connection is stale when its mpsc sender is closed (the outbound
         // task dropped the receiver — e.g., after a server restart killed the
@@ -146,10 +220,14 @@ impl WebSocketManager {
 
         let conn_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(WS_CHANNEL_CAPACITY);
+        let kill: KillSignal = Arc::new(Notify::new());
+        let catching_up: CatchUpFlag = Arc::new(AtomicBool::new(false));
 
         let conn = TrackedConnection {
             id: conn_id,
-            sender: tx,
+            sender: tx.clone(),
+            kill: Arc::clone(&kill),
+            catching_up: Arc::clone(&catching_up),
         };
 
         // Add to local connections.
@@ -170,7 +248,13 @@ impl WebSocketManager {
             self.deliver_to_local_user(user_id, &json);
         }
 
-        Ok((conn_id, rx))
+        Ok(ConnectionHandle {
+            id: conn_id,
+            rx,
+            tx,
+            kill,
+            catching_up,
+        })
     }
 
     /// Unregister a WebSocket connection.
@@ -295,21 +379,61 @@ impl WebSocketManager {
         workspace_id: &str,
         json: &str,
     ) {
-        let members: Vec<(String,)> = match trakkt_core::db_fetch_all!(
-            &self.inner.db,
-            (String,),
+        self.deliver_raw_to_recipients(
             "SELECT user_id FROM workspace_users WHERE workspace_id = $1",
-            workspace_id
-        ) {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::error!("Failed to query workspace members for broadcast: {e}");
-                return;
-            }
-        };
+            workspace_id,
+            "workspace members",
+            json,
+        )
+        .await;
+    }
 
-        for (member_user_id,) in members {
-            self.deliver(&member_user_id, json).await;
+    /// Broadcast a pre-serialized JSON string to the *current* members of one
+    /// team.
+    ///
+    /// The team counterpart of [`Self::broadcast_raw_to_workspace`], and the
+    /// live half of the `team_members` predicate in
+    /// `sync_log_service::ENTRIES_SINCE_SQL`. The recipient set is deliberately
+    /// the same one that predicate admits — `team_members` as it stands right
+    /// now, with no `workspace_users` join — so a member cannot be sent a frame
+    /// live that their next delta would withhold, or the reverse. Changing this
+    /// query without changing that predicate re-opens TRA-10039.
+    ///
+    /// "Current" is resolved here, at delivery time, and delivery runs strictly
+    /// after the mutation's transaction commits (see
+    /// `sync_log_service::SyncBatch::commit_and_deliver`). That ordering is what
+    /// makes membership changes made by the same transaction visible to this
+    /// read — and it is also mandatory, because this read reaches the pool,
+    /// which an open transaction on SQLite is holding the only connection to.
+    pub async fn broadcast_raw_to_team_members(&self, team_id: &str, json: &str) {
+        self.deliver_raw_to_recipients(
+            "SELECT user_id FROM team_members WHERE team_id = $1",
+            team_id,
+            "team members",
+            json,
+        )
+        .await;
+    }
+
+    /// Resolve a recipient set with `sql` and deliver `json` to every user in
+    /// it.
+    ///
+    /// `sql` must select exactly one `user_id` column and take exactly one bind
+    /// parameter, which `scope_id` supplies. `scope` names the recipient set in
+    /// the log line a failed resolve emits, which is the only trace a dropped
+    /// broadcast leaves — delivery is best-effort and nothing here propagates.
+    async fn deliver_raw_to_recipients(&self, sql: &str, scope_id: &str, scope: &str, json: &str) {
+        let recipients: Vec<(String,)> =
+            match trakkt_core::db_fetch_all!(&self.inner.db, (String,), sql, scope_id) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!("Failed to query {scope} for broadcast: {e}");
+                    return;
+                }
+            };
+
+        for (user_id,) in recipients {
+            self.deliver(&user_id, json).await;
         }
     }
 
@@ -386,9 +510,32 @@ impl WebSocketManager {
 
     /// Deliver a JSON-encoded message to all local WebSocket connections for a user.
     ///
-    /// Uses `try_send` — if a connection's bounded channel is full (client can't
-    /// keep up), the message is dropped for that connection rather than blocking.
-    /// Cleans up stale (closed) connections.
+    /// Uses `try_send` so one connection can never block delivery to the others.
+    ///
+    /// A full channel means the client is not draining its socket. Dropping the
+    /// message there would lose a sync frame permanently and invisibly — the
+    /// client's cursor only advances on `SyncComplete`, so nothing would ever
+    /// re-fetch it. Instead the connection is killed and unregistered: the
+    /// client reconnects and delta-syncs from its cursor, which recovers the
+    /// missed change. Closed connections are unregistered as before.
+    ///
+    /// The exception is a connection mid-catch-up. A bootstrap or delta stream
+    /// writes with `send().await`, so it holds the channel at capacity for its
+    /// whole run; killing on `Full` there would kill every client loading a
+    /// large workspace while anyone is editing it, and the client would
+    /// reconnect straight back into the same bootstrap. Dropping the frame is
+    /// safe *only* in that window: the in-flight stream's `SyncComplete`
+    /// watermark was read before this change landed, so the client's cursor
+    /// ends up below it and a later delta re-delivers it — bounded staleness,
+    /// not permanent loss.
+    ///
+    /// Known residual: the flag clears when `SyncComplete` is queued, while the
+    /// channel may still hold ~1024 undrained frames, so an edit in that gap
+    /// can still kill the connection. Drain time is short and the client
+    /// recovers by reconnecting, so this is accepted rather than overlooked.
+    ///
+    /// This is also the delivery path the Redis subscriber uses, so slow
+    /// consumers are handled identically in single-pod and multi-pod mode.
     fn deliver_to_local_user(&self, user_id: &str, json: &str) {
         let mut stale_ids: Vec<u64> = Vec::new();
 
@@ -400,17 +547,30 @@ impl WebSocketManager {
                         stale_ids.push(conn.id);
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        if conn.catching_up.load(Ordering::Acquire) {
+                            tracing::warn!(
+                                user_id,
+                                connection_id = conn.id,
+                                "WebSocket send buffer full during catch-up, dropping live frame"
+                            );
+                            continue;
+                        }
                         tracing::warn!(
                             user_id,
                             connection_id = conn.id,
-                            "WebSocket send buffer full, dropping message"
+                            "WebSocket send buffer full, disconnecting slow sync consumer"
                         );
+                        // `notify_one` leaves a permit behind, so the socket
+                        // task is torn down even if it has not started waiting
+                        // on the signal yet.
+                        conn.kill.notify_one();
+                        stale_ids.push(conn.id);
                     }
                 }
             }
         }
 
-        // Clean up stale connections.
+        // Unregister the connections that are closed or being killed.
         if !stale_ids.is_empty()
             && let Some(mut conns) = self.inner.connections.get_mut(user_id)
         {
@@ -425,5 +585,216 @@ impl std::fmt::Debug for WebSocketManager {
             .field("local_users", &self.inner.connections.len())
             .field("local_connections", &self.local_connection_count())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trakkt_core::test_helpers::channel::recv_soon;
+
+    /// Single-instance manager (no Redis) backed by a throwaway in-memory DB.
+    /// None of the paths exercised here run a query; the pool only satisfies
+    /// `WebSocketManager::new`.
+    async fn test_manager() -> WebSocketManager {
+        let db = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+        WebSocketManager::new(None, db)
+    }
+
+    /// `connect()` heartbeats every local connection of the user, so a receiver
+    /// starts with one frame per connect that happened after it registered.
+    /// Drain them so the assertions below only observe test traffic.
+    async fn drain_heartbeats(rx: &mut mpsc::Receiver<String>, expected: usize) {
+        for drained in 0..expected {
+            let frame = recv_soon(
+                rx,
+                &format!("connect heartbeat {} of {expected}", drained + 1),
+            )
+            .await;
+            let parsed: WebSocketMessage =
+                serde_json::from_str(&frame).expect("heartbeat frame is a WebSocketMessage");
+            assert!(
+                matches!(parsed.msg_type, trakkt_core::MessageType::Heartbeat),
+                "expected heartbeat, got {frame}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_sender_addresses_only_its_own_connection() {
+        let manager = test_manager().await;
+        let user_id = "usr_two_browsers";
+
+        let mut first = manager.connect(user_id).expect("first connection");
+        let mut second = manager.connect(user_id).expect("second connection");
+
+        // `first` saw its own connect heartbeat plus the one `second` triggered.
+        drain_heartbeats(&mut first.rx, 2).await;
+        drain_heartbeats(&mut second.rx, 1).await;
+
+        first
+            .tx
+            .send("bootstrap-for-first".to_string())
+            .await
+            .expect("send to the first connection");
+
+        assert_eq!(
+            recv_soon(&mut first.rx, "the first connection's own bootstrap frame").await,
+            "bootstrap-for-first"
+        );
+        assert!(
+            matches!(second.rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the second connection must not observe the first connection's sync traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_broadcast_still_reaches_every_connection_of_the_user() {
+        let manager = test_manager().await;
+        let user_id = "usr_two_browsers";
+
+        let mut first = manager.connect(user_id).expect("first connection");
+        let mut second = manager.connect(user_id).expect("second connection");
+
+        drain_heartbeats(&mut first.rx, 2).await;
+        drain_heartbeats(&mut second.rx, 1).await;
+
+        manager.deliver_to_local_user(user_id, "workspace-broadcast");
+
+        assert_eq!(
+            recv_soon(&mut first.rx, "the broadcast reaching the first connection").await,
+            "workspace-broadcast"
+        );
+        assert_eq!(
+            recv_soon(&mut second.rx, "the broadcast reaching the second connection").await,
+            "workspace-broadcast"
+        );
+    }
+
+    /// Queue messages until the connection's outbound channel refuses more.
+    /// The connection is left registered — only its buffer is full.
+    fn saturate(handle: &ConnectionHandle) {
+        let mut queued = 0;
+        while handle.tx.try_send("backlog".to_string()).is_ok() {
+            queued += 1;
+        }
+        assert!(
+            queued > 0,
+            "expected to queue at least one message before the buffer filled"
+        );
+    }
+
+    /// A connection that fired its kill signal must be torn down promptly; the
+    /// signal carries a permit, so this resolves without the socket task having
+    /// been waiting beforehand.
+    async fn assert_killed(handle: &ConnectionHandle, what: &str) {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            handle.kill.notified(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{what}: kill signal was never fired"));
+    }
+
+    #[tokio::test]
+    async fn saturated_connection_is_killed_and_unregistered() {
+        let manager = test_manager().await;
+        let user_id = "usr_slow_client";
+
+        // The connect heartbeat is never read, so the buffer only fills up.
+        let slow = manager.connect(user_id).expect("connection");
+        saturate(&slow);
+        assert_eq!(manager.local_connection_count(), 1);
+
+        manager.deliver_to_local_user(user_id, "workspace-broadcast");
+
+        assert_eq!(
+            manager.local_connection_count(),
+            0,
+            "a connection that cannot take its sync frame must be unregistered"
+        );
+        assert_killed(&slow, "saturated connection").await;
+    }
+
+    #[tokio::test]
+    async fn saturated_connection_survives_while_it_is_catching_up() {
+        let manager = test_manager().await;
+        let user_id = "usr_bootstrapping_client";
+
+        // A bootstrap stream holds the channel at capacity for its whole run.
+        let loading = manager.connect(user_id).expect("connection");
+        let _catching_up = CatchUpGuard::new(&loading.catching_up);
+        saturate(&loading);
+
+        manager.deliver_to_local_user(user_id, "workspace-broadcast");
+
+        assert_eq!(
+            manager.local_connection_count(),
+            1,
+            "a connection mid-catch-up must stay registered when a live frame cannot fit"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                loading.kill.notified(),
+            )
+            .await
+            .is_err(),
+            "a connection mid-catch-up must not be killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_catch_up_no_longer_exempts_the_connection() {
+        let manager = test_manager().await;
+        let user_id = "usr_finished_bootstrap";
+
+        let slow = manager.connect(user_id).expect("connection");
+        // The guard's scope is the stream; once it ends the exemption ends.
+        {
+            let _catching_up = CatchUpGuard::new(&slow.catching_up);
+        }
+        saturate(&slow);
+
+        manager.deliver_to_local_user(user_id, "workspace-broadcast");
+
+        assert_eq!(
+            manager.local_connection_count(),
+            0,
+            "the exemption must not outlive the catch-up stream"
+        );
+        assert_killed(&slow, "connection that finished catching up").await;
+    }
+
+    #[tokio::test]
+    async fn one_saturated_connection_does_not_cost_a_healthy_one_its_frame() {
+        let manager = test_manager().await;
+        let user_id = "usr_two_browsers";
+
+        let slow = manager.connect(user_id).expect("first connection");
+        let mut healthy = manager.connect(user_id).expect("second connection");
+
+        drain_heartbeats(&mut healthy.rx, 1).await;
+        saturate(&slow);
+
+        manager.deliver_to_local_user(user_id, "workspace-broadcast");
+
+        assert_eq!(
+            recv_soon(
+                &mut healthy.rx,
+                "the broadcast reaching the connection that is keeping up"
+            )
+            .await,
+            "workspace-broadcast",
+            "a healthy connection must still get the frame"
+        );
+        assert_eq!(
+            manager.local_connection_count(),
+            1,
+            "only the saturated connection should be unregistered"
+        );
+        assert_killed(&slow, "saturated connection").await;
     }
 }

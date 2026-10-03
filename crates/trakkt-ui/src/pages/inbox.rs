@@ -22,8 +22,8 @@ use crate::components::{
 };
 use crate::server_fns::notifications::{
     bulk_delete_notifications, bulk_mark_notifications_read, bulk_mark_notifications_unread,
-    bulk_restore_notifications, list_notifications, mark_all_notifications_read,
-    mark_notification_read,
+    bulk_restore_notifications, count_notifications, list_notifications,
+    mark_all_notifications_read, mark_notification_read,
 };
 use crate::server_fns::teams::list_teams;
 use crate::types::IssueNavState;
@@ -46,6 +46,13 @@ fn notification_event_text(notification: &Notification) -> String {
         "status_changed" => "Status changed".to_string(),
         "assigned" => "You were assigned".to_string(),
         "priority_changed" => "Priority changed".to_string(),
+        "label_changed" => format!("{actor} changed labels"),
+        "due_date_changed" => format!("{actor} changed the due date"),
+        "estimate_changed" => format!("{actor} changed the estimate"),
+        "milestone_changed" => format!("{actor} changed the milestone"),
+        "project_changed" => format!("{actor} changed the project"),
+        "team_changed" => format!("{actor} moved this issue"),
+        "relation_added" => format!("{actor} added a relation"),
         _ => format!("{actor} updated"),
     }
 }
@@ -62,19 +69,24 @@ pub fn InboxPage() -> impl IntoView {
     let (type_filter, set_type_filter) = signal(String::new());
     let (search_text, set_search_text) = signal(String::new());
 
+    // Pagination state
+    let page = RwSignal::new(0i64);
+    const PAGE_SIZE: i64 = 20;
+
     // Selection state for bulk actions
     let selected = RwSignal::new(HashSet::<String>::new());
     let bulk_pending = RwSignal::new(false);
     let confirm_delete_open = RwSignal::new(false);
     let pending_delete_ids = RwSignal::new(Vec::<String>::new());
 
-    // Clear selection when any filter changes
+    // Clear selection and reset page when any filter changes
     Effect::new(move |_| {
         view_mode.get();
         team_filter.get();
         type_filter.get();
         search_text.get();
         selected.set(HashSet::new());
+        page.set(0);
     });
 
     // Load teams for the team filter dropdown
@@ -97,10 +109,44 @@ pub fn InboxPage() -> impl IntoView {
             ("status_changed".to_string(), "Status changes".to_string()),
             ("assigned".to_string(), "Assignments".to_string()),
             ("priority_changed".to_string(), "Priority changes".to_string()),
+            ("label_changed".to_string(), "Label changes".to_string()),
+            ("due_date_changed".to_string(), "Due date changes".to_string()),
+            ("estimate_changed".to_string(), "Estimate changes".to_string()),
+            ("milestone_changed".to_string(), "Milestone changes".to_string()),
+            ("project_changed".to_string(), "Project changes".to_string()),
+            ("team_changed".to_string(), "Team changes".to_string()),
+            ("relation_added".to_string(), "Relations".to_string()),
         ]
     });
 
     let notifications_resource = Resource::new(
+        move || (
+            unread_only.get(),
+            deleted_only.get(),
+            refetch_version.get(),
+            team_filter.get(),
+            type_filter.get(),
+            search_text.get(),
+            page.get(),
+        ),
+        move |(uo, del, _, tk, tf, search, pg)| async move {
+            let team_key = if tk.is_empty() { None } else { Some(tk) };
+            let notification_type = if tf.is_empty() { None } else { Some(tf) };
+            let search = if search.is_empty() { None } else { Some(search) };
+            list_notifications(
+                uo,
+                Some(del),
+                notification_type,
+                team_key,
+                search,
+                Some(PAGE_SIZE),
+                Some(pg * PAGE_SIZE),
+            )
+            .await
+        },
+    );
+
+    let count_resource = Resource::new(
         move || (
             unread_only.get(),
             deleted_only.get(),
@@ -113,9 +159,25 @@ pub fn InboxPage() -> impl IntoView {
             let team_key = if tk.is_empty() { None } else { Some(tk) };
             let notification_type = if tf.is_empty() { None } else { Some(tf) };
             let search = if search.is_empty() { None } else { Some(search) };
-            list_notifications(uo, Some(del), notification_type, team_key, search).await
+            count_notifications(uo, Some(del), notification_type, team_key, search).await
         },
     );
+
+    let total_count = Signal::derive(move || {
+        count_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or(0)
+    });
+
+    let total_pages = Signal::derive(move || {
+        let total = total_count.get();
+        if total == 0 {
+            1
+        } else {
+            (total + PAGE_SIZE - 1) / PAGE_SIZE
+        }
+    });
 
     let sync_store = use_context::<SyncStore>();
 
@@ -525,6 +587,45 @@ pub fn InboxPage() -> impl IntoView {
                 </Suspense>
             </div>
 
+            // Pagination controls
+            {move || {
+                let total = total_count.get();
+                let current_page = page.get();
+                let pages = total_pages.get();
+                (total > 0).then(|| {
+                    let start = current_page * PAGE_SIZE + 1;
+                    let end = ((current_page + 1) * PAGE_SIZE).min(total);
+                    view! {
+                        <div class="flex items-center justify-between px-5 py-3 border-t border-border shrink-0">
+                            <span class="text-xs text-muted-foreground">
+                                {format!("Showing {start}-{end} of {total}")}
+                            </span>
+                            <div class="flex items-center gap-2">
+                                <Button
+                                    variant=ButtonVariant::Ghost
+                                    size=ButtonSize::Sm
+                                    disabled=Signal::derive(move || page.get() == 0)
+                                    on:click=move |_| page.set(page.get_untracked() - 1)
+                                >
+                                    "Previous"
+                                </Button>
+                                <span class="text-xs text-muted-foreground">
+                                    {move || format!("Page {} of {}", current_page + 1, pages)}
+                                </span>
+                                <Button
+                                    variant=ButtonVariant::Ghost
+                                    size=ButtonSize::Sm
+                                    disabled=Signal::derive(move || page.get() >= total_pages.get() - 1)
+                                    on:click=move |_| page.set(page.get_untracked() + 1)
+                                >
+                                    "Next"
+                                </Button>
+                            </div>
+                        </div>
+                    }
+                })
+            }}
+
             <ConfirmDialog
                 open=Signal::derive(move || confirm_delete_open.get())
                 title=Signal::derive(move || {
@@ -599,6 +700,8 @@ fn NotificationRow(
     let issue_number_for_label = notification.issue_number;
     let team_key_for_click = notification.team_key.clone();
     let issue_number_for_click = notification.issue_number;
+    let context_id_for_click = notification.context_id.clone();
+    let notification_type_for_click = notification.notification_type.clone();
 
     // Per-row action menu state
     let menu_open = RwSignal::new(false);
@@ -630,17 +733,35 @@ fn NotificationRow(
                 on_refetch.run(());
             });
         }
+        // Build the comment fragment suffix for "commented" notifications with a context_id.
+        let fragment = if notification_type_for_click == "commented" {
+            context_id_for_click.as_deref().map(|cid| format!("#comment-{cid}"))
+        } else {
+            None
+        };
         let href = {
             // Prefer data from the notification itself
             let from_notification = team_key_for_click.as_ref().and_then(|tk| {
-                issue_number_for_click.map(|num| format!("/issues/{tk}-{num}"))
+                issue_number_for_click.map(|num| {
+                    let base = format!("/issues/{tk}-{num}");
+                    match &fragment {
+                        Some(frag) => format!("{base}{frag}"),
+                        None => base,
+                    }
+                })
             });
             from_notification.or_else(|| {
                 sync_store.and_then(|store| {
                     store.issues().get_untracked()
                         .iter()
                         .find(|i| i.issue_id == issue_id_for_lookup)
-                        .map(|issue| format!("/issues/{}-{}", issue.team_key, issue.number))
+                        .map(|issue| {
+                            let base = format!("/issues/{}-{}", issue.team_key, issue.number);
+                            match &fragment {
+                                Some(frag) => format!("{base}{frag}"),
+                                None => base,
+                            }
+                        })
                 })
             })
         };
@@ -822,7 +943,7 @@ fn NotificationRow(
                             {if is_deleted {
                                 view! {
                                     <button
-                                        class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                        class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                         on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                         on:click=on_restore.clone()
                                     >
@@ -833,14 +954,14 @@ fn NotificationRow(
                                 if is_unread {
                                     view! {
                                         <button
-                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                             on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                             on:click=on_mark_read.clone()
                                         >
                                             "Mark as read"
                                         </button>
                                         <button
-                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                             on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                             on:click=on_delete.clone()
                                         >
@@ -850,14 +971,14 @@ fn NotificationRow(
                                 } else {
                                     view! {
                                         <button
-                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-foreground hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                             on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                             on:click=on_mark_unread.clone()
                                         >
                                             "Mark as unread"
                                         </button>
                                         <button
-                                            class="flex items-center gap-2 w-full text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                            class="flex items-center gap-2 w-[calc(100%-0.5rem)] text-left text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] text-destructive hover:bg-secondary transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                             on:mousedown=move |ev: web_sys::MouseEvent| ev.stop_propagation()
                                             on:click=on_delete.clone()
                                         >

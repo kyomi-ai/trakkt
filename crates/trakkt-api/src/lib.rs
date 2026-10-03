@@ -19,6 +19,8 @@ pub mod milestones;
 pub mod openapi;
 pub mod projects;
 pub mod relations;
+pub mod releases;
+pub mod stars;
 pub mod statuses;
 pub mod teams;
 
@@ -254,6 +256,8 @@ pub fn all_operations() -> Vec<ApiOperation> {
     ops.extend(activities::operations());
     ops.extend(github_links::operations());
     ops.extend(issue_attachments::operations());
+    ops.extend(releases::operations());
+    ops.extend(stars::operations());
     ops
 }
 
@@ -273,19 +277,24 @@ mod tests {
     /// for that pattern.
     #[test]
     fn schemars_double_option_generates_valid_schema() {
-        #[derive(Debug, schemars::JsonSchema)]
+        #[derive(schemars::JsonSchema)]
         struct TestUpdateParams {
             id: String,
             title: Option<Option<String>>,
             priority: Option<Option<i32>>,
         }
 
-        let params = TestUpdateParams {
+        // `schema_for!` derives the schema from the field *types* and never
+        // touches an instance, so nothing else here reads these fields and
+        // `dead_code` fires. Destructure one instance to read them for real —
+        // suppressing the lint is not permitted. This also pins the shape the
+        // assertions below describe: an absent update field is the outer `None`.
+        let TestUpdateParams { id, title, priority } = TestUpdateParams {
             id: "x".into(),
             title: None,
             priority: None,
         };
-        let _ = format!("{params:?}");
+        assert_eq!((id.as_str(), title, priority), ("x", None, None));
 
         let schema = schemars::schema_for!(TestUpdateParams);
         let json = serde_json::to_value(&schema).expect("schema should serialize to JSON");
@@ -405,8 +414,19 @@ mod tests {
         assert!(names.contains(&"attach_to_issue"));
         assert!(names.contains(&"detach_from_issue"));
 
-        // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 2 + 3 + 3 = 36
-        assert_eq!(ops.len(), 36, "expected 36 total operations");
+        // Release operations (4)
+        assert!(names.contains(&"list_releases"));
+        assert!(names.contains(&"get_release"));
+        assert!(names.contains(&"create_release"));
+        assert!(names.contains(&"list_unreleased_issues"));
+
+        // Star operations (3)
+        assert!(names.contains(&"star_issue"));
+        assert!(names.contains(&"unstar_issue"));
+        assert!(names.contains(&"list_starred_issues"));
+
+        // Total: 6 + 1 + 2 + 2 + 1 + 3 + 5 + 4 + 4 + 2 + 3 + 3 + 4 + 3 = 43
+        assert_eq!(ops.len(), 43, "expected 43 total operations");
     }
 
     #[test]

@@ -38,5 +38,13 @@ pub fn render_via_suffix(
             }
             .into_any()
         }
+        ActionSource::Github => {
+            let label = action_source_label
+                .unwrap_or_else(|| "GitHub".to_string());
+            view! {
+                <span class="text-muted-foreground font-normal">" via "{label}</span>
+            }
+            .into_any()
+        }
     }
 }

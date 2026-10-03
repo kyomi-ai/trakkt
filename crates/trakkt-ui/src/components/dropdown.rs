@@ -75,7 +75,7 @@ const SEARCH_INPUT_CLASS: &str = "w-full px-2.5 py-[5px] text-xs bg-transparent 
 /// - Border radius: 3px
 /// - Hover: `bg-surface-alt` (bg-secondary)
 /// - Transition: colors
-const ITEM_BASE: &str = "flex items-center gap-2 w-full cursor-default select-none \
+const ITEM_BASE: &str = "flex items-center gap-2 cursor-default select-none \
     text-[13px] px-2.5 py-[5px] mx-1 my-px rounded-[3px] \
     transition-colors duration-100 \
     hover:bg-secondary";
