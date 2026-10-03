@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sync_log_service;
 use crate::websocket::WebSocketManager;
+use trakkt_types::models::WorkspaceSettingsSnapshot;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 /// Get all active workspace user memberships for a workspace.
@@ -93,6 +94,30 @@ struct WorkspaceSnapshotRow {
     workspace_id: String,
     name: Option<String>,
     settings: Option<String>,
+    /// The workspace-level default team, carried here rather than as an entity
+    /// type of its own.
+    ///
+    /// It is a column on this same `workspaces` row and is semantically a
+    /// workspace-level setting — which is exactly what the `workspace_settings`
+    /// entity already is. A second entity type for one nullable string on the
+    /// row this one already carries would be a second name for the same thing,
+    /// and the two could then disagree about which is current.
+    ///
+    /// The alternative was priced before it was rejected. A new entity type
+    /// costs a constant in `entity_types` (`crates/trakkt-types/src/sync.rs`), a
+    /// bootstrap stream in `apps/server/src/routes/websocket.rs`, both an
+    /// `Update` and a `Delete` arm in `crates/trakkt-ui/src/cache/apply.rs`, a
+    /// version counter on the client store, and a `NOT_CACHED`/cache-membership
+    /// decision — all to move a field that already travels in this row.
+    ///
+    /// Adding the field instead is bounded, and the bound was checked rather
+    /// than assumed: `apply.rs`'s two `WORKSPACE_SETTINGS` arms read **no**
+    /// field off the payload — they only bump `workspace_settings_version`, and
+    /// the settings page refetches through `get_workspace_settings`. The
+    /// bootstrap reader forwards the snapshot opaquely. Nothing decodes a
+    /// cached `workspace_settings` row into a typed struct, so the addition is
+    /// purely additive to every reader that exists.
+    default_team_id: Option<String>,
     updated_at: String,
 }
 
@@ -105,26 +130,38 @@ struct WorkspaceSnapshotRow {
 const WORKSPACE_SNAPSHOT_SQL: &str = r#"SELECT workspace_id,
           name,
           CAST(settings AS TEXT) AS settings,
+          default_team_id,
           CAST(updated_at AS TEXT) AS updated_at
    FROM workspaces WHERE workspace_id = $1"#;
 
 impl WorkspaceSnapshotRow {
     /// The `workspace_settings` entity as the sync protocol carries it.
     ///
+    /// Returns the typed [`WorkspaceSettingsSnapshot`] rather than the
+    /// `serde_json::json!` literal this used to build. The literal was the
+    /// reason `workspace_settings` was the one bootstrap entity with no Rust
+    /// type behind it, and therefore the one whose `entity_id` could only be
+    /// recovered by looking up a string key — see
+    /// [`trakkt_types::sync::SyncEntity`], which this type now implements.
+    /// [`workspace_settings_snapshot_in_tx`] encodes it back to a
+    /// `serde_json::Value` for the `sync_log` payload, so the shape on the wire
+    /// is unchanged: the same five keys, with the same values.
+    ///
     /// `Err` only for a `settings` column that is not parseable JSON, which is
     /// a corrupt row rather than an absent one.
-    fn into_sync_value(self) -> trakkt_core::Result<serde_json::Value> {
-        let settings_json: Option<serde_json::Value> = match self.settings.as_deref() {
+    fn into_snapshot(self) -> trakkt_core::Result<WorkspaceSettingsSnapshot> {
+        let settings: Option<serde_json::Value> = match self.settings.as_deref() {
             Some(settings) => Some(serde_json::from_str(settings)?),
             None => None,
         };
 
-        Ok(serde_json::json!({
-            "workspace_id": self.workspace_id,
-            "name": self.name,
-            "settings": settings_json,
-            "updated_at": self.updated_at,
-        }))
+        Ok(WorkspaceSettingsSnapshot {
+            workspace_id: self.workspace_id,
+            name: self.name,
+            settings,
+            default_team_id: self.default_team_id,
+            updated_at: self.updated_at,
+        })
     }
 }
 
@@ -184,11 +221,15 @@ async fn workspace_settings_snapshot_in_tx(
         )));
     };
 
-    row.into_sync_value()
+    // The `sync_log` payload column is JSON, so the typed snapshot is encoded
+    // here rather than at each of the three callers. `to_value` on a struct of
+    // strings and an already-parsed `Value` has no failing case, but it is not
+    // an infallible signature, so the error propagates like every other.
+    Ok(serde_json::to_value(row.into_snapshot()?)?)
 }
 
-/// Return a workspace settings snapshot (name, settings, updated_at) as a
-/// JSON value for the sync bootstrap protocol.
+/// Return the workspace's [`WorkspaceSettingsSnapshot`] for the sync bootstrap
+/// protocol.
 ///
 /// `Ok(None)` means the workspace has no row: a real answer, and one the
 /// bootstrap streams as "this workspace has no settings entity". `Err` means
@@ -202,7 +243,7 @@ async fn workspace_settings_snapshot_in_tx(
 pub async fn get_workspace_settings_for_sync(
     pool: &DbPool,
     workspace_id: &str,
-) -> trakkt_core::Result<Option<serde_json::Value>> {
+) -> trakkt_core::Result<Option<WorkspaceSettingsSnapshot>> {
     let row = trakkt_core::db_fetch_optional!(
         pool,
         WorkspaceSnapshotRow,
@@ -210,7 +251,7 @@ pub async fn get_workspace_settings_for_sync(
         workspace_id
     )?;
 
-    row.map(WorkspaceSnapshotRow::into_sync_value).transpose()
+    row.map(WorkspaceSnapshotRow::into_snapshot).transpose()
 }
 
 /// Update workspace display name.
@@ -320,10 +361,24 @@ pub async fn update_workspace_settings(
 /// Set the workspace-level default team.
 ///
 /// Validates that the team belongs to this workspace before writing.
+///
+/// The UPDATE and its `sync_log` entry are one transaction, for the same reason
+/// as [`update_workspace_name`]: a default-team change that commits without its
+/// sync row is invisible to every connected client until the next full
+/// bootstrap, and no later delta reports it — the row a delta would re-read
+/// already carries the new default, so nothing marks it as changed.
+///
+/// The validation deliberately runs on the pool, *before* `begin()`.
+/// [`crate::team_service::get_team`] takes a `&DbPool`, and SQLite pins the pool
+/// to one connection ([`DbPool::connect`]) which an open transaction holds — a
+/// pool read inside the span would wait on a connection only the commit can
+/// free, until sqlx's 30s acquire timeout fires. Authorization and validation
+/// belong ahead of the transaction in any case.
 pub async fn set_workspace_default_team(
     pool: &DbPool,
     workspace_id: &str,
     team_id: &str,
+    ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<bool> {
     let team = crate::team_service::get_team(pool, team_id)
         .await?
@@ -339,8 +394,33 @@ pub async fn set_workspace_default_team(
     let sql = format!(
         "UPDATE workspaces SET default_team_id = $1, updated_at = {now} WHERE workspace_id = $2"
     );
-    let result = trakkt_core::db_execute!(pool, &sql, team_id, workspace_id)?;
-    Ok(result.rows_affected() > 0)
+
+    let mut tx = pool.begin().await?;
+    let result = trakkt_core::tx_execute!(&mut tx, &sql, team_id, workspace_id)?;
+
+    if result.rows_affected() == 0 {
+        // `tx` is dropped here, which rolls it back (see `DbTx`).
+        return Ok(false);
+    }
+
+    // Read back on the transaction, not the pool: the new default team is not
+    // visible outside this transaction yet (see
+    // `workspace_settings_snapshot_in_tx`).
+    let snapshot = workspace_settings_snapshot_in_tx(&mut tx, workspace_id).await?;
+
+    sync_log_service::commit_and_deliver(
+        tx,
+        entity_types::WORKSPACE_SETTINGS,
+        workspace_id,
+        workspace_id,
+        sync_log_service::SyncAudience::Workspace,
+        SyncActionType::Update,
+        Some(snapshot),
+        ws_manager,
+    )
+    .await?;
+
+    Ok(true)
 }
 
 /// Get the workspace-level default team ID, if set.

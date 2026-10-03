@@ -166,30 +166,27 @@ fn serialise_sync_entry_data(
 ///
 /// This is the non-transactional form: the insert auto-commits on its own, so a
 /// failure leaves the caller's mutation already committed with no `sync_log`
-/// row to replay it — permanently invisible to delta sync. Services whose
-/// mutation and log write have been made atomic use
-/// [`write_sync_entry_in_tx`] instead; this form remains for the services that
-/// have not been converted yet.
+/// row to replay it — permanently invisible to delta sync. Every service
+/// mutation uses [`write_sync_entry_in_tx`] instead; grepped at TRA-10016, this
+/// form has no caller outside test code, where it is how a test gets a committed
+/// entry without a mutation to attach one to.
 ///
-/// `visibility_user_id` scopes who may receive this row on delta sync:
-/// - `None` — workspace-visible: every member of `workspace_id` receives it.
-/// - `Some(user_id)` — only that user receives it.
-///
-/// Per-user entities (notifications, favorites, notification preferences,
-/// unshared views) MUST pass `Some(owner)`. Passing `None` for them replays one
-/// member's private rows to the whole workspace, which is the leak TRA-9920
-/// fixed. The scope must match what `sync_bootstrap` exposes to the same user,
-/// otherwise a client's dataset depends on which sync path it took.
+/// `audience` decides the `visibility_user_id` column — see [`SyncAudience`] for
+/// what each variant means and why the choice is a named one rather than an
+/// `Option<&str>`. Unlike `commit_and_deliver`, nothing here delivers the live
+/// frame, so the caller is responsible for making the delivery match the
+/// audience it passed.
 pub async fn write_sync_entry(
     db: &DbPool,
     entity_type: &str,
     entity_id: &str,
     workspace_id: &str,
-    visibility_user_id: Option<&str>,
+    audience: SyncAudience<'_>,
     action: SyncActionType,
     data: Option<serde_json::Value>,
 ) -> trakkt_core::Result<i64> {
     let is_pg = db.is_postgres();
+    let visibility_user_id = audience.visibility_user_id();
     let action_str = action_type_to_str(&action);
     let data_str = serialise_sync_entry_data(data.as_ref())?;
     let sql = sync_entry_insert_sql(is_pg);
@@ -250,7 +247,7 @@ pub async fn write_sync_entry(
 /// Insert a row into `sync_log` on the caller's open transaction and return the
 /// assigned `sync_id`.
 ///
-/// Same insert as [`write_sync_entry`], same `visibility_user_id` contract —
+/// Same insert as [`write_sync_entry`], same [`SyncAudience`] contract —
 /// the difference is only where it runs. Because the row lands in the caller's
 /// transaction, the mutation it describes and the log entry that replays it
 /// commit together or not at all: a failure here rolls the mutation back
@@ -268,11 +265,12 @@ pub async fn write_sync_entry_in_tx(
     entity_type: &str,
     entity_id: &str,
     workspace_id: &str,
-    visibility_user_id: Option<&str>,
+    audience: SyncAudience<'_>,
     action: SyncActionType,
     data: Option<serde_json::Value>,
 ) -> trakkt_core::Result<i64> {
     let is_pg = tx.is_postgres();
+    let visibility_user_id = audience.visibility_user_id();
     let action_str = action_type_to_str(&action);
     let data_str = serialise_sync_entry_data(data.as_ref())?;
     let sql = sync_entry_insert_sql(is_pg);
@@ -338,6 +336,14 @@ pub async fn write_sync_entry_in_tx(
 /// express it and no value written at mutation time can: membership changes
 /// after the row is written. The audience is therefore derived here, at read
 /// time, from `team_members` as it stands when the delta is served.
+///
+/// The live frame is derived the same way, from the same table, by
+/// [`SyncAudience::Team`]'s delivery arm —
+/// `WebSocketManager::broadcast_raw_to_team_members` (TRA-10039). The two
+/// recipient sets are meant to be identical, so this predicate and that query
+/// are a pair: narrowing one without the other means either a non-member holds
+/// a private team until they reconnect, or a member never sees a rename until
+/// they do.
 ///
 /// It applies only to rows that would **add or refresh** a team, never to rows
 /// that remove one, and that asymmetry is the whole of the design:
@@ -588,6 +594,37 @@ pub async fn send_sync_action_to_user(
     ws_manager.send_to_user_raw(user_id, &json).await;
 }
 
+/// Send a `SyncResponse::SyncAction` with the full entity data to the current
+/// members of one team only.
+///
+/// The live-broadcast counterpart of a sync entry written with
+/// [`SyncAudience::Team`]. `ENTRIES_SINCE_SQL` hands a TEAM insert or update
+/// only to the users `team_members` lists for that team, so the live frame must
+/// reach exactly that set: wider is TRA-10039's disclosure, narrower is a member
+/// who sees a rename only after reconnecting.
+///
+/// `sync_id` follows the same contract as [`broadcast_sync_action`]: the id
+/// returned by the matching [`write_sync_entry`], or `0` when that write failed.
+///
+/// Best-effort: failures are logged but never propagated.
+pub async fn send_sync_action_to_team_members(
+    ws_manager: &WebSocketManager,
+    team_id: &str,
+    workspace_id: &str,
+    entity_type: &str,
+    entity_id: &str,
+    action: SyncActionType,
+    data: Option<serde_json::Value>,
+    sync_id: i64,
+) {
+    let Some(json) = sync_action_frame(workspace_id, entity_type, entity_id, action, data, sync_id)
+    else {
+        return;
+    };
+
+    ws_manager.broadcast_raw_to_team_members(team_id, &json).await;
+}
+
 /// Serialize one `SyncResponse::SyncAction` frame.
 ///
 /// Returns `None` when the payload cannot be serialized — an unsendable frame
@@ -667,18 +704,113 @@ pub(crate) fn sync_payload<T: serde::Serialize>(
 /// private data but pushed live to everyone, or the reverse, where a member's
 /// live frame never arrives again after a reconnect.
 ///
-/// So the two are not separate parameters. This one value decides the
-/// `visibility_user_id` column *and* the delivery call, and
-/// [`commit_and_deliver`] is the only thing that reads it. A caller cannot scope
-/// the persisted row to one user and broadcast the frame to the workspace,
-/// because there is no pair of arguments to disagree about.
+/// So the two are not separate parameters. `commit_and_deliver` and `SyncBatch`
+/// read this one value for the `visibility_user_id` column *and* for the
+/// delivery call, so a mutation routed through them cannot scope the persisted
+/// row to one user and broadcast the frame to the workspace: there is no pair of
+/// arguments to disagree about.
 ///
-/// It is also deliberately not `Option<&str>`. `None` is the kind of thing that
-/// gets typed when a `user_id` is not to hand, and it would silently mean
-/// "publish this to the whole workspace"; `Workspace` has to be chosen on
-/// purpose and reads as a decision at the call site.
+/// A caller that writes through [`write_sync_entry_in_tx`] directly and then
+/// hand-rolls its own broadcast gets only the column from this value —
+/// `team_service`, `issue_service` and `comment_service` all still do that, and
+/// there the two halves agreeing is a convention rather than a consequence.
+/// Converting them onto `SyncBatch` is what would make it a consequence.
+///
+/// It is also deliberately not `Option<&str>`, and since TRA-10016 that is
+/// enforced rather than merely intended: [`write_sync_entry`] and
+/// [`write_sync_entry_in_tx`] take this type, so the anonymous form does not
+/// compile. `None` is the kind of thing that gets typed when a `user_id` is not
+/// to hand, and it would silently mean "publish this to the whole workspace";
+/// `Workspace` has to be chosen on purpose and reads as a decision at the call
+/// site.
+///
+/// ```compile_fail,E0308
+/// # use trakkt_auth::sync_log_service::{write_sync_entry_in_tx, SyncAudience};
+/// # use trakkt_types::sync::SyncActionType;
+/// # async fn demo(tx: &mut trakkt_core::db::DbTx) -> trakkt_core::Result<i64> {
+/// write_sync_entry_in_tx(
+///     tx,
+///     "issue",
+///     "iss_1",
+///     "ws_1",
+///     None, // error[E0308]: expected `SyncAudience<'_>`, found `Option<_>`
+///     SyncActionType::Update,
+///     None,
+/// )
+/// .await
+/// # }
+/// ```
+///
+/// The same call with the audience named is the one that compiles. The two
+/// blocks differ on that one line and nowhere else — including the `use`, which
+/// imports `SyncAudience` in both — so the rejection above is a statement about
+/// this type and not about the rest of the signature:
+///
+/// ```no_run
+/// # use trakkt_auth::sync_log_service::{write_sync_entry_in_tx, SyncAudience};
+/// # use trakkt_types::sync::SyncActionType;
+/// # async fn demo(tx: &mut trakkt_core::db::DbTx) -> trakkt_core::Result<i64> {
+/// write_sync_entry_in_tx(
+///     tx,
+///     "issue",
+///     "iss_1",
+///     "ws_1",
+///     SyncAudience::Workspace,
+///     SyncActionType::Update,
+///     None,
+/// )
+/// .await
+/// # }
+/// ```
+///
+/// # How TEAM is covered: the `Team` variant, and why `Delete` is not it
+///
+/// A team's audience is "its N current members", which no single
+/// `visibility_user_id` value can name and no value written at mutation time
+/// could keep correct as membership changes. TRA-10013 therefore derives it at
+/// **read** time, in `ENTRIES_SINCE_SQL`'s `team_members` predicate.
+///
+/// That closed the delta path and only the delta path. Until TRA-10039 every
+/// TEAM insert and update passed [`SyncAudience::Workspace`] — the one
+/// exception being the eviction `Delete` in
+/// `team_service::write_membership_sync_entry`, which was already
+/// [`SyncAudience::User`]. `Workspace` on a TEAM write was half a statement:
+/// workspace-visible as persisted, membership-scoped as read — and, on the
+/// live frame, workspace-wide again, because `broadcast_sync_action` resolves
+/// its recipients from `workspace_users`. A connected non-member received a
+/// private team's name, icon and settings the moment it was created or renamed,
+/// and `apply_action_to_memory`'s TEAM arm
+/// (`crates/trakkt-ui/src/cache/apply.rs`) cached whatever arrived.
+///
+/// [`SyncAudience::Team`] is that missing half. Its persisted arm is forced —
+/// NULL, exactly as `Workspace` writes, because the audience does not fit in
+/// the column — so all of its value is in its delivery arm, which resolves
+/// `team_members` and sends only to those users. TRA-10016 declined to add it
+/// while that delivery arm was out of scope, on the grounds that a variant
+/// byte-identical to `Workspace` reads as enforcement while enforcing nothing.
+/// With the delivery arm it is the enforcement: the same value drives the
+/// column and the send, so a TEAM insert or update cannot be persisted
+/// membership-scoped and pushed workspace-wide.
+///
+/// A TEAM `Delete` is **not** a `Team` audience and must never be given one.
+/// `ENTRIES_SINCE_SQL` exempts `action = 'delete'` from its membership
+/// predicate because `team_members` declares `ON DELETE CASCADE` on
+/// `teams(team_id)`: by the time a delete row is read back, every membership
+/// that would authorise it is gone. `team_service::delete_team`'s audience
+/// genuinely *is* the workspace and [`SyncAudience::Workspace`] says so
+/// truthfully. Both TEAM `Delete` writers pass a `None` payload — that one and
+/// the eviction row, which stays [`SyncAudience::User`] because it addresses a
+/// user who has just stopped being a member — so nothing about the team is
+/// disclosed by letting either through. Narrowing `delete_team` to `Team` would
+/// resolve the membership set the cascade has already emptied, delivering to
+/// nobody and leaving a deleted team in every remaining member's cache with
+/// nothing able to remove it —
+/// `deleting_a_team_reaches_a_non_member_live` (`apps/server/tests/sync_ws.rs`)
+/// covers the live half of that and
+/// [`tests::deleting_a_team_still_evicts_it_from_every_members_cache`] the
+/// delta half.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum SyncAudience<'a> {
+pub enum SyncAudience<'a> {
     /// Visible to every member of the workspace: `visibility_user_id` is NULL
     /// and the live frame is broadcast workspace-wide.
     Workspace,
@@ -690,13 +822,31 @@ pub(crate) enum SyncAudience<'a> {
     /// Downgrading one of these to [`SyncAudience::Workspace`] republishes one
     /// member's private rows to the whole workspace.
     User(&'a str),
+    /// Visible to the current members of one team, named by its `team_id`:
+    /// `visibility_user_id` is NULL and the live frame goes only to the users
+    /// `team_members` lists for that team at delivery time.
+    ///
+    /// The NULL is not a downgrade to [`SyncAudience::Workspace`]. The column
+    /// holds one user and the audience is a set, so the row has to be persisted
+    /// unscoped and narrowed by `ENTRIES_SINCE_SQL`'s `team_members` predicate
+    /// when it is read; this variant is what makes the live frame reach that
+    /// same set instead of the whole workspace.
+    ///
+    /// For TEAM inserts and updates only — see this type's docs for why a TEAM
+    /// `Delete` is [`SyncAudience::Workspace`] and has to stay that way.
+    Team(&'a str),
 }
 
 impl<'a> SyncAudience<'a> {
     /// The `visibility_user_id` column value for this audience.
+    ///
+    /// `Team` writes NULL for the reason its own docs give: the column names
+    /// one user and a team is a set. It is not interchangeable with `Workspace`
+    /// — they differ in `SyncBatch::commit_and_deliver`'s delivery arm, which is
+    /// where the whole distinction lives.
     fn visibility_user_id(self) -> Option<&'a str> {
         match self {
-            Self::Workspace => None,
+            Self::Workspace | Self::Team(_) => None,
             Self::User(user_id) => Some(user_id),
         }
     }
@@ -734,7 +884,11 @@ impl<'a> SyncAudience<'a> {
 /// hard-codes the TEAM entity type and the `Update` action, and returns the row
 /// it read to its caller. Generalising it into this signature would take a
 /// read-back callback and a second return type to serve one module — a worse
-/// abstraction, not a shared one. Leave it where it is.
+/// abstraction, not a shared one. So it stays where it is — but since TRA-10039
+/// it *delegates* its tail to this function rather than duplicating it, which is
+/// the part that was worth sharing: the commit-then-deliver ordering and the one
+/// [`SyncAudience`] driving both halves. What is left in `team_service` is only
+/// the read-back and the return.
 pub(crate) async fn commit_and_deliver(
     mut tx: DbTx,
     entity_type: &str,
@@ -834,7 +988,7 @@ impl<'a> SyncBatch<'a> {
             entity_type,
             entity_id,
             workspace_id,
-            audience.visibility_user_id(),
+            audience,
             action.clone(),
             payload.clone(),
         )
@@ -900,6 +1054,19 @@ impl<'a> SyncBatch<'a> {
                     )
                     .await;
                 }
+                SyncAudience::Team(team_id) => {
+                    send_sync_action_to_team_members(
+                        ws,
+                        team_id,
+                        &entry.workspace_id,
+                        &entry.entity_type,
+                        &entry.entity_id,
+                        entry.action,
+                        entry.payload,
+                        entry.sync_id,
+                    )
+                    .await;
+                }
             }
         }
 
@@ -912,10 +1079,12 @@ impl<'a> SyncBatch<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trakkt_types::enums::FavoriteTarget;
     use trakkt_types::models::{
-        Favorite, IssueWithDetails, Label, Project, ProjectMember, ProjectMilestone, ProjectUpdate,
-        Status, Team, View,
+        Favorite, IssueAttachment, IssueWithDetails, Label, Project, ProjectMember,
+        ProjectMilestone, ProjectUpdate, Status, Team, View,
     };
+    use trakkt_core::test_helpers::channel::recv_soon;
     use trakkt_types::sync::{entity_types, SyncResponse};
 
     /// A single-instance manager over a workspace with one member.
@@ -960,7 +1129,7 @@ mod tests {
 
         let mut conn = manager.connect(user_id).expect("connection");
         // Discard the connect heartbeat.
-        conn.rx.recv().await.expect("heartbeat frame");
+        recv_soon(&mut conn.rx, "the connect heartbeat").await;
 
         broadcast_sync_action(
             &manager,
@@ -973,7 +1142,7 @@ mod tests {
         )
         .await;
 
-        let frame = conn.rx.recv().await.expect("broadcast frame");
+        let frame = recv_soon(&mut conn.rx, "the broadcast frame under test").await;
         match serde_json::from_str::<SyncResponse>(&frame)
             .expect("broadcast frame is a SyncResponse")
         {
@@ -1176,8 +1345,15 @@ mod tests {
         .clone();
 
         let favorite =
-            crate::favorite_service::add_favorite(db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::add_favorite(
+                db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect("A favorites the issue");
 
         (notification_id, favorite.favorite_id)
@@ -1443,8 +1619,8 @@ mod tests {
 
         let mut a_conn = manager.connect(USER_A).expect("A connects");
         let mut b_conn = manager.connect(USER_B).expect("B connects");
-        a_conn.rx.recv().await.expect("A's heartbeat");
-        b_conn.rx.recv().await.expect("B's heartbeat");
+        recv_soon(&mut a_conn.rx, "A's connect heartbeat").await;
+        recv_soon(&mut b_conn.rx, "B's connect heartbeat").await;
 
         crate::notification_service::create_notification(
             &db,
@@ -1461,7 +1637,7 @@ mod tests {
         .await
         .expect("notify A");
 
-        let frame = a_conn.rx.recv().await.expect("A receives the notification");
+        let frame = recv_soon(&mut a_conn.rx, "A's notification frame").await;
         match serde_json::from_str::<SyncResponse>(&frame).expect("a SyncResponse") {
             SyncResponse::SyncAction(action) => {
                 assert_eq!(action.entity_type, entity_types::NOTIFICATION);
@@ -1680,7 +1856,7 @@ mod tests {
     async fn watching_member(db: &DbPool) -> (WebSocketManager, crate::websocket::manager::ConnectionHandle) {
         let manager = WebSocketManager::new(None, db.clone());
         let mut conn = manager.connect(USER_B).expect("B connects");
-        conn.rx.recv().await.expect("connect heartbeat");
+        recv_soon(&mut conn.rx, "B's connect heartbeat").await;
         (manager, conn)
     }
 
@@ -1689,13 +1865,22 @@ mod tests {
     /// Going through `SyncResponse` is the point of the test: it is the exact
     /// call `cache/websocket.rs` makes, and it is where the old envelope frame
     /// failed.
-    async fn next_sync_action(conn: &mut crate::websocket::manager::ConnectionHandle) -> SyncAction {
-        let frame = conn.rx.recv().await.expect("a broadcast frame");
+    ///
+    /// `what` names the delivery being awaited, and every failure below repeats
+    /// it. The receive is bounded by [`recv_soon`], so "the frame never arrives"
+    /// is reported as a named failure instead of a hang — see
+    /// [`trakkt_core::test_helpers::channel`] for why that is the failure mode
+    /// this whole family of tests has to be able to report.
+    async fn next_sync_action(
+        conn: &mut crate::websocket::manager::ConnectionHandle,
+        what: &str,
+    ) -> SyncAction {
+        let frame = recv_soon(&mut conn.rx, what).await;
         match serde_json::from_str::<SyncResponse>(&frame).unwrap_or_else(|e| {
-            panic!("frame did not parse as a SyncResponse: {e}\nframe: {frame}")
+            panic!("the frame carrying {what} did not parse as a SyncResponse: {e}\nframe: {frame}")
         }) {
             SyncResponse::SyncAction(action) => action,
-            other => panic!("expected a sync_action frame, got {other:?}"),
+            other => panic!("expected a sync_action frame carrying {what}, got {other:?}"),
         }
     }
 
@@ -1758,7 +1943,7 @@ mod tests {
 
         let status = create_test_status(&db, Some(&manager)).await;
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the status create frame").await;
         assert!(matches!(action.action, SyncActionType::Insert));
         let data = payload_of(&action, entity_types::STATUS, &status.status_id);
 
@@ -1782,7 +1967,7 @@ mod tests {
 
         let project = create_test_project(&db, Some(&manager)).await;
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the project create frame").await;
         assert!(matches!(action.action, SyncActionType::Insert));
         let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
 
@@ -1800,7 +1985,7 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         let updated = crate::project_service::update_project(
             &db,
@@ -1821,7 +2006,7 @@ mod tests {
         .await
         .expect("update project");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the project update frame").await;
         assert!(matches!(action.action, SyncActionType::Update));
         let data = payload_of(&action, entity_types::PROJECT, &project.project_id);
 
@@ -1857,7 +2042,7 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         crate::project_service::add_project_member(
             &db,
@@ -1870,7 +2055,7 @@ mod tests {
         .await
         .expect("add member");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the member-add frame").await;
         assert!(
             matches!(action.action, SyncActionType::Insert),
             "adding a member creates a membership row, so the frame is an \
@@ -1902,7 +2087,7 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         crate::project_service::add_project_member(
             &db,
@@ -1914,7 +2099,7 @@ mod tests {
         )
         .await
         .expect("add member");
-        next_sync_action(&mut conn).await; // the member-add frame
+        next_sync_action(&mut conn, "the member-add frame").await;
 
         crate::project_service::remove_project_member(
             &db,
@@ -1926,7 +2111,7 @@ mod tests {
         .await
         .expect("remove member");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the member-remove frame").await;
         assert!(
             matches!(action.action, SyncActionType::Delete),
             "removing a member deletes the membership row, so the frame is a \
@@ -1956,7 +2141,7 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         let posted = crate::project_service::create_project_update(
             &db,
@@ -1970,7 +2155,7 @@ mod tests {
         .await
         .expect("post a project update");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the project-update create frame").await;
         assert!(
             matches!(action.action, SyncActionType::Insert),
             "posting an update creates a row, so the frame is an Insert of that \
@@ -2123,11 +2308,11 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the project create frame
+        next_sync_action(&mut conn, "the project create frame").await;
 
         let milestone = create_test_milestone(&db, &project.project_id, "Beta", Some(&manager)).await;
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the milestone create frame").await;
         assert!(matches!(action.action, SyncActionType::Insert));
         let data = payload_of(
             &action,
@@ -2158,9 +2343,9 @@ mod tests {
         let db = two_user_workspace().await;
         let (manager, mut conn) = watching_member(&db).await;
         let project = create_test_project(&db, Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the project create frame
+        next_sync_action(&mut conn, "the project create frame").await;
         let milestone = create_test_milestone(&db, &project.project_id, "Beta", Some(&manager)).await;
-        next_sync_action(&mut conn).await; // the milestone create frame
+        next_sync_action(&mut conn, "the milestone create frame").await;
 
         let updated = crate::project_service::update_milestone(
             &db,
@@ -2174,7 +2359,7 @@ mod tests {
         .await
         .expect("update milestone");
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the milestone update frame").await;
         assert!(matches!(action.action, SyncActionType::Update));
         let data = payload_of(
             &action,
@@ -2477,8 +2662,15 @@ mod tests {
         let db = two_user_workspace().await;
 
         let favorite =
-            crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::add_favorite(
+                &db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect("A favorites the issue");
 
         // A favorite is scoped to its owner, so it is A's delta that carries it.
@@ -3444,6 +3636,7 @@ mod tests {
             &db,
             std::slice::from_ref(&hidden),
             USER_A,
+            None,
         )
         .await
         .expect("soft-delete one of A's two notifications");
@@ -3478,10 +3671,11 @@ mod tests {
 
         // The read in `delete_issue` deliberately does not filter on
         // `deleted_at`, and this is what that decision buys. A client that
-        // cached the row before it was soft-deleted still holds it:
-        // `bulk_delete_notifications` writes no `sync_log` entry at all, so
-        // nothing on the wire ever told that client the row was hidden. Skipping
-        // it here would strand it in the cache permanently.
+        // cached the row still holds it after the soft-delete:
+        // `bulk_delete_notifications` reports one as an `Update` carrying the
+        // stamped row, and the update arm of `crates/trakkt-ui/src/cache/apply.rs`
+        // upserts it — only a `Delete` reaches `remove_notification_in_memory`.
+        // Skipping it here would strand it in the cache permanently.
         assert_eq!(
             notification_entries(visible_entries_after(&db, seeded_entries).await),
             expected,
@@ -3874,7 +4068,7 @@ mod tests {
             entity_types::ISSUE,
             "iss_first",
             WS,
-            None,
+            SyncAudience::Workspace,
             SyncActionType::Insert,
             None,
         )
@@ -3885,7 +4079,7 @@ mod tests {
             entity_types::ISSUE,
             "iss_second",
             WS,
-            None,
+            SyncAudience::Workspace,
             SyncActionType::Update,
             None,
         )
@@ -3926,7 +4120,7 @@ mod tests {
             entity_types::ISSUE,
             "iss_discarded",
             WS,
-            None,
+            SyncAudience::Workspace,
             SyncActionType::Insert,
             None,
         )
@@ -3959,7 +4153,7 @@ mod tests {
 
         let mut conn = manager.connect(USER_B).expect("connection");
         // Discard the connect heartbeat.
-        conn.rx.recv().await.expect("heartbeat frame");
+        recv_soon(&mut conn.rx, "the connect heartbeat").await;
 
         crate::issue_service::update_issue(
             &db,
@@ -3978,7 +4172,7 @@ mod tests {
         .await
         .expect("update issue");
 
-        let frame = conn.rx.recv().await.expect("broadcast frame");
+        let frame = recv_soon(&mut conn.rx, "the issue update frame").await;
         let action = match serde_json::from_str::<SyncResponse>(&frame)
             .expect("broadcast frame is a SyncResponse")
         {
@@ -6078,6 +6272,103 @@ mod tests {
             .collect()
     }
 
+    // ─── Attachment-link frames and payloads (TRA-9979) ──────────────────────
+    //
+    // `attach_to_issue` used to record its ISSUE_ATTACHMENT insert with a `None`
+    // payload. `apply_action_to_memory` (`crates/trakkt-ui/src/cache/apply.rs`)
+    // returns at its data-less guard *before* the entity-type match, so the
+    // frame was dropped and linking an existing file to an issue reached no
+    // other client at all — not live, and not on reconnect either, because the
+    // stored entry was equally empty. The two tests below are that pair: the
+    // live frame and the persisted row, which are separate criteria and neither
+    // of which can stand in for the other.
+    //
+    // An entry existing is not the property under test; the defect was an entry
+    // that existed and was empty. Both tests therefore deserialise the payload
+    // into the `IssueAttachment` the client applies and assert its fields.
+
+    /// The sync entity id for a link: `issue_attachments` has a composite
+    /// primary key and no surrogate id, so the two columns are joined. Written
+    /// out here rather than shared with the service, so a change to the id
+    /// scheme has to be made deliberately in both places — the same reason
+    /// `member_entity_id` above is a local copy.
+    fn link_entity_id(issue_id: &str, attachment_id: &str) -> String {
+        format!("{issue_id}:{attachment_id}")
+    }
+
+    #[tokio::test]
+    async fn issue_attach_frame_carries_the_new_link() {
+        let db = two_user_workspace().await;
+        seed_attachments(&db).await;
+        let (manager, mut conn) = watching_member(&db).await;
+
+        // `att_loose` rather than `att_linked`: with `ON CONFLICT DO NOTHING` an
+        // already-linked attachment makes the INSERT a no-op, and this test
+        // would then be asserting over a row some other statement wrote.
+        crate::attachment_service::attach_to_issue(&db, WS, "iss_vis", "att_loose", Some(&manager))
+            .await
+            .expect("link an existing attachment to the issue");
+
+        let action = next_sync_action(&mut conn, "the attachment-link frame").await;
+        assert!(
+            matches!(action.action, SyncActionType::Insert),
+            "linking creates a junction row, so the frame is an Insert of that \
+             row"
+        );
+        let data = payload_of(
+            &action,
+            entity_types::ISSUE_ATTACHMENT,
+            &link_entity_id("iss_vis", "att_loose"),
+        );
+
+        let received: IssueAttachment =
+            serde_json::from_value(data).expect("payload deserializes into an IssueAttachment");
+        assert_eq!(received.issue_id, "iss_vis");
+        assert_eq!(
+            received.attachment_id, "att_loose",
+            "the frame has to name which attachment was linked — the entity id \
+             alone is a string the client would have to parse"
+        );
+        assert!(
+            !received.created_at.is_empty(),
+            "the payload is built after the re-read on the transaction, so the \
+             DB-assigned created_at has to be in it"
+        );
+    }
+
+    /// The durable half. Run with **no `ws_manager`**, so the live frame cannot
+    /// satisfy any of it: this is what a client that was offline for the whole
+    /// thing replays on reconnect, and it is the half `None` broke silently —
+    /// there was no delivery to notice missing.
+    #[tokio::test]
+    async fn delta_carries_the_junction_row_for_a_link_to_an_existing_attachment() {
+        let db = two_user_workspace().await;
+        seed_attachments(&db).await;
+
+        crate::attachment_service::attach_to_issue(&db, WS, "iss_vis", "att_loose", None)
+            .await
+            .expect("link an existing attachment to the issue");
+
+        // `delta_payloads` panics rather than skipping when a non-delete entry
+        // has no payload, which is exactly the defect: an entry that exists and
+        // is empty would fail here, where "assert an entry exists" would pass.
+        let links: Vec<IssueAttachment> =
+            delta_payloads(&db, USER_B, entity_types::ISSUE_ATTACHMENT).await;
+
+        assert_eq!(links.len(), 1, "one link was made, got {links:?}");
+        assert_eq!(links[0].issue_id, "iss_vis");
+        assert_eq!(
+            links[0].attachment_id, "att_loose",
+            "the stored row has to name what was linked to what, or a \
+             reconnecting client learns nothing it can act on"
+        );
+        assert!(
+            !links[0].created_at.is_empty(),
+            "the payload is built from the re-read, so the DB-assigned \
+             created_at has to be in it"
+        );
+    }
+
     #[tokio::test]
     async fn attachment_create_rolls_back_when_its_sync_entry_cannot_be_written() {
         let db = two_user_workspace().await;
@@ -6162,6 +6453,14 @@ mod tests {
         );
     }
 
+    /// `attach_to_issue` writes exactly **one** `sync_log` entry — one
+    /// `commit_and_deliver` call, no batch and no loop — so a blanket trigger
+    /// would be correct here today. It is narrowed to `ISSUE_ATTACHMENT` anyway,
+    /// because "correct given the current entry count" is a property of the
+    /// implementation and not of this test: an entry added ahead of the link's
+    /// would silently turn the blanket form into an assertion about that new
+    /// entry instead, and it would still pass. The `WHEN` clause makes the
+    /// rejection land on the link entry or nowhere.
     #[tokio::test]
     async fn issue_attach_rolls_back_when_its_sync_entry_cannot_be_written() {
         let db = two_user_workspace().await;
@@ -6174,7 +6473,7 @@ mod tests {
              NOTHING; got {before:?}"
         );
 
-        reject_sync_log_inserts(&db).await;
+        reject_sync_log_inserts_for_entity_type(&db, entity_types::ISSUE_ATTACHMENT).await;
 
         let err =
             crate::attachment_service::attach_to_issue(&db, WS, "iss_vis", "att_loose", None)
@@ -6358,8 +6657,15 @@ mod tests {
         let db = two_user_workspace().await;
         reject_sync_log_inserts(&db).await;
 
-        let err = crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
-            .await
+        let err = crate::favorite_service::add_favorite(
+            &db,
+            USER_A,
+            WS,
+            FavoriteTarget::Issue,
+            "iss_vis",
+            None,
+        )
+        .await
             .expect_err("an add whose sync entry cannot be written must fail");
 
         assert!(
@@ -6380,8 +6686,15 @@ mod tests {
     async fn favorite_remove_rolls_back_when_its_sync_entry_cannot_be_written() {
         let db = two_user_workspace().await;
         let favorite =
-            crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::add_favorite(
+                &db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect("A favorites the issue");
 
         let before = favorites(&db).await;
@@ -6398,8 +6711,15 @@ mod tests {
         reject_sync_log_inserts(&db).await;
 
         let err =
-            crate::favorite_service::remove_favorite(&db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::remove_favorite(
+                &db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect_err("a remove whose sync entry cannot be written must fail");
 
         assert!(
@@ -6668,8 +6988,15 @@ mod tests {
         .clone();
 
         let favorite =
-            crate::favorite_service::add_favorite(db, USER_A, WS, "issue", "iss_vis", None)
-                .await
+            crate::favorite_service::add_favorite(
+                db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                None,
+            )
+            .await
                 .expect("A favorites the issue");
 
         let prefs = crate::notification_service::get_or_default_preferences(db, USER_A, WS, None)
@@ -6763,13 +7090,20 @@ mod tests {
 
         let mut a_conn = manager.connect(USER_A).expect("A connects");
         let mut b_conn = manager.connect(USER_B).expect("B connects");
-        a_conn.rx.recv().await.expect("A's connect heartbeat");
-        b_conn.rx.recv().await.expect("B's connect heartbeat");
+        recv_soon(&mut a_conn.rx, "A's connect heartbeat").await;
+        recv_soon(&mut b_conn.rx, "B's connect heartbeat").await;
 
         // One mutation per converted per-user site, in order.
         let favorite =
-            crate::favorite_service::add_favorite(&db, USER_A, WS, "issue", "iss_vis", Some(&manager))
-                .await
+            crate::favorite_service::add_favorite(
+                &db,
+                USER_A,
+                WS,
+                FavoriteTarget::Issue,
+                "iss_vis",
+                Some(&manager),
+            )
+            .await
                 .expect("A favorites the issue");
         notify(&db, USER_A, Some(&manager)).await;
         crate::notification_service::get_or_default_preferences(&db, USER_A, WS, Some(&manager))
@@ -6790,7 +7124,7 @@ mod tests {
             &db,
             USER_A,
             WS,
-            "issue",
+            FavoriteTarget::Issue,
             "iss_vis",
             Some(&manager),
         )
@@ -6799,8 +7133,12 @@ mod tests {
 
         // A receives every one of them, in order, each addressed to A's own row.
         let mut a_frames = Vec::new();
-        for _ in 0..6 {
-            let action = next_sync_action(&mut a_conn).await;
+        for received in 0..6 {
+            let action = next_sync_action(
+                &mut a_conn,
+                &format!("A's own-mutation frame {} of 6", received + 1),
+            )
+            .await;
             a_frames.push((action.entity_type.clone(), action.entity_id.clone()));
             assert!(
                 action.sync_id > 0,
@@ -6840,7 +7178,8 @@ mod tests {
         // the assertion above is about audience and not about delivery being
         // broken.
         let shared = make_view(&db, USER_A, "A's shared view", true, Some(&manager)).await;
-        let b_frame = next_sync_action(&mut b_conn).await;
+        let b_frame =
+            next_sync_action(&mut b_conn, "the shared view reaching B").await;
         assert_eq!(
             (b_frame.entity_type.as_str(), b_frame.entity_id.as_str()),
             (entity_types::VIEW, shared.view_id.as_str()),
@@ -7248,7 +7587,7 @@ mod tests {
         let manager = WebSocketManager::new(None, db.clone());
 
         let mut conn = manager.connect(USER_B).expect("B connects");
-        conn.rx.recv().await.expect("B's connect heartbeat");
+        recv_soon(&mut conn.rx, "B's connect heartbeat").await;
 
         let release = crate::release_service::create_release(
             &db,
@@ -7266,8 +7605,12 @@ mod tests {
         .expect("create release");
 
         let mut actions = Vec::new();
-        for _ in 0..3 {
-            let action = next_sync_action(&mut conn).await;
+        for received in 0..3 {
+            let action = next_sync_action(
+                &mut conn,
+                &format!("the release's frame {} of 3", received + 1),
+            )
+            .await;
             assert!(
                 action.sync_id > 0,
                 "every frame has to carry the id of its committed row so a \
@@ -8048,26 +8391,49 @@ mod tests {
 
     const TRANSFER: &str = "xfer_vis";
 
-    /// Every workspace row as `(workspace_id, name, settings, owner_user_id)`.
-    async fn workspaces(db: &DbPool) -> Vec<(String, Option<String>, Option<String>, String)> {
+    /// Every field of a `workspaces` row that a mutation in this module writes.
+    ///
+    /// A struct rather than a tuple because three of the five fields are
+    /// `Option<String>` and two of those — `settings` and `default_team_id` —
+    /// are adjacent. In a tuple an assertion that transposed them would compile
+    /// and pass, and a rollback test that cannot fail is worse than none.
+    #[derive(Debug, PartialEq, Eq)]
+    struct WorkspaceFootprint {
+        workspace_id: String,
+        name: Option<String>,
+        settings: Option<String>,
+        default_team_id: Option<String>,
+        owner_user_id: String,
+    }
+
+    /// Every workspace row, in a stable order.
+    async fn workspaces(db: &DbPool) -> Vec<WorkspaceFootprint> {
         #[derive(sqlx::FromRow)]
         struct WorkspaceFootprintRow {
             workspace_id: String,
             name: Option<String>,
             settings: Option<String>,
+            default_team_id: Option<String>,
             owner_user_id: String,
         }
 
         let rows: Vec<WorkspaceFootprintRow> = db_fetch_all!(
             db,
             WorkspaceFootprintRow,
-            "SELECT workspace_id, name, CAST(settings AS TEXT) AS settings, owner_user_id \
+            "SELECT workspace_id, name, CAST(settings AS TEXT) AS settings, default_team_id, \
+             owner_user_id \
              FROM workspaces ORDER BY workspace_id"
         )
         .expect("read workspaces back");
 
         rows.into_iter()
-            .map(|r| (r.workspace_id, r.name, r.settings, r.owner_user_id))
+            .map(|r| WorkspaceFootprint {
+                workspace_id: r.workspace_id,
+                name: r.name,
+                settings: r.settings,
+                default_team_id: r.default_team_id,
+                owner_user_id: r.owner_user_id,
+            })
             .collect()
     }
 
@@ -8147,7 +8513,13 @@ mod tests {
         let before = workspaces(&db).await;
         assert_eq!(
             before,
-            vec![(WS.to_string(), Some("Old Name".to_string()), None, USER_A.to_string())],
+            vec![WorkspaceFootprint {
+                workspace_id: WS.to_string(),
+                name: Some("Old Name".to_string()),
+                settings: None,
+                default_team_id: None,
+                owner_user_id: USER_A.to_string(),
+            }],
             "precondition: the workspace carries the name the rename will try to \
              replace"
         );
@@ -8288,6 +8660,216 @@ mod tests {
         );
     }
 
+    /// The `workspace_settings` payload carries exactly the five keys it always
+    /// has.
+    ///
+    /// TRA-10004 replaced the `serde_json::json!` literal that built this
+    /// payload with a typed `WorkspaceSettingsSnapshot` that is serialized
+    /// instead, so its keys are now serde field names rather than quoted
+    /// strings. Nothing else in this suite would notice if that conversion had
+    /// dropped, added or respelled one: the assertions above name three keys
+    /// and pass just as well with the other two absent, and on the client side
+    /// `cache/apply.rs`'s two `WORKSPACE_SETTINGS` arms read no field off the
+    /// payload at all — they bump a version counter and let the settings page
+    /// refetch. A payload that quietly lost `workspace_id` would therefore
+    /// travel all the way to IndexedDB before anything disagreed with it.
+    ///
+    /// Keys only, and sorted: the values are what the two tests above are for,
+    /// and `serde_json::Map` is a `BTreeMap` here, so the order is the
+    /// comparison's and not the writer's.
+    #[tokio::test]
+    async fn the_workspace_settings_payload_carries_exactly_its_five_keys() {
+        let db = two_user_workspace().await;
+
+        crate::workspace_service::update_workspace_name(&db, WS, "New Name", None)
+            .await
+            .expect("rename the workspace");
+
+        let payloads: Vec<serde_json::Value> =
+            delta_payloads(&db, USER_A, entity_types::WORKSPACE_SETTINGS).await;
+        let [payload] = payloads.as_slice() else {
+            panic!("one rename is one entry, got {payloads:?}");
+        };
+        let keys: Vec<&str> = payload
+            .as_object()
+            .unwrap_or_else(|| panic!("the payload is a JSON object, got {payload:?}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                "default_team_id",
+                "name",
+                "settings",
+                "updated_at",
+                "workspace_id",
+            ],
+            "the workspace_settings entity's wire shape is fixed; got {payload:?}"
+        );
+    }
+
+    // ─── Workspace default team (TRA-9978) ───────────────────────────────────
+    //
+    // `set_workspace_default_team` writes exactly one entry
+    // (WORKSPACE_SETTINGS / update), so the blanket [`reject_sync_log_inserts`]
+    // trigger lands on the write under test rather than shadowing it behind an
+    // earlier one. The seeding call below writes its own entry, but it commits
+    // *before* the trigger is installed, so the trigger only ever sees the
+    // entry the function under test writes.
+
+    const TEAM_SECOND: &str = "team_second";
+
+    /// A second team in the fixture workspace, so a default-team change has a
+    /// prior value to be rolled back to rather than rolling back to NULL.
+    async fn add_second_team(db: &DbPool) {
+        db_execute!(
+            db,
+            "INSERT INTO teams (team_id, workspace_id, name, key) VALUES ($1, $2, $3, $4)",
+            TEAM_SECOND,
+            WS,
+            "Second",
+            "SEC"
+        )
+        .expect("insert a second team");
+    }
+
+    #[tokio::test]
+    async fn workspace_default_team_change_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        add_second_team(&db).await;
+
+        crate::workspace_service::set_workspace_default_team(&db, WS, "team_vis", None)
+            .await
+            .expect("seed the default team the failed write will try to replace");
+
+        let before = workspaces(&db).await;
+        assert_eq!(
+            before,
+            vec![WorkspaceFootprint {
+                workspace_id: WS.to_string(),
+                name: None,
+                settings: None,
+                default_team_id: Some("team_vis".to_string()),
+                owner_user_id: USER_A.to_string(),
+            }],
+            "precondition: the workspace carries the default team the write \
+             below will try to replace, so the rollback assertion is comparing \
+             against a real value and not against NULL"
+        );
+
+        let entries_before = sync_entries(&db).await;
+        assert_eq!(
+            entries_before.len(),
+            1,
+            "precondition: the seeding write is one entry, so the comparison \
+             below distinguishes it from the write under test"
+        );
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::workspace_service::set_workspace_default_team(&db, WS, TEAM_SECOND, None)
+                .await
+                .expect_err(
+                    "a default-team change whose sync entry cannot be written must fail",
+                );
+
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            workspaces(&db).await,
+            before,
+            "a default-team change with no sync_log row is invisible to every \
+             connected client until the next full bootstrap, and no later delta \
+             reports it — the row a delta re-reads already holds the new default, \
+             so nothing marks it changed — which is why it must not survive"
+        );
+        assert_eq!(
+            sync_entries(&db).await,
+            entries_before,
+            "the seeding write's entry stays; the failed write's must not be \
+             there at all"
+        );
+    }
+
+    /// The persisted payload must carry the default team the write *set*, not
+    /// the one it replaced.
+    ///
+    /// This is the assertion that pins the snapshot read to the transaction,
+    /// for the same reasons spelled out on
+    /// [`workspace_sync_entry_carries_the_post_update_state`]: on Postgres a
+    /// pool read here sits outside the transaction, returns the pre-update row,
+    /// and silently persists a stale snapshot that advances every client's
+    /// watermark past a change it never delivered; on SQLite it stalls on the
+    /// single connection the transaction holds instead. Comparing the payload
+    /// against the newly-set team is what makes both impossible.
+    ///
+    /// It also pins `default_team_id` into the snapshot at all. Before TRA-9978
+    /// the column was absent from `WORKSPACE_SNAPSHOT_SQL`, so an entry for a
+    /// default-team change would have carried a payload in which nothing had
+    /// changed.
+    #[tokio::test]
+    async fn workspace_default_team_sync_entry_carries_the_post_update_state() {
+        let db = two_user_workspace().await;
+        add_second_team(&db).await;
+
+        crate::workspace_service::set_workspace_default_team(&db, WS, "team_vis", None)
+            .await
+            .expect("set the default team");
+        crate::workspace_service::set_workspace_default_team(&db, WS, TEAM_SECOND, None)
+            .await
+            .expect("move the default team to the second team");
+
+        let payloads: Vec<serde_json::Value> =
+            delta_payloads(&db, USER_A, entity_types::WORKSPACE_SETTINGS).await;
+
+        assert_eq!(payloads.len(), 2, "one entry per write");
+
+        assert_eq!(
+            payloads[0].get("default_team_id"),
+            Some(&serde_json::json!("team_vis")),
+            "the first write's entry must carry the team it set — the pre-update \
+             value here is NULL, a payload that tells every client nothing changed"
+        );
+        assert_eq!(
+            payloads[1].get("default_team_id"),
+            Some(&serde_json::json!(TEAM_SECOND)),
+            "and the second write's entry must carry the team *it* set, not the \
+             one the first write left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_the_workspace_default_team_writes_one_workspace_wide_entry() {
+        let db = two_user_workspace().await;
+
+        let changed =
+            crate::workspace_service::set_workspace_default_team(&db, WS, "team_vis", None)
+                .await
+                .expect("set the default team");
+        assert!(changed, "the fixture workspace exists, so the UPDATE matched");
+
+        assert_eq!(
+            visible_entries_after(&db, 0).await,
+            vec![VisibleEntry {
+                entity_type: entity_types::WORKSPACE_SETTINGS.to_string(),
+                entity_id: WS.to_string(),
+                action: "update".to_string(),
+                visibility_user_id: None,
+            }],
+            "exactly one entry, addressed to the workspace: the default team is \
+             workspace-level configuration every member reads, so a \
+             `visibility_user_id` here would replay it to one member and leave \
+             the rest stale"
+        );
+    }
+
     #[tokio::test]
     async fn ownership_transfer_commits_its_three_statements_together() {
         let db = two_user_workspace().await;
@@ -8311,7 +8893,13 @@ mod tests {
 
         assert_eq!(
             workspaces(&db).await,
-            vec![(WS.to_string(), None, None, USER_B.to_string())],
+            vec![WorkspaceFootprint {
+                workspace_id: WS.to_string(),
+                name: None,
+                settings: None,
+                default_team_id: None,
+                owner_user_id: USER_B.to_string(),
+            }],
             "statement 1: the workspace owner moves to B"
         );
         assert_eq!(
@@ -8752,7 +9340,7 @@ mod tests {
             "precondition: the status change wrote exactly one activity"
         );
 
-        let action = next_sync_action(&mut conn).await;
+        let action = next_sync_action(&mut conn, "the activity insert frame").await;
         assert!(
             matches!(action.action, SyncActionType::Insert),
             "recording an activity creates a row, so the frame is an Insert of \
@@ -8804,7 +9392,8 @@ mod tests {
         let inserted = issue_activities(&db).await;
         assert_eq!(inserted.len(), 1, "precondition: one activity so far");
 
-        let insert_frame = next_sync_action(&mut conn).await;
+        let insert_frame =
+            next_sync_action(&mut conn, "the activity insert frame").await;
         assert!(matches!(insert_frame.action, SyncActionType::Insert));
         let insert_payload: trakkt_types::models::IssueActivity = serde_json::from_value(
             payload_of(
@@ -8842,7 +9431,8 @@ mod tests {
             "precondition: the second change coalesced rather than inserting"
         );
 
-        let update_frame = next_sync_action(&mut conn).await;
+        let update_frame =
+            next_sync_action(&mut conn, "the coalesced activity update frame").await;
         assert!(
             matches!(update_frame.action, SyncActionType::Update),
             "the coalescing branch updates the row, so that is what the frame \
@@ -8979,4 +9569,578 @@ mod tests {
             assert!(!payload.created_at.is_empty());
         }
     }
+
+    // ─── Notification read/state sync (TRA-9974) ─────────────────────────────
+    //
+    // `mark_as_read`, `mark_all_as_read` and the four `bulk_*` functions used to
+    // write no `sync_log` entry at all: a notification read in one tab stayed
+    // unread in every other one, through reconnects, until a full bootstrap.
+    //
+    // Each writes one entry per notification it *actually* changed, which is a
+    // subset of what was asked for — every one of them has a state predicate the
+    // change itself falsifies. The tests below pin the set, not the count: an
+    // entry for a row the predicate excluded announces a change that never
+    // happened, and is as wrong as a missing one.
+
+    /// Distinct notification types, so several notifications can be seeded for
+    /// one user on one issue and still be told apart by [`seed_notification`].
+    const SEED_TYPES: [&str; 3] = [
+        crate::notification_service::TYPE_ASSIGNED,
+        crate::notification_service::TYPE_COMMENTED,
+        crate::notification_service::TYPE_STATUS_CHANGED,
+    ];
+
+    /// Seed `count` notifications for `user` through the real service, returning
+    /// their ids in seed order.
+    ///
+    /// These commit as they go, which is what later lets a blanket `sync_log`
+    /// trigger land on the function under test rather than on the fixture.
+    async fn seed_notifications(db: &DbPool, user: &str, count: usize) -> Vec<String> {
+        let actor = if user == USER_A { USER_B } else { USER_A };
+        let mut ids = Vec::new();
+        for notification_type in SEED_TYPES.iter().take(count) {
+            ids.push(seed_notification(db, user, "iss_vis", notification_type, actor).await);
+        }
+        assert_eq!(ids.len(), count, "SEED_TYPES must cover the requested count");
+        ids
+    }
+
+    /// Every notification of `user` as `(id, read, soft_deleted)`, ordered by id.
+    ///
+    /// Those two booleans are precisely the state the six functions change, so
+    /// an unchanged `Vec` means nothing moved and a changed one names what did.
+    /// Ordered, and compared whole, because a count would not notice one row
+    /// being flipped while another was flipped back.
+    async fn notification_states(db: &DbPool, user: &str) -> Vec<(String, bool, bool)> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            notification_id: String,
+            read: bool,
+            deleted: bool,
+        }
+
+        let rows: Vec<Row> = db_fetch_all!(
+            db,
+            Row,
+            "SELECT notification_id, read, (deleted_at IS NOT NULL) AS deleted \
+             FROM notifications WHERE user_id = $1 ORDER BY notification_id",
+            user
+        )
+        .expect("read the notification states back");
+
+        rows.into_iter()
+            .map(|r| (r.notification_id, r.read, r.deleted))
+            .collect()
+    }
+
+    /// The entry a state change writes: an `update` addressed to the recipient.
+    ///
+    /// `update` and not `delete` even for a soft-delete —
+    /// [`expected_notification_delete`] is the cascade's entry, and the two have
+    /// to stay distinguishable on the wire.
+    fn expected_notification_update(entity_id: &str, recipient: &str) -> VisibleEntry {
+        VisibleEntry {
+            entity_type: entity_types::NOTIFICATION.to_string(),
+            entity_id: entity_id.to_string(),
+            action: "update".to_string(),
+            visibility_user_id: Some(recipient.to_string()),
+        }
+    }
+
+    /// The NOTIFICATION entries written after `seeded`, sorted for comparison.
+    async fn entries_written_after(db: &DbPool, seeded: usize) -> Vec<VisibleEntry> {
+        notification_entries(visible_entries_after(db, seeded).await)
+    }
+
+    fn sorted(mut expected: Vec<VisibleEntry>) -> Vec<VisibleEntry> {
+        expected.sort();
+        expected
+    }
+
+    // ── Per-function completeness ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_as_read_logs_an_entry_for_the_notification_it_marked() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::mark_as_read(&db, &ids[1], USER_A, None)
+            .await
+            .expect("A reads their second notification");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            vec![expected_notification_update(&ids[1], USER_A)],
+            "one entry, for the one row that changed — the other two were never \
+             asked about and must not be announced"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_all_as_read_logs_entries_for_only_the_unread_ones() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let b_ids = seed_notifications(&db, USER_B, 1).await;
+
+        crate::notification_service::mark_as_read(&db, &ids[0], USER_A, None)
+            .await
+            .expect("A reads one of them before the sweep");
+
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::mark_all_as_read(&db, USER_A, None)
+            .await
+            .expect("A marks their whole inbox read");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[1], USER_A),
+                expected_notification_update(&ids[2], USER_A),
+            ]),
+            "the already-read one is excluded by the `read = false` predicate, \
+             so it changed nothing and gets no entry"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_B).await,
+            vec![(b_ids[0].clone(), false, false)],
+            "the sweep is scoped to A by `user_id = $1`, so B's inbox is \
+             untouched — which is also what makes 'entries for the right rows' \
+             distinguishable from 'entries for every row'"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_mark_as_read_skips_the_requested_ids_that_were_already_read() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::mark_as_read(&db, &ids[0], USER_A, None)
+            .await
+            .expect("A reads the first one, and that commits");
+
+        let seeded = sync_entries(&db).await.len();
+
+        // All three ids are requested; only two of them can change.
+        crate::notification_service::bulk_mark_as_read(&db, &ids, USER_A, None)
+            .await
+            .expect("A bulk-marks all three read");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[1], USER_A),
+                expected_notification_update(&ids[2], USER_A),
+            ]),
+            "the entries must match the rows that changed, not the ids that \
+             were requested — an entry for the already-read one announces a \
+             change that did not happen"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_mark_as_unread_logs_entries_for_only_the_read_ones() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::bulk_mark_as_read(&db, &ids[..2], USER_A, None)
+            .await
+            .expect("A reads the first two");
+
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::bulk_mark_as_unread(&db, &ids, USER_A, None)
+            .await
+            .expect("A marks all three unread again");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[0], USER_A),
+                expected_notification_update(&ids[1], USER_A),
+            ]),
+            "the third was already unread, so the `read = true` predicate \
+             excluded it and it gets no entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_logs_update_entries_for_only_the_live_ones() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::bulk_delete_notifications(&db, &ids[..1], USER_A, None)
+            .await
+            .expect("A dismisses the first one");
+
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::bulk_delete_notifications(&db, &ids, USER_A, None)
+            .await
+            .expect("A dismisses all three");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[1], USER_A),
+                expected_notification_update(&ids[2], USER_A),
+            ]),
+            "the already-dismissed one is excluded by `deleted_at IS NULL`; and \
+             the action is `update`, because the row is still there — `delete` \
+             is what the cascade in `issue_service` uses when it destroys one"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_restore_logs_entries_for_only_the_deleted_ones() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::bulk_delete_notifications(&db, &ids[..2], USER_A, None)
+            .await
+            .expect("A dismisses the first two");
+
+        let seeded = sync_entries(&db).await.len();
+
+        crate::notification_service::bulk_restore_notifications(&db, &ids, USER_A, None)
+            .await
+            .expect("A restores all three");
+
+        assert_eq!(
+            entries_written_after(&db, seeded).await,
+            sorted(vec![
+                expected_notification_update(&ids[0], USER_A),
+                expected_notification_update(&ids[1], USER_A),
+            ]),
+            "the third was never dismissed, so `deleted_at IS NOT NULL` \
+             excluded it and it gets no entry"
+        );
+    }
+
+    // ── Audience isolation, both halves ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_read_state_never_reaches_another_members_delta() {
+        let db = two_user_workspace().await;
+        let a_ids = seed_notifications(&db, USER_A, 2).await;
+
+        crate::notification_service::mark_all_as_read(&db, USER_A, None)
+            .await
+            .expect("A reads their inbox");
+
+        let b_ids = delta_entity_ids(&db, USER_B, entity_types::NOTIFICATION).await;
+        for id in &a_ids {
+            assert!(
+                !b_ids.contains(id),
+                "B's delta carries A's notification {id}: {b_ids:?} — a read \
+                 state is as private as the notification it belongs to"
+            );
+        }
+
+        // The control: A's own delta does carry the read state, so the assertion
+        // above is about audience and not about the entries being missing
+        // outright.
+        //
+        // Filtered to `Update` deliberately, and not read through
+        // `delta_entity_ids`. `create_notification` writes an `Insert` entry for
+        // each of these same ids into the same delta, so an unfiltered control
+        // is satisfied by the fixture: with the `sync_log` write removed from
+        // `mark_all_as_read` entirely, the unfiltered form still passed. Only the
+        // `Update` entries are `mark_all_as_read`'s output.
+        let a_updates: Vec<String> = get_entries_since(&db, WS, USER_A, 0, 10_000)
+            .await
+            .expect("A's delta")
+            .into_iter()
+            .filter(|e| {
+                e.entity_type == entity_types::NOTIFICATION
+                    && matches!(e.action, SyncActionType::Update)
+            })
+            .map(|e| e.entity_id)
+            .collect();
+        for id in &a_ids {
+            assert!(
+                a_updates.contains(id),
+                "the scope must not over-restrict: A's own delta is missing the \
+                 read-state update for {id}: {a_updates:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_state_never_reaches_another_members_live_connection() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 1).await;
+
+        let manager = WebSocketManager::new(None, db.clone());
+        let mut a_conn = manager.connect(USER_A).expect("A connects");
+        let mut b_conn = manager.connect(USER_B).expect("B connects");
+        recv_soon(&mut a_conn.rx, "A's connect heartbeat").await;
+        recv_soon(&mut b_conn.rx, "B's connect heartbeat").await;
+
+        crate::notification_service::mark_as_read(&db, &ids[0], USER_A, Some(&manager))
+            .await
+            .expect("A reads it");
+
+        let action = next_sync_action(&mut a_conn, "A's own read state").await;
+        assert_eq!(
+            (action.entity_type.as_str(), action.entity_id.as_str()),
+            (entity_types::NOTIFICATION, ids[0].as_str()),
+            "A must receive the frame for their own read state"
+        );
+
+        // The persisted-side test above cannot see this: `visibility_user_id`
+        // could be set correctly on the row while the frame was still pushed
+        // workspace-wide. TRA-9950 established that one of the two is not enough.
+        assert!(
+            b_conn.rx.try_recv().is_err(),
+            "B received a live frame for A's read state — this is the TRA-9920 \
+             leak on the socket"
+        );
+    }
+
+    // ── Rollback ────────────────────────────────────────────────────────────
+    //
+    // All six use the *blanket* trigger, `reject_sync_log_inserts`.
+    //
+    // `reject_sync_log_inserts_for_entity_type` would not discriminate here:
+    // every entry these six write is `entity_types::NOTIFICATION`, so narrowing
+    // by type produces exactly the blanket trigger. What makes the blanket form
+    // correct is the ordering instead — the fixture (`seed_notifications`, and
+    // any prior state change) runs through the real services and *commits* its
+    // own entries before the trigger is installed, so the trigger only ever sees
+    // entries written by the function under test.
+    //
+    // That ordering is the whole point. TRA-9950 hit the opposite case in
+    // `notification_service::update_preference`, where `get_or_default_
+    // preferences` emits an `Insert` from an earlier transaction: a blanket
+    // trigger aborted that one, the test saw an error, and the code under test
+    // was never reached.
+
+    #[tokio::test]
+    async fn mark_as_read_rolls_back_when_its_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::mark_as_read(&db, &ids[0], USER_A, None)
+            .await
+            .expect_err("a mark-read whose sync entry cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure, not a swallowed \
+             warning; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "the read flag must unwind with the entry that would have carried \
+             it to the other tabs"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_all_as_read_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let _ids = seed_notifications(&db, USER_A, 3).await;
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::mark_all_as_read(&db, USER_A, None)
+            .await
+            .expect_err("a sweep whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "all three rows unwind together — the sweep is one transaction, so \
+             a partial sweep with no entries is not a reachable state"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_mark_as_read_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::bulk_mark_as_read(&db, &ids, USER_A, None)
+            .await
+            .expect_err("a bulk mark-read whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(notification_states(&db, USER_A).await, before);
+    }
+
+    #[tokio::test]
+    async fn bulk_mark_as_unread_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        // The prior state this test restores to, established and committed
+        // before the trigger exists.
+        crate::notification_service::bulk_mark_as_read(&db, &ids, USER_A, None)
+            .await
+            .expect("A reads all three");
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err = crate::notification_service::bulk_mark_as_unread(&db, &ids, USER_A, None)
+            .await
+            .expect_err("a bulk mark-unread whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "every row must still be read, exactly as it was before the call"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::notification_service::bulk_delete_notifications(&db, &ids, USER_A, None)
+                .await
+                .expect_err("a bulk delete whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "nothing may be left soft-deleted with no entry to announce it — \
+             the row would be hidden on the server and visible on every client"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_restore_rolls_back_when_a_sync_entry_cannot_be_written() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 3).await;
+
+        crate::notification_service::bulk_delete_notifications(&db, &ids, USER_A, None)
+            .await
+            .expect("A dismisses all three");
+        let before = notification_states(&db, USER_A).await;
+
+        reject_sync_log_inserts(&db).await;
+
+        let err =
+            crate::notification_service::bulk_restore_notifications(&db, &ids, USER_A, None)
+                .await
+                .expect_err("a bulk restore whose sync entries cannot be written must fail");
+        assert!(
+            err.to_string().contains("sync_log insert rejected"),
+            "the caller must see the sync entry failure; got: {err}"
+        );
+
+        assert_eq!(
+            notification_states(&db, USER_A).await,
+            before,
+            "every row must still be dismissed, exactly as it was before"
+        );
+    }
+
+    // ── The symptom ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reading_a_notification_in_one_tab_reaches_the_users_other_tab() {
+        let db = two_user_workspace().await;
+        let ids = seed_notifications(&db, USER_A, 1).await;
+
+        let manager = WebSocketManager::new(None, db.clone());
+        // Two sessions for one user: two browser tabs.
+        let mut tab_one = manager.connect(USER_A).expect("A's first tab connects");
+        let mut tab_two = manager.connect(USER_A).expect("A's second tab connects");
+
+        // `connect` delivers its heartbeat with `deliver_to_local_user`, which
+        // reaches every connection the user already has rather than only the new
+        // one. So the first tab has two queued — its own, then the second tab's
+        // — and the second tab has one.
+        recv_soon(&mut tab_one.rx, "the first tab's own connect heartbeat").await;
+        recv_soon(
+            &mut tab_one.rx,
+            "the heartbeat the second tab's connect sends to the first",
+        )
+        .await;
+        recv_soon(&mut tab_two.rx, "the second tab's connect heartbeat").await;
+
+        crate::notification_service::mark_as_read(&db, &ids[0], USER_A, Some(&manager))
+            .await
+            .expect("A reads the notification in the first tab");
+
+        // The other tab is told, and told the new *state* — not merely that
+        // something about the notification changed. `cache/apply.rs` upserts the
+        // payload wholesale, so a payload still saying `read: false` would leave
+        // the second tab showing it unread, which is the reported bug exactly.
+        let action =
+            next_sync_action(&mut tab_two, "the read state reaching the second tab").await;
+        let payload = payload_of(&action, entity_types::NOTIFICATION, &ids[0]);
+        assert_eq!(
+            payload.get("read").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the second tab must receive the notification marked read: {payload}"
+        );
+
+        // The tab that made the change hears it too, over its own connection.
+        let echoed =
+            next_sync_action(&mut tab_one, "the read state echoed to the first tab").await;
+        assert_eq!(
+            (echoed.entity_type.as_str(), echoed.entity_id.as_str()),
+            (entity_types::NOTIFICATION, ids[0].as_str())
+        );
+
+        // And a tab that was offline for the change replays it to the same
+        // state. This is the path that was broken outright before: with no entry
+        // written at all, no delta could carry the read state and only a full
+        // bootstrap corrected the stale tab.
+        let replayed: Vec<serde_json::Value> = get_entries_since(&db, WS, USER_A, 0, 10_000)
+            .await
+            .expect("A's delta")
+            .into_iter()
+            .filter(|e| e.entity_id == ids[0] && matches!(e.action, SyncActionType::Update))
+            .filter_map(|e| e.data)
+            .collect();
+
+        assert_eq!(
+            replayed.len(),
+            1,
+            "exactly one update entry for the one read: {replayed:?}"
+        );
+        assert_eq!(
+            replayed[0].get("read").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a reconnecting tab replays the same read state the live frame \
+             carried: {:?}",
+            replayed[0]
+        );
+    }
+
 }

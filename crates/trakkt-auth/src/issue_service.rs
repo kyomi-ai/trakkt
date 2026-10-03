@@ -10,7 +10,7 @@
 use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
-use trakkt_types::enums::ActionSource;
+use trakkt_types::enums::{ActionSource, FavoriteTarget};
 use trakkt_types::models::{CreateIssueParams, Issue, IssueFilters, IssueUpdate, IssueWithDetails, Label};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
@@ -406,7 +406,7 @@ pub async fn create_issue(
         entity_types::ISSUE,
         &issue_id,
         &params.workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Insert,
         payload.clone(),
     )
@@ -998,7 +998,7 @@ pub async fn update_issue(
         entity_types::ISSUE,
         &issue.issue_id,
         workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload.clone(),
     )
@@ -1022,7 +1022,7 @@ pub async fn update_issue(
             entity_types::ISSUE,
             &blocked_id,
             workspace_id,
-            None,
+            sync_log_service::SyncAudience::Workspace,
             SyncActionType::Update,
             data.clone(),
         )
@@ -1313,10 +1313,14 @@ pub async fn delete_issue(
     //
     // Deliberately not filtered on `deleted_at`. A soft-deleted notification is
     // still a row, still holds the foreign key, and so is still destroyed by the
-    // cascade — and a client that cached it before the soft-delete still holds
-    // it, because `notification_service::bulk_delete_notifications` writes no
-    // `sync_log` entry at all. Filtering here would leave exactly those rows
-    // stranded in the cache.
+    // cascade — and a client that cached it still holds it after the
+    // soft-delete, because `notification_service::bulk_delete_notifications`
+    // reports one as an `Update` carrying the stamped row, not a `Delete`. Only
+    // a `Delete` evicts: the update arm of `crates/trakkt-ui/src/cache/apply.rs`
+    // upserts the notification, and `remove_notification_in_memory` is reached
+    // from the delete arm alone. So the row is in the client's cache either way,
+    // and filtering here would strand exactly the soft-deleted ones there
+    // permanently.
     //
     // This is what the CASCADE added by
     // `20260803000000_notification_issue_cascade.sql` made necessary. Before it,
@@ -1363,12 +1367,21 @@ pub async fn delete_issue(
     //   two schemas disagree, and that disagreement is not this function's to
     //   fix.
     // * `issue_attachments` — same reasoning, and TRA-9966 made it hold whatever
-    //   TRA-9979 does. `attachment_service::attach_to_issue` records the link
-    //   with `None` and the bootstrap does not stream the type, so no junction
-    //   row is cached today; and `issue_attachment` is now on `NOT_CACHED` in
-    //   `cache/cached_types.rs`, so giving that insert a payload will not start
-    //   caching one either. This table therefore stays out of the list read
-    //   above rather than joining it later.
+    //   TRA-9979 did. `attachment_service::attach_to_issue` now sends the
+    //   junction row as its payload, but `issue_attachment` is on `NOT_CACHED`
+    //   in `cache/cached_types.rs` and the bootstrap does not stream the type,
+    //   so no junction row is cached and none ever was. This table therefore
+    //   stays out of the list read above rather than joining it later.
+
+    // `favorites` is the one cascaded type the database does not cascade at all:
+    // `target_id` is polymorphic TEXT with no foreign key to `issues` in either
+    // dialect, so the DELETE below leaves a favorite pinning this issue pointing
+    // at nothing (TRA-10025). Read here for the same reason as every id above —
+    // afterwards nothing connects the two — and removed by `delete_and_record`,
+    // which will not part the rows from the entries that evict them.
+    let doomed_favorites =
+        crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::Issue, &issue_id)
+            .await?;
 
     trakkt_core::tx_execute!(
         &mut tx,
@@ -1435,6 +1448,12 @@ pub async fn delete_issue(
             .await?;
     }
 
+    // Private per row, like the notifications above and for the same reason: a
+    // favorite is addressed to the member who pinned it, never to the workspace.
+    doomed_favorites
+        .delete_and_record(&mut tx, &mut batch)
+        .await?;
+
     batch.commit_and_deliver(tx, ws_manager).await
 }
 
@@ -1489,7 +1508,7 @@ pub async fn set_issue_labels(
         entity_types::ISSUE,
         issue_id,
         &ws_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload.clone(),
     )
@@ -1621,7 +1640,7 @@ pub async fn set_sort_order(
         entity_types::ISSUE,
         &issue_id,
         workspace_id,
-        None,
+        sync_log_service::SyncAudience::Workspace,
         SyncActionType::Update,
         payload.clone(),
     )

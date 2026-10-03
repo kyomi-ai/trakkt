@@ -199,6 +199,67 @@ fn build_groups(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// List interaction state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What the user has told the list to do: the three toolbar filters, the sort,
+/// and the grouping.
+///
+/// Created by `ProjectDetailPage` as part of `ProjectEditState` and passed in,
+/// not created in [`ProjectListView`]'s body. The reasoning is the same as for
+/// `BoardViewState` in `project_board.rs`: this component is built inside
+/// `ProjectDetailContent`'s `{move || active_view…}` child, which is itself
+/// inside `ProjectDetailPage`'s six-resource content closure, so any of those
+/// resources settling rebuilds it and replaces every signal declared in its
+/// body at its initial value.
+#[derive(Clone, Copy)]
+pub struct ListViewState {
+    search: RwSignal<String>,
+    priority_filter: RwSignal<Vec<String>>,
+    label_filter: RwSignal<Vec<String>>,
+    sort_field: RwSignal<SortField>,
+    sort_direction: RwSignal<SortDirection>,
+    group_by: RwSignal<GroupBy>,
+}
+
+impl ListViewState {
+    // The three non-empty starting values, named once each so [`Default`] and
+    // [`Self::reset`] cannot drift apart — a `reset` that put the list into a
+    // sort no freshly-opened list is ever in would be a bug nothing here would
+    // catch.
+    const DEFAULT_SORT_FIELD: SortField = SortField::Priority;
+    const DEFAULT_SORT_DIRECTION: SortDirection = SortDirection::Asc;
+    const DEFAULT_GROUP_BY: GroupBy = GroupBy::None;
+
+    /// Put every control back to the value it has on a list opened fresh.
+    ///
+    /// Called from `ProjectEditState::reset`, i.e. when the router moves this
+    /// page to a different project — otherwise a grouping or filter chosen on
+    /// one project would still be in force on the next.
+    pub fn reset(&self) {
+        self.search.set(String::new());
+        self.priority_filter.set(Vec::new());
+        self.label_filter.set(Vec::new());
+        self.sort_field.set(Self::DEFAULT_SORT_FIELD);
+        self.sort_direction.set(Self::DEFAULT_SORT_DIRECTION);
+        self.group_by.set(Self::DEFAULT_GROUP_BY);
+    }
+}
+
+impl Default for ListViewState {
+    fn default() -> Self {
+        Self {
+            search: RwSignal::new(String::new()),
+            priority_filter: RwSignal::new(Vec::new()),
+            label_filter: RwSignal::new(Vec::new()),
+            sort_field: RwSignal::new(Self::DEFAULT_SORT_FIELD),
+            sort_direction: RwSignal::new(Self::DEFAULT_SORT_DIRECTION),
+            group_by: RwSignal::new(Self::DEFAULT_GROUP_BY),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Project List View
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -210,7 +271,19 @@ pub fn ProjectListView(
     /// Project milestones — used for milestone grouping.
     #[prop(into)]
     milestones: Signal<Vec<ProjectMilestone>>,
+    /// Filter, sort and grouping selections, owned by `ProjectDetailPage` so
+    /// they survive this component being reconstructed. See [`ListViewState`].
+    state: ListViewState,
 ) -> impl IntoView {
+    let ListViewState {
+        search,
+        priority_filter,
+        label_filter,
+        sort_field,
+        sort_direction,
+        group_by,
+    } = state;
+
     let sync_store = use_context::<crate::cache::store::SyncStore>();
 
     // ── Data: issues for this project ────────────────────────────────────
@@ -229,18 +302,6 @@ pub fn ProjectListView(
             .filter(|issue| issue.project_id.as_deref() == Some(&pid))
             .collect::<Vec<_>>()
     });
-
-    // ── Filter state ─────────────────────────────────────────────────────
-    let (search, set_search) = signal(String::new());
-    let (priority_filter, set_priority_filter) = signal(Vec::<String>::new());
-    let (label_filter, set_label_filter) = signal(Vec::<String>::new());
-
-    // ── Sort state ───────────────────────────────────────────────────────
-    let (sort_field, set_sort_field) = signal(SortField::Priority);
-    let (sort_direction, set_sort_direction) = signal(SortDirection::Asc);
-
-    // ── Group-by state ───────────────────────────────────────────────────
-    let (group_by, set_group_by) = signal(GroupBy::None);
 
     // ── Computed: filtered + sorted issues ───────────────────────────────
     let display_issues = Memo::new(move |_| {
@@ -281,30 +342,30 @@ pub fn ProjectListView(
             // ── Toolbar ─────────────────────────────────────────────────
             <div class="bg-background px-5 py-2 flex items-center gap-3 shrink-0 flex-wrap">
                 <SearchInput
-                    value=Signal::derive(move || search.get())
-                    on_input=Callback::new(move |v: String| set_search.set(v))
+                    value=search
+                    on_input=Callback::new(move |v: String| search.set(v))
                     placeholder="Filter issues..."
                     class="flex-1 max-w-sm"
                 />
                 <PriorityFilterDropdown
                     value=priority_filter
-                    on_change=Callback::new(move |v: Vec<String>| set_priority_filter.set(v))
+                    on_change=Callback::new(move |v: Vec<String>| priority_filter.set(v))
                 />
                 <LabelFilterDropdown
                     value=label_filter
-                    on_change=Callback::new(move |v: Vec<String>| set_label_filter.set(v))
+                    on_change=Callback::new(move |v: Vec<String>| label_filter.set(v))
                 />
                 <SortDropdown
                     field=sort_field
                     direction=sort_direction
                     on_change=Callback::new(move |(f, d): (SortField, SortDirection)| {
-                        set_sort_field.set(f);
-                        set_sort_direction.set(d);
+                        sort_field.set(f);
+                        sort_direction.set(d);
                     })
                 />
                 <GroupByDropdown
                     value=group_by
-                    on_change=Callback::new(move |v: GroupBy| set_group_by.set(v))
+                    on_change=Callback::new(move |v: GroupBy| group_by.set(v))
                 />
             </div>
 
