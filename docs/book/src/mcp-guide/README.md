@@ -1,6 +1,6 @@
 # MCP Server
 
-Trakkt includes a built-in [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that lets AI agents interact with your issue tracker programmatically. The MCP server exposes the same 36 operations as the [REST API](../api-reference/README.md), so agents have full access to create issues, update statuses, search, and more.
+Trakkt includes a built-in [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that lets AI agents interact with your issue tracker programmatically. The MCP server exposes the same 36 operations as the [REST API](../api-reference/index.html), so agents have full access to create issues, update statuses, search, and more.
 
 ## Quick Start
 
