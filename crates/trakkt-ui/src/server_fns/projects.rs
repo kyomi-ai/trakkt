@@ -97,9 +97,45 @@ pub async fn update_project(
         lead_id: opt_clear(lead_id),
         start_date: opt_clear(start_date),
         target_date: opt_clear(target_date),
+        archived_at: None,
     };
     let result = trakkt_api::projects::update_project(&ctx, params).await.into_sfn()?;
     serde_json::from_value(result).into_sfn()
+}
+
+/// Archive or unarchive a project.
+///
+/// When `archive` is `true`, sets `archived_at` to the current timestamp.
+/// When `false`, clears `archived_at` (unarchive).
+#[server(prefix = "/leptos-api")]
+pub async fn archive_project(
+    project_id: String,
+    archive: bool,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let ctx = ac.api_ctx();
+
+    let archived_at_value = if archive {
+        Some(Some(chrono::Utc::now().to_rfc3339()))
+    } else {
+        Some(None)
+    };
+    let update_params = trakkt_types::api::UpdateProjectApiParams {
+        project_id: Some(project_id),
+        name: None,
+        description: None,
+        icon: None,
+        color: None,
+        status: None,
+        lead_id: None,
+        start_date: None,
+        target_date: None,
+        archived_at: archived_at_value,
+    };
+    trakkt_api::projects::update_project(&ctx, update_params)
+        .await
+        .into_sfn()?;
+    Ok(())
 }
 
 /// Delete a project by its ID.
@@ -285,6 +321,16 @@ pub async fn get_project_progress(
 // ─── Helpers (server-only) ─────────────────────────────────────────────────
 
 /// Verify that a project belongs to the user's current workspace.
+///
+/// This **authorizes**: the `project_id` arrives from the browser, and the
+/// answer decides whether the caller's operation proceeds.
+///
+/// It reaches for the unscoped `project_service::get_project` and does the
+/// workspace comparison itself, rather than calling
+/// `project_service::get_project_in_workspace`, so that both the missing and
+/// the foreign case surface the same `"Project not found"` string to the
+/// client — a server-fn error message that names no project id. The comparison
+/// below is load-bearing; dropping it turns this into a plain fetch.
 #[cfg(feature = "ssr")]
 async fn verify_project_ownership(
     db: &trakkt_core::DbPool,

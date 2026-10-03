@@ -68,6 +68,8 @@ pub async fn add_relation(
         &target_issue.issue_id,
         &params.relation_type,
         Some(&ctx.user_id),
+        ctx.action_source,
+        ctx.action_source_label.as_deref(),
         ctx.ws_manager,
     )
     .await?;

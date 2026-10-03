@@ -22,7 +22,7 @@ use leptos_router::hooks::{use_location, use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
+    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CopyLinkButton,
     DatePicker, DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
     LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Select, SelectVariant, Skeleton,
@@ -39,8 +39,10 @@ use crate::server_fns::projects::list_milestones;
 use crate::server_fns::relations::{add_relation, list_issue_relations, remove_relation};
 use crate::server_fns::statuses::list_statuses;
 use crate::server_fns::team::list_workspace_members;
+use crate::server_fns::stars::{is_starred, star_issue, unstar_issue};
 use crate::server_fns::watchers::{is_watching, watch_issue, unwatch_issue};
 use crate::types::{IssueNavState, WorkspaceMember};
+use crate::utils::github::github_author_login_from_metadata;
 use crate::utils::relative_time::{format_datetime, relative_time};
 use trakkt_types::models::{Comment, IssueActivity, IssueWithDetails};
 #[cfg(target_arch = "wasm32")]
@@ -50,56 +52,7 @@ use leptos::task::spawn_local;
 // Shared kode theme builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a kode `Theme` matching Trakkt's design system (warm light palette).
-///
-/// Since kode's `Theme` is `#[non_exhaustive]`, we start from `Theme::light()`
-/// and override the fields we need.
-pub(crate) fn trakkt_kode_theme() -> kode_leptos::Theme {
-    let mut t = kode_leptos::Theme::light();
-    // Colors use CSS var() references so they follow Trakkt's light/dark
-    // mode automatically. The actual values live in main.css :root block
-    // which maps --kode-* vars to --color-* design tokens.
-    t.bg = "var(--color-card)";
-    t.fg = "var(--color-foreground)";
-    t.fg_bright = "var(--color-foreground)";
-    t.fg_dim = "var(--color-muted-foreground)";
-    t.cursor = "var(--color-foreground)";
-    t.selection = "rgba(13, 148, 136, 0.15)";
-    t.current_line = "transparent";
-    t.gutter_fg = "var(--color-muted-foreground)";
-    t.gutter_border = "var(--color-border)";
-    t.border = "var(--color-border)";
-    t.accent = "var(--color-primary)";
-    t.bg_highlight = "var(--color-accent)";
-    t.bg_hover = "var(--color-accent)";
-    t.marker_error = "#DC2626";
-    t.marker_warning = "#CA8A04";
-    t.marker_info = "#2563EB";
-    t.marker_hint = "var(--color-muted-foreground)";
-    t.code_fg = "var(--color-primary)";
-    t.link = "var(--color-primary)";
-    t.syntax = kode_leptos::SyntaxTheme::GithubLight;
-    // Typography — DESIGN.md fonts
-    t.content_font_family = Some("'DM Sans', sans-serif");
-    t.heading_font_family = Some("'Instrument Serif', serif");
-    t.code_font_family = Some("'Geist Mono', monospace");
-    t.font_family = Some("'Geist Mono', monospace");
-    // Content layout
-    t.content_max_width = Some("100%");
-    t.container_padding = Some("0");
-    // Toolbar styling — also uses CSS vars for dark mode
-    t.toolbar_bg = Some("var(--color-card)");
-    t.toolbar_border_color = Some("var(--color-border)");
-    t.toolbar_button_border_radius = Some("6px");
-    t.toolbar_button_hover_bg = Some("var(--color-accent)");
-    t.toolbar_button_selected_bg = Some("var(--color-primary)");
-    t.toolbar_button_selected_color = Some("#FFFFFF");
-    // Heading styling
-    t.heading_font_weight = Some("600");
-    t.h1_border_width = Some("0");
-    t.h2_border_width = Some("0");
-    t
-}
+pub(crate) use crate::components::description::trakkt_kode_theme;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue Detail Page
@@ -151,6 +104,16 @@ pub fn IssueDetailPage() -> impl IntoView {
         server_issue.get()
     });
 
+    let copy_path = Signal::derive(move || {
+        let issue = issue_data.get()?.ok()??;
+        crate::components::copy_link::issue_link_path(
+            &team_key.get(),
+            number.get(),
+            &issue.team_key,
+            issue.number,
+        )
+    });
+
     // Only tracks load-state transitions (Loading → Loaded, etc.),
     // not SyncStore data changes. Prevents IssueDetailContent from being
     // recreated on every WebSocket update.
@@ -193,7 +156,7 @@ pub fn IssueDetailPage() -> impl IntoView {
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Header ─────────────────────────────────────────────────────
-            <div class="page-header h-14 px-5 flex items-center gap-3 shrink-0">
+            <div class="page-header min-h-14 px-5 py-2 flex flex-wrap items-center gap-3 shrink-0">
                 <Button
                     variant=ButtonVariant::GhostMuted
                     size=ButtonSize::IconSm
@@ -221,6 +184,7 @@ pub fn IssueDetailPage() -> impl IntoView {
                 >
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>
                 </Button>
+                <CopyLinkButton path=copy_path/>
                 <span class="font-mono text-sm text-muted-foreground">
                     {move || format!("{}-{}", team_key.get(), number.get())}
                 </span>
@@ -333,7 +297,11 @@ fn IssueDetailContent(
         let cv = sync_store.map(|s| s.comments_version());
 
         Effect::new(move || {
-            if let Some(cv) = cv {
+            // Borrowed, not bound by value: `comments_version` returns an
+            // `ArcSignal<u32>` (`Clone`, not `Copy`), so `if let Some(cv) = cv`
+            // would move out of the capture and leave this `FnOnce`. The `get()`
+            // is what subscribes the effect, on every run, as before.
+            if let Some(cv) = &cv {
                 let _ = cv.get();
             }
             let iid = issue_id.clone();
@@ -847,9 +815,30 @@ fn MetadataSidebar(
     let milestone_trigger_ref = NodeRef::<leptos::html::Div>::new();
     let (milestone_search, set_milestone_search) = signal(String::new());
 
-    // Milestones: reactive resource that refetches when project_id changes
+    // Milestones: refetched when the issue's project changes, and when another
+    // client creates, renames or re-dates one. The list is read straight from
+    // the server function rather than the SyncStore, so `milestones_version` —
+    // bumped by every project_milestone sync action — is the only thing that
+    // can tell this dropdown its names and dates went stale.
+    //
+    // Resolved once here and moved into the effect. Same shape as `ws_version`
+    // in `AttachmentsSection`.
+    let milestones_version = sync_store.map(|s| s.milestones_version());
     let milestones = RwSignal::new(Vec::<trakkt_types::models::ProjectMilestone>::new());
     Effect::new(move || {
+        // Read unconditionally so the subscription is established on every run
+        // regardless of which branch is taken, not just on runs where the issue
+        // happens to have a project. Reading it inside the branch would pick the
+        // dependency up later and less predictably; this keeps the effect's
+        // dependency set stable instead of varying with the data.
+        //
+        // Borrowed rather than bound by value: `milestones_version` is an
+        // `ArcSignal<u32>` (`Clone`, not `Copy`), so binding it would move out
+        // of the capture. `track()` still runs on every effect run, which is
+        // what "unconditionally" above is claiming.
+        if let Some(v) = &milestones_version {
+            v.track();
+        }
         let pid = project_id.get();
         if let Some(pid) = pid {
             leptos::task::spawn_local(async move {
@@ -1328,6 +1317,9 @@ fn MetadataSidebar(
             // ── Watch toggle ──────────────────────────────────────────────
             <WatchToggle team_key=stored_tk.get_value() number=stored_number/>
 
+            // ── Star toggle ──────────────────────────────────────────────
+            <StarToggle team_key=stored_tk.get_value() number=stored_number/>
+
             // ── Team ──────────────────────────────────────────────────────
             <div>
                 <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Team"</div>
@@ -1403,6 +1395,79 @@ fn WatchToggle(team_key: String, number: i32) -> impl IntoView {
                     {move || {
                         let w = watching_resource.get().and_then(|r| r.ok()).unwrap_or(false);
                         if w { "Watching" } else { "Watch" }
+                    }}
+                </span>
+            </button>
+        </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Star Toggle
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Star icon button that toggles star/unstar state for an issue.
+#[component]
+fn StarToggle(team_key: String, number: i32) -> impl IntoView {
+    let tk = team_key.clone();
+    let (version, set_version) = signal(0u32);
+    let starred_resource = Resource::new(
+        move || (tk.clone(), number, version.get()),
+        move |(tk, num, _)| async move { is_starred(tk, num).await },
+    );
+
+    let (loading, set_loading) = signal(false);
+
+    let toggle = move |_| {
+        if loading.get_untracked() {
+            return;
+        }
+        let currently_starred = starred_resource
+            .get()
+            .and_then(|r| r.ok())
+            .unwrap_or(false);
+
+        set_loading.set(true);
+        let tk = team_key.clone();
+        leptos::task::spawn_local(async move {
+            let result = if currently_starred {
+                unstar_issue(tk, number).await
+            } else {
+                star_issue(tk, number).await
+            };
+            if let Err(e) = result {
+                tracing::warn!("Failed to toggle star: {e}");
+            }
+            // Guard: component may have been destroyed while the future was in flight.
+            let _ = set_loading.try_set(false);
+            let _ = set_version.try_update(|v| *v += 1);
+        });
+    };
+
+    view! {
+        <div>
+            <div class="text-xs text-muted-foreground font-medium uppercase tracking-wide mb-1.5">"Star"</div>
+            <button
+                class="flex items-center gap-1.5 px-2 py-1 rounded text-sm text-muted-foreground hover:text-foreground hover:bg-surface-alt transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                on:click=toggle
+                disabled=move || loading.get()
+                title=move || {
+                    let s = starred_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                    if s { "Unstar this issue" } else { "Star this issue" }
+                }
+            >
+                {move || {
+                    let s = starred_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                    if s {
+                        view! { <span class="text-warning-foreground"><Icon icon=phosphor_leptos::STAR weight=phosphor_leptos::IconWeight::Fill size="16px"/></span> }.into_any()
+                    } else {
+                        view! { <Icon icon=phosphor_leptos::STAR weight=phosphor_leptos::IconWeight::Light size="16px"/> }.into_any()
+                    }
+                }}
+                <span class="text-xs">
+                    {move || {
+                        let s = starred_resource.get().and_then(|r| r.ok()).unwrap_or(false);
+                        if s { "Starred" } else { "Star" }
                     }}
                 </span>
             </button>
@@ -1599,7 +1664,7 @@ fn DescriptionEditor(
     /// Issue ID for auto-linking inline uploads to this issue.
     issue_id: String,
 ) -> impl IntoView {
-    use kode_leptos::TreeWysiwygEditor;
+    use crate::components::description::MarkdownDescription;
 
     let latest_text = RwSignal::new(String::new());
     let edit_version = RwSignal::new(0u32);
@@ -1812,19 +1877,6 @@ fn DescriptionEditor(
         }
     };
 
-    let theme_state = use_context::<crate::components::theme::ThemeState>();
-    let theme_signal = Signal::derive(move || {
-        let mut theme = trakkt_kode_theme();
-        theme.content_padding = Some("0");
-        theme.bg = "var(--color-background)";
-        if let Some(ts) = theme_state
-            && ts.effective.get() == "dark"
-        {
-            theme.syntax = kode_leptos::SyntaxTheme::OneDark;
-        }
-        theme
-    });
-
     view! {
         <div class="mt-6" style="min-height: 120px;">
             // Hidden file input for the "Attach file" slash command extension
@@ -1835,12 +1887,9 @@ fn DescriptionEditor(
                 accept=".png,.jpg,.jpeg,.gif,.webp,.svg,.pdf,.csv,.txt,.json,.log"
                 on:change=on_attach_file_selected
             />
-            <TreeWysiwygEditor
+            <MarkdownDescription
                 content=auto_linked_content
                 on_change=on_change
-                show_fixed_toolbar=false
-                show_floating_toolbar=true
-                theme=theme_signal
                 on_upload=on_upload
                 on_delete_attachment=on_delete
                 on_click_attachment=on_click
@@ -1879,11 +1928,22 @@ fn RelationsSection(
     let tk = team_key.clone();
     let (version, set_version) = signal(0u32);
     let sync_store = use_context::<crate::cache::store::SyncStore>();
-    let ws_version = Signal::derive(move || {
-        sync_store.map(|s| s.relations_version().get()).unwrap_or(0)
-    });
+    // `version` covers this tab's own adds and removes. The store counter covers
+    // everyone else's: an issue_relation frame bumps it.
+    //
+    // Resolved once here and moved into the source closure, which borrows it
+    // with `as_ref` because `relations_version` returns an `ArcSignal<u32>`
+    // (`Clone`, not `Copy`). Same shape as `ws_version` in `AttachmentsSection`.
+    let ws_version = sync_store.map(|s| s.relations_version());
     let relations_resource = Resource::new(
-        move || (tk.clone(), number, version.get(), ws_version.get()),
+        move || {
+            (
+                tk.clone(),
+                number,
+                version.get(),
+                ws_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
         move |(tk, num, _, _)| async move { list_issue_relations(tk, num).await },
     );
 
@@ -2263,15 +2323,23 @@ fn IssueTimeline(
     let sync_store = use_context::<crate::cache::store::SyncStore>();
     let (filter, set_filter) = signal(TimelineFilter::All);
 
-    // Activities version from SyncStore — bumps on WebSocket activity events
-    let activities_version = Signal::derive(move || {
-        sync_store.map(|s| s.activities_version().get()).unwrap_or(0)
-    });
+    // Activities version from SyncStore — bumps on WebSocket activity events.
+    //
+    // Resolved once here and moved into the source closure, which borrows it
+    // with `as_ref` because `activities_version` returns an `ArcSignal<u32>`
+    // (`Clone`, not `Copy`). Same shape as `ws_version` in `AttachmentsSection`.
+    let activities_version = sync_store.map(|s| s.activities_version());
 
     // Fetch activities reactively, re-fetching when version bumps
     let tk = team_key.clone();
     let activities_resource = Resource::new(
-        move || (tk.clone(), number, activities_version.get()),
+        move || {
+            (
+                tk.clone(),
+                number,
+                activities_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
         move |(tk, num, _version)| async move {
             list_issue_activities(tk, num).await
         },
@@ -2426,8 +2494,7 @@ fn IssueTimeline(
                                 }.into_any()
                             }
                             TimelineEntry::Activity(activity) => {
-                                let name = activity.actor_name.clone()
-                                    .unwrap_or_else(|| "Someone".to_string());
+                                let name = activity_actor_display(&activity);
                                 view! {
                                     <ActivityEntry
                                         activity=activity
@@ -2477,6 +2544,21 @@ fn ActivityEntry(
     }
 }
 
+/// Determine the display name for an activity's actor.
+///
+/// Prefers the resolved Trakkt user name. For GitHub-sourced activities (which
+/// frequently have no matching Trakkt user) it falls back to the `author_login`
+/// stored in the activity metadata, rendered as `@login`. Finally falls back to
+/// `"Someone"`.
+fn activity_actor_display(activity: &IssueActivity) -> String {
+    if let Some(name) = activity.actor_name.clone() {
+        return name;
+    }
+
+    github_author_login_from_metadata(activity.metadata.as_deref())
+        .unwrap_or_else(|| "Someone".to_string())
+}
+
 /// Map activity action_type to a phosphor icon view.
 fn activity_icon(action_type: &str) -> leptos::prelude::AnyView {
     match action_type {
@@ -2494,6 +2576,11 @@ fn activity_icon(action_type: &str) -> leptos::prelude::AnyView {
         "parent_changed" => view! { <Icon icon=phosphor_leptos::TREE_STRUCTURE size="14px"/> }.into_any(),
         "moved_to_team" => view! { <Icon icon=phosphor_leptos::ARROWS_LEFT_RIGHT size="14px"/> }.into_any(),
         "estimate_changed" => view! { <Icon icon=phosphor_leptos::GAUGE size="14px"/> }.into_any(),
+        "commit_pushed" => view! { <Icon icon=phosphor_leptos::GIT_COMMIT size="14px"/> }.into_any(),
+        "pr_opened" => view! { <Icon icon=phosphor_leptos::GIT_PULL_REQUEST size="14px"/> }.into_any(),
+        "pr_merged" => view! { <Icon icon=phosphor_leptos::GIT_MERGE size="14px"/> }.into_any(),
+        "pr_closed" => view! { <Icon icon=phosphor_leptos::GIT_PULL_REQUEST size="14px"/> }.into_any(),
+        "branch_created" => view! { <Icon icon=phosphor_leptos::GIT_BRANCH size="14px"/> }.into_any(),
         _ => view! { <Icon icon=phosphor_leptos::CLOCK_COUNTER_CLOCKWISE size="14px"/> }.into_any(),
     }
 }
@@ -2575,11 +2662,149 @@ fn format_activity_description(activity: &IssueActivity) -> leptos::prelude::Any
             }
             view! { <span>"removed a relation"</span> }.into_any()
         }
+        "commit_pushed" | "pr_opened" | "pr_merged" | "pr_closed" | "branch_created" => {
+            format_github_activity_description(activity)
+        }
         _ => {
             let text = format_activity_text(activity);
             auto_link_view(&text)
         }
     }
+}
+
+/// CSS classes for an external GitHub link rendered inside an activity row.
+const GITHUB_ACTIVITY_LINK_CLASS: &str = "text-accent-foreground hover:underline font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm";
+
+/// Render the description for a GitHub-sourced activity (commit/PR/branch).
+///
+/// Parses the activity metadata to build a compact, single-line description
+/// with a clickable external link to GitHub. Falls back to a plain message
+/// (and a warning) when metadata is missing or malformed.
+fn format_github_activity_description(activity: &IssueActivity) -> leptos::prelude::AnyView {
+    let meta = match activity.metadata {
+        Some(ref meta_str) => match serde_json::from_str::<serde_json::Value>(meta_str) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!(error = %e, action_type = %activity.action_type, "Failed to parse GitHub activity metadata");
+                return github_activity_fallback(&activity.action_type);
+            }
+        },
+        None => {
+            tracing::warn!(action_type = %activity.action_type, "GitHub activity missing metadata");
+            return github_activity_fallback(&activity.action_type);
+        }
+    };
+
+    let url = meta.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    match activity.action_type.as_str() {
+        "commit_pushed" => {
+            // commit_count is a reasonable-to-default field; a single commit is
+            // the sensible fallback when it is absent.
+            let commit_count = meta.get("commit_count").and_then(|v| v.as_i64()).unwrap_or(1);
+
+            // commit_sha provides the anchor text; an empty sha would render a
+            // broken empty link, so a missing/empty sha forces the plain-text
+            // fallback below alongside a missing url.
+            let short_sha = meta
+                .get("commit_sha")
+                .and_then(|v| v.as_str())
+                .filter(|sha| !sha.is_empty())
+                .map(|sha| sha[..7.min(sha.len())].to_string());
+
+            let commit_message = meta
+                .get("commit_message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let branch = meta.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            match (url, short_sha) {
+                (Some(url), Some(short_sha)) if commit_count > 1 => view! {
+                    <span>
+                        {format!("pushed {commit_count} commits to {branch} \u{2014} ")}
+                        <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{short_sha}</a>
+                        {format!(" {commit_message}")}
+                    </span>
+                }
+                .into_any(),
+                (Some(url), Some(short_sha)) => view! {
+                    <span>
+                        "pushed commit "
+                        <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{short_sha}</a>
+                        {format!(" {commit_message}")}
+                    </span>
+                }
+                .into_any(),
+                _ => {
+                    tracing::warn!("commit_pushed activity missing url or commit_sha");
+                    github_activity_fallback("commit_pushed")
+                }
+            }
+        }
+        "pr_opened" | "pr_merged" | "pr_closed" => {
+            let pr_number = meta.get("pr_number").and_then(|v| v.as_i64());
+            let pr_title = meta
+                .get("pr_title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let verb = match activity.action_type.as_str() {
+                "pr_opened" => "opened",
+                "pr_merged" => "merged",
+                _ => "closed",
+            };
+            match (url, pr_number) {
+                (Some(url), Some(pr_number)) => {
+                    let link_text = format!("#{pr_number}: {pr_title}");
+                    view! {
+                        <span>
+                            {format!("{verb} PR ")}
+                            <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{link_text}</a>
+                        </span>
+                    }
+                    .into_any()
+                }
+                _ => {
+                    tracing::warn!(action_type = %activity.action_type, "PR activity missing url or pr_number");
+                    github_activity_fallback(&activity.action_type)
+                }
+            }
+        }
+        "branch_created" => {
+            let branch = meta.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            match url {
+                Some(url) => view! {
+                    <span>
+                        "created branch "
+                        <a href=url target="_blank" rel="noopener noreferrer" class=GITHUB_ACTIVITY_LINK_CLASS>{branch}</a>
+                    </span>
+                }
+                .into_any(),
+                None => {
+                    tracing::warn!("branch_created activity missing url");
+                    github_activity_fallback("branch_created")
+                }
+            }
+        }
+        other => {
+            tracing::warn!(action_type = %other, "Unexpected GitHub activity type");
+            github_activity_fallback(other)
+        }
+    }
+}
+
+/// Plain-text fallback description for a GitHub activity with bad metadata.
+fn github_activity_fallback(action_type: &str) -> leptos::prelude::AnyView {
+    let text = match action_type {
+        "commit_pushed" => "pushed a commit",
+        "pr_opened" => "opened a pull request",
+        "pr_merged" => "merged a pull request",
+        "pr_closed" => "closed a pull request",
+        "branch_created" => "created a branch",
+        _ => "performed a GitHub action",
+    };
+    view! { <span>{text}</span> }.into_any()
 }
 
 /// Build the plain-text description for non-relation activity types.
@@ -3047,9 +3272,28 @@ fn AttachmentsSection(
     let tk_for_detach = team_key.clone();
     let (version, set_version) = signal(0u32);
 
+    // `version` covers this tab's own uploads and detaches. The store counter
+    // covers everyone else's: an attachment/issue_attachment frame bumps it, and
+    // without it a file added or removed elsewhere never appears here.
+    //
+    // Resolved once here and moved into the source closure. The `as_ref` is
+    // because `attachments_version` returns an `ArcSignal<u32>`, which is
+    // `Clone` and not `Copy` (see the getter notes on `SyncStore`): `Option::map`
+    // would consume the capture and leave this closure `FnOnce`. The `get()`
+    // inside is what tracks, unchanged. Same shape as `comments_version` above.
+    let sync_store = use_context::<crate::cache::store::SyncStore>();
+    let ws_version = sync_store.map(|s| s.attachments_version());
+
     let attachments_resource = Resource::new(
-        move || (tk.clone(), number, version.get()),
-        move |(tk, num, _)| async move { list_issue_attachments(tk, num).await },
+        move || {
+            (
+                tk.clone(),
+                number,
+                version.get(),
+                ws_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
+        move |(tk, num, _, _)| async move { list_issue_attachments(tk, num).await },
     );
 
     // ── Upload via hidden file input ────────────────────────────────────

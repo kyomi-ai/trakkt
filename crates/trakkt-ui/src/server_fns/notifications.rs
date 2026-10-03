@@ -6,7 +6,7 @@
 //! call service, return.
 
 use leptos::prelude::*;
-use trakkt_types::models::Notification;
+use trakkt_types::models::{Notification, NotificationPreferences};
 
 // Helpers — delegate to shared extractors in parent module
 #[cfg(feature = "ssr")]
@@ -25,6 +25,8 @@ pub async fn list_notifications(
     notification_type: Option<String>,
     team_key: Option<String>,
     search: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 ) -> Result<Vec<Notification>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let notifications = trakkt_auth::notification_service::list_notifications(
@@ -35,10 +37,36 @@ pub async fn list_notifications(
         notification_type.as_deref(),
         team_key.as_deref(),
         search.as_deref(),
+        limit.unwrap_or(trakkt_auth::notification_service::DEFAULT_NOTIFICATION_LIMIT),
+        offset.unwrap_or(0),
     )
     .await
     .into_sfn()?;
     Ok(notifications)
+}
+
+/// Count notifications matching the given filters (for pagination).
+#[server(prefix = "/leptos-api")]
+pub async fn count_notifications(
+    unread_only: bool,
+    deleted_only: Option<bool>,
+    notification_type: Option<String>,
+    team_key: Option<String>,
+    search: Option<String>,
+) -> Result<i64, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let count = trakkt_auth::notification_service::count_notifications(
+        ac.db(),
+        &ac.auth.user_id,
+        unread_only,
+        deleted_only.unwrap_or(false),
+        notification_type.as_deref(),
+        team_key.as_deref(),
+        search.as_deref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(count)
 }
 
 /// Count unread notifications for the current user.
@@ -57,9 +85,14 @@ pub async fn count_unread_notifications() -> Result<i64, ServerFnError> {
 #[server(prefix = "/leptos-api")]
 pub async fn mark_notification_read(notification_id: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    trakkt_auth::notification_service::mark_as_read(ac.db(), &notification_id, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::mark_as_read(
+        ac.db(),
+        &notification_id,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -67,9 +100,13 @@ pub async fn mark_notification_read(notification_id: String) -> Result<(), Serve
 #[server(prefix = "/leptos-api")]
 pub async fn mark_all_notifications_read() -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    trakkt_auth::notification_service::mark_all_as_read(ac.db(), &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::mark_all_as_read(
+        ac.db(),
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -98,9 +135,14 @@ fn parse_notification_ids(raw: &str) -> Result<Vec<String>, ServerFnError> {
 pub async fn bulk_mark_notifications_read(notification_ids: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let ids = parse_notification_ids(&notification_ids)?;
-    trakkt_auth::notification_service::bulk_mark_as_read(ac.db(), &ids, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::bulk_mark_as_read(
+        ac.db(),
+        &ids,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -111,9 +153,14 @@ pub async fn bulk_mark_notifications_read(notification_ids: String) -> Result<()
 pub async fn bulk_mark_notifications_unread(notification_ids: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let ids = parse_notification_ids(&notification_ids)?;
-    trakkt_auth::notification_service::bulk_mark_as_unread(ac.db(), &ids, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::bulk_mark_as_unread(
+        ac.db(),
+        &ids,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -124,9 +171,14 @@ pub async fn bulk_mark_notifications_unread(notification_ids: String) -> Result<
 pub async fn bulk_delete_notifications(notification_ids: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let ids = parse_notification_ids(&notification_ids)?;
-    trakkt_auth::notification_service::bulk_delete_notifications(ac.db(), &ids, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::bulk_delete_notifications(
+        ac.db(),
+        &ids,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -137,8 +189,50 @@ pub async fn bulk_delete_notifications(notification_ids: String) -> Result<(), S
 pub async fn bulk_restore_notifications(notification_ids: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let ids = parse_notification_ids(&notification_ids)?;
-    trakkt_auth::notification_service::bulk_restore_notifications(ac.db(), &ids, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::bulk_restore_notifications(
+        ac.db(),
+        &ids,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
+}
+
+// ─── Notification Preferences ─────────────────────────────────────────────
+
+/// Get notification preferences for the current user in the active workspace.
+#[server(prefix = "/leptos-api")]
+pub async fn get_notification_preferences() -> Result<NotificationPreferences, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let prefs = trakkt_auth::notification_service::get_or_default_preferences(
+        ac.db(),
+        &ac.auth.user_id,
+        &ac.ws_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(prefs)
+}
+
+/// Update a single notification preference field.
+#[server(prefix = "/leptos-api")]
+pub async fn update_notification_preference(
+    field: String,
+    value: bool,
+) -> Result<NotificationPreferences, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    let prefs = trakkt_auth::notification_service::update_preference(
+        ac.db(),
+        &ac.auth.user_id,
+        &ac.ws_id,
+        &field,
+        value,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
+    Ok(prefs)
 }

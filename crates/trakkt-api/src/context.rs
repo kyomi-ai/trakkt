@@ -21,7 +21,11 @@ pub fn parse_issue_identifier(identifier: &str) -> Option<(String, i32)> {
 
 /// Resolve a team to its `team_id` using either a direct ID or a short key.
 ///
-/// - If `team_id` is provided, it is returned directly.
+/// - If `team_id` is provided, it is checked against `workspace_id` before
+///   being returned. Both inputs come from the caller, so an id from another
+///   workspace has to be rejected here — every caller then feeds the result to
+///   a query it also scopes by `workspace_id`, where a foreign team silently
+///   matches nothing on a read and writes a dangling reference on a write.
 /// - If `team_key` is provided, the team is looked up by key within the
 ///   workspace. Returns an error if no team matches.
 /// - If neither is provided, returns `None`.
@@ -32,7 +36,9 @@ pub async fn resolve_team(
     team_id: Option<&str>,
 ) -> ApiResult<Option<String>> {
     if let Some(id) = team_id {
-        return Ok(Some(id.to_string()));
+        let team =
+            trakkt_auth::team_service::get_team_in_workspace(db, id, workspace_id).await?;
+        return Ok(Some(team.team_id));
     }
     if let Some(key) = team_key {
         let team = trakkt_auth::team_service::get_team_by_key(db, workspace_id, key)
@@ -115,24 +121,24 @@ mod tests {
 
     #[test]
     fn resolve_via_identifier() {
-        let (key, num) =
-            resolve_issue_key_and_number(Some("TRA-35"), None, None).unwrap();
+        let (key, num) = resolve_issue_key_and_number(Some("TRA-35"), None, None)
+            .expect("resolving a well-formed identifier with no separate key or number");
         assert_eq!(key, "TRA");
         assert_eq!(num, 35);
     }
 
     #[test]
     fn resolve_via_key_and_number() {
-        let (key, num) =
-            resolve_issue_key_and_number(None, Some("ENG"), Some(7)).unwrap();
+        let (key, num) = resolve_issue_key_and_number(None, Some("ENG"), Some(7))
+            .expect("resolving a separate team key and issue number with no identifier");
         assert_eq!(key, "ENG");
         assert_eq!(num, 7);
     }
 
     #[test]
     fn resolve_identifier_takes_precedence() {
-        let (key, num) =
-            resolve_issue_key_and_number(Some("TRA-10"), Some("ENG"), Some(99)).unwrap();
+        let (key, num) = resolve_issue_key_and_number(Some("TRA-10"), Some("ENG"), Some(99))
+            .expect("resolving when both an identifier and a key/number pair are supplied");
         assert_eq!(key, "TRA");
         assert_eq!(num, 10);
     }

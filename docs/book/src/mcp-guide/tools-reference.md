@@ -8,9 +8,9 @@ See the [Issues API Reference](../api-reference/issues.md) for parameter details
 
 | Tool | Description | Scope |
 |------|-------------|-------|
-| `list_issues` | List issues with optional filters. Ordered by priority (urgent first), then creation date. Excludes completed/cancelled by default -- pass `include_closed=true` to include them. | `issues:read` |
+| `list_issues` | Find issues with optional filters. Ordered by priority (urgent first), then creation date. Excludes completed/cancelled by default -- pass `include_closed=true` to include them. Rows are lean: `number`, `key`, `title`, `priority`, `status_id`, `status_name`, `updated_at`, `labels` (id and name only). Never includes descriptions, comments, or activities -- call `get_issue` to read a ticket. | `issues:read` |
 | `search_issues` | Full-text search across titles, descriptions, and comments. Returns ranked results with snippet context. | `issues:read` |
-| `get_issue` | Get a single issue by identifier (e.g., `ENG-42`), including description, comments, activity log, and relations. | `issues:read` |
+| `get_issue` | Read a single issue in full by identifier (e.g., `ENG-42`): description, comments, activity log, and relations. This is the way to read a ticket's content -- `list_issues` deliberately omits it. | `issues:read` |
 | `create_issue` | Create a new issue. Specify `team_key` (e.g., `"ENG"`) or `team_id` to assign to a team. Starts in backlog status. | `issues:write` |
 | `update_issue` | Update an existing issue. Only provided fields change; omit a field to leave it unchanged, set to `null` to clear it. | `issues:write` |
 | `delete_issue` | Permanently delete an issue by identifier (e.g., `ENG-42`) and all associated comments and labels. | `issues:write` |

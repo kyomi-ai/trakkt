@@ -34,6 +34,8 @@ pub struct InvitationData {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSettingsData {
     pub workspace_name: String,
+    /// Workspace-level default auto-archive days. `None` means not configured.
+    pub default_auto_archive_days: Option<u32>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

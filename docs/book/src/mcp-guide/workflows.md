@@ -195,5 +195,6 @@ Keep track of what is happening across the workspace:
 - **Use `team_key` over `team_id`.** Keys like `"ENG"` are human-readable and stable. IDs are UUIDs that are harder to work with.
 - **Use issue identifiers.** Tools accept identifiers like `"ENG-42"` rather than raw UUIDs. These are the same identifiers shown in the Trakkt UI.
 - **Filter aggressively.** `list_issues` supports `team_key`, `priority`, `status_category`, `label`, and `assignee` filters. Narrow your queries to avoid processing large result sets.
+- **List to find, `get_issue` to read.** `list_issues` returns lean rows -- `number`, `key`, `title`, `priority`, `status_id`, `status_name`, `updated_at`, and label ids/names -- and never the issue description, comments, or activities. That keeps a full page of results small enough to read in one tool result. Once you have picked a ticket, call `get_issue` with its `key` to get the full description and history.
 - **Exclude closed issues by default.** `list_issues` already excludes completed and cancelled issues unless you pass `include_closed=true`. This is usually what you want.
 - **Check `list_statuses` for status IDs.** Do not hardcode status IDs. They vary between workspaces and teams.

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use leptos::prelude::*;
 use phosphor_leptos::Icon;
 
-use crate::components::{Alert, AlertVariant, Button, ButtonVariant, EmptyState, ProjectCreationModal, StatusBadge};
+use crate::components::{Alert, AlertVariant, Button, ButtonSize, ButtonVariant, EmptyState, ProjectCreationModal, SearchInput, StatusBadge, ToggleButton};
 use crate::server_fns::projects::list_projects;
 use crate::utils::date::format_date;
 use crate::utils::project::{status_label, status_variant};
@@ -27,6 +27,12 @@ use crate::utils::project::{status_label, status_variant};
 pub fn ProjectListPage() -> impl IntoView {
     // ── Create-project modal ──────────────────────────────────────────────
     let (show_create, set_show_create) = signal(false);
+
+    // ── Search state ─────────────────────────────────────────────────────
+    let (search_text, set_search_text) = signal(String::new());
+
+    // ── Show archived toggle ─────────────────────────────────────────────
+    let (show_archived, set_show_archived) = signal(false);
 
     // ── Data source: SyncStore (real-time) with server function fallback ───
     let sync_store = use_context::<crate::cache::store::SyncStore>();
@@ -84,6 +90,30 @@ pub fn ProjectListPage() -> impl IntoView {
                 on_close=Callback::new(move |()| set_show_create.set(false))
             />
 
+            // ── Search bar ─────────────────────────────────────────────────
+            <div class="px-5 py-2 border-b border-border shrink-0 flex items-center gap-3">
+                <SearchInput
+                    value=Signal::derive(move || search_text.get())
+                    on_input=Callback::new(move |v: String| set_search_text.set(v))
+                    placeholder="Search projects..."
+                    class="max-w-sm".to_string()
+                />
+                <ToggleButton
+                    variant=Signal::derive(move || {
+                        if show_archived.get() {
+                            ButtonVariant::Secondary
+                        } else {
+                            ButtonVariant::GhostMuted
+                        }
+                    })
+                    size=ButtonSize::Sm
+                    on:click=move |_| set_show_archived.update(|v| *v = !*v)
+                >
+                    <Icon icon=phosphor_leptos::ARCHIVE size="14px"/>
+                    "Archived"
+                </ToggleButton>
+            </div>
+
             // ── Error alert ─────────────────────────────────────────────────
             <Show when=move || error_msg.get().is_some()>
                 <div class="mx-4 mt-4">
@@ -96,9 +126,29 @@ pub fn ProjectListPage() -> impl IntoView {
             // ── Content area ────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto">
                 {move || {
-                    let list = projects.get();
+                    let all = projects.get();
+                    let search = search_text.get().to_lowercase();
+                    let include_archived = show_archived.get();
+                    let list: Vec<_> = all.iter().filter(|p| {
+                        // Filter out archived projects unless show_archived is enabled.
+                        if !include_archived && p.archived_at.is_some() {
+                            return false;
+                        }
+                        search.is_empty() || p.name.to_lowercase().contains(&search)
+                    }).cloned().collect();
 
                     if list.is_empty() {
+                        let (title, description) = if all.is_empty() {
+                            (
+                                "No projects yet",
+                                "Projects are cross-team initiatives that group related issues together.",
+                            )
+                        } else {
+                            (
+                                "No matching projects",
+                                "Try a different search term.",
+                            )
+                        };
                         let empty_icon: Arc<dyn Fn() -> AnyView + Send + Sync> = Arc::new(move || {
                             view! {
                                 <Icon icon=phosphor_leptos::FOLDER weight=phosphor_leptos::IconWeight::Duotone size="48px"/>
@@ -108,8 +158,8 @@ pub fn ProjectListPage() -> impl IntoView {
                             <div class="p-4 md:p-6">
                                 <EmptyState
                                     icon=empty_icon
-                                    title="No projects yet"
-                                    description="Projects are cross-team initiatives that group related issues together."
+                                    title=title
+                                    description=description
                                 />
                             </div>
                         }.into_any()
@@ -143,6 +193,7 @@ fn ProjectRow(project: trakkt_types::models::Project) -> impl IntoView {
     let href = format!("/projects/{}", project.project_id);
     let variant = status_variant(&project.status);
     let label = status_label(&project.status);
+    let is_archived = project.archived_at.is_some();
 
     let dates_view = {
         let start = project.start_date.as_deref().map(format_date);
@@ -155,10 +206,16 @@ fn ProjectRow(project: trakkt_types::models::Project) -> impl IntoView {
         }
     };
 
+    let row_class = if is_archived {
+        "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer no-underline text-inherit opacity-60"
+    } else {
+        "h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer no-underline text-inherit"
+    };
+
     view! {
         <a
             href=href
-            class="h-9 px-3 py-[6px] flex items-center gap-2.5 border-b border-border hover:bg-surface-alt focus-visible:bg-surface-alt focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring transition-colors cursor-pointer no-underline text-inherit"
+            class=row_class
             role="listitem"
             tabindex="0"
         >
@@ -171,6 +228,13 @@ fn ProjectRow(project: trakkt_types::models::Project) -> impl IntoView {
             <span class="text-sm font-medium text-foreground flex-1 truncate">
                 {project.name.clone()}
             </span>
+
+            // Archived badge
+            {is_archived.then(|| view! {
+                <span class="text-[10px] font-medium uppercase tracking-wide text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                    "Archived"
+                </span>
+            })}
 
             // Status badge
             <StatusBadge variant=variant>

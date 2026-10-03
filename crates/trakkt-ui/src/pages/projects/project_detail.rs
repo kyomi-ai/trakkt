@@ -17,24 +17,28 @@ use leptos_router::NavigateOptions;
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Button, ButtonSize, ButtonVariant, ConfirmDialog, DatePicker, EmptyState,
+    Button, ButtonSize, ButtonVariant, Card, CardContent, CardDescription,
+    CardHeader, CardTitle, ConfirmDialog, CopyLinkButton, DatePicker, EmptyState,
     IssueStatusBadge, IssueStatusVariant, INPUT_CLASS,
     PriorityIndicator, LabelBadge, Select, SelectVariant,
     TeamKeyBadge, ToggleButton,
 };
-use crate::pages::projects::project_board::ProjectBoardContent;
-use crate::pages::projects::project_list_view::ProjectListView;
+use crate::pages::projects::project_board::{BoardViewState, ProjectBoardContent};
+use crate::pages::projects::project_list_view::{ListViewState, ProjectListView};
 use crate::server_fns::projects::{
+    archive_project, delete_project,
     get_project, get_project_progress, list_milestones,
     create_milestone, update_milestone, delete_milestone,
     list_project_updates, create_project_update,
     update_project,
+    list_project_members, add_project_member, remove_project_member,
 };
 use crate::server_fns::issues::list_issues;
 use crate::server_fns::team::list_workspace_members;
 use crate::types::IssueNavState;
 use crate::utils::date::{format_date, format_short_date};
-use trakkt_types::models::{IssueWithDetails, Project, ProjectMilestone, ProjectProgress, ProjectUpdate};
+use crate::types::WorkspaceMember;
+use trakkt_types::models::{IssueWithDetails, Project, ProjectMember, ProjectMilestone, ProjectProgress, ProjectUpdate};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Project Detail Page
@@ -52,12 +56,193 @@ fn parse_view_param(search: &str) -> String {
             && key == "view"
         {
             return match value {
-                "board" | "list" => value.to_string(),
+                "board" | "list" | "settings" => value.to_string(),
                 _ => "overview".to_string(),
             };
         }
     }
     "overview".to_string()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Interaction state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether one inline click-to-edit field is open, and what has been typed into
+/// it but not yet saved.
+#[derive(Clone, Copy)]
+struct InlineTextEdit {
+    editing: RwSignal<bool>,
+    draft: RwSignal<String>,
+}
+
+impl InlineTextEdit {
+    fn new() -> Self {
+        Self {
+            editing: RwSignal::new(false),
+            draft: RwSignal::new(String::new()),
+        }
+    }
+
+    /// Close the field. The draft is left alone — every open path overwrites it
+    /// with the field's current value before setting `editing`.
+    fn close(&self) {
+        self.editing.set(false);
+    }
+}
+
+/// In-progress milestone interactions: which row's inline rename is open and
+/// what has been typed into it, whether the add form is open and what is in it,
+/// and which milestone a delete is being confirmed for.
+#[derive(Clone, Copy)]
+struct MilestoneEditState {
+    editing_id: RwSignal<Option<String>>,
+    edit_name: RwSignal<String>,
+    edit_date: RwSignal<Option<String>>,
+    adding: RwSignal<bool>,
+    new_name: RwSignal<String>,
+    new_date: RwSignal<Option<String>>,
+    deleting_id: RwSignal<Option<String>>,
+}
+
+impl MilestoneEditState {
+    fn new() -> Self {
+        Self {
+            editing_id: RwSignal::new(None),
+            edit_name: RwSignal::new(String::new()),
+            edit_date: RwSignal::new(None),
+            adding: RwSignal::new(false),
+            new_name: RwSignal::new(String::new()),
+            new_date: RwSignal::new(None),
+            deleting_id: RwSignal::new(None),
+        }
+    }
+
+    /// Open the inline rename for `milestone_id`, seeded with its current
+    /// values. This is what `MilestoneRow` used an `Effect` for before the
+    /// drafts were hoisted; entering edit mode only happens here, so doing it
+    /// on the way in is equivalent and needs no effect at all.
+    fn begin_edit(&self, milestone_id: String, name: String, target_date: Option<String>) {
+        self.edit_name.set(name);
+        self.edit_date.set(target_date);
+        self.editing_id.set(Some(milestone_id));
+    }
+
+    /// Close the add form and drop its draft.
+    ///
+    /// Clearing is this method's job precisely because the draft now outlives
+    /// the form: before it was hoisted, closing the form destroyed the signals
+    /// with it, so reopening always started empty by accident.
+    fn close_add(&self) {
+        self.adding.set(false);
+        self.new_name.set(String::new());
+        self.new_date.set(None);
+    }
+}
+
+/// The health-update composer's draft.
+#[derive(Clone, Copy)]
+struct UpdateDraft {
+    posting: RwSignal<bool>,
+    health: RwSignal<String>,
+    body: RwSignal<String>,
+}
+
+impl UpdateDraft {
+    const DEFAULT_HEALTH: &'static str = "on_track";
+
+    fn new() -> Self {
+        Self {
+            posting: RwSignal::new(false),
+            health: RwSignal::new(Self::DEFAULT_HEALTH.to_string()),
+            body: RwSignal::new(String::new()),
+        }
+    }
+
+    /// Close the composer and discard what was in it.
+    fn reset(&self) {
+        self.posting.set(false);
+        self.health.set(Self::DEFAULT_HEALTH.to_string());
+        self.body.set(String::new());
+    }
+}
+
+/// In-progress project-member interactions.
+#[derive(Clone, Copy)]
+struct MemberEditState {
+    adding: RwSignal<bool>,
+    add_value: RwSignal<String>,
+    removing_id: RwSignal<Option<String>>,
+}
+
+impl MemberEditState {
+    fn new() -> Self {
+        Self {
+            adding: RwSignal::new(false),
+            add_value: RwSignal::new(String::new()),
+            removing_id: RwSignal::new(None),
+        }
+    }
+}
+
+/// Drafts and tab selections owned by the route. Resource updates refresh
+/// separate sections; the project-identity keyed content keeps the description
+/// editor mounted. Reset this state when navigation changes the project ID.
+#[derive(Clone, Copy)]
+struct ProjectEditState {
+    name: InlineTextEdit,
+    description: InlineTextEdit,
+    milestones: MilestoneEditState,
+    update: UpdateDraft,
+    members: MemberEditState,
+    /// Whether the settings tab's delete-project confirmation is open.
+    confirming_delete: RwSignal<bool>,
+    /// The board tab's toolbar filters and in-progress drag.
+    board: BoardViewState,
+    /// The list tab's toolbar filters, sort and grouping.
+    list: ListViewState,
+}
+
+impl ProjectEditState {
+    fn new() -> Self {
+        Self {
+            name: InlineTextEdit::new(),
+            description: InlineTextEdit::new(),
+            milestones: MilestoneEditState::new(),
+            update: UpdateDraft::new(),
+            members: MemberEditState::new(),
+            confirming_delete: RwSignal::new(false),
+            board: BoardViewState::default(),
+            list: ListViewState::default(),
+        }
+    }
+
+    /// Drop every open editor and draft, and every view-tab selection.
+    ///
+    /// Needed because the router matches `/projects/:id` once and reuses this
+    /// component across projects: without it, an add form left open on one
+    /// project would appear, still holding its draft, on the next — and, since
+    /// TRA-10032 hoisted them too, a board filter or a list grouping chosen on
+    /// one project would silently narrow the next one's issues.
+    ///
+    /// A *tab* switch deliberately does not go through here. Moving between
+    /// Board and List and back is not an instruction to drop what you had
+    /// filtered to, and the two tabs hold separate state, so neither can
+    /// surprise the other.
+    fn reset(&self) {
+        self.name.close();
+        self.description.close();
+        self.milestones.close_add();
+        self.milestones.editing_id.set(None);
+        self.milestones.deleting_id.set(None);
+        self.update.reset();
+        self.members.adding.set(false);
+        self.members.add_value.set(String::new());
+        self.members.removing_id.set(None);
+        self.confirming_delete.set(false);
+        self.board.reset();
+        self.list.reset();
+    }
 }
 
 /// Full project detail page — metadata + filtered issue list.
@@ -100,14 +285,51 @@ pub fn ProjectDetailPage() -> impl IntoView {
         move |id| async move { get_project_progress(id).await },
     );
 
+    // Milestones are not held in the SyncStore — they come from the server
+    // function. `milestones_version` bumps on every project_milestone sync
+    // action, so keying the resource on it is what makes another client's
+    // create/rename/re-date arrive here without a reload.
+    //
+    // Each of the three counters below is resolved once here and moved into the
+    // one source closure that reads it. The `as_ref()` is because the getters
+    // return `ArcSignal<u32>`, which is `Clone` and not `Copy` (see the getter
+    // notes on `SyncStore`): `Option::map` would consume the capture and make
+    // the closure `FnOnce`, so the read borrows it instead. The counter is
+    // tracked by the `get()` inside the closure, exactly as before — borrowing
+    // rather than copying the wrapper is not a reactive operation.
+    let milestones_version = sync_store.map(|s| s.milestones_version());
+
     let server_milestones = Resource::new(
-        move || project_id.get(),
-        move |id| async move { list_milestones(id).await },
+        move || (
+            project_id.get(),
+            milestones_version.as_ref().map(|v| v.get()).unwrap_or(0),
+        ),
+        move |(id, _version)| async move { list_milestones(id).await },
     );
 
+    // Posted status updates and memberships are not held in the SyncStore
+    // either — both come from server functions. Their counters bump on every
+    // project_update / project_member sync action, so keying the resources on
+    // them is what makes another client's post, add or remove arrive here
+    // without a reload.
+    let project_updates_version = sync_store.map(|s| s.project_updates_version());
+
     let server_updates = Resource::new(
-        move || project_id.get(),
-        move |id| async move { list_project_updates(id).await },
+        move || (
+            project_id.get(),
+            project_updates_version.as_ref().map(|v| v.get()).unwrap_or(0),
+        ),
+        move |(id, _version)| async move { list_project_updates(id).await },
+    );
+
+    let project_members_version = sync_store.map(|s| s.project_members_version());
+
+    let server_members = Resource::new(
+        move || (
+            project_id.get(),
+            project_members_version.as_ref().map(|v| v.get()).unwrap_or(0),
+        ),
+        move |(id, _version)| async move { list_project_members(id).await },
     );
 
     // Resolve the project from SyncStore or server function.
@@ -126,6 +348,11 @@ pub fn ProjectDetailPage() -> impl IntoView {
             }
         }
         server_project.get()
+    });
+
+    let copy_path = Signal::derive(move || {
+        let project = project_data.get()?.ok()??;
+        crate::components::copy_link::project_link_path(&project_id.get(), &project.project_id)
     });
 
     // Resolve issues for this project from SyncStore or server function.
@@ -157,14 +384,64 @@ pub fn ProjectDetailPage() -> impl IntoView {
             .collect::<Vec<_>>()
     });
 
+    // ── Interaction state ──────────────────────────────────────────────────
+    // Held here, not in the components that read it. See `ProjectEditState`.
+    let edit_state = ProjectEditState::new();
+
+    // The router matches `/projects/:id` once and reuses this component when the
+    // id changes, so `edit_state` has to be cleared explicitly on that move.
+    // The first run has no previous id and clears nothing.
+    Effect::new(move |previous: Option<String>| {
+        let id = project_id.get();
+        if previous.is_some_and(|prev| prev != id) {
+            edit_state.reset();
+        }
+        id
+    });
+
+    // Workspace members, read by both the lead selector and the add-member
+    // picker. Created here for the same reason as `edit_state`: inside the
+    // content closure this was a fresh Resource — and so a fresh
+    // `list_workspace_members` request — on every re-render.
+    let workspace_members = Resource::new(
+        || (),
+        move |_| async move { list_workspace_members().await },
+    );
+
     // Hoist use_navigate to component construction time (not inside closures).
     let nav = use_navigate();
 
     // ── Render ──────────────────────────────────────────────────────────────
+    let progress = Signal::derive(move || server_progress.get().and_then(|r| r.ok()));
+    let milestones = Signal::derive(move || match server_milestones.get() {
+        Some(Ok(rows)) => rows,
+        Some(Err(error)) => {
+            leptos::logging::warn!("Failed to load milestones: {error}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    });
+    let updates = Signal::derive(move || match server_updates.get() {
+        Some(Ok(rows)) => rows,
+        Some(Err(error)) => {
+            leptos::logging::warn!("Failed to load project updates: {error}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    });
+    let members = Signal::derive(move || match server_members.get() {
+        Some(Ok(rows)) => rows,
+        Some(Err(error)) => {
+            leptos::logging::warn!("Failed to load project members: {error}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    });
+
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Header ────────────────────────────────────────────────────
-            <div class="page-header h-14 px-5 flex items-center gap-3 shrink-0">
+            <div class="page-header min-h-14 px-5 py-2 flex flex-wrap items-center gap-3 shrink-0">
                 <Button
                     variant=ButtonVariant::GhostMuted
                     size=ButtonSize::IconSm
@@ -175,6 +452,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
                 >
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>
                 </Button>
+                <CopyLinkButton path=copy_path/>
                 <span class="text-muted-foreground">
                     <Icon icon=phosphor_leptos::FOLDER weight=phosphor_leptos::IconWeight::Duotone size="16px"/>
                 </span>
@@ -193,7 +471,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
                         None
                     } else {
                         Some(view! {
-                            <crate::components::layout::FavoriteToggle target_type="project" target_id=id/>
+                            <crate::components::layout::FavoriteToggle target_type=trakkt_types::enums::FavoriteTarget::Project target_id=id/>
                         })
                     }
                 }}
@@ -201,59 +479,46 @@ pub fn ProjectDetailPage() -> impl IntoView {
 
             // ── Content ───────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto p-4 md:p-6">
-                {move || {
-                    match project_data.get() {
-                        Some(Ok(Some(project))) => {
-                            let issues = project_issues.get();
-                            let progress = server_progress.get().and_then(|r| r.ok());
-                            let milestones = match server_milestones.get() {
-                                Some(Ok(v)) => v,
-                                Some(Err(e)) => {
-                                    leptos::logging::warn!("Failed to load milestones: {e}");
-                                    Vec::new()
-                                }
-                                None => Vec::new(),
-                            };
-                            let updates = match server_updates.get() {
-                                Some(Ok(v)) => v,
-                                Some(Err(e)) => {
-                                    leptos::logging::warn!("Failed to load project updates: {e}");
-                                    Vec::new()
-                                }
-                                None => Vec::new(),
-                            };
-                            view! {
-                                <ProjectDetailContent
-                                    project=project
-                                    issues=issues
-                                    progress=progress
-                                    milestones=milestones
-                                    server_milestones=server_milestones
-                                    updates=updates
-                                    server_updates=server_updates
-                                    active_view=active_view
-                                    project_id=project_id
-                                />
-                            }.into_any()
-                        }
-                        Some(Ok(None)) => {
-                            view! { <ProjectNotFound/> }.into_any()
-                        }
-                        Some(Err(_)) => {
-                            view! {
-                                <div class="max-w-[860px] mx-auto w-full text-center py-16">
-                                    <p class="text-muted-foreground">"Failed to load project. Please try again."</p>
-                                </div>
-                            }.into_any()
-                        }
-                        None => {
-                            view! {
-                                <div class="max-w-[860px] mx-auto w-full text-center py-16">
-                                    <p class="text-muted-foreground">"Loading..."</p>
-                                </div>
-                            }.into_any()
+                // Key the mounted content by project identity, not resource snapshots.
+                // Settling resources update individual sections without replacing the
+                // description's contenteditable DOM or its selection.
+                <For
+                    each=move || { project_data.get().and_then(Result::ok).flatten().into_iter().collect::<Vec<_>>() }
+                    key=|project| project.project_id.clone()
+                    children=move |initial: Project| {
+                        let initial = StoredValue::new(initial);
+                        let project = Signal::derive(move || {
+                            project_data.get().and_then(Result::ok).flatten()
+                                .unwrap_or_else(|| initial.get_value())
+                        });
+                        view! {
+                            <ProjectDetailContent
+                                project=project
+                                issues=Signal::derive(move || project_issues.get())
+                                progress=progress
+                                milestones=milestones
+                                server_milestones=server_milestones
+                                updates=updates
+                                server_updates=server_updates
+                                members=members
+                                server_members=server_members
+                                workspace_members=workspace_members
+                                edit_state=edit_state
+                                active_view=active_view
+                                project_id=project_id
+                            />
                         }
                     }
+                />
+                {move || match project_data.get() {
+                    Some(Ok(Some(_))) => None,
+                    Some(Ok(None)) => Some(view! { <ProjectNotFound/> }.into_any()),
+                    Some(Err(_)) => Some(view! {
+                        <p class="text-muted-foreground text-center py-16">"Failed to load project. Please try again."</p>
+                    }.into_any()),
+                    None => Some(view! {
+                        <p class="text-muted-foreground text-center py-16">"Loading..."</p>
+                    }.into_any()),
                 }}
             </div>
         </div>
@@ -272,13 +537,20 @@ pub fn ProjectDetailPage() -> impl IntoView {
 /// signal updates; the SyncStore will reconcile via websocket.
 #[component]
 fn ProjectDetailContent(
-    project: Project,
-    issues: Vec<IssueWithDetails>,
-    progress: Option<ProjectProgress>,
-    milestones: Vec<ProjectMilestone>,
+    project: Signal<Project>,
+    issues: Signal<Vec<IssueWithDetails>>,
+    progress: Signal<Option<ProjectProgress>>,
+    milestones: Signal<Vec<ProjectMilestone>>,
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
-    updates: Vec<ProjectUpdate>,
+    updates: Signal<Vec<ProjectUpdate>>,
     server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
+    members: Signal<Vec<ProjectMember>>,
+    server_members: Resource<Result<Vec<ProjectMember>, ServerFnError>>,
+    /// Workspace members, for the lead selector and the add-member picker.
+    workspace_members: Resource<Result<Vec<WorkspaceMember>, ServerFnError>>,
+    /// Open editors and unsaved drafts, owned by `ProjectDetailPage` so they
+    /// survive this component being reconstructed. See `ProjectEditState`.
+    edit_state: ProjectEditState,
     /// The currently active view tab: "overview", "board", or "list".
     #[prop(into)]
     active_view: Memo<String>,
@@ -286,12 +558,12 @@ fn ProjectDetailContent(
     #[prop(into)]
     project_id: Memo<String>,
 ) -> impl IntoView {
-    let issue_count = issues.len();
-    let pid = StoredValue::new(project.project_id.clone());
+    let initial_project = project.get_untracked();
+    let pid = StoredValue::new(initial_project.project_id.clone());
 
     // Milestones signal — reactive via server_milestones Resource, falls back
     // to the initial snapshot when the Resource hasn't resolved yet.
-    let initial_milestones = StoredValue::new(milestones.clone());
+    let initial_milestones = StoredValue::new(milestones.get_untracked());
     let milestones_signal: Signal<Vec<ProjectMilestone>> = Signal::derive(move || {
         match server_milestones.get() {
             Some(Ok(v)) => v,
@@ -303,9 +575,13 @@ fn ProjectDetailContent(
     let nav_create_view = use_navigate();
 
     // ── Editable name (click-to-edit) ────────────────────────────────────
-    let editing_name = RwSignal::new(false);
-    let name_value = RwSignal::new(project.name.clone());
-    let name_draft = RwSignal::new(project.name.clone());
+    // `editing_name` and `name_draft` are the user's in-progress edit and come
+    // from `edit_state`, so a settling resource cannot discard them.
+    // `name_value` is this component's optimistic mirror of the server's value
+    // and is refreshed by the project-sync effect below.
+    let editing_name = edit_state.name.editing;
+    let name_draft = edit_state.name.draft;
+    let name_value = RwSignal::new(initial_project.name.clone());
 
     let save_name = move || {
         let new_name = name_draft.get_untracked();
@@ -347,15 +623,12 @@ fn ProjectDetailContent(
     };
 
     // ── Editable status ────────────────────────────────────────────────
-    let status_value = RwSignal::new(project.status.clone());
+    let status_value = RwSignal::new(initial_project.status.clone());
 
     // ── Editable lead ──────────────────────────────────────────────────
-    let lead_value = RwSignal::new(project.lead_id.clone().unwrap_or_default());
+    let lead_value = RwSignal::new(initial_project.lead_id.clone().unwrap_or_default());
 
-    let members_resource = Resource::new(
-        || (),
-        move |_| async move { list_workspace_members().await },
-    );
+    let members_resource = workspace_members;
 
     let member_options = Signal::derive(move || {
         let mut opts = vec![("".to_string(), "(Unassigned)".to_string())];
@@ -369,8 +642,8 @@ fn ProjectDetailContent(
     });
 
     // ── Editable dates (DatePicker) ──────────────────────────────────────
-    let start_date_value: RwSignal<Option<String>> = RwSignal::new(project.start_date.clone());
-    let target_date_value: RwSignal<Option<String>> = RwSignal::new(project.target_date.clone());
+    let start_date_value: RwSignal<Option<String>> = RwSignal::new(initial_project.start_date.clone());
+    let target_date_value: RwSignal<Option<String>> = RwSignal::new(initial_project.target_date.clone());
 
     let start_date_signal = Signal::derive(move || start_date_value.get());
     let target_date_signal = Signal::derive(move || target_date_value.get());
@@ -406,28 +679,22 @@ fn ProjectDetailContent(
         })
     };
 
-    // ── Editable description (click-to-edit textarea) ────────────────────
-    let editing_desc = RwSignal::new(false);
-    let desc_value = RwSignal::new(project.description.clone().unwrap_or_default());
-    let desc_draft = RwSignal::new(project.description.clone().unwrap_or_default());
-
-    let save_desc = move || {
-        let new_desc = desc_draft.get_untracked();
-        if new_desc == desc_value.get_untracked() {
-            editing_desc.set(false);
-            return;
-        }
-        desc_value.set(new_desc.clone());
-        editing_desc.set(false);
-        let project_id = pid.get_value();
-        leptos::task::spawn_local(async move {
-            if let Err(e) = update_project(
-                project_id, None, Some(new_desc), None, None, None, None, None, None,
-            ).await {
-                leptos::logging::warn!("Failed to update description: {e}");
-            }
-        });
-    };
+    // Refresh metadata mirrors without rebuilding the description subtree.
+    Effect::new(move || {
+        let current = project.get();
+        name_value.set(current.name);
+        status_value.set(current.status);
+        lead_value.set(current.lead_id.unwrap_or_default());
+        start_date_value.set(current.start_date);
+        target_date_value.set(current.target_date);
+    });
+    let description = Signal::derive(move || project.get().description.unwrap_or_default());
+    let user_context = use_context::<LocalResource<Result<crate::server_fns::context::UserContext, ServerFnError>>>();
+    let can_edit_description = Signal::derive(move || {
+        user_context.and_then(|resource| resource.get()).and_then(Result::ok)
+            .is_some_and(|context| context.is_personal_mode || context.is_owner
+                || context.workspace_roles.iter().any(|role| role == "workspace_admin" || role == "workspace_user"))
+    });
 
     view! {
         <div>
@@ -545,93 +812,49 @@ fn ProjectDetailContent(
                 </div>
             </div>
 
-            // ── Description (click-to-edit textarea) ─────────────────────
-            <div class="mt-4">
-                <Show
-                    when=move || editing_desc.get()
-                    fallback=move || {
-                        view! {
-                            <p
-                                class=move || {
-                                    if !desc_value.get().is_empty() {
-                                        "text-sm text-muted-foreground cursor-pointer hover:text-foreground/80 transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
-                                    } else {
-                                        "text-sm text-muted-foreground/60 italic cursor-pointer hover:text-muted-foreground transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
-                                    }
-                                }
-                                tabindex="0"
-                                role="button"
-                                aria-label="Click to edit description"
-                                on:click=move |_| {
-                                    desc_draft.set(desc_value.get_untracked());
-                                    editing_desc.set(true);
-                                }
-                                on:keydown=move |ev: leptos::ev::KeyboardEvent| {
-                                    if ev.key() == "Enter" {
-                                        desc_draft.set(desc_value.get_untracked());
-                                        editing_desc.set(true);
-                                    }
-                                }
-                            >
-                                {move || {
-                                    let v = desc_value.get();
-                                    if v.is_empty() {
-                                        "Add a description...".to_string()
-                                    } else {
-                                        v
-                                    }
-                                }}
-                            </p>
-                        }
-                    }
-                >
-                    <textarea
-                        class=format!("{INPUT_CLASS} !h-auto min-h-[80px] w-full resize-y")
-                        prop:value=move || desc_draft.get()
-                        on:input=move |ev| desc_draft.set(event_target_value(&ev))
-                        autofocus=true
-                    ></textarea>
-                    <div class="flex items-center gap-2 mt-2">
-                        <Button
-                            variant=ButtonVariant::Secondary
-                            size=ButtonSize::Sm
-                            on:click=move |_| save_desc()
-                        >
-                            "Save"
-                        </Button>
-                        <Button
-                            variant=ButtonVariant::GhostMuted
-                            size=ButtonSize::Sm
-                            on:click=move |_| {
-                                desc_draft.set(desc_value.get_untracked());
-                                editing_desc.set(false);
-                            }
-                        >
-                            "Cancel"
-                        </Button>
-                    </div>
-                </Show>
-            </div>
+            <ProjectDescription
+                project_id=pid.get_value()
+                description=description
+                can_edit=can_edit_description
+                state=edit_state.description
+            />
 
             // ── Progress bar ─────────────────────────────────────────────
-            {progress.filter(|p| p.total > 0).map(|p| {
+            {move || progress.get().filter(|p| p.total > 0).map(|p| {
                 view! { <ProgressSection progress=p/> }
             })}
 
             // ── Milestones ──────────────────────────────────────────────
-            <MilestoneSection
-                project_id=project.project_id.clone()
-                milestones=milestones.clone()
-                issues=issues.clone()
-                server_milestones=server_milestones
-            />
+            {move || view! {
+                <MilestoneSection
+                    project_id=pid.get_value()
+                    milestones=milestones.get()
+                    issues=issues.get()
+                    server_milestones=server_milestones
+                    state=edit_state.milestones
+                />
+            }}
 
             // ── Health Updates ───────────────────────────────────────────
-            <HealthUpdateSection
-                project_id=project.project_id.clone()
-                updates=updates
-                server_updates=server_updates
-            />
+            {move || view! {
+                <HealthUpdateSection
+                    project_id=pid.get_value()
+                    updates=updates.get()
+                    server_updates=server_updates
+                    draft=edit_state.update
+                />
+            }}
+
+            // ── Members ──────────────────────────────────────────────────
+            {move || view! {
+                <ProjectMembersSection
+                    project_id=pid.get_value()
+                    members=members.get()
+                    server_members=server_members
+                    workspace_members=members_resource
+                    state=edit_state.members
+                />
+            }}
 
             // ── Divider ───────────────────────────────────────────────────
             <div class="border-t border-border my-6"></div>
@@ -657,10 +880,16 @@ fn ProjectDetailContent(
                         active=active_view
                         project_id=pid
                     />
+                    <ProjectViewTab
+                        label="Settings"
+                        value="settings"
+                        active=active_view
+                        project_id=pid
+                    />
 
                     // Issue count badge
                     <span class="text-xs text-muted-foreground ml-2">
-                        {format!("{issue_count}")}
+                        {move || issues.get().len().to_string()}
                     </span>
                 </div>
                 <Button
@@ -703,13 +932,27 @@ fn ProjectDetailContent(
                 "board" => {
                     let pid_signal = Signal::derive(move || project_id.get());
                     view! {
-                        <ProjectBoardContent project_id=pid_signal/>
+                        <ProjectBoardContent project_id=pid_signal state=edit_state.board/>
                     }.into_any()
                 }
                 "list" => {
                     let pid_signal = Signal::derive(move || project_id.get());
                     view! {
-                        <ProjectListView project_id=pid_signal milestones=milestones_signal/>
+                        <ProjectListView
+                            project_id=pid_signal
+                            milestones=milestones_signal
+                            state=edit_state.list
+                        />
+                    }.into_any()
+                }
+                "settings" => {
+                    view! {
+                        <div class="max-w-[860px] mx-auto w-full">
+                            <ProjectSettingsContent
+                                project=project.get()
+                                confirming_delete=edit_state.confirming_delete
+                            />
+                        </div>
                     }.into_any()
                 }
                 _ => {
@@ -717,8 +960,8 @@ fn ProjectDetailContent(
                     view! {
                         <div class="max-w-[860px] mx-auto w-full">
                             <ProjectOverviewIssues
-                                issues=issues.clone()
-                                milestones=milestones.clone()
+                                issues=issues.get()
+                                milestones=milestones.get()
                             />
                         </div>
                     }.into_any()
@@ -732,6 +975,129 @@ fn ProjectDetailContent(
 // ─────────────────────────────────────────────────────────────────────────────
 // View Tab Button
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Project persistence stays explicit: opening seeds a draft, Cancel discards
+/// it, and Save sends the Markdown emitted by the shared issue editor.
+#[component]
+fn ProjectDescription(
+    project_id: String,
+    description: Signal<String>,
+    can_edit: Signal<bool>,
+    state: InlineTextEdit,
+) -> impl IntoView {
+    use crate::components::description::MarkdownDescription;
+
+    let project_id = StoredValue::new(project_id);
+    let saving = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let displayed = RwSignal::new(description.get_untracked());
+    Effect::new(move || {
+        let external = description.get();
+        // Live updates are visible in display mode; never overwrite a draft.
+        displayed.set(external);
+        if !can_edit.get() {
+            state.close();
+        }
+    });
+    let begin_edit = move || {
+        if can_edit.get_untracked() {
+            state.draft.set(displayed.get_untracked());
+            error.set(None);
+            state.editing.set(true);
+        }
+    };
+    let on_change: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text| {
+        if can_edit.get_untracked() {
+            state.draft.set(text);
+        }
+    });
+    let save = move || {
+        if !can_edit.get_untracked() || saving.get_untracked() {
+            return;
+        }
+        let text = state.draft.get_untracked();
+        if text == displayed.get_untracked() {
+            state.close();
+            return;
+        }
+        saving.set(true);
+        error.set(None);
+        let id = project_id.get_value();
+        leptos::task::spawn_local(async move {
+            match update_project(
+                id,
+                None,
+                Some(text.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(_) => {
+                    // Keep edits typed during the request instead of closing
+                    // their editor when the earlier save acknowledges.
+                    if displayed.try_set(text.clone()).is_some() {
+                        return;
+                    }
+                    if state.draft.try_get_untracked().as_ref() == Some(&text) {
+                        state.close();
+                    }
+                }
+                Err(failure) => {
+                    tracing::warn!("Failed to update project description: {failure}");
+                    if error.try_set(Some(
+                        "Could not save description. Please try again.".to_string(),
+                    )).is_some() {
+                        return;
+                    }
+                }
+            }
+            if saving.try_set(false).is_some() {
+                tracing::debug!("Description editor unmounted before save completed");
+            }
+        });
+    };
+
+    view! {
+        <section class="mt-4 min-w-0" aria-label="Project description">
+            <Show when=move || state.editing.get() fallback=move || view! {
+                <Show when=move || !displayed.get().is_empty() fallback=move || view! {
+                    <Show when=move || can_edit.get()>
+                        <Button variant=ButtonVariant::GhostMuted size=ButtonSize::Sm on:click=move |_| begin_edit()>
+                            "Add a description..."
+                        </Button>
+                    </Show>
+                }>
+                    <MarkdownDescription content=Signal::derive(move || displayed.get()) readonly=true/>
+                    <Show when=move || can_edit.get()>
+                        <Button variant=ButtonVariant::GhostMuted size=ButtonSize::Sm on:click=move |_| begin_edit()>
+                            "Edit description"
+                        </Button>
+                    </Show>
+                </Show>
+            }>
+                <MarkdownDescription content=Signal::derive(move || state.draft.get()) on_change=on_change.clone() autofocus=true/>
+                <div class="flex items-center gap-2 mt-2">
+                    <Button variant=ButtonVariant::Secondary size=ButtonSize::Sm disabled=Signal::derive(move || saving.get()) on:click=move |_| save()>
+                        "Save"
+                    </Button>
+                    <Button variant=ButtonVariant::GhostMuted size=ButtonSize::Sm disabled=Signal::derive(move || saving.get()) on:click=move |_| {
+                        state.draft.set(displayed.get_untracked());
+                        state.close();
+                        error.set(None);
+                    }>
+                        "Cancel"
+                    </Button>
+                </div>
+                {move || error.get().map(|message| view! { <p class="text-sm text-error-foreground" role="alert">{message}</p> })}
+            </Show>
+        </section>
+    }
+}
 
 /// A single tab button in the project detail view switcher.
 ///
@@ -936,11 +1302,13 @@ fn MilestoneSection(
     milestones: Vec<ProjectMilestone>,
     issues: Vec<IssueWithDetails>,
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
+    /// Which row is being renamed, what the add form holds, and which milestone
+    /// a delete is being confirmed for. Owned by `ProjectDetailPage` — this
+    /// component is reconstructed on every `project_milestone` frame, so state
+    /// created here would be discarded mid-edit. See `ProjectEditState`.
+    state: MilestoneEditState,
 ) -> impl IntoView {
-    // ── State signals ──────────────────────────────────────────────────────
-    let editing_milestone_id: RwSignal<Option<String>> = RwSignal::new(None);
-    let adding_milestone: RwSignal<bool> = RwSignal::new(false);
-    let deleting_milestone_id: RwSignal<Option<String>> = RwSignal::new(None);
+    let deleting_milestone_id = state.deleting_id;
 
     // Refetch callback used after mutations.
     let refetch = move || server_milestones.refetch();
@@ -993,6 +1361,8 @@ fn MilestoneSection(
 
                     let ms_id_edit = ms_id.clone();
                     let ms_id_delete = ms_id.clone();
+                    let ms_name_edit = ms_name.clone();
+                    let ms_date_edit = ms_target_date.clone();
 
                     view! {
                         <MilestoneRow
@@ -1002,9 +1372,17 @@ fn MilestoneSection(
                             done_count=done
                             total_count=total
                             all_done=all_done
-                            editing_milestone_id=editing_milestone_id
+                            state=state
                             on_edit=Callback::new(move |()| {
-                                editing_milestone_id.set(Some(ms_id_edit.clone()));
+                                // Seeding the draft here — rather than from an
+                                // `Effect` inside the row — is what lets the
+                                // draft be hoisted: entering edit mode happens
+                                // only through this callback.
+                                state.begin_edit(
+                                    ms_id_edit.clone(),
+                                    ms_name_edit.clone(),
+                                    ms_date_edit.clone(),
+                                );
                             })
                             on_delete=Callback::new(move |()| {
                                 deleting_milestone_id.set(Some(ms_id_delete.clone()));
@@ -1017,14 +1395,14 @@ fn MilestoneSection(
 
             // ── Add milestone form / button ─────────────────────────────
             <Show
-                when=move || adding_milestone.get()
+                when=move || state.adding.get()
                 fallback=move || {
                     view! {
                         <div class="mt-2">
                             <Button
                                 variant=ButtonVariant::GhostMuted
                                 size=ButtonSize::Sm
-                                on:click=move |_| adding_milestone.set(true)
+                                on:click=move |_| state.adding.set(true)
                             >
                                 <Icon icon=phosphor_leptos::PLUS size="14px"/>
                                 "Add milestone"
@@ -1035,7 +1413,7 @@ fn MilestoneSection(
             >
                 <AddMilestoneForm
                     project_id=project_id.clone()
-                    adding_milestone=adding_milestone
+                    state=state
                     server_milestones=server_milestones
                 />
             </Show>
@@ -1088,10 +1466,16 @@ fn HealthUpdateSection(
     project_id: String,
     updates: Vec<ProjectUpdate>,
     server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
+    /// The composer's draft, owned by `ProjectDetailPage`. This section has the
+    /// same defect as `MilestoneSection` had — it is reconstructed whenever any
+    /// of the page's resources settles, including on a `project_update` frame —
+    /// so a colleague posting an update discarded whatever was half-written
+    /// here. See `ProjectEditState`.
+    draft: UpdateDraft,
 ) -> impl IntoView {
-    let posting_update: RwSignal<bool> = RwSignal::new(false);
-    let post_health: RwSignal<String> = RwSignal::new("on_track".to_string());
-    let post_body: RwSignal<String> = RwSignal::new(String::new());
+    let posting_update = draft.posting;
+    let post_health = draft.health;
+    let post_body = draft.body;
 
     let pid = StoredValue::new(project_id.clone());
     let do_post = move || {
@@ -1106,11 +1490,7 @@ fn HealthUpdateSection(
         let pid_c = pid.get_value();
         leptos::task::spawn_local(async move {
             match create_project_update(pid_c, health_val, body_param).await {
-                Ok(_) => {
-                    posting_update.set(false);
-                    post_health.set("on_track".to_string());
-                    post_body.set(String::new());
-                }
+                Ok(_) => draft.reset(),
                 Err(e) => {
                     leptos::logging::warn!("Failed to create project update: {e}");
                 }
@@ -1179,9 +1559,7 @@ fn HealthUpdateSection(
                 }
             >
                 <PostUpdateForm
-                    posting_update=posting_update
-                    post_health=post_health
-                    post_body=post_body
+                    draft=draft
                     on_post=Callback::new(move |()| do_post())
                 />
             </Show>
@@ -1193,16 +1571,12 @@ fn HealthUpdateSection(
 /// body textarea, and Post/Cancel action buttons.
 #[component]
 fn PostUpdateForm(
-    posting_update: RwSignal<bool>,
-    post_health: RwSignal<String>,
-    post_body: RwSignal<String>,
+    draft: UpdateDraft,
     on_post: Callback<()>,
 ) -> impl IntoView {
-    let cancel = move || {
-        posting_update.set(false);
-        post_health.set("on_track".to_string());
-        post_body.set(String::new());
-    };
+    let post_health = draft.health;
+    let post_body = draft.body;
+    let cancel = move || draft.reset();
 
     view! {
         <div class="mt-2 border border-border rounded-md p-3">
@@ -1266,6 +1640,260 @@ fn PostUpdateForm(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Project Members Section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Project members section — lists project members with role display,
+/// inline add-member flow, and remove-member with confirmation.
+///
+/// Follows the same section pattern as `MilestoneSection` and
+/// `HealthUpdateSection`: heading + list + add button/form.
+#[component]
+fn ProjectMembersSection(
+    project_id: String,
+    members: Vec<ProjectMember>,
+    server_members: Resource<Result<Vec<ProjectMember>, ServerFnError>>,
+    workspace_members: Resource<Result<Vec<WorkspaceMember>, ServerFnError>>,
+    /// Whether the add-member picker is open and which member a removal is
+    /// being confirmed for. Owned by `ProjectDetailPage` for the same reason as
+    /// the milestone state — see `ProjectEditState`.
+    state: MemberEditState,
+) -> impl IntoView {
+    let adding_member = state.adding;
+    let removing_member_id = state.removing_id;
+
+    let has_members = !members.is_empty();
+    let pid = StoredValue::new(project_id.clone());
+    let initial_members = StoredValue::new(members);
+
+    // Refetch callback used after mutations.
+    let refetch = move || server_members.refetch();
+
+    // ── Resolve workspace member display name by user_id ──────────────────
+    let resolve_name = move |user_id: &str| -> String {
+        match workspace_members.get() {
+            Some(Ok(ws_members)) => {
+                ws_members
+                    .iter()
+                    .find(|m| m.user_id == user_id)
+                    .map(|m| m.name.clone().unwrap_or_else(|| m.email.clone()))
+                    .unwrap_or_else(|| user_id.to_string())
+            }
+            _ => user_id.to_string(),
+        }
+    };
+
+    // ── Delete confirmation ────────────────────────────────────────────────
+    let delete_dialog_open = Signal::derive(move || removing_member_id.get().is_some());
+
+    let on_confirm_remove = {
+        Callback::new(move |()| {
+            if let Some(uid) = removing_member_id.get_untracked() {
+                removing_member_id.set(None);
+                let project_id = pid.get_value();
+                leptos::task::spawn_local(async move {
+                    if let Err(e) = remove_project_member(project_id, uid).await {
+                        leptos::logging::warn!("Failed to remove project member: {e}");
+                    }
+                    refetch();
+                });
+            }
+        })
+    };
+
+    let on_cancel_remove = Callback::new(move |()| {
+        removing_member_id.set(None);
+    });
+
+    // ── Role change handler ───────────────────────────────────────────────
+    // Since there is no update_role endpoint, changing a role requires
+    // removing and re-adding the member with the new role.
+    let on_role_change = move |user_id: String, new_role: String| {
+        let project_id = pid.get_value();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = remove_project_member(project_id.clone(), user_id.clone()).await {
+                leptos::logging::warn!("Failed to remove member for role change: {e}");
+                return;
+            }
+            if let Err(e) = add_project_member(project_id, user_id, new_role).await {
+                leptos::logging::warn!("Failed to re-add member with new role: {e}");
+            }
+            refetch();
+        });
+    };
+
+    // ── Add member handler ────────────────────────────────────────────────
+    let add_member_value = state.add_value;
+
+    // Options for the add-member Select: workspace members not already in
+    // the project.
+    let add_member_options = Signal::derive(move || {
+        let current_members: Vec<String> = match server_members.get() {
+            Some(Ok(pm)) => pm.iter().map(|m| m.user_id.clone()).collect(),
+            _ => initial_members.get_value().iter().map(|m| m.user_id.clone()).collect(),
+        };
+        let mut opts = vec![("".to_string(), "Select a member...".to_string())];
+        if let Some(Ok(ws_members)) = workspace_members.get() {
+            for m in ws_members {
+                if !current_members.contains(&m.user_id) {
+                    let label = m.name.unwrap_or_else(|| m.email.clone());
+                    opts.push((m.user_id, label));
+                }
+            }
+        }
+        opts
+    });
+
+    let on_add_member_select = Callback::new(move |selected_user_id: String| {
+        if selected_user_id.is_empty() {
+            return;
+        }
+        add_member_value.set(String::new());
+        adding_member.set(false);
+        let project_id = pid.get_value();
+        leptos::task::spawn_local(async move {
+            if let Err(e) = add_project_member(project_id, selected_user_id, "member".to_string()).await {
+                leptos::logging::warn!("Failed to add project member: {e}");
+            }
+            refetch();
+        });
+    });
+
+    // ── Role options for the per-row Select ───────────────────────────────
+    let role_options: Signal<Vec<(String, String)>> = Signal::derive(|| vec![
+        ("member".to_string(), "Member".to_string()),
+        ("lead".to_string(), "Lead".to_string()),
+    ]);
+
+    let members_for_view = initial_members.get_value();
+
+    view! {
+        <div class="mt-6">
+            <h3 class="text-sm font-medium text-foreground mb-3">"Members"</h3>
+
+            // ── Member rows ──────────────────────────────────────────────
+            {if has_members {
+                Some(view! {
+                    <div class="flex flex-col">
+                        {members_for_view.iter().map(|member| {
+                            let uid_remove = member.user_id.clone();
+                            let uid_role = member.user_id.clone();
+                            let member_name = resolve_name(&member.user_id);
+                            let role_value = RwSignal::new(member.role.clone());
+
+                            view! {
+                                <div class="flex items-center gap-2 py-1.5 border-b border-border group">
+                                    // Member name
+                                    <span class="text-sm text-foreground flex-1 truncate">
+                                        {member_name}
+                                    </span>
+
+                                    // Role selector
+                                    <div class="w-28">
+                                        <Select
+                                            value=Signal::derive(move || role_value.get())
+                                            options=role_options
+                                            on_change={
+                                                Callback::new(move |new_role: String| {
+                                                    let old_role = role_value.get_untracked();
+                                                    if new_role == old_role {
+                                                        return;
+                                                    }
+                                                    on_role_change(uid_role.clone(), new_role);
+                                                })
+                                            }
+                                            variant=SelectVariant::Form
+                                        />
+                                    </div>
+
+                                    // Remove button
+                                    <span class="opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                                        <Button
+                                            variant=ButtonVariant::GhostMuted
+                                            size=ButtonSize::IconXs
+                                            aria_label="Remove member"
+                                            on:click=move |_| {
+                                                removing_member_id.set(Some(uid_remove.clone()));
+                                            }
+                                        >
+                                            <Icon icon=phosphor_leptos::X size="14px"/>
+                                        </Button>
+                                    </span>
+                                </div>
+                            }
+                        }).collect_view()}
+                    </div>
+                })
+            } else {
+                None
+            }}
+
+            // ── Empty state ──────────────────────────────────────────────
+            {if !has_members {
+                Some(view! {
+                    <p class="text-sm text-muted-foreground/60 italic">"No members added yet"</p>
+                })
+            } else {
+                None
+            }}
+
+            // ── Add member form / button ─────────────────────────────────
+            <Show
+                when=move || adding_member.get()
+                fallback=move || {
+                    view! {
+                        <div class={if has_members { "mt-2" } else { "mt-1" }}>
+                            <Button
+                                variant=ButtonVariant::GhostMuted
+                                size=ButtonSize::Sm
+                                on:click=move |_| adding_member.set(true)
+                            >
+                                <Icon icon=phosphor_leptos::PLUS size="14px"/>
+                                "Add member"
+                            </Button>
+                        </div>
+                    }
+                }
+            >
+                <div class="mt-2 flex items-center gap-2">
+                    <div class="w-56">
+                        <Select
+                            value=Signal::derive(move || add_member_value.get())
+                            options=add_member_options
+                            on_change=on_add_member_select
+                            variant=SelectVariant::Form
+                            placeholder="Select a member..."
+                            search_placeholder="Search members..."
+                        />
+                    </div>
+                    <Button
+                        variant=ButtonVariant::GhostMuted
+                        size=ButtonSize::Sm
+                        on:click=move |_| {
+                            add_member_value.set(String::new());
+                            adding_member.set(false);
+                        }
+                    >
+                        "Cancel"
+                    </Button>
+                </div>
+            </Show>
+        </div>
+
+        // ── Remove confirmation dialog ──────────────────────────────────
+        <ConfirmDialog
+            open=delete_dialog_open
+            title="Remove member?"
+            message="This will remove the member from this project."
+            confirm_text="Remove"
+            destructive=true
+            on_confirm=on_confirm_remove
+            on_cancel=on_cancel_remove
+        />
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Milestone Row
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1281,29 +1909,23 @@ fn MilestoneRow(
     done_count: usize,
     total_count: usize,
     all_done: bool,
-    editing_milestone_id: RwSignal<Option<String>>,
+    /// The page-level milestone interaction state. The row reads which id is
+    /// being edited and the shared name/date draft out of it rather than owning
+    /// them, so a sync frame reconstructing this row does not reset the edit.
+    state: MilestoneEditState,
     on_edit: Callback<()>,
     on_delete: Callback<()>,
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
 ) -> impl IntoView {
+    let editing_milestone_id = state.editing_id;
     let mid = milestone_id.clone();
     let is_editing = Signal::derive(move || {
         editing_milestone_id.get().as_deref() == Some(&mid)
     });
 
-    // ── Edit state signals ──
-    let edit_name = RwSignal::new(name.clone());
-    let edit_date = RwSignal::new(target_date.clone());
-
-    // Reset edit fields when entering edit mode.
-    let name_for_reset = name.clone();
-    let date_for_reset = target_date.clone();
-    Effect::new(move || {
-        if is_editing.get() {
-            edit_name.set(name_for_reset.clone());
-            edit_date.set(date_for_reset.clone());
-        }
-    });
+    // Seeded by `MilestoneEditState::begin_edit` on the way into edit mode.
+    let edit_name = state.edit_name;
+    let edit_date = state.edit_date;
 
     // ── Save handler ──
     // Store originals so the save closure can be called multiple times (Fn, not FnOnce).
@@ -1484,11 +2106,13 @@ fn MilestoneRow(
 #[component]
 fn AddMilestoneForm(
     project_id: String,
-    adding_milestone: RwSignal<bool>,
+    /// The page-level milestone interaction state. The form's draft lives there
+    /// so a sync frame arriving mid-typing cannot close the form or empty it.
+    state: MilestoneEditState,
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
 ) -> impl IntoView {
-    let new_name = RwSignal::new(String::new());
-    let new_date: RwSignal<Option<String>> = RwSignal::new(None);
+    let new_name = state.new_name;
+    let new_date = state.new_date;
 
     let pid = project_id.clone();
     let do_create = move || {
@@ -1497,7 +2121,8 @@ fn AddMilestoneForm(
             return;
         }
         let date_val = new_date.get_untracked();
-        adding_milestone.set(false);
+        // Read both drafts first: this clears them.
+        state.close_add();
 
         let pid_c = pid.clone();
         leptos::task::spawn_local(async move {
@@ -1517,7 +2142,7 @@ fn AddMilestoneForm(
             }
             "Escape" => {
                 ev.prevent_default();
-                adding_milestone.set(false);
+                state.close_add();
             }
             _ => {}
         }
@@ -1554,7 +2179,7 @@ fn AddMilestoneForm(
             <Button
                 variant=ButtonVariant::GhostMuted
                 size=ButtonSize::Sm
-                on:click=move |_| adding_milestone.set(false)
+                on:click=move |_| state.close_add()
             >
                 "Cancel"
             </Button>
@@ -1651,6 +2276,164 @@ fn ProjectIssueRow(issue: IssueWithDetails) -> impl IntoView {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Project Settings Content
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Settings tab content for a project — archive/unarchive and delete.
+///
+/// Layout follows the same Card pattern used in `team_settings.rs`.
+#[component]
+fn ProjectSettingsContent(
+    project: Project,
+    /// Whether the delete confirmation is open. Owned by `ProjectDetailPage`:
+    /// held here, an arriving sync frame reconstructed this component and shut
+    /// the dialog under the user's cursor. See `ProjectEditState`.
+    confirming_delete: RwSignal<bool>,
+) -> impl IntoView {
+    let project_id = StoredValue::new(project.project_id.clone());
+    let project_name = StoredValue::new(project.name.clone());
+    let is_archived = RwSignal::new(project.archived_at.is_some());
+
+    let nav = use_navigate();
+    let store = use_context::<crate::cache::store::SyncStore>();
+
+    // ── Archive handler ────────────────────────────────────────────────────
+    let on_archive_toggle = move |_| {
+        let pid = project_id.get_value();
+        let currently_archived = is_archived.get_untracked();
+        let archive = !currently_archived;
+        is_archived.set(archive);
+        leptos::task::spawn_local(async move {
+            if let Err(e) = archive_project(pid, archive).await {
+                tracing::warn!(error = %e, "Failed to archive/unarchive project");
+                is_archived.set(!archive);
+            }
+        });
+    };
+
+    // ── Delete confirmation ────────────────────────────────────────────────
+    let confirm_message = format!(
+        "Are you sure you want to delete \"{}\"? Issues linked to this project will be \
+         unlinked. This action cannot be undone.",
+        project_name.get_value(),
+    );
+
+    let on_confirm_delete = {
+        let nav = nav.clone();
+        Callback::new(move |()| {
+            confirming_delete.set(false);
+            let pid = project_id.get_value();
+            let nav = nav.clone();
+            leptos::task::spawn_local(async move {
+                match delete_project(pid.clone()).await {
+                    Ok(()) => {
+                        if let Some(store) = store {
+                            store.remove_project(&pid);
+                        }
+                        nav("/projects", Default::default());
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to delete project");
+                    }
+                }
+            });
+        })
+    };
+
+    let on_cancel_delete = Callback::new(move |()| {
+        confirming_delete.set(false);
+    });
+
+    view! {
+        <div class="space-y-6">
+            // ── Archive card ───────────────────────────────────────────────
+            <Card>
+                <CardHeader>
+                    <CardTitle>"Archive project"</CardTitle>
+                    <CardDescription>
+                        "Archived projects are hidden from the project list and sidebar. \
+                         You can unarchive a project at any time."
+                    </CardDescription>
+                </CardHeader>
+                <CardContent>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm font-medium text-foreground">
+                                {move || if is_archived.get() {
+                                    "This project is archived"
+                                } else {
+                                    "Archive this project"
+                                }}
+                            </p>
+                            <p class="text-xs text-muted-foreground">
+                                {move || if is_archived.get() {
+                                    "Unarchive to restore the project to the active list."
+                                } else {
+                                    "Archived projects remain accessible via the filter toggle."
+                                }}
+                            </p>
+                        </div>
+                        <Button
+                            variant={if project.archived_at.is_some() {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Default
+                            }}
+                            on:click=on_archive_toggle
+                        >
+                            {move || if is_archived.get() {
+                                "Unarchive"
+                            } else {
+                                "Archive"
+                            }}
+                        </Button>
+                    </div>
+                </CardContent>
+            </Card>
+
+            // ── Danger Zone card ───────────────────────────────────────────
+            <Card>
+                <CardHeader>
+                    <CardTitle>
+                        <span class="text-error-foreground">"Danger Zone"</span>
+                    </CardTitle>
+                    <CardDescription>
+                        "Destructive actions that cannot be undone."
+                    </CardDescription>
+                </CardHeader>
+                <CardContent>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm font-medium text-foreground">"Delete this project"</p>
+                            <p class="text-xs text-muted-foreground">
+                                "Permanently delete this project. Issues will be unlinked but not deleted."
+                            </p>
+                        </div>
+                        <Button
+                            variant=ButtonVariant::Destructive
+                            on:click=move |_| confirming_delete.set(true)
+                        >
+                            "Delete project"
+                        </Button>
+                    </div>
+                </CardContent>
+            </Card>
+        </div>
+
+        // ── Delete confirmation dialog ─────────────────────────────────────
+        <ConfirmDialog
+            open=Signal::derive(move || confirming_delete.get())
+            title="Delete project?"
+            message=confirm_message
+            confirm_text="Delete"
+            destructive=true
+            on_confirm=on_confirm_delete
+            on_cancel=on_cancel_delete
+        />
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Not Found State
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1677,5 +2460,481 @@ fn ProjectNotFound() -> impl IntoView {
                 "Back to Projects"
             </Button>
         </div>
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Do the view tabs survive a resource settling?
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The runtime half of TRA-10032's audit.
+///
+/// Reading the code does not settle the question on its own. The closure that
+/// builds the two view tabs is `ProjectDetailContent`'s `{move || …}` at the
+/// "View content" comment above, and its body reads exactly one thing —
+/// `active_view`. Nothing about a resource appears anywhere in it, which reads
+/// as "these tabs re-run when you change tab, and at no other time".
+///
+/// That reading is wrong, and this module is what shows it. `ProjectDetailPage`
+/// builds `ProjectDetailContent` *inside* its six-resource content closure, so
+/// a settling resource reconstructs `ProjectDetailContent`, and a dynamic
+/// child's `Render::rebuild` in `tachys` is
+/// `let new = self.build(); … old.unmount();` — an unconditional fresh build,
+/// not a reuse. So the tab's component function runs again and every signal
+/// declared in its body comes back at its initial value, however few things its
+/// own closure reads.
+///
+/// Each test mounts the real `ProjectBoardContent` / `ProjectListView` in that
+/// nesting and, in the same subtree, a probe that keeps its text in a signal
+/// declared in its own body — the shape the tabs had before this ticket. One
+/// resource settling has to leave the tab's filter box alone and clear the
+/// probe. The probe is not decoration: without it a passing run cannot
+/// distinguish "the state survived the rebuild" from "no rebuild happened", and
+/// the second would make the assertion worthless.
+///
+/// Both were run against a variant that keeps the current signatures and puts
+/// the filters back in the component bodies — the pre-hoist behaviour, isolated
+/// from every other difference. Both failed, on every run, and failed on the
+/// *last* assertion: `content_builds` was 2 and the probe was empty, so the
+/// rebuild was measured and it was the filter alone that did not survive it.
+///
+/// What these do not cover is the nesting itself: `ContentShim` stands where
+/// `ProjectDetailContent` stands, so a refactor that took the view tabs out
+/// from under the content closure would leave them passing and pointless. The
+/// production chain is asserted end-to-end, on a real sync frame between two
+/// windows, by `e2e/tests/sync/project-view-state.spec.ts`.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod view_tab_rebuild_tests {
+    use gloo_timers::future::TimeoutFuture;
+    use leptos::prelude::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use crate::pages::projects::project_board::{BoardViewState, ProjectBoardContent};
+    use crate::pages::projects::project_list_view::{ListViewState, ProjectListView};
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// What gets typed into both boxes.
+    const TYPED: &str = "half-typed filter";
+    /// The probe's placeholder, used to find it in the DOM.
+    const PROBE_PLACEHOLDER: &str = "body-owned probe";
+
+    /// A field that keeps its text in a signal declared in its own body.
+    ///
+    /// This is what `ProjectBoardContent` and `ProjectListView` looked like
+    /// before their filters were hoisted, reduced to the one observable part.
+    #[component]
+    fn BodyOwnedProbe() -> impl IntoView {
+        let text = RwSignal::new(String::new());
+        view! {
+            <input
+                type="text"
+                placeholder=PROBE_PLACEHOLDER
+                prop:value=move || text.get()
+                on:input=move |ev| text.set(event_target_value(&ev))
+            />
+        }
+    }
+
+    /// Stands in for `ProjectDetailContent`: a component built inside the
+    /// resource-reading closure, holding the `{move || active_view…}` dynamic
+    /// child that builds whichever view tab is showing.
+    ///
+    /// Its closure reads `active_view` and nothing else, which is the whole
+    /// point — that is the shape that reads as safe.
+    #[component]
+    fn ContentShim(
+        active_view: Memo<String>,
+        board: BoardViewState,
+        list: ListViewState,
+    ) -> impl IntoView {
+        let project_id = Signal::derive(|| "project-under-test".to_owned());
+        let milestones = Signal::derive(Vec::new);
+        view! {
+            {move || {
+                match active_view.get().as_str() {
+                    "board" => view! {
+                        <ProjectBoardContent project_id=project_id state=board/>
+                        <BodyOwnedProbe/>
+                    }.into_any(),
+                    _ => view! {
+                        <ProjectListView
+                            project_id=project_id
+                            milestones=milestones
+                            state=list
+                        />
+                        <BodyOwnedProbe/>
+                    }.into_any(),
+                }
+            }}
+        }
+    }
+
+    /// The one `<input>` in `container` carrying `placeholder`.
+    fn input_by_placeholder(
+        container: &web_sys::HtmlElement,
+        placeholder: &str,
+    ) -> web_sys::HtmlInputElement {
+        container
+            .query_selector(&format!("input[placeholder=\"{placeholder}\"]"))
+            .expect("querying the mounted subtree for a filter box")
+            .unwrap_or_else(|| panic!("no input with placeholder {placeholder:?} is rendered"))
+            .dyn_into()
+            .expect("the element found by placeholder is an input")
+    }
+
+    /// Type `text` into `input` the way a user does — set the value, then let
+    /// the `on:input` handler read it back off the event target.
+    ///
+    /// The event has to bubble: Leptos delegates `input` to a listener on the
+    /// document, so a non-bubbling event would reach no handler and the test
+    /// would measure a box nobody had typed into.
+    fn type_into(input: &web_sys::HtmlInputElement, text: &str) {
+        input.set_value(text);
+        let event = web_sys::Event::new("input").expect("constructing an input event");
+        event.init_event_with_bubbles("input", true);
+        input
+            .dispatch_event(&event)
+            .expect("dispatching the input event to the filter box");
+    }
+
+    /// What the two boxes hold after one resource settles under them.
+    struct Outcome {
+        /// The value in the view tab's own filter box.
+        tab_filter: String,
+        /// The value in the body-owned probe beside it.
+        probe: String,
+        /// How many times the resource-reading closure produced content.
+        content_builds: u32,
+    }
+
+    /// Mount the production nesting, type into both boxes, then make the
+    /// resource settle again.
+    ///
+    /// `tab` selects which view tab `ContentShim` builds; `placeholder`
+    /// identifies that tab's filter box.
+    async fn one_resource_settling(tab: &'static str, placeholder: &'static str) -> Outcome {
+        let container = mount_container();
+
+        // `ProjectDetailPage` has six of these. One is enough: the closure is
+        // rebuilt by whichever of them moves, so the other five would only
+        // repeat what this one already shows.
+        let version = RwSignal::new(0u32);
+        let resource = Resource::new(move || version.get(), move |v| async move { v });
+        let content_builds = RwSignal::new(0u32);
+
+        let active_view = Memo::new(move |_| tab.to_owned());
+        let board = BoardViewState::default();
+        let list = ListViewState::default();
+
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                {move || match resource.get() {
+                    None => view! { <p>"Loading..."</p> }.into_any(),
+                    Some(_) => {
+                        content_builds.update_untracked(|n| *n += 1);
+                        view! {
+                            <ContentShim active_view=active_view board=board list=list/>
+                        }.into_any()
+                    }
+                }}
+            }
+        });
+
+        // The fetcher resolves on a macrotask, so the first content build has
+        // to be waited for rather than assumed.
+        TimeoutFuture::new(150).await;
+        type_into(&input_by_placeholder(&container, placeholder), TYPED);
+        type_into(&input_by_placeholder(&container, PROBE_PLACEHOLDER), TYPED);
+        TimeoutFuture::new(30).await;
+
+        // A colleague's change lands: the resource re-fetches and settles.
+        version.set(1);
+        TimeoutFuture::new(150).await;
+
+        let outcome = Outcome {
+            tab_filter: input_by_placeholder(&container, placeholder).value(),
+            probe: input_by_placeholder(&container, PROBE_PLACEHOLDER).value(),
+            content_builds: content_builds.get_untracked(),
+        };
+        drop(handle);
+        container.remove();
+        outcome
+    }
+
+    /// Assert the parts every one of these tests shares.
+    fn assert_rebuilt_and_kept(outcome: &Outcome, what: &str) {
+        assert_eq!(
+            outcome.content_builds, 2,
+            "the resource-reading closure did not produce content twice, so no rebuild was \
+             measured and the rest of this test proves nothing"
+        );
+        assert_eq!(
+            outcome.probe, "",
+            "the probe kept its text, which means the view tab beside it was never rebuilt. \
+             Either the nesting changed or the settle did not happen — either way the \
+             assertion below would pass without testing anything"
+        );
+        assert_eq!(
+            outcome.tab_filter, TYPED,
+            "{what} was discarded by a resource settling under it. It has to be owned by \
+             `ProjectDetailPage` — see `ProjectEditState` — because the closure that builds \
+             this tab is inside `ProjectDetailPage`'s six-resource content closure, however \
+             little the tab's own closure reads"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_boards_filter_survives_a_resource_settling() {
+        boot_leptos_executor();
+        let outcome = one_resource_settling("board", "Filter cards...").await;
+        assert_rebuilt_and_kept(&outcome, "the board's card filter");
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_lists_filter_survives_a_resource_settling() {
+        boot_leptos_executor();
+        let outcome = one_resource_settling("list", "Filter issues...").await;
+        assert_rebuilt_and_kept(&outcome, "the list's issue filter");
+    }
+}
+
+/// Component coverage runs in the existing WASM Browser Tests CI workflow.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod description_tests {
+    use super::{InlineTextEdit, ProjectDescription};
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
+    use gloo_timers::future::TimeoutFuture;
+    use leptos::prelude::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    const MARKDOWN: &str = include_str!("../../../tests/fixtures/project-description.md");
+
+    fn click(container: &web_sys::HtmlElement, label: &str) {
+        let buttons = container
+            .query_selector_all("button")
+            .expect("finding description buttons");
+        for index in 0..buttons.length() {
+            let button = buttons
+                .item(index)
+                .expect("button at the selected index")
+                .dyn_into::<web_sys::HtmlElement>()
+                .expect("description button is an HTML element");
+            if button.text_content().unwrap_or_default().trim() == label {
+                button.click();
+                return;
+            }
+        }
+        panic!("description button {label} was not rendered");
+    }
+
+    #[wasm_bindgen_test]
+    async fn stored_markdown_renders_without_changing_source_and_cancel_discards_draft() {
+        boot_leptos_executor();
+        let container = mount_container();
+        let source = RwSignal::new(MARKDOWN.to_string());
+        let state = InlineTextEdit::new();
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                <ProjectDescription project_id="fixture-project".to_string()
+                    description=Signal::derive(move || source.get())
+                    can_edit=Signal::stored(true) state=state/>
+            }
+        });
+        TimeoutFuture::new(100).await;
+        for selector in [
+            "h1",
+            "h2",
+            "strong",
+            "em",
+            "ul li",
+            "ol li",
+            "table",
+            "pre code",
+            "blockquote",
+        ] {
+            assert!(
+                container
+                    .query_selector(selector)
+                    .expect("querying rendered Markdown")
+                    .is_some(),
+                "missing {selector}"
+            );
+        }
+        let link = container
+            .query_selector("a[href='https://example.com/storage']")
+            .expect("querying rendered storage link")
+            .expect("Markdown link remains independently clickable");
+        assert_eq!(link.text_content().as_deref(), Some("Storage guide"));
+        assert_eq!(source.get_untracked(), MARKDOWN);
+        assert!(
+            container
+                .query_selector("[contenteditable='true']")
+                .expect("querying edit surface")
+                .is_none()
+        );
+        click(&container, "Edit description");
+        TimeoutFuture::new(40).await;
+        assert_eq!(state.draft.get_untracked(), MARKDOWN);
+        state.draft.set("# Unsaved replacement".to_string());
+        TimeoutFuture::new(40).await;
+        click(&container, "Cancel");
+        TimeoutFuture::new(40).await;
+        assert_eq!(source.get_untracked(), MARKDOWN);
+        assert_eq!(state.draft.get_untracked(), MARKDOWN);
+        assert!(!state.editing.get_untracked());
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn keyed_project_updates_keep_draft_editor_dom_focus_and_selection() {
+        boot_leptos_executor();
+        let container = mount_container();
+        let source = RwSignal::new(MARKDOWN.to_string());
+        let unrelated = RwSignal::new(0u32);
+        let state = InlineTextEdit::new();
+        // Same identity boundary as ProjectDetailPage: resource snapshots may
+        // change while the project key remains the same.
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                <For each=move || { source.get(); vec!["fixture-project".to_string()] }
+                    key=|id| id.clone() children=move |id| view! {
+                        <ProjectDescription project_id=id
+                            description=Signal::derive(move || source.get())
+                            can_edit=Signal::stored(true) state=state/>
+                        {move || view! { <span>{unrelated.get()}</span> }}
+                    }/>
+            }
+        });
+        TimeoutFuture::new(100).await;
+        click(&container, "Edit description");
+        TimeoutFuture::new(40).await;
+        state.draft.set("A half typed draft".to_string());
+        TimeoutFuture::new(40).await;
+        let editor = container
+            .query_selector("[contenteditable='true']")
+            .expect("finding the active description editor")
+            .expect("editing mounts the kode editor")
+            .dyn_into::<web_sys::HtmlElement>()
+            .expect("the editor is an HTML element");
+        editor
+            .focus()
+            .expect("focusing the active description editor");
+        let document = container
+            .owner_document()
+            .expect("mounted container has a document");
+        let text = editor
+            .query_selector("p")
+            .expect("finding draft paragraph")
+            .expect("draft paragraph is rendered")
+            .first_child()
+            .expect("draft paragraph has text");
+        let range = document
+            .create_range()
+            .expect("creating a draft caret range");
+        range.set_start(&text, 5).expect("placing the draft caret");
+        range.collapse_with_to_start(true);
+        let selection = document
+            .get_selection()
+            .expect("reading browser selection")
+            .expect("browser provides selection");
+        selection
+            .remove_all_ranges()
+            .expect("clearing the browser selection");
+        selection
+            .add_range(&range)
+            .expect("installing the draft caret");
+        unrelated.set(1);
+        source.set("# Colleague changed the persisted description".to_string());
+        TimeoutFuture::new(100).await;
+        let current = container
+            .query_selector("[contenteditable='true']")
+            .expect("finding description after updates")
+            .expect("the draft editor stays mounted");
+        assert!(editor.is_same_node(Some(&current)));
+        assert!(
+            document
+                .active_element()
+                .expect("description retains focus")
+                .is_same_node(Some(&editor))
+        );
+        assert_eq!(selection.anchor_offset(), 5);
+        assert_eq!(state.draft.get_untracked(), "A half typed draft");
+        click(&container, "Cancel");
+        TimeoutFuture::new(40).await;
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Colleague changed the persisted description")
+        );
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn read_only_and_empty_descriptions_have_correct_affordances() {
+        boot_leptos_executor();
+        let container = mount_container();
+        let source = RwSignal::new(String::new());
+        let can_edit = RwSignal::new(false);
+        let state = InlineTextEdit::new();
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                <ProjectDescription project_id="fixture-project".to_string()
+                    description=Signal::derive(move || source.get())
+                    can_edit=Signal::derive(move || can_edit.get()) state=state/>
+            }
+        });
+        TimeoutFuture::new(60).await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Add a description")
+        );
+        source.set(MARKDOWN.to_string());
+        TimeoutFuture::new(60).await;
+        assert!(
+            container
+                .query_selector("h1")
+                .expect("finding read-only heading")
+                .is_some()
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Edit description")
+        );
+        assert!(
+            container
+                .query_selector("[contenteditable='true']")
+                .expect("querying read-only surface")
+                .is_none()
+        );
+        source.set(String::new());
+        can_edit.set(true);
+        TimeoutFuture::new(60).await;
+        click(&container, "Add a description...");
+        TimeoutFuture::new(40).await;
+        assert!(state.editing.get_untracked());
+        can_edit.set(false);
+        TimeoutFuture::new(60).await;
+        assert!(!state.editing.get_untracked());
+        assert!(
+            container
+                .query_selector("[contenteditable='true']")
+                .expect("querying surface after access revocation")
+                .is_none()
+        );
+        drop(handle);
+        container.remove();
     }
 }

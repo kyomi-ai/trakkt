@@ -228,6 +228,7 @@ async fn github_webhook(
                     inst,
                     action.as_deref().unwrap_or(""),
                     &payload,
+                    Some(&state.ws_manager),
                 )
                 .await;
 
@@ -266,7 +267,7 @@ async fn github_webhook(
         // Push events — extract refs from branch names and commit messages
         "push" => {
             if let Some(inst) = &installation {
-                Some(trakkt_github::events::process_push(&state.db, inst, &payload).await)
+                Some(trakkt_github::events::process_push(&state.db, inst, &payload, Some(&state.ws_manager)).await)
             } else {
                 tracing::warn!(event = %event_key, "push event with no installation — marking processed");
                 Some(Ok(()))
