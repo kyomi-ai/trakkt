@@ -59,6 +59,7 @@ pub async fn test_state() -> AppState {
 
     AppState {
         ws_manager: WebSocketManager::new(None, db.clone()),
+        connect_manager: trakkt_auth::connect_manager::ConnectManager::new(),
         mcp_sessions: MCPSessionManager::new(kv.clone()),
         // A valid 32-byte AES key, but deliberately not the one `config` names:
         // decoding `config.encryption_key` needs `base64`, which is a regular
