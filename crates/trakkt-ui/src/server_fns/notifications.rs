@@ -85,9 +85,14 @@ pub async fn count_unread_notifications() -> Result<i64, ServerFnError> {
 #[server(prefix = "/leptos-api")]
 pub async fn mark_notification_read(notification_id: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    trakkt_auth::notification_service::mark_as_read(ac.db(), &notification_id, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::mark_as_read(
+        ac.db(),
+        &notification_id,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -95,9 +100,13 @@ pub async fn mark_notification_read(notification_id: String) -> Result<(), Serve
 #[server(prefix = "/leptos-api")]
 pub async fn mark_all_notifications_read() -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
-    trakkt_auth::notification_service::mark_all_as_read(ac.db(), &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::mark_all_as_read(
+        ac.db(),
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -126,9 +135,14 @@ fn parse_notification_ids(raw: &str) -> Result<Vec<String>, ServerFnError> {
 pub async fn bulk_mark_notifications_read(notification_ids: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let ids = parse_notification_ids(&notification_ids)?;
-    trakkt_auth::notification_service::bulk_mark_as_read(ac.db(), &ids, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::bulk_mark_as_read(
+        ac.db(),
+        &ids,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -139,9 +153,14 @@ pub async fn bulk_mark_notifications_read(notification_ids: String) -> Result<()
 pub async fn bulk_mark_notifications_unread(notification_ids: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let ids = parse_notification_ids(&notification_ids)?;
-    trakkt_auth::notification_service::bulk_mark_as_unread(ac.db(), &ids, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::bulk_mark_as_unread(
+        ac.db(),
+        &ids,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -152,9 +171,14 @@ pub async fn bulk_mark_notifications_unread(notification_ids: String) -> Result<
 pub async fn bulk_delete_notifications(notification_ids: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let ids = parse_notification_ids(&notification_ids)?;
-    trakkt_auth::notification_service::bulk_delete_notifications(ac.db(), &ids, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::bulk_delete_notifications(
+        ac.db(),
+        &ids,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 
@@ -165,9 +189,14 @@ pub async fn bulk_delete_notifications(notification_ids: String) -> Result<(), S
 pub async fn bulk_restore_notifications(notification_ids: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let ids = parse_notification_ids(&notification_ids)?;
-    trakkt_auth::notification_service::bulk_restore_notifications(ac.db(), &ids, &ac.auth.user_id)
-        .await
-        .into_sfn()?;
+    trakkt_auth::notification_service::bulk_restore_notifications(
+        ac.db(),
+        &ids,
+        &ac.auth.user_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
     Ok(())
 }
 

@@ -262,18 +262,22 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) -> StoreDi
                     // same list, so it shares the counter — one counter per
                     // reader, not per entity type.
                     //
-                    // This arm only runs when the frame carries a payload, and
-                    // `attach_to_issue` in
-                    // `crates/trakkt-auth/src/attachment_service.rs` records the
-                    // link with `None`. So the paths that are live today are the
-                    // `Delete` arm below (an unlink) and the attachment insert an
-                    // upload emits alongside its link. Sending the junction row
-                    // here is the server's half — `add_project_member` in
-                    // `project_service.rs` already does exactly that for the
-                    // membership its own arm depends on — and it is tracked as
-                    // TRA-9979. Handling it here is what leaves that a change to
-                    // one service function rather than a second silent gap to
-                    // rediscover.
+                    // This arm only runs when the frame carries a payload, which
+                    // is why TRA-9979 was a change to the server and not to this
+                    // module. Until it, `attach_to_issue` in
+                    // `crates/trakkt-auth/src/attachment_service.rs` recorded the
+                    // link with `None`, so this arm was unreachable for a link
+                    // made against a file that already existed — the live paths
+                    // were the `Delete` arm below (an unlink) and the attachment
+                    // insert an upload emits alongside its link. It now sends the
+                    // junction row, exactly as `add_project_member` in
+                    // `project_service.rs` already did for the membership its own
+                    // arm depends on.
+                    //
+                    // `entity_data` is deliberately not read here, for the same
+                    // reason as the milestone and member arms: the counter is
+                    // what the reader subscribes to, and the payload's job is to
+                    // get execution past the guard above at all.
                     store.bump_attachments_version();
                 }
                 et if et == entity_types::NOTIFICATION_PREFERENCES => {
@@ -659,6 +663,39 @@ mod test_support {
     // and a reader is a reactive signal. So their payloads are wasm-only; built
     // on the native target they are three functions nothing calls.
 
+    /// The payload the notification state changes send, with `read` set by the
+    /// caller.
+    ///
+    /// Serialized from the real model rather than written out as JSON, for the
+    /// same reason [`issue_activity_json`] is: every one of
+    /// `notification_service`'s six state changes reads the row back and hands
+    /// it to `sync_log_service::sync_payload`, which is `serde_json::to_value`
+    /// over exactly this type — so a renamed field moves this fixture and the
+    /// wire together instead of leaving the two agreeing only by hand.
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn notification_json(read: bool) -> serde_json::Value {
+        let notification = trakkt_types::models::Notification {
+            notification_id: "ntf-1".to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            user_id: "usr-alice".to_owned(),
+            issue_id: "issue-1".to_owned(),
+            notification_type: "assigned".to_owned(),
+            read,
+            issue_title: Some("A leaky issue".to_owned()),
+            issue_number: Some(42),
+            team_key: Some("TRA".to_owned()),
+            actor_id: Some("usr-bob".to_owned()),
+            actor_name: Some("Bob".to_owned()),
+            action_source: trakkt_types::enums::ActionSource::User,
+            action_source_label: None,
+            created_at: "2026-07-26T00:00:00Z".to_owned(),
+            deleted_at: None,
+            context_id: None,
+        };
+        serde_json::to_value(&notification)
+            .expect("serializing a Notification the way `sync_payload` does")
+    }
+
     /// The payload `create_attachment` sends, as the wire carries it.
     #[cfg(target_arch = "wasm32")]
     pub(super) fn attachment_json() -> serde_json::Value {
@@ -695,14 +732,17 @@ mod test_support {
         })
     }
 
-    /// The snapshot `update_workspace_name` and `update_workspace_settings`
-    /// both send — the shape `WorkspaceSnapshotRow::into_sync_value` builds.
+    /// The snapshot `update_workspace_name`, `update_workspace_settings` and
+    /// `set_workspace_default_team` all send — the shape
+    /// `WorkspaceSnapshotRow::into_snapshot` builds, encoded from
+    /// `trakkt_types::models::WorkspaceSettingsSnapshot`.
     #[cfg(target_arch = "wasm32")]
     pub(super) fn workspace_settings_json() -> serde_json::Value {
         serde_json::json!({
             "workspace_id": "ws-1",
             "name": "Renamed Workspace",
             "settings": {"default_auto_archive_days": 30},
+            "default_team_id": "team-1",
             "updated_at": "2026-07-26T00:00:00Z",
         })
     }
@@ -1787,8 +1827,9 @@ mod tests {
     /// `match`, so a persisted type with no arm had its row written and removed
     /// by nothing — `attachment`, `issue_relation`, `notification_preferences`
     /// and `workspace_settings` were all in that state, and `issue_attachment`
-    /// would have joined them the moment TRA-9979 gave it a payload. A reset was
-    /// the only thing that ever cleared them.
+    /// would have joined them when TRA-9979 gave it a payload had TRA-9966 not
+    /// put it on `NOT_CACHED` first. A reset was the only thing that ever
+    /// cleared them.
     #[test]
     fn a_delete_removes_every_row_the_write_path_persists() {
         for entity_type in entity_types::ALL {
@@ -1921,9 +1962,10 @@ mod wasm_tests {
     /// `version` — its uploads and detaches — is held still here, so the only
     /// thing that can move this tuple is a frame from the sync stream.
     /// Each counter is resolved once, outside the closure, exactly as the pages
-    /// do it — the getters build a fresh owner-registered `Signal` wrapper per
-    /// call, so calling one from inside a closure that re-runs is a different
-    /// (and wrong) shape from the one under test.
+    /// do it. Since TRA-9996 the getters return `ArcSignal<u32>`, which has no
+    /// owner, so resolving one inside the closure would behave identically. The
+    /// shape is matched to the pages so this rebuild stays a rebuild of what the
+    /// pages actually do — not because one of the two forms is unsafe.
     fn attachment_list_source(store: SyncStore) -> Signal<(String, i32, u32, u32)> {
         let version = store.attachments_version();
         Signal::derive(move || ("TRA".to_owned(), 42, 0, version.get()))
@@ -1940,8 +1982,8 @@ mod wasm_tests {
     ///
     /// The counter is resolved once here, outside the closure, which is how
     /// `IssueTimeline` reads it too — TRA-9991 hoisted it out of the source
-    /// closure, so this rebuild now matches the page shape for shape. See the
-    /// getter contract on [`SyncStore`].
+    /// closure, so this rebuild matches the page shape for shape. See the getter
+    /// notes on [`SyncStore`].
     fn issue_timeline_source(store: SyncStore) -> Signal<(String, i32, u32)> {
         let version = store.activities_version();
         Signal::derive(move || ("TRA".to_owned(), 42, version.get()))
@@ -2086,18 +2128,23 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     fn a_link_frame_without_a_payload_still_reaches_nothing() {
-        // Not a gap in this module: the data-less guard is deliberate, and it is
-        // what stops a payload-less frame from burning a sync id and advancing
-        // every client's watermark past a change it never delivered.
+        // Kept, and kept asserting the same thing, after TRA-9979 sent the
+        // payload from the server. What changed is the server, not this guard:
+        // the guard is deliberate — it is what stops a payload-less frame from
+        // burning a sync id and advancing every client's watermark past a change
+        // it never delivered — and it is precisely why the payload is
+        // load-bearing rather than decorative. Weakening it to "a link frame now
+        // reaches the counter" would only restate
+        // `linking_an_attachment_to_an_issue_refetches_the_list` above, and would
+        // delete the one assertion that says what a `None` payload costs.
         //
-        // It does mean `attach_to_issue` in `crates/trakkt-auth/src/attachment_service.rs`
-        // has a live gap of its own: it records the link with `None`, so the
-        // link half of the arm above cannot run for a link made through the API
-        // or an agent. Uploads are unaffected — they emit an `attachment` insert
-        // with a payload alongside — and an unlink needs no payload. Sending the
-        // junction row here is the server's half, exactly as `add_project_member`
-        // already does. That is tracked as TRA-9979; this test is what makes the
-        // gap visible rather than silent until it lands.
+        // What this test cannot do is catch the server regressing to `None`
+        // again — nothing on this side of the wire can. That half is
+        // `issue_attach_frame_carries_the_new_link` and
+        // `delta_carries_the_junction_row_for_a_link_to_an_existing_attachment`
+        // in `crates/trakkt-auth/src/sync_log_service.rs`, which assert the live
+        // frame and the persisted entry respectively. The pair is the invariant;
+        // this is the half that says why it matters.
         let observed = observe(&action_with_id(
             entity_types::ISSUE_ATTACHMENT,
             "issue-1:att-1",
@@ -2319,5 +2366,90 @@ mod wasm_tests {
         assert!(!observed.activities);
         assert!(!observed.notification_preferences);
         assert!(!observed.workspace_settings);
+    }
+
+    // ── notification (TRA-9974) ─────────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn a_notification_update_frame_reaches_the_store() {
+        // The NOTIFICATION update arm and `notification`'s absence from
+        // `NOT_CACHED` were both established by reading the code. TRA-9938 and
+        // TRA-9940 each found a client arm missing for a type that looked
+        // supported that way, so this asserts it instead.
+        with_store(|store| {
+            // The tab already holds the notification unread, as a bootstrap or
+            // an insert frame would have left it.
+            let held_before: trakkt_types::models::Notification =
+                serde_json::from_value(notification_json(false))
+                    .expect("the unread notification the second tab starts with");
+            store.upsert_notification(held_before);
+
+            apply_action_to_memory(
+                &store,
+                &action_with_id(
+                    entity_types::NOTIFICATION,
+                    "ntf-1",
+                    SyncActionType::Update,
+                    Some(notification_json(true)),
+                ),
+            );
+
+            let held = store.notifications().get_untracked();
+            assert_eq!(
+                held.len(),
+                1,
+                "the update must replace the row it already held, not append a \
+                 second copy of the same notification: {held:?}"
+            );
+            assert_eq!(held[0].notification_id, "ntf-1");
+            assert!(
+                held[0].read,
+                "the read state has to reach the store — this signal is what the \
+                 inbox and the unread badge render, so a frame that stops short \
+                 of it leaves the other tab showing the notification unread, \
+                 which is the bug TRA-9974 reports"
+            );
+        });
+    }
+
+    #[wasm_bindgen_test]
+    fn a_soft_deleted_notification_frame_keeps_the_row_and_stamps_it() {
+        // A soft-delete arrives as an `Update` carrying `deleted_at`, not as a
+        // `Delete`. That distinction is what `issue_service::delete_issue`'s
+        // cascade comment depends on: the row stays in the client's cache, so
+        // the cascade that later destroys it still has to send a `Delete`.
+        with_store(|store| {
+            let live: trakkt_types::models::Notification =
+                serde_json::from_value(notification_json(false))
+                    .expect("the live notification the tab starts with");
+            store.upsert_notification(live);
+
+            let mut dismissed = notification_json(false);
+            dismissed["deleted_at"] = serde_json::Value::String("2026-07-26T01:00:00Z".to_owned());
+
+            apply_action_to_memory(
+                &store,
+                &action_with_id(
+                    entity_types::NOTIFICATION,
+                    "ntf-1",
+                    SyncActionType::Update,
+                    Some(dismissed),
+                ),
+            );
+
+            let held = store.notifications().get_untracked();
+            assert_eq!(
+                held.len(),
+                1,
+                "an update never evicts — only the delete arm calls \
+                 `remove_notification_in_memory`: {held:?}"
+            );
+            assert_eq!(
+                held[0].deleted_at.as_deref(),
+                Some("2026-07-26T01:00:00Z"),
+                "the dismissal has to reach the row itself, since that is what \
+                 the inbox filters on"
+            );
+        });
     }
 }

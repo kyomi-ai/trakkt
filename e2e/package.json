@@ -16,10 +16,10 @@
     "report": "npx playwright show-report"
   },
   "devDependencies": {
-    "@playwright/test": "^1.60.0",
-    "otplib": "^13.4.0"
+    "@playwright/test": "^1.62.1",
+    "otplib": "^13.4.1"
   },
   "dependencies": {
-    "argon2": "^0.44.0"
+    "argon2": "^0.45.1"
   }
 }

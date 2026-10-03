@@ -5679,6 +5679,7 @@ name = "trakkt-ui"
 version = "0.1.0"
 dependencies = [
  "any_spawner",
+ "arborium-sysroot",
  "axum",
  "base64 0.22.1",
  "chrono",

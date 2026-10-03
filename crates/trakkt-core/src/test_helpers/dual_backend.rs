@@ -16,6 +16,22 @@
 //! assertion holds on both, and only a shared body can keep answering it after
 //! someone edits one half.
 //!
+//! # What this module is not
+//!
+//! It is a harness, not a guarantee. It runs the bodies it is given, and the
+//! bodies live in `apps/server/tests/postgres_dialect.rs` — 25 of them as of
+//! TRA-10001, against 119 `is_postgres()` call sites and 164 `sql_compat::`
+//! call sites outside the test directories. A green `Postgres Dialect Tests`
+//! job therefore says those 25 bodies passed on both backends. It does not say
+//! the Postgres arms are covered, and reading it that way is how a suite built
+//! for exactly one defect class went two years without covering that class:
+//! the `sort_order` FLOAT4 decode named above had no body of its own until
+//! TRA-10001 wrote one.
+//!
+//! `docs/CODING_STANDARDS.md`, "What it covers, and what it does not", carries
+//! the current inventory of both halves. Keep it and this paragraph honest in
+//! the same change that makes them wrong.
+//!
 //! # How to tell whether the Postgres half ran
 //!
 //! From the test output, and only from the test output:

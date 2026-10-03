@@ -159,7 +159,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify sccache can reach GHA cache
         run: |

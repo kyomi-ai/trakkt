@@ -8,6 +8,7 @@
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::FavoriteTarget;
 use trakkt_types::models::{Project, ProjectMember, ProjectMilestone, ProjectProgress, ProjectUpdate};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
@@ -634,17 +635,24 @@ pub async fn delete_project(
         project_id
     )?;
 
+    // `favorites` used to be listed below as deliberately *not* given an entry,
+    // on the ground that this DELETE cascaded nothing there — `target_id` has no
+    // foreign key to `projects` in either dialect — so an entry would have
+    // reported a deletion that never happened. That reasoning was right and its
+    // conclusion has been overtaken: TRA-10025 made the deletion real. The rows
+    // are read here and removed below, so the entries that follow describe a
+    // removal this function genuinely performed.
+    //
+    // Read before the DELETE, like every other id captured above: afterwards
+    // nothing connects a favorite to the project it named. Nothing is removed
+    // yet — `delete_and_record` does both halves at once, so the rows cannot go
+    // without the entries that evict them from their owners' caches.
+    let doomed_favorites =
+        crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::Project, project_id)
+            .await?;
+
     // Deliberately *not* given an entry:
     //
-    // * `favorites` — a favourited project is stored as `(target_type,
-    //   target_id)` with no foreign key to `projects` in either dialect, so this
-    //   DELETE cascades nothing there and the row survives. `favorite` is cached
-    //   (it is not on `NOT_CACHED`, and `sync_bootstrap` streams it), and the
-    //   surviving row is now stale — but it is an orphan the schema leaves
-    //   behind, not a removal this function performed, and a FAVORITE delete
-    //   entry here would report a deletion that did not happen and would silently
-    //   diverge the cache from the table. That is a defect in its own right and
-    //   is reported separately rather than papered over here.
     // * `notifications` — `context_id` is plain TEXT with no foreign key
     //   (`migrations-sqlite/20260610400000_notification_context_id.sql`), so a
     //   project delete cascades nothing there either. Notifications are removed
@@ -767,6 +775,14 @@ pub async fn delete_project(
             )
             .await?;
     }
+
+    // Last, because it is the one group whose entries are not workspace-wide: a
+    // favorite is private to whoever pinned it, so each row's entry is addressed
+    // to its own owner (see `DoomedFavorites::delete_and_record`). A project
+    // pinned by four members is four rows and four entries.
+    doomed_favorites
+        .delete_and_record(&mut tx, &mut batch)
+        .await?;
 
     batch.commit_and_deliver(tx, ws_manager).await
 }

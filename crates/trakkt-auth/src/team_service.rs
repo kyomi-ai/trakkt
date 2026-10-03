@@ -9,10 +9,12 @@
 use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::FavoriteTarget;
 use trakkt_types::models::{IssueTeamMember, Team, TeamSettings, WorkspaceSettings};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
 use crate::sync_log_service;
+use crate::sync_log_service::CascadedIdRow;
 use crate::websocket::WebSocketManager;
 
 // ─── Row type ────────────────────────────────────────────────────────────────
@@ -113,14 +115,23 @@ async fn get_team_tx(tx: &mut DbTx, team_id: &str) -> trakkt_core::Result<Team> 
 }
 
 /// Finish a team mutation that has already run its UPDATE on `tx`: read the
-/// team back, log the change, commit, then broadcast.
+/// team back, then hand the transaction to
+/// [`sync_log_service::commit_and_deliver`], which logs the change, commits and
+/// delivers it.
 ///
-/// Every single-statement team update ends this way, and the ordering is the
-/// part that has to be right every time — the read and the `sync_log` entry
-/// inside the transaction so the change and the row that replays it commit
-/// together, the broadcast strictly after the commit so it carries a `sync_id`
-/// that exists and so it never runs while the transaction holds the SQLite
-/// connection (see [`DbTx`]).
+/// Every single-statement team update ends this way — rename, key change, icon
+/// set/upload/delete and `update_team_settings` all land here — so the read-back
+/// is what this function is for. The ordering that has to be right every time is
+/// not: `commit_and_deliver` owns it, and owns the pairing of the persisted
+/// `visibility_user_id` column with the live frame's recipients. Before
+/// TRA-10039 this hand-rolled its own `write_sync_entry_in_tx` and broadcast,
+/// which is how the audience came to disagree: the entry persisted
+/// membership-scoped (narrowed at read time by `ENTRIES_SINCE_SQL`) while the
+/// broadcast went to every member of the workspace.
+///
+/// The read has to run on the transaction — the new state is not visible on the
+/// pool until the commit — and both the stored entry and the live frame carry
+/// the full team, which the client skips either of without.
 ///
 /// Takes the transaction by value: committing it is part of the job, and no
 /// caller has anything left to do on it.
@@ -130,36 +141,19 @@ async fn commit_team_update(
     workspace_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Team> {
-    // Read the updated row before the sync log write: both the stored entry and
-    // the live frame carry the full team, and the client skips either without it.
     let team = get_team_tx(&mut tx, team_id).await?;
-    let payload = team_payload_value(&team);
 
-    let sync_id = sync_log_service::write_sync_entry_in_tx(
-        &mut tx,
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::TEAM,
         team_id,
         workspace_id,
-        None,
+        sync_log_service::SyncAudience::Team(team_id),
         SyncActionType::Update,
-        payload.clone(),
+        team_payload_value(&team),
+        ws_manager,
     )
     .await?;
-
-    tx.commit().await?;
-
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::TEAM,
-            team_id,
-            SyncActionType::Update,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
 
     Ok(team)
 }
@@ -262,49 +256,52 @@ pub async fn create_team(
     let team = get_team_tx(&mut tx, &team_id).await?;
     let payload = team_payload_value(&team);
 
-    // The broadcast below carries the Insert entry's sync_id: it is the Insert
-    // frame, and a client that spots the gap re-fetches from there, which also
-    // picks up the member-add Update entry written just after it.
-    let sync_id = sync_log_service::write_sync_entry_in_tx(
-        &mut tx,
-        entity_types::TEAM,
-        &team_id,
-        params.workspace_id,
-        None,
-        SyncActionType::Insert,
-        payload.clone(),
-    )
-    .await?;
+    // Two entries, one commit, so this is a `SyncBatch` rather than a
+    // `commit_and_deliver`. Both are audienced to the team: the batch resolves
+    // `team_members` after the commit that inserted the creator, so the creator
+    // is the one recipient. Every other workspace member is a non-member of a
+    // team that may be private, which is TRA-10039.
+    //
+    // With no `creator_id` the team has no members and these frames reach
+    // nobody, which is right rather than a hole: a memberless team is invisible
+    // to `list_teams(.., Some(user))` on bootstrap and to `ENTRIES_SINCE_SQL`'s
+    // membership predicate on delta, so there is no user who would have kept it.
+    //
+    // Both entries are delivered, where the hand-rolled broadcast this replaces
+    // sent only the `Insert`. That is the point of routing through the batch: a
+    // persisted entry with no live frame is the same audience disagreement in
+    // the other direction. The two carry the same payload and the client's TEAM
+    // arm is an `upsert_team`, so the second is idempotent — and a client
+    // catching up on delta has always received both.
+    let mut batch = sync_log_service::SyncBatch::new();
 
-    if params.creator_id.is_some() {
-        sync_log_service::write_sync_entry_in_tx(
+    batch
+        .record(
             &mut tx,
             entity_types::TEAM,
             &team_id,
             params.workspace_id,
-            None,
-            SyncActionType::Update,
+            sync_log_service::SyncAudience::Team(&team_id),
+            SyncActionType::Insert,
             payload.clone(),
         )
         .await?;
+
+    if params.creator_id.is_some() {
+        batch
+            .record(
+                &mut tx,
+                entity_types::TEAM,
+                &team_id,
+                params.workspace_id,
+                sync_log_service::SyncAudience::Team(&team_id),
+                SyncActionType::Update,
+                payload,
+            )
+            .await?;
     }
 
-    tx.commit().await?;
-
-    // The broadcast reaches for the socket, so it follows the commit and
-    // carries the sync_id that was actually committed.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            params.workspace_id,
-            entity_types::TEAM,
-            &team_id,
-            SyncActionType::Insert,
-            payload,
-            sync_id,
-        )
-        .await;
-    }
+    batch.commit_and_deliver(tx, ws_manager).await?;
 
     Ok(team)
 }
@@ -689,8 +686,9 @@ pub async fn delete_team_icon(
 
 /// Delete a team and optionally reassign its issues to another team.
 ///
-/// Steps, in order. Everything up to and including 5 runs on the pool; 6 is one
-/// transaction; 7 follows its commit.
+/// Steps, in order. 1–4 run on the pool; 5 is a transaction of its own that
+/// commits and broadcasts before 6 opens; 6 is one transaction; 7 follows its
+/// commit.
 /// 1. Verify the team exists and belongs to this workspace
 /// 2. Prevent deletion of the last team in a workspace
 /// 3. Refuse to strand issues: a team with issues needs a reassign target
@@ -806,14 +804,32 @@ pub async fn delete_team(
 
     // 5. Optionally set a new workspace default team.
     //
-    // This runs on the pool, so it cannot move inside the transaction below, and
-    // it does not need to: it writes no `sync_log` row of its own, so it is not
-    // part of the atomicity this function owes the sync stream. It stays ahead
-    // of the team delete exactly as it was, and touches only `workspaces` —
-    // disjoint from every table the transaction writes.
+    // Since TRA-9978 this call is its own atomic unit: it opens a transaction,
+    // writes `workspaces.default_team_id` with a WORKSPACE_SETTINGS `sync_log`
+    // entry beside it, commits, and broadcasts — all before the transaction
+    // below opens. So it is no longer true that it writes no sync row; what
+    // remains true is that its row is not part of *this* function's transaction,
+    // and cannot be.
+    //
+    // It cannot move inside step 6 for two reasons. It takes a `&DbPool` and
+    // owns a transaction internally, so calling it from inside an open one would
+    // reach for the pool while step 6 holds SQLite's single connection (see
+    // `DbTx`). And it performs its own commit-and-broadcast, which must not run
+    // while another transaction is open.
+    //
+    // The ordering is therefore unchanged from before: the default-team change
+    // lands first and independently, and touches only `workspaces` — disjoint
+    // from every table step 6 writes. A failure in step 6 leaves the new default
+    // team standing, which was already the case and is the honest outcome: the
+    // workspace default genuinely did change.
     if let Some(new_default_id) = new_workspace_default_id {
-        crate::workspace_service::set_workspace_default_team(db, workspace_id, new_default_id)
-            .await?;
+        crate::workspace_service::set_workspace_default_team(
+            db,
+            workspace_id,
+            new_default_id,
+            ws_manager,
+        )
+        .await?;
     }
 
     // 6. Everything that writes a `sync_log` row is one transaction: the issue
@@ -822,9 +838,50 @@ pub async fn delete_team(
     //    longer exists, or a deleted team no client is ever told about.
     let mut tx = db.begin().await?;
 
-    // Reassigned issues, held until the commit — the broadcasts below cannot run
-    // while the transaction is open.
-    let mut reassigned: Vec<(String, Option<serde_json::Value>, i64)> = Vec::new();
+    // Every favorite this delete strands, read before anything is removed —
+    // afterwards nothing connects a favorite to what it named. Two sources, and
+    // the second is the one that is easy to miss:
+    //
+    // * the team itself, pinned as `('team', team_id)`;
+    // * every view scoped to this team. `views.team_id` is `ON DELETE CASCADE`
+    //   in both dialects — Postgres always had it and
+    //   `migrations-sqlite/20260803100000_dual_backend_fk_parity.sql` gave
+    //   SQLite the same, which `deleting_a_team_deletes_the_views_scoped_to_it`
+    //   (`apps/server/tests/postgres_dialect.rs`) holds — so the `DELETE FROM
+    //   teams` below takes those views with it. A favorite pinning one is
+    //   stranded exactly as if the view had been deleted directly, and
+    //   `delete_view` is never reached to notice.
+    //
+    // Nothing is removed here; `delete_and_record` below does the DELETE and
+    // writes the entry that evicts each row from its owner's cache, so the two
+    // cannot come apart. Before TRA-10025 this was a bare `DELETE FROM favorites
+    // WHERE target_type = 'team'` with no entry at all and no view arm — the
+    // rows vanished server-side and stayed in every owner's IndexedDB.
+    let team_scoped_view_ids: Vec<CascadedIdRow> = trakkt_core::tx_fetch_all!(
+        &mut tx,
+        CascadedIdRow,
+        "SELECT view_id AS id FROM views WHERE team_id = $1",
+        team_id
+    )?;
+
+    let mut doomed_favorites = vec![
+        crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::Team, team_id)
+            .await?,
+    ];
+    for view in &team_scoped_view_ids {
+        doomed_favorites.push(
+            crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::View, &view.id)
+                .await?,
+        );
+    }
+
+    // One issue entry per reassignment plus the team's own delete, against a
+    // single commit — `SyncBatch`'s exact shape. It holds every entry until the
+    // commit, which is not a convenience: `broadcast_raw_to_workspace` resolves
+    // its recipients from the pool, and on SQLite this transaction is holding
+    // the only connection (see `DbTx`). `record` takes no `WebSocketManager`, so
+    // inside the loop below there is nothing to deliver with.
+    let mut batch = sync_log_service::SyncBatch::new();
 
     if let Some((target_team_id, issue_ids, status_id)) = &reassignment {
         // Reassign each issue one at a time so team-scoped numbers are sequential.
@@ -848,28 +905,27 @@ pub async fn delete_team(
             // anywhere else yet.
             let payload = crate::issue_service::issue_sync_payload_tx(&mut tx, issue_id).await?;
 
-            let sync_id = sync_log_service::write_sync_entry_in_tx(
-                &mut tx,
-                entity_types::ISSUE,
-                issue_id,
-                workspace_id,
-                None,
-                SyncActionType::Update,
-                payload.clone(),
-            )
-            .await?;
-
-            reassigned.push((issue_id.clone(), payload, sync_id));
+            batch
+                .record(
+                    &mut tx,
+                    entity_types::ISSUE,
+                    issue_id,
+                    workspace_id,
+                    sync_log_service::SyncAudience::Workspace,
+                    SyncActionType::Update,
+                    payload,
+                )
+                .await?;
         }
     }
 
-    // Delete favorites referencing this team. `favorites.target_id` is
-    // polymorphic and carries no foreign key, so nothing cascades it.
-    trakkt_core::tx_execute!(
-        &mut tx,
-        "DELETE FROM favorites WHERE target_type = 'team' AND target_id = $1",
-        team_id
-    )?;
+    // Delete the favorites read above, each with the entry that evicts it from
+    // its owner's cache. Ahead of the `DELETE FROM teams` below only for
+    // symmetry with the other three delete paths; `favorites.target_id` carries
+    // no foreign key, so the order does not matter to the database.
+    for doomed in &doomed_favorites {
+        doomed.delete_and_record(&mut tx, &mut batch).await?;
+    }
 
     // Clear default_team_id on any users who had this team as default.
     // `users.default_team_id` is a plain column with no foreign key either.
@@ -887,45 +943,34 @@ pub async fn delete_team(
 
     // Sync log for the team delete, after the DELETE it describes — the same
     // order as `issue_service::delete_issue`.
-    let sync_id = sync_log_service::write_sync_entry_in_tx(
-        &mut tx,
-        entity_types::TEAM,
-        team_id,
-        workspace_id,
-        None,
-        SyncActionType::Delete,
-        None,
-    )
-    .await?;
-
-    tx.commit().await?;
-
-    // 7. Broadcast, now that every id above addresses a committed row.
-    if let Some(ws) = ws_manager {
-        for (issue_id, payload, issue_sync_id) in reassigned {
-            sync_log_service::broadcast_sync_action(
-                ws,
-                workspace_id,
-                entity_types::ISSUE,
-                &issue_id,
-                SyncActionType::Update,
-                payload,
-                issue_sync_id,
-            )
-            .await;
-        }
-
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
+    //
+    // `Workspace`, not `Team`, and that is not an oversight left over from
+    // TRA-10039. `teams` has just been deleted and `team_members` declares
+    // `ON DELETE CASCADE` on `teams(team_id)`, so the membership rows a `Team`
+    // audience would resolve are already gone — it would deliver this to nobody
+    // and leave the deleted team in every remaining member's cache with nothing
+    // able to remove it. `ENTRIES_SINCE_SQL` exempts `action = 'delete'` from
+    // its membership predicate for exactly that reason, so the workspace-wide
+    // audience here is what makes the live frame and the delta agree. The
+    // payload is `None`, so reaching a non-member discloses a UUID and nothing
+    // else. `deleting_a_team_reaches_a_non_member_live`
+    // (`apps/server/tests/sync_ws.rs`) fails if this is narrowed.
+    batch
+        .record(
+            &mut tx,
             entity_types::TEAM,
             team_id,
+            workspace_id,
+            sync_log_service::SyncAudience::Workspace,
             SyncActionType::Delete,
             None,
-            sync_id,
         )
-        .await;
-    }
+        .await?;
+
+    // 7. Commit, then deliver every entry recorded above — the batch owns that
+    //    ordering, and the `SyncAudience` values above are what decide who each
+    //    frame reaches. Nothing is delivered if the commit fails.
+    batch.commit_and_deliver(tx, ws_manager).await?;
 
     Ok(())
 }
@@ -1077,6 +1122,22 @@ impl MembershipChange {
 ///
 /// The `Delete` carries no payload, matching `delete_team`'s: neither the
 /// memory nor the cache half of the client's `Delete` arm reads `action.data`.
+///
+/// ## Audiences
+///
+/// The `Update` is [`sync_log_service::SyncAudience::Team`] and the `Delete` is
+/// [`sync_log_service::SyncAudience::User`]. Neither is a behaviour change from
+/// the `Workspace`/`User` pair this used to pass: `Team` and `Workspace` persist
+/// the same NULL `visibility_user_id`, and the three callers below take no
+/// `WebSocketManager`, so nothing here delivers a live frame either way. What it
+/// changes is that the value now says what the read-time filter already does —
+/// this `Update` reaches the team's members, not the workspace — so if a live
+/// frame is ever wired up here it starts out addressed to the right people
+/// instead of re-opening TRA-10039 by default.
+///
+/// The `Delete` stays `User`: it is the departing member's eviction row, it is
+/// exempt from the membership filter (they are no longer a member), and a `Team`
+/// audience would resolve a set that by construction excludes them.
 async fn write_membership_sync_entry(
     tx: &mut DbTx,
     team: &Team,
@@ -1090,7 +1151,7 @@ async fn write_membership_sync_entry(
         entity_types::TEAM,
         &team.team_id,
         &team.workspace_id,
-        None,
+        sync_log_service::SyncAudience::Team(&team.team_id),
         SyncActionType::Update,
         team_payload_value(team),
     )
@@ -1110,7 +1171,7 @@ async fn write_membership_sync_entry(
             entity_types::TEAM,
             &team.team_id,
             &team.workspace_id,
-            Some(user_id),
+            sync_log_service::SyncAudience::User(user_id),
             SyncActionType::Delete,
             None,
         )
