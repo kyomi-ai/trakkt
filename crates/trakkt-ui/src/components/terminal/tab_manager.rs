@@ -36,7 +36,7 @@ pub fn TabBar(
                             } else { ButtonVariant::GhostMuted }) size=ButtonSize::Sm
                                 attr:role="tab"
                                 attr:data-session-id=tab.session_id
-                                attr:aria-selected=move || active_session.get().as_deref() == Some(aria_id.as_str())
+                                attr:aria-selected=move || (active_session.get().as_deref() == Some(aria_id.as_str())).to_string()
                                 on:click=move |_| on_select.run(select_id.clone())>
                                 <span class="truncate max-w-[180px]">{move || tabs.with(|tabs| tabs.iter()
                                     .find(|tab| tab.session_id == label_id).map(|tab| tab.label.clone()))}</span>

@@ -44,3 +44,7 @@ and temporary personal-mode SQLite database, isolated from the workflow's
 existing server on 3100 and Postgres service. Failures upload the Connect
 Playwright traces and attached fixture logs with the existing E2E artifacts.
 No Claude installation or model request is needed.
+
+A failed Connect run also saves the built server and WASM bundle as
+`connect-acceptance-runtime`, so the exact failed runtime can be reproduced
+without rebuilding it locally.

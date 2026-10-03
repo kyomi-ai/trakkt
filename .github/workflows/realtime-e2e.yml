@@ -299,6 +299,7 @@ jobs:
       # 3441 and agent on 3442. Its environment allowlist excludes this job's
       # Postgres credentials and server configuration on 3100.
       - name: Run Connect real-PTY acceptance
+        id: connect_acceptance
         working-directory: e2e
         env:
           CONNECT_SERVER_BINARY: ${{ github.workspace }}/target/dev-server/trakkt
@@ -321,6 +322,17 @@ jobs:
           path: |
             e2e/test-results/
             server.log
+          retention-days: 7
+
+      - name: Upload the failed Connect runtime
+        if: failure() && steps.connect_acceptance.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: connect-acceptance-runtime
+          path: |
+            target/dev-server/trakkt
+            crates/trakkt-ui/dist/
+          if-no-files-found: error
           retention-days: 7
 
       - name: Stop the server
