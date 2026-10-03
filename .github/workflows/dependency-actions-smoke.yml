@@ -1,0 +1,75 @@
+name: Dependency Actions Smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/dependency-actions-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  artifact-roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create representative realtime E2E artifacts
+        run: |
+          mkdir -p e2e/test-results
+          printf 'artifact probe\n' > e2e/test-results/probe.txt
+          printf 'server probe\n' > server.log
+
+      - name: Upload representative realtime E2E artifacts
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependency-actions-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            e2e/test-results/
+            server.log
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Download the uploaded archive
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.upload.outputs.artifact-id }}
+          path: downloaded
+          digest-mismatch: error
+
+      - name: Verify nested paths and exact contents survived
+        run: |
+          cmp e2e/test-results/probe.txt downloaded/e2e/test-results/probe.txt
+          cmp server.log downloaded/server.log
+          test "$(find downloaded -type f | wc -l)" -eq 2
+
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: 'false'
+      DOCKER_BUILD_SUMMARY: 'false'
+    steps:
+      - name: Create minimal local build context
+        run: |
+          mkdir -p smoke-context
+          printf 'FROM busybox\nRUN true\n' > smoke-context/Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build linux amd64 and exercise scoped GHA cache
+        uses: docker/build-push-action@v7
+        with:
+          context: ./smoke-context
+          file: ./smoke-context/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,version=2,scope=dependency-actions-smoke-${{ github.run_id }}
+          cache-to: type=gha,version=2,mode=max,scope=dependency-actions-smoke-${{ github.run_id }}
