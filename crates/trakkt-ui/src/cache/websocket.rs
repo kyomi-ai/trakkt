@@ -159,6 +159,7 @@ impl WebSocketClient {
     ///
     /// Closes the existing connection and opens a new one with the provided
     /// credentials. The `on_message` callback is preserved across reconnects.
+    /// Cancels any pending auto-reconnect timeout before opening the connection.
     pub fn reconnect(&self, user_id: &str, workspace_id: &str, token: &str) {
         let state = self.inner.with_value(|handle| handle.state.clone());
         let conn_state = self.connection_state.clone();
@@ -176,6 +177,7 @@ impl WebSocketClient {
             s._closures.clear();
             s.connecting = false;
             s.reconnect_attempts = 0;
+            s.reconnect_timeout = None;
         }
 
         do_connect(state, conn_state, user_id, workspace_id, token);
@@ -477,4 +479,66 @@ fn schedule_reconnect(
     });
 
     state.borrow_mut().reconnect_timeout = Some(SendWrapper::new(timeout));
+}
+
+#[cfg(test)]
+mod wasm_tests {
+    use super::*;
+    use gloo_timers::callback::Timeout;
+    use gloo_timers::future::TimeoutFuture;
+    use std::cell::Cell;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    async fn explicit_reconnect_cancels_the_pending_browser_timeout() {
+        let owner = Owner::new();
+        owner.set();
+        let client = disconnected();
+        let retry_fired = Rc::new(Cell::new(false));
+
+        // Retain a real pending Gloo timeout exactly where schedule_reconnect
+        // stores it, observing its callback without fetching a JWT from a server.
+        client.with_state(|state| {
+            let retry_fired = retry_fired.clone();
+            state.borrow_mut().reconnect_timeout =
+                Some(SendWrapper::new(Timeout::new(0, move || {
+                    retry_fired.set(true)
+                })));
+        });
+
+        client.reconnect(
+            "timer-test-user",
+            "timer-test-workspace",
+            "timer-test-token",
+        );
+
+        // Close only the newly dialed socket, without disconnect()'s timeout
+        // cancellation, so its network events cannot schedule another retry
+        // against the browser test harness while we observe the original timer.
+        client.with_state(|state| {
+            let mut state = state.borrow_mut();
+            let ws = state
+                .ws
+                .take()
+                .expect("explicit reconnect creates a socket");
+            ws.set_onclose(None);
+            ws.set_onerror(None);
+            ws.set_onmessage(None);
+            ws.set_onopen(None);
+            ws.close()
+                .expect("closing the test socket before network callbacks");
+            state._closures.clear();
+        });
+
+        // This later browser timer proves we yielded past the pending callback's
+        // deadline; merely checking that the Option is empty would not do that.
+        TimeoutFuture::new(10).await;
+        assert!(
+            !retry_fired.get(),
+            "explicit reconnect must cancel the pending retry"
+        );
+        disconnect(&client);
+    }
 }
