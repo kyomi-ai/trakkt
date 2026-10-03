@@ -22,7 +22,7 @@ use leptos_router::hooks::{use_location, use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant,
+    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CopyLinkButton,
     DatePicker, DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
     LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Select, SelectVariant, Skeleton,
@@ -104,6 +104,16 @@ pub fn IssueDetailPage() -> impl IntoView {
         server_issue.get()
     });
 
+    let copy_path = Signal::derive(move || {
+        let issue = issue_data.get()?.ok()??;
+        crate::components::copy_link::issue_link_path(
+            &team_key.get(),
+            number.get(),
+            &issue.team_key,
+            issue.number,
+        )
+    });
+
     // Only tracks load-state transitions (Loading → Loaded, etc.),
     // not SyncStore data changes. Prevents IssueDetailContent from being
     // recreated on every WebSocket update.
@@ -146,7 +156,7 @@ pub fn IssueDetailPage() -> impl IntoView {
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Header ─────────────────────────────────────────────────────
-            <div class="page-header h-14 px-5 flex items-center gap-3 shrink-0">
+            <div class="page-header min-h-14 px-5 py-2 flex flex-wrap items-center gap-3 shrink-0">
                 <Button
                     variant=ButtonVariant::GhostMuted
                     size=ButtonSize::IconSm
@@ -174,6 +184,7 @@ pub fn IssueDetailPage() -> impl IntoView {
                 >
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>
                 </Button>
+                <CopyLinkButton path=copy_path/>
                 <span class="font-mono text-sm text-muted-foreground">
                     {move || format!("{}-{}", team_key.get(), number.get())}
                 </span>

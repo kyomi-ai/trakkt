@@ -18,7 +18,7 @@ use phosphor_leptos::Icon;
 
 use crate::components::{
     Button, ButtonSize, ButtonVariant, Card, CardContent, CardDescription,
-    CardHeader, CardTitle, ConfirmDialog, DatePicker, EmptyState,
+    CardHeader, CardTitle, ConfirmDialog, CopyLinkButton, DatePicker, EmptyState,
     IssueStatusBadge, IssueStatusVariant, INPUT_CLASS,
     PriorityIndicator, LabelBadge, Select, SelectVariant,
     TeamKeyBadge, ToggleButton,
@@ -350,6 +350,11 @@ pub fn ProjectDetailPage() -> impl IntoView {
         server_project.get()
     });
 
+    let copy_path = Signal::derive(move || {
+        let project = project_data.get()?.ok()??;
+        crate::components::copy_link::project_link_path(&project_id.get(), &project.project_id)
+    });
+
     // Resolve issues for this project from SyncStore or server function.
     let project_issues = Memo::new(move |_| {
         let id = project_id.get();
@@ -436,7 +441,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Header ────────────────────────────────────────────────────
-            <div class="page-header h-14 px-5 flex items-center gap-3 shrink-0">
+            <div class="page-header min-h-14 px-5 py-2 flex flex-wrap items-center gap-3 shrink-0">
                 <Button
                     variant=ButtonVariant::GhostMuted
                     size=ButtonSize::IconSm
@@ -447,6 +452,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
                 >
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>
                 </Button>
+                <CopyLinkButton path=copy_path/>
                 <span class="text-muted-foreground">
                     <Icon icon=phosphor_leptos::FOLDER weight=phosphor_leptos::IconWeight::Duotone size="16px"/>
                 </span>
