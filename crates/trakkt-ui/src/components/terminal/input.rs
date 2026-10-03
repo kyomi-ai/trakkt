@@ -39,12 +39,12 @@ pub fn translate_key(event: &KeyboardEvent, application_cursor_mode: bool) -> Op
     let alt = event.alt_key();
 
     // ── Ctrl+Shift+C → copy (browser handles) ───────────────────────────
-    if ctrl && event.shift_key() && key == "C" {
+    if ctrl && event.shift_key() && key.eq_ignore_ascii_case("c") {
         return None;
     }
 
     // ── Ctrl+V → paste (handled via paste event) ─────────────────────────
-    if ctrl && key == "v" {
+    if ctrl && key.eq_ignore_ascii_case("v") {
         return None;
     }
 

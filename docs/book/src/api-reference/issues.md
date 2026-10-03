@@ -4,7 +4,7 @@
 
 **Operation:** `list_issues`
 
-List issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them.
+Find issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Response shape: `{issues, matched_count, returned_count, truncated}`. Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `status_id`, `status_name`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.
 
 **Scope:** `issues:read`
 
@@ -13,6 +13,7 @@ List issues in the workspace with optional filters. Returns issues ordered by pr
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
 | `assignee` | query | string (nullable) | No | Filter by assignee user ID |
+| `filters` | query | string (nullable) | No | JSON array of composable filter clauses, AND-ed together. Each clause is `{"field","operator","values"}`. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Example: `[{"field":"label","operator":"none_of","values":["label-id-1"]}]` |
 | `include_closed` | query | boolean (nullable) | No | If true, include completed and cancelled issues |
 | `label` | query | string (nullable) | No | Filter by label ID(s). Comma-separated for multiple (OR logic) |
 | `limit` | query | integer (int64) (nullable) | No | Maximum number of issues to return (default: 50, max: 100) |
@@ -81,7 +82,7 @@ Returns `201 Created` on success with the created resource as JSON.
 
 **Operation:** `search_issues`
 
-Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns results ranked by relevance with snippet context showing where the match was found. By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.
+Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total}` where results are ranked by relevance with snippet context, and total is the full match count for pagination. Supports `offset` for pagination. By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.
 
 **Scope:** `issues:read`
 
@@ -93,6 +94,7 @@ Search for issues by text query. Uses full-text search across titles, descriptio
 | `include_closed` | query | boolean (nullable) | No | If true, include completed and cancelled issues |
 | `include_comments` | query | boolean (nullable) | No | Also search comment bodies (default: true) |
 | `limit` | query | integer (int64) (nullable) | No | Max results (default: 20, max: 100) |
+| `offset` | query | integer (int64) (nullable) | No | Offset for pagination (default: 0) |
 | `query` | query | string | Yes | Search text (required) |
 | `team_id` | query | string (nullable) | No | Filter by team ID |
 | `team_key` | query | string (nullable) | No | Filter by team key |
@@ -141,7 +143,7 @@ Returns `200 OK` on success with the result as JSON.
 
 **Operation:** `get_issue`
 
-Get a single issue by its team-scoped identifier (e.g. 'TRA-35'), including full details (description, labels, assignee, creator), all comments, activity log, and relations.
+Read a single issue in full by its team-scoped identifier (e.g. 'TRA-35'). This is the way to get an issue's content: it returns the complete record (description, labels, assignee, creator), all comments, the activity log, and relations. list_issues returns lean rows without descriptions, so the normal pattern is to list first, then call get_issue for each ticket you actually need to read.
 
 **Scope:** `issues:read`
 
@@ -213,6 +215,68 @@ curl -X PATCH "https://your-trakkt-instance.com/api/v1/issues/TRA-35" \
 ### Response
 
 Returns `200 OK` on success with the result as JSON.
+
+---
+
+## `DELETE /issues/{id}/star`
+
+**Operation:** `unstar_issue`
+
+Unstar an issue for the current user.
+
+**Scope:** `issues:write`
+
+### Parameters
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | Yes |  |
+
+### Example
+
+```bash
+curl -X DELETE "https://your-trakkt-instance.com/api/v1/issues/abc123/star" \
+  -H "Authorization: Bearer <token>"
+```
+
+### Response
+
+Returns `200 OK` on success with the result as JSON.
+
+---
+
+## `POST /issues/{id}/star`
+
+**Operation:** `star_issue`
+
+Star an issue for the current user.
+
+**Scope:** `issues:write`
+
+### Parameters
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | Yes |  |
+
+### Request Body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `issue_id` | string | Yes | The issue ID to star (e.g. 'iss_abc123') |
+
+### Example
+
+```bash
+curl -X POST "https://your-trakkt-instance.com/api/v1/issues/abc123/star" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"issue_id": "example-issue_id"}'
+```
+
+### Response
+
+Returns `201 Created` on success with the created resource as JSON.
 
 ---
 

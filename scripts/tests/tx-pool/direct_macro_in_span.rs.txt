@@ -1,0 +1,8 @@
+// expect: violations
+pub async fn bad(db: &DbPool, id: &str) -> trakkt_core::Result<()> {
+    let mut tx = db.begin().await?;
+    trakkt_core::tx_execute!(&mut tx, "UPDATE t SET x = 1")?;
+    let _n = trakkt_core::db_fetch_scalar!(db, i64, "SELECT COUNT(*) FROM t")?; //~ VIOLATION
+    tx.commit().await?;
+    Ok(())
+}

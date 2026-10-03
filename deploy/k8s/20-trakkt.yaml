@@ -19,6 +19,10 @@ metadata:
   namespace: trakkt
 spec:
   replicas: 1
+  # Connect routes PTYs through one in-memory relay. Avoid old/new server overlap;
+  # deployments briefly interrupt service until the replacement passes readiness.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: trakkt

@@ -58,7 +58,11 @@ impl vte::Perform for TerminalHandler<'_> {
 
         /// Return `params[idx]` or `default` when absent / zero.
         fn p(params: &[u16], idx: usize, default: u16) -> u16 {
-            params.get(idx).copied().filter(|&v| v != 0).unwrap_or(default)
+            params
+                .get(idx)
+                .copied()
+                .filter(|&v| v != 0)
+                .unwrap_or(default)
         }
 
         match action {
@@ -79,18 +83,29 @@ impl vte::Perform for TerminalHandler<'_> {
             }
             'G' => {
                 let col = p(&params, 0, 1) as usize;
-                self.grid.cursor_to(self.grid.cursor.row, col.saturating_sub(1));
+                self.grid
+                    .cursor_to(self.grid.cursor.row, col.saturating_sub(1));
             }
             'H' | 'f' => {
                 let row = p(&params, 0, 1) as usize;
                 let col = p(&params, 1, 1) as usize;
-                let origin = if self.grid.modes.origin_mode { self.grid.scroll_top } else { 0 };
-                self.grid.cursor_to(row.saturating_sub(1) + origin, col.saturating_sub(1));
+                let origin = if self.grid.modes.origin_mode {
+                    self.grid.scroll_top
+                } else {
+                    0
+                };
+                self.grid
+                    .cursor_to(row.saturating_sub(1) + origin, col.saturating_sub(1));
             }
             'd' => {
                 let row = p(&params, 0, 1) as usize;
-                let origin = if self.grid.modes.origin_mode { self.grid.scroll_top } else { 0 };
-                self.grid.cursor_to(row.saturating_sub(1) + origin, self.grid.cursor.col);
+                let origin = if self.grid.modes.origin_mode {
+                    self.grid.scroll_top
+                } else {
+                    0
+                };
+                self.grid
+                    .cursor_to(row.saturating_sub(1) + origin, self.grid.cursor.col);
             }
 
             // -- erase ------------------------------------------------------
@@ -110,10 +125,8 @@ impl vte::Perform for TerminalHandler<'_> {
             'r' => {
                 let top = p(&params, 0, 1) as usize;
                 let bottom = p(&params, 1, self.grid.rows as u16) as usize;
-                self.grid.set_scroll_region(
-                    top.saturating_sub(1),
-                    bottom.saturating_sub(1),
-                );
+                self.grid
+                    .set_scroll_region(top.saturating_sub(1), bottom.saturating_sub(1));
             }
             'S' => self.grid.scroll_up(p(&params, 0, 1) as usize),
             'T' => self.grid.scroll_down(p(&params, 0, 1) as usize),
@@ -138,7 +151,9 @@ impl vte::Perform for TerminalHandler<'_> {
                 let row = self.grid.cursor.row + 1;
                 let col = self.grid.cursor.col + 1;
                 let response = format!("\x1b[{row};{col}R");
-                self.grid.response_bytes.extend_from_slice(response.as_bytes());
+                self.grid
+                    .response_bytes
+                    .extend_from_slice(response.as_bytes());
             }
 
             // -- tab clear --------------------------------------------------
@@ -326,18 +341,7 @@ impl TerminalHandler<'_> {
                     6 => self.grid.modes.origin_mode = enable,
                     7 => self.grid.modes.auto_wrap = enable,
                     25 => self.grid.modes.cursor_visible = enable,
-                    47 => self.grid.modes.alternate_screen = enable,
-                    1049 => {
-                        if enable {
-                            self.grid.save_cursor();
-                            self.grid.modes.alternate_screen = true;
-                            self.grid.erase_display(2);
-                        } else {
-                            self.grid.modes.alternate_screen = false;
-                            self.grid.erase_display(2);
-                            self.grid.restore_cursor();
-                        }
-                    }
+                    47 | 1047 | 1049 => self.grid.set_alternate_screen(enable),
                     2004 => self.grid.modes.bracketed_paste = enable,
                     _ => {}
                 }

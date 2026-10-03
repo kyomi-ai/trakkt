@@ -188,11 +188,10 @@ pub fn TerminalRenderer(
 
     let rows_view = move || {
         grid.with(|g| {
-            (0..g.rows)
-                .map(|row_idx| {
-                    let spans = g.row_to_styled_spans(row_idx);
-                    render_row(spans)
-                })
+            g.scrollback
+                .iter()
+                .map(|row| render_row(Grid::cells_to_styled_spans(row)))
+                .chain((0..g.rows).map(|row_idx| render_row(g.row_to_styled_spans(row_idx))))
                 .collect_view()
         })
     };
@@ -210,12 +209,11 @@ pub fn TerminalRenderer(
             }
 
             let col = g.cursor.col.min(g.cols.saturating_sub(1));
-            let row = g.cursor.row.min(g.rows.saturating_sub(1));
+            let row = g.scrollback.len() + g.cursor.row.min(g.rows.saturating_sub(1));
 
-            // Position: each character is 1ch wide; each row is 1.2em tall
-            // (matching line-height).
+            // Position uses the same 18px row height as the resize calculation.
             let left = format!("{}ch", col);
-            let top = format!("calc({} * 1.2em)", row);
+            let top = format!("{}px", row * 18);
 
             Some(view! {
                 <div
@@ -224,7 +222,7 @@ pub fn TerminalRenderer(
                          left:{left};\
                          top:{top};\
                          width:1ch;\
-                         height:1.2em;\
+                         height:18px;\
                          background-color:#d4d4d4;\
                          animation:terminal-cursor-blink 1s step-end infinite;\
                          pointer-events:none;"
@@ -241,12 +239,12 @@ pub fn TerminalRenderer(
     view! {
         <style>{CURSOR_KEYFRAMES}</style>
         <div
-            tabindex="0"
             style="\
-                font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Menlo', monospace;\
+                font-family: monospace;\
+                font-size: 14px;\
                 background-color: #1e1e1e;\
                 color: #d4d4d4;\
-                line-height: 1.2;\
+                line-height: 18px;\
                 white-space: pre;\
                 overflow: hidden;\
                 outline: none;\
@@ -383,10 +381,7 @@ mod tests {
         };
         let style = span_style(&span);
         // Inverse: effective fg = bg (white #ffffff), effective bg = fg (red #cd3131)
-        assert!(
-            style.contains("color:#ffffff"),
-            "inverse fg wrong: {style}"
-        );
+        assert!(style.contains("color:#ffffff"), "inverse fg wrong: {style}");
         assert!(
             style.contains("background-color:#cd3131"),
             "inverse bg wrong: {style}"
@@ -438,10 +433,7 @@ mod tests {
             attrs: CellAttrs::default(),
         };
         let style = span_style(&span);
-        assert!(
-            style.contains("color:rgb(255,0,0)"),
-            "missing fg: {style}"
-        );
+        assert!(style.contains("color:rgb(255,0,0)"), "missing fg: {style}");
         assert!(
             style.contains("background-color:rgb(0,255,0)"),
             "missing bg: {style}"

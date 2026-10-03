@@ -114,18 +114,27 @@ async fn run_agent() {
     eprintln!();
 
     // 3. Start health check server
-    tokio::spawn(health::run_health_server(
-        health_port,
-        ws_connected.clone(),
-    ));
+    tokio::spawn(health::run_health_server(health_port, ws_connected.clone()));
 
     eprintln!("  Ready — connecting to server.");
     eprintln!();
 
-    // 4. Run forever (reconnects automatically on disconnection)
-    ws_client
-        .run_forever(ws_connected, pty_manager, agent_tx, agent_rx)
-        .await;
+    // 4. PTYs survive network disconnects, but stop when the user stops the agent.
+    tokio::select! {
+        _ = ws_client.run_forever(ws_connected, Arc::clone(&pty_manager), agent_tx, agent_rx) => {}
+        signal = shutdown_signal() => { if let Err(error) = signal { tracing::warn!(%error, "Shutdown signal failed"); } }
+    }
+    pty_manager.shutdown().await;
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! { signal = tokio::signal::ctrl_c() => signal, _ = term.recv() => Ok(()) }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 async fn run_status() {
@@ -152,7 +161,10 @@ async fn run_status() {
     // Token check
     eprint!("  Token          ");
     if config.token.starts_with("trakkt-") {
-        eprintln!("\x1b[32m\u{2713}\x1b[0m  {}...", &config.token[..14.min(config.token.len())]);
+        eprintln!(
+            "\x1b[32m\u{2713}\x1b[0m  {}...",
+            &config.token[..14.min(config.token.len())]
+        );
     } else {
         eprintln!("\x1b[33m?\x1b[0m  (non-standard format)");
     }
@@ -172,7 +184,10 @@ async fn run_status() {
             }
         }
         None => {
-            eprintln!("\x1b[31m\u{2717}\x1b[0m  agent not running (port {})", config.health_port);
+            eprintln!(
+                "\x1b[31m\u{2717}\x1b[0m  agent not running (port {})",
+                config.health_port
+            );
         }
     }
 
@@ -204,9 +219,7 @@ async fn reqwest_health_check(url: &str) -> Option<HealthResponse> {
     .ok()?;
 
     // Send a minimal HTTP request
-    let request = format!(
-        "GET /healthz HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    );
+    let request = format!("GET /healthz HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
 
     stream.writable().await.ok()?;
     stream.try_write(request.as_bytes()).ok()?;
@@ -241,13 +254,13 @@ fn run_setup() {
     eprintln!("  1. Create a config file at {}:", config_path.display());
     eprintln!();
     eprintln!("     token = \"trakkt-...\"");
-    eprintln!("     server_url = \"wss://app.trakkt.dev/api/connect/ws\"");
+    eprintln!("     server_url = \"wss://trakkt.app/ws/connect/agent\"");
     eprintln!("     working_dir = \"/home/user/projects\"");
     eprintln!();
     eprintln!("  2. Or set environment variables:");
     eprintln!();
     eprintln!("     TRAKKT_TOKEN=trakkt-...");
-    eprintln!("     TRAKKT_SERVER_URL=wss://app.trakkt.dev/api/connect/ws");
+    eprintln!("     TRAKKT_SERVER_URL=wss://trakkt.app/ws/connect/agent");
     eprintln!("     TRAKKT_WORKING_DIR=/home/user/projects");
     eprintln!();
     eprintln!("  3. Run the agent:");
@@ -266,26 +279,26 @@ fn run_setup() {
     if let Ok(path) = config_file::ConfigFile::default_config_dir()
         && !path.exists()
     {
-            if let Err(e) = std::fs::create_dir_all(&path) {
-                eprintln!("  (Could not create config directory: {e})");
-            } else {
-                eprintln!("  Config directory created at {}", path.display());
-                eprintln!();
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            eprintln!("  (Could not create config directory: {e})");
+        } else {
+            eprintln!("  Config directory created at {}", path.display());
+            eprintln!();
 
-                // Write an example config file if none exists
-                let example = config_file::ConfigFile {
-                    token: Some("trakkt-YOUR-TOKEN-HERE".into()),
-                    server_url: Some("wss://app.trakkt.dev/ws/connect/agent".into()),
-                    working_dir: None,
-                    allowed_commands: None,
-                    health_port: None,
-                    scrollback_size: None,
-                };
-                match example.save_to(&path) {
-                    Ok(p) => eprintln!("  Example config written to {}", p.display()),
-                    Err(e) => eprintln!("  (Could not write example config: {e})"),
-                }
-                eprintln!();
+            // Write an example config file if none exists
+            let example = config_file::ConfigFile {
+                token: Some("trakkt-YOUR-TOKEN-HERE".into()),
+                server_url: Some("wss://trakkt.app/ws/connect/agent".into()),
+                working_dir: None,
+                allowed_commands: None,
+                health_port: None,
+                scrollback_size: None,
+            };
+            match example.save_to(&path) {
+                Ok(p) => eprintln!("  Example config written to {}", p.display()),
+                Err(e) => eprintln!("  (Could not write example config: {e})"),
             }
+            eprintln!();
         }
+    }
 }

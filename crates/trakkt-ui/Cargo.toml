@@ -63,9 +63,14 @@ web-sys = { version = "0.3", features = [
     "AuthenticatorResponse", "AuthenticatorAttestationResponse",
     "AuthenticatorAssertionResponse",
     "CredentialCreationOptions", "CredentialRequestOptions",
-    "Clipboard", "History", "HtmlDivElement", "DomRect",
+    "Clipboard", "History", "HtmlDivElement", "DomRect", "Crypto",
     "ScrollIntoViewOptions", "ScrollLogicalPosition", "ScrollBehavior",
     "WebSocket", "MessageEvent", "CloseEvent",
+    # Cross-tab sync coordination (cache/tab_leader.rs). The Web Locks half of
+    # that module is hand-bound, not listed here: web-sys puts Lock/LockManager
+    # behind --cfg=web_sys_unstable_apis, which cannot be enabled workspace-wide
+    # without breaking the kode-leptos dependency. See cache/tab_leader.rs.
+    "BroadcastChannel",
     "FormData", "File", "FileList", "Blob", "BlobPropertyBag",
     "Headers", "Request", "RequestInit", "RequestCredentials", "Response",
     "ResizeObserver", "ResizeObserverEntry", "ResizeObserverSize",
@@ -74,6 +79,9 @@ web-sys = { version = "0.3", features = [
 
 # Timers for WASM
 gloo-timers = { version = "0.3", features = ["futures"] }
+
+# Channels for the single-writer IndexedDB queue (cache/idb_writer.rs)
+futures = { workspace = true }
 
 # SendWrapper for non-Send JS values in Leptos reactive closures
 send_wrapper = "0.6"
@@ -118,7 +126,25 @@ webauthn-rs = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
-[dev-dependencies]
+# Kode's parser uses this upstream C runtime on browser WASM targets.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+arborium-sysroot = "2.17"
+
+# Server-side test dependencies. Target-gated because `cargo build --tests`
+# for wasm32 (wasm-pack test) would otherwise try to compile these native-only
+# crates — sqlx, tokio and getrandom do not build for wasm32-unknown-unknown.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 trakkt-core = { workspace = true, features = ["test-helpers"] }
 trakkt-auth = { workspace = true }
 tokio = { workspace = true }
+
+# Browser-hosted tests for the IndexedDB writer.
+# Run: wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+# Leptos spawns through this — `Effect`, `Resource` and `LocalResource` all do,
+# on construction — and boots it from `mount_to_body` / `hydrate_body`, neither
+# of which a `wasm-bindgen-test` runs. Tests that spawn before they mount have to
+# initialise it themselves; see `src/wasm_test_support.rs`. Already in the lock
+# file as a transitive dependency of leptos, and pinned to the same version.
+any_spawner = "0.3"

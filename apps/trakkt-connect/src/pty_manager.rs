@@ -54,6 +54,7 @@ struct PtySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Handle to the reader task so we can abort it on kill.
     reader_handle: tokio::task::JoinHandle<()>,
+    killed: bool,
 }
 
 /// Ring buffer that stores the most recent `capacity` bytes of PTY output.
@@ -92,6 +93,8 @@ impl ScrollbackBuffer {
 /// Manages all PTY sessions for this agent instance.
 pub struct PtyManager {
     sessions: Mutex<HashMap<String, PtySession>>,
+    spawn_lock: Mutex<()>,
+    output_lock: Mutex<()>,
     agent_tx: mpsc::Sender<AgentMessage>,
     config: PtyConfig,
 }
@@ -101,6 +104,8 @@ impl PtyManager {
     pub fn new(agent_tx: mpsc::Sender<AgentMessage>, config: PtyConfig) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            spawn_lock: Mutex::new(()),
+            output_lock: Mutex::new(()),
             agent_tx,
             config,
         }
@@ -119,6 +124,17 @@ impl PtyManager {
         cols: u16,
         rows: u16,
     ) {
+        let _spawn_guard = self.spawn_lock.lock().await;
+        if self.sessions.lock().await.len() >= 32 || cols == 0 || rows == 0 {
+            self.send_event(
+                &session_id,
+                SessionEventKind::SpawnFailed {
+                    error: "session limit or invalid dimensions".into(),
+                },
+            )
+            .await;
+            return;
+        }
         // Validate command
         if command.is_empty() {
             self.send_event(
@@ -216,7 +232,7 @@ impl PtyManager {
         }
 
         // Spawn the child process
-        let child = match pair.slave.spawn_command(cmd) {
+        let mut child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
             Err(e) => {
                 self.send_event(
@@ -239,6 +255,9 @@ impl PtyManager {
         let writer = match pair.master.take_writer() {
             Ok(w) => w,
             Err(e) => {
+                if let Err(error) = child.kill() {
+                    tracing::warn!(%error, "Failed to stop child after PTY setup error");
+                }
                 self.send_event(
                     &session_id,
                     SessionEventKind::SpawnFailed {
@@ -254,6 +273,9 @@ impl PtyManager {
         let reader = match pair.master.try_clone_reader() {
             Ok(r) => r,
             Err(e) => {
+                if let Err(error) = child.kill() {
+                    tracing::warn!(%error, "Failed to stop child after PTY setup error");
+                }
                 self.send_event(
                     &session_id,
                     SessionEventKind::SpawnFailed {
@@ -267,8 +289,9 @@ impl PtyManager {
 
         let started_at = chrono::Utc::now().to_rfc3339();
 
-        // Start the reader task
-        let reader_handle = self.spawn_reader_task(session_id.clone(), reader);
+        // The reader must not publish an immediate exit before the session exists.
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let reader_handle = self.spawn_reader_task(session_id.clone(), reader, start_rx);
 
         // Store the session
         {
@@ -277,9 +300,7 @@ impl PtyManager {
                 session_id.clone(),
                 PtySession {
                     command: command.clone(),
-                    working_dir: Some(
-                        resolved_working_dir.to_string_lossy().into_owned(),
-                    ),
+                    working_dir: Some(resolved_working_dir.to_string_lossy().into_owned()),
                     started_at,
                     cols,
                     rows,
@@ -289,13 +310,17 @@ impl PtyManager {
                     scrollback: ScrollbackBuffer::new(self.config.scrollback_size),
                     child,
                     reader_handle,
+                    killed: false,
                 },
             );
         }
 
-        // Notify server that the session started
+        // Publish Started before the reader can publish output or an immediate exit.
         self.send_event(&session_id, SessionEventKind::Started)
             .await;
+        if start_tx.send(()).is_err() {
+            tracing::warn!(session_id, "PTY reader cancelled before start");
+        }
 
         tracing::info!(
             session_id,
@@ -396,46 +421,38 @@ impl PtyManager {
 
         let pid = session.pid;
 
-        if !force {
-            // Try SIGTERM first
-            #[cfg(unix)]
-            {
-                use nix::sys::signal::{Signal, kill};
-                use nix::unistd::Pid;
-
-                if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
-                    tracing::warn!(session_id, pid, error = %e, "SIGTERM failed, using kill()");
-                    if let Err(e) = session.child.kill() {
-                        tracing::warn!(session_id, pid, error = %e, "Failed to kill process");
+        #[cfg(unix)]
+        let killed = {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            // portable-pty creates a new session with setsid: the child PID is
+            // its process-group ID. Signal children as well as their shell.
+            if pid == 0 {
+                false
+            } else {
+                match killpg(
+                    Pid::from_raw(pid as i32),
+                    if force {
+                        Signal::SIGKILL
+                    } else {
+                        Signal::SIGTERM
+                    },
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, session_id, "PTY signal failed");
+                        false
                     }
                 }
             }
-            #[cfg(not(unix))]
-            {
-                if let Err(e) = session.child.kill() {
-                    tracing::warn!(session_id, pid, error = %e, "Failed to kill process");
-                }
-            }
-        } else {
-            // Force kill (SIGKILL)
-            if let Err(e) = session.child.kill() {
-                tracing::warn!(session_id, pid, error = %e, "Failed to force-kill process");
-            }
-        }
-
-        tracing::info!(session_id, pid, force, "Kill signal sent to session");
-
-        // Emit Killed event so the server knows this was a deliberate kill,
-        // not a natural exit.
-        let msg = AgentMessage::SessionEvent {
-            session_id: session_id.to_string(),
-            event: SessionEventKind::Killed,
         };
-        // Release lock before async send
-        drop(sessions);
-        if let Err(e) = self.agent_tx.send(msg).await {
-            tracing::warn!(session_id, error = %e, "Failed to send kill event");
+        #[cfg(not(unix))]
+        let killed = session.child.kill().is_ok();
+        if killed {
+            session.killed = true;
         }
+        // The reader reports Killed only after EOF. A process that ignores
+        // SIGTERM must remain visible until it exits or the user forces a kill.
     }
 
     /// List all active sessions.
@@ -482,6 +499,25 @@ impl PtyManager {
         }
     }
 
+    /// Stop local children and readers when the agent itself shuts down.
+    pub async fn shutdown(&self) {
+        let mut sessions = self.sessions.lock().await;
+        for (id, mut session) in sessions.drain() {
+            #[cfg(unix)]
+            if session.pid != 0 {
+                use nix::sys::signal::{Signal, killpg};
+                use nix::unistd::Pid;
+                if let Err(error) = killpg(Pid::from_raw(session.pid as i32), Signal::SIGKILL) {
+                    tracing::debug!(%error, session_id=id, "PTY group already exited at shutdown");
+                }
+            }
+            if let Err(error) = session.child.kill() {
+                tracing::debug!(%error, session_id=id, "PTY already exited at shutdown");
+            }
+            session.reader_handle.abort();
+        }
+    }
+
     /// Send a session event message to the server.
     async fn send_event(&self, session_id: &str, event: SessionEventKind) {
         let msg = AgentMessage::SessionEvent {
@@ -502,11 +538,15 @@ impl PtyManager {
         self: &Arc<Self>,
         session_id: String,
         mut reader: Box<dyn Read + Send>,
+        start: tokio::sync::oneshot::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
         let agent_tx = self.agent_tx.clone();
 
         tokio::task::spawn(async move {
+            if start.await.is_err() {
+                return;
+            }
             // Channel from the blocking reader thread to the async forwarder
             let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(256);
 
@@ -542,12 +582,18 @@ impl PtyManager {
                 // Try to receive with a timeout for batching
                 match tokio::time::timeout(batch_interval, output_rx.recv()).await {
                     Ok(Some(data)) => {
+                        // Serialize scrollback snapshots with append+enqueue so
+                        // browsers can replace the grid and resume live output.
+                        let _output_guard = manager.output_lock.lock().await;
                         // Accumulate into the current batch
                         manager.append_scrollback(&session_id, &data).await;
                         batch.extend_from_slice(&data);
 
                         // Drain any additional immediately available data
-                        while let Ok(more) = output_rx.try_recv() {
+                        while batch.len() < 64 * 1024 {
+                            let Ok(more) = output_rx.try_recv() else {
+                                break;
+                            };
                             manager.append_scrollback(&session_id, &more).await;
                             batch.extend_from_slice(&more);
                         }
@@ -597,7 +643,9 @@ impl PtyManager {
             }
 
             // Wait for the blocking reader to finish
-            let _ = blocking_handle.await;
+            if let Err(error) = blocking_handle.await {
+                tracing::warn!(%error, "PTY reader task failed");
+            }
 
             // Collect exit code. We must not hold the RwLockWriteGuard
             // across an await point because PtySession contains !Sync trait
@@ -635,10 +683,20 @@ impl PtyManager {
                 }
             };
 
+            let killed = manager
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .is_some_and(|session| session.killed);
             // Send exit event
             let msg = AgentMessage::SessionEvent {
                 session_id: session_id.clone(),
-                event: SessionEventKind::Exited { exit_code },
+                event: if killed {
+                    SessionEventKind::Killed
+                } else {
+                    SessionEventKind::Exited { exit_code }
+                },
             };
             if let Err(e) = agent_tx.send(msg).await {
                 tracing::warn!(session_id, error = %e, "Failed to send session exit event");
@@ -689,6 +747,7 @@ pub async fn dispatch(
             manager.kill(&session_id, force).await;
         }
         ServerMessage::ScrollbackRequest { session_id } => {
+            let _output_guard = manager.output_lock.lock().await;
             let data = manager
                 .get_scrollback(&session_id)
                 .await
@@ -706,6 +765,15 @@ pub async fn dispatch(
             }
         }
         ServerMessage::Ping { ts } => {
+            // Refresh after any reconnect overlap; PTYs outlive the server's registry.
+            if let Err(error) = agent_tx
+                .send(AgentMessage::SessionList {
+                    sessions: manager.list_sessions().await,
+                })
+                .await
+            {
+                tracing::warn!(%error, "Failed to refresh Connect sessions");
+            }
             let msg = AgentMessage::Pong { ts };
             if let Err(e) = agent_tx.send(msg).await {
                 tracing::warn!(error = %e, "Failed to send pong");
@@ -717,6 +785,82 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn real_pty_input_scrollback_resize_and_exit() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let manager = Arc::new(PtyManager::new(
+            tx,
+            PtyConfig {
+                working_dir: std::env::temp_dir(),
+                allowed_commands: vec!["sh".into()],
+                scrollback_size: 65536,
+            },
+        ));
+        manager
+            .spawn(
+                "trial".into(),
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf ready-marker; read line; printf 'reply-%s' \"$line\"".into(),
+                ],
+                None,
+                HashMap::new(),
+                80,
+                24,
+            )
+            .await;
+        let mut output = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&output).contains("ready-marker") {
+                if let Some(AgentMessage::SessionOutput { data, .. }) = rx.recv().await {
+                    output.extend(BASE64.decode(data).expect("PTY output base64"));
+                }
+            }
+        })
+        .await
+        .expect("shell produces initial output");
+        manager.resize("trial", 120, 40).await;
+        let sessions = manager.list_sessions().await;
+        assert_eq!(sessions[0].cols, 120);
+        assert_eq!(sessions[0].rows, 40);
+        manager
+            .spawn(
+                "trial".into(),
+                vec!["sh".into()],
+                None,
+                HashMap::new(),
+                80,
+                24,
+            )
+            .await;
+        assert_eq!(manager.list_sessions().await.len(), 1);
+        manager
+            .write_input("trial", &BASE64.encode(b"hello\n"))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(AgentMessage::SessionOutput { data, .. }) => {
+                        output.extend(BASE64.decode(data).expect("PTY output base64"))
+                    }
+                    Some(AgentMessage::SessionEvent {
+                        event: SessionEventKind::Exited { exit_code },
+                        ..
+                    }) => {
+                        assert_eq!(exit_code, 0);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("real shell exits");
+        assert!(String::from_utf8_lossy(&output).contains("reply-hello"));
+        assert!(manager.list_sessions().await.is_empty());
+    }
 
     #[test]
     fn scrollback_buffer_basic() {

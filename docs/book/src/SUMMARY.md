@@ -33,6 +33,7 @@
 - [Issues](api-reference/issues.md)
 - [Labels](api-reference/labels.md)
 - [Milestones](api-reference/milestones.md)
+- [Other](api-reference/other.md)
 - [Projects](api-reference/projects.md)
 - [Relations](api-reference/relations.md)
 - [Statuses](api-reference/statuses.md)
@@ -54,4 +55,5 @@
 - [Docker](self-hosting/docker.md)
 - [Kubernetes](self-hosting/kubernetes.md)
 - [Reverse Proxy](self-hosting/reverse-proxy.md)
+- [Connect terminal](self-hosting/connect.md)
 - [Upgrading](self-hosting/upgrading.md)

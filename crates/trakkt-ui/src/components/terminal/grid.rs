@@ -32,7 +32,6 @@ impl std::fmt::Debug for Color {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // CellAttrs — bitflag newtype
 // ---------------------------------------------------------------------------
@@ -180,6 +179,7 @@ pub struct StyledSpan {
 // ---------------------------------------------------------------------------
 
 /// The terminal's visible cell grid plus scrollback, cursor, modes, and pen.
+#[derive(Clone)]
 pub struct Grid {
     pub cols: usize,
     pub rows: usize,
@@ -209,6 +209,8 @@ pub struct Grid {
     pub title: String,
     /// Bytes queued to send back to the PTY (e.g. device-status responses).
     pub response_bytes: Vec<u8>,
+    /// Primary screen retained while a fullscreen CLI owns the alternate screen.
+    primary_screen: Option<Box<Grid>>,
 }
 
 impl Grid {
@@ -242,6 +244,7 @@ impl Grid {
             tab_stops,
             title: String::new(),
             response_bytes: Vec::new(),
+            primary_screen: None,
         }
     }
 
@@ -279,7 +282,9 @@ impl Grid {
             // Push excess top rows into scrollback.
             while self.cells.len() > rows {
                 let line = self.cells.remove(0);
-                self.scrollback.push(line);
+                if !self.modes.alternate_screen {
+                    self.scrollback.push(line);
+                }
                 self.cursor.row = self.cursor.row.saturating_sub(1);
             }
             trim_scrollback(&mut self.scrollback, self.max_scrollback);
@@ -545,7 +550,7 @@ impl Grid {
 
         for _ in 0..n {
             let line = self.cells.remove(top);
-            if is_full_screen {
+            if is_full_screen && !self.modes.alternate_screen {
                 self.scrollback.push(line);
             }
             self.cells.insert(bottom, blank_row(self.cols));
@@ -647,6 +652,7 @@ impl Grid {
     /// Full terminal reset — clear grid, scrollback, cursor, modes, pen, and
     /// title.
     pub fn reset(&mut self) {
+        self.primary_screen = None;
         self.cells = blank_grid(self.cols, self.rows);
         self.scrollback.clear();
         self.cursor = CursorState::default();
@@ -688,12 +694,17 @@ impl Grid {
             return Vec::new();
         }
 
-        let line = &self.cells[row];
+        Self::cells_to_styled_spans(&self.cells[row])
+    }
+
+    pub fn cells_to_styled_spans(line: &[Cell]) -> Vec<StyledSpan> {
         let mut spans: Vec<StyledSpan> = Vec::new();
 
         for cell in line {
             match spans.last_mut() {
-                Some(span) if span.fg == cell.fg && span.bg == cell.bg && span.attrs == cell.attrs => {
+                Some(span)
+                    if span.fg == cell.fg && span.bg == cell.bg && span.attrs == cell.attrs =>
+                {
                     span.text.push(cell.c);
                 }
                 _ => {
@@ -708,6 +719,27 @@ impl Grid {
         }
 
         spans
+    }
+
+    /// Fullscreen programs get their own cells, cursor and scrollback. Leaving
+    /// that screen restores the shell output rather than clearing it.
+    pub fn set_alternate_screen(&mut self, enabled: bool) {
+        if enabled == self.modes.alternate_screen {
+            return;
+        }
+        if enabled {
+            let primary = self.clone();
+            let mut alternate = Self::new(self.cols, self.rows);
+            alternate.modes = self.modes.clone();
+            alternate.modes.alternate_screen = true;
+            alternate.primary_screen = Some(Box::new(primary));
+            *self = alternate;
+        } else if let Some(primary) = self.primary_screen.take() {
+            let (cols, rows) = (self.cols, self.rows);
+            *self = *primary;
+            self.resize(cols, rows);
+            self.mark_all_dirty();
+        }
     }
 
     // -- private helpers ----------------------------------------------------

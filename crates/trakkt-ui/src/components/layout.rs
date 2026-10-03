@@ -11,6 +11,7 @@ use wasm_bindgen::JsCast;
 use phosphor_leptos::{Icon, IconWeight};
 
 use std::collections::HashMap;
+use trakkt_types::enums::FavoriteTarget;
 use crate::cache::store::SyncStore;
 use crate::components::issue_status_badge::{IssueStatusVariant, view_status_icon};
 use crate::components::{Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CommandPalette, ConfirmDialog, CreateIssueTrigger, FeedbackModal, ProjectCreationModal, Spinner, TeamCreationModal, TeamIcon};
@@ -77,85 +78,268 @@ pub fn Layout() -> impl IntoView {
     });
 
     // ── Sync engine wiring (WASM only) ────────────────────────────────────
-    // Once auth is confirmed and user context is available:
-    // 1. Hydrate the store from IndexedDB for instant UI
-    // 2. Connect the WebSocket
-    // 3. Start the sync engine to keep data current
+    // Every tab of a browser shares one IndexedDB cache, so only one of them —
+    // the tab holding the sync leadership lock — may run a sync engine against
+    // it. Two tabs writing entities and the shared cursor concurrently is what
+    // let a throttled tab's stale writes land on top of a live tab's newer
+    // ones. See `cache::tab_leader`.
+    //
+    // Every tab:      set workspace, hydrate from IndexedDB, subscribe to the
+    //                 leader's broadcast, request leadership.
+    // The leader tab: additionally start the engine and dial the WebSocket —
+    //                 immediately if it wins the lock, or later on promotion
+    //                 when the previous leader's tab closes.
+    //
+    // Both live-update paths wait on `hydration_gate`. Hydration replaces whole
+    // store lists at once, so anything applied while it is still in flight gets
+    // wiped by the `set_*` that lands after it — and the leader's cursor has
+    // already moved past, so nothing re-delivers it.
+    //
+    // The two wait differently because their transports differ. The socket is
+    // simply not dialed until hydration finishes: nothing has been received
+    // yet, so delaying it only reorders. The cross-tab channel cannot be
+    // treated the same way — it has no replay, so a late subscription would
+    // *drop* whatever other tabs posted in that window rather than delay it.
+    // So the subscription goes up immediately and its messages are held in a
+    // FIFO until the gate opens. See `cache::broadcast_queue`.
     #[cfg(target_arch = "wasm32")]
     {
-        use crate::cache::websocket;
+        use crate::cache::broadcast_queue::BroadcastQueue;
+        use crate::cache::delete_route::DeleteRoute;
+        use crate::cache::hydration_gate::HydrationGate;
+        use crate::cache::idb_writer::IdbWriter;
         use crate::cache::sync_engine;
+        use crate::cache::tab_leader::{self, Leadership, SyncBroadcast};
+        use crate::cache::websocket;
         use crate::server_fns::context::UserContext;
 
         let user_ctx = expect_context::<LocalResource<Result<UserContext, ServerFnError>>>();
 
-        // Track whether we've already started the sync engine to avoid
-        // re-connecting on every reactive re-fire.
+        // The WebSocket handle is built here, at component setup, and dialed
+        // later — only by the leader, and only once hydration has finished.
+        // Building it up front is what lets `provide_context` run synchronously
+        // in the reactive scope, where pages resolving `WebSocketClient` can
+        // actually see it: context is a setup-time snapshot, so a handle
+        // provided from inside the effect below would be invisible to every
+        // page. One handle for the tab's whole life also means a page mounted
+        // before this tab is promoted observes the real `connection_state`
+        // afterwards, instead of holding a stale disconnected handle.
+        let ws_client = websocket::disconnected();
+        provide_context(ws_client.clone());
+        {
+            let ws_for_cleanup = ws_client.clone();
+            on_cleanup(move || websocket::disconnect(&ws_for_cleanup));
+        }
+
+        // Latch that hydration opens, and that both the dial and the cross-tab
+        // message queue wait on. Lives at setup because its halves can run in
+        // different executions of the effect below: a promoted follower
+        // hydrated long ago, while the first tab hydrates and takes leadership
+        // in a single pass.
+        let hydration_gate = HydrationGate::new();
+
+        // The owner the sync engine's connection-state watcher is registered
+        // under. It has to be this one — created here, at setup — rather than
+        // whichever owner is current when the leader half below runs.
+        //
+        // That half runs inside the effect body, and an `Effect` re-run calls
+        // `Owner::with_cleanup` on its own owner: everything the previous run
+        // created is disposed. A watcher registered from in there would be torn
+        // down by the next re-run, leaving the socket reconnecting on its own
+        // backoff with nothing left to notice it reaching `Connected` — so no
+        // `sync_bootstrap` or `sync_delta` would ever go out again and the tab
+        // would look connected while it had silently stopped syncing.
+        //
+        // A child of the component's owner, so the watcher is disposed with the
+        // Layout and not before. Same reasoning as the handles above; this one
+        // is a reactive scope rather than a browser handle.
+        let engine_owner = Owner::new();
+
+        // Track what has already been done so neither half re-runs when the
+        // effect re-fires (it re-fires on promotion, by design).
         let sync_started = std::rc::Rc::new(std::cell::Cell::new(false));
+        let leader_started = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        // Set once the leadership lock is granted. A plain signal is all the
+        // promotion machinery needs: the grant callback sets it, this effect
+        // re-runs and starts the engine — no polling, and the work happens
+        // under the reactive owner rather than inside a bare JS callback.
+        let is_leader = RwSignal::new(false);
+
+        // Non-Send browser handles that must outlive the effect run that
+        // created them. Hoisted to component setup so they are created once.
+        let broadcast: StoredValue<send_wrapper::SendWrapper<Option<SyncBroadcast>>> =
+            StoredValue::new(send_wrapper::SendWrapper::new(None));
+        let leadership: StoredValue<send_wrapper::SendWrapper<Option<tab_leader::LeadershipRequest>>> =
+            StoredValue::new(send_wrapper::SendWrapper::new(None));
+        // The cache writer, set only once this tab holds the leadership lock. A
+        // follower never has one — which is the whole reason its deletes travel
+        // over the broadcast channel instead. The message handler below reads it
+        // on every message, so a tab promoted after the handler was installed
+        // starts servicing other tabs' deletes without re-registering anything.
+        let cache_writer: StoredValue<send_wrapper::SendWrapper<Option<IdbWriter>>> =
+            StoredValue::new(send_wrapper::SendWrapper::new(None));
 
         Effect::new(move |_| {
-            web_sys::console::log_1(&"[trakkt-sync] Effect fired, checking user_ctx".into());
+            // Re-runs when leadership is granted; both halves below are guarded.
+            let leader_now = is_leader.get();
+
             // Wait for user context to resolve successfully.
             let Some(Ok(ctx)) = user_ctx.get() else {
-                web_sys::console::log_1(&"[trakkt-sync] user_ctx not ready yet".into());
                 return;
             };
-
-            if sync_started.get() {
-                web_sys::console::log_1(&"[trakkt-sync] already started, skipping".into());
-                return;
-            }
-            sync_started.set(true);
 
             let user_id = ctx.user_id.clone();
             let workspace_id = ctx
                 .workspace_id
                 .clone()
                 .unwrap_or_else(|| "workspace-local".to_string());
-            web_sys::console::log_1(&format!("[trakkt-sync] starting sync for {user_id} / {workspace_id}").into());
-            sync_store.set_workspace_id(workspace_id.clone());
 
-            // 1. Hydrate from IDB (instant cached data)
-            let wid_hydrate = workspace_id.clone();
-            leptos::task::spawn_local(async move {
-                match crate::cache::db::init_cache_db(&wid_hydrate).await {
-                    Ok(cache_db) => {
-                        sync_engine::hydrate_store_from_db(&cache_db, &wid_hydrate, &sync_store)
-                            .await;
+            // ── Every tab ───────────────────────────────────────────────────
+            if !sync_started.get() {
+                sync_started.set(true);
+
+                // 1. Hydrate from IDB (instant cached data), then open the gate
+                //    the leader's dial is waiting on.
+                leptos::task::spawn_local(sync_engine::hydrate_then_open_gate(
+                    workspace_id.clone(),
+                    sync_store,
+                    hydration_gate.clone(),
+                ));
+
+                // 2. Subscribe to the cross-tab channel. A follower's entire
+                //    live-update path runs through here; the leader opens the
+                //    same channel to publish on (it never receives its own
+                //    messages back) and to service the cache deletes follower
+                //    tabs ask it to perform.
+                //
+                //    The subscription is registered now and its messages are
+                //    queued, rather than the subscription itself being delayed
+                //    until hydration finishes. That ordering matters both ways:
+                //    delaying it would lose messages outright, and applying
+                //    them on arrival would hand them to lists hydration is
+                //    about to replace.
+                //
+                //    The queue is created here, in the same synchronous block
+                //    that spawned hydration above — so there is no arrangement
+                //    in which a queue exists to fill but no hydration exists to
+                //    release it, and the backlog is bounded by hydration
+                //    finishing.
+                match SyncBroadcast::open(&workspace_id) {
+                    Ok(channel) => {
+                        let queue = BroadcastQueue::new(move |message| {
+                            cache_writer.with_value(|writer| {
+                                crate::cache::apply::apply_broadcast(
+                                    &sync_store,
+                                    (**writer).as_ref(),
+                                    message,
+                                );
+                            });
+                        });
+                        leptos::task::spawn_local(sync_engine::release_when_hydrated(
+                            hydration_gate.clone(),
+                            queue.clone(),
+                        ));
+                        channel.set_on_message(move |message| queue.deliver(message));
+                        // Until this tab wins the lock it owns no cache writer,
+                        // so its own deletes go to the tab that does.
+                        sync_store.set_delete_route(DeleteRoute::delegated(channel.clone()));
+                        *broadcast.write_value() =
+                            send_wrapper::SendWrapper::new(Some(channel));
                     }
-                    Err(e) => {
-                        web_sys::console::warn_1(&format!("Failed to open IDB: {e}").into());
-                        // Mark initialized even on IDB failure — an empty store is
-                        // valid state (the sync engine bootstrap will populate it).
-                        // Without this, the sidebar stays in skeleton state forever.
-                        sync_store.set_initialized(true);
+                    Err(e) => tracing::warn!(
+                        "sync: no BroadcastChannel ({e:?}) — this tab will not see the \
+                         leader's updates until it reloads, and cannot ask the leader to \
+                         delete anything from the shared cache"
+                    ),
+                }
+
+                // 3. Stand for election. The callback fires immediately if no
+                //    other tab holds the lock, or when the leader's tab closes.
+                match tab_leader::acquire_leadership(&workspace_id, move || {
+                    is_leader.set(true);
+                }) {
+                    Leadership::Requested(request) => {
+                        *leadership.write_value() =
+                            send_wrapper::SendWrapper::new(Some(request));
+                    }
+                    Leadership::Unsupported => {
+                        // Documented capability fallback: a browser with no Web
+                        // Locks cannot elect anyone, so every tab syncs as it
+                        // did before this change.
+                        tracing::info!(
+                            "sync: no Web Locks in this browser — running without a tab \
+                             leader, as every tab did previously"
+                        );
+                        is_leader.set(true);
                     }
                 }
-            });
+            }
 
-            // 2. Connect WebSocket — start with empty token (connects immediately
-            //    so provide_context works in the reactive scope). Then fetch a
-            //    JWT asynchronously and reconnect with it for multi-user mode.
-            let ws_client = websocket::connect(&user_id, &workspace_id, "");
+            // ── Leader tab only ─────────────────────────────────────────────
+            if !leader_now || leader_started.get() {
+                return;
+            }
+            leader_started.set(true);
+            tracing::info!(%workspace_id, "sync: this tab is the sync leader");
 
-            sync_engine::start_sync_engine(&ws_client, &sync_store, &workspace_id);
+            // Registering the message callback and the connection-state watcher
+            // before the socket exists is safe — and required: the dial below
+            // happens on a later turn of the event loop, so the engine is
+            // listening well before the first byte can arrive.
+            //
+            // The watcher goes under `engine_owner` rather than this effect
+            // run's own owner, which is what keeps it alive across any later
+            // re-run of this effect. See where `engine_owner` is created.
+            let writer = sync_engine::start_sync_engine(
+                &engine_owner,
+                &ws_client,
+                &sync_store,
+                &workspace_id,
+                broadcast.with_value(|channel| (**channel).clone()),
+            );
 
-            let ws_for_cleanup = ws_client.clone();
-            provide_context(ws_client.clone());
+            // This tab now owns every write to the shared cache. Its own deletes
+            // go straight onto the queue rather than round-tripping through the
+            // channel to itself, and the handler installed above starts
+            // enqueueing the deletes other tabs ask for.
+            sync_store.set_delete_route(DeleteRoute::owned(writer.clone()));
+            *cache_writer.write_value() = send_wrapper::SendWrapper::new(Some(writer));
 
-            on_cleanup(move || {
-                websocket::disconnect(&ws_for_cleanup);
-            });
-
-            // Fetch JWT and reconnect with auth (multi-user mode only).
-            let ws_for_reconnect = ws_client;
-            let uid_reconnect = user_id.clone();
-            let wid_reconnect = workspace_id.clone();
-            leptos::task::spawn_local(async move {
-                if let Ok(token) = crate::server_fns::auth::get_ws_token().await && !token.is_empty() {
-                    ws_for_reconnect.reconnect(&uid_reconnect, &wid_reconnect, &token);
-                }
-            });
+            // Dial once hydration is done, with a token already in hand.
+            //
+            // The token is a JWT in both deployment modes: personal mode issues
+            // one like any other (the server bypasses auth for the WebSocket, so
+            // it is simply ignored there), multi-user mode requires it. Fetching
+            // it *before* the first dial is what removes the old
+            // connect-with-nothing → 4001 close → reconnect-with-a-JWT churn on
+            // every multi-user page load.
+            //
+            // If the token cannot be fetched we still dial. In personal mode the
+            // connection succeeds regardless; in multi-user mode the server
+            // closes it, which is precisely the event that drives the existing
+            // backoff loop — and that loop re-fetches the token on every
+            // attempt. Refusing to dial would instead leave the tab with no
+            // socket and no path back to one.
+            leptos::task::spawn_local(sync_engine::dial_when_hydrated(
+                hydration_gate.clone(),
+                ws_client.clone(),
+                user_id,
+                workspace_id,
+                async {
+                    match crate::server_fns::auth::get_ws_token().await {
+                        Ok(token) => token,
+                        Err(e) => {
+                            tracing::warn!(
+                                "sync: could not fetch a WebSocket token — dialing without one; \
+                                 an unauthenticated close will trigger the reconnect loop, which \
+                                 fetches a fresh token per attempt: {e}"
+                            );
+                            String::new()
+                        }
+                    }
+                },
+            ));
         });
     }
 
@@ -560,7 +744,7 @@ fn SidebarProjectsSection() -> impl IntoView {
                             let href = format!("/projects/{}", project.project_id);
                             let name = project.name.clone();
                             view! {
-                                <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type="project" favorite_id=fav_id/>
+                                <SidebarEntityItem href=href name=name icon=phosphor_leptos::FOLDER favorite_type=FavoriteTarget::Project favorite_id=fav_id/>
                             }
                         }).collect_view()}
                     </div>
@@ -787,7 +971,7 @@ fn SidebarWorkspacePresetItem(
 /// `add_favorite` or `remove_favorite` server function.
 #[component]
 pub fn FavoriteToggle(
-    target_type: &'static str,
+    target_type: FavoriteTarget,
     target_id: String,
 ) -> impl IntoView {
     let store = use_context::<SyncStore>();
@@ -798,7 +982,7 @@ pub fn FavoriteToggle(
                 s.favorites()
                     .get()
                     .iter()
-                    .any(|f| f.target_type == target_type && f.target_id == tid)
+                    .any(|f| f.target_type == target_type.as_str() && f.target_id == tid)
             })
             .unwrap_or(false)
     });
@@ -813,7 +997,7 @@ pub fn FavoriteToggle(
             return;
         }
         toggling.set(true);
-        let tt = target_type.to_string();
+        let tt = target_type.as_str().to_string();
         let ti = target_id_click.clone();
         let currently_fav = is_fav.get_untracked();
         leptos::task::spawn_local(async move {
@@ -858,7 +1042,7 @@ fn SidebarEntityItem(
     href: String,
     name: String,
     icon: phosphor_leptos::IconData,
-    #[prop(optional)] favorite_type: Option<&'static str>,
+    #[prop(optional)] favorite_type: Option<FavoriteTarget>,
     #[prop(optional)] favorite_id: Option<String>,
 ) -> impl IntoView {
     let path = leptos_router::hooks::use_location().pathname;
@@ -1208,9 +1392,18 @@ fn SidebarInboxNavItem() -> impl IntoView {
     };
 
     let sync_store = use_context::<SyncStore>();
+    // Resolved here, at component setup, rather than inside the closure below:
+    // the eight collection getters build a fresh arena-registered `Signal`
+    // wrapper on each call, so calling one from a closure that re-runs abandons
+    // a wrapper per evaluation and is one refactor from the disposed-value
+    // panic. This is the site TRA-9995 found in that shape. The nine
+    // `*_version()` counters no longer behave this way — TRA-9996 moved them to
+    // `ArcSignal`, which has no owner — so the rule is now specific to the
+    // collections. See the getter notes on `SyncStore`, and [[TRA-9998]].
+    let notifications = sync_store.map(|store| store.notifications());
     let unread_count = Signal::derive(move || {
-        sync_store
-            .map(|store| store.notifications().get().iter().filter(|n| !n.read).count())
+        notifications
+            .map(|list| list.get().iter().filter(|n| n.is_unread_in_inbox()).count())
             .unwrap_or(0)
     });
 
@@ -1337,5 +1530,205 @@ fn BillingBanner() -> impl IntoView {
                 </Button>
             </div>
         </Show>
+    }
+}
+
+// ── Browser tests ───────────────────────────────────────────────────────────
+
+/// What the sidebar's unread badge counts, asserted on the badge itself.
+///
+/// These mount the real `SidebarInboxNavItem` and read the number out of the
+/// DOM. The alternative — evaluating the count expression from a test — restates
+/// the predicate under test and would agree with it however wrong it is, which
+/// is how TRA-9995 survived a suite that already covered the store this badge
+/// reads from.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use gloo_timers::future::TimeoutFuture;
+    use leptos_router::components::Router;
+    use trakkt_types::enums::ActionSource;
+    use trakkt_types::models::Notification;
+    use trakkt_types::sync::{entity_types, SyncAction, SyncActionType};
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use crate::cache::apply::apply_action_to_memory;
+    use crate::cache::store::SyncStore;
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
+
+    use super::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// One unread, undeleted notification.
+    ///
+    /// Built as the model rather than as JSON so that a field renamed on
+    /// [`Notification`] changes this fixture and the payload [`update_frame`]
+    /// serialises together, instead of leaving the two agreeing only by hand.
+    fn unread(notification_id: &str) -> Notification {
+        Notification {
+            notification_id: notification_id.to_owned(),
+            workspace_id: "ws-1".to_owned(),
+            user_id: "usr-alice".to_owned(),
+            issue_id: "issue-1".to_owned(),
+            notification_type: "assigned".to_owned(),
+            read: false,
+            issue_title: Some("A leaky issue".to_owned()),
+            issue_number: Some(42),
+            team_key: Some("TRA".to_owned()),
+            actor_id: Some("usr-bob".to_owned()),
+            actor_name: Some("Bob".to_owned()),
+            action_source: ActionSource::User,
+            action_source_label: None,
+            created_at: "2026-07-26T00:00:00Z".to_owned(),
+            deleted_at: None,
+            context_id: None,
+        }
+    }
+
+    /// The frame the server delivers for one notification it has just changed.
+    ///
+    /// `notification_service::change_notifications` records one `Update` per
+    /// affected row carrying the whole row as `sync_log_service::sync_payload`
+    /// serialised it, and `commit_and_deliver` sends it to every session the
+    /// recipient has open — including the one that asked for the change. A
+    /// soft-delete and a mark-read are the same frame with a different row
+    /// inside it, which is why both tests below build theirs here.
+    fn update_frame(notification: &Notification) -> SyncAction {
+        SyncAction {
+            sync_id: 1,
+            entity_type: entity_types::NOTIFICATION.to_owned(),
+            entity_id: notification.notification_id.clone(),
+            workspace_id: notification.workspace_id.clone(),
+            action: SyncActionType::Update,
+            data: Some(
+                serde_json::to_value(notification)
+                    .expect("serializing a Notification the way `sync_payload` does"),
+            ),
+            timestamp: "2026-07-26T01:00:00Z".to_owned(),
+        }
+    }
+
+    /// Mount the real sidebar item with `store` in context, as `Layout` provides
+    /// it. The caller drops the handle and removes the container when done.
+    ///
+    /// The `<Router>` is not decoration: `SidebarInboxNavItem` calls
+    /// `use_location` to decide whether it is the active item, and that panics
+    /// outside a router context. Nothing here asserts on the active state — the
+    /// router is the price of mounting the component unmodified rather than a
+    /// stand-in that would prove nothing about the badge in the sidebar.
+    fn mount_inbox_nav_item(store: SyncStore) -> (impl Sized, web_sys::HtmlElement) {
+        let container = mount_container();
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            provide_context(store);
+            view! { <Router><SidebarInboxNavItem/></Router> }
+        });
+        (handle, container)
+    }
+
+    /// The number the badge is showing, or `None` when no badge is rendered.
+    ///
+    /// The `<span>` is the only one in the anchor: the tray icon renders an
+    /// `<svg>` and the "Inbox" label is a bare text node. So this selector finds
+    /// the badge or finds nothing, and "nothing" is the count reaching zero
+    /// rather than a selector that stopped matching.
+    fn badge_text(container: &web_sys::HtmlElement) -> Option<String> {
+        container
+            .query_selector("a[href=\"/inbox\"] span")
+            .expect("querying the mounted sidebar item for its unread badge")
+            .map(|span| {
+                span.text_content()
+                    .expect("an element node always has textContent")
+            })
+    }
+
+    /// Deleting an unread notification has to take it off the badge.
+    ///
+    /// Deleting from the inbox is a *soft* delete: `bulk_delete_notifications`
+    /// stamps `deleted_at` and the row stays in this tab's store, arriving as an
+    /// `Update` — `cache::apply`'s
+    /// `a_soft_deleted_notification_frame_keeps_the_row_and_stamps_it` pins that
+    /// half. So a badge that counts `!read` alone goes on counting a row the
+    /// inbox no longer lists, and goes on counting it until the page is
+    /// reloaded. That is TRA-9995.
+    ///
+    /// Two notifications rather than one so the assertion is a count that
+    /// dropped and not a badge that vanished: at zero the badge is not rendered
+    /// at all, and an element missing for some unrelated reason would read the
+    /// same.
+    #[wasm_bindgen_test]
+    async fn the_badge_stops_counting_a_notification_the_user_deleted() {
+        boot_leptos_executor();
+
+        let store = SyncStore::new();
+        store.set_notifications(vec![unread("ntf-1"), unread("ntf-2")]);
+        let (handle, container) = mount_inbox_nav_item(store);
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("2"),
+            "the badge is not showing the two unread notifications the store was \
+             seeded with, so nothing below this line measures what deleting one \
+             does — fix this first"
+        );
+
+        let mut deleted = unread("ntf-1");
+        deleted.deleted_at = Some("2026-07-26T01:00:00Z".to_owned());
+        apply_action_to_memory(&store, &update_frame(&deleted));
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("1"),
+            "the badge still counts a notification the user deleted. The row is \
+             still in the store — the delete stamped `deleted_at` instead of \
+             evicting it — so the count has to exclude it explicitly, the way \
+             `notification_service::count_unread` does with \
+             `read = false AND deleted_at IS NULL`"
+        );
+
+        drop(handle);
+        container.remove();
+    }
+
+    /// Marking an unread notification read has to take it off the badge too.
+    ///
+    /// Same frame, same store, the other half of the predicate — so this is what
+    /// stops a fix for the delete case from being written as `deleted_at
+    /// IS NULL` alone. It arrives here by the sync frame rather than by the
+    /// inbox's optimistic `upsert_notification`, because the frame is the path
+    /// that has to work for the tab the user is *not* looking at.
+    #[wasm_bindgen_test]
+    async fn the_badge_stops_counting_a_notification_the_user_read() {
+        boot_leptos_executor();
+
+        let store = SyncStore::new();
+        store.set_notifications(vec![unread("ntf-1"), unread("ntf-2")]);
+        let (handle, container) = mount_inbox_nav_item(store);
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("2"),
+            "the badge is not showing the two unread notifications the store was \
+             seeded with, so nothing below this line measures what reading one \
+             does — fix this first"
+        );
+
+        let mut read = unread("ntf-1");
+        read.read = true;
+        apply_action_to_memory(&store, &update_frame(&read));
+
+        TimeoutFuture::new(100).await;
+        assert_eq!(
+            badge_text(&container).as_deref(),
+            Some("1"),
+            "the badge still counts a notification that has been read in this \
+             workspace, so it is no longer the count of things needing attention \
+             that it exists to be"
+        );
+
+        drop(handle);
+        container.remove();
     }
 }

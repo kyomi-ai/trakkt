@@ -53,10 +53,10 @@ pub async fn update_team_settings(
     )
     .await?;
 
-    // Re-fetch the team to return the updated state.
-    let team = team_service::get_team(ctx.db, &team_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("team {team_id} not found")))?;
+    // Re-fetch the team to return the updated state. Scoped to the workspace:
+    // the UPDATE above is, so a team from elsewhere leaves it a no-op, and an
+    // unscoped read here would hand that team's row back regardless.
+    let team = team_service::get_team_in_workspace(ctx.db, &team_id, &ctx.workspace_id).await?;
 
     Ok(serde_json::to_value(&team)?)
 }

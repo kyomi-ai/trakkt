@@ -64,17 +64,24 @@ impl ConfigFile {
         std::fs::create_dir_all(config_dir)?;
         let path = config_dir.join("config.toml");
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&path, &content)?;
-
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+        use std::io::Write;
+        file.write_all(content.as_bytes())?;
 
         Ok(path)
     }
-
 }
 
 #[cfg(test)]
@@ -84,7 +91,7 @@ mod tests {
     fn test_config() -> ConfigFile {
         ConfigFile {
             token: Some("trakkt-test-token-value".to_string()),
-            server_url: Some("wss://app.trakkt.dev/api/connect/ws".to_string()),
+            server_url: Some("wss://trakkt.app/ws/connect/agent".to_string()),
             working_dir: Some("/home/user/projects".to_string()),
             allowed_commands: Some(vec![
                 "claude".to_string(),
@@ -99,8 +106,8 @@ mod tests {
     #[test]
     fn round_trip_toml() {
         let config = test_config();
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let loaded: ConfigFile = toml::from_str(&toml_str).unwrap();
+        let toml_str = toml::to_string_pretty(&config).expect("valid config test fixture");
+        let loaded: ConfigFile = toml::from_str(&toml_str).expect("valid config test fixture");
         assert_eq!(loaded.token, config.token);
         assert_eq!(loaded.server_url, config.server_url);
         assert_eq!(loaded.working_dir, config.working_dir);
@@ -119,8 +126,8 @@ mod tests {
             health_port: None,
             scrollback_size: None,
         };
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let loaded: ConfigFile = toml::from_str(&toml_str).unwrap();
+        let toml_str = toml::to_string_pretty(&config).expect("valid config test fixture");
+        let loaded: ConfigFile = toml::from_str(&toml_str).expect("valid config test fixture");
         assert_eq!(loaded.token, config.token);
         assert!(loaded.server_url.is_none());
         assert!(loaded.working_dir.is_none());
@@ -133,7 +140,7 @@ mod tests {
     fn default_config_dir_returns_path() {
         let result = ConfigFile::default_config_dir();
         assert!(result.is_ok());
-        let path = result.unwrap();
+        let path = result.expect("valid config test fixture");
         assert!(path.ends_with("trakkt-connect"));
     }
 
@@ -142,39 +149,41 @@ mod tests {
         let paths = ConfigFile::config_paths();
         assert!(!paths.is_empty());
         assert_eq!(
-            paths.last().unwrap(),
+            paths.last().expect("valid config test fixture"),
             &PathBuf::from("/etc/trakkt-connect/config.toml")
         );
     }
 
     #[test]
     fn save_to_writes_config_and_sets_permissions() {
-        let tmp = std::env::temp_dir().join(format!(
-            "trakkt-connect-test-save-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp =
+            std::env::temp_dir().join(format!("trakkt-connect-test-save-{}", std::process::id()));
+        if tmp.exists() {
+            std::fs::remove_dir_all(&tmp).expect("remove previous test fixture");
+        }
 
         let config = test_config();
-        let path = config.save_to(&tmp).unwrap();
+        let path = config.save_to(&tmp).expect("valid config test fixture");
 
         assert!(path.exists());
-        let written = std::fs::read_to_string(&path).unwrap();
+        let written = std::fs::read_to_string(&path).expect("valid config test fixture");
         assert!(written.contains("trakkt-test-token-value"));
-        assert!(written.contains("wss://app.trakkt.dev/api/connect/ws"));
+        assert!(written.contains("wss://trakkt.app/ws/connect/agent"));
 
         // Verify round-trip through file
-        let loaded: ConfigFile = toml::from_str(&written).unwrap();
+        let loaded: ConfigFile = toml::from_str(&written).expect("valid config test fixture");
         assert_eq!(loaded.token, config.token);
         assert_eq!(loaded.server_url, config.server_url);
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::metadata(&path).unwrap().permissions();
+            let perms = std::fs::metadata(&path)
+                .expect("valid config test fixture")
+                .permissions();
             assert_eq!(perms.mode() & 0o777, 0o600);
         }
 
-        std::fs::remove_dir_all(&tmp).unwrap();
+        std::fs::remove_dir_all(&tmp).expect("valid config test fixture");
     }
 }

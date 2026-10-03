@@ -8,6 +8,9 @@ pub mod input;
 pub mod renderer;
 pub mod tab_manager;
 pub mod vte_handler;
+pub mod sessions;
+#[cfg(target_arch = "wasm32")]
+pub mod client;
 
 pub use grid::{CellAttrs, Color, CursorState, Grid, Cell, StyledSpan, TerminalModes};
 pub use renderer::TerminalRenderer;

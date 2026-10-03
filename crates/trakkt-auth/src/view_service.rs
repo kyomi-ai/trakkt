@@ -8,10 +8,11 @@
 
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_types::enums::FavoriteTarget;
 use trakkt_types::models::View;
 use trakkt_types::sync::{SyncActionType, entity_types};
 
-use crate::sync_log_service;
+use crate::sync_log_service::{self, SyncAudience};
 use crate::websocket::WebSocketManager;
 
 // ─── Row types ──────────────────────────────────────────────────────────────
@@ -68,6 +69,35 @@ const VIEW_SELECT: &str = "\
            CAST(created_at AS TEXT) AS created_at, \
            CAST(updated_at AS TEXT) AS updated_at \
     FROM views";
+
+// ─── Sync visibility ────────────────────────────────────────────────────────
+
+/// Who a view's sync rows are addressed to.
+///
+/// This service is the one place where the audience genuinely varies per call:
+/// a shared view goes to the workspace and an unshared one only to its creator.
+/// Derived from the WHERE clause of [`list_views`], which is also the
+/// `sync_bootstrap` query:
+/// `workspace_id = $1 AND (created_by = $2 OR is_shared = TRUE)`. The sync log
+/// has to scope rows the same way — otherwise the entity set a client ends up
+/// with depends on whether it bootstrapped or delta-synced.
+///
+/// Returning a [`SyncAudience`] rather than an `Option<&str>` is what keeps the
+/// persisted `visibility_user_id` and the live frame in step: the single value
+/// returned here drives both, so an unshared view cannot be logged as private
+/// and then broadcast to everyone.
+///
+/// Note this reads the view's *current* `is_shared`: un-sharing a view makes
+/// subsequent rows owner-only, which is the safe direction. Members who already
+/// cached it while it was shared keep their stale copy until their next
+/// bootstrap — un-sharing does not retroactively evict it.
+fn view_audience(view: &View) -> SyncAudience<'_> {
+    if view.is_shared {
+        SyncAudience::Workspace
+    } else {
+        SyncAudience::User(view.created_by.as_str())
+    }
+}
 
 // ─── View CRUD ──────────────────────────────────────────────────────────────
 
@@ -158,6 +188,10 @@ pub struct CreateViewParams<'a> {
 ///
 /// `params.team_id` scopes the view to a specific team. `params.position`
 /// controls the ordering of views in the sidebar.
+///
+/// The INSERT and its `sync_log` entry are one transaction: a view that commits
+/// without its sync row is invisible to every future delta, so a failed log
+/// write rolls the view back rather than leaving it stranded.
 pub async fn create_view(
     db: &DbPool,
     params: &CreateViewParams<'_>,
@@ -186,8 +220,10 @@ pub async fn create_view(
              sort_order, is_shared, team_id, position, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, {filters_cast}, {display_cast}, 0, {shared_val}, $9, {position_cast}, {now}, {now})"
     );
-    trakkt_core::db_execute!(
-        db,
+    let mut tx = db.begin().await?;
+
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         &view_id,
         params.workspace_id,
@@ -200,42 +236,29 @@ pub async fn create_view(
         params.team_id
     )?;
 
-    // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::VIEW,
-        &view_id,
-        params.workspace_id,
-        SyncActionType::Insert,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, view_id = %view_id, "Failed to write sync log entry for view create");
-    }
-
-    // Re-fetch to get DB-assigned timestamps.
-    let sql = format!("{VIEW_SELECT} WHERE view_id = $1");
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    // Re-fetch to get DB-assigned timestamps, and so the entry can be scoped
+    // from the view's persisted `is_shared`. The row does not exist outside the
+    // transaction yet, so the read runs on it.
+    let row: ViewRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         ViewRow,
-        &sql,
+        &format!("{VIEW_SELECT} WHERE view_id = $1"),
         &view_id
     )?;
     let view = row.into_dto();
+    let payload = sync_log_service::sync_payload(&view, entity_types::VIEW, &view_id);
 
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            params.workspace_id,
-            entity_types::VIEW,
-            &view_id,
-            SyncActionType::Insert,
-            serde_json::to_value(&view).ok(),
-        )
-        .await;
-    }
+    sync_log_service::commit_and_deliver(
+        tx,
+        entity_types::VIEW,
+        &view_id,
+        params.workspace_id,
+        view_audience(&view),
+        SyncActionType::Insert,
+        payload,
+        ws_manager,
+    )
+    .await?;
 
     Ok(view)
 }
@@ -263,6 +286,10 @@ pub struct UpdateViewParams<'a> {
 /// Update a view.
 ///
 /// Only fields that are `Some` are changed. `updated_at` is always set.
+///
+/// The UPDATE and its `sync_log` entry are one transaction — an edit that
+/// commits without its sync row leaves every other client showing the old name,
+/// filters or share state until it next bootstraps.
 pub async fn update_view(
     db: &DbPool,
     params: &UpdateViewParams<'_>,
@@ -327,7 +354,12 @@ pub async fn update_view(
         "UPDATE views SET {set_clause} WHERE view_id = ${vid_idx}"
     );
 
-    let affected: u64 = trakkt_core::db_with_pool!(db, |p| {
+    let mut tx = db.begin().await?;
+
+    // The binds are built at runtime, so this goes through `tx_with!` — the
+    // transaction-scoped form of `db_with_pool!`. Running it on the pool instead
+    // would put the UPDATE outside the transaction that logs it.
+    let affected: u64 = trakkt_core::tx_with!(&mut tx, |e| {
         let mut query = sqlx::query(&sql);
 
         if let Some(v) = params.name {
@@ -355,100 +387,117 @@ pub async fn update_view(
 
         query = query.bind(params.view_id);
 
-        query.execute(p).await.map(|r| r.rows_affected())
+        query.execute(e).await.map(|r| r.rows_affected())
     })?;
 
     if affected == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "view {} not found", params.view_id
         )));
     }
 
-    // Re-fetch the updated view.
-    let sql = format!("{VIEW_SELECT} WHERE view_id = $1");
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    // Re-fetch the updated view on the transaction: the new `is_shared` that
+    // scopes the entry is not visible on the pool until the commit.
+    let row: ViewRow = trakkt_core::tx_fetch_one!(
+        &mut tx,
         ViewRow,
-        &sql,
+        &format!("{VIEW_SELECT} WHERE view_id = $1"),
         params.view_id
     )?;
     let view = row.into_dto();
+    let payload = sync_log_service::sync_payload(&view, entity_types::VIEW, params.view_id);
 
-    // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
+    sync_log_service::commit_and_deliver(
+        tx,
         entity_types::VIEW,
         params.view_id,
         &view.workspace_id,
+        view_audience(&view),
         SyncActionType::Update,
-        None,
+        payload,
+        ws_manager,
     )
-    .await
-    {
-        tracing::warn!(error = %e, view_id = %params.view_id, "Failed to write sync log entry for view update");
-    }
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            &view.workspace_id,
-            entity_types::VIEW,
-            params.view_id,
-            SyncActionType::Update,
-            serde_json::to_value(&view).ok(),
-        )
-        .await;
-    }
+    .await?;
 
     Ok(view)
 }
 
-/// Delete a view.
+/// Delete a view, and with it every favorite that pinned it.
+///
+/// The DELETE and its `sync_log` entry are one transaction — a delete that
+/// commits without its sync row leaves the view in every other client's sidebar
+/// forever, and no later delta can repair it: the row it would have to re-read
+/// is gone.
+///
+/// The favorites go the same way and for the same reason. `favorites.target_id`
+/// has no foreign key to `views`, so nothing in either dialect removes them
+/// (TRA-10025); left behind they point at nothing, and being a cached type they
+/// return after every `SyncReset` because the server still has the row. This is
+/// one of the four delete paths
+/// `every_favorite_target_is_deleted_with_its_target` holds to that.
 pub async fn delete_view(
     db: &DbPool,
     view_id: &str,
     workspace_id: &str,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    let result = trakkt_core::db_execute!(
-        db,
+    // Read the view before deleting it: once the row is gone there is no way to
+    // tell whether the delete was for a shared view (workspace-visible) or a
+    // personal one (owner only), and the sync entry has to carry that scope.
+    // This reads state that predates the transaction, so it stays on the pool
+    // ahead of `begin` — once the transaction is open the pool is unreachable on
+    // SQLite (see `DbTx`).
+    let Some(view) = get_view(db, view_id).await? else {
+        return Err(trakkt_core::Error::NotFound(format!(
+            "view {view_id} not found"
+        )));
+    };
+
+    let mut tx = db.begin().await?;
+
+    // Ahead of the DELETE, because after it nothing connects a favorite to the
+    // view it named. Nothing is removed yet — `delete_and_record` does that, so
+    // the rows cannot go without the entries that evict them from their owners'
+    // caches.
+    let doomed_favorites =
+        crate::favorite_service::doomed_favorites_tx(&mut tx, FavoriteTarget::View, view_id).await?;
+
+    let result = trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM views WHERE view_id = $1",
         view_id
     )?;
 
     if result.rows_affected() == 0 {
+        tx.rollback().await?;
         return Err(trakkt_core::Error::NotFound(format!(
             "view {view_id} not found"
         )));
     }
 
-    // Sync log — best-effort.
-    if let Err(e) = sync_log_service::write_sync_entry(
-        db,
-        entity_types::VIEW,
-        view_id,
-        workspace_id,
-        SyncActionType::Delete,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, view_id = %view_id, "Failed to write sync log entry for view delete");
-    }
+    // A batch rather than `commit_and_deliver`: the view's own entry is no
+    // longer the only one, and a favorite's is addressed to its owner alone
+    // while the view's follows `view_audience`. One commit, N deliveries.
+    let mut batch = sync_log_service::SyncBatch::new();
 
-    // WebSocket broadcast — delete has no entity data.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
+    batch
+        .record(
+            &mut tx,
             entity_types::VIEW,
             view_id,
+            workspace_id,
+            view_audience(&view),
             SyncActionType::Delete,
             None,
         )
-        .await;
-    }
+        .await?;
+
+    doomed_favorites
+        .delete_and_record(&mut tx, &mut batch)
+        .await?;
+
+    batch.commit_and_deliver(tx, ws_manager).await?;
 
     Ok(())
 }

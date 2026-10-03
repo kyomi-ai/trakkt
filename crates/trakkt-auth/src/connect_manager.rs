@@ -1,314 +1,617 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-//! ConnectManager — central registry for Connect agents, terminal sessions,
-//! and browser subscribers.
-//!
-//! The server never executes commands; it is purely a relay. The manager
-//! routes messages between agents and browsers:
-//!
-//! - **Agent registration**: agents connect via WebSocket and register here.
-//! - **Session routing**: each session maps to an agent; browser input is
-//!   forwarded to the owning agent.
-//! - **Browser fan-out**: multiple browsers can watch the same session;
-//!   agent output is broadcast to all subscribers.
-//!
-//! Pattern mirrors [`crate::websocket::WebSocketManager`] — `Arc<Inner>` with
-//! `DashMap` for lock-free concurrent access.
-
+//! Atomic, owner-scoped relay registry. No OS commands execute on the server.
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
-use dashmap::DashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
+use trakkt_connect_protocol::{AgentMessage, ServerMessage, SessionEventKind, SessionInfo};
 
-/// Capacity of the bounded mpsc channel between the manager and each
-/// connection's outbound task. Terminal output can be bursty, so we use
-/// a generous buffer.
-const CHANNEL_CAPACITY: usize = 2048;
-
-/// Monotonically increasing ID for browser connection deduplication.
+const CHANNEL_CAPACITY: usize = 64;
+const MAX_SESSIONS_PER_AGENT: usize = 32;
 static NEXT_BROWSER_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Generate a unique browser connection ID.
 pub fn next_browser_connection_id() -> u64 {
     NEXT_BROWSER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
 }
-
-/// A connected agent's send channel and metadata.
-struct AgentConnection {
-    workspace_id: String,
-    user_id: String,
+#[derive(Clone, PartialEq, Eq)]
+struct Owner {
+    workspace: String,
+    user: String,
+}
+struct Agent {
+    owner: Owner,
     sender: mpsc::Sender<String>,
 }
-
-/// A browser subscriber watching a terminal session.
-struct BrowserConnection {
-    connection_id: u64,
+struct Browser {
+    owner: Owner,
     sender: mpsc::Sender<String>,
+    sessions: HashSet<String>,
 }
-
-/// Internal shared state behind `Arc` (cheap clones).
-struct ConnectManagerInner {
-    /// Connected agents: agent_id -> AgentConnection.
-    agents: DashMap<String, AgentConnection>,
-    /// Session routing: session_id -> agent_id.
-    sessions: DashMap<String, String>,
-    /// Browser connections watching sessions: session_id -> Vec<BrowserConnection>.
-    browsers: DashMap<String, Vec<BrowserConnection>>,
+#[derive(Default)]
+struct Registry {
+    agents: HashMap<String, Agent>,
+    sessions: HashMap<String, String>,
+    infos: HashMap<String, SessionInfo>,
+    browsers: HashMap<u64, Browser>,
 }
-
-/// Central registry for connected agents, active sessions, and browser
-/// subscribers. Cheaply cloneable (inner `Arc`).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ConnectManager {
-    inner: Arc<ConnectManagerInner>,
+    inner: Arc<Mutex<Registry>>,
 }
-
 impl ConnectManager {
-    /// Create a new, empty manager.
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(ConnectManagerInner {
-                agents: DashMap::new(),
-                sessions: DashMap::new(),
-                browsers: DashMap::new(),
-            }),
-        }
+        Self::default()
     }
-
-    /// Register a connected agent.
-    ///
-    /// Returns an `mpsc::Receiver<String>` that the caller should drain and
-    /// forward to the agent's WebSocket sink.
-    pub fn register_agent(
-        &self,
-        agent_id: &str,
-        workspace_id: &str,
-        user_id: &str,
-    ) -> mpsc::Receiver<String> {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        self.inner.agents.insert(
-            agent_id.to_string(),
-            AgentConnection {
-                workspace_id: workspace_id.to_string(),
-                user_id: user_id.to_string(),
-                sender: tx,
-            },
-        );
-        tracing::info!(
-            agent_id,
-            workspace_id,
-            user_id,
-            "Connect agent registered"
-        );
-        rx
+    fn registry(&self) -> MutexGuard<'_, Registry> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
-
-    /// Unregister an agent and clean up all its sessions.
-    ///
-    /// Removes the agent from the registry and drops all session mappings
-    /// that pointed to this agent.
-    pub fn unregister_agent(&self, agent_id: &str) {
-        self.inner.agents.remove(agent_id);
-
-        // Collect session IDs owned by this agent, then remove them.
-        let owned_sessions: Vec<String> = self
-            .inner
-            .sessions
-            .iter()
-            .filter(|entry| entry.value() == agent_id)
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        for session_id in &owned_sessions {
-            self.inner.sessions.remove(session_id);
-            // Notify any watching browsers that the session is gone by
-            // dropping their entries (senders will close naturally).
-            self.inner.browsers.remove(session_id);
-        }
-
-        tracing::info!(
-            agent_id,
-            sessions_cleaned = owned_sessions.len(),
-            "Connect agent unregistered"
-        );
-    }
-
-    /// Register a session-to-agent mapping.
-    pub fn register_session(&self, session_id: &str, agent_id: &str) {
-        self.inner
-            .sessions
-            .insert(session_id.to_string(), agent_id.to_string());
-        tracing::debug!(session_id, agent_id, "Session registered");
-    }
-
-    /// Remove a session mapping and its browser subscribers.
-    pub fn unregister_session(&self, session_id: &str) {
-        self.inner.sessions.remove(session_id);
-        self.inner.browsers.remove(session_id);
-        tracing::debug!(session_id, "Session unregistered");
-    }
-
-    /// Subscribe a browser to session output.
-    ///
-    /// Returns an `mpsc::Receiver<String>` that the caller should drain and
-    /// forward to the browser's WebSocket sink.
-    pub fn subscribe_browser(&self, session_id: &str, connection_id: u64) -> mpsc::Receiver<String> {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        self.inner
-            .browsers
-            .entry(session_id.to_string())
-            .or_default()
-            .push(BrowserConnection {
-                connection_id,
-                sender: tx,
-            });
-        tracing::debug!(session_id, connection_id, "Browser subscribed to session");
-        rx
-    }
-
-    /// Unsubscribe a browser from session output.
-    pub fn unsubscribe_browser(&self, session_id: &str, connection_id: u64) {
-        if let Some(mut browsers) = self.inner.browsers.get_mut(session_id) {
-            browsers.retain(|b| b.connection_id != connection_id);
-        }
-        // Clean up empty entries.
-        self.inner
-            .browsers
-            .remove_if(session_id, |_, browsers| browsers.is_empty());
-        tracing::debug!(session_id, connection_id, "Browser unsubscribed from session");
-    }
-
-    /// Route a message to the agent owning a session.
-    ///
-    /// Returns `true` if the message was queued, `false` if the session or
-    /// agent is unknown or the agent's channel is full/closed.
-    pub fn send_to_agent(&self, session_id: &str, message: &str) -> bool {
-        let agent_id = match self.inner.sessions.get(session_id) {
-            Some(entry) => entry.value().clone(),
-            None => {
-                tracing::warn!(session_id, "send_to_agent: unknown session");
-                return false;
-            }
+    pub fn register_agent(&self, id: &str, workspace: &str, user: &str) -> mpsc::Receiver<String> {
+        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        let owner = Owner {
+            workspace: workspace.into(),
+            user: user.into(),
         };
-
-        match self.inner.agents.get(&agent_id) {
-            Some(conn) => match conn.sender.try_send(message.to_string()) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(agent_id, session_id, "Agent send buffer full, dropping message");
-                    false
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::warn!(agent_id, session_id, "Agent channel closed");
-                    false
-                }
+        let mut r = self.registry();
+        r.agents.insert(
+            id.into(),
+            Agent {
+                owner: owner.clone(),
+                sender,
             },
-            None => {
-                tracing::warn!(agent_id, session_id, "send_to_agent: agent not found");
+        );
+        Self::notify_owner(
+            &mut r,
+            &owner,
+            &AgentMessage::AgentStatus { connected: true },
+        );
+        receiver
+    }
+    pub fn unregister_agent(&self, id: &str) {
+        let mut r = self.registry();
+        if let Some(agent) = r.agents.remove(id) {
+            let removed: HashSet<_> = r
+                .sessions
+                .iter()
+                .filter(|(_, agent_id)| *agent_id == id)
+                .map(|(session, _)| session.clone())
+                .collect();
+            r.sessions.retain(|_, agent_id| agent_id != id);
+            r.infos.retain(|session, _| !removed.contains(session));
+            for browser in r.browsers.values_mut() {
+                browser
+                    .sessions
+                    .retain(|session| !removed.contains(session));
+            }
+            let connected = r.agents.values().any(|a| a.owner == agent.owner);
+            Self::notify_owner(
+                &mut r,
+                &agent.owner,
+                &AgentMessage::AgentStatus { connected },
+            );
+            let sessions = Self::owner_sessions(&r, &agent.owner);
+            Self::notify_owner(
+                &mut r,
+                &agent.owner,
+                &AgentMessage::SessionList { sessions },
+            );
+        }
+    }
+    /// One bounded outbound channel per browser; disconnect drops every subscription.
+    pub fn register_browser(&self, id: u64, workspace: &str, user: &str) -> mpsc::Receiver<String> {
+        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        let owner = Owner {
+            workspace: workspace.into(),
+            user: user.into(),
+        };
+        let mut r = self.registry();
+        let connected = r.agents.values().any(|a| a.owner == owner);
+        Self::send(&sender, &AgentMessage::AgentStatus { connected });
+        r.browsers.insert(
+            id,
+            Browser {
+                owner,
+                sender,
+                sessions: HashSet::new(),
+            },
+        );
+        receiver
+    }
+    pub fn unregister_browser(&self, id: u64) {
+        self.registry().browsers.remove(&id);
+    }
+    fn send(sender: &mpsc::Sender<String>, msg: &AgentMessage) -> bool {
+        match serde_json::to_string(msg) {
+            Ok(json) => sender.try_send(json).is_ok(),
+            Err(error) => {
+                tracing::warn!(%error, "Connect message serialization failed");
                 false
             }
         }
     }
-
-    /// Broadcast a message to all browser subscribers of a session.
-    ///
-    /// Uses `try_send` — if a browser's channel is full, the message is
-    /// dropped for that browser (terminal output is best-effort for slow
-    /// consumers). Stale (closed) connections are pruned.
-    pub fn broadcast_to_browsers(&self, session_id: &str, message: &str) {
-        let mut stale_ids: Vec<u64> = Vec::new();
-
-        if let Some(browsers) = self.inner.browsers.get(session_id) {
-            for browser in browsers.value().iter() {
-                match browser.sender.try_send(message.to_string()) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        stale_ids.push(browser.connection_id);
+    fn notify_owner(r: &mut Registry, owner: &Owner, msg: &AgentMessage) {
+        r.browsers
+            .retain(|_, browser| browser.owner != *owner || Self::send(&browser.sender, msg));
+    }
+    /// Authorization, session reservation and queueing share one lock. A duplicate
+    /// ID never replaces a live session, even under concurrent spawn requests.
+    pub fn browser_command(&self, id: u64, msg: &ServerMessage) -> Result<(), &'static str> {
+        let mut r = self.registry();
+        let owner = r
+            .browsers
+            .get(&id)
+            .ok_or("Browser disconnected")?
+            .owner
+            .clone();
+        let json = serde_json::to_string(msg).map_err(|_| "Invalid command")?;
+        match msg {
+            ServerMessage::SpawnSession {
+                session_id,
+                command,
+                working_dir,
+                env,
+                cols,
+                rows,
+            } => {
+                if command.is_empty()
+                    || command.len() > 16
+                    || command.iter().map(String::len).sum::<usize>() > 1024
+                    || working_dir.as_ref().is_some_and(|path| path.len() > 1024)
+                    || env.len() > 128
+                    || env
+                        .iter()
+                        .map(|(key, value)| key.len() + value.len())
+                        .sum::<usize>()
+                        > 16 * 1024
+                    || *cols == 0
+                    || *rows == 0
+                    || *cols > 500
+                    || *rows > 500
+                {
+                    return Err("Invalid command or terminal dimensions");
+                }
+                if session_id.is_empty() || session_id.len() > 128 {
+                    return Err("Invalid session ID");
+                }
+                if r.sessions.contains_key(session_id) {
+                    return Err("Session ID already exists");
+                }
+                let agent_id = r
+                    .agents
+                    .iter()
+                    .find(|(_, a)| a.owner == owner)
+                    .map(|(id, _)| id.clone())
+                    .ok_or("No agent connected")?;
+                if r.sessions.values().filter(|a| **a == agent_id).count() >= MAX_SESSIONS_PER_AGENT
+                {
+                    return Err("Session limit reached");
+                }
+                r.agents[&agent_id]
+                    .sender
+                    .try_send(json)
+                    .map_err(|_| "Agent unavailable or busy")?;
+                r.sessions.insert(session_id.clone(), agent_id);
+                if let Some(browser) = r.browsers.get_mut(&id) {
+                    browser.sessions.insert(session_id.clone());
+                }
+            }
+            ServerMessage::SessionInput { session_id, .. }
+            | ServerMessage::SessionResize { session_id, .. }
+            | ServerMessage::SessionKill { session_id, .. }
+            | ServerMessage::ScrollbackRequest { session_id } => {
+                let agent_id = r.sessions.get(session_id).ok_or("Unknown session")?.clone();
+                let agent = r.agents.get(&agent_id).ok_or("Agent disconnected")?;
+                if agent.owner != owner {
+                    return Err("Session access denied");
+                }
+                agent
+                    .sender
+                    .try_send(json)
+                    .map_err(|_| "Agent unavailable or busy")?;
+                if matches!(msg, ServerMessage::ScrollbackRequest { .. })
+                    && let Some(browser) = r.browsers.get_mut(&id)
+                {
+                    browser.sessions.insert(session_id.clone());
+                }
+            }
+            ServerMessage::ListSessions => {
+                let mut sent = false;
+                for agent in r.agents.values().filter(|a| a.owner == owner) {
+                    agent
+                        .sender
+                        .try_send(json.clone())
+                        .map_err(|_| "Agent unavailable or busy")?;
+                    sent = true;
+                }
+                if !sent && let Some(browser) = r.browsers.get(&id) {
+                    Self::send(
+                        &browser.sender,
+                        &AgentMessage::SessionList { sessions: vec![] },
+                    );
+                }
+            }
+            ServerMessage::Ping { .. } => {}
+        }
+        Ok(())
+    }
+    /// Agent events cannot forge another agent's output, exit, or routing table.
+    pub fn agent_message(&self, id: &str, msg: &AgentMessage) {
+        let mut r = self.registry();
+        let Some(owner) = r.agents.get(id).map(|a| a.owner.clone()) else {
+            return;
+        };
+        match msg {
+            AgentMessage::SessionList { sessions } => {
+                let mut accepted: Vec<SessionInfo> = Vec::new();
+                for info in sessions.iter().take(MAX_SESSIONS_PER_AGENT) {
+                    if info.session_id.is_empty() || info.session_id.len() > 128 {
+                        continue;
                     }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::warn!(
-                            session_id,
-                            connection_id = browser.connection_id,
-                            "Browser send buffer full, dropping terminal output"
-                        );
+                    if r.sessions
+                        .get(&info.session_id)
+                        .is_some_and(|agent| agent != id)
+                    {
+                        continue;
+                    }
+                    r.sessions.insert(info.session_id.clone(), id.into());
+                    r.infos.insert(info.session_id.clone(), info.clone());
+                    accepted.push(info.clone());
+                }
+                let ids: HashSet<_> = accepted.iter().map(|s| s.session_id.as_str()).collect();
+                // A list requested before Spawn may arrive after its reservation.
+                // Only prune sessions previously acknowledged by a list; pending
+                // commands are completed by Started/SpawnFailed/exit events.
+                let acknowledged: HashSet<_> = r.infos.keys().cloned().collect();
+                r.sessions.retain(|session, agent| {
+                    agent != id || ids.contains(session.as_str()) || !acknowledged.contains(session)
+                });
+                let valid: HashSet<_> = r.sessions.keys().cloned().collect();
+                r.infos.retain(|session, _| valid.contains(session));
+                for browser in r.browsers.values_mut() {
+                    browser.sessions.retain(|session| valid.contains(session));
+                }
+                let sessions = Self::owner_sessions(&r, &owner);
+                Self::notify_owner(&mut r, &owner, &AgentMessage::SessionList { sessions });
+            }
+            AgentMessage::SessionOutput { session_id, .. }
+            | AgentMessage::ScrollbackDump { session_id, .. }
+            | AgentMessage::SessionEvent { session_id, .. } => {
+                if r.sessions.get(session_id).is_none_or(|agent| agent != id) {
+                    return;
+                }
+                r.browsers.retain(|_, b| {
+                    b.owner != owner
+                        || !b.sessions.contains(session_id)
+                        || Self::send(&b.sender, msg)
+                });
+                if matches!(
+                    msg,
+                    AgentMessage::SessionEvent {
+                        event: SessionEventKind::Exited { .. }
+                            | SessionEventKind::Killed
+                            | SessionEventKind::SpawnFailed { .. },
+                        ..
+                    }
+                ) {
+                    r.sessions.remove(session_id);
+                    r.infos.remove(session_id);
+                    for browser in r.browsers.values_mut() {
+                        browser.sessions.remove(session_id);
                     }
                 }
             }
-        }
-
-        if !stale_ids.is_empty()
-            && let Some(mut browsers) = self.inner.browsers.get_mut(session_id)
-        {
-            browsers.retain(|b| !stale_ids.contains(&b.connection_id));
+            AgentMessage::Ready { .. } => Self::notify_owner(&mut r, &owner, msg),
+            AgentMessage::Pong { .. } | AgentMessage::AgentStatus { .. } => {}
         }
     }
-
-    /// Get a clone of an agent's send channel.
-    pub fn get_agent_sender(&self, agent_id: &str) -> Option<mpsc::Sender<String>> {
-        self.inner
-            .agents
-            .get(agent_id)
-            .map(|conn| conn.sender.clone())
+    fn owner_sessions(r: &Registry, owner: &Owner) -> Vec<SessionInfo> {
+        r.infos
+            .values()
+            .filter(|info| {
+                r.sessions
+                    .get(&info.session_id)
+                    .and_then(|agent| r.agents.get(agent))
+                    .is_some_and(|agent| agent.owner == *owner)
+            })
+            .cloned()
+            .collect()
     }
-
-    /// Find any connected agent in the given workspace.
-    ///
-    /// Returns the `agent_id` of the first match. If multiple agents are
-    /// connected for the same workspace, the selection is arbitrary.
-    pub fn find_agent_for_workspace(&self, workspace_id: &str) -> Option<String> {
-        self.inner
-            .agents
-            .iter()
-            .find(|entry| entry.value().workspace_id == workspace_id)
-            .map(|entry| entry.key().clone())
-    }
-
-    /// Get the workspace_id for a connected agent.
-    pub fn get_agent_workspace(&self, agent_id: &str) -> Option<String> {
-        self.inner
-            .agents
-            .get(agent_id)
-            .map(|conn| conn.workspace_id.clone())
-    }
-
-    /// Get the user_id for a connected agent.
-    pub fn get_agent_user(&self, agent_id: &str) -> Option<String> {
-        self.inner
-            .agents
-            .get(agent_id)
-            .map(|conn| conn.user_id.clone())
-    }
-
-    /// Get the workspace_id for a session by resolving through the agent.
-    ///
-    /// Returns `None` if the session or its agent is unknown.
-    pub fn get_session_workspace(&self, session_id: &str) -> Option<String> {
-        let agent_id = self.inner.sessions.get(session_id)?.value().clone();
-        self.get_agent_workspace(&agent_id)
+    pub fn browser_error(&self, id: u64, session_id: &str, error: &str) {
+        let r = self.registry();
+        if let Some(b) = r.browsers.get(&id) {
+            Self::send(
+                &b.sender,
+                &AgentMessage::SessionEvent {
+                    session_id: session_id.into(),
+                    event: SessionEventKind::SpawnFailed {
+                        error: error.into(),
+                    },
+                },
+            );
+        }
     }
 }
-
-impl Default for ConnectManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl std::fmt::Debug for ConnectManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = self.registry();
         f.debug_struct("ConnectManager")
-            .field("agents", &self.inner.agents.len())
-            .field("sessions", &self.inner.sessions.len())
-            .field(
-                "browser_subscriptions",
-                &self
-                    .inner
-                    .browsers
-                    .iter()
-                    .map(|e| e.value().len())
-                    .sum::<usize>(),
-            )
+            .field("agents", &r.agents.len())
+            .field("sessions", &r.sessions.len())
+            .field("browsers", &r.browsers.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn spawn(id: &str) -> ServerMessage {
+        ServerMessage::SpawnSession {
+            session_id: id.into(),
+            command: vec!["sh".into()],
+            working_dir: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+        }
+    }
+    fn info(id: &str) -> SessionInfo {
+        SessionInfo {
+            session_id: id.into(),
+            command: vec!["sh".into()],
+            working_dir: None,
+            started_at: "fixture".into(),
+            cols: 80,
+            rows: 24,
+            pid: 42,
+        }
+    }
+    #[test]
+    fn concurrent_duplicate_reservation_has_exactly_one_winner() {
+        let m = ConnectManager::new();
+        let _a = m.register_agent("a", "w", "u");
+        let _b1 = m.register_browser(1, "w", "u");
+        let _b2 = m.register_browser(2, "w", "u");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (1..=2)
+            .map(|id| {
+                let manager = m.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager.browser_command(id, &spawn("same")).is_ok()
+                })
+            })
+            .collect();
+        let count = handles
+            .into_iter()
+            .map(|h| usize::from(h.join().expect("reservation thread")))
+            .sum::<usize>();
+        assert_eq!(count, 1);
+        assert_eq!(m.registry().sessions.len(), 1);
+    }
+    #[test]
+    fn lists_and_presence_are_owner_scoped_and_exit_cleans_subscriptions() {
+        let m = ConnectManager::new();
+        let _a = m.register_agent("a", "w", "u");
+        let mut owner = m.register_browser(1, "w", "u");
+        let mut other = m.register_browser(2, "w", "other");
+        assert!(owner.try_recv().expect("presence").contains("true"));
+        assert!(other.try_recv().expect("presence").contains("false"));
+        assert!(m.browser_command(1, &spawn("s")).is_ok());
+        m.agent_message(
+            "a",
+            &AgentMessage::SessionList {
+                sessions: vec![info("s")],
+            },
+        );
+        assert!(owner.try_recv().expect("list").contains("\"s\""));
+        assert!(other.try_recv().is_err());
+        m.agent_message(
+            "a",
+            &AgentMessage::SessionEvent {
+                session_id: "s".into(),
+                event: SessionEventKind::Exited { exit_code: 0 },
+            },
+        );
+        assert!(m.registry().sessions.is_empty());
+        assert!(m.registry().browsers[&1].sessions.is_empty());
+        m.unregister_browser(1);
+        assert!(!m.registry().browsers.contains_key(&1));
+    }
+    #[test]
+    fn earlier_list_response_does_not_erase_pending_spawn() {
+        let m = ConnectManager::new();
+        let mut agent = m.register_agent("a", "w", "u");
+        let _browser = m.register_browser(1, "w", "u");
+        assert!(m.browser_command(1, &ServerMessage::ListSessions).is_ok());
+        assert!(m.browser_command(1, &spawn("pending")).is_ok());
+        assert!(
+            agent
+                .try_recv()
+                .expect("first command")
+                .contains("list_sessions")
+        );
+        assert!(
+            agent
+                .try_recv()
+                .expect("second command")
+                .contains("spawn_session")
+        );
+        m.agent_message("a", &AgentMessage::SessionList { sessions: vec![] });
+        assert!(
+            m.browser_command(
+                1,
+                &ServerMessage::SessionInput {
+                    session_id: "pending".into(),
+                    data: "YQ==".into()
+                }
+            )
+            .is_ok()
+        );
+    }
+    #[test]
+    fn duplicate_spawn_does_not_reassign_existing_owner() {
+        let m = ConnectManager::new();
+        let mut a = m.register_agent("a", "w1", "u1");
+        let _b = m.register_agent("b", "w2", "u2");
+        let _one = m.register_browser(1, "w1", "u1");
+        let _two = m.register_browser(2, "w2", "u2");
+        assert!(m.browser_command(1, &spawn("s")).is_ok());
+        assert!(m.browser_command(2, &spawn("s")).is_err());
+        assert_eq!(
+            m.registry().sessions.get("s").map(String::as_str),
+            Some("a")
+        );
+        assert!(a.try_recv().is_ok());
+        assert!(a.try_recv().is_err());
+    }
+    #[test]
+    fn same_workspace_other_user_and_other_workspace_cannot_control_session() {
+        let m = ConnectManager::new();
+        let mut agent = m.register_agent("a", "w1", "u1");
+        let _one = m.register_browser(1, "w1", "u1");
+        let _two = m.register_browser(2, "w1", "u2");
+        let _three = m.register_browser(3, "w2", "u1");
+        assert!(m.browser_command(1, &spawn("s")).is_ok());
+        assert!(agent.try_recv().is_ok());
+        for browser in [2, 3] {
+            for command in [
+                ServerMessage::SessionInput {
+                    session_id: "s".into(),
+                    data: "YQ==".into(),
+                },
+                ServerMessage::SessionResize {
+                    session_id: "s".into(),
+                    cols: 1,
+                    rows: 1,
+                },
+                ServerMessage::SessionKill {
+                    session_id: "s".into(),
+                    force: true,
+                },
+                ServerMessage::ScrollbackRequest {
+                    session_id: "s".into(),
+                },
+            ] {
+                assert!(m.browser_command(browser, &command).is_err());
+            }
+        }
+        assert!(agent.try_recv().is_err());
+    }
+    #[test]
+    fn forged_agent_events_and_lists_cannot_modify_or_observe_other_sessions() {
+        let m = ConnectManager::new();
+        let _a = m.register_agent("a", "w1", "u1");
+        let _b = m.register_agent("b", "w2", "u2");
+        let mut browser = m.register_browser(1, "w1", "u1");
+        assert!(browser.try_recv().is_ok());
+        assert!(m.browser_command(1, &spawn("s")).is_ok());
+        for msg in [
+            AgentMessage::SessionOutput {
+                session_id: "s".into(),
+                data: "forged".into(),
+            },
+            AgentMessage::ScrollbackDump {
+                session_id: "s".into(),
+                data: "forged".into(),
+            },
+            AgentMessage::SessionEvent {
+                session_id: "s".into(),
+                event: SessionEventKind::Killed,
+            },
+            AgentMessage::SessionList {
+                sessions: vec![info("s")],
+            },
+        ] {
+            m.agent_message("b", &msg);
+        }
+        assert!(browser.try_recv().is_err());
+        assert_eq!(
+            m.registry().sessions.get("s").map(String::as_str),
+            Some("a")
+        );
+        m.agent_message(
+            "a",
+            &AgentMessage::SessionOutput {
+                session_id: "s".into(),
+                data: "valid".into(),
+            },
+        );
+        assert!(browser.try_recv().expect("owner output").contains("valid"));
+    }
+    #[test]
+    fn no_agent_or_closed_queue_leaves_no_session_reservation() {
+        let m = ConnectManager::new();
+        let _browser = m.register_browser(1, "w", "u");
+        assert!(m.browser_command(1, &spawn("s")).is_err());
+        let rx = m.register_agent("a", "w", "u");
+        drop(rx);
+        assert!(m.browser_command(1, &spawn("s")).is_err());
+        assert!(m.registry().sessions.is_empty());
+    }
+    #[test]
+    fn reconnect_and_server_restart_recover_routes_and_owner_lists() {
+        let m = ConnectManager::new();
+        let _a = m.register_agent("old", "w", "u");
+        let mut browser = m.register_browser(1, "w", "u");
+        assert!(browser.try_recv().is_ok());
+        assert!(m.browser_command(1, &spawn("s")).is_ok());
+        m.unregister_agent("old");
+        assert!(browser.try_recv().expect("presence").contains("false"));
+        assert!(
+            browser
+                .try_recv()
+                .expect("empty list")
+                .contains("session_list")
+        );
+        let _b = m.register_agent("new", "w", "u");
+        assert!(browser.try_recv().expect("presence").contains("true"));
+        m.agent_message(
+            "new",
+            &AgentMessage::SessionList {
+                sessions: vec![info("s")],
+            },
+        );
+        assert!(
+            browser
+                .try_recv()
+                .expect("recovered list")
+                .contains("\"s\"")
+        );
+        assert!(
+            m.browser_command(
+                1,
+                &ServerMessage::ScrollbackRequest {
+                    session_id: "s".into()
+                }
+            )
+            .is_ok()
+        );
+        let fresh = ConnectManager::new();
+        let _a = fresh.register_agent("new", "w", "u");
+        m.agent_message(
+            "old",
+            &AgentMessage::SessionEvent {
+                session_id: "s".into(),
+                event: SessionEventKind::Killed,
+            },
+        );
+        assert!(m.registry().sessions.contains_key("s"));
+        fresh.agent_message(
+            "new",
+            &AgentMessage::SessionList {
+                sessions: vec![info("s")],
+            },
+        );
+        let _browser = fresh.register_browser(1, "w", "u");
+        assert!(
+            fresh
+                .browser_command(
+                    1,
+                    &ServerMessage::ScrollbackRequest {
+                        session_id: "s".into()
+                    }
+                )
+                .is_ok()
+        );
     }
 }
