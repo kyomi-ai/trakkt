@@ -21,6 +21,9 @@ pub struct ViewFilters {
     /// Persisted sort direction ("asc" or "desc").
     #[serde(default)]
     pub sort_direction: Option<String>,
+    /// Persisted group-by field (e.g. "none", "team").
+    #[serde(default)]
+    pub group_by: Option<String>,
 }
 
 // ───────────────────────────────────────────────���─────────────────────────────
@@ -85,6 +88,7 @@ impl LegacyViewFilters {
             clauses,
             sort_field: self.sort_field,
             sort_direction: self.sort_direction,
+            group_by: None,
         }
     }
 }

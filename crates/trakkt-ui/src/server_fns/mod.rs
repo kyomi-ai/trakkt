@@ -20,6 +20,7 @@ pub mod projects;
 pub mod relations;
 pub mod security;
 pub mod sidebar;
+pub mod stars;
 pub mod statuses;
 pub mod team;
 pub mod teams;

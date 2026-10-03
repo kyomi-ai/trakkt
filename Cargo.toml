@@ -115,6 +115,9 @@ dashmap = "6"
 # Stream utilities (for Redis pub/sub)
 futures-util = "0.3"
 
+# Channels + executor (client-side IndexedDB writer queue and its unit tests)
+futures = "0.3"
+
 [workspace.lints.clippy]
 unwrap_used = "warn"
 

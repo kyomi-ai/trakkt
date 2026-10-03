@@ -221,10 +221,54 @@ async fn handle_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Authenticate in non-personal mode, exactly as the two siblings on this
+    // route do — `handle_post` above and `handle_sse` at `:206`. Personal mode
+    // (single-user desktop, no login) bypasses auth in all three. The resolved
+    // value is bound rather than discarded because the ownership check below
+    // needs the caller's workspace; that is `handle_post`'s shape, and it costs
+    // the same one `resolve_auth` call `handle_sse` makes.
+    let resolved_auth = if state.config.is_personal() {
+        None // Personal mode bypasses auth entirely
+    } else {
+        let auth = auth_shared::resolve_auth(&headers, &state).await;
+        if auth.is_none() {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Not authenticated"}))).into_response();
+        }
+        auth
+    };
+
     if let Some(session_id) = headers.get(MCP_SESSION_ID_HEADER).and_then(|v| v.to_str().ok()) {
+        // Authentication alone would still let any authenticated user of any
+        // other workspace terminate this session, so ownership is checked too.
+        // `create_session` records the workspace `initialize` authenticated as
+        // (`crates/trakkt-auth/src/mcp_session_manager.rs:70-77`) and
+        // `validate_session` reads it back, so the comparison costs one KV read.
+        // A legitimate client is unaffected: it only ever deletes the session id
+        // `initialize` handed it, which carries that client's own workspace.
+        //
+        // The refusal answers 204, not 403/404. An unknown session id already
+        // answers 204 — `validate_session` returns `None`, the chain
+        // short-circuits, and `remove_session` finds nothing to remove — so
+        // answering differently here would tell an authenticated caller whether
+        // a given session id exists in a workspace they are not in. No
+        // legitimate client can observe the difference.
+        //
+        // Personal mode has no `ResolvedAuth` to compare against and skips this,
+        // exactly as it skips the gate above.
+        if let Some(auth) = &resolved_auth
+            && let Some(session_workspace) = state.mcp_sessions.validate_session(session_id).await
+            && session_workspace != auth.workspace_id
+        {
+            tracing::warn!(
+                session_id,
+                caller_workspace = %auth.workspace_id,
+                "refused MCP session termination requested from another workspace"
+            );
+            return StatusCode::NO_CONTENT.into_response();
+        }
         state.mcp_sessions.remove_session(session_id).await;
     }
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -245,18 +289,63 @@ fn handle_initialize(id: Option<Value>, _params: Option<Value>) -> JsonRpcRespon
     }))
 }
 
+/// Rewrite a schemars-generated JSON Schema into the OpenAI function-calling
+/// subset that most models' native tool-calling reliably accepts. Some models
+/// (e.g. MiMo, Qwen-class) cannot bind a tool whose parameter schema uses
+/// draft-2020-12 constructs and silently fall back to emitting the call as
+/// `<function=...><parameter=...>` text — which arrives at the server with no
+/// arguments.
+///
+/// Normalizations applied recursively:
+/// - flatten nullable unions: `"type": ["string", "null"]` -> `"type": "string"`
+/// - drop the `$schema` dialect declaration
+/// - drop non-standard `format` hints (e.g. `int64`) that strict validators reject
+fn sanitize_schema_for_tool_calling(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("format");
+            // Flatten nullable unions: `"type": ["string", "null"]` -> `"string"`.
+            let flattened = map
+                .get("type")
+                .and_then(Value::as_array)
+                .and_then(|types| types.iter().find(|t| t.as_str() != Some("null")).cloned());
+            if let Some(non_null) = flattened {
+                map.insert("type".to_string(), non_null);
+            }
+            for child in map.values_mut() {
+                sanitize_schema_for_tool_calling(child);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                sanitize_schema_for_tool_calling(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
     let mut tools = Vec::new();
 
     for op in trakkt_api::all_operations() {
         let schema = (op.json_schema)();
-        let schema_value = match serde_json::to_value(&schema) {
+        let mut schema_value = match serde_json::to_value(&schema) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(tool = %op.name, error = %e, "failed to serialize tool schema");
                 continue;
             }
         };
+        // Normalize every tool's schema to the OpenAI function-calling subset.
+        // schemars emits draft-2020-12 constructs (nullable unions, `$schema`,
+        // `int64` formats) that some models' tool-calling layers can't bind —
+        // they silently fall back to emitting the call as `<function=...>` text,
+        // which reaches the server with no arguments. Verified against
+        // MiMo-V2.5-Pro via OpenRouter/OpenCode: with the raw schema the model
+        // emits unparseable text; with the sanitized schema it calls natively.
+        sanitize_schema_for_tool_calling(&mut schema_value);
         tools.push(json!({
             "name": op.name,
             "description": op.description,
@@ -406,4 +495,65 @@ async fn dispatch_registry_tool(
     })?;
 
     serde_json::to_string_pretty(&result).map_err(trakkt_core::Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_flattens_nullable_unions_and_strips_dialect() {
+        // Mirrors what schemars emits for a params struct with Option<T> fields.
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "GetIssueApiParams",
+            "type": "object",
+            "properties": {
+                "issue_identifier": { "type": ["string", "null"] },
+                "issue_number": { "type": ["integer", "null"], "format": "int64" },
+                "team_key": { "type": ["null", "string"] },
+                "body": { "type": "string" }
+            },
+            "required": ["body"]
+        });
+
+        sanitize_schema_for_tool_calling(&mut schema);
+
+        // Dialect declaration dropped.
+        assert!(schema.get("$schema").is_none());
+        let props = &schema["properties"];
+        // Nullable unions flattened to the non-null type (order-independent).
+        assert_eq!(props["issue_identifier"]["type"], json!("string"));
+        assert_eq!(props["issue_number"]["type"], json!("integer"));
+        assert_eq!(props["team_key"]["type"], json!("string"));
+        // Non-standard format hint dropped.
+        assert!(props["issue_number"].get("format").is_none());
+        // Plain required string untouched; required array preserved.
+        assert_eq!(props["body"]["type"], json!("string"));
+        assert_eq!(schema["required"], json!(["body"]));
+    }
+
+    #[test]
+    fn sanitize_recurses_into_nested_schemas() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": ["array", "null"],
+                    "items": {
+                        "type": "object",
+                        "properties": { "value": { "type": ["string", "null"] } }
+                    }
+                }
+            }
+        });
+
+        sanitize_schema_for_tool_calling(&mut schema);
+
+        assert_eq!(schema["properties"]["filters"]["type"], json!("array"));
+        assert_eq!(
+            schema["properties"]["filters"]["items"]["properties"]["value"]["type"],
+            json!("string")
+        );
+    }
 }

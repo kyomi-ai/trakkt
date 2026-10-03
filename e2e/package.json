@@ -11,6 +11,7 @@
     "test:settings": "npx playwright test tests/settings/",
     "test:team": "npx playwright test tests/team/",
     "test:mcp": "npx playwright test tests/mcp/",
+    "test:sync": "npx playwright test --config playwright.sync.config.ts",
     "test:modes": "npx playwright test tests/modes/",
     "report": "npx playwright show-report"
   },

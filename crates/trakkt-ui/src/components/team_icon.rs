@@ -6,7 +6,9 @@
 //! Three states:
 //! - **Preset icon**: Rounded square with `icon_color` background and a
 //!   white Phosphor icon inside.
-//! - **Custom icon**: `<img>` tag pointing to `/api/teams/{id}/icon`.
+//! - **Custom icon**: `<img>` tag pointing to `/api/v1/teams/{id}/icon`. That
+//!   endpoint requires an authenticated caller in the team's workspace; the tag
+//!   is same-origin, so the browser attaches the `access_token` cookie itself.
 //! - **Fallback**: Rounded square with neutral gray background and the
 //!   first letter of the team name in white.
 

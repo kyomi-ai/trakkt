@@ -56,13 +56,71 @@ pub struct FilterClause {
     pub values: Vec<String>,
 }
 
+/// A label as it appears on a lean issue list row: identity only.
+///
+/// `color`, `created_at`, `workspace_id`, and `team_id` are deliberately
+/// dropped — a list row needs to say *which* labels an issue carries, not
+/// describe them. Full label records come from `list_labels`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueListLabel {
+    pub label_id: String,
+    pub name: String,
+}
+
+impl From<crate::models::Label> for IssueListLabel {
+    fn from(label: crate::models::Label) -> Self {
+        Self {
+            label_id: label.label_id,
+            name: label.name,
+        }
+    }
+}
+
+/// A single row of a `list_issues` response — the lean projection of
+/// [`crate::models::IssueWithDetails`].
+///
+/// `list_issues` answers "which issues are there?", not "what does this issue
+/// say?". Descriptions are multi-KB specs and dominate the payload, so a row
+/// carries only what is needed to identify, sort, and triage an issue. It never
+/// carries `description`, `comments`, or `activities`, and there is no flag to
+/// add them back: callers that need an issue's content call `get_issue`, which
+/// returns one issue in full.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueListRow {
+    pub number: i32,
+    /// Team-scoped identifier, e.g. `"TRA-1234"` — the handle every other
+    /// operation accepts.
+    pub key: String,
+    pub title: String,
+    pub priority: i32,
+    pub status_id: String,
+    pub status_name: String,
+    pub updated_at: String,
+    pub labels: Vec<IssueListLabel>,
+}
+
+impl From<crate::models::IssueWithDetails> for IssueListRow {
+    fn from(issue: crate::models::IssueWithDetails) -> Self {
+        Self {
+            key: format!("{}-{}", issue.team_key, issue.number),
+            number: issue.number,
+            title: issue.title,
+            priority: issue.priority,
+            status_id: issue.status_id,
+            status_name: issue.status_name,
+            updated_at: issue.updated_at,
+            labels: issue.labels.into_iter().map(IssueListLabel::from).collect(),
+        }
+    }
+}
+
 /// Wrapper response for `list_issues` that includes truncation metadata.
 ///
 /// When composable filter clauses reduce the result set below the raw DB fetch,
 /// callers need to know whether more results exist beyond the returned page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListIssuesResponse {
-    pub issues: Vec<crate::models::IssueWithDetails>,
+    pub issues: Vec<IssueListRow>,
     /// Number of issues that passed all filters within the server's fetch window
     /// (approximately 5× the requested limit). When `truncated` is true, the true
     /// total may exceed this count.
@@ -202,6 +260,8 @@ pub struct SearchIssuesApiParams {
     pub include_comments: Option<bool>,
     /// Max results (default: 20, max: 100)
     pub limit: Option<i64>,
+    /// Offset for pagination (default: 0)
+    pub offset: Option<i64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,9 +287,18 @@ pub struct AddCommentApiParams {
 // Label operations
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parameters for listing all labels in the workspace.
+/// Parameters for listing labels in the workspace.
+///
+/// When `team_id` or `team_key` is provided, returns workspace-level labels
+/// (team_id IS NULL) plus labels scoped to that team. When neither is
+/// provided, returns all labels in the workspace (current behaviour).
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
-pub struct ListLabelsApiParams {}
+pub struct ListLabelsApiParams {
+    /// Filter by team ID — returns workspace-level + team-scoped labels
+    pub team_id: Option<String>,
+    /// Filter by team key (e.g. 'TRA') — resolved to team_id server-side
+    pub team_key: Option<String>,
+}
 
 /// Parameters for creating a new label.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -370,6 +439,8 @@ pub struct UpdateProjectApiParams {
     pub start_date: Option<Option<String>>,
     /// Target date in ISO 8601 format, or null to clear
     pub target_date: Option<Option<String>>,
+    /// Archive timestamp, or null to unarchive
+    pub archived_at: Option<Option<String>>,
 }
 
 /// Parameters for deleting a project.
@@ -568,4 +639,185 @@ pub struct LookupCommitApiParams {
 pub struct LookupBranchApiParams {
     /// Branch name (exact match)
     pub branch: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Release operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for listing releases in the workspace.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListReleasesApiParams {
+    /// Filter by team key (e.g. 'TRA')
+    pub team_key: Option<String>,
+}
+
+/// Parameters for getting a single release by ID.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct GetReleaseApiParams {
+    /// The release ID
+    pub release_id: String,
+}
+
+/// Parameters for creating a new release.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct CreateReleaseApiParams {
+    /// Team key this release belongs to (e.g. 'TRA')
+    pub team_key: String,
+    /// Git tag name (e.g. 'v2026.05.20.1')
+    pub tag_name: String,
+    /// Previous tag (for commit range context)
+    pub previous_tag: Option<String>,
+    /// Optional human-readable title
+    pub title: Option<String>,
+    /// Release notes / changelog markdown
+    pub notes: Option<String>,
+    /// List of full commit SHAs included in this release. Used to auto-link issues via github_links.
+    pub commit_shas: Vec<String>,
+}
+
+/// Parameters for listing unreleased issues (completed but not yet shipped).
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListUnreleasedIssuesApiParams {
+    /// Filter by team key (e.g. 'TRA')
+    pub team_key: Option<String>,
+}
+
+// ─── Star operations ─────────────────────────────────────────────────────────
+
+/// Parameters for starring an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct StarIssueApiParams {
+    /// The issue ID to star (e.g. 'iss_abc123')
+    pub issue_id: String,
+}
+
+/// Parameters for unstarring an issue.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct UnstarIssueApiParams {
+    /// The issue ID to unstar (e.g. 'iss_abc123')
+    pub issue_id: String,
+}
+
+/// Parameters for listing starred issues (no params needed — scoped to current user/workspace).
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ListStarredIssuesApiParams {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{IssueWithDetails, Label};
+
+    /// A description the size of a real Trakkt spec ticket (~4 KB).
+    fn spec_sized_description() -> String {
+        "## Context\nThis ticket describes, at length, exactly what has to change and why. "
+            .repeat(50)
+    }
+
+    fn label(id: &str, name: &str) -> Label {
+        Label {
+            label_id: id.to_string(),
+            workspace_id: "ws_1".to_string(),
+            team_id: Some("team_1".to_string()),
+            name: name.to_string(),
+            color: "#0D9488".to_string(),
+            created_at: "2026-07-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn issue(number: i32, description: String) -> IssueWithDetails {
+        IssueWithDetails {
+            issue_id: format!("iss_{number}"),
+            workspace_id: "ws_1".to_string(),
+            team_id: "team_1".to_string(),
+            team_key: "TEAM".to_string(),
+            number,
+            title: format!("Issue number {number}"),
+            description: Some(description),
+            status_id: "status_todo".to_string(),
+            status_name: "Todo".to_string(),
+            status_category: "unstarted".to_string(),
+            priority: 2,
+            assignee_id: Some("user_1".to_string()),
+            assignee_name: Some("Jason".to_string()),
+            creator_id: "user_1".to_string(),
+            creator_name: Some("Jason".to_string()),
+            due_date: None,
+            project_id: Some("proj_1".to_string()),
+            project_name: Some("Trakkt".to_string()),
+            milestone_id: None,
+            estimate: Some(3),
+            parent_identifier: None,
+            parent_title: None,
+            sort_order: Some(1.0),
+            created_at: "2026-07-01T00:00:00Z".to_string(),
+            updated_at: "2026-07-20T12:34:56Z".to_string(),
+            started_at: None,
+            completed_at: None,
+            released_at: None,
+            archived_at: None,
+            has_children: false,
+            is_blocked: false,
+            is_blocking: false,
+            has_relations: false,
+            labels: vec![label("lbl_1", "agent-ready"), label("lbl_2", "bug")],
+        }
+    }
+
+    #[test]
+    fn lean_row_drops_heavy_fields_and_carries_key() {
+        let row = IssueListRow::from(issue(123, spec_sized_description()));
+        let value = serde_json::to_value(&row).expect("row should serialize");
+        let object = value.as_object().expect("row should be a JSON object");
+
+        for forbidden in ["description", "comments", "activities"] {
+            assert!(
+                !object.contains_key(forbidden),
+                "lean list row must never carry `{forbidden}` — use get_issue to read an issue in full; got keys {:?}",
+                object.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // serde_json orders object keys alphabetically.
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "key",
+                "labels",
+                "number",
+                "priority",
+                "status_id",
+                "status_name",
+                "title",
+                "updated_at",
+            ],
+            "lean row shape changed"
+        );
+        assert_eq!(value["key"], "TEAM-123");
+        assert_eq!(value["number"], 123);
+        assert_eq!(value["status_name"], "Todo");
+        assert_eq!(value["updated_at"], "2026-07-20T12:34:56Z");
+    }
+
+    #[test]
+    fn lean_row_labels_carry_id_and_name_only() {
+        let row = IssueListRow::from(issue(7, String::new()));
+        let value = serde_json::to_value(&row).expect("row should serialize");
+        let labels = value["labels"].as_array().expect("labels should be an array");
+
+        assert_eq!(labels.len(), 2);
+        for label_value in labels {
+            let object = label_value.as_object().expect("label should be an object");
+            assert_eq!(
+                object.keys().map(String::as_str).collect::<Vec<_>>(),
+                vec!["label_id", "name"],
+                "list-row labels must expose id and name only, not the full Label record"
+            );
+        }
+        assert_eq!(labels[0]["label_id"], "lbl_1");
+        assert_eq!(labels[0]["name"], "agent-ready");
+    }
+
+    // The payload-size regression for a full page lives with the handler that
+    // builds it: `trakkt_api::issues::tests::full_page_response_stays_small`.
 }

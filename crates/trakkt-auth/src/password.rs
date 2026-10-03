@@ -52,20 +52,20 @@ mod tests {
     #[test]
     fn hash_and_verify_argon2() {
         let password = "correct-horse-battery-staple";
-        let hash = hash_password(password).unwrap();
+        let hash = hash_password(password).expect("hashing a password with Argon2");
 
         assert!(hash.starts_with("$argon2"));
-        assert!(verify_password(password, &hash).unwrap());
-        assert!(!verify_password("wrong-password", &hash).unwrap());
+        assert!(verify_password(password, &hash).expect("verifying the correct password against its Argon2 hash"));
+        assert!(!verify_password("wrong-password", &hash).expect("verifying a wrong password against an Argon2 hash"));
     }
 
     #[test]
     fn verify_bcrypt_legacy() {
         let password = "legacy-password";
         // Pre-generate a bcrypt hash (cost=4 for fast tests)
-        let hash = bcrypt::hash(password, 4).unwrap();
+        let hash = bcrypt::hash(password, 4).expect("producing a cost-4 bcrypt hash to stand in for a legacy stored hash");
 
-        assert!(verify_password(password, &hash).unwrap());
-        assert!(!verify_password("wrong", &hash).unwrap());
+        assert!(verify_password(password, &hash).expect("verifying the correct password against a legacy bcrypt hash"));
+        assert!(!verify_password("wrong", &hash).expect("verifying a wrong password against a legacy bcrypt hash"));
     }
 }
