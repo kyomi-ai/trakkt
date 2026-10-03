@@ -158,7 +158,7 @@ jobs:
           components: clippy
           targets: wasm32-unknown-unknown
 
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify sccache can reach GHA cache
         run: |
@@ -260,7 +260,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify sccache can reach GHA cache
         run: |
@@ -454,7 +454,7 @@ jobs:
             | tar xz --strip-components=1 -C /usr/local/bin wasm-pack-v0.14.0-x86_64-unknown-linux-musl/wasm-pack
           wasm-pack --version
 
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify sccache can reach GHA cache
         run: |
@@ -584,7 +584,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify sccache can reach GHA cache
         run: |
