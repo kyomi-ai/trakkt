@@ -21,7 +21,7 @@ metadata:
 spec:
   redirectRegex:
     regex: "^(https?://[^/]+/docs)(\\?.*)?$"
-    replacement: "${1}/${2}"
+    replacement: "https://trakkt.app/docs/${2}"
     permanent: false
 ---
 apiVersion: traefik.io/v1alpha1

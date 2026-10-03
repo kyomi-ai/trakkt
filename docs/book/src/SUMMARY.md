@@ -55,4 +55,5 @@
 - [Docker](self-hosting/docker.md)
 - [Kubernetes](self-hosting/kubernetes.md)
 - [Reverse Proxy](self-hosting/reverse-proxy.md)
+- [Connect terminal](self-hosting/connect.md)
 - [Upgrading](self-hosting/upgrading.md)

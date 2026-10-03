@@ -56,17 +56,37 @@ on:
       - 'crates/trakkt-auth/src/sync_log_service.rs'
       - 'crates/trakkt-auth/src/project_service.rs'
       - 'apps/server/src/**'
+      # The real-PTY relay and customer agent share this browser acceptance.
+      - 'apps/trakkt-connect/**'
+      - 'crates/trakkt-connect-protocol/**'
+      - 'crates/trakkt-auth/src/connect_manager.rs'
+      - 'crates/trakkt-ui/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       # The suite itself.
       - 'e2e/tests/sync/**'
       - 'e2e/playwright.sync.config.ts'
+      - 'e2e/tests/connect/**'
+      - 'e2e/helpers/connect-fixture.ts'
+      - 'e2e/playwright.connect.config.ts'
+      - 'e2e/package.json'
+      - 'e2e/package-lock.json'
+      - '.github/workflows/connect-agent.yml'
       - '.github/workflows/realtime-e2e.yml'
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
+  connect-agent:
+    uses: ./.github/workflows/connect-agent.yml
+
   realtime-e2e:
+    needs: connect-agent
     # Stable, and chosen so it still reads correctly if this ever does become a
     # required check — required-check names cannot churn without an admin
     # editing branch protection, so it is named for what it verifies rather than
@@ -261,6 +281,32 @@ jobs:
         working-directory: e2e
         run: npx playwright test --config playwright.sync.config.ts
 
+      - name: Download the customer Connect agent
+        uses: actions/download-artifact@v8
+        with:
+          name: trakkt-connect-linux-x86_64
+          path: ${{ runner.temp }}/connect-agent-artifact
+          digest-mismatch: error
+
+      - name: Verify and extract the Connect agent
+        working-directory: ${{ runner.temp }}/connect-agent-artifact
+        run: |
+          sha256sum --check SHA256SUMS
+          mkdir unpacked
+          tar -xzf trakkt-connect-linux-x86_64.tar.gz -C unpacked
+
+      # This fixture starts its own personal-mode server/SQLite database on
+      # 3441 and agent on 3442. Its environment allowlist excludes this job's
+      # Postgres credentials and server configuration on 3100.
+      - name: Run Connect real-PTY acceptance
+        id: connect_acceptance
+        working-directory: e2e
+        env:
+          CONNECT_SERVER_BINARY: ${{ github.workspace }}/target/dev-server/trakkt
+          CONNECT_DIST_DIR: ${{ github.workspace }}/crates/trakkt-ui/dist
+          CONNECT_AGENT_BINARY: ${{ runner.temp }}/connect-agent-artifact/unpacked/trakkt-connect
+        run: npx playwright test --config playwright.connect.config.ts
+
       # The suite fails on any uncaught wasm panic, but one arriving after the
       # last assertion still leaves a trace here, and the server log is the other
       # half of any failure that turns out not to be the client's fault.
@@ -276,6 +322,17 @@ jobs:
           path: |
             e2e/test-results/
             server.log
+          retention-days: 7
+
+      - name: Upload the failed Connect runtime
+        if: failure() && steps.connect_acceptance.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: connect-acceptance-runtime
+          path: |
+            target/dev-server/trakkt
+            crates/trakkt-ui/dist/
+          if-no-files-found: error
           retention-days: 7
 
       - name: Stop the server

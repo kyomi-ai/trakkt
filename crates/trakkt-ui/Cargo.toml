@@ -63,7 +63,7 @@ web-sys = { version = "0.3", features = [
     "AuthenticatorResponse", "AuthenticatorAttestationResponse",
     "AuthenticatorAssertionResponse",
     "CredentialCreationOptions", "CredentialRequestOptions",
-    "Clipboard", "History", "HtmlDivElement", "DomRect",
+    "Clipboard", "History", "HtmlDivElement", "DomRect", "Crypto",
     "ScrollIntoViewOptions", "ScrollLogicalPosition", "ScrollBehavior",
     "WebSocket", "MessageEvent", "CloseEvent",
     # Cross-tab sync coordination (cache/tab_leader.rs). The Web Locks half of
@@ -73,6 +73,8 @@ web-sys = { version = "0.3", features = [
     "BroadcastChannel",
     "FormData", "File", "FileList", "Blob", "BlobPropertyBag",
     "Headers", "Request", "RequestInit", "RequestCredentials", "Response",
+    "ResizeObserver", "ResizeObserverEntry", "ResizeObserverSize",
+    "ClipboardEvent", "DataTransfer",
 ] }
 
 # Timers for WASM
@@ -100,6 +102,12 @@ regex = { workspace = true }
 
 # URL encoding/decoding (for persisting filters in query params)
 percent-encoding = { workspace = true }
+
+# VTE escape sequence parser (terminal emulator)
+vte = "0.13"
+
+# Terminal protocol types
+trakkt-connect-protocol = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

@@ -135,4 +135,3 @@ curl "https://your-trakkt-instance.com/api/v1/unreleased-issues" \
 Returns `200 OK` on success with the result as JSON.
 
 ---
-
