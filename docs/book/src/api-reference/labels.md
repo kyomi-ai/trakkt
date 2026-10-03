@@ -4,9 +4,16 @@
 
 **Operation:** `list_labels`
 
-List all labels in the workspace, ordered alphabetically by name.
+List labels in the workspace. Optionally filter by team_key or team_id to get workspace-level + team-scoped labels.
 
 **Scope:** `labels:read`
+
+### Parameters
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `team_id` | query | string (nullable) | No | Filter by team ID — returns workspace-level + team-scoped labels |
+| `team_key` | query | string (nullable) | No | Filter by team key (e.g. 'TRA') — resolved to team_id server-side |
 
 ### Example
 

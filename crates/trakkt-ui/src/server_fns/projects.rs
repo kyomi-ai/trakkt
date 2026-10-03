@@ -321,6 +321,16 @@ pub async fn get_project_progress(
 // ─── Helpers (server-only) ─────────────────────────────────────────────────
 
 /// Verify that a project belongs to the user's current workspace.
+///
+/// This **authorizes**: the `project_id` arrives from the browser, and the
+/// answer decides whether the caller's operation proceeds.
+///
+/// It reaches for the unscoped `project_service::get_project` and does the
+/// workspace comparison itself, rather than calling
+/// `project_service::get_project_in_workspace`, so that both the missing and
+/// the foreign case surface the same `"Project not found"` string to the
+/// client — a server-fn error message that names no project id. The comparison
+/// below is load-bearing; dropping it turns this into a plain fetch.
 #[cfg(feature = "ssr")]
 async fn verify_project_ownership(
     db: &trakkt_core::DbPool,

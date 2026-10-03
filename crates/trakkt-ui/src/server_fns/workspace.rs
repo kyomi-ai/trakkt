@@ -70,9 +70,14 @@ pub async fn update_workspace_name(name: String) -> Result<(), ServerFnError> {
         return Err(ServerFnError::new("Workspace name cannot be empty"));
     }
 
-    trakkt_auth::workspace_service::update_workspace_name(ac.db(), &ac.ws_id, trimmed)
-        .await
-        .into_sfn()?;
+    trakkt_auth::workspace_service::update_workspace_name(
+        ac.db(),
+        &ac.ws_id,
+        trimmed,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
 
     Ok(())
 }
@@ -121,9 +126,14 @@ pub async fn update_workspace_auto_archive(
         }
     };
 
-    trakkt_auth::workspace_service::update_workspace_settings(ac.db(), &ac.ws_id, &settings_value)
-        .await
-        .into_sfn()?;
+    trakkt_auth::workspace_service::update_workspace_settings(
+        ac.db(),
+        &ac.ws_id,
+        &settings_value,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
 
     Ok(())
 }

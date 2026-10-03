@@ -3,6 +3,7 @@
 pub mod billing;
 pub mod integrations;
 pub mod labels;
+pub mod live_update;
 pub mod notifications;
 pub mod profile;
 pub mod security;

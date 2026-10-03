@@ -185,7 +185,8 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(
             axum::http::header::COOKIE,
-            HeaderValue::from_str(value).unwrap(),
+            HeaderValue::from_str(value)
+                .expect("the test's Cookie header value to be valid header-safe ASCII"),
         );
         h
     }
@@ -213,9 +214,9 @@ mod tests {
         rewrite_access_token_cookie(&mut h, "access_token", "new-token");
         let cookie = h
             .get(axum::http::header::COOKIE)
-            .unwrap()
+            .expect("the rewrite to leave a Cookie header in place")
             .to_str()
-            .unwrap();
+            .expect("the rewritten Cookie header to still be valid ASCII");
         // Other cookies must survive; access_token must be the new value.
         assert!(cookie.contains("a=1"));
         assert!(cookie.contains("b=2"));
@@ -229,9 +230,9 @@ mod tests {
         rewrite_access_token_cookie(&mut h, "access_token", "fresh");
         let cookie = h
             .get(axum::http::header::COOKIE)
-            .unwrap()
+            .expect("the append to leave a Cookie header in place")
             .to_str()
-            .unwrap();
+            .expect("the appended-to Cookie header to still be valid ASCII");
         assert!(cookie.contains("a=1"));
         assert!(cookie.contains("b=2"));
         assert!(cookie.contains("access_token=fresh"));
@@ -242,7 +243,10 @@ mod tests {
         let mut h = HeaderMap::new();
         rewrite_access_token_cookie(&mut h, "access_token", "solo");
         assert_eq!(
-            h.get(axum::http::header::COOKIE).unwrap().to_str().unwrap(),
+            h.get(axum::http::header::COOKIE)
+                .expect("the rewrite to insert a Cookie header where the map had none")
+                .to_str()
+                .expect("the inserted Cookie header to be valid ASCII"),
             "access_token=solo"
         );
     }

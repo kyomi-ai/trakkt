@@ -9,6 +9,7 @@
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use trakkt_core::db::DbTx;
 use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
 use trakkt_types::enums::ActionSource;
@@ -21,6 +22,29 @@ use crate::websocket::WebSocketManager;
 // ─── Row type ────────────────────────────────────────────────────────────────
 
 const DESCRIPTION_COALESCE_WINDOW_SECS: i64 = 60;
+
+/// Columns, table and actor join shared by every `issue_activities` read that
+/// produces an [`IssueActivity`].
+///
+/// Used by [`list_issue_activities`] — what the issue timeline calls — and by
+/// [`read_activity_for_sync`], which builds the payload the sync entry carries.
+/// Those two have to agree column for column: the payload is what another
+/// client applies *instead of* calling `list_issue_activities`, so a column
+/// present in one and not the other is a field that silently differs between a
+/// timeline that was reloaded and one that was updated live. Kept as one
+/// fragment so a column added later cannot land in only one of them.
+///
+/// `WHERE` and `ORDER BY` are deliberately not part of it: the two callers
+/// filter on different columns.
+const ISSUE_ACTIVITY_SELECT: &str = "\
+    SELECT a.activity_id, a.issue_id, a.workspace_id, a.actor_id, \
+           u.name AS actor_name, \
+           a.action_type, a.field, a.old_value, a.new_value, \
+           CAST(a.metadata AS TEXT) AS metadata, \
+           a.action_source, a.action_source_label, \
+           CAST(a.created_at AS TEXT) AS created_at \
+    FROM issue_activities a \
+    LEFT JOIN users u ON u.user_id = a.actor_id";
 
 #[derive(sqlx::FromRow)]
 struct CoalesceRow {
@@ -67,6 +91,32 @@ impl IssueActivityRow {
             created_at: self.created_at,
         }
     }
+}
+
+/// Read one activity back **on the transaction that wrote it**, in the shape
+/// its sync payload has to carry.
+///
+/// The read runs on `tx`, and it has to: the row was written on this
+/// transaction and does not exist for any other reader until it commits, so a
+/// pool query would find nothing. On SQLite it would not even get that far —
+/// the pool is pinned to `max_connections(1)` and this transaction is holding
+/// that connection, so the acquire would block until sqlx's 30s
+/// `acquire_timeout` fired and then fail with `PoolTimedOut` (see `DbTx`, and
+/// `scripts/check-tx-pool.py` which enforces this).
+///
+/// The payload matters because of what the client does without one:
+/// `apply_action_to_memory` (`crates/trakkt-ui/src/cache/apply.rs`) returns on a
+/// data-less insert/update *before* its entity-type match, so an ACTIVITY frame
+/// with no payload reaches no arm at all — neither live nor on a delta replay —
+/// and no other client's timeline moves until it is reloaded.
+async fn read_activity_for_sync(
+    tx: &mut DbTx,
+    activity_id: &str,
+) -> trakkt_core::Result<IssueActivity> {
+    let sql = format!("{ISSUE_ACTIVITY_SELECT} WHERE a.activity_id = $1");
+    let row: IssueActivityRow =
+        trakkt_core::tx_fetch_one!(&mut *tx, IssueActivityRow, &sql, activity_id)?;
+    Ok(row.into_dto())
 }
 
 // ─── Snapshot type ───────────────────────────────────────────────────────────
@@ -176,6 +226,43 @@ pub struct FieldChangeParams<'a> {
 ///
 /// Create one at the start of a request/operation and use its methods to
 /// record all activities generated during that operation.
+///
+/// # Why the recorder owns its transaction
+///
+/// TRA-9923 requires a `sync_log` row to commit atomically with the mutation it
+/// describes. For an activity that mutation is *the activity row itself*, so
+/// each activity gets its own transaction: the row and its `sync_log` entry are
+/// written on it, it commits, and only then is the change broadcast. A method
+/// that records several — [`ActivityRecorder::record_issue_diff`] — runs one
+/// such transaction per activity.
+///
+/// It does not instead take the caller's transaction, because there is no
+/// caller transaction to take. Every construction of an `ActivityRecorder`
+/// lives in `trakkt-api` or `trakkt-github` (`comments.rs`, `issues.rs`,
+/// `relations.rs`, `events.rs`), and `grep -rn '\.begin()'` over
+/// `crates/trakkt-api/src/` and `crates/trakkt-github/src/` matches nothing —
+/// neither crate opens a transaction anywhere. Each caller calls a service
+/// function that opens and commits its own transaction and returns, and only
+/// then records the activity describing what already committed.
+///
+/// The remaining non-atomicity is activity-vs-issue-update, and that is the
+/// intended trade. An activity is a derived audit record; a failed activity
+/// write must not roll back a legitimate issue update, and every call site
+/// already treats recording as best-effort (`if let Err(e) = recorder.record(…)`
+/// followed by a log and a continue).
+///
+/// # Coalescing read visibility
+///
+/// [`ActivityRecorder::coalesce_or_insert_activity`] runs its lookup on its own
+/// transaction, so it sees committed rows only. That is the right set here: a
+/// row it could coalesce onto was written by an earlier, separate recorder call
+/// that has already committed. Rows written earlier in the *same* logical
+/// mutation would additionally be visible if this joined the caller's
+/// transaction, but none of them could match. The coalesce predicate matches on
+/// `action_type`; the only caller of the coalescing path is the
+/// `description_changed` branch of [`ActivityRecorder::record_issue_diff`],
+/// which runs at most once per diff; and no other branch of that diff writes
+/// `description_changed`.
 pub struct ActivityRecorder<'a> {
     db: &'a DbPool,
     workspace_id: &'a str,
@@ -445,6 +532,12 @@ impl<'a> ActivityRecorder<'a> {
     ///
     /// This prevents flooding the activity feed when a field is saved
     /// repeatedly in quick succession (e.g. description auto-save).
+    ///
+    /// The lookup runs on the same transaction as the write it decides, so the
+    /// row it found cannot be deleted, nor a newer one inserted, between the two
+    /// — previously they were separate pool round trips. Which branch is taken
+    /// is therefore a property of one consistent read, not of whatever the
+    /// database happened to hold at two different moments.
     async fn coalesce_or_insert_activity(
         &self,
         issue_id: &str,
@@ -477,8 +570,10 @@ impl<'a> ActivityRecorder<'a> {
              LIMIT 1"
         );
 
-        let existing: Option<CoalesceRow> = trakkt_core::db_fetch_optional!(
-            self.db,
+        let mut tx = self.db.begin().await?;
+
+        let existing: Option<CoalesceRow> = trakkt_core::tx_fetch_optional!(
+            &mut tx,
             CoalesceRow,
             &find_sql,
             issue_id,
@@ -487,53 +582,54 @@ impl<'a> ActivityRecorder<'a> {
             field
         )?;
 
-        if let Some(row) = existing {
-            // Update the existing row's timestamp to "now".
-            let now = sql_compat::now(is_pg);
-            let update_sql = format!(
-                "UPDATE issue_activities SET created_at = {now} WHERE activity_id = $1"
-            );
-            trakkt_core::db_execute!(self.db, &update_sql, &row.activity_id)?;
-
-            // Sync log — best-effort, log on failure.
-            if let Err(e) = sync_log_service::write_sync_entry(
-                self.db,
-                entity_types::ACTIVITY,
-                &row.activity_id,
-                self.workspace_id,
-                SyncActionType::Update,
-                None,
-            )
-            .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    activity_id = %row.activity_id,
-                    "Failed to write sync log entry for coalesced activity"
+        let (activity_id, action) = match existing {
+            Some(row) => {
+                // Update the existing row's timestamp to "now".
+                let now = sql_compat::now(is_pg);
+                let update_sql = format!(
+                    "UPDATE issue_activities SET created_at = {now} WHERE activity_id = $1"
                 );
-            }
+                trakkt_core::tx_execute!(&mut tx, &update_sql, &row.activity_id)?;
 
-            // Broadcast via WebSocket — best-effort.
-            if let Some(ws) = self.ws_manager {
-                sync_log_service::broadcast_sync_action(
-                    ws,
-                    self.workspace_id,
-                    entity_types::ACTIVITY,
-                    &row.activity_id,
-                    SyncActionType::Update,
-                    None,
-                )
-                .await;
+                (row.activity_id, SyncActionType::Update)
             }
+            None => {
+                let activity_id = self
+                    .insert_activity_row(
+                        &mut tx, issue_id, action_type, field, old_value, new_value, metadata,
+                    )
+                    .await?;
 
-            Ok(())
-        } else {
-            self.insert_activity(issue_id, action_type, field, old_value, new_value, metadata)
-                .await
-        }
+                (activity_id, SyncActionType::Insert)
+            }
+        };
+
+        // Read back after both branches, not inside either. The coalescing
+        // branch's whole effect is moving `created_at` forward, so a payload
+        // built before it would carry the timestamp the update replaced and
+        // every other client would sort the entry to the wrong place in its
+        // timeline. Reading here is also the only way one payload covers both
+        // branches. See `read_activity_for_sync` for why it runs on `tx`.
+        let activity = read_activity_for_sync(&mut tx, &activity_id).await?;
+        let payload = sync_log_service::sync_payload(&activity, entity_types::ACTIVITY, &activity_id);
+
+        // Logs the entry on `tx`, commits, and only then broadcasts — the
+        // broadcast resolves its recipients from the pool, which this
+        // transaction is holding on SQLite (see `DbTx`).
+        sync_log_service::commit_and_deliver(
+            tx,
+            entity_types::ACTIVITY,
+            &activity_id,
+            self.workspace_id,
+            sync_log_service::SyncAudience::Workspace,
+            action,
+            payload,
+            self.ws_manager,
+        )
+        .await
     }
 
-    /// Insert a single activity row.
+    /// Insert a single activity row, log it, and broadcast it once committed.
     async fn insert_activity(
         &self,
         issue_id: &str,
@@ -543,7 +639,52 @@ impl<'a> ActivityRecorder<'a> {
         new_value: Option<&str>,
         metadata: Option<&serde_json::Value>,
     ) -> trakkt_core::Result<()> {
-        let is_pg = self.db.is_postgres();
+        let mut tx = self.db.begin().await?;
+
+        let activity_id = self
+            .insert_activity_row(
+                &mut tx, issue_id, action_type, field, old_value, new_value, metadata,
+            )
+            .await?;
+
+        // The row the INSERT just wrote, read back for its DB-assigned
+        // `created_at` and its joined `actor_name` — neither is known to this
+        // function, and the timeline renders both. See `read_activity_for_sync`
+        // for why the read is on `tx` rather than the pool.
+        let activity = read_activity_for_sync(&mut tx, &activity_id).await?;
+        let payload = sync_log_service::sync_payload(&activity, entity_types::ACTIVITY, &activity_id);
+
+        sync_log_service::commit_and_deliver(
+            tx,
+            entity_types::ACTIVITY,
+            &activity_id,
+            self.workspace_id,
+            sync_log_service::SyncAudience::Workspace,
+            SyncActionType::Insert,
+            payload,
+            self.ws_manager,
+        )
+        .await
+    }
+
+    /// Write one `issue_activities` row on an open transaction and return its
+    /// generated id.
+    ///
+    /// The `sync_log` entry, the commit and the broadcast are the caller's:
+    /// both callers finish through
+    /// [`sync_log_service::commit_and_deliver`], which is what keeps the
+    /// delivery strictly after the commit.
+    async fn insert_activity_row(
+        &self,
+        tx: &mut DbTx,
+        issue_id: &str,
+        action_type: &str,
+        field: Option<&str>,
+        old_value: Option<&str>,
+        new_value: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> trakkt_core::Result<String> {
+        let is_pg = tx.is_postgres();
         let now = sql_compat::now(is_pg);
         let activity_id = uuid::Uuid::new_v4().to_string();
 
@@ -564,8 +705,8 @@ impl<'a> ActivityRecorder<'a> {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {json_cast}, $10, $11, {now})",
         );
 
-        trakkt_core::db_execute!(
-            self.db,
+        trakkt_core::tx_execute!(
+            &mut *tx,
             &sql,
             &activity_id,
             issue_id,
@@ -580,38 +721,7 @@ impl<'a> ActivityRecorder<'a> {
             self.action_source_label.as_deref()
         )?;
 
-        // Sync log entry — best-effort, log on failure.
-        if let Err(e) = sync_log_service::write_sync_entry(
-            self.db,
-            entity_types::ACTIVITY,
-            &activity_id,
-            self.workspace_id,
-            SyncActionType::Insert,
-            None,
-        )
-        .await
-        {
-            tracing::warn!(
-                error = %e,
-                activity_id = %activity_id,
-                "Failed to write sync log entry for activity"
-            );
-        }
-
-        // Broadcast to workspace via WebSocket — best-effort.
-        if let Some(ws) = self.ws_manager {
-            sync_log_service::broadcast_sync_action(
-                ws,
-                self.workspace_id,
-                entity_types::ACTIVITY,
-                &activity_id,
-                SyncActionType::Insert,
-                None,
-            )
-            .await;
-        }
-
-        Ok(())
+        Ok(activity_id)
     }
 
     /// Diff label sets and record label_added / label_removed for each difference.
@@ -670,21 +780,9 @@ pub async fn list_issue_activities(
     db: &DbPool,
     issue_id: &str,
 ) -> trakkt_core::Result<Vec<IssueActivity>> {
-    let rows: Vec<IssueActivityRow> = trakkt_core::db_fetch_all!(
-        db,
-        IssueActivityRow,
-        "SELECT a.activity_id, a.issue_id, a.workspace_id, a.actor_id, \
-                u.name AS actor_name, \
-                a.action_type, a.field, a.old_value, a.new_value, \
-                CAST(a.metadata AS TEXT) AS metadata, \
-                a.action_source, a.action_source_label, \
-                CAST(a.created_at AS TEXT) AS created_at \
-         FROM issue_activities a \
-         LEFT JOIN users u ON u.user_id = a.actor_id \
-         WHERE a.issue_id = $1 \
-         ORDER BY a.created_at ASC",
-        issue_id
-    )?;
+    let sql = format!("{ISSUE_ACTIVITY_SELECT} WHERE a.issue_id = $1 ORDER BY a.created_at ASC");
+    let rows: Vec<IssueActivityRow> =
+        trakkt_core::db_fetch_all!(db, IssueActivityRow, &sql, issue_id)?;
     Ok(rows.into_iter().map(IssueActivityRow::into_dto).collect())
 }
 
