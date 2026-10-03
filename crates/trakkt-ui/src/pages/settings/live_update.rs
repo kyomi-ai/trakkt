@@ -187,7 +187,6 @@ mod latency_tests {
     use std::task::{Context, Poll};
 
     use gloo_timers::future::TimeoutFuture;
-    use leptos::prelude::*;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
