@@ -764,7 +764,6 @@ mod icon_save_fixture {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use gloo_timers::future::TimeoutFuture;
-    use leptos::prelude::*;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
