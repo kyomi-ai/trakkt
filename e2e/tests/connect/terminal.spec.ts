@@ -60,6 +60,10 @@ test('browser controls a real shell PTY and restores sessions without an agent i
   await expect(tabs).toHaveCount(1);
   const failedId = await tabs.first().getAttribute('data-session-id');
   expect(failedId).toBeTruthy();
+  // ResizeObserver activity must not replace the useful spawn failure with a
+  // late command rejection after the server removes the failed reservation.
+  await page.setViewportSize({ width: 1180, height: 780 });
+  await expect(page.getByRole('alert')).toContainText('command not allowed');
   await page.getByRole('button', { name: `Close session ${failedId}`, exact: true }).click();
   await expect(tabs).toHaveCount(0);
 
@@ -93,6 +97,8 @@ test('browser controls a real shell PTY and restores sessions without an agent i
     clipboardData.setData('text/plain', "printf '\\n%s%s\\n' PASTE_ ROUNDTRIP\n");
     element.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
   });
+  // Bracketed paste inserts text; Enter submits it in an interactive shell.
+  await page.keyboard.press('Enter');
   await expect(terminal).toContainText('PASTE_ROUNDTRIP');
 
   const previousResizeCount = frames.filter(frame => frame.type === 'session_resize').length;

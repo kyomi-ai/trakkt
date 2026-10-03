@@ -16,6 +16,7 @@ pub struct Session {
     pub running: bool,
     pub restoring: bool,
     subscribed: bool,
+    spawn_failure: Option<String>,
 }
 
 #[derive(Default)]
@@ -38,6 +39,7 @@ impl Sessions {
                     running: true,
                     restoring: false,
                     subscribed: true,
+                    spawn_failure: None,
                 },
             );
         }
@@ -156,7 +158,15 @@ impl Sessions {
             SessionEventKind::Killed => session.running = false,
             SessionEventKind::SpawnFailed { error } => {
                 session.running = false;
-                return Some(format!("Could not start {}: {error}", session.label));
+                // A command queued while spawning can be rejected after the
+                // failed spawn removes its server reservation. Keep the first
+                // cause instead of replacing it with that follow-up error.
+                if session.spawn_failure.is_some() {
+                    return None;
+                }
+                let message = format!("Could not start {}: {error}", session.label);
+                session.spawn_failure = Some(message.clone());
+                return Some(message);
             }
         }
         None
@@ -218,6 +228,56 @@ mod tests {
         assert!(!sessions.entries["one"].running);
         sessions.remove("one");
         assert!(sessions.active.is_none());
+    }
+
+    #[test]
+    fn follow_up_command_failure_preserves_each_sessions_original_spawn_error() {
+        let mut sessions = Sessions::default();
+        sessions.add("one".into(), "claude".into(), 80, 24);
+        sessions.output("one", b"retained output", false);
+        // An earlier list can mark a pending session ended before its failure.
+        sessions.restore_list(&[], true);
+        let original = sessions
+            .event(
+                "one",
+                &SessionEventKind::SpawnFailed {
+                    error: "command not allowed: claude".into(),
+                },
+            )
+            .expect("the first spawn failure must be visible even after an empty list");
+        assert!(original.contains("command not allowed: claude"));
+        assert_eq!(
+            sessions.event(
+                "one",
+                &SessionEventKind::SpawnFailed {
+                    error: "Unknown session".into(),
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            sessions.entries["one"].spawn_failure.as_ref(),
+            Some(&original)
+        );
+        assert!(visible(&sessions.grid()).contains("retained output"));
+        assert!(!sessions.entries["one"].running);
+
+        sessions.add("two".into(), "sh".into(), 80, 24);
+        assert!(
+            sessions
+                .event(
+                    "two",
+                    &SessionEventKind::SpawnFailed {
+                        error: "missing executable".into(),
+                    },
+                )
+                .expect("a different session's first failure must still be visible")
+                .contains("missing executable")
+        );
+        assert_eq!(
+            sessions.entries["one"].spawn_failure.as_ref(),
+            Some(&original)
+        );
     }
 
     #[test]
