@@ -26,6 +26,21 @@ use trakkt_auth::{jwt, redis_ops, token_service, user_service};
 
 use crate::state::AppState;
 
+/// Keep handler errors small while preserving their complete HTTP responses.
+struct OAuthError(Box<Response>);
+
+impl From<Response> for OAuthError {
+    fn from(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
+
+impl IntoResponse for OAuthError {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
 // ===========================================================================
 // Well-known discovery routes (mounted at root level, no /api/v1 prefix)
 // ===========================================================================
@@ -227,13 +242,14 @@ async fn oauth_authorize(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
-) -> Result<Response, Response> {
+) -> Result<Response, OAuthError> {
     if params.response_type != "code" {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "Only response_type=code is supported"})),
         )
-            .into_response());
+            .into_response()
+            .into());
     }
 
     // Validate client
@@ -330,7 +346,7 @@ async fn oauth_authorize_continue(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<AuthorizeContinueParams>,
-) -> Result<Response, Response> {
+) -> Result<Response, OAuthError> {
     // Check authentication FIRST, before consuming the state.
     let cookie_name = &trakkt_core::constants::get().cookies.access_token_name;
     let access_token = trakkt_auth::cookies::get_cookie_value(&headers, cookie_name)
@@ -437,7 +453,7 @@ async fn oauth_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     Form(params): Form<TokenRequest>,
-) -> Result<Json<TokenResponse>, Response> {
+) -> Result<Json<TokenResponse>, OAuthError> {
     tracing::info!(
         grant_type = %params.grant_type,
         client_id = %&params.client_id[..std::cmp::min(20, params.client_id.len())],
@@ -453,16 +469,17 @@ async fn oauth_token(
         "authorization_code" => handle_authorization_code(&state, &headers, &params, &client.name)
             .await
             .map(Json)
-            .map_err(|e| e.into_response()),
+            .map_err(|e| OAuthError::from(e.into_response())),
         "refresh_token" => handle_refresh_token(&state, &headers, &params, &client.name)
             .await
             .map(Json)
-            .map_err(|e| e.into_response()),
+            .map_err(|e| OAuthError::from(e.into_response())),
         other => Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("Unsupported grant_type: {other}")})),
         )
-            .into_response()),
+            .into_response()
+            .into()),
     }
 }
 
@@ -760,13 +777,14 @@ struct ClientRegistrationResponse {
 async fn register_client(
     State(state): State<AppState>,
     Json(registration): Json<ClientRegistrationRequest>,
-) -> Result<Json<ClientRegistrationResponse>, Response> {
+) -> Result<Json<ClientRegistrationResponse>, OAuthError> {
     if registration.redirect_uris.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "redirect_uris is required and must not be empty"})),
         )
-            .into_response());
+            .into_response()
+            .into());
     }
 
     // Generate unique client_id
@@ -939,6 +957,40 @@ fn extract_device_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn boxed_oauth_errors_preserve_http_responses() {
+        let responses = [
+            (StatusCode::UNAUTHORIZED, "Not logged in").into_response(),
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Unsupported grant_type: invalid"})),
+            )
+                .into_response(),
+            Redirect::to("https://example.com/oauth-complete").into_response(),
+        ];
+
+        for response in responses {
+            let (parts, body) = response.into_parts();
+            let expected_body = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .expect("reading the original OAuth error body");
+            let expected_status = parts.status;
+            let expected_headers = parts.headers.clone();
+            let response =
+                Response::from_parts(parts, axum::body::Body::from(expected_body.clone()));
+
+            let wrapped = OAuthError::from(response).into_response();
+            assert_eq!(wrapped.status(), expected_status);
+            assert_eq!(wrapped.headers(), &expected_headers);
+            assert_eq!(
+                axum::body::to_bytes(wrapped.into_body(), usize::MAX)
+                    .await
+                    .expect("reading the boxed OAuth error body"),
+                expected_body
+            );
+        }
+    }
 
     #[test]
     fn oauth_metadata_shape() {
