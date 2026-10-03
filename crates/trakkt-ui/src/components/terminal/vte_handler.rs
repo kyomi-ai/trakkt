@@ -167,9 +167,7 @@ impl vte::Perform for TerminalHandler<'_> {
                         }
                     }
                     3 => {
-                        for stop in &mut self.grid.tab_stops {
-                            *stop = false;
-                        }
+                        self.grid.tab_stops.fill(false);
                     }
                     _ => {}
                 }
