@@ -43,7 +43,7 @@ jobs:
     # time rather than only covering noise.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -76,7 +76,7 @@ jobs:
     # same reason as `lint-suppression` above.
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Check migration versions
         run: scripts/check-migrations.sh
@@ -102,7 +102,7 @@ jobs:
     # every remaining job in this file and in the other three workflows.)
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # python3 is preinstalled on the ubuntu-latest image (3.12.3 on
       # ubuntu-24.04, 3.14.4 on 26.04); the script needs only 3.9+. Probed in its
@@ -146,7 +146,7 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -251,7 +251,7 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -410,7 +410,7 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Required, not cargo-culted: `cc` is in this target's build-dependency
       # graph (`cargo tree -p trakkt-ui --target wasm32-unknown-unknown
@@ -575,7 +575,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -682,7 +682,7 @@ jobs:
     # slow or rate-limited database fetch.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
