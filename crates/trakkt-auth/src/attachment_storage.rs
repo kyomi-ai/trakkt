@@ -6,26 +6,53 @@
 //! and deleting attachment file data. Use `create_storage` to instantiate the
 //! appropriate backend based on application configuration.
 
+use std::{future::Future, pin::Pin};
+
 use async_trait::async_trait;
 use trakkt_core::Result;
 
-#[async_trait]
+/// Object-safe, sendable future returned by an attachment storage operation.
+pub type AttachmentFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Boxed futures retain the lifetime contract used by async-trait implementations.
 pub trait AttachmentStorage: Send + Sync {
     /// Store file bytes, return the storage_path for later retrieval.
-    async fn store(
-        &self,
-        workspace_id: &str,
-        attachment_id: &str,
-        bytes: &[u8],
-        filename: &str,
-        content_type: &str,
-    ) -> Result<String>;
+    fn store<'storage, 'workspace, 'attachment, 'bytes, 'filename, 'content_type, 'future>(
+        &'storage self,
+        workspace_id: &'workspace str,
+        attachment_id: &'attachment str,
+        bytes: &'bytes [u8],
+        filename: &'filename str,
+        content_type: &'content_type str,
+    ) -> AttachmentFuture<'future, String>
+    where
+        'storage: 'future,
+        'workspace: 'future,
+        'attachment: 'future,
+        'bytes: 'future,
+        'filename: 'future,
+        'content_type: 'future,
+        Self: 'future;
 
     /// Retrieve file bytes from storage.
-    async fn retrieve(&self, storage_path: &str) -> Result<Vec<u8>>;
+    fn retrieve<'storage, 'path, 'future>(
+        &'storage self,
+        storage_path: &'path str,
+    ) -> AttachmentFuture<'future, Vec<u8>>
+    where
+        'storage: 'future,
+        'path: 'future,
+        Self: 'future;
 
     /// Delete a stored file.
-    async fn delete(&self, storage_path: &str) -> Result<()>;
+    fn delete<'storage, 'path, 'future>(
+        &'storage self,
+        storage_path: &'path str,
+    ) -> AttachmentFuture<'future, ()>
+    where
+        'storage: 'future,
+        'path: 'future,
+        Self: 'future;
 }
 
 // ── Local Filesystem Storage ────────────────────────────────────────────────
@@ -240,5 +267,57 @@ pub fn create_storage(config: &trakkt_core::Config) -> Result<Box<dyn Attachment
                 config.attachment_local_path.clone(),
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttachmentStorage, LocalAttachmentStorage};
+
+    #[tokio::test]
+    async fn dyn_storage_futures_are_send_and_preserve_file_operations() {
+        let directory =
+            std::env::temp_dir().join(format!("trakkt-attachment-{}", uuid::Uuid::new_v4()));
+        let storage: Box<dyn AttachmentStorage> = Box::new(LocalAttachmentStorage::new(
+            directory.to_string_lossy().into_owned(),
+        ));
+
+        tokio::spawn(async move {
+            let workspace = String::from("workspace");
+            let attachment = String::from("attachment");
+            let filename = String::from("document.txt");
+            let content_type = String::from("text/plain");
+            let bytes = Vec::from(b"stored bytes");
+            let path = storage
+                .store(&workspace, &attachment, &bytes, &filename, &content_type)
+                .await
+                .expect("storing borrowed attachment inputs through dyn AttachmentStorage");
+            assert_eq!(path, "workspace/attachment.txt");
+            assert_eq!(
+                storage
+                    .retrieve(&path)
+                    .await
+                    .expect("retrieving the stored attachment"),
+                bytes
+            );
+            storage
+                .delete(&path)
+                .await
+                .expect("deleting the stored attachment");
+            assert!(matches!(
+                storage.retrieve(&path).await,
+                Err(trakkt_core::Error::NotFound(_))
+            ));
+            storage
+                .delete(&path)
+                .await
+                .expect("deleting an already missing attachment");
+        })
+        .await
+        .expect("running Send attachment futures on the Tokio executor");
+
+        tokio::fs::remove_dir_all(directory)
+            .await
+            .expect("removing the attachment test directory");
     }
 }

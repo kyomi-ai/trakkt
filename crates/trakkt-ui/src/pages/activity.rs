@@ -1075,7 +1075,6 @@ mod wasm_tests {
     use std::rc::Rc;
 
     use gloo_timers::future::TimeoutFuture;
-    use leptos::prelude::*;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     use crate::cache::store::SyncStore;
