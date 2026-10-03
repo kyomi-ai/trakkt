@@ -52,56 +52,7 @@ use leptos::task::spawn_local;
 // Shared kode theme builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a kode `Theme` matching Trakkt's design system (warm light palette).
-///
-/// Since kode's `Theme` is `#[non_exhaustive]`, we start from `Theme::light()`
-/// and override the fields we need.
-pub(crate) fn trakkt_kode_theme() -> kode_leptos::Theme {
-    let mut t = kode_leptos::Theme::light();
-    // Colors use CSS var() references so they follow Trakkt's light/dark
-    // mode automatically. The actual values live in main.css :root block
-    // which maps --kode-* vars to --color-* design tokens.
-    t.bg = "var(--color-card)";
-    t.fg = "var(--color-foreground)";
-    t.fg_bright = "var(--color-foreground)";
-    t.fg_dim = "var(--color-muted-foreground)";
-    t.cursor = "var(--color-foreground)";
-    t.selection = "rgba(13, 148, 136, 0.15)";
-    t.current_line = "transparent";
-    t.gutter_fg = "var(--color-muted-foreground)";
-    t.gutter_border = "var(--color-border)";
-    t.border = "var(--color-border)";
-    t.accent = "var(--color-primary)";
-    t.bg_highlight = "var(--color-accent)";
-    t.bg_hover = "var(--color-accent)";
-    t.marker_error = "#DC2626";
-    t.marker_warning = "#CA8A04";
-    t.marker_info = "#2563EB";
-    t.marker_hint = "var(--color-muted-foreground)";
-    t.code_fg = "var(--color-primary)";
-    t.link = "var(--color-primary)";
-    t.syntax = kode_leptos::SyntaxTheme::GithubLight;
-    // Typography — DESIGN.md fonts
-    t.content_font_family = Some("'DM Sans', sans-serif");
-    t.heading_font_family = Some("'Instrument Serif', serif");
-    t.code_font_family = Some("'Geist Mono', monospace");
-    t.font_family = Some("'Geist Mono', monospace");
-    // Content layout
-    t.content_max_width = Some("100%");
-    t.container_padding = Some("0");
-    // Toolbar styling — also uses CSS vars for dark mode
-    t.toolbar_bg = Some("var(--color-card)");
-    t.toolbar_border_color = Some("var(--color-border)");
-    t.toolbar_button_border_radius = Some("6px");
-    t.toolbar_button_hover_bg = Some("var(--color-accent)");
-    t.toolbar_button_selected_bg = Some("var(--color-primary)");
-    t.toolbar_button_selected_color = Some("#FFFFFF");
-    // Heading styling
-    t.heading_font_weight = Some("600");
-    t.h1_border_width = Some("0");
-    t.h2_border_width = Some("0");
-    t
-}
+pub(crate) use crate::components::description::trakkt_kode_theme;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue Detail Page
@@ -1702,7 +1653,7 @@ fn DescriptionEditor(
     /// Issue ID for auto-linking inline uploads to this issue.
     issue_id: String,
 ) -> impl IntoView {
-    use kode_leptos::TreeWysiwygEditor;
+    use crate::components::description::MarkdownDescription;
 
     let latest_text = RwSignal::new(String::new());
     let edit_version = RwSignal::new(0u32);
@@ -1915,19 +1866,6 @@ fn DescriptionEditor(
         }
     };
 
-    let theme_state = use_context::<crate::components::theme::ThemeState>();
-    let theme_signal = Signal::derive(move || {
-        let mut theme = trakkt_kode_theme();
-        theme.content_padding = Some("0");
-        theme.bg = "var(--color-background)";
-        if let Some(ts) = theme_state
-            && ts.effective.get() == "dark"
-        {
-            theme.syntax = kode_leptos::SyntaxTheme::OneDark;
-        }
-        theme
-    });
-
     view! {
         <div class="mt-6" style="min-height: 120px;">
             // Hidden file input for the "Attach file" slash command extension
@@ -1938,12 +1876,9 @@ fn DescriptionEditor(
                 accept=".png,.jpg,.jpeg,.gif,.webp,.svg,.pdf,.csv,.txt,.json,.log"
                 on:change=on_attach_file_selected
             />
-            <TreeWysiwygEditor
+            <MarkdownDescription
                 content=auto_linked_content
                 on_change=on_change
-                show_fixed_toolbar=false
-                show_floating_toolbar=true
-                theme=theme_signal
                 on_upload=on_upload
                 on_delete_attachment=on_delete
                 on_click_attachment=on_click

@@ -118,6 +118,10 @@ webauthn-rs = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
+# Kode's parser uses this upstream C runtime on browser WASM targets.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+arborium-sysroot = "2.17"
+
 # Server-side test dependencies. Target-gated because `cargo build --tests`
 # for wasm32 (wasm-pack test) would otherwise try to compile these native-only
 # crates — sqlx, tokio and getrandom do not build for wasm32-unknown-unknown.

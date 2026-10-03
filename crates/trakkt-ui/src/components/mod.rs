@@ -16,6 +16,7 @@ pub mod checkbox;
 pub mod command_palette;
 pub mod confirm_dialog;
 pub mod date_picker;
+pub mod description;
 pub mod dropdown;
 pub mod empty_state;
 pub mod feedback_modal;

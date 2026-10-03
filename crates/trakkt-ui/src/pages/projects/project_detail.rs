@@ -185,36 +185,9 @@ impl MemberEditState {
     }
 }
 
-/// Everything on the project detail page that represents a user part-way
-/// through an interaction — which inline editor is open, and what has been
-/// typed into it but not yet saved.
-///
-/// It is created by `ProjectDetailPage` and threaded down as a prop rather than
-/// created where it is used, and that is load-bearing rather than stylistic.
-/// `ProjectDetailPage`'s content closure reads `project_data`, `project_issues`,
-/// `server_progress`, `server_milestones`, `server_updates` and
-/// `server_members`, so any one of them settling re-runs it and reconstructs
-/// `ProjectDetailContent` and every section under it. A signal created inside
-/// that closure is therefore replaced, back at its initial value, mid
-/// interaction. `server_milestones` is keyed on `milestones_version`, which
-/// bumps on every `project_milestone` sync frame, so a colleague adding a
-/// milestone in another window closed this window's add form and inline rename
-/// input and discarded what was being typed into them (TRA-10030). Held here,
-/// on a component the router constructs once per route, the signals outlive the
-/// rebuild and the interaction survives it.
-///
-/// The board and list tabs are in scope for the same reason (TRA-10032). They
-/// sit one level deeper — inside `ProjectDetailContent`'s
-/// `{move || active_view…}` child, whose own closure reads nothing but
-/// `active_view` — which is why they read as unaffected. They are not: a
-/// dynamic child's `rebuild` is an unconditional `build()` of a fresh
-/// `RenderEffect` and `unmount()` of the old one, so reconstructing
-/// `ProjectDetailContent` reconstructs whichever view tab is showing, filters
-/// and all.
-///
-/// This is the standards' "Reactive Primitives" rule — hoist reactive
-/// primitives to component setup level, outside the view closure — applied to
-/// the whole page rather than to one section.
+/// Drafts and tab selections owned by the route. Resource updates refresh
+/// separate sections; the project-identity keyed content keeps the description
+/// editor mounted. Reset this state when navigation changes the project ID.
 #[derive(Clone, Copy)]
 struct ProjectEditState {
     name: InlineTextEdit,
@@ -434,6 +407,32 @@ pub fn ProjectDetailPage() -> impl IntoView {
     let nav = use_navigate();
 
     // ── Render ──────────────────────────────────────────────────────────────
+    let progress = Signal::derive(move || server_progress.get().and_then(|r| r.ok()));
+    let milestones = Signal::derive(move || match server_milestones.get() {
+        Some(Ok(rows)) => rows,
+        Some(Err(error)) => {
+            leptos::logging::warn!("Failed to load milestones: {error}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    });
+    let updates = Signal::derive(move || match server_updates.get() {
+        Some(Ok(rows)) => rows,
+        Some(Err(error)) => {
+            leptos::logging::warn!("Failed to load project updates: {error}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    });
+    let members = Signal::derive(move || match server_members.get() {
+        Some(Ok(rows)) => rows,
+        Some(Err(error)) => {
+            leptos::logging::warn!("Failed to load project members: {error}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    });
+
     view! {
         <div class="bg-background flex flex-col h-full">
             // ── Header ────────────────────────────────────────────────────
@@ -474,71 +473,46 @@ pub fn ProjectDetailPage() -> impl IntoView {
 
             // ── Content ───────────────────────────────────────────────────
             <div class="flex-1 overflow-y-auto p-4 md:p-6">
-                {move || {
-                    match project_data.get() {
-                        Some(Ok(Some(project))) => {
-                            let issues = project_issues.get();
-                            let progress = server_progress.get().and_then(|r| r.ok());
-                            let milestones = match server_milestones.get() {
-                                Some(Ok(v)) => v,
-                                Some(Err(e)) => {
-                                    leptos::logging::warn!("Failed to load milestones: {e}");
-                                    Vec::new()
-                                }
-                                None => Vec::new(),
-                            };
-                            let updates = match server_updates.get() {
-                                Some(Ok(v)) => v,
-                                Some(Err(e)) => {
-                                    leptos::logging::warn!("Failed to load project updates: {e}");
-                                    Vec::new()
-                                }
-                                None => Vec::new(),
-                            };
-                            let members = match server_members.get() {
-                                Some(Ok(v)) => v,
-                                Some(Err(e)) => {
-                                    leptos::logging::warn!("Failed to load project members: {e}");
-                                    Vec::new()
-                                }
-                                None => Vec::new(),
-                            };
-                            view! {
-                                <ProjectDetailContent
-                                    project=project
-                                    issues=issues
-                                    progress=progress
-                                    milestones=milestones
-                                    server_milestones=server_milestones
-                                    updates=updates
-                                    server_updates=server_updates
-                                    members=members
-                                    server_members=server_members
-                                    workspace_members=workspace_members
-                                    edit_state=edit_state
-                                    active_view=active_view
-                                    project_id=project_id
-                                />
-                            }.into_any()
-                        }
-                        Some(Ok(None)) => {
-                            view! { <ProjectNotFound/> }.into_any()
-                        }
-                        Some(Err(_)) => {
-                            view! {
-                                <div class="max-w-[860px] mx-auto w-full text-center py-16">
-                                    <p class="text-muted-foreground">"Failed to load project. Please try again."</p>
-                                </div>
-                            }.into_any()
-                        }
-                        None => {
-                            view! {
-                                <div class="max-w-[860px] mx-auto w-full text-center py-16">
-                                    <p class="text-muted-foreground">"Loading..."</p>
-                                </div>
-                            }.into_any()
+                // Key the mounted content by project identity, not resource snapshots.
+                // Settling resources update individual sections without replacing the
+                // description's contenteditable DOM or its selection.
+                <For
+                    each=move || { project_data.get().and_then(Result::ok).flatten().into_iter().collect::<Vec<_>>() }
+                    key=|project| project.project_id.clone()
+                    children=move |initial: Project| {
+                        let initial = StoredValue::new(initial);
+                        let project = Signal::derive(move || {
+                            project_data.get().and_then(Result::ok).flatten()
+                                .unwrap_or_else(|| initial.get_value())
+                        });
+                        view! {
+                            <ProjectDetailContent
+                                project=project
+                                issues=Signal::derive(move || project_issues.get())
+                                progress=progress
+                                milestones=milestones
+                                server_milestones=server_milestones
+                                updates=updates
+                                server_updates=server_updates
+                                members=members
+                                server_members=server_members
+                                workspace_members=workspace_members
+                                edit_state=edit_state
+                                active_view=active_view
+                                project_id=project_id
+                            />
                         }
                     }
+                />
+                {move || match project_data.get() {
+                    Some(Ok(Some(_))) => None,
+                    Some(Ok(None)) => Some(view! { <ProjectNotFound/> }.into_any()),
+                    Some(Err(_)) => Some(view! {
+                        <p class="text-muted-foreground text-center py-16">"Failed to load project. Please try again."</p>
+                    }.into_any()),
+                    None => Some(view! {
+                        <p class="text-muted-foreground text-center py-16">"Loading..."</p>
+                    }.into_any()),
                 }}
             </div>
         </div>
@@ -557,14 +531,14 @@ pub fn ProjectDetailPage() -> impl IntoView {
 /// signal updates; the SyncStore will reconcile via websocket.
 #[component]
 fn ProjectDetailContent(
-    project: Project,
-    issues: Vec<IssueWithDetails>,
-    progress: Option<ProjectProgress>,
-    milestones: Vec<ProjectMilestone>,
+    project: Signal<Project>,
+    issues: Signal<Vec<IssueWithDetails>>,
+    progress: Signal<Option<ProjectProgress>>,
+    milestones: Signal<Vec<ProjectMilestone>>,
     server_milestones: Resource<Result<Vec<ProjectMilestone>, ServerFnError>>,
-    updates: Vec<ProjectUpdate>,
+    updates: Signal<Vec<ProjectUpdate>>,
     server_updates: Resource<Result<Vec<ProjectUpdate>, ServerFnError>>,
-    members: Vec<ProjectMember>,
+    members: Signal<Vec<ProjectMember>>,
     server_members: Resource<Result<Vec<ProjectMember>, ServerFnError>>,
     /// Workspace members, for the lead selector and the add-member picker.
     workspace_members: Resource<Result<Vec<WorkspaceMember>, ServerFnError>>,
@@ -578,12 +552,12 @@ fn ProjectDetailContent(
     #[prop(into)]
     project_id: Memo<String>,
 ) -> impl IntoView {
-    let issue_count = issues.len();
-    let pid = StoredValue::new(project.project_id.clone());
+    let initial_project = project.get_untracked();
+    let pid = StoredValue::new(initial_project.project_id.clone());
 
     // Milestones signal — reactive via server_milestones Resource, falls back
     // to the initial snapshot when the Resource hasn't resolved yet.
-    let initial_milestones = StoredValue::new(milestones.clone());
+    let initial_milestones = StoredValue::new(milestones.get_untracked());
     let milestones_signal: Signal<Vec<ProjectMilestone>> = Signal::derive(move || {
         match server_milestones.get() {
             Some(Ok(v)) => v,
@@ -598,10 +572,10 @@ fn ProjectDetailContent(
     // `editing_name` and `name_draft` are the user's in-progress edit and come
     // from `edit_state`, so a settling resource cannot discard them.
     // `name_value` is this component's optimistic mirror of the server's value
-    // and is deliberately re-seeded from the freshly rendered `project`.
+    // and is refreshed by the project-sync effect below.
     let editing_name = edit_state.name.editing;
     let name_draft = edit_state.name.draft;
-    let name_value = RwSignal::new(project.name.clone());
+    let name_value = RwSignal::new(initial_project.name.clone());
 
     let save_name = move || {
         let new_name = name_draft.get_untracked();
@@ -643,10 +617,10 @@ fn ProjectDetailContent(
     };
 
     // ── Editable status ────────────────────────────────────────────────
-    let status_value = RwSignal::new(project.status.clone());
+    let status_value = RwSignal::new(initial_project.status.clone());
 
     // ── Editable lead ──────────────────────────────────────────────────
-    let lead_value = RwSignal::new(project.lead_id.clone().unwrap_or_default());
+    let lead_value = RwSignal::new(initial_project.lead_id.clone().unwrap_or_default());
 
     let members_resource = workspace_members;
 
@@ -662,8 +636,8 @@ fn ProjectDetailContent(
     });
 
     // ── Editable dates (DatePicker) ──────────────────────────────────────
-    let start_date_value: RwSignal<Option<String>> = RwSignal::new(project.start_date.clone());
-    let target_date_value: RwSignal<Option<String>> = RwSignal::new(project.target_date.clone());
+    let start_date_value: RwSignal<Option<String>> = RwSignal::new(initial_project.start_date.clone());
+    let target_date_value: RwSignal<Option<String>> = RwSignal::new(initial_project.target_date.clone());
 
     let start_date_signal = Signal::derive(move || start_date_value.get());
     let target_date_signal = Signal::derive(move || target_date_value.get());
@@ -699,30 +673,22 @@ fn ProjectDetailContent(
         })
     };
 
-    // ── Editable description (click-to-edit textarea) ────────────────────
-    // Same split as the name above: mode and draft are hoisted, the optimistic
-    // value mirror is not.
-    let editing_desc = edit_state.description.editing;
-    let desc_draft = edit_state.description.draft;
-    let desc_value = RwSignal::new(project.description.clone().unwrap_or_default());
-
-    let save_desc = move || {
-        let new_desc = desc_draft.get_untracked();
-        if new_desc == desc_value.get_untracked() {
-            editing_desc.set(false);
-            return;
-        }
-        desc_value.set(new_desc.clone());
-        editing_desc.set(false);
-        let project_id = pid.get_value();
-        leptos::task::spawn_local(async move {
-            if let Err(e) = update_project(
-                project_id, None, Some(new_desc), None, None, None, None, None, None,
-            ).await {
-                leptos::logging::warn!("Failed to update description: {e}");
-            }
-        });
-    };
+    // Refresh metadata mirrors without rebuilding the description subtree.
+    Effect::new(move || {
+        let current = project.get();
+        name_value.set(current.name);
+        status_value.set(current.status);
+        lead_value.set(current.lead_id.unwrap_or_default());
+        start_date_value.set(current.start_date);
+        target_date_value.set(current.target_date);
+    });
+    let description = Signal::derive(move || project.get().description.unwrap_or_default());
+    let user_context = use_context::<LocalResource<Result<crate::server_fns::context::UserContext, ServerFnError>>>();
+    let can_edit_description = Signal::derive(move || {
+        user_context.and_then(|resource| resource.get()).and_then(Result::ok)
+            .is_some_and(|context| context.is_personal_mode || context.is_owner
+                || context.workspace_roles.iter().any(|role| role == "workspace_admin" || role == "workspace_user"))
+    });
 
     view! {
         <div>
@@ -840,104 +806,49 @@ fn ProjectDetailContent(
                 </div>
             </div>
 
-            // ── Description (click-to-edit textarea) ─────────────────────
-            <div class="mt-4">
-                <Show
-                    when=move || editing_desc.get()
-                    fallback=move || {
-                        view! {
-                            <p
-                                class=move || {
-                                    if !desc_value.get().is_empty() {
-                                        "text-sm text-muted-foreground cursor-pointer hover:text-foreground/80 transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
-                                    } else {
-                                        "text-sm text-muted-foreground/60 italic cursor-pointer hover:text-muted-foreground transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
-                                    }
-                                }
-                                tabindex="0"
-                                role="button"
-                                aria-label="Click to edit description"
-                                on:click=move |_| {
-                                    desc_draft.set(desc_value.get_untracked());
-                                    editing_desc.set(true);
-                                }
-                                on:keydown=move |ev: leptos::ev::KeyboardEvent| {
-                                    if ev.key() == "Enter" {
-                                        desc_draft.set(desc_value.get_untracked());
-                                        editing_desc.set(true);
-                                    }
-                                }
-                            >
-                                {move || {
-                                    let v = desc_value.get();
-                                    if v.is_empty() {
-                                        "Add a description...".to_string()
-                                    } else {
-                                        v
-                                    }
-                                }}
-                            </p>
-                        }
-                    }
-                >
-                    <textarea
-                        class=format!("{INPUT_CLASS} !h-auto min-h-[80px] w-full resize-y")
-                        prop:value=move || desc_draft.get()
-                        on:input=move |ev| desc_draft.set(event_target_value(&ev))
-                        autofocus=true
-                    ></textarea>
-                    <div class="flex items-center gap-2 mt-2">
-                        <Button
-                            variant=ButtonVariant::Secondary
-                            size=ButtonSize::Sm
-                            on:click=move |_| save_desc()
-                        >
-                            "Save"
-                        </Button>
-                        <Button
-                            variant=ButtonVariant::GhostMuted
-                            size=ButtonSize::Sm
-                            on:click=move |_| {
-                                desc_draft.set(desc_value.get_untracked());
-                                editing_desc.set(false);
-                            }
-                        >
-                            "Cancel"
-                        </Button>
-                    </div>
-                </Show>
-            </div>
+            <ProjectDescription
+                project_id=pid.get_value()
+                description=description
+                can_edit=can_edit_description
+                state=edit_state.description
+            />
 
             // ── Progress bar ─────────────────────────────────────────────
-            {progress.filter(|p| p.total > 0).map(|p| {
+            {move || progress.get().filter(|p| p.total > 0).map(|p| {
                 view! { <ProgressSection progress=p/> }
             })}
 
             // ── Milestones ──────────────────────────────────────────────
-            <MilestoneSection
-                project_id=project.project_id.clone()
-                milestones=milestones.clone()
-                issues=issues.clone()
-                server_milestones=server_milestones
-                state=edit_state.milestones
-            />
+            {move || view! {
+                <MilestoneSection
+                    project_id=pid.get_value()
+                    milestones=milestones.get()
+                    issues=issues.get()
+                    server_milestones=server_milestones
+                    state=edit_state.milestones
+                />
+            }}
 
             // ── Health Updates ───────────────────────────────────────────
-            <HealthUpdateSection
-                project_id=project.project_id.clone()
-                updates=updates
-                server_updates=server_updates
-                draft=edit_state.update
-            />
+            {move || view! {
+                <HealthUpdateSection
+                    project_id=pid.get_value()
+                    updates=updates.get()
+                    server_updates=server_updates
+                    draft=edit_state.update
+                />
+            }}
 
             // ── Members ──────────────────────────────────────────────────
-            <ProjectMembersSection
-                project_id=project.project_id.clone()
-                members=members
-                server_members=server_members
-                workspace_members=members_resource
-                state=edit_state.members
-            />
+            {move || view! {
+                <ProjectMembersSection
+                    project_id=pid.get_value()
+                    members=members.get()
+                    server_members=server_members
+                    workspace_members=members_resource
+                    state=edit_state.members
+                />
+            }}
 
             // ── Divider ───────────────────────────────────────────────────
             <div class="border-t border-border my-6"></div>
@@ -972,7 +883,7 @@ fn ProjectDetailContent(
 
                     // Issue count badge
                     <span class="text-xs text-muted-foreground ml-2">
-                        {format!("{issue_count}")}
+                        {move || issues.get().len().to_string()}
                     </span>
                 </div>
                 <Button
@@ -1032,7 +943,7 @@ fn ProjectDetailContent(
                     view! {
                         <div class="max-w-[860px] mx-auto w-full">
                             <ProjectSettingsContent
-                                project=project.clone()
+                                project=project.get()
                                 confirming_delete=edit_state.confirming_delete
                             />
                         </div>
@@ -1043,8 +954,8 @@ fn ProjectDetailContent(
                     view! {
                         <div class="max-w-[860px] mx-auto w-full">
                             <ProjectOverviewIssues
-                                issues=issues.clone()
-                                milestones=milestones.clone()
+                                issues=issues.get()
+                                milestones=milestones.get()
                             />
                         </div>
                     }.into_any()
@@ -1058,6 +969,129 @@ fn ProjectDetailContent(
 // ─────────────────────────────────────────────────────────────────────────────
 // View Tab Button
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Project persistence stays explicit: opening seeds a draft, Cancel discards
+/// it, and Save sends the Markdown emitted by the shared issue editor.
+#[component]
+fn ProjectDescription(
+    project_id: String,
+    description: Signal<String>,
+    can_edit: Signal<bool>,
+    state: InlineTextEdit,
+) -> impl IntoView {
+    use crate::components::description::MarkdownDescription;
+
+    let project_id = StoredValue::new(project_id);
+    let saving = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let displayed = RwSignal::new(description.get_untracked());
+    Effect::new(move || {
+        let external = description.get();
+        // Live updates are visible in display mode; never overwrite a draft.
+        displayed.set(external);
+        if !can_edit.get() {
+            state.close();
+        }
+    });
+    let begin_edit = move || {
+        if can_edit.get_untracked() {
+            state.draft.set(displayed.get_untracked());
+            error.set(None);
+            state.editing.set(true);
+        }
+    };
+    let on_change: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text| {
+        if can_edit.get_untracked() {
+            state.draft.set(text);
+        }
+    });
+    let save = move || {
+        if !can_edit.get_untracked() || saving.get_untracked() {
+            return;
+        }
+        let text = state.draft.get_untracked();
+        if text == displayed.get_untracked() {
+            state.close();
+            return;
+        }
+        saving.set(true);
+        error.set(None);
+        let id = project_id.get_value();
+        leptos::task::spawn_local(async move {
+            match update_project(
+                id,
+                None,
+                Some(text.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(_) => {
+                    // Keep edits typed during the request instead of closing
+                    // their editor when the earlier save acknowledges.
+                    if displayed.try_set(text.clone()).is_some() {
+                        return;
+                    }
+                    if state.draft.try_get_untracked().as_ref() == Some(&text) {
+                        state.close();
+                    }
+                }
+                Err(failure) => {
+                    tracing::warn!("Failed to update project description: {failure}");
+                    if error.try_set(Some(
+                        "Could not save description. Please try again.".to_string(),
+                    )).is_some() {
+                        return;
+                    }
+                }
+            }
+            if saving.try_set(false).is_some() {
+                tracing::debug!("Description editor unmounted before save completed");
+            }
+        });
+    };
+
+    view! {
+        <section class="mt-4 min-w-0" aria-label="Project description">
+            <Show when=move || state.editing.get() fallback=move || view! {
+                <Show when=move || !displayed.get().is_empty() fallback=move || view! {
+                    <Show when=move || can_edit.get()>
+                        <Button variant=ButtonVariant::GhostMuted size=ButtonSize::Sm on:click=move |_| begin_edit()>
+                            "Add a description..."
+                        </Button>
+                    </Show>
+                }>
+                    <MarkdownDescription content=Signal::derive(move || displayed.get()) readonly=true/>
+                    <Show when=move || can_edit.get()>
+                        <Button variant=ButtonVariant::GhostMuted size=ButtonSize::Sm on:click=move |_| begin_edit()>
+                            "Edit description"
+                        </Button>
+                    </Show>
+                </Show>
+            }>
+                <MarkdownDescription content=Signal::derive(move || state.draft.get()) on_change=on_change.clone() autofocus=true/>
+                <div class="flex items-center gap-2 mt-2">
+                    <Button variant=ButtonVariant::Secondary size=ButtonSize::Sm disabled=Signal::derive(move || saving.get()) on:click=move |_| save()>
+                        "Save"
+                    </Button>
+                    <Button variant=ButtonVariant::GhostMuted size=ButtonSize::Sm disabled=Signal::derive(move || saving.get()) on:click=move |_| {
+                        state.draft.set(displayed.get_untracked());
+                        state.close();
+                        error.set(None);
+                    }>
+                        "Cancel"
+                    </Button>
+                </div>
+                {move || error.get().map(|message| view! { <p class="text-sm text-error-foreground" role="alert">{message}</p> })}
+            </Show>
+        </section>
+    }
+}
 
 /// A single tab button in the project detail view switcher.
 ///
@@ -2658,5 +2692,243 @@ mod view_tab_rebuild_tests {
         boot_leptos_executor();
         let outcome = one_resource_settling("list", "Filter issues...").await;
         assert_rebuilt_and_kept(&outcome, "the list's issue filter");
+    }
+}
+
+/// Component coverage runs in the existing WASM Browser Tests CI workflow.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod description_tests {
+    use super::{InlineTextEdit, ProjectDescription};
+    use crate::wasm_test_support::{boot_leptos_executor, mount_container};
+    use gloo_timers::future::TimeoutFuture;
+    use leptos::prelude::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    const MARKDOWN: &str = include_str!("../../../tests/fixtures/project-description.md");
+
+    fn click(container: &web_sys::HtmlElement, label: &str) {
+        let buttons = container
+            .query_selector_all("button")
+            .expect("finding description buttons");
+        for index in 0..buttons.length() {
+            let button = buttons
+                .item(index)
+                .expect("button at the selected index")
+                .dyn_into::<web_sys::HtmlElement>()
+                .expect("description button is an HTML element");
+            if button.text_content().unwrap_or_default().trim() == label {
+                button.click();
+                return;
+            }
+        }
+        panic!("description button {label} was not rendered");
+    }
+
+    #[wasm_bindgen_test]
+    async fn stored_markdown_renders_without_changing_source_and_cancel_discards_draft() {
+        boot_leptos_executor();
+        let container = mount_container();
+        let source = RwSignal::new(MARKDOWN.to_string());
+        let state = InlineTextEdit::new();
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                <ProjectDescription project_id="fixture-project".to_string()
+                    description=Signal::derive(move || source.get())
+                    can_edit=Signal::stored(true) state=state/>
+            }
+        });
+        TimeoutFuture::new(100).await;
+        for selector in [
+            "h1",
+            "h2",
+            "strong",
+            "em",
+            "ul li",
+            "ol li",
+            "table",
+            "pre code",
+            "blockquote",
+        ] {
+            assert!(
+                container
+                    .query_selector(selector)
+                    .expect("querying rendered Markdown")
+                    .is_some(),
+                "missing {selector}"
+            );
+        }
+        let link = container
+            .query_selector("a[href='https://example.com/storage']")
+            .expect("querying rendered storage link")
+            .expect("Markdown link remains independently clickable");
+        assert_eq!(link.text_content().as_deref(), Some("Storage guide"));
+        assert_eq!(source.get_untracked(), MARKDOWN);
+        assert!(
+            container
+                .query_selector("[contenteditable='true']")
+                .expect("querying edit surface")
+                .is_none()
+        );
+        click(&container, "Edit description");
+        TimeoutFuture::new(40).await;
+        assert_eq!(state.draft.get_untracked(), MARKDOWN);
+        state.draft.set("# Unsaved replacement".to_string());
+        TimeoutFuture::new(40).await;
+        click(&container, "Cancel");
+        TimeoutFuture::new(40).await;
+        assert_eq!(source.get_untracked(), MARKDOWN);
+        assert_eq!(state.draft.get_untracked(), MARKDOWN);
+        assert!(!state.editing.get_untracked());
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn keyed_project_updates_keep_draft_editor_dom_focus_and_selection() {
+        boot_leptos_executor();
+        let container = mount_container();
+        let source = RwSignal::new(MARKDOWN.to_string());
+        let unrelated = RwSignal::new(0u32);
+        let state = InlineTextEdit::new();
+        // Same identity boundary as ProjectDetailPage: resource snapshots may
+        // change while the project key remains the same.
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                <For each=move || { source.get(); vec!["fixture-project".to_string()] }
+                    key=|id| id.clone() children=move |id| view! {
+                        <ProjectDescription project_id=id
+                            description=Signal::derive(move || source.get())
+                            can_edit=Signal::stored(true) state=state/>
+                        {move || view! { <span>{unrelated.get()}</span> }}
+                    }/>
+            }
+        });
+        TimeoutFuture::new(100).await;
+        click(&container, "Edit description");
+        TimeoutFuture::new(40).await;
+        state.draft.set("A half typed draft".to_string());
+        TimeoutFuture::new(40).await;
+        let editor = container
+            .query_selector("[contenteditable='true']")
+            .expect("finding the active description editor")
+            .expect("editing mounts the kode editor")
+            .dyn_into::<web_sys::HtmlElement>()
+            .expect("the editor is an HTML element");
+        editor
+            .focus()
+            .expect("focusing the active description editor");
+        let document = container
+            .owner_document()
+            .expect("mounted container has a document");
+        let text = editor
+            .query_selector("p")
+            .expect("finding draft paragraph")
+            .expect("draft paragraph is rendered")
+            .first_child()
+            .expect("draft paragraph has text");
+        let range = document
+            .create_range()
+            .expect("creating a draft caret range");
+        range.set_start(&text, 5).expect("placing the draft caret");
+        range.collapse_with_to_start(true);
+        let selection = document
+            .get_selection()
+            .expect("reading browser selection")
+            .expect("browser provides selection");
+        selection
+            .remove_all_ranges()
+            .expect("clearing the browser selection");
+        selection
+            .add_range(&range)
+            .expect("installing the draft caret");
+        unrelated.set(1);
+        source.set("# Colleague changed the persisted description".to_string());
+        TimeoutFuture::new(100).await;
+        let current = container
+            .query_selector("[contenteditable='true']")
+            .expect("finding description after updates")
+            .expect("the draft editor stays mounted");
+        assert!(editor.is_same_node(Some(&current)));
+        assert!(
+            document
+                .active_element()
+                .expect("description retains focus")
+                .is_same_node(Some(&editor))
+        );
+        assert_eq!(selection.anchor_offset(), 5);
+        assert_eq!(state.draft.get_untracked(), "A half typed draft");
+        click(&container, "Cancel");
+        TimeoutFuture::new(40).await;
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Colleague changed the persisted description")
+        );
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn read_only_and_empty_descriptions_have_correct_affordances() {
+        boot_leptos_executor();
+        let container = mount_container();
+        let source = RwSignal::new(String::new());
+        let can_edit = RwSignal::new(false);
+        let state = InlineTextEdit::new();
+        let handle = leptos::mount::mount_to(container.clone(), move || {
+            view! {
+                <ProjectDescription project_id="fixture-project".to_string()
+                    description=Signal::derive(move || source.get())
+                    can_edit=Signal::derive(move || can_edit.get()) state=state/>
+            }
+        });
+        TimeoutFuture::new(60).await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Add a description")
+        );
+        source.set(MARKDOWN.to_string());
+        TimeoutFuture::new(60).await;
+        assert!(
+            container
+                .query_selector("h1")
+                .expect("finding read-only heading")
+                .is_some()
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Edit description")
+        );
+        assert!(
+            container
+                .query_selector("[contenteditable='true']")
+                .expect("querying read-only surface")
+                .is_none()
+        );
+        source.set(String::new());
+        can_edit.set(true);
+        TimeoutFuture::new(60).await;
+        click(&container, "Add a description...");
+        TimeoutFuture::new(40).await;
+        assert!(state.editing.get_untracked());
+        can_edit.set(false);
+        TimeoutFuture::new(60).await;
+        assert!(!state.editing.get_untracked());
+        assert!(
+            container
+                .query_selector("[contenteditable='true']")
+                .expect("querying surface after access revocation")
+                .is_none()
+        );
+        drop(handle);
+        container.remove();
     }
 }
