@@ -34,3 +34,13 @@ connections and closes the existing native terminal WebSocket; reconnection uses
 the application's normal path. Claude spawn failure uses the real agent's command allowlist; Claude
 itself is not required. Personal mode deliberately bypasses application login,
 so this suite does not claim authentication coverage.
+
+The **Realtime E2E** workflow runs this suite after its two-client sync checks,
+reusing the server and frontend it already built. A reusable Connect Agent Build
+job supplies the Linux customer release package from the same workflow run;
+the download fails on a digest mismatch and verifies `SHA256SUMS` before
+extraction. The fixture still starts its own server on 3441, agent on 3442,
+and temporary personal-mode SQLite database, isolated from the workflow's
+existing server on 3100 and Postgres service. Failures upload the Connect
+Playwright traces and attached fixture logs with the existing E2E artifacts.
+No Claude installation or model request is needed.

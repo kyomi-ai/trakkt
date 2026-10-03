@@ -83,6 +83,8 @@ test('browser controls a real shell PTY and restores sessions without an agent i
   )).toBe(true);
   await expect(page.getByPlaceholder('Type a command or search issues...')).toHaveCount(0);
   await expect(terminal).toBeFocused();
+  // Clear any canonical input left by Ctrl+K when /bin/sh has no readline.
+  await page.keyboard.press('Control+u');
   await command(page, terminal, "printf '\\n%s%s\\n' CONTROL_KEY_ ROUNDTRIP");
   await expect(terminal).toContainText('CONTROL_KEY_ROUNDTRIP');
 
