@@ -5,8 +5,10 @@ members = [
     "crates/trakkt-types",
     "crates/trakkt-api",
     "crates/trakkt-github",
+    "crates/trakkt-connect-protocol",
     "crates/trakkt-ui",
     "apps/server",
+    "apps/trakkt-connect",
     "tools/gen-api-docs",
 ]
 resolver = "3"
@@ -95,6 +97,7 @@ trakkt-server = { path = "apps/server" }
 trakkt-api = { path = "crates/trakkt-api" }
 trakkt-types = { path = "crates/trakkt-types" }
 trakkt-github = { path = "crates/trakkt-github" }
+trakkt-connect-protocol = { version = "0.1.0", path = "crates/trakkt-connect-protocol" }
 # Stripe billing
 async-stripe = { version = "=1.0.0-rc.1", default-features = false, features = ["rustls-tls-webpki-roots", "rustls-ring"] }
 async-stripe-webhook = { version = "=1.0.0-rc.1", features = ["async-stripe-billing", "async-stripe-checkout", "async-stripe-core"] }

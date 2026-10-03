@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+trakkt-connect-protocol = { workspace = true }
 trakkt-core = { workspace = true }
 trakkt-types = { workspace = true }
 axum = { workspace = true }

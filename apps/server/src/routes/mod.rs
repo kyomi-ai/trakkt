@@ -5,6 +5,7 @@
 pub mod auth_shared;
 pub mod auth_token;
 pub mod billing;
+pub mod connect;
 pub mod github;
 pub mod mcp;
 pub mod oauth;

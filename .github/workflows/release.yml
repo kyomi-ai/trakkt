@@ -98,11 +98,16 @@ jobs:
           cache-from: type=gha,scope=docker
           cache-to: type=gha,mode=max,scope=docker
 
+  # Uses the same nonpublishing build validated by pull-request CI.
+  connect-agent:
+    uses: ./.github/workflows/connect-agent.yml
+
   # ---------------------------------------------------------------------------
   # Deploy: notify trakkt-cloud to deploy from GHCR
   # ---------------------------------------------------------------------------
   deploy-notify:
-    needs: [prepare, docker]
+    # Customers must be able to download the agent when Connect becomes live.
+    needs: [prepare, docker, release]
     runs-on: ubuntu-latest
     # Two GitHub API calls: mint an app token, then dispatch the event.
     # Measured at 3-7s across the 12 most recent releases. Sized as a floor
@@ -134,7 +139,7 @@ jobs:
   # GitHub Release
   # ---------------------------------------------------------------------------
   release:
-    needs: [prepare, docker]
+    needs: [prepare, docker, connect-agent]
     runs-on: ubuntu-latest
     # One API call, but `generate_release_notes: true` makes GitHub walk the
     # commit range since the previous tag, so this is the only short job here
@@ -144,10 +149,22 @@ jobs:
     # `prepare` above.
     timeout-minutes: 5
     steps:
+      - name: Download validated Connect agent assets
+        uses: actions/download-artifact@v8
+        with:
+          name: trakkt-connect-linux-x86_64
+          path: agent-assets
+          digest-mismatch: error
+      - name: Verify release asset checksum
+        run: cd agent-assets && sha256sum --check SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            agent-assets/trakkt-connect-linux-x86_64.tar.gz
+            agent-assets/SHA256SUMS
           body: |
             ## Installation
 

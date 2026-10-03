@@ -8,6 +8,7 @@ name = "trakkt"
 path = "src/main.rs"
 
 [dependencies]
+trakkt-connect-protocol = { workspace = true }
 trakkt-core = { workspace = true }
 trakkt-auth = { workspace = true }
 trakkt-api = { workspace = true }

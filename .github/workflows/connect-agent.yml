@@ -1,0 +1,47 @@
+name: Connect Agent Build
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/trakkt-connect/**'
+      - 'crates/trakkt-connect-protocol/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/connect-agent.yml'
+      - '.github/workflows/release.yml'
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Connect Linux x86_64 artifact
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Strip local development patches
+        run: sed -i '/^# BEGIN_LOCAL_DEV_PATCHES$/,/^# END_LOCAL_DEV_PATCHES$/{ /^# BEGIN_LOCAL_DEV_PATCHES$/!{ /^# END_LOCAL_DEV_PATCHES$/!d } }' Cargo.toml
+      - name: Build and validate customer agent
+        run: |
+          cargo build --locked --release -p trakkt-connect
+          ./target/release/trakkt-connect --help
+          ./target/release/trakkt-connect --version
+      - name: Package binary and verify checksum
+        run: |
+          mkdir -p agent-package artifacts
+          cp target/release/trakkt-connect agent-package/
+          cp apps/trakkt-connect/README.md agent-package/README.md
+          tar -czf artifacts/trakkt-connect-linux-x86_64.tar.gz -C agent-package trakkt-connect README.md
+          cd artifacts
+          sha256sum trakkt-connect-linux-x86_64.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: trakkt-connect-linux-x86_64
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7

@@ -83,6 +83,8 @@ pub fn build_router(state: state::AppState) -> Router {
         .nest("/mcp", routes::mcp::routes())
         .merge(routes::oauth::well_known_routes())
         .nest("/api/v1/oauth", routes::oauth::routes())
+        .route("/ws/connect/agent", axum::routing::get(routes::connect::agent_ws_handler))
+        .route("/ws/connect/terminal", axum::routing::get(routes::connect::terminal_ws_handler))
         .route("/ws/{user_id}", axum::routing::get(routes::websocket::ws_handler))
         // Leptos server functions
         .route("/leptos-api/{*fn_name}", axum::routing::post({
