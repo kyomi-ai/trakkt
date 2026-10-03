@@ -202,7 +202,17 @@ pub struct ProjectProgress {
     pub percent_done: f64,
 }
 
-/// A user-pinned favorite (team, project, or view) for quick sidebar access.
+/// A user-pinned issue, project, team or view, for quick sidebar access.
+///
+/// `target_type` is a `String` and not a [`crate::enums::FavoriteTarget`] on
+/// purpose, and the asymmetry is deliberate: writes are strict, reads are not.
+/// `favorite_service::add_favorite` takes the enum, so nothing new can be stored
+/// outside the closed set — but this type also decodes rows that predate
+/// TRA-10025, when the column took whatever string an HTTP caller sent. Parsing
+/// here would turn one such legacy row into a failed bootstrap for its owner
+/// rather than a favorite that renders as nothing.
+/// `migrations/20260807000000_prune_dangling_favorites.sql` is what removes
+/// them; until it has run, this field has to be able to hold one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Favorite {
     pub favorite_id: String,
@@ -269,6 +279,29 @@ pub struct Notification {
     /// Optional context ID for deep-linking (e.g. comment_id for "commented" notifications).
     #[serde(default)]
     pub context_id: Option<String>,
+}
+
+impl Notification {
+    /// Whether the inbox still lists this notification *and* the user has not
+    /// read it — what the sidebar's unread badge counts.
+    ///
+    /// Both halves are load-bearing. Deleting from the inbox is a soft delete:
+    /// `notification_service::bulk_delete_notifications` stamps `deleted_at` and
+    /// leaves the row in place, and it reaches clients as an `Update` carrying
+    /// the stamped row rather than as a `Delete`, so a dismissed notification is
+    /// still sitting in the client's cache with `read == false`. Counting `!read`
+    /// alone therefore counts rows the inbox no longer shows.
+    ///
+    /// This is the client-side statement of the predicate
+    /// `notification_service::count_unread` runs as SQL —
+    /// `read = false AND deleted_at IS NULL`, the same one
+    /// `list_notifications` applies when it builds the inbox's rows. The two are
+    /// written in different languages and cannot be shared, so the point of
+    /// naming this once here is that the next place needing "unread, as the
+    /// inbox means it" reads it rather than restating it and drifting.
+    pub fn is_unread_in_inbox(&self) -> bool {
+        !self.read && self.deleted_at.is_none()
+    }
 }
 
 /// User-level notification preferences for a workspace.
@@ -562,6 +595,36 @@ pub struct WorkspaceSettings {
     pub default_auto_archive_days: Option<u32>,
 }
 
+/// The `workspace_settings` sync entity: the workspace-level fields clients
+/// cache, as one addressable row.
+///
+/// This is the only entity the bootstrap streams that is not a table row of its
+/// own — it is a projection of the `workspaces` row, assembled by
+/// `workspace_service::WorkspaceSnapshotRow::into_snapshot`. It was also the
+/// only one with no Rust type at all: the projection was a hand-built
+/// `serde_json::json!` literal, so it was the one entity whose id could not be
+/// derived from a type and the one place the next `"workspace_id"` typo would
+/// have landed. Giving it a struct is what lets it implement [`SyncEntity`]
+/// alongside the other ten.
+///
+/// [`SyncEntity`]: crate::sync::SyncEntity
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceSettingsSnapshot {
+    pub workspace_id: String,
+    pub name: Option<String>,
+    /// The `workspaces.settings` column, carried as parsed JSON rather than as
+    /// [`WorkspaceSettings`].
+    ///
+    /// Deliberately untyped: `WorkspaceSettings` does not deny unknown fields,
+    /// so decoding into it and re-encoding would silently drop any key it does
+    /// not declare — a lossy round-trip for a column written as free-form JSON
+    /// by older versions and by `update_workspace_settings`, which takes a
+    /// `serde_json::Value` from its caller. `None` is a NULL column.
+    pub settings: Option<serde_json::Value>,
+    pub default_team_id: Option<String>,
+    pub updated_at: String,
+}
+
 /// A file attachment linked to an issue.
 ///
 /// WASM-safe serializable DTO for file attachment metadata.
@@ -571,6 +634,26 @@ pub struct Attachment {
     pub filename: String,
     pub content_type: String,
     pub size_bytes: i64,
+    pub created_at: String,
+}
+
+/// The link between one issue and one attachment — a row of the
+/// `issue_attachments` junction table.
+///
+/// Distinct from [`Attachment`], which is the file itself. An upload creates an
+/// attachment and links it in one request, so both frames go out together; but a
+/// link can also be made against a file that already exists, and that change is
+/// this row and nothing else. Without a type of its own there is no value
+/// `attachment_service::attach_to_issue` could put on the wire, and
+/// `cache/apply.rs` drops an insert frame that carries no payload before it
+/// reaches any entity arm — so the link would reach no other client at all.
+///
+/// The junction has a composite primary key and no surrogate id; the sync entity
+/// id is `issue_id:attachment_id`, assembled by the service.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueAttachment {
+    pub issue_id: String,
+    pub attachment_id: String,
     pub created_at: String,
 }
 
@@ -631,4 +714,61 @@ pub struct ReleaseIssue {
     pub title: String,
     pub status_name: String,
     pub status_category: String,
+}
+
+// ---------------------------------------------------------------------------
+// Sync addressing
+// ---------------------------------------------------------------------------
+
+/// Implement [`SyncEntity`] for the models the sync bootstrap streams.
+///
+/// One row per entity: the model, the [`entity_types`] constant its frames are
+/// tagged with, and the field holding its primary key. This table is the whole
+/// of what `handle_sync_bootstrap` used to restate — an `entity_type` constant
+/// and an id-field *string literal* — once per entity at its own call site, with
+/// nothing checking either against the model it was written beside.
+///
+/// What the compiler now checks, and what it still does not:
+///
+/// - `$id_field` is a field access. A field that does not exist, or that is not
+///   a `String`, does not compile. There is no string to mistype.
+/// - `$entity_type` is a path into [`entity_types`], so a type outside the
+///   declared set does not compile either.
+/// - The **pairing** of a model with its constant is still a statement, not a
+///   deduction: `Label => STATUS, label_id` would compile. Nothing in Rust can
+///   derive a wire string from a type, so this has to be said once somewhere.
+///   Said here, it is eleven adjacent rows that read as a table; said at the
+///   call sites, it was eleven separate lines scattered through a handler. A
+///   wrong pairing here is also not silent the way a wrong id literal was — the
+///   client would cache the payload under another type's store and misrender
+///   it, rather than accept it, file it under `""`, and go quietly stale.
+///
+/// [`SyncEntity`]: crate::sync::SyncEntity
+/// [`entity_types`]: crate::sync::entity_types
+macro_rules! impl_sync_entity {
+    ($($model:ident => $entity_type:ident, $id_field:ident;)+) => {
+        $(
+            impl crate::sync::SyncEntity for $model {
+                const ENTITY_TYPE: &'static str = crate::sync::entity_types::$entity_type;
+
+                fn entity_id(&self) -> &str {
+                    &self.$id_field
+                }
+            }
+        )+
+    };
+}
+
+impl_sync_entity! {
+    IssueWithDetails => ISSUE, issue_id;
+    Label => LABEL, label_id;
+    Status => STATUS, status_id;
+    Team => TEAM, team_id;
+    Project => PROJECT, project_id;
+    View => VIEW, view_id;
+    Favorite => FAVORITE, favorite_id;
+    Notification => NOTIFICATION, notification_id;
+    Comment => COMMENT, comment_id;
+    ProjectMilestone => PROJECT_MILESTONE, milestone_id;
+    WorkspaceSettingsSnapshot => WORKSPACE_SETTINGS, workspace_id;
 }

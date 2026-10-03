@@ -91,6 +91,12 @@ pub struct Config {
     /// Backend base URL for constructing OAuth redirect URIs
     pub base_url: String,
 
+    /// Directory holding the Trunk-built frontend bundle (`index.html`, WASM,
+    /// CSS). Resolved once here rather than per request so the path the static
+    /// file service was built from and the path the SPA shell is read from
+    /// cannot disagree.
+    pub dist_dir: String,
+
     // ── Attachments ────────────────────────────────────────────────────
     /// Storage backend for file attachments: "local" or "s3"
     pub attachment_storage: String,
@@ -179,6 +185,8 @@ impl Config {
                 .unwrap_or_else(|_| "support@trakkt.app".into()),
             frontend_url,
             base_url,
+            dist_dir: env::var("TRUNK_DIST_DIR")
+                .unwrap_or_else(|_| "crates/trakkt-ui/dist".into()),
             attachment_storage: env::var("ATTACHMENT_STORAGE").unwrap_or_else(|_| "local".into()),
             attachment_local_path: env::var("ATTACHMENT_LOCAL_PATH").unwrap_or_else(|_| "./data/attachments".into()),
             attachment_s3_endpoint: env::var("ATTACHMENT_S3_ENDPOINT").ok(),
@@ -195,8 +203,36 @@ impl Config {
         const TEST_ENCRYPTION_KEY_B64: &str = "dGVzdC1hZXMta2V5LWZvci11bml0LXRlc3RzISEhISE=";
 
         Self {
-            database_url: env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://tane_test:test@localhost:5434/tane_test".into()),
+            // Deliberately names no host and no port.
+            //
+            // Nothing reads this field off a test config. `test_config` has two
+            // callers — `apps/server/tests/common/mod.rs`, whose `AppState`
+            // takes its pool from `test_helpers::test_pool()`, and
+            // `redis::tests`, which reads only `redis_url` — and workspace-wide
+            // `database_url` is consumed at exactly one site,
+            // `apps/server/src/main.rs`, on a `from_env` config. The field
+            // still has to hold something to build a `Config`, so it holds the
+            // backend those tests actually run on: the in-memory SQLite
+            // `test_pool` opens.
+            //
+            // Until TRA-10002 it read
+            // `postgres://tane_test:test@localhost:5434/tane_test`, from an
+            // env-var default inherited with the code. On the development
+            // machines 5434 is another project's *test* Postgres — the ladder
+            // is recorded on `test_helpers::dual_backend::DEFAULT_PG_TEST_URL`,
+            // whose 5436 is Trakkt's rung — so the first caller to pass this to
+            // `DbPool::connect` would have opened a connection to a database
+            // belonging to someone else's test run. (Today that connection is
+            // refused at authentication — the credentials name a *third*
+            // project, so they match neither occupant. Which container sits on
+            // a rung, and with which roles, is not something this crate gets to
+            // assume.)
+            //
+            // Naming no port means there is no rung left to get wrong. Keep it
+            // that way: a test that genuinely needs Postgres should take its
+            // URL from `dual_backend::pg_maintenance_url()`, not add a second
+            // hardcoded literal here for the two to drift apart.
+            database_url: "sqlite::memory:".into(),
             redis_url: env::var("REDIS_URL").ok(),
             jwt_secret: env::var("JWT_SECRET_KEY")
                 .unwrap_or_else(|_| "test-jwt-secret-not-for-production".into()),
@@ -216,6 +252,10 @@ impl Config {
             support_email: "test@trakkt.app".into(),
             frontend_url: "http://localhost:5173".into(),
             base_url: "http://localhost:8003".into(),
+            // No frontend is built during `cargo test`, so this path does not
+            // exist. Tests that assert on SPA serving point it at a temporary
+            // directory they populate themselves.
+            dist_dir: "crates/trakkt-ui/dist".into(),
             attachment_storage: "local".into(),
             attachment_local_path: "/tmp/trakkt-test-attachments".into(),
             attachment_s3_endpoint: None,

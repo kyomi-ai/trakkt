@@ -176,7 +176,10 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            result.expect("an operation that succeeds on its first attempt to return that value"),
+            42
+        );
         assert_eq!(counter.load(Ordering::SeqCst), 1, "called exactly once");
     }
 
@@ -201,7 +204,10 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(
+            result.expect("one TooManyRequests failure to be retried through to the succeeding attempt"),
+            "ok"
+        );
         assert_eq!(
             counter.load(Ordering::SeqCst),
             2,
