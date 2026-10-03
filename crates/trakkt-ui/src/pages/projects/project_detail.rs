@@ -452,7 +452,6 @@ pub fn ProjectDetailPage() -> impl IntoView {
                 >
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>
                 </Button>
-                <CopyLinkButton path=copy_path/>
                 <span class="text-muted-foreground">
                     <Icon icon=phosphor_leptos::FOLDER weight=phosphor_leptos::IconWeight::Duotone size="16px"/>
                 </span>
@@ -494,6 +493,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
                         view! {
                             <ProjectDetailContent
                                 project=project
+                                copy_path=copy_path
                                 issues=Signal::derive(move || project_issues.get())
                                 progress=progress
                                 milestones=milestones
@@ -538,6 +538,7 @@ pub fn ProjectDetailPage() -> impl IntoView {
 #[component]
 fn ProjectDetailContent(
     project: Signal<Project>,
+    copy_path: Signal<Option<String>>,
     issues: Signal<Vec<IssueWithDetails>>,
     progress: Signal<Option<ProjectProgress>>,
     milestones: Signal<Vec<ProjectMilestone>>,
@@ -700,39 +701,44 @@ fn ProjectDetailContent(
         <div>
         <div class="max-w-[860px] mx-auto w-full">
             // ── Project name (click-to-edit) ─────────────────────────────
-            <Show
-                when=move || editing_name.get()
-                fallback=move || view! {
-                    <h1
-                        class="text-2xl font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
-                        tabindex="0"
-                        role="button"
-                        aria-label="Click to edit project name"
-                        on:click=move |_| {
-                            name_draft.set(name_value.get_untracked());
-                            editing_name.set(true);
-                        }
-                        on:keydown=move |ev: leptos::ev::KeyboardEvent| {
-                            if ev.key() == "Enter" {
-                                name_draft.set(name_value.get_untracked());
-                                editing_name.set(true);
-                            }
+            <div class="flex items-start gap-2">
+                <div class="min-w-0 [overflow-wrap:anywhere] has-[input]:flex-1">
+                    <Show
+                        when=move || editing_name.get()
+                        fallback=move || view! {
+                            <h1
+                                class="text-2xl font-display text-foreground cursor-pointer hover:text-foreground/80 transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm"
+                                tabindex="0"
+                                role="button"
+                                aria-label="Click to edit project name"
+                                on:click=move |_| {
+                                    name_draft.set(name_value.get_untracked());
+                                    editing_name.set(true);
+                                }
+                                on:keydown=move |ev: leptos::ev::KeyboardEvent| {
+                                    if ev.key() == "Enter" {
+                                        name_draft.set(name_value.get_untracked());
+                                        editing_name.set(true);
+                                    }
+                                }
+                            >
+                                {move || name_value.get()}
+                            </h1>
                         }
                     >
-                        {move || name_value.get()}
-                    </h1>
-                }
-            >
-                <input
-                    type="text"
-                    class=format!("{INPUT_CLASS} !text-2xl !font-display !h-auto !py-1")
-                    prop:value=move || name_draft.get()
-                    on:input=move |ev| name_draft.set(event_target_value(&ev))
-                    on:keydown=name_keydown
-                    on:blur=move |_| save_name()
-                    autofocus=true
-                />
-            </Show>
+                        <input
+                            type="text"
+                            class=format!("{INPUT_CLASS} !text-2xl !font-display !h-auto !py-1")
+                            prop:value=move || name_draft.get()
+                            on:input=move |ev| name_draft.set(event_target_value(&ev))
+                            on:keydown=name_keydown
+                            on:blur=move |_| save_name()
+                            autofocus=true
+                        />
+                    </Show>
+                </div>
+                <CopyLinkButton path=copy_path/>
+            </div>
 
             // ── Metadata bar ─────────────────────────────────────────────
             <div class="flex flex-wrap items-center gap-4 mt-4">
