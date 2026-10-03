@@ -1,0 +1,16 @@
+/* Keep description overflow local, including narrow project/issue layouts. */
+.markdown-description .wysiwyg-container {
+    min-width: 0;
+    max-width: 100%;
+}
+.markdown-description .tree-wysiwyg-scroll-container {
+    overflow-x: auto;
+}
+.markdown-description .wysiwyg-table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+}
+.markdown-description .wysiwyg-code-block {
+    max-width: 100%;
+}
