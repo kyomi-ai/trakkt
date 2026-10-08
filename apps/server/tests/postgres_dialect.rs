@@ -3903,3 +3903,93 @@ dual_backend_test! {
         );
     }
 }
+
+// MCP refresh renewal must apply the same atomic guards on both SQL dialects.
+dual_backend_test! {
+    async fn mcp_refresh_renewal_preserves_grant_state(db) {
+        use chrono::{DateTime, Duration, Utc};
+        use trakkt_auth::token_service::{self, DeviceInfo};
+
+        seed_user(db, USER, "refresh-dialect@example.test")
+            .await.expect("seed refresh grant owner");
+        let device = DeviceInfo {
+            user_agent: None, ip_address: None, country_code: None, oauth_client_id: None,
+        };
+        let raw = "dialect-refresh-grant";
+        let original = Utc::now() + Duration::hours(1);
+        let token_id = token_service::store_refresh_token(
+            db, USER, &token_service::hash_refresh_token(raw), original, &device, "refresh-family",
+        ).await.expect("store existing unexpired grant");
+        let read_expiry = "SELECT expires_at FROM refresh_tokens WHERE token_id = $1";
+        let before = Utc::now();
+        assert!(token_service::renew_mcp_refresh_token(db, &token_id)
+            .await.expect("renew current grant"));
+        let expiry: DateTime<Utc> = db_fetch_scalar!(db, DateTime<Utc>, read_expiry, &token_id)
+            .expect("read renewed expiry");
+        let ttl = Duration::days(trakkt_core::constants::get().jwt.refresh_token_expire_days);
+        assert!(expiry >= before + ttl && expiry <= Utc::now() + ttl);
+        assert!(expiry > original);
+
+        // A request that observes a newer renewal must not overwrite it with a
+        // shorter deadline. This is the same row predicate used under concurrency.
+        let newer = Utc::now() + ttl + Duration::days(1);
+        db_execute!(db, "UPDATE refresh_tokens SET expires_at = $2 WHERE token_id = $1", &token_id, &newer)
+            .expect("simulate a renewal committed by another request");
+        assert!(token_service::renew_mcp_refresh_token(db, &token_id)
+            .await.expect("renew after concurrent request"));
+        assert_eq!(db_fetch_scalar!(db, DateTime<Utc>, read_expiry, &token_id)
+            .expect("read monotonic expiry"), newer);
+
+        token_service::revoke_refresh_token(db, &token_id).await.expect("revoke before renewal persists");
+        assert!(!token_service::renew_mcp_refresh_token(db, &token_id)
+            .await.expect("reject concurrently revoked grant"));
+        assert_eq!(db_fetch_scalar!(db, DateTime<Utc>, read_expiry, &token_id)
+            .expect("read revoked expiry"), newer);
+        assert!(!db_fetch_scalar!(db, bool,
+            "SELECT is_active FROM refresh_tokens WHERE token_id = $1", &token_id)
+            .expect("read revoked grant state"));
+        assert!(!token_service::renew_mcp_refresh_token(db, "unknown-token")
+            .await.expect("reject unknown grant"));
+
+        let expired = Utc::now() - Duration::seconds(1);
+        let expired_id = token_service::store_refresh_token(
+            db, USER, "expired-dialect-hash", expired, &device, "expired-family",
+        ).await.expect("store expired grant");
+        assert!(!token_service::renew_mcp_refresh_token(db, &expired_id)
+            .await.expect("reject inactive grant"));
+        assert_eq!(db_fetch_scalar!(db, DateTime<Utc>, read_expiry, &expired_id)
+            .expect("read expired deadline"), expired);
+
+        // Browser rotation still replaces the old grant and creates a distinct
+        // token. MCP grace use must never extend the replaced grant's lifetime.
+        let browser_id = token_service::store_refresh_token(
+            db, USER, &token_service::hash_refresh_token("browser-old"), original, &device, "browser-family",
+        ).await.expect("store browser session");
+        let rotated_id = token_service::rotate_refresh_token(
+            db, &browser_id, USER, "browser-family", "browser-new-hash", newer, &device,
+        ).await.expect("rotate browser session");
+        assert_ne!(rotated_id, browser_id);
+        assert_eq!(db_fetch_scalar!(db, DateTime<Utc>, read_expiry, &browser_id)
+            .expect("read browser expiry after rotation"), original);
+        assert!(token_service::renew_mcp_refresh_token(db, &browser_id)
+            .await.expect("accept replaced grant during grace"));
+        assert_eq!(db_fetch_scalar!(db, DateTime<Utc>, read_expiry, &browser_id)
+            .expect("read unchanged grace expiry"), original);
+        let past_grace = Utc::now() - Duration::seconds(
+            trakkt_core::constants::get().jwt.refresh_token_grace_period_seconds + 5,
+        );
+        db_execute!(db, "UPDATE refresh_tokens SET replaced_at = $2 WHERE token_id = $1", &browser_id, &past_grace)
+            .expect("simulate passage beyond rotation grace");
+        assert!(!token_service::renew_mcp_refresh_token(db, &browser_id)
+            .await.expect("reject replaced grant after grace"));
+        assert_eq!(db_fetch_scalar!(db, DateTime<Utc>, read_expiry, &browser_id)
+            .expect("read unchanged replaced expiry"), original);
+        assert!(matches!(
+            token_service::verify_refresh_token(db, "browser-old").await
+                .expect("verify browser reuse after grace"),
+            token_service::RefreshTokenVerifyResult::TheftDetected { .. }
+        ));
+        assert!(!token_service::renew_mcp_refresh_token(db, &rotated_id)
+            .await.expect("reject family revoked by theft detection"));
+    }
+}
