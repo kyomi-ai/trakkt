@@ -503,13 +503,13 @@ async fn handle_authorization_code(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant: code expired or invalid"})),
+                Json(json!({"error": "invalid_grant", "error_description": "code expired or invalid"})),
             )
         })?
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant: code expired or invalid"})),
+                Json(json!({"error": "invalid_grant", "error_description": "code expired or invalid"})),
             )
         })?;
 
@@ -517,7 +517,7 @@ async fn handle_authorization_code(
     if code_data.get("client_id").and_then(|v| v.as_str()) != Some(&params.client_id) {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_grant: client_id mismatch"})),
+            Json(json!({"error": "invalid_grant", "error_description": "client_id mismatch"})),
         ));
     }
 
@@ -527,7 +527,7 @@ async fn handle_authorization_code(
     {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_grant: redirect_uri mismatch"})),
+            Json(json!({"error": "invalid_grant", "error_description": "redirect_uri mismatch"})),
         ));
     }
 
@@ -540,20 +540,20 @@ async fn handle_authorization_code(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant: user not found"})),
+                Json(json!({"error": "invalid_grant", "error_description": "user not found"})),
             )
         })?
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant: user not found"})),
+                Json(json!({"error": "invalid_grant", "error_description": "user not found"})),
             )
         })?;
 
     if !user.active {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_grant: user not found"})),
+            Json(json!({"error": "invalid_grant", "error_description": "user not found"})),
         ));
     }
 
@@ -645,7 +645,7 @@ async fn handle_refresh_token(
             tracing::warn!(error = %e, "OAuth refresh token verification failed");
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant: refresh token invalid or expired"})),
+                Json(json!({"error": "invalid_grant", "error_description": "refresh token invalid or expired"})),
             )
         })?;
 
@@ -657,13 +657,13 @@ async fn handle_refresh_token(
         token_service::RefreshTokenVerifyResult::TheftDetected { .. } => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant: refresh token revoked"})),
+                Json(json!({"error": "invalid_grant", "error_description": "refresh token revoked"})),
             ));
         }
         token_service::RefreshTokenVerifyResult::Invalid => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant: refresh token invalid or expired"})),
+                Json(json!({"error": "invalid_grant", "error_description": "refresh token invalid or expired"})),
             ));
         }
     };
@@ -674,20 +674,20 @@ async fn handle_refresh_token(
         .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant: user not found"})),
+                Json(json!({"error": "invalid_grant", "error_description": "user not found"})),
             )
         })?
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant: user not found"})),
+                Json(json!({"error": "invalid_grant", "error_description": "user not found"})),
             )
         })?;
 
     if !user.active {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_grant: user not found"})),
+            Json(json!({"error": "invalid_grant", "error_description": "user not found"})),
         ));
     }
 
@@ -702,7 +702,7 @@ async fn handle_refresh_token(
         tracing::warn!(user_id = %user.user_id, "OAuth refresh: no workspace found");
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_grant: no workspace access"})),
+            Json(json!({"error": "invalid_grant", "error_description": "no workspace access"})),
         ));
     };
 
