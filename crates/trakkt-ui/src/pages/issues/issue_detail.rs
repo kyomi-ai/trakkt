@@ -184,7 +184,6 @@ pub fn IssueDetailPage() -> impl IntoView {
                 >
                     <Icon icon=phosphor_leptos::ARROW_LEFT size="20px"/>
                 </Button>
-                <CopyLinkButton path=copy_path/>
                 <span class="font-mono text-sm text-muted-foreground">
                     {move || format!("{}-{}", team_key.get(), number.get())}
                 </span>
@@ -224,7 +223,7 @@ pub fn IssueDetailPage() -> impl IntoView {
                             _ => return view! { <IssueDetailSkeleton/> }.into_any(),
                         };
                         view! {
-                            <IssueDetailContent initial_issue=issue />
+                            <IssueDetailContent initial_issue=issue copy_path=copy_path/>
                         }.into_any()
                     }
                 />
@@ -246,6 +245,7 @@ pub fn IssueDetailPage() -> impl IntoView {
 #[component]
 fn IssueDetailContent(
     initial_issue: IssueWithDetails,
+    copy_path: Signal<Option<String>>,
 ) -> impl IntoView {
     let number = initial_issue.number;
     let initial_team_key = initial_issue.team_key.clone();
@@ -408,7 +408,12 @@ fn IssueDetailContent(
                 </Show>
 
                 // ── Title ──────────────────────────────────────────────
-                <EditableTitle team_key=initial_team_key.clone() number=number title=title on_save=noop/>
+                <div class="flex items-start gap-2">
+                    <div class="min-w-0 [overflow-wrap:anywhere] has-[input]:flex-1">
+                        <EditableTitle team_key=initial_team_key.clone() number=number title=title on_save=noop/>
+                    </div>
+                    <CopyLinkButton path=copy_path/>
+                </div>
 
                 // ── Description ────────────────────────────────────────
                 <DescriptionEditor

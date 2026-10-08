@@ -61,7 +61,7 @@ async fn copy_link(path: &str) -> Result<(), &'static str> {
     clipboard_result(clipboard.write_text(&absolute_link(&origin, path))).await
 }
 
-/// Visible detail-header action. `path` is present only for a loaded current entity.
+/// Compact action beside the detail title. `path` is present only for a loaded current entity.
 #[component]
 pub fn CopyLinkButton(#[prop(into)] path: Signal<Option<String>>) -> impl IntoView {
     let copied_path = RwSignal::new(None::<String>);
@@ -86,7 +86,7 @@ pub fn CopyLinkButton(#[prop(into)] path: Signal<Option<String>>) -> impl IntoVi
         leptos::task::spawn_local(async move {
             let result = copy_link(&current_path).await;
             busy.try_set(false);
-            // The router can reuse this header while a clipboard request is pending.
+            // Navigation can change the current entity while a clipboard request is pending.
             if path.try_get_untracked().flatten().as_ref() != Some(&current_path) {
                 return;
             }
@@ -107,27 +107,32 @@ pub fn CopyLinkButton(#[prop(into)] path: Signal<Option<String>>) -> impl IntoVi
     #[cfg(not(target_arch = "wasm32"))]
     let on_click = |_| {};
 
+    let copied = Signal::derive(move || path.get().is_some() && copied_path.get() == path.get());
+
     view! {
-        <div class="relative shrink-0">
+        <div class="relative shrink-0 mt-1">
             <Button
                 variant=ButtonVariant::GhostMuted
-                size=ButtonSize::Sm
+                size=ButtonSize::IconSm
                 aria_label="Copy link"
                 disabled=Signal::derive(move || path.get().is_none() || busy.get())
                 on:click=on_click
             >
-                <phosphor_leptos::Icon icon=phosphor_leptos::LINK size="16px"/>
-                <span aria-live="polite">
-                    {move || if path.get().is_some() && copied_path.get() == path.get() {
-                        "Copied"
+                {move || {
+                    let icon = if copied.get() {
+                        phosphor_leptos::CHECK
                     } else {
-                        "Copy link"
-                    }}
-                </span>
+                        phosphor_leptos::LINK
+                    };
+                    view! { <phosphor_leptos::Icon icon=icon size="16px"/> }
+                }}
             </Button>
+            <span class="sr-only" role="status" aria-live="polite">
+                {move || if copied.get() { "Copied" } else { "" }}
+            </span>
             {move || error.get().filter(|(failed_path, _)| path.get().as_ref() == Some(failed_path))
                 .map(|(_, message)| view! {
-                    <div class="absolute top-full left-0 z-50 mt-1 w-56 shadow-md">
+                    <div class="fixed bottom-4 inset-x-4 z-50 mx-auto max-w-sm shadow-md">
                         <Alert variant=AlertVariant::Error>
                             <AlertDescription>{message}</AlertDescription>
                         </Alert>
