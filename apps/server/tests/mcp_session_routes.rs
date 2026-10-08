@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Route-level tests for `DELETE /mcp` — MCP session termination.
+//! Route-level tests for MCP session termination and OAuth token expiry.
 //!
 //! The handler's protection is two separate things — the authentication gate
 //! and the workspace comparison that follows it — and both live inside the
@@ -21,9 +21,9 @@ mod common;
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use tower::ServiceExt;
 
 use trakkt_core::config::TrakktMode;
@@ -245,4 +245,66 @@ async fn delete_in_personal_mode_needs_no_credentials() {
         None,
         "personal mode must still terminate the session, not merely answer 204"
     );
+}
+
+// Clients use the exact OAuth error code to decide whether to reauthorize.
+// Exercise the token endpoint with a real expired token and a missing token.
+#[tokio::test]
+async fn expired_and_unknown_refresh_tokens_return_invalid_grant() {
+    use axum::body::to_bytes;
+    use chrono::{Duration, Utc};
+    use serde_json::Value;
+    use trakkt_auth::token_service::{self, DeviceInfo};
+    let state = common::test_state().await;
+    seed_user(&state.db, "oauth-user", "oauth@example.test")
+        .await
+        .unwrap();
+    trakkt_core::db_execute!(
+        &state.db,
+        "INSERT INTO oauth_clients (id, client_id, name) VALUES ($1, $2, $3)",
+        "00000000-0000-0000-0000-000000000001",
+        "test-client",
+        "Test MCP client"
+    )
+    .unwrap();
+    token_service::store_refresh_token(
+        &state.db,
+        "oauth-user",
+        &token_service::hash_refresh_token("expired-token"),
+        Utc::now() - Duration::days(2),
+        &DeviceInfo {
+            user_agent: None,
+            ip_address: None,
+            country_code: None,
+            oauth_client_id: Some("test-client".into()),
+        },
+        "test-family",
+    )
+    .await
+    .unwrap();
+    let app = Router::new()
+        .nest("/api/v1/oauth", routes::oauth::routes())
+        .with_state(state);
+    for token in ["expired-token", "unknown-token"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "grant_type=refresh_token&client_id=test-client&refresh_token={token}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "invalid_grant");
+        assert_eq!(
+            error["error_description"],
+            "refresh token invalid or expired"
+        );
+    }
 }
