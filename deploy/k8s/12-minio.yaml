@@ -30,7 +30,8 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+          image: 192.168.1.100:6145/minio/minio:RELEASE.2025-04-22T22-12-26Z-amd64
+          imagePullPolicy: IfNotPresent
           args: ["server", "/data", "--console-address", ":9001"]
           env:
             - name: MINIO_ROOT_USER
