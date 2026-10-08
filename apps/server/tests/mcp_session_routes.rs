@@ -258,7 +258,7 @@ async fn expired_and_unknown_refresh_tokens_return_invalid_grant() {
     let state = common::test_state().await;
     seed_user(&state.db, "oauth-user", "oauth@example.test")
         .await
-        .unwrap();
+        .expect("seed OAuth user");
     trakkt_core::db_execute!(
         &state.db,
         "INSERT INTO oauth_clients (id, client_id, name) VALUES ($1, $2, $3)",
@@ -266,7 +266,7 @@ async fn expired_and_unknown_refresh_tokens_return_invalid_grant() {
         "test-client",
         "Test MCP client"
     )
-    .unwrap();
+    .expect("seed OAuth client");
     token_service::store_refresh_token(
         &state.db,
         "oauth-user",
@@ -281,7 +281,7 @@ async fn expired_and_unknown_refresh_tokens_return_invalid_grant() {
         "test-family",
     )
     .await
-    .unwrap();
+    .expect("store expired refresh token");
     let app = Router::new()
         .nest("/api/v1/oauth", routes::oauth::routes())
         .with_state(state);
@@ -294,13 +294,15 @@ async fn expired_and_unknown_refresh_tokens_return_invalid_grant() {
                     .body(Body::from(format!(
                         "grant_type=refresh_token&client_id=test-client&refresh_token={token}"
                     )))
-                    .unwrap(),
+                    .expect("build refresh request"),
             )
             .await
-            .unwrap();
+            .expect("dispatch refresh request");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let error: Value = serde_json::from_slice(&body).unwrap();
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read OAuth error body");
+        let error: Value = serde_json::from_slice(&body).expect("decode OAuth error JSON");
         assert_eq!(error["error"], "invalid_grant");
         assert_eq!(
             error["error_description"],
