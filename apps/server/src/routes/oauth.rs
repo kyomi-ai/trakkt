@@ -729,6 +729,24 @@ async fn handle_refresh_token(
         )
     })?;
 
+    // Persist sliding expiry only after every grant check and JWT creation succeeds.
+    // Recheck token state atomically so revocation/rotation cannot be undone.
+    let renewed = token_service::renew_mcp_refresh_token(&state.db, &user_data.token_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to renew OAuth refresh token");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal_error"})),
+            )
+        })?;
+    if !renewed {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_grant", "error_description": "refresh token invalid or expired"})),
+        ));
+    }
+
     tracing::info!(
         user_id = %user.user_id,
         client_id = %params.client_id,

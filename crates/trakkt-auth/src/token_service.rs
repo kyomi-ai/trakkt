@@ -182,6 +182,44 @@ pub async fn verify_refresh_token(
     Ok(RefreshTokenVerifyResult::Valid(user_data))
 }
 
+/// Persist successful MCP refresh activity without rotating the raw token.
+///
+/// Only a still-active, unexpired grant can renew. Replaced grants retain their
+/// original expiry and must still be within the rotation grace period. The
+/// atomic update cannot reactivate a revoked grant or shorten a newer expiry.
+/// Browser refresh callers must continue using `rotate_refresh_token` instead.
+pub async fn renew_mcp_refresh_token(
+    pool: &DbPool,
+    token_id: &str,
+) -> trakkt_core::Result<bool> {
+    let is_pg = pool.is_postgres();
+    let now_sql = sql_compat::now(is_pg);
+    let bt = sql_compat::bool_true(is_pg);
+    let now = Utc::now();
+    let config = &trakkt_core::constants::get().jwt;
+    let expires_at = now + Duration::days(config.refresh_token_expire_days);
+    let grace_start = now - Duration::seconds(config.refresh_token_grace_period_seconds);
+    // SQLite stores timestamps as text; chrono-bound values and SQL's current
+    // timestamp use different separators, so compare their chronological values.
+    let expiry = if is_pg { "expires_at" } else { "julianday(expires_at)" };
+    let target = if is_pg { "$2" } else { "julianday($2)" };
+    let current = if is_pg { now_sql } else { "julianday('now')" };
+    let within_grace = if is_pg {
+        "replaced_at >= $3"
+    } else {
+        "julianday(replaced_at) >= julianday($3)"
+    };
+    let sql = format!(
+        "UPDATE refresh_tokens \
+         SET expires_at = CASE WHEN replaced_at IS NULL AND {expiry} < {target} \
+                               THEN $2 ELSE expires_at END, last_used = {now_sql} \
+         WHERE token_id = $1 AND is_active = {bt} AND {expiry} > {current} \
+           AND (replaced_at IS NULL OR {within_grace})"
+    );
+    let result = trakkt_core::db_execute!(pool, &sql, token_id, &expires_at, &grace_start)?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Rotate a refresh token: mark the old one as replaced, create a new one in the same family.
 ///
 /// Returns the new token_id.
