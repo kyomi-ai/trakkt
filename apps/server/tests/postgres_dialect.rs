@@ -3907,7 +3907,7 @@ dual_backend_test! {
 // MCP refresh renewal must apply the same atomic guards on both SQL dialects.
 dual_backend_test! {
     async fn mcp_refresh_renewal_preserves_grant_state(db) {
-        use chrono::{DateTime, Duration, Utc};
+        use chrono::{DateTime, Duration, Timelike, Utc};
         use trakkt_auth::token_service::{self, DeviceInfo};
 
         seed_user(db, USER, "refresh-dialect@example.test")
@@ -3916,7 +3916,8 @@ dual_backend_test! {
             user_agent: None, ip_address: None, country_code: None, oauth_client_id: None,
         };
         let raw = "dialect-refresh-grant";
-        let original = Utc::now() + Duration::hours(1);
+        let now = Utc::now().with_nanosecond(0).expect("normalize seed precision for both databases");
+        let original = now + Duration::hours(1);
         let token_id = token_service::store_refresh_token(
             db, USER, &token_service::hash_refresh_token(raw), original, &device, "refresh-family",
         ).await.expect("store existing unexpired grant");
@@ -3932,7 +3933,7 @@ dual_backend_test! {
 
         // A request that observes a newer renewal must not overwrite it with a
         // shorter deadline. This is the same row predicate used under concurrency.
-        let newer = Utc::now() + ttl + Duration::days(1);
+        let newer = now + ttl + Duration::days(1);
         db_execute!(db, "UPDATE refresh_tokens SET expires_at = $2 WHERE token_id = $1", &token_id, &newer)
             .expect("simulate a renewal committed by another request");
         assert!(token_service::renew_mcp_refresh_token(db, &token_id)
@@ -3951,7 +3952,7 @@ dual_backend_test! {
         assert!(!token_service::renew_mcp_refresh_token(db, "unknown-token")
             .await.expect("reject unknown grant"));
 
-        let expired = Utc::now() - Duration::seconds(1);
+        let expired = now - Duration::seconds(1);
         let expired_id = token_service::store_refresh_token(
             db, USER, "expired-dialect-hash", expired, &device, "expired-family",
         ).await.expect("store expired grant");
@@ -3975,7 +3976,7 @@ dual_backend_test! {
             .await.expect("accept replaced grant during grace"));
         assert_eq!(db_fetch_scalar!(db, DateTime<Utc>, read_expiry, &browser_id)
             .expect("read unchanged grace expiry"), original);
-        let past_grace = Utc::now() - Duration::seconds(
+        let past_grace = now - Duration::seconds(
             trakkt_core::constants::get().jwt.refresh_token_grace_period_seconds + 5,
         );
         db_execute!(db, "UPDATE refresh_tokens SET replaced_at = $2 WHERE token_id = $1", &browser_id, &past_grace)
