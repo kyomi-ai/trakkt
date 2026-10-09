@@ -85,6 +85,28 @@ spec:
                   name: trakkt-secrets
                   key: encryption-key
 
+            # GitHub App — optional until credentials are configured.
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: github-app-id
+                  optional: true
+            - name: GITHUB_APP_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: github-app-name
+                  optional: true
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: github-webhook-secret
+                  optional: true
+            - name: GITHUB_APP_PRIVATE_KEY_PATH
+              value: /var/run/trakkt-github/private-key.pem
+
             # Server configuration
             - name: PORT
               valueFrom:
@@ -223,6 +245,9 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: github-app-key
+              mountPath: /var/run/trakkt-github
+              readOnly: true
 
           securityContext:
             readOnlyRootFilesystem: true
@@ -236,3 +261,10 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: github-app-key
+          secret:
+            secretName: trakkt-secrets
+            optional: true
+            items:
+              - key: github-app-private-key
+                path: private-key.pem

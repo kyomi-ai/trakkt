@@ -108,7 +108,10 @@ async fn serve() {
     }
 
     // GitHub App client (optional — disabled when GITHUB_APP_ID is not set)
-    let github_client = trakkt_github::from_env().map(Arc::new);
+    let github_client = trakkt_github::initialize_from_env(&db, &encryption_key)
+        .await
+        .expect("Failed to initialize GitHub App integration")
+        .map(Arc::new);
     if github_client.is_some() {
         tracing::info!("GitHub App integration enabled");
     } else {

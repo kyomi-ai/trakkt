@@ -63,22 +63,19 @@ pub async fn get_github_integration_status(
     let ac = AuthenticatedContext::extract().await?;
     let db = ac.db();
 
+    let Some(client) = ac.ctx.github_client.as_deref() else {
+        return Ok(GitHubIntegrationStatus::NotConfigured);
+    };
+
     // Check if GitHub App is configured via the database
     let app = trakkt_github::schema::get_github_app(db)
         .await
         .into_sfn()?;
 
-    // Determine the app slug — from DB row or env-based config
+    // Determine the app slug from the persisted or running configuration.
     let app_slug = match app {
         Some(ref a) => a.app_name.clone(),
-        None => {
-            // No DB row — check if env-based config exists
-            match std::env::var("GITHUB_APP_ID") {
-                Ok(_) => std::env::var("GITHUB_APP_NAME")
-                    .unwrap_or_else(|_| "trakkt".to_string()),
-                Err(_) => return Ok(GitHubIntegrationStatus::NotConfigured),
-            }
-        }
+        None => client.app_name().to_string(),
     };
 
     // Check if workspace has an active installation
@@ -133,8 +130,8 @@ pub async fn process_github_callback(
         )));
     }
 
-    // Build GitHubClient from env
-    let client = trakkt_github::from_env()
+    // Use the client validated and registered during server startup.
+    let client = ac.ctx.github_client.as_deref()
         .ok_or_else(|| ServerFnError::new("GitHub App not configured"))?;
 
     // Call GitHub API to verify installation exists and get details
@@ -143,14 +140,14 @@ pub async fn process_github_callback(
         .await
         .into_sfn()?;
 
-    // Get the github_app row (must exist if from_env() succeeded)
+    // Startup registers the app before accepting installation callbacks.
     let app = trakkt_github::schema::get_github_app(db)
         .await
         .into_sfn()?
         .ok_or_else(|| ServerFnError::new("GitHub App not configured in database"))?;
 
     // Resolve the repository list: None for "all", or a JSON array of full names
-    let repos_json = resolve_repos_json(&client, installation_id as u64, &details).await?;
+    let repos_json = resolve_repos_json(client, installation_id as u64, &details).await?;
 
     // Check if installation already exists for this workspace (e.g. reconnecting)
     let existing = trakkt_github::schema::get_installation_for_workspace(db, &ac.ws_id)
@@ -182,12 +179,12 @@ pub async fn process_github_callback(
         )
         .await
         .into_sfn()?;
-
-        // Seed default transition rules for the workspace
-        trakkt_github::schema::seed_default_transition_rules(db, &ac.ws_id)
-            .await
-            .into_sfn()?;
     }
+
+    // Idempotent: reconnecting also repairs an installation with missing rules.
+    trakkt_github::schema::seed_default_transition_rules(db, &ac.ws_id)
+        .await
+        .into_sfn()?;
 
     Ok(())
 }

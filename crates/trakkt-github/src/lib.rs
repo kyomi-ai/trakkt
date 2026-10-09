@@ -366,51 +366,116 @@ impl GitHubClient {
 /// - `GITHUB_APP_PRIVATE_KEY_PATH` (path to PEM file)
 /// - `GITHUB_APP_NAME` (defaults to "trakkt")
 pub fn from_env() -> Option<GitHubClient> {
-    let app_id_str = std::env::var("GITHUB_APP_ID").ok()?;
-    let app_id: u64 = match app_id_str.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(
-                app_id = %app_id_str,
-                error = %e,
-                "GITHUB_APP_ID is not a valid u64, GitHub integration disabled"
-            );
-            return None;
-        }
-    };
-
-    let key_path = match std::env::var("GITHUB_APP_PRIVATE_KEY_PATH") {
-        Ok(path) => path,
-        Err(_) => {
-            tracing::warn!("GITHUB_APP_PRIVATE_KEY_PATH not set, GitHub integration disabled");
-            return None;
-        }
-    };
-
-    let private_key_pem = match std::fs::read(&key_path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(
-                path = %key_path,
-                error = %e,
-                "failed to read GitHub App private key file, GitHub integration disabled"
-            );
-            return None;
-        }
-    };
-
-    let app_name = std::env::var("GITHUB_APP_NAME").unwrap_or_else(|_| "trakkt".to_string());
-
-    match GitHubClient::new(app_id, &private_key_pem, &app_name) {
-        Ok(client) => Some(client),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "failed to create GitHubClient, GitHub integration disabled"
-            );
+    match client_from_env() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "Invalid GitHub App configuration, integration disabled");
             None
         }
     }
+}
+
+fn client_from_env() -> trakkt_core::Result<Option<GitHubClient>> {
+    let app_id = match std::env::var("GITHUB_APP_ID") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| Error::Internal("GITHUB_APP_ID must be a positive integer".into()))?,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => {
+            return Err(Error::Internal(
+                "GITHUB_APP_ID must be valid Unicode".into(),
+            ));
+        }
+    };
+    if app_id == 0 || i64::try_from(app_id).is_err() {
+        return Err(Error::Internal(
+            "GITHUB_APP_ID must be a positive signed 64-bit integer".into(),
+        ));
+    }
+    let key_path = std::env::var("GITHUB_APP_PRIVATE_KEY_PATH")
+        .map_err(|_| Error::Internal("GITHUB_APP_PRIVATE_KEY_PATH is required".into()))?;
+    let private_key = std::fs::read(&key_path)
+        .map_err(|e| Error::Internal(format!("Failed to read GitHub App private key: {e}")))?;
+    let app_name = std::env::var("GITHUB_APP_NAME").unwrap_or_else(|_| "trakkt".into());
+    GitHubClient::new(app_id, &private_key, &app_name).map(Some)
+}
+
+/// Initialize the optional GitHub integration and persist its encrypted credentials.
+///
+/// An absent app ID disables integration. Once an ID is supplied, incomplete or
+/// invalid credentials are errors so startup cannot silently disable automation.
+pub async fn initialize_from_env(
+    db: &trakkt_core::DbPool,
+    encryption_key: &[u8; 32],
+) -> trakkt_core::Result<Option<GitHubClient>> {
+    let Some(client) = client_from_env()? else {
+        return Ok(None);
+    };
+    let webhook_secret = std::env::var("GITHUB_WEBHOOK_SECRET")
+        .map_err(|_| Error::Internal("GITHUB_WEBHOOK_SECRET is required".into()))?;
+    ensure_configured(db, &client, &webhook_secret, encryption_key).await?;
+    Ok(Some(client))
+}
+
+async fn ensure_configured(
+    db: &trakkt_core::DbPool,
+    client: &GitHubClient,
+    webhook_secret: &str,
+    encryption_key: &[u8; 32],
+) -> trakkt_core::Result<()> {
+    let app_id = i64::try_from(client.app_id)
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            Error::Internal("GITHUB_APP_ID must be a positive signed 64-bit integer".into())
+        })?;
+    if webhook_secret.trim().is_empty() {
+        return Err(Error::Internal(
+            "GITHUB_WEBHOOK_SECRET must not be empty".into(),
+        ));
+    }
+    if client.app_name.trim().is_empty() {
+        return Err(Error::Internal("GITHUB_APP_NAME must not be empty".into()));
+    }
+    let existing = schema::get_github_app(db).await?;
+    if let Some(ref app) = existing
+        && app.app_id != app_id
+    {
+        return Err(Error::Internal(
+            "GITHUB_APP_ID differs from the configured app; configure the existing app or explicitly migrate its configuration".into(),
+        ));
+    }
+    let pem = std::str::from_utf8(&client.private_key)
+        .map_err(|_| Error::Internal("GitHub App private key PEM must be UTF-8".into()))?;
+    let private_key_encrypted = trakkt_auth::encryption::encrypt(pem, encryption_key)?;
+    let webhook_secret_encrypted =
+        trakkt_auth::encryption::encrypt(webhook_secret, encryption_key)?;
+    match existing {
+        Some(app) => {
+            schema::update_github_app_credentials(
+                db,
+                &app.github_app_id,
+                &client.app_name,
+                &private_key_encrypted,
+                &webhook_secret_encrypted,
+            )
+            .await?
+        }
+        None => {
+            let empty_secret = trakkt_auth::encryption::encrypt("", encryption_key)?;
+            schema::create_github_app(
+                db,
+                app_id,
+                &client.app_name,
+                "",
+                &empty_secret,
+                &private_key_encrypted,
+                &webhook_secret_encrypted,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
@@ -502,6 +567,243 @@ mod tests {
             .to_vec();
         TestKeyPair { private_pem, public_pem }
     });
+
+    #[tokio::test]
+    async fn configuration_bootstrap_preserves_identity_and_rotates_credentials() {
+        configuration_bootstrap_roundtrip("sqlite::memory:").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_GITHUB_DATABASE_URL pointing to an isolated PostgreSQL database"]
+    async fn configuration_bootstrap_preserves_identity_and_rotates_credentials_postgres() {
+        let url = std::env::var("TEST_GITHUB_DATABASE_URL")
+            .expect("TEST_GITHUB_DATABASE_URL must name an isolated PostgreSQL test database");
+        configuration_bootstrap_roundtrip(&url).await;
+    }
+
+    async fn configuration_bootstrap_roundtrip(url: &str) {
+        let db = trakkt_core::DbPool::connect(url)
+            .await
+            .expect("opening bootstrap test database");
+        let key = [7; 32];
+        let client = GitHubClient::new(12345, &TEST_KEYS.private_pem, "first-app")
+            .expect("constructing bootstrap client");
+        ensure_configured(&db, &client, "first-webhook-secret", &key)
+            .await
+            .expect("bootstrapping app configuration");
+        let first = schema::get_github_app(&db)
+            .await
+            .expect("reading bootstrapped app")
+            .expect("bootstrap must persist app");
+        assert_eq!(
+            trakkt_auth::encryption::decrypt(&first.private_key_encrypted, &key)
+                .expect("decrypting stored PEM")
+                .as_bytes(),
+            TEST_KEYS.private_pem
+        );
+        assert_eq!(
+            trakkt_auth::encryption::decrypt(&first.webhook_secret_encrypted, &key)
+                .expect("decrypting stored webhook secret"),
+            "first-webhook-secret"
+        );
+        assert_eq!(
+            trakkt_auth::encryption::decrypt(&first.client_secret_encrypted, &key)
+                .expect("decrypting OAuth placeholder"),
+            ""
+        );
+        assert_ne!(first.webhook_secret_encrypted, "first-webhook-secret");
+        let oauth_secret = trakkt_auth::encryption::encrypt("existing-oauth-secret", &key)
+            .expect("encrypting existing OAuth credential");
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE github_apps SET client_id = $1, client_secret_encrypted = $2",
+            "existing-client",
+            &oauth_secret
+        )
+        .expect("seeding existing OAuth settings");
+        ensure_configured(&db, &client, "first-webhook-secret", &key)
+            .await
+            .expect("restarting app configuration");
+        let restarted = schema::get_github_app(&db)
+            .await
+            .expect("reading restarted app")
+            .expect("restarted app exists");
+        assert_eq!(first.github_app_id, restarted.github_app_id);
+        let mut rng = rand_core::OsRng;
+        let rotated_pem = RsaPrivateKey::new(&mut rng, 2048)
+            .expect("generating rotated RSA key")
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("encoding rotated RSA key");
+        let rotated = GitHubClient::new(12345, rotated_pem.as_bytes(), "renamed-app")
+            .expect("constructing rotated client");
+        ensure_configured(&db, &rotated, "rotated-webhook-secret", &key)
+            .await
+            .expect("rotating configuration");
+        let current = schema::get_github_app(&db)
+            .await
+            .expect("reading rotated app")
+            .expect("rotated app exists");
+        assert_eq!(first.github_app_id, current.github_app_id);
+        assert_eq!(current.app_name, "renamed-app");
+        assert_eq!(current.client_id, "existing-client");
+        assert_eq!(current.client_secret_encrypted, oauth_secret);
+        assert_eq!(
+            trakkt_auth::encryption::decrypt(&current.private_key_encrypted, &key)
+                .expect("decrypting rotated PEM"),
+            rotated_pem.as_str()
+        );
+        assert_eq!(
+            trakkt_auth::encryption::decrypt(&current.webhook_secret_encrypted, &key)
+                .expect("decrypting rotated webhook secret"),
+            "rotated-webhook-secret"
+        );
+        let mismatched = GitHubClient::new(54321, &TEST_KEYS.private_pem, "other-app")
+            .expect("constructing mismatched app client");
+        ensure_configured(&db, &mismatched, "other-secret", &key)
+            .await
+            .expect_err("changing app identity must be rejected");
+        let unchanged = schema::get_github_app(&db)
+            .await
+            .expect("reading unchanged app")
+            .expect("original app still exists");
+        assert_eq!(unchanged.app_id, 12345);
+        assert_eq!(
+            unchanged.webhook_secret_encrypted,
+            current.webhook_secret_encrypted
+        );
+        ensure_configured(&db, &client, "  ", &key)
+            .await
+            .expect_err("empty webhook secret must be rejected");
+        let empty_name = GitHubClient::new(12345, &TEST_KEYS.private_pem, "")
+            .expect("constructing client with an empty app name");
+        ensure_configured(&db, &empty_name, "valid-secret", &key)
+            .await
+            .expect_err("empty app name must be rejected");
+        let invalid_id = GitHubClient::new(0, &TEST_KEYS.private_pem, "test-app")
+            .expect("constructing client with a zero app ID");
+        ensure_configured(&db, &invalid_id, "valid-secret", &key)
+            .await
+            .expect_err("zero app ID must be rejected");
+    }
+
+    #[tokio::test]
+    async fn installation_selected_repositories_and_token_roundtrip() {
+        installation_roundtrip("sqlite::memory:").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_GITHUB_DATABASE_URL pointing to an isolated PostgreSQL database"]
+    async fn installation_selected_repositories_and_token_roundtrip_postgres() {
+        let url = std::env::var("TEST_GITHUB_DATABASE_URL")
+            .expect("TEST_GITHUB_DATABASE_URL must name an isolated PostgreSQL test database");
+        installation_roundtrip(&url).await;
+    }
+
+    async fn installation_roundtrip(url: &str) {
+        let db = trakkt_core::DbPool::connect(url)
+            .await
+            .expect("opening migrated installation test database");
+        let owner_id = uuid::Uuid::new_v4().to_string();
+        let workspace_id = uuid::Uuid::new_v4().to_string();
+        trakkt_core::db_execute!(
+            &db,
+            "INSERT INTO users (user_id, email) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            &owner_id,
+            "github-installation-test@example.test"
+        )
+        .expect("creating installation workspace owner");
+        trakkt_core::db_execute!(
+            &db,
+            "INSERT INTO workspaces (workspace_id, owner_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            &workspace_id,
+            &owner_id
+        ).expect("creating installation workspace");
+        let key = [9; 32];
+        let client = GitHubClient::new(12345, &TEST_KEYS.private_pem, "test-app")
+            .expect("constructing installation test client");
+        ensure_configured(&db, &client, "test-webhook-secret", &key)
+            .await
+            .expect("configuring installation test app");
+        let app = schema::get_github_app(&db)
+            .await
+            .expect("reading installation test app")
+            .expect("configured app exists");
+        let selected_repos = serde_json::json!(["example/trakkt", "example/docs"]);
+        let installation = schema::create_installation(
+            &db,
+            &workspace_id,
+            &app.github_app_id,
+            67890,
+            "example",
+            "Organization",
+            Some(&selected_repos),
+        )
+        .await
+        .expect("creating installation with selected repositories");
+        let encrypted_token = trakkt_auth::encryption::encrypt("test-installation-token", &key)
+            .expect("encrypting installation token");
+        let expiry = "2030-01-02T03:04:05Z";
+        schema::update_installation_token(
+            &db,
+            &installation.installation_id,
+            &encrypted_token,
+            expiry,
+        )
+        .await
+        .expect("persisting installation token and expiry");
+        let by_workspace = schema::get_installation_for_workspace(&db, &workspace_id)
+            .await
+            .expect("looking up selected-repository installation by workspace")
+            .expect("workspace installation exists");
+        let by_github_id = schema::get_installation_by_github_id(&db, 67890)
+            .await
+            .expect("looking up selected-repository installation by GitHub ID")
+            .expect("GitHub installation exists");
+        let by_local_id = schema::get_installation_by_id(&db, &installation.installation_id)
+            .await
+            .expect("looking up selected-repository installation by local ID")
+            .expect("local installation exists");
+        for retrieved in [installation, by_workspace, by_github_id, by_local_id] {
+            let repos: serde_json::Value = serde_json::from_str(
+                retrieved
+                    .target_repos
+                    .as_deref()
+                    .expect("selected repositories are stored"),
+            )
+            .expect("decoding stored selected repositories");
+            assert_eq!(repos, selected_repos);
+            assert_eq!(retrieved.workspace_id, workspace_id);
+            assert_eq!(retrieved.github_installation_id, 67890);
+            assert_eq!(retrieved.github_app_id, app.github_app_id);
+        }
+        let cached = schema::get_installation_by_github_id(&db, 67890)
+            .await
+            .expect("reading cached installation credentials")
+            .expect("installation exists");
+        assert_eq!(
+            trakkt_auth::encryption::decrypt(
+                cached
+                    .access_token_encrypted
+                    .as_deref()
+                    .expect("token is persisted"),
+                &key,
+            )
+            .expect("decrypting cached installation token"),
+            "test-installation-token"
+        );
+        let stored_expiry = crate::transitions::parse_token_expiry(
+            cached
+                .token_expires_at
+                .as_deref()
+                .expect("token expiry is persisted"),
+        )
+        .expect("parsing stored installation token expiry");
+        assert_eq!(
+            stored_expiry,
+            chrono::DateTime::parse_from_rfc3339(expiry)
+                .expect("parsing expected installation token expiry")
+        );
+    }
 
     #[test]
     fn jwt_generation_produces_valid_token() {

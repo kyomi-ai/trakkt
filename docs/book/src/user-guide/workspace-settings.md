@@ -40,6 +40,10 @@ Connect your GitHub organization to link pull requests, branches, and commits to
 
 When connected, Trakkt can automatically link PRs and commits that reference issue identifiers (e.g., `TRA-35`) in their title or description.
 
+The default automation rules move linked tickets to **Started** when a PR opens and **Completed** when a PR merges with `Closes TRA-35`, `Fixes TRA-35`, or `Resolves TRA-35` in its title or body. A plain reference such as `TRA-35` links the ticket without closing it on merge. Repeat the closing phrase for each ticket you want completed.
+
+The default rules also move a ticket to **Cancelled** when its PR closes without merging and contains a closing phrase. Workspace admins can toggle each rule in the Integrations page. Your workspace must have statuses in the corresponding categories for transitions to apply.
+
 ## Billing
 
 The Billing page is available in SaaS mode and lets workspace owners manage their subscription through Stripe.

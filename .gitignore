@@ -5,6 +5,7 @@
 .env
 .env.local
 deploy/k8s/01-secrets.yaml
+deploy/k8s/github-secrets.local.yaml
 data/
 .gstack/
 .gstack-screenshots/

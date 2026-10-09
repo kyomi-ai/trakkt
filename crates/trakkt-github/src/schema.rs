@@ -157,6 +157,26 @@ pub async fn create_github_app(
     Ok(row)
 }
 
+/// Rotate app credentials while preserving installation references and OAuth settings.
+pub async fn update_github_app_credentials(
+    db: &DbPool,
+    github_app_id: &str,
+    app_name: &str,
+    private_key_encrypted: &str,
+    webhook_secret_encrypted: &str,
+) -> trakkt_core::Result<()> {
+    trakkt_core::db_execute!(
+        db,
+        "UPDATE github_apps SET app_name = $2, private_key_encrypted = $3, \
+         webhook_secret_encrypted = $4 WHERE github_app_id = $1",
+        github_app_id,
+        app_name,
+        private_key_encrypted,
+        webhook_secret_encrypted
+    )?;
+    Ok(())
+}
+
 // ─── github_installations ────────────────────────────────────────────────────
 
 /// Look up an installation by its GitHub-assigned installation ID.
@@ -168,7 +188,7 @@ pub async fn get_installation_by_github_id(
         db,
         GitHubInstallation,
         "SELECT installation_id, workspace_id, github_app_id, github_installation_id, \
-                account_login, account_type, target_repos, \
+                account_login, account_type, CAST(target_repos AS TEXT) AS target_repos, \
                 access_token_encrypted, \
                 CAST(token_expires_at AS TEXT) AS token_expires_at, \
                 CAST(created_at AS TEXT) AS created_at, \
@@ -189,7 +209,7 @@ pub async fn get_installation_for_workspace(
         db,
         GitHubInstallation,
         "SELECT installation_id, workspace_id, github_app_id, github_installation_id, \
-                account_login, account_type, target_repos, \
+                account_login, account_type, CAST(target_repos AS TEXT) AS target_repos, \
                 access_token_encrypted, \
                 CAST(token_expires_at AS TEXT) AS token_expires_at, \
                 CAST(created_at AS TEXT) AS created_at, \
@@ -233,7 +253,7 @@ pub async fn create_installation(
         db,
         GitHubInstallation,
         "SELECT installation_id, workspace_id, github_app_id, github_installation_id, \
-                account_login, account_type, target_repos, \
+                account_login, account_type, CAST(target_repos AS TEXT) AS target_repos, \
                 access_token_encrypted, \
                 CAST(token_expires_at AS TEXT) AS token_expires_at, \
                 CAST(created_at AS TEXT) AS created_at, \
@@ -251,12 +271,18 @@ pub async fn update_installation_token(
     access_token_encrypted: &str,
     token_expires_at: &str,
 ) -> trakkt_core::Result<()> {
+    let expiry = sql_compat::cast_to_timestamptz(db.is_postgres(), "$2");
+    let sql = format!(
+        "UPDATE github_installations \
+         SET access_token_encrypted = $1, token_expires_at = {expiry} \
+         WHERE installation_id = $3"
+    );
     trakkt_core::db_execute!(
         db,
-        "UPDATE github_installations \
-         SET access_token_encrypted = $1, token_expires_at = $2 \
-         WHERE installation_id = $3",
-        access_token_encrypted, token_expires_at, installation_id
+        &sql,
+        access_token_encrypted,
+        token_expires_at,
+        installation_id
     )?;
     Ok(())
 }
@@ -583,7 +609,7 @@ pub async fn get_installation_by_id(
         db,
         GitHubInstallation,
         "SELECT installation_id, workspace_id, github_app_id, github_installation_id, \
-                account_login, account_type, target_repos, \
+                account_login, account_type, CAST(target_repos AS TEXT) AS target_repos, \
                 access_token_encrypted, \
                 CAST(token_expires_at AS TEXT) AS token_expires_at, \
                 CAST(created_at AS TEXT) AS created_at, \

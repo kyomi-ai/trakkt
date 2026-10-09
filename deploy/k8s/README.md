@@ -8,6 +8,19 @@ Complete k8s deployment for trakkt with PostgreSQL, Redis, and the trakkt server
 - kubectl configured to access your cluster
 - Docker or container runtime for building the image
 
+## Optional GitHub integration
+
+Register a GitHub App as described in the [configuration guide](../../docs/book/src/getting-started/configuration.md#github-integration). Add its ID, URL slug, downloaded private key, and webhook secret to the existing `trakkt-secrets` Secret, using keys `github-app-id`, `github-app-name`, `github-app-private-key`, and `github-webhook-secret`. If your deployment uses Sealed Secrets, merge these keys into the existing SealedSecret using your cluster’s controller and apply that resource. Keep plaintext credentials out of source control.
+
+The deployment manifest already reads these optional keys and mounts the PEM file at `/var/run/trakkt-github/private-key.pem`. After applying the updated Secret or SealedSecret, restart the server to load the credentials:
+
+```bash
+kubectl -n trakkt rollout restart deployment/trakkt
+kubectl -n trakkt rollout status deployment/trakkt
+```
+
+Deploy a server version with GitHub configuration bootstrap before configuring credentials. A workspace admin can then finish setup in **Settings > Integrations > Connect GitHub**. PRs containing `Closes TRA-123` will complete that ticket when merged, provided the merge transition rule is enabled.
+
 ## Quick Start
 
 ### 1. Build the Docker image
