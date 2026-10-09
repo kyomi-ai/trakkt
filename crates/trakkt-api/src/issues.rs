@@ -628,7 +628,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_issues",
-            description: "Find issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Response shape: `{issues, matched_count, returned_count, truncated}`. Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `status_id`, `status_name`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
+            description: "Find issues in the workspace with optional filters. Returns issues ordered Urgent (1), High (2), Medium (3), Low (4), None (0), then by creation date (newest first), before the result limit is applied. Priority numbers are stored identifiers, not ascending rank. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Response shape: a flat array without composable filters; with composable filters, `{issues, matched_count, returned_count, truncated}`. Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues",
@@ -907,6 +907,76 @@ mod tests {
         let rows = value["issues"].as_array().expect("envelope carries issues");
         assert_eq!(rows.len(), 3);
         assert_rows_are_lean(rows);
+    }
+
+    /// TRA-10096: stored priority zero must rank last before either response
+    /// path applies its limit. Fixed timestamps also exercise newest-first ties.
+    #[tokio::test]
+    async fn priority_order_precedes_limit_for_flat_and_filtered_responses() {
+        let (db, workspace_id, user_id) = seeded_workspace(7).await;
+        // Number 7 is the newest None; it must not displace assigned priorities.
+        for (number, priority, created_at) in [
+            (1, 1, "2026-07-01T00:00:00Z"),
+            (2, 2, "2026-07-02T00:00:00Z"),
+            (3, 3, "2026-07-03T00:00:00Z"),
+            (4, 4, "2026-07-04T00:00:00Z"),
+            (5, 0, "2026-07-05T00:00:00Z"),
+            (6, 1, "2026-07-06T00:00:00Z"),
+            (7, 0, "2026-07-07T00:00:00Z"),
+        ] {
+            trakkt_core::db_execute!(
+                &db,
+                "UPDATE issues SET priority = $1, created_at = $2 WHERE workspace_id = $3 AND number = $4",
+                priority,
+                created_at,
+                &workspace_id,
+                number
+            )
+            .expect("set fixture priority and creation time");
+        }
+        let ctx = ApiCtx::from_leptos(
+            workspace_id,
+            user_id,
+            &db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        );
+        for clauses in [
+            None,
+            Some(r#"[{"field":"priority","operator":"any_of","values":["0","1","2","3","4"]}]"#),
+        ] {
+            for (limit, expected_numbers) in [(50, vec![6, 1, 2, 3, 4, 7, 5]), (3, vec![6, 1, 2])] {
+                let mut params = list_params(clauses);
+                params.limit = Some(limit);
+                // Also exercise the SQL search filter without changing the matches.
+                params.search = Some("Seeded issue".to_string());
+                let value = list_issues(&ctx, params).await.expect("list ranked issues");
+                let rows = if clauses.is_some() {
+                    value["issues"].as_array().expect("filtered envelope rows")
+                } else {
+                    value.as_array().expect("flat response rows")
+                };
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row["number"].as_i64().expect("issue number"))
+                        .collect::<Vec<_>>(),
+                    expected_numbers
+                );
+                for row in rows {
+                    let expected_name = match row["priority"].as_i64().expect("numeric priority") {
+                        0 => "No priority",
+                        1 => "Urgent",
+                        2 => "High",
+                        3 => "Medium",
+                        4 => "Low",
+                        other => panic!("unexpected priority {other}"),
+                    };
+                    assert_eq!(row["priority_name"], expected_name);
+                }
+            }
+        }
     }
 
     /// TRA-9915: a full page of spec-sized issues used to serialize to ~226 KB

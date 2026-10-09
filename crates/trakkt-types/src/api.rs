@@ -92,7 +92,11 @@ pub struct IssueListRow {
     /// operation accepts.
     pub key: String,
     pub title: String,
+    /// Stored mapping: 0=None, 1=Urgent, 2=High, 3=Medium, 4=Low.
     pub priority: i32,
+    /// Human-readable label using the shared priority names.
+    #[serde(default)]
+    pub priority_name: String,
     pub status_id: String,
     pub status_name: String,
     pub updated_at: String,
@@ -106,6 +110,9 @@ impl From<crate::models::IssueWithDetails> for IssueListRow {
             number: issue.number,
             title: issue.title,
             priority: issue.priority,
+            priority_name: crate::enums::Priority::from_i32(issue.priority)
+                .display_name()
+                .to_string(),
             status_id: issue.status_id,
             status_name: issue.status_name,
             updated_at: issue.updated_at,
@@ -786,6 +793,7 @@ mod tests {
                 "labels",
                 "number",
                 "priority",
+                "priority_name",
                 "status_id",
                 "status_name",
                 "title",
@@ -797,6 +805,19 @@ mod tests {
         assert_eq!(value["number"], 123);
         assert_eq!(value["status_name"], "Todo");
         assert_eq!(value["updated_at"], "2026-07-20T12:34:56Z");
+    }
+
+    #[test]
+    fn lean_row_accepts_responses_without_priority_name() {
+        let row = IssueListRow::from(issue(7, String::new()));
+        let mut value = serde_json::to_value(&row).expect("serialize current row");
+        value
+            .as_object_mut()
+            .expect("row object")
+            .remove("priority_name");
+        let decoded: IssueListRow = serde_json::from_value(value).expect("decode older row shape");
+        assert_eq!(decoded.priority, 2);
+        assert!(decoded.priority_name.is_empty());
     }
 
     #[test]

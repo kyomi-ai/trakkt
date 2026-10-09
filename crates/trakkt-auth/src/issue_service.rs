@@ -585,7 +585,8 @@ pub async fn get_issue(
 /// List issues in a workspace with optional filters.
 ///
 /// Supports filtering by status, priority, assignee, label, and text search.
-/// Results are ordered by priority ASC (urgent first), then created_at DESC.
+/// Results are ordered Urgent, High, Medium, Low, None, then created_at DESC.
+/// Priority ranking happens in SQL before LIMIT/OFFSET are applied.
 pub async fn list_issues(
     db: &DbPool,
     workspace_id: &str,
@@ -683,7 +684,8 @@ pub async fn list_issues(
     let sql = format!(
         "{ISSUE_DETAIL_SELECT} \
          WHERE {where_clause} \
-         ORDER BY i.priority ASC, i.created_at DESC{limit_offset}"
+         ORDER BY CASE i.priority WHEN 0 THEN 5 ELSE i.priority END ASC, \
+         i.created_at DESC{limit_offset}"
     );
 
     // Prepare the search term with wildcards, escaping LIKE special chars.
