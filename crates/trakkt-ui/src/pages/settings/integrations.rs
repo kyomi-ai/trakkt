@@ -134,8 +134,9 @@ fn NotConfiguredCard() -> impl IntoView {
                         <p class="font-medium">"To enable GitHub integration:"</p>
                         <ol class="list-decimal list-inside space-y-1.5 text-secondary-foreground ml-1">
                             <li>"Register a GitHub App for your domain"</li>
-                            <li>"Set the required environment variables " <code class="text-xs bg-muted px-1 py-0.5 rounded">"GITHUB_APP_ID"</code> ", " <code class="text-xs bg-muted px-1 py-0.5 rounded">"GITHUB_APP_NAME"</code> ", and " <code class="text-xs bg-muted px-1 py-0.5 rounded">"GITHUB_PRIVATE_KEY"</code></li>
+                            <li>"Set " <code class="text-xs bg-muted px-1 py-0.5 rounded">"GITHUB_APP_ID"</code> ", " <code class="text-xs bg-muted px-1 py-0.5 rounded">"GITHUB_APP_NAME"</code> ", " <code class="text-xs bg-muted px-1 py-0.5 rounded">"GITHUB_APP_PRIVATE_KEY_PATH"</code> ", and " <code class="text-xs bg-muted px-1 py-0.5 rounded">"GITHUB_WEBHOOK_SECRET"</code></li>
                             <li>"Restart Trakkt"</li>
+                            <li>"Connect GitHub from this page and select the repositories to integrate"</li>
                         </ol>
                     </div>
 

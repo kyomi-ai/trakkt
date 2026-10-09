@@ -70,6 +70,14 @@ async fn query_matching_rule(
 
 // ─── Token Management ──────────────────────────────────────────────────────
 
+/// Accept both GitHub's RFC 3339 timestamps and PostgreSQL's text representation.
+pub(crate) fn parse_token_expiry(
+    value: &str,
+) -> chrono::ParseResult<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .or_else(|_| chrono::DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%#z"))
+}
+
 /// Get or refresh an installation access token.
 ///
 /// Checks the cached token's expiry (with 5-minute buffer). If still valid,
@@ -84,7 +92,7 @@ async fn get_installation_token(
     // Check if the cached token is still valid (with 5-minute buffer).
     if let Some(ref encrypted_token) = installation.access_token_encrypted
         && let Some(ref expires_str) = installation.token_expires_at
-        && let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_str)
+        && let Ok(expires_at) = parse_token_expiry(expires_str)
     {
         let buffer = chrono::Duration::minutes(5);
         if chrono::Utc::now() < expires_at - buffer {

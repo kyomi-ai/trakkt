@@ -113,4 +113,13 @@ SMTP is optional. Without it, features like email verification and password rese
 |----------|-------------|---------|
 | `GITHUB_APP_ID` | GitHub App ID. When set, enables commit/branch/PR linking to issues. | (none -- disabled) |
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Path to the GitHub App PEM private key file. Required when `GITHUB_APP_ID` is set. | (none) |
-| `GITHUB_APP_NAME` | GitHub App name. | `trakkt` |
+| `GITHUB_APP_NAME` | GitHub App URL slug (the name in `github.com/apps/<slug>`). | `trakkt` |
+| `GITHUB_WEBHOOK_SECRET` | Secret configured on the GitHub App for verifying webhook signatures. Required when `GITHUB_APP_ID` is set. | (none) |
+
+Register a GitHub App in your organization’s [developer settings](https://github.com/organizations/your-org/settings/apps). Use your instance’s public URL for the homepage, `<FRONTEND_URL>/integrations/github/callback` for the **Setup URL**, and `<BASE_URL>/webhooks/github` for the **Webhook URL**. For trakkt.app these are `https://trakkt.app/integrations/github/callback` and `https://trakkt.app/webhooks/github`.
+
+Grant **Contents: read** and **Pull requests: read and write**, and subscribe to **Push** and **Pull request** events. Metadata read access is included by GitHub. See [GitHub’s webhook setup guide](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/using-webhooks-with-github-apps).
+
+Generate a private key, mount the PEM file into the server, and set the variables above. Set the same webhook secret in both GitHub and Trakkt. On restart, Trakkt registers the app in its database and encrypts its credentials using `ENCRYPTION_KEY`. Invalid or incomplete app configuration prevents startup instead of silently disabling the integration. Keep the environment variables and key file available on every restart. Restarting with the same app preserves workspace connections; changing to a different app ID is rejected.
+
+Finally, a workspace admin must open **Settings > Integrations > Connect GitHub**, install the app on the selected repositories, and return to Trakkt to finish linking the workspace. Merely configuring the server does not connect a workspace.
