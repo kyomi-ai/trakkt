@@ -5,8 +5,8 @@
 //! All functions are free functions taking `db: &DbPool` as the first argument,
 //! following the project's service-layer conventions.
 
-use trakkt_core::sql_compat;
 use trakkt_core::DbPool;
+use trakkt_core::sql_compat;
 
 // ─── Row types ───────────────────────────────────────────────────────────────
 
@@ -22,7 +22,7 @@ pub struct GitHubApp {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
 pub struct GitHubInstallation {
     pub installation_id: String,
     pub workspace_id: String,
@@ -35,6 +35,48 @@ pub struct GitHubInstallation {
     pub token_expires_at: Option<String>,
     pub created_at: String,
     pub suspended_at: Option<String>,
+    pub disconnected_at: Option<String>,
+    pub uninstalled_at: Option<String>,
+    pub authorization_verified_at: Option<String>,
+    pub github_account_id: Option<i64>,
+    pub repository_selection: String,
+    pub token_generation: i64,
+    pub repository_scope_pending: bool,
+}
+
+impl GitHubInstallation {
+    /// Legacy connections stay quarantined until user authorization revalidates identity.
+    pub fn is_active(&self) -> bool {
+        !self.repository_scope_pending
+            && self.disconnected_at.is_none()
+            && self.suspended_at.is_none()
+            && self.uninstalled_at.is_none()
+            && self.authorization_verified_at.is_some()
+    }
+
+    /// NULL means all only when the verified selection says all; [] means none.
+    pub fn allows_repository(&self, repository: &str) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        if self.repository_selection == "all" {
+            return true;
+        }
+        match self
+            .target_repos
+            .as_deref()
+            .map(serde_json::from_str::<Vec<String>>)
+        {
+            Some(Ok(repos)) => repos
+                .iter()
+                .any(|repo| repo.eq_ignore_ascii_case(repository)),
+            Some(Err(error)) => {
+                tracing::warn!(installation_id = %self.installation_id, %error, "Invalid repository scope; denying event");
+                false
+            }
+            None => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -139,9 +181,15 @@ pub async fn create_github_app(
          VALUES ($1, $2, $3, $4, $5, $6, $7, {now})"
     );
     trakkt_core::db_execute!(
-        db, &sql,
-        &github_app_id, app_id, app_name, client_id,
-        client_secret_encrypted, private_key_encrypted, webhook_secret_encrypted
+        db,
+        &sql,
+        &github_app_id,
+        app_id,
+        app_name,
+        client_id,
+        client_secret_encrypted,
+        private_key_encrypted,
+        webhook_secret_encrypted
     )?;
 
     let row = trakkt_core::db_fetch_one!(
@@ -192,7 +240,11 @@ pub async fn get_installation_by_github_id(
                 access_token_encrypted, \
                 CAST(token_expires_at AS TEXT) AS token_expires_at, \
                 CAST(created_at AS TEXT) AS created_at, \
-                CAST(suspended_at AS TEXT) AS suspended_at \
+                CAST(suspended_at AS TEXT) AS suspended_at, \
+                CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
+                CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
+                github_account_id, repository_selection, token_generation, repository_scope_pending \
          FROM github_installations \
          WHERE github_installation_id = $1",
         github_installation_id
@@ -200,12 +252,12 @@ pub async fn get_installation_by_github_id(
     Ok(row)
 }
 
-/// Get the GitHub installation for a workspace.
-pub async fn get_installation_for_workspace(
+/// List every connection, including disconnected historical installations.
+pub async fn list_installations_for_workspace(
     db: &DbPool,
     workspace_id: &str,
-) -> trakkt_core::Result<Option<GitHubInstallation>> {
-    let row = trakkt_core::db_fetch_optional!(
+) -> trakkt_core::Result<Vec<GitHubInstallation>> {
+    let row = trakkt_core::db_fetch_all!(
         db,
         GitHubInstallation,
         "SELECT installation_id, workspace_id, github_app_id, github_installation_id, \
@@ -213,12 +265,30 @@ pub async fn get_installation_for_workspace(
                 access_token_encrypted, \
                 CAST(token_expires_at AS TEXT) AS token_expires_at, \
                 CAST(created_at AS TEXT) AS created_at, \
-                CAST(suspended_at AS TEXT) AS suspended_at \
+                CAST(suspended_at AS TEXT) AS suspended_at, \
+                CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
+                CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
+                github_account_id, repository_selection, token_generation, repository_scope_pending \
          FROM github_installations \
-         WHERE workspace_id = $1",
+         WHERE workspace_id = $1 ORDER BY account_login ASC, created_at ASC, installation_id ASC",
         workspace_id
     )?;
     Ok(row)
+}
+
+/// Legacy single-connection helper: never silently select among multiple connections.
+pub async fn get_installation_for_workspace(
+    db: &DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Option<GitHubInstallation>> {
+    let mut rows = list_installations_for_workspace(db, workspace_id).await?;
+    if rows.len() > 1 {
+        return Err(trakkt_core::Error::Conflict(
+            "Select an explicit GitHub connection".into(),
+        ));
+    }
+    Ok(rows.pop())
 }
 
 /// Create a new GitHub installation record.
@@ -240,13 +310,24 @@ pub async fn create_installation(
     let sql = format!(
         "INSERT INTO github_installations \
          (installation_id, workspace_id, github_app_id, github_installation_id, \
-          account_login, account_type, target_repos, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, {repos_cast}, {now})"
+          account_login, account_type, target_repos, repository_selection, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, {repos_cast}, $8, {now}) ON CONFLICT DO NOTHING"
     );
     trakkt_core::db_execute!(
-        db, &sql,
-        &installation_id, workspace_id, github_app_id, github_installation_id,
-        account_login, account_type, &target_repos_json
+        db,
+        &sql,
+        &installation_id,
+        workspace_id,
+        github_app_id,
+        github_installation_id,
+        account_login,
+        account_type,
+        &target_repos_json,
+        if target_repos.is_none() {
+            "all"
+        } else {
+            "selected"
+        }
     )?;
 
     let row = trakkt_core::db_fetch_one!(
@@ -257,7 +338,11 @@ pub async fn create_installation(
                 access_token_encrypted, \
                 CAST(token_expires_at AS TEXT) AS token_expires_at, \
                 CAST(created_at AS TEXT) AS created_at, \
-                CAST(suspended_at AS TEXT) AS suspended_at \
+                CAST(suspended_at AS TEXT) AS suspended_at, \
+                CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
+                CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
+                github_account_id, repository_selection, token_generation, repository_scope_pending \
          FROM github_installations WHERE installation_id = $1",
         &installation_id
     )?;
@@ -287,75 +372,393 @@ pub async fn update_installation_token(
     Ok(())
 }
 
-/// Mark an installation as suspended.
-pub async fn suspend_installation(
+/// Lifecycle changes invalidate tokens and publish settings invalidation atomically.
+async fn change_installation(
     db: &DbPool,
     installation_id: &str,
+    assignments: &str,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    let is_pg = db.is_postgres();
-    let now = sql_compat::now(is_pg);
+    let mut tx = db.begin().await?;
     let sql = format!(
-        "UPDATE github_installations SET suspended_at = {now} WHERE installation_id = $1"
+        "UPDATE github_installations SET {assignments}, access_token_encrypted = NULL, token_expires_at = NULL, token_generation = token_generation + 1 WHERE installation_id = $1"
     );
-    trakkt_core::db_execute!(db, &sql, installation_id)?;
-    Ok(())
+    trakkt_core::tx_execute!(&mut tx, &sql, installation_id)?;
+    record_installation_change(&mut tx, installation_id)
+        .await?
+        .commit_and_deliver(tx, ws_manager)
+        .await
 }
 
-/// Clear the suspended status and update the account details of an installation.
-///
-/// Used during the reconnection flow (disconnect then reconnect) to reactivate
-/// an existing installation record with potentially updated account information.
-pub async fn reactivate_installation(
-    db: &DbPool,
+async fn record_installation_change(
+    tx: &mut trakkt_core::db::DbTx,
     installation_id: &str,
-    github_installation_id: i64,
-    account_login: &str,
-    account_type: &str,
-    target_repos: Option<&serde_json::Value>,
-) -> trakkt_core::Result<()> {
-    let is_pg = db.is_postgres();
-    let target_repos_json = target_repos.map(|v| v.to_string());
-    let repos_cast = sql_compat::cast_to_json(is_pg, "$4");
-    let sql = format!(
-        "UPDATE github_installations \
-         SET suspended_at = NULL, github_installation_id = $1, \
-             account_login = $2, account_type = $3, target_repos = {repos_cast} \
-         WHERE installation_id = $5"
-    );
-    trakkt_core::db_execute!(
-        db, &sql,
-        github_installation_id, account_login, account_type, &target_repos_json, installation_id
+) -> trakkt_core::Result<trakkt_auth::sync_log_service::SyncBatch<'static>> {
+    use trakkt_auth::sync_log_service::{SyncAudience, SyncBatch};
+    let workspace = trakkt_core::tx_fetch_scalar!(
+        &mut *tx,
+        String,
+        "SELECT workspace_id FROM github_installations WHERE installation_id = $1",
+        installation_id
     )?;
-    Ok(())
+    let mut batch = SyncBatch::new();
+    batch
+        .record(
+            tx,
+            "GITHUB_INSTALLATION",
+            installation_id,
+            &workspace,
+            SyncAudience::Workspace,
+            trakkt_types::sync::SyncActionType::Update,
+            Some(serde_json::json!({"installation_id":installation_id,"workspace_id":workspace})),
+        )
+        .await?;
+    Ok(batch)
 }
 
-/// Update the target_repos JSONB for an installation.
+pub async fn disconnect_installation(
+    db: &DbPool,
+    installation_id: &str,
+    workspace_id: &str,
+) -> trakkt_core::Result<()> {
+    disconnect_installation_with_delivery(db, installation_id, workspace_id, None).await
+}
+
+pub async fn disconnect_installation_with_delivery(
+    db: &DbPool,
+    installation_id: &str,
+    workspace_id: &str,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    let row = get_installation_by_id(db, installation_id)
+        .await?
+        .ok_or_else(|| trakkt_core::Error::NotFound("GitHub connection not found".into()))?;
+    if row.workspace_id != workspace_id {
+        return Err(trakkt_core::Error::Forbidden(
+            "GitHub connection belongs to another workspace".into(),
+        ));
+    }
+    let now = sql_compat::now(db.is_postgres());
+    change_installation(
+        db,
+        installation_id,
+        &format!("disconnected_at = {now}"),
+        ws_manager,
+    )
+    .await
+}
+
+pub async fn suspend_installation(db: &DbPool, installation_id: &str) -> trakkt_core::Result<()> {
+    suspend_installation_with_delivery(db, installation_id, None).await
+}
+
+pub async fn suspend_installation_with_delivery(
+    db: &DbPool,
+    installation_id: &str,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    let now = sql_compat::now(db.is_postgres());
+    change_installation(
+        db,
+        installation_id,
+        &format!("suspended_at = {now}"),
+        ws_manager,
+    )
+    .await
+}
+
+pub async fn uninstall_installation(db: &DbPool, installation_id: &str) -> trakkt_core::Result<()> {
+    uninstall_installation_with_delivery(db, installation_id, None).await
+}
+
+pub async fn uninstall_installation_with_delivery(
+    db: &DbPool,
+    installation_id: &str,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    let now = sql_compat::now(db.is_postgres());
+    change_installation(
+        db,
+        installation_id,
+        &format!("uninstalled_at = {now}"),
+        ws_manager,
+    )
+    .await
+}
+
+pub async fn unsuspend_installation(db: &DbPool, installation_id: &str) -> trakkt_core::Result<()> {
+    unsuspend_installation_with_delivery(db, installation_id, None).await
+}
+
+pub async fn unsuspend_installation_with_delivery(
+    db: &DbPool,
+    installation_id: &str,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    change_installation(db, installation_id, "suspended_at = NULL", ws_manager).await
+}
+
+/// Authoritative scope replacement invalidates in-flight token refreshes.
 pub async fn update_installation_repos(
     db: &DbPool,
     installation_id: &str,
     target_repos: Option<&serde_json::Value>,
 ) -> trakkt_core::Result<()> {
-    let is_pg = db.is_postgres();
-    let target_repos_json = target_repos.map(|v| v.to_string());
-    let repos_cast = sql_compat::cast_to_json(is_pg, "$1");
-    let sql = format!(
-        "UPDATE github_installations SET target_repos = {repos_cast} WHERE installation_id = $2"
-    );
-    trakkt_core::db_execute!(db, &sql, &target_repos_json, installation_id)?;
-    Ok(())
+    update_installation_repos_with_delivery(db, installation_id, target_repos, None).await
 }
 
-/// Clear the suspended status of an installation.
-pub async fn unsuspend_installation(
+pub async fn update_installation_repos_with_delivery(
     db: &DbPool,
     installation_id: &str,
+    target_repos: Option<&serde_json::Value>,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    trakkt_core::db_execute!(
-        db,
-        "UPDATE github_installations SET suspended_at = NULL WHERE installation_id = $1",
+    let repos = target_repos.map(serde_json::Value::to_string);
+    let cast = sql_compat::cast_to_json(db.is_postgres(), "$2");
+    let selection = if target_repos.is_none() {
+        "all"
+    } else {
+        "selected"
+    };
+    let mut tx = db.begin().await?;
+    let sql = format!(
+        "UPDATE github_installations SET target_repos = {cast}, repository_selection = $3, access_token_encrypted = NULL, token_expires_at = NULL, token_generation = token_generation + 1 WHERE installation_id = $1"
+    );
+    trakkt_core::tx_execute!(&mut tx, &sql, installation_id, &repos, selection)?;
+    record_installation_change(&mut tx, installation_id)
+        .await?
+        .commit_and_deliver(tx, ws_manager)
+        .await
+}
+
+/// Serialize repository deltas against the current row, never a pre-webhook snapshot.
+pub async fn apply_repository_delta(
+    db: &DbPool,
+    installation_id: &str,
+    selection: &str,
+    added: &[String],
+    removed: &[String],
+) -> trakkt_core::Result<()> {
+    apply_repository_delta_with_delivery(db, installation_id, selection, added, removed, None).await
+}
+
+pub async fn apply_repository_delta_with_delivery(
+    db: &DbPool,
+    installation_id: &str,
+    selection: &str,
+    added: &[String],
+    removed: &[String],
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    if !matches!(selection, "all" | "selected") {
+        return Err(trakkt_core::Error::BadRequest(
+            "Invalid GitHub repository selection".into(),
+        ));
+    }
+    let is_pg = db.is_postgres();
+    let mut tx = db.begin().await?;
+    // This write obtains SQLite's writer lock; PostgreSQL obtains the row lock.
+    trakkt_core::tx_execute!(
+        &mut tx,
+        "UPDATE github_installations SET token_generation = token_generation + 1, access_token_encrypted = NULL, token_expires_at = NULL WHERE installation_id = $1",
         installation_id
     )?;
-    Ok(())
+    let current = trakkt_core::tx_fetch_scalar!(
+        &mut tx,
+        Option<String>,
+        "SELECT CAST(target_repos AS TEXT) FROM github_installations WHERE installation_id = $1",
+        installation_id
+    )?;
+    let repos = if selection == "all" {
+        None
+    } else {
+        let mut repos: Vec<String> = match current {
+            Some(value) => serde_json::from_str(&value).map_err(|error| {
+                trakkt_core::Error::Internal(format!(
+                    "Invalid stored GitHub repository scope: {error}"
+                ))
+            })?,
+            None => Vec::new(),
+        };
+        for repo in added {
+            if !repos.contains(repo) {
+                repos.push(repo.clone());
+            }
+        }
+        repos.retain(|repo| !removed.contains(repo));
+        repos.sort();
+        Some(serde_json::to_string(&repos).map_err(|error| {
+            trakkt_core::Error::Internal(format!("Cannot encode GitHub repository scope: {error}"))
+        })?)
+    };
+    let cast = sql_compat::cast_to_json(is_pg, "$2");
+    let sql = format!(
+        "UPDATE github_installations SET target_repos = {cast}, repository_selection = $3 WHERE installation_id = $1"
+    );
+    trakkt_core::tx_execute!(&mut tx, &sql, installation_id, &repos, selection)?;
+    record_installation_change(&mut tx, installation_id)
+        .await?
+        .commit_and_deliver(tx, ws_manager)
+        .await
+}
+
+/// Quarantine scope before remote reconciliation; failure remains visible and denied.
+pub async fn begin_repository_reconciliation(
+    db: &DbPool,
+    installation_id: &str,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<i64> {
+    let pending = sql_compat::bool_true(db.is_postgres());
+    let mut tx = db.begin().await?;
+    let sql = format!(
+        "UPDATE github_installations SET repository_scope_pending = {pending}, token_generation = token_generation + 1, access_token_encrypted = NULL, token_expires_at = NULL WHERE installation_id = $1"
+    );
+    trakkt_core::tx_execute!(&mut tx, &sql, installation_id)?;
+    let generation = trakkt_core::tx_fetch_scalar!(
+        &mut tx,
+        i64,
+        "SELECT token_generation FROM github_installations WHERE installation_id = $1",
+        installation_id
+    )?;
+    record_installation_change(&mut tx, installation_id)
+        .await?
+        .commit_and_deliver(tx, ws_manager)
+        .await?;
+    Ok(generation)
+}
+
+/// Never let a slow fetch replace scope after a newer disconnect or scope change.
+pub async fn finish_repository_reconciliation(
+    db: &DbPool,
+    installation_id: &str,
+    expected_generation: i64,
+    target_repos: Option<&serde_json::Value>,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<bool> {
+    let repos = target_repos.map(serde_json::Value::to_string);
+    let cast = sql_compat::cast_to_json(db.is_postgres(), "$3");
+    let pending = sql_compat::bool_false(db.is_postgres());
+    let selection = if target_repos.is_none() {
+        "all"
+    } else {
+        "selected"
+    };
+    let mut tx = db.begin().await?;
+    let sql = format!(
+        "UPDATE github_installations SET repository_scope_pending = {pending}, target_repos = {cast}, repository_selection = $4 WHERE installation_id = $1 AND token_generation = $2 AND repository_scope_pending = {}",
+        sql_compat::bool_true(db.is_postgres())
+    );
+    let changed = trakkt_core::tx_execute!(
+        &mut tx,
+        &sql,
+        installation_id,
+        expected_generation,
+        &repos,
+        selection
+    )?;
+    if changed.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    record_installation_change(&mut tx, installation_id)
+        .await?
+        .commit_and_deliver(tx, ws_manager)
+        .await?;
+    Ok(true)
+}
+
+/// Publish a refreshed token only if no lifecycle/scope change occurred meanwhile.
+pub async fn cache_installation_token(
+    db: &DbPool,
+    installation: &GitHubInstallation,
+    token: &str,
+    expires_at: &str,
+) -> trakkt_core::Result<bool> {
+    let expiry = sql_compat::cast_to_timestamptz(db.is_postgres(), "$2");
+    let sql = format!(
+        "UPDATE github_installations SET access_token_encrypted = $1, token_expires_at = {expiry} WHERE installation_id = $3 AND token_generation = $4 AND disconnected_at IS NULL AND suspended_at IS NULL AND uninstalled_at IS NULL AND authorization_verified_at IS NOT NULL AND repository_scope_pending = {}",
+        sql_compat::bool_false(db.is_postgres())
+    );
+    Ok(trakkt_core::db_execute!(
+        db,
+        &sql,
+        token,
+        expires_at,
+        &installation.installation_id,
+        installation.token_generation
+    )?
+    .rows_affected()
+        == 1)
+}
+
+/// Serializes a connection's permitted side effect with disconnect and scope changes.
+pub struct ConnectionAdmission<'a> {
+    pub installation: &'a GitHubInstallation,
+    pub repository: &'a str,
+}
+
+impl trakkt_core::db::TransactionAdmission for ConnectionAdmission<'_> {
+    fn admit<'a>(
+        &'a self,
+        tx: &'a mut trakkt_core::db::DbTx,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = trakkt_core::Result<()>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // A write obtains a row lock on PostgreSQL and the writer lock on
+            // SQLite before reading authorization. Lifecycle mutations use the
+            // same row, so they cannot pass admission before this commit.
+            trakkt_core::tx_execute!(
+                &mut *tx,
+                "UPDATE github_installations SET token_generation = token_generation WHERE installation_id = $1",
+                &self.installation.installation_id
+            )?;
+            let current = trakkt_core::tx_fetch_optional!(
+                &mut *tx,
+                GitHubInstallation,
+                "SELECT installation_id, workspace_id, github_app_id, github_installation_id, \
+                account_login, account_type, CAST(target_repos AS TEXT) AS target_repos, \
+                access_token_encrypted, \
+                CAST(token_expires_at AS TEXT) AS token_expires_at, \
+                CAST(created_at AS TEXT) AS created_at, \
+                CAST(suspended_at AS TEXT) AS suspended_at, \
+                CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
+                CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
+                github_account_id, repository_selection, token_generation, repository_scope_pending \
+         FROM github_installations \
+         WHERE installation_id = $1",
+                &self.installation.installation_id
+            )?;
+            if !current.is_some_and(|current| {
+                current.workspace_id == self.installation.workspace_id
+                    && current.token_generation == self.installation.token_generation
+                    && current.allows_repository(self.repository)
+            }) {
+                return Err(trakkt_core::Error::Conflict(
+                    "GitHub connection changed before mutation admission".into(),
+                ));
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Hold admission through an outbound request. Callers must avoid pool access
+/// until this transaction is committed or dropped.
+pub async fn admit_outbound(
+    db: &DbPool,
+    installation: &GitHubInstallation,
+    repository: &str,
+) -> trakkt_core::Result<trakkt_core::db::DbTx> {
+    use trakkt_core::db::TransactionAdmission;
+    let mut tx = db.begin().await?;
+    ConnectionAdmission {
+        installation,
+        repository,
+    }
+    .admit(&mut tx)
+    .await?;
+    Ok(tx)
 }
 
 // ─── github_links ────────────────────────────────────────────────────────────
@@ -449,7 +852,22 @@ pub async fn upsert_link(
     db: &DbPool,
     params: &CreateLinkParams<'_>,
 ) -> trakkt_core::Result<GitHubLink> {
-    let is_pg = db.is_postgres();
+    upsert_link_with_admission(db, params, None).await
+}
+
+/// Upsert a link while holding an optional authorization admission lock.
+pub async fn upsert_link_with_admission(
+    db: &DbPool,
+    params: &CreateLinkParams<'_>,
+    admission: Option<&dyn trakkt_core::db::TransactionAdmission>,
+) -> trakkt_core::Result<GitHubLink> {
+    #[cfg(test)]
+    mutation_pause::wait(params.installation_id).await;
+    let mut tx = db.begin().await?;
+    if let Some(admission) = admission {
+        admission.admit(&mut tx).await?;
+    }
+    let is_pg = tx.is_postgres();
     let now = sql_compat::now(is_pg);
     let link_id = uuid::Uuid::new_v4().to_string();
 
@@ -470,16 +888,28 @@ pub async fn upsert_link(
             github_node_id = EXCLUDED.github_node_id, \
             updated_at = {now}"
     );
-    trakkt_core::db_execute!(
-        db, &sql,
-        &link_id, params.workspace_id, params.issue_id, params.installation_id, params.link_type,
-        params.github_id, params.github_node_id, params.repo_full_name, params.ref_identifier,
-        params.title, params.state, params.url, params.author_login, params.close_intent
+    trakkt_core::tx_execute!(
+        &mut tx,
+        &sql,
+        &link_id,
+        params.workspace_id,
+        params.issue_id,
+        params.installation_id,
+        params.link_type,
+        params.github_id,
+        params.github_node_id,
+        params.repo_full_name,
+        params.ref_identifier,
+        params.title,
+        params.state,
+        params.url,
+        params.author_login,
+        params.close_intent
     )?;
 
     // Fetch the row — either newly created or updated (conflict case).
-    let row = trakkt_core::db_fetch_one!(
-        db,
+    let row = trakkt_core::tx_fetch_one!(
+        &mut tx,
         GitHubLink,
         "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
                 github_id, github_node_id, repo_full_name, ref_identifier, \
@@ -489,9 +919,13 @@ pub async fn upsert_link(
          FROM github_links \
          WHERE workspace_id = $1 AND issue_id = $2 AND link_type = $3 \
                AND repo_full_name = $4 AND ref_identifier = $5",
-        params.workspace_id, params.issue_id, params.link_type,
-        params.repo_full_name, params.ref_identifier
+        params.workspace_id,
+        params.issue_id,
+        params.link_type,
+        params.repo_full_name,
+        params.ref_identifier
     )?;
+    tx.commit().await?;
     Ok(row)
 }
 
@@ -509,16 +943,47 @@ pub async fn delete_links_not_matching_issues(
     ref_identifier: &str,
     keep_issue_ids: &[String],
 ) -> trakkt_core::Result<u64> {
+    delete_links_with_admission(
+        db,
+        workspace_id,
+        link_type,
+        repo_full_name,
+        ref_identifier,
+        keep_issue_ids,
+        None,
+    )
+    .await
+}
+
+/// Delete stale links while holding authorization through the commit.
+pub async fn delete_links_with_admission(
+    db: &DbPool,
+    workspace_id: &str,
+    link_type: &str,
+    repo_full_name: &str,
+    ref_identifier: &str,
+    keep_issue_ids: &[String],
+    admission: Option<&dyn trakkt_core::db::TransactionAdmission>,
+) -> trakkt_core::Result<u64> {
+    let mut tx = db.begin().await?;
+    if let Some(admission) = admission {
+        admission.admit(&mut tx).await?;
+    }
     if keep_issue_ids.is_empty() {
         // Delete all links for this object in this workspace
-        let result = trakkt_core::db_execute!(
-            db,
+        let result = trakkt_core::tx_execute!(
+            &mut tx,
             "DELETE FROM github_links \
              WHERE workspace_id = $1 AND link_type = $2 \
                    AND repo_full_name = $3 AND ref_identifier = $4",
-            workspace_id, link_type, repo_full_name, ref_identifier
+            workspace_id,
+            link_type,
+            repo_full_name,
+            ref_identifier
         )?;
-        return Ok(result.rows_affected());
+        let affected = result.rows_affected();
+        tx.commit().await?;
+        return Ok(affected);
     }
 
     // Build IN clause for the keep list.
@@ -532,7 +997,7 @@ pub async fn delete_links_not_matching_issues(
 
     // Dynamically bind the keep_issue_ids. Use db_with_pool! since the
     // number of binds is variable and the macros expect a fixed list.
-    let rows_affected: u64 = trakkt_core::db_with_pool!(db, |pool| {
+    let rows_affected: u64 = trakkt_core::tx_with!(&mut tx, |executor| {
         let mut query = sqlx::query(&sql)
             .bind(workspace_id)
             .bind(link_type)
@@ -541,10 +1006,11 @@ pub async fn delete_links_not_matching_issues(
         for id in keep_issue_ids {
             query = query.bind(id);
         }
-        let result = query.execute(pool).await?;
+        let result = query.execute(executor).await?;
         Ok::<u64, sqlx::Error>(result.rows_affected())
     })?;
 
+    tx.commit().await?;
     Ok(rows_affected)
 }
 
@@ -613,7 +1079,11 @@ pub async fn get_installation_by_id(
                 access_token_encrypted, \
                 CAST(token_expires_at AS TEXT) AS token_expires_at, \
                 CAST(created_at AS TEXT) AS created_at, \
-                CAST(suspended_at AS TEXT) AS suspended_at \
+                CAST(suspended_at AS TEXT) AS suspended_at, \
+                CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
+                CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
+                github_account_id, repository_selection, token_generation, repository_scope_pending \
          FROM github_installations \
          WHERE installation_id = $1",
         installation_id
@@ -661,22 +1131,23 @@ pub async fn create_event(
          VALUES ($1, $2, $3, $4, $5, {payload_cast}, {now})"
     );
     trakkt_core::db_execute!(
-        db, &sql,
-        &event_id, github_delivery_id, installation_id, event_type, action, &payload_json
+        db,
+        &sql,
+        &event_id,
+        github_delivery_id,
+        installation_id,
+        event_type,
+        action,
+        &payload_json
     )?;
     Ok(event_id)
 }
 
 /// Mark an event as successfully processed.
-pub async fn mark_event_processed(
-    db: &DbPool,
-    event_id: &str,
-) -> trakkt_core::Result<()> {
+pub async fn mark_event_processed(db: &DbPool, event_id: &str) -> trakkt_core::Result<()> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
-    let sql = format!(
-        "UPDATE github_events SET processed_at = {now} WHERE event_id = $1"
-    );
+    let sql = format!("UPDATE github_events SET processed_at = {now} WHERE event_id = $1");
     trakkt_core::db_execute!(db, &sql, event_id)?;
     Ok(())
 }
@@ -690,7 +1161,8 @@ pub async fn mark_event_failed(
     trakkt_core::db_execute!(
         db,
         "UPDATE github_events SET error = $1 WHERE event_id = $2",
-        error, event_id
+        error,
+        event_id
     )?;
     Ok(())
 }
@@ -698,10 +1170,7 @@ pub async fn mark_event_failed(
 /// Check whether an event with the given delivery ID has already been recorded.
 ///
 /// Used for idempotency — GitHub may redeliver webhooks.
-pub async fn event_exists(
-    db: &DbPool,
-    github_delivery_id: &str,
-) -> trakkt_core::Result<bool> {
+pub async fn event_exists(db: &DbPool, github_delivery_id: &str) -> trakkt_core::Result<bool> {
     let count: i64 = trakkt_core::db_fetch_scalar!(
         db,
         i64,
@@ -756,10 +1225,7 @@ pub async fn seed_default_transition_rules(
          VALUES ($1, $2, $3, {bool_false}, $4, {bool_true}, {now}) \
          ON CONFLICT DO NOTHING"
     );
-    trakkt_core::db_execute!(
-        db, &sql,
-        &rule_id_1, workspace_id, "pr_opened", "started"
-    )?;
+    trakkt_core::db_execute!(db, &sql, &rule_id_1, workspace_id, "pr_opened", "started")?;
 
     // pr_merged -> completed (close intent required)
     let sql = format!(
@@ -769,10 +1235,7 @@ pub async fn seed_default_transition_rules(
          VALUES ($1, $2, $3, {bool_true}, $4, {bool_true}, {now}) \
          ON CONFLICT DO NOTHING"
     );
-    trakkt_core::db_execute!(
-        db, &sql,
-        &rule_id_2, workspace_id, "pr_merged", "completed"
-    )?;
+    trakkt_core::db_execute!(db, &sql, &rule_id_2, workspace_id, "pr_merged", "completed")?;
 
     // pr_closed -> cancelled (close intent required)
     let sql = format!(
@@ -782,10 +1245,7 @@ pub async fn seed_default_transition_rules(
          VALUES ($1, $2, $3, {bool_true}, $4, {bool_true}, {now}) \
          ON CONFLICT DO NOTHING"
     );
-    trakkt_core::db_execute!(
-        db, &sql,
-        &rule_id_3, workspace_id, "pr_closed", "cancelled"
-    )?;
+    trakkt_core::db_execute!(db, &sql, &rule_id_3, workspace_id, "pr_closed", "cancelled")?;
 
     Ok(())
 }
@@ -797,17 +1257,56 @@ pub async fn update_transition_rule_enabled(
     workspace_id: &str,
     enabled: bool,
 ) -> trakkt_core::Result<()> {
-    let is_pg = db.is_postgres();
-    let bool_val = if enabled {
-        sql_compat::bool_true(is_pg)
-    } else {
-        sql_compat::bool_false(is_pg)
-    };
-    let sql = format!(
-        "UPDATE github_transition_rules \
-         SET enabled = {bool_val} \
-         WHERE rule_id = $1 AND workspace_id = $2"
-    );
-    trakkt_core::db_execute!(db, &sql, rule_id, workspace_id)?;
-    Ok(())
+    update_transition_rule_enabled_with_delivery(db, rule_id, workspace_id, enabled, None).await
+}
+
+pub async fn update_transition_rule_enabled_with_delivery(
+    db: &DbPool,
+    rule_id: &str,
+    workspace_id: &str,
+    enabled: bool,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    use trakkt_auth::sync_log_service::{SyncAudience, SyncBatch};
+    let mut tx = db.begin().await?;
+    let changed = trakkt_core::tx_execute!(
+        &mut tx,
+        "UPDATE github_transition_rules SET enabled = $1 WHERE rule_id = $2 AND workspace_id = $3",
+        enabled,
+        rule_id,
+        workspace_id
+    )?;
+    if changed.rows_affected() != 1 {
+        return Err(trakkt_core::Error::NotFound(
+            "GitHub automation rule not found".into(),
+        ));
+    }
+    let mut batch = SyncBatch::new();
+    batch.record(&mut tx, trakkt_types::sync::entity_types::GITHUB_TRANSITION_RULE, rule_id, workspace_id, SyncAudience::Workspace, trakkt_types::sync::SyncActionType::Update, Some(serde_json::json!({"rule_id":rule_id,"workspace_id":workspace_id,"enabled":enabled}))).await?;
+    batch.commit_and_deliver(tx, ws_manager).await
+}
+
+#[cfg(test)]
+pub(crate) mod mutation_pause {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    use tokio::sync::Notify;
+    type Pause = (Arc<Notify>, Arc<Notify>);
+    static PAUSES: LazyLock<Mutex<HashMap<String, Pause>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    pub fn register(id: &str) -> Pause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        PAUSES
+            .lock()
+            .expect("mutation pause registry")
+            .insert(id.into(), pause.clone());
+        pause
+    }
+    pub async fn wait(id: &str) {
+        let pause = PAUSES.lock().expect("mutation pause registry").remove(id);
+        if let Some((reached, resume)) = pause {
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
 }

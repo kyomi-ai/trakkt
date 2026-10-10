@@ -78,6 +78,8 @@ struct SyncStoreInner {
     /// Used by the workspace settings page to trigger a refetch from the
     /// server.
     workspace_settings_version: ArcRwSignal<u32>,
+    /// GitHub connection and shared rule changes invalidate integration settings.
+    integration_settings_version: ArcRwSignal<u32>,
     /// Where this tab's `remove_*` methods send the matching cache delete.
     ///
     /// Set by the Layout once the tab's sync role is known, and set again if a
@@ -102,7 +104,7 @@ struct SyncStoreInner {
 /// differs between the two groups is the *wrapper type* handed back, and that
 /// difference is what decides whether a caller has to be careful.
 ///
-/// ## The nine `*_version()` counters return [`ArcSignal`] — no contract needed
+/// ## The `*_version()` counters return [`ArcSignal`] — no contract needed
 ///
 /// [`ArcSignal`] holds its `SignalTypes` **inline** (`reactive_graph-0.2.14`,
 /// `wrappers.rs`: `struct ArcSignal { inner: SignalTypes<T, S> }`). There is no
@@ -234,6 +236,7 @@ impl SyncStore {
                 attachments_version: ArcRwSignal::new(0),
                 notification_preferences_version: ArcRwSignal::new(0),
                 workspace_settings_version: ArcRwSignal::new(0),
+                integration_settings_version: ArcRwSignal::new(0),
                 delete_route: RefCell::new(DeleteRoute::default()),
             })),
         }
@@ -506,6 +509,19 @@ impl SyncStore {
         self.inner.with_value(|inner| {
             inner.workspace_settings_version.update(|v| *v += 1);
         });
+    }
+
+    /// Reactive invalidation source for GitHub connection and shared rule snapshots.
+    pub fn integration_settings_version(&self) -> ArcSignal<u32> {
+        let signal = self
+            .inner
+            .with_value(|inner| inner.integration_settings_version.clone());
+        ArcSignal::derive(move || signal.get())
+    }
+
+    pub fn bump_integration_settings_version(&self) {
+        self.inner
+            .with_value(|inner| inner.integration_settings_version.update(|v| *v += 1));
     }
 
     // ── Bulk setters (bootstrap / hydration) ─────────────────────────────────
@@ -796,7 +812,7 @@ impl SyncStore {
     /// every fresh bootstrap.
     ///
     /// That second caller is why the eight collections go through
-    /// [`clear_if_populated`] and the nine version counters through
+    /// [`clear_if_populated`] and the version counters through
     /// [`rewind_to_zero`], rather than `set`: on a fresh bootstrap they are
     /// already empty and already `0`, and `set` notifies whether or not the
     /// value moved. See [`rewind_to_zero`] for the mechanism and for what an
@@ -830,6 +846,7 @@ impl SyncStore {
             rewind_to_zero(&inner.attachments_version);
             rewind_to_zero(&inner.notification_preferences_version);
             rewind_to_zero(&inner.workspace_settings_version);
+            rewind_to_zero(&inner.integration_settings_version);
         });
     }
 }
@@ -846,7 +863,7 @@ impl SyncStore {
 ///
 /// `maybe_update` is the same write with the notification made conditional: a
 /// `false` return calls `untrack()` on the guard, which *takes* the triggerable,
-/// and `Drop` then finds nothing to notify. The nine counters are `u32`, so
+/// and `Drop` then finds nothing to notify. The version counters are `u32`, so
 /// "did it move" is a comparison against `0`.
 ///
 /// # What an unchanged-value notification costs
@@ -958,17 +975,17 @@ mod wasm_tests {
 
     // ── Probing what `reset()` wakes ────────────────────────────────────────
 
-    /// A `*_version()` getter, as a value so the nine can be walked in a loop.
+    /// A `*_version()` getter, as a value so the counters can be walked in a loop.
     type CounterGetter = fn(&SyncStore) -> ArcSignal<u32>;
     /// A `bump_*_version()` method, likewise.
     type CounterBump = fn(&SyncStore);
 
-    /// The nine version counters [`SyncStore::reset`] rewinds.
+    /// The version counters [`SyncStore::reset`] rewinds.
     ///
     /// Each entry is the getter a page resolves at setup and the bump the sync
-    /// engine calls when that entity's frame arrives. All nine are listed so a
-    /// fix applied to eight of them fails, naming the one that was missed.
-    const COUNTERS: [(&str, CounterGetter, CounterBump); 9] = [
+    /// engine calls when that entity's frame arrives. Every counter is listed so a
+    /// fix that misses one fails, naming the one that was missed.
+    const COUNTERS: [(&str, CounterGetter, CounterBump); 10] = [
         (
             "activities_version",
             SyncStore::activities_version,
@@ -1008,6 +1025,11 @@ mod wasm_tests {
             "notification_preferences_version",
             SyncStore::notification_preferences_version,
             SyncStore::bump_notification_preferences_version,
+        ),
+        (
+            "integration_settings_version",
+            SyncStore::integration_settings_version,
+            SyncStore::bump_integration_settings_version,
         ),
         (
             "workspace_settings_version",
@@ -1283,7 +1305,7 @@ mod wasm_tests {
 
     /// Attach a subscriber to every collection [`SyncStore::reset`] clears.
     ///
-    /// All eight are listed for the same reason all nine counters are: a guard
+    /// All collections are listed for the same reason all counters are: a guard
     /// applied to seven of them must fail, naming the one left on `set`.
     fn probe_every_collection(store: &SyncStore) -> Vec<CollectionProbe> {
         let store = *store;
@@ -1639,7 +1661,7 @@ mod wasm_tests {
     ///
     /// TRA-9996's fix, asserted directly, and the inverse of the test above:
     /// same store, same scenario, a counter instead of a collection. Revert the
-    /// nine getters to `Signal<u32>` and this panics with "already been
+    /// version getters to `Signal<u32>` and this panics with "already been
     /// disposed" — which is the only thing that makes it a test rather than a
     /// restatement of the type signature.
     ///

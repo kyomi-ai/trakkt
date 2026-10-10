@@ -2,25 +2,18 @@
 
 //! Integrations settings page — GitHub App installation self-service UI.
 //!
-//! Displays the current GitHub integration status and allows workspace admins
-//! to connect/disconnect their GitHub organization. Three states:
-//!
-//! - **NotConfigured**: GitHub App not set up (self-hosted, no env vars).
-//!   Shows a setup guide.
-//! - **NotConnected**: App exists but workspace not connected. Shows a
-//!   "Connect GitHub" button linking to the GitHub App installation flow.
-//! - **Connected**: Active installation. Shows connection details, repo list,
-//!   and a disconnect button with inline confirmation.
+//! Lists every retained connection with per-account controls and authoritative
+//! repository access. Automation rules remain shared across the workspace.
 
 use leptos::prelude::*;
 use phosphor_leptos::{Icon, IconWeight};
 
 use crate::components::{
-    Alert, AlertDescription, AlertVariant, Button, ButtonSize, ButtonVariant, Card,
-    CardContent, CardHeader, CardTitle, Skeleton, Spinner, Switch,
+    Alert, AlertDescription, AlertVariant, Button, ButtonSize, ButtonVariant, Card, CardContent,
+    CardHeader, CardTitle, Skeleton, Spinner, Switch,
 };
 use crate::server_fns::github::{
-    GitHubIntegrationStatus, TransitionRuleDisplay, disconnect_github,
+    GitHubConnectionDisplay, GitHubIntegrationStatus, TransitionRuleDisplay, disconnect_github,
     get_github_integration_status, get_transition_rules, start_github_connection,
     toggle_transition_rule,
 };
@@ -32,7 +25,17 @@ use crate::server_fns::github::{
 #[component]
 pub fn IntegrationsPage() -> impl IntoView {
     let (version, set_version) = signal(0u32);
-    let status_resource = Resource::new(move || version.get(), |_| get_github_integration_status());
+    let settings_version = use_context::<crate::cache::store::SyncStore>()
+        .map(|store| store.integration_settings_version());
+    let status_resource = Resource::new(
+        move || {
+            (
+                version.get(),
+                settings_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
+        |_| get_github_integration_status(),
+    );
 
     view! {
         <div class="p-4 sm:p-6">
@@ -63,27 +66,15 @@ pub fn IntegrationsPage() -> impl IntoView {
                             GitHubIntegrationStatus::AuthorizationNotConfigured => {
                                 view! { <Alert variant=AlertVariant::Warning><AlertDescription>"GitHub user authorization is not configured. Ask your server administrator to set GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET and GITHUB_OAUTH_CALLBACK_URL, and register /integrations/github/oauth/callback as the GitHub App Callback URL. Existing automation remains available."</AlertDescription></Alert> }.into_any()
                             }
-                            GitHubIntegrationStatus::NotConnected { retained_installation, .. } => {
-                                view! { <NotConnectedCard retained_installation=retained_installation/> }.into_any()
-                            }
-                            GitHubIntegrationStatus::Connected {
-                                account_login,
-                                account_type,
-                                repos,
-                                connected_at,
-                                github_installation_id,
-                            } => {
+                            GitHubIntegrationStatus::Connections { connections } => {
                                 view! {
-                                    <ConnectedCard
-                                        account_login=account_login
-                                        account_type=account_type
-                                        repos=repos
-                                        connected_at=connected_at
-                                        github_installation_id=github_installation_id
-                                        on_disconnected=Callback::new(move |()| {
-                                            set_version.update(|v| *v += 1);
-                                        })
-                                    />
+                                    <div class="space-y-4">
+                                        <NotConnectedCard/>
+                                        {connections.into_iter().map(|connection| view! {
+                                            <ConnectedCard connection=connection on_disconnected=Callback::new(move |()| set_version.update(|v| *v += 1))/>
+                                        }).collect_view()}
+                                        <Card><CardContent><TransitionRulesSection/></CardContent></Card>
+                                    </div>
                                 }.into_any()
                             }
                         },
@@ -157,9 +148,9 @@ fn NotConfiguredCard() -> impl IntoView {
 // State 2: Not Connected
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// GitHub App exists but workspace not connected — show connect button.
+/// Adding an account stays available regardless of the existing connections.
 #[component]
-fn NotConnectedCard(retained_installation: bool) -> impl IntoView {
+fn NotConnectedCard() -> impl IntoView {
     view! {
         <Card>
             <CardHeader>
@@ -171,31 +162,36 @@ fn NotConnectedCard(retained_installation: bool) -> impl IntoView {
             <CardContent>
                 <div class="space-y-4">
                     <p class="text-sm text-secondary-foreground">
-                        "Connect your GitHub organization to automatically link pull requests, commits, and branches to Trakkt issues."
+                        "Connect a GitHub personal account or organization to automatically link pull requests, commits, and branches to Trakkt issues."
                     </p>
 
-                    <GitHubConnectButton label=if retained_installation { "Reconnect GitHub" } else { "Connect GitHub" }/>
-                    {retained_installation.then(|| view! { <GitHubConnectButton label="Reinstall GitHub App" reinstall=true/> })}
+                    <GitHubConnectButton label="Add account"/>
                 </div>
             </CardContent>
         </Card>
     }
 }
 
-/// Both connect and reconnect must begin with a server-created admin state.
+/// Add and per-account reconnect both begin with a server-created admin state.
 #[component]
 fn GitHubConnectButton(
     label: &'static str,
+    #[prop(optional)] connection_id: Option<String>,
     #[prop(default = false)] reinstall: bool,
 ) -> impl IntoView {
-    let action = Action::new(move |_: &()| async move { start_github_connection(reinstall).await });
+    let action = Action::new(move |_: &()| {
+        let connection_id = connection_id.clone();
+        async move { start_github_connection(connection_id, reinstall).await }
+    });
     let (error, set_error) = signal(Option::<String>::None);
     Effect::new(move || {
         if let Some(result) = action.value().get() {
             match result {
                 Ok(url) => {
                     #[cfg(target_arch = "wasm32")]
-                    if web_sys::window().is_none_or(|window| window.location().assign(&url).is_err()) {
+                    if web_sys::window()
+                        .is_none_or(|window| window.location().assign(&url).is_err())
+                    {
                         set_error.set(Some("Could not open GitHub authorization".into()));
                     }
                     #[cfg(not(target_arch = "wasm32"))]
@@ -215,20 +211,36 @@ fn GitHubConnectButton(
 // State 3: Connected
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Active GitHub installation — show connection details and disconnect option.
+/// A retained connection, including inactive states that require authorization.
 #[component]
 fn ConnectedCard(
-    account_login: String,
-    account_type: String,
-    repos: Vec<String>,
-    connected_at: String,
-    github_installation_id: i64,
+    connection: GitHubConnectionDisplay,
     on_disconnected: Callback<()>,
 ) -> impl IntoView {
+    let GitHubConnectionDisplay {
+        connection_id,
+        account_login,
+        account_type,
+        repos,
+        repository_selection,
+        connected_at,
+        github_installation_id,
+        active,
+        disconnected,
+        suspended,
+        uninstalled,
+        verified,
+        scope_pending,
+    } = connection;
+    let card_id = connection_id.clone();
+    let disconnect_id = connection_id.clone();
     let (show_confirm, set_show_confirm) = signal(false);
     let (disconnect_error, set_disconnect_error) = signal(Option::<String>::None);
 
-    let disconnect_action = Action::new(move |_: &()| async move { disconnect_github().await });
+    let disconnect_action = Action::new(move |_: &()| {
+        let id = disconnect_id.clone();
+        async move { disconnect_github(id).await }
+    });
 
     // React to disconnect result
     Effect::new(move || {
@@ -261,19 +273,40 @@ fn ConnectedCard(
         other => other.to_string(),
     };
 
-    let manage_url = format!(
-        "https://github.com/settings/installations/{}",
-        github_installation_id
-    );
+    let manage_url = if account_type == "Organization" {
+        format!(
+            "https://github.com/organizations/{account_login}/settings/installations/{github_installation_id}"
+        )
+    } else {
+        format!("https://github.com/settings/installations/{github_installation_id}")
+    };
 
-    // Empty Vec means "all repositories" — server returns empty when repository_selection="all"
-    let all_repos = repos.is_empty();
+    let all_repos = repository_selection == "all";
+    let lifecycle = [
+        disconnected.then_some("Disconnected"),
+        suspended.then_some("Suspended by GitHub"),
+        uninstalled.then_some("Uninstalled on GitHub"),
+        (!verified).then_some("Authorization required"),
+        scope_pending
+            .then_some("Repository access needs refresh. Reconnect to refresh permissions."),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let lifecycle = if active {
+        "Connected".to_string()
+    } else {
+        lifecycle
+    };
+    let disconnect_disabled = disconnected;
     let repos_clone = repos.clone();
 
     view! {
+        <div data-github-connection=card_id>
         <Card>
             <CardHeader>
-                <div class="flex items-center justify-between">
+                <div class="flex flex-wrap items-center justify-between gap-2">
                     <div class="flex items-center gap-2">
                         <Icon icon=phosphor_leptos::GITHUB_LOGO weight=IconWeight::Regular size="24px" attr:class="text-muted-foreground"/>
                         <CardTitle>"GitHub Integration"</CardTitle>
@@ -284,9 +317,9 @@ fn ConnectedCard(
                         {move || {
                             if show_confirm.get() {
                                 view! {
-                                    <div class="flex items-center gap-2">
+                                    <div class="flex flex-wrap items-center gap-2">
                                         <span class="text-xs text-muted-foreground">
-                                            "This will stop all GitHub syncing."
+                                            "Stop syncing this account? History is retained and the GitHub App stays installed."
                                         </span>
                                         <Button
                                             variant=ButtonVariant::Outline
@@ -320,6 +353,7 @@ fn ConnectedCard(
                                     <Button
                                         variant=ButtonVariant::Outline
                                         size=ButtonSize::Sm
+                                        disabled=disconnect_disabled
                                         on:click=move |_| {
                                             set_disconnect_error.set(None);
                                             set_show_confirm.set(true);
@@ -342,14 +376,14 @@ fn ConnectedCard(
                         </Alert>
                     })}
 
-                    <GitHubConnectButton label="Reconnect GitHub"/>
-                    <GitHubConnectButton label="Reinstall GitHub App" reinstall=true/>
+                    <GitHubConnectButton label="Reconnect GitHub" connection_id=connection_id.clone()/>
+                    <GitHubConnectButton label="Reinstall GitHub App" connection_id=connection_id.clone() reinstall=true/>
 
                     // Connection details
                     <div class="flex items-center gap-2 text-sm">
-                        <Icon icon=phosphor_leptos::CHECK_CIRCLE weight=IconWeight::Fill size="16px" attr:class="text-success-foreground"/>
+                        <Icon icon=if active { phosphor_leptos::CHECK_CIRCLE } else { phosphor_leptos::X_CIRCLE } weight=IconWeight::Regular size="16px" attr:class="text-muted-foreground"/>
                         <span class="text-foreground font-medium">
-                            "Connected to: "
+                            "Account: "
                             <span class="font-mono text-xs">"@"{account_login.clone()}</span>
                         </span>
                         <span class="text-muted-foreground">
@@ -357,6 +391,7 @@ fn ConnectedCard(
                         </span>
                     </div>
 
+                    <p class="text-sm text-secondary-foreground">{lifecycle}</p>
                     <div class="text-sm text-muted-foreground">
                         "Installed: " {display_date}
                     </div>
@@ -364,12 +399,16 @@ fn ConnectedCard(
                     // Repository list
                     <div class="space-y-2">
                         <p class="text-sm font-medium text-foreground">"Repositories:"</p>
-                        {if all_repos {
+                        {if scope_pending {
+                            view! { <p class="text-sm text-secondary-foreground ml-2">"Repository access needs refresh"</p> }.into_any()
+                        } else if all_repos {
                             view! {
                                 <p class="text-sm text-secondary-foreground ml-2">
                                     "All repositories"
                                 </p>
                             }.into_any()
+                        } else if repos_clone.is_empty() {
+                            view! { <p class="text-sm text-secondary-foreground ml-2">"No repositories selected"</p> }.into_any()
                         } else {
                             let items = repos_clone.into_iter().map(|repo| {
                                 view! {
@@ -397,13 +436,11 @@ fn ConnectedCard(
                         <Icon icon=phosphor_leptos::ARROW_SQUARE_OUT weight=IconWeight::Light size="14px"/>
                     </a>
 
-                    // Status transition rules
-                    <div class="border-t border-border pt-3 mt-3">
-                        <TransitionRulesSection/>
-                    </div>
+
                 </div>
             </CardContent>
         </Card>
+        </div>
     }
 }
 
@@ -414,7 +451,12 @@ fn ConnectedCard(
 /// Displays all transition rules for the workspace with toggle switches.
 #[component]
 fn TransitionRulesSection() -> impl IntoView {
-    let rules_resource = Resource::new(|| (), |_| get_transition_rules());
+    let settings_version = use_context::<crate::cache::store::SyncStore>()
+        .map(|store| store.integration_settings_version());
+    let rules_resource = Resource::new(
+        move || settings_version.as_ref().map(|v| v.get()).unwrap_or(0),
+        |_| get_transition_rules(),
+    );
 
     view! {
         <div class="space-y-3">
@@ -538,23 +580,54 @@ fn format_target_status(category: &str) -> &'static str {
 }
 
 #[cfg(all(test, feature = "ssr"))]
-mod authorization_ui_tests {
+mod tests {
     use super::*;
 
+    fn connection(id: &str, repository_selection: &str) -> GitHubConnectionDisplay {
+        GitHubConnectionDisplay {
+            connection_id: id.into(),
+            account_login: id.into(),
+            account_type: "User".into(),
+            repos: Vec::new(),
+            repository_selection: repository_selection.into(),
+            connected_at: "2026-10-10T00:00:00Z".into(),
+            github_installation_id: 123,
+            active: false,
+            disconnected: true,
+            suspended: false,
+            uninstalled: false,
+            verified: true,
+            scope_pending: false,
+        }
+    }
+
     #[tokio::test]
-    async fn disconnected_connection_offers_reinstall_without_hiding_reconnect() {
+    async fn retained_connections_distinguish_all_and_selected_empty_and_offer_reconnect() {
         static EXECUTOR: std::sync::Once = std::sync::Once::new();
         EXECUTOR.call_once(|| {
-            any_spawner::Executor::init_tokio().expect("native UI tests initialize the Tokio executor once");
+            any_spawner::Executor::init_tokio()
+                .expect("native connection rendering initializes the Tokio executor");
         });
         tokio::task::LocalSet::new().run_until(async {
-        let owner = Owner::new();
-        let retained = owner.with(|| view! { <NotConnectedCard retained_installation=true/> }.to_html());
-        assert!(retained.contains("Reconnect GitHub"));
-        assert!(retained.contains("Reinstall GitHub App"), "a disconnected account whose old installation was deleted needs the setup route");
-        let fresh = owner.with(|| view! { <NotConnectedCard retained_installation=false/> }.to_html());
-        assert!(fresh.contains("Connect GitHub"));
-        assert!(!fresh.contains("Reinstall GitHub App"));
+            let owner = Owner::new();
+            let mut pending = connection("pending", "selected");
+            pending.disconnected = false;
+            pending.scope_pending = true;
+            let html = owner.with(|| view! {
+                <NotConnectedCard/>
+                <ConnectedCard connection=connection("personal", "all") on_disconnected=Callback::new(|()| {})/>
+                <ConnectedCard connection=connection("organization", "selected") on_disconnected=Callback::new(|()| {})/>
+                <ConnectedCard connection=pending on_disconnected=Callback::new(|()| {})/>
+            }.to_html());
+            assert_eq!(html.matches("data-github-connection=").count(), 3);
+            assert_eq!(html.matches("All repositories").count(), 1);
+            assert_eq!(html.matches("No repositories selected").count(), 1);
+            assert_eq!(html.matches("Reconnect GitHub").count(), 3);
+            assert_eq!(html.matches("Reinstall GitHub App").count(), 3);
+            assert!(html.contains("Add account"));
+            assert!(html.contains("Repository access needs refresh. Reconnect to refresh permissions."));
+            assert_eq!(html.matches("Disconnected").count(), 2);
+            assert!(!html.contains("Status Transitions"), "rules belong to the workspace, not the account cards");
         }).await;
     }
 }

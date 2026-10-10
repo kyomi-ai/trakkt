@@ -3,6 +3,9 @@ name = "trakkt-github"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-helpers = []
+
 [dependencies]
 trakkt-core = { workspace = true }
 trakkt-auth = { workspace = true }

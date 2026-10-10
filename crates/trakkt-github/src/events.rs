@@ -32,6 +32,22 @@ pub async fn process_pull_request(
     payload: &serde_json::Value,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
+    let current = schema::get_installation_by_id(db, &installation.installation_id).await?;
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let repository = payload
+        .pointer("/repository/full_name")
+        .and_then(serde_json::Value::as_str);
+    if !repository.is_some_and(|repo| current.allows_repository(repo)) {
+        return Ok(());
+    }
+    let installation = &current;
+    let admission = schema::ConnectionAdmission {
+        installation,
+        repository: repository.unwrap_or_default(),
+    };
+
     let pr = match payload.get("pull_request") {
         Some(pr) => pr,
         None => {
@@ -50,7 +66,10 @@ pub async fn process_pull_request(
         }
     };
 
-    let body = pr.get("body").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let body = pr
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let branch_name = match pr.pointer("/head/ref").and_then(|v| v.as_str()) {
         Some(b) => b.to_string(),
         None => {
@@ -75,14 +94,26 @@ pub async fn process_pull_request(
         }
     };
 
-    let author = pr.pointer("/user/login").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let base_branch = pr.pointer("/base/ref").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let author = pr
+        .pointer("/user/login")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let base_branch = pr
+        .pointer("/base/ref")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     // GitHub omits these fields or sets them to null for some event types — false is the correct default.
     let merged = pr.get("merged").and_then(|v| v.as_bool()).unwrap_or(false);
     let draft = pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
-    let node_id = pr.get("node_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let node_id = pr
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    let repo = match payload.pointer("/repository/full_name").and_then(|v| v.as_str()) {
+    let repo = match payload
+        .pointer("/repository/full_name")
+        .and_then(|v| v.as_str())
+    {
         Some(r) => r.to_string(),
         None => {
             tracing::warn!("pull_request event missing repository.full_name");
@@ -128,7 +159,7 @@ pub async fn process_pull_request(
             None => continue,
         };
 
-        schema::upsert_link(
+        schema::upsert_link_with_admission(
             db,
             &CreateLinkParams {
                 workspace_id: &installation.workspace_id,
@@ -145,6 +176,7 @@ pub async fn process_pull_request(
                 author_login: author.as_deref(),
                 close_intent: close_set.contains(issue_ref),
             },
+            Some(&admission),
         )
         .await?;
 
@@ -154,13 +186,14 @@ pub async fn process_pull_request(
     // ── For "edited" action, remove stale links ───────────────────────────
 
     if action == "edited" {
-        let deleted = schema::delete_links_not_matching_issues(
+        let deleted = schema::delete_links_with_admission(
             db,
             &installation.workspace_id,
             "pull_request",
             &repo,
             &pr_number.to_string(),
             &valid_issue_ids,
+            Some(&admission),
         )
         .await?;
 
@@ -195,7 +228,8 @@ pub async fn process_pull_request(
             ActionSource::Github,
             Some("GitHub".to_string()),
             ws_manager,
-        );
+        )
+        .with_admission(&admission);
 
         let mut recorded: HashSet<&str> = HashSet::new();
         for issue_id in &valid_issue_ids {
@@ -238,6 +272,22 @@ pub async fn process_push(
     payload: &serde_json::Value,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<()> {
+    let current = schema::get_installation_by_id(db, &installation.installation_id).await?;
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let repository = payload
+        .pointer("/repository/full_name")
+        .and_then(serde_json::Value::as_str);
+    if !repository.is_some_and(|repo| current.allows_repository(repo)) {
+        return Ok(());
+    }
+    let installation = &current;
+    let admission = schema::ConnectionAdmission {
+        installation,
+        repository: repository.unwrap_or_default(),
+    };
+
     // ── Extract branch name ───────────────────────────────────────────────
 
     let git_ref = match payload.get("ref").and_then(|v| v.as_str()) {
@@ -253,7 +303,10 @@ pub async fn process_push(
         .unwrap_or(&git_ref)
         .to_string();
 
-    let repo = match payload.pointer("/repository/full_name").and_then(|v| v.as_str()) {
+    let repo = match payload
+        .pointer("/repository/full_name")
+        .and_then(|v| v.as_str())
+    {
         Some(r) => r.to_string(),
         None => {
             tracing::warn!("push event missing repository.full_name");
@@ -269,10 +322,8 @@ pub async fn process_push(
     let mut branch_issue_ids: Vec<String> = Vec::new();
 
     for issue_ref in &branch_refs {
-        if let Some(issue) =
-            validate_issue_ref(db, &installation.workspace_id, issue_ref).await?
-        {
-            schema::upsert_link(
+        if let Some(issue) = validate_issue_ref(db, &installation.workspace_id, issue_ref).await? {
+            schema::upsert_link_with_admission(
                 db,
                 &CreateLinkParams {
                     workspace_id: &installation.workspace_id,
@@ -289,6 +340,7 @@ pub async fn process_push(
                     author_login: None,
                     close_intent: false,
                 },
+                Some(&admission),
             )
             .await?;
             total_branch_links += 1;
@@ -299,7 +351,10 @@ pub async fn process_push(
     // ── Record branch_created activities (best-effort) ────────────────────
     //
     // Only when this push actually created the branch (`created == true`).
-    if payload.get("created").and_then(|v| v.as_bool()).unwrap_or(false)
+    if payload
+        .get("created")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
         && !branch_issue_ids.is_empty()
     {
         // The pusher (GitHub actor) login — no email is available, so the
@@ -322,14 +377,18 @@ pub async fn process_push(
             ActionSource::Github,
             Some("GitHub".to_string()),
             ws_manager,
-        );
+        )
+        .with_admission(&admission);
 
         let mut recorded: HashSet<&str> = HashSet::new();
         for issue_id in &branch_issue_ids {
             if !recorded.insert(issue_id.as_str()) {
                 continue;
             }
-            if let Err(e) = recorder.record(issue_id, "branch_created", Some(&meta)).await {
+            if let Err(e) = recorder
+                .record(issue_id, "branch_created", Some(&meta))
+                .await
+            {
                 tracing::warn!(
                     error = %e,
                     issue_id = %issue_id,
@@ -390,7 +449,7 @@ pub async fn process_push(
             if let Some(issue) =
                 validate_issue_ref(db, &installation.workspace_id, issue_ref).await?
             {
-                schema::upsert_link(
+                schema::upsert_link_with_admission(
                     db,
                     &CreateLinkParams {
                         workspace_id: &installation.workspace_id,
@@ -407,6 +466,7 @@ pub async fn process_push(
                         author_login: author_login.as_deref(),
                         close_intent: close_set.contains(issue_ref),
                     },
+                    Some(&admission),
                 )
                 .await?;
 
@@ -446,9 +506,13 @@ pub async fn process_push(
             ActionSource::Github,
             Some("GitHub".to_string()),
             ws_manager,
-        );
+        )
+        .with_admission(&admission);
 
-        if let Err(e) = recorder.record(&issue_id, "commit_pushed", Some(&meta)).await {
+        if let Err(e) = recorder
+            .record(&issue_id, "commit_pushed", Some(&meta))
+            .await
+        {
             tracing::warn!(
                 error = %e,
                 issue_id = %issue_id,
@@ -571,8 +635,8 @@ async fn validate_issue_ref(
     workspace_id: &str,
     issue_ref: &IssueRef,
 ) -> trakkt_core::Result<Option<ValidatedIssue>> {
-    let team = trakkt_auth::team_service::get_team_by_key(db, workspace_id, &issue_ref.team_key)
-        .await?;
+    let team =
+        trakkt_auth::team_service::get_team_by_key(db, workspace_id, &issue_ref.team_key).await?;
 
     if team.is_none() {
         tracing::debug!(
@@ -672,7 +736,10 @@ mod tests {
 
     #[test]
     fn pr_activity_ready_for_review() {
-        assert_eq!(pr_activity_type("ready_for_review", false), Some("pr_opened"));
+        assert_eq!(
+            pr_activity_type("ready_for_review", false),
+            Some("pr_opened")
+        );
     }
 
     #[test]

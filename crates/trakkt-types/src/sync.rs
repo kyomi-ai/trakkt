@@ -73,6 +73,8 @@ pub mod entity_types {
 
     declare_entity_types! {
         WORKSPACE_SETTINGS = "workspace_settings";
+        GITHUB_INSTALLATION = "GITHUB_INSTALLATION";
+        GITHUB_TRANSITION_RULE = "GITHUB_TRANSITION_RULE";
         ISSUE = "issue";
         COMMENT = "comment";
         LABEL = "label";

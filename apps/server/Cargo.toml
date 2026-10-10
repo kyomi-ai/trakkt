@@ -48,6 +48,9 @@ async-stripe-shared = { workspace = true }
 async-stripe-types = { workspace = true }
 
 [dev-dependencies]
+rsa = { version = "0.9", features = ["pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+trakkt-github = { workspace = true, features = ["test-helpers"] }
 trakkt-core = { workspace = true, features = ["test-helpers"] }
 trakkt-auth = { workspace = true }
 axum = { workspace = true }

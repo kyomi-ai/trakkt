@@ -287,6 +287,11 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) -> StoreDi
                     // that user's own change from another tab or device.
                     store.bump_notification_preferences_version();
                 }
+                et if et == entity_types::GITHUB_INSTALLATION
+                    || et == entity_types::GITHUB_TRANSITION_RULE =>
+                {
+                    store.bump_integration_settings_version();
+                }
                 et if et == entity_types::WORKSPACE_SETTINGS => {
                     // The workspace settings page reads through its own
                     // `get_workspace_settings` round trip, so a rename or an
@@ -365,6 +370,11 @@ pub fn apply_action_to_memory(store: &SyncStore, action: &SyncAction) -> StoreDi
                     // is what stops one from arriving as silence if that changes
                     // — the same reasoning as the posted-update arm above.
                     store.bump_notification_preferences_version();
+                }
+                et if et == entity_types::GITHUB_INSTALLATION
+                    || et == entity_types::GITHUB_TRANSITION_RULE =>
+                {
+                    store.bump_integration_settings_version();
                 }
                 et if et == entity_types::WORKSPACE_SETTINGS => {
                     // Likewise: settings are only ever updated today, never
@@ -1512,6 +1522,39 @@ mod tests {
         });
     }
 
+    #[test]
+    fn github_connection_and_shared_rule_frames_invalidate_only_integrations() {
+        with_store(|store| {
+            let version = store.integration_settings_version();
+            let mut expected = 0;
+            for entity_type in [
+                entity_types::GITHUB_INSTALLATION,
+                entity_types::GITHUB_TRANSITION_RULE,
+            ] {
+                for kind in [
+                    SyncActionType::Insert,
+                    SyncActionType::Update,
+                    SyncActionType::Delete,
+                ] {
+                    let payload = if kind == SyncActionType::Delete {
+                        None
+                    } else {
+                        Some(serde_json::json!({"workspace_id": "ws-1"}))
+                    };
+                    let action = action_with_id(entity_type, "connection-1", kind, payload);
+                    assert_eq!(
+                        apply_action_to_memory(&store, &action),
+                        StoreDispatch::Handled
+                    );
+                    expected += 1;
+                    assert_eq!(version.get_untracked(), expected);
+                    assert_eq!(store.workspace_settings_version().get_untracked(), 0);
+                    assert_eq!(store.notification_preferences_version().get_untracked(), 0);
+                }
+            }
+        });
+    }
+
     /// Every type on `NOT_CACHED`, through the real write path.
     ///
     /// One assertion per type rather than a loop over the constant, because a
@@ -1522,7 +1565,15 @@ mod tests {
     /// write path would have skipped anyway.
     #[test]
     fn a_not_cached_type_is_never_persisted() {
-        let cases: [(&str, serde_json::Value); 4] = [
+        let cases: [(&str, serde_json::Value); 6] = [
+            (
+                entity_types::GITHUB_INSTALLATION,
+                serde_json::json!({"installation_id": "connection-1", "workspace_id": "ws-1"}),
+            ),
+            (
+                entity_types::GITHUB_TRANSITION_RULE,
+                serde_json::json!({"rule_id": "rule-1", "workspace_id": "ws-1", "enabled": false}),
+            ),
             (
                 entity_types::ATTACHMENT,
                 serde_json::json!({

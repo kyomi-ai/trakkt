@@ -270,6 +270,7 @@ pub struct ActivityRecorder<'a> {
     action_source: ActionSource,
     action_source_label: Option<String>,
     ws_manager: Option<&'a WebSocketManager>,
+    admission: Option<&'a dyn trakkt_core::db::TransactionAdmission>,
 }
 
 impl<'a> ActivityRecorder<'a> {
@@ -293,6 +294,7 @@ impl<'a> ActivityRecorder<'a> {
             action_source,
             action_source_label,
             ws_manager,
+            admission: None,
         }
     }
 
@@ -316,7 +318,14 @@ impl<'a> ActivityRecorder<'a> {
             action_source,
             action_source_label,
             ws_manager,
+            admission: None,
         }
+    }
+
+    /// Require transaction-held authorization for each recorded activity.
+    pub fn with_admission(mut self, admission: &'a dyn trakkt_core::db::TransactionAdmission) -> Self {
+        self.admission = Some(admission);
+        self
     }
 
     /// Record a simple action with optional metadata (no field change).
@@ -571,6 +580,9 @@ impl<'a> ActivityRecorder<'a> {
         );
 
         let mut tx = self.db.begin().await?;
+        if let Some(admission) = self.admission {
+            admission.admit(&mut tx).await?;
+        }
 
         let existing: Option<CoalesceRow> = trakkt_core::tx_fetch_optional!(
             &mut tx,
@@ -640,6 +652,9 @@ impl<'a> ActivityRecorder<'a> {
         metadata: Option<&serde_json::Value>,
     ) -> trakkt_core::Result<()> {
         let mut tx = self.db.begin().await?;
+        if let Some(admission) = self.admission {
+            admission.admit(&mut tx).await?;
+        }
 
         let activity_id = self
             .insert_activity_row(
