@@ -142,7 +142,9 @@ pub fn build_router(state: state::AppState) -> Router {
         .with_state(state)
         .layer(axum::middleware::from_fn(middleware::security_headers))
         .layer(middleware::cors_layer())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+            tracing::info_span!("http_request", method = %request.method(), path = %request.uri().path())
+        }))
         .layer(RequestBodyLimitLayer::new(16 * 1024 * 1024))
 }
 

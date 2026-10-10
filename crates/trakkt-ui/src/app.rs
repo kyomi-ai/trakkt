@@ -149,6 +149,7 @@ pub fn App() -> impl IntoView {
 
                     // GitHub App installation callback
                     <Route path=path!("/integrations/github/callback") view=GitHubCallbackPage/>
+                    <Route path=path!("/integrations/github/oauth/callback") view=GitHubCallbackPage/>
 
                     // Settings
                     <ParentRoute path=path!("/settings") view=|| view! {

@@ -525,10 +525,8 @@ jobs:
   # comment is a standing instruction not to add Postgres or Redis to it, and
   # jobs run in parallel, so this costs runner minutes but no PR wall-clock.
   #
-  # It runs one test binary — apps/server/tests/postgres_dialect.rs — because
-  # that is the only one whose Postgres halves exist. Everything else in the
-  # workspace is SQLite-only and already covered by Test Suite; running it again
-  # here would double the cost for no extra signal.
+  # Run the server dialect suite and the GitHub authorization callback tests;
+  # both contain dual-backend bodies whose Postgres halves need this service.
   # ---------------------------------------------------------------------------
   postgres-dialect:
     name: Postgres Dialect Tests
@@ -662,6 +660,18 @@ jobs:
             exit 1
           fi
           echo "✅ Every Postgres dialect test ran; none were skipped."
+
+      - name: cargo test (GitHub authorization on both databases)
+        env:
+          RUSTC_WRAPPER: ${{ env.SCCACHE_AVAILABLE == 'true' && 'sccache' || '' }}
+        run: |
+          set -o pipefail
+          cargo test --locked -p trakkt-github authorization::tests \
+            -- --include-ignored | tee github-authorization.log
+          if ! grep -qE 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored' github-authorization.log; then
+            echo "::error::GitHub authorization tests must run with no skipped Postgres cases."
+            exit 1
+          fi
 
       - name: sccache stats
         if: always()
