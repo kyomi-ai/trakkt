@@ -30,7 +30,7 @@ pub enum GitHubIntegrationStatus {
     NotConfigured,
     /// App automation is configured, but self-service authorization is missing.
     AuthorizationNotConfigured,
-    /// All retained connections, including inactive lifecycle states.
+    /// Visible connections, including inactive cards awaiting reconnection or removal.
     Connections {
         connections: Vec<GitHubConnectionDisplay>,
     },
@@ -65,7 +65,7 @@ use super::{AuthenticatedContext, IntoServerFnError, require_workspace_admin};
 // Server functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Query every retained GitHub connection for the workspace.
+/// Query visible GitHub connections for the workspace.
 #[server(prefix = "/leptos-api")]
 pub async fn get_github_integration_status() -> Result<GitHubIntegrationStatus, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
@@ -79,7 +79,7 @@ pub async fn get_github_integration_status() -> Result<GitHubIntegrationStatus, 
         return Ok(GitHubIntegrationStatus::AuthorizationNotConfigured);
     }
 
-    let installations = trakkt_github::schema::list_installations_for_workspace(db, &ac.ws_id)
+    let installations = trakkt_github::schema::list_visible_installations_for_workspace(db, &ac.ws_id)
         .await
         .into_sfn()?;
     let mut connections = Vec::with_capacity(installations.len());
@@ -242,6 +242,22 @@ pub async fn disconnect_github(connection_id: String) -> Result<(), ServerFnErro
         ac.db(),
         &connection_id,
         &ac.ws_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()
+}
+
+/// Remove an inactive settings card, retaining installation history and ownership.
+#[server(prefix = "/leptos-api")]
+pub async fn remove_github(connection_id: String) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    trakkt_github::schema::remove_installation_with_delivery(
+        ac.db(),
+        &connection_id,
+        &ac.ws_id,
+        &ac.auth.user_id,
         ac.ctx.ws_manager.as_ref(),
     )
     .await
