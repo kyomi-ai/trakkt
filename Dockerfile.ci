@@ -71,11 +71,11 @@ RUN mkdir -p /root/.cache/trunk/wasm-opt-skip/bin \
     && chmod +x /root/.cache/trunk/wasm-opt-skip/bin/wasm-opt
 RUN cd crates/trakkt-ui && trunk build --release
 
-# Build server binary
-RUN cargo build --release --bin trakkt
+# Build server and operator identity-backfill binaries
+RUN cargo build --release --bin trakkt --bin github-backfill
 
 # ==========================================================================
-# Stage 2: runtime — minimal image with just the binary and assets
+# Stage 2: runtime — minimal image with application/operator binaries and assets
 # ==========================================================================
 FROM debian:bookworm-slim
 
@@ -90,6 +90,7 @@ WORKDIR /app
 
 # Copy built artifacts from builder stage
 COPY --from=builder /build/target/release/trakkt /app/trakkt
+COPY --from=builder /build/target/release/github-backfill /app/github-backfill
 COPY --from=builder /build/crates/trakkt-ui/dist /app/dist
 
 ENV PORT=8003 \
