@@ -28,6 +28,8 @@ pub async fn security_headers(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let github_callback = matches!(request.uri().path(),
+        "/integrations/github/callback" | "/integrations/github/oauth/callback");
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
 
@@ -43,6 +45,11 @@ pub async fn security_headers(
         HeaderName::from_static("x-xss-protection"),
         HeaderValue::from_static("1; mode=block"),
     );
+
+    if github_callback {
+        headers.insert(HeaderName::from_static("referrer-policy"), HeaderValue::from_static("no-referrer"));
+        headers.insert(HeaderName::from_static("cache-control"), HeaderValue::from_static("no-store"));
+    }
 
     response
 }

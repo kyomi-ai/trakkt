@@ -21,8 +21,11 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 subtle = { workspace = true }
 hex = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
+trakkt-core = { workspace = true, features = ["test-helpers"] }
+axum = { workspace = true }
 tokio = { workspace = true }
 rsa = { version = "0.9", features = ["pem"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

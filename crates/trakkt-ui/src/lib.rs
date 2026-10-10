@@ -19,8 +19,7 @@ pub mod server_fns;
 pub mod types;
 pub mod utils;
 
-/// Setup shared by the browser tests in `cache/` and `pages/`. Test-only, and
-/// wasm-only because `any_spawner` is a `wasm32`-gated dev-dependency.
+/// Test-only browser setup shared by the tests in `cache/` and `pages/`.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_test_support;
 

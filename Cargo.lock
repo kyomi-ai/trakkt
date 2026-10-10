@@ -6031,11 +6031,13 @@ dependencies = [
 name = "trakkt-github"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "chrono",
  "hex",
  "hmac",
  "jsonwebtoken",
+ "rand 0.9.4",
  "rand_core 0.6.4",
  "regex",
  "reqwest",

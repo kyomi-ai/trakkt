@@ -28,8 +28,10 @@ pub struct TransitionRuleDisplay {
 pub enum GitHubIntegrationStatus {
     /// No GitHub App configured (self-hosted, no env vars set).
     NotConfigured,
+    /// App automation is configured, but self-service authorization is missing.
+    AuthorizationNotConfigured,
     /// App configured but workspace not connected.
-    NotConnected { app_slug: String },
+    NotConnected { app_slug: String, retained_installation: bool },
     /// Workspace connected to GitHub.
     Connected {
         account_login: String,
@@ -45,7 +47,7 @@ pub enum GitHubIntegrationStatus {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "ssr")]
-use super::{require_workspace_admin, AuthenticatedContext, IntoServerFnError};
+use super::{AuthenticatedContext, IntoServerFnError, require_workspace_admin};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Server functions
@@ -58,8 +60,7 @@ use super::{require_workspace_admin, AuthenticatedContext, IntoServerFnError};
 /// - `NotConnected` if the App exists but this workspace hasn't installed it
 /// - `Connected` with account details if the workspace has an active installation
 #[server(prefix = "/leptos-api")]
-pub async fn get_github_integration_status(
-) -> Result<GitHubIntegrationStatus, ServerFnError> {
+pub async fn get_github_integration_status() -> Result<GitHubIntegrationStatus, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let db = ac.db();
 
@@ -67,10 +68,12 @@ pub async fn get_github_integration_status(
         return Ok(GitHubIntegrationStatus::NotConfigured);
     };
 
+    if !client.user_authorization_configured() {
+        return Ok(GitHubIntegrationStatus::AuthorizationNotConfigured);
+    }
+
     // Check if GitHub App is configured via the database
-    let app = trakkt_github::schema::get_github_app(db)
-        .await
-        .into_sfn()?;
+    let app = trakkt_github::schema::get_github_app(db).await.into_sfn()?;
 
     // Determine the app slug from the persisted or running configuration.
     let app_slug = match app {
@@ -102,91 +105,94 @@ pub async fn get_github_integration_status(
                 github_installation_id: inst.github_installation_id,
             })
         }
-        _ => Ok(GitHubIntegrationStatus::NotConnected { app_slug }),
+        other => Ok(GitHubIntegrationStatus::NotConnected { app_slug, retained_installation: other.is_some() }),
     }
 }
 
-/// Process the GitHub App installation callback.
-///
-/// Called after the user installs (or reinstalls) the GitHub App on their
-/// organization/account. Verifies the installation via GitHub's API, then
-/// creates or reactivates the local installation record.
-///
-/// Requires workspace admin role.
+/// Start a workspace-bound installation or reconnect authorization.
+#[server(prefix = "/leptos-api")]
+pub async fn start_github_connection(reinstall: bool) -> Result<String, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    let client = ac
+        .ctx
+        .github_client
+        .as_deref()
+        .ok_or_else(|| ServerFnError::new("GitHub App not configured"))?;
+    let key = ac
+        .ctx
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| ServerFnError::new("Credential encryption not configured"))?;
+    trakkt_github::authorization::start_connection(
+        ac.db(),
+        client,
+        key,
+        &ac.auth.user_id,
+        &ac.ws_id,
+        reinstall,
+    )
+    .await
+    .into_sfn()
+}
+
+/// Setup callback selects a candidate and returns a separate OAuth redirect.
 #[server(prefix = "/leptos-api")]
 pub async fn process_github_callback(
     installation_id: i64,
     setup_action: String,
-) -> Result<(), ServerFnError> {
-    let ac = AuthenticatedContext::extract().await?;
-    require_workspace_admin(&ac.auth)?;
-    let db = ac.db();
-
-    if setup_action != "install" {
-        tracing::warn!(setup_action = %setup_action, "unexpected GitHub setup_action; only 'install' is handled");
-        return Err(ServerFnError::new(format!(
-            "Unsupported setup action '{}'; only 'install' is accepted",
-            setup_action
-        )));
-    }
-
-    // Use the client validated and registered during server startup.
-    let client = ac.ctx.github_client.as_deref()
+    state: String,
+) -> Result<String, ServerFnError> {
+    let auth = super::extract_auth().await?;
+    let ctx = super::extract_context()?;
+    let client = ctx
+        .github_client
+        .as_deref()
         .ok_or_else(|| ServerFnError::new("GitHub App not configured"))?;
+    let key = ctx
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| ServerFnError::new("Credential encryption not configured"))?;
+    trakkt_github::authorization::advance_setup(
+        &ctx.db,
+        client,
+        key,
+        &auth.user_id,
+        &state,
+        installation_id,
+        &setup_action,
+    )
+    .await
+    .into_sfn()
+}
 
-    // Call GitHub API to verify installation exists and get details
-    let details = client
-        .get_installation_details(installation_id as u64)
-        .await
-        .into_sfn()?;
-
-    // Startup registers the app before accepting installation callbacks.
-    let app = trakkt_github::schema::get_github_app(db)
-        .await
-        .into_sfn()?
-        .ok_or_else(|| ServerFnError::new("GitHub App not configured in database"))?;
-
-    // Resolve the repository list: None for "all", or a JSON array of full names
-    let repos_json = resolve_repos_json(client, installation_id as u64, &details).await?;
-
-    // Check if installation already exists for this workspace (e.g. reconnecting)
-    let existing = trakkt_github::schema::get_installation_for_workspace(db, &ac.ws_id)
-        .await
-        .into_sfn()?;
-
-    if let Some(existing) = existing {
-        // Reactivate the existing installation with updated details
-        trakkt_github::schema::reactivate_installation(
-            db,
-            &existing.installation_id,
-            installation_id,
-            &details.account.login,
-            &details.account.account_type,
-            repos_json.as_ref(),
-        )
-        .await
-        .into_sfn()?;
-    } else {
-        // Create new installation record
-        trakkt_github::schema::create_installation(
-            db,
-            &ac.ws_id,
-            &app.github_app_id,
-            installation_id,
-            &details.account.login,
-            &details.account.account_type,
-            repos_json.as_ref(),
-        )
-        .await
-        .into_sfn()?;
-    }
-
-    // Idempotent: reconnecting also repairs an installation with missing rules.
-    trakkt_github::schema::seed_default_transition_rules(db, &ac.ws_id)
-        .await
-        .into_sfn()?;
-
-    Ok(())
+/// OAuth callback completes the original workspace's connection; active
+/// workspace selection is intentionally irrelevant to this destination.
+#[server(prefix = "/leptos-api")]
+pub async fn complete_github_authorization(
+    state: String,
+    code: String,
+) -> Result<(), ServerFnError> {
+    let auth = super::extract_auth().await?;
+    let ctx = super::extract_context()?;
+    let client = ctx
+        .github_client
+        .as_deref()
+        .ok_or_else(|| ServerFnError::new("GitHub App not configured"))?;
+    let key = ctx
+        .encryption_key
+        .as_deref()
+        .ok_or_else(|| ServerFnError::new("Credential encryption not configured"))?;
+    trakkt_github::authorization::complete_connection(
+        &ctx.db,
+        client,
+        key,
+        &auth.user_id,
+        &state,
+        &code,
+    )
+    .await
+    .into_sfn()
 }
 
 /// Disconnect the GitHub integration for the current workspace.
@@ -247,10 +253,7 @@ pub async fn get_transition_rules() -> Result<Vec<TransitionRuleDisplay>, Server
 ///
 /// Requires workspace admin role.
 #[server(prefix = "/leptos-api")]
-pub async fn toggle_transition_rule(
-    rule_id: String,
-    enabled: bool,
-) -> Result<(), ServerFnError> {
+pub async fn toggle_transition_rule(rule_id: String, enabled: bool) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     require_workspace_admin(&ac.auth)?;
     let db = ac.db();
@@ -316,41 +319,4 @@ pub async fn list_github_links_for_issue(
         .collect();
 
     Ok(display_links)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers (server-only)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolve the target repos for an installation.
-///
-/// If the installation has access to "all" repos, returns `None`.
-/// Otherwise, fetches the list from GitHub and returns a JSON array of full names.
-#[cfg(feature = "ssr")]
-async fn resolve_repos_json(
-    client: &trakkt_github::GitHubClient,
-    installation_id: u64,
-    details: &trakkt_github::GitHubInstallationDetails,
-) -> Result<Option<serde_json::Value>, ServerFnError> {
-    if details.repository_selection == "all" {
-        return Ok(None);
-    }
-
-    let token = client
-        .request_installation_token(installation_id)
-        .await
-        .into_sfn()?;
-    let repos = client
-        .list_installation_repos(&token.token)
-        .await
-        .into_sfn()?;
-    let repo_names: Vec<String> = repos.into_iter().map(|r| r.full_name).collect();
-
-    match serde_json::to_value(repo_names) {
-        Ok(v) => Ok(Some(v)),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to serialize repo names to JSON");
-            Err(ServerFnError::new(format!("JSON serialization error: {e}")))
-        }
-    }
 }

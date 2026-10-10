@@ -8,6 +8,7 @@
 //! The client does NOT perform any database operations — callers handle
 //! token caching and persistence.
 
+pub mod authorization;
 pub mod events;
 pub mod patterns;
 pub mod schema;
@@ -45,6 +46,7 @@ pub struct GitHubInstallationDetails {
 /// A GitHub account (organization or user) that installed the App.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubAccount {
+    pub id: u64,
     pub login: String,
     #[serde(rename = "type")]
     pub account_type: String,
@@ -113,9 +115,13 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 /// HTTP client for the GitHub API, authenticated as a GitHub App.
 pub struct GitHubClient {
     http: reqwest::Client,
+    authorization_http: reqwest::Client,
     app_id: u64,
     private_key: Vec<u8>,
     app_name: String,
+    oauth: Option<authorization::OAuthConfig>,
+    api_base: String,
+    oauth_base: String,
 }
 
 impl std::fmt::Debug for GitHubClient {
@@ -139,14 +145,26 @@ impl GitHubClient {
 
         let http = reqwest::Client::builder()
             .user_agent(app_name)
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| Error::Internal(format!("failed to build HTTP client: {e}")))?;
 
+        let authorization_http = reqwest::Client::builder()
+            .user_agent(app_name)
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| Error::Internal("failed to build GitHub authorization client".into()))?;
+
         Ok(Self {
             http,
+            authorization_http,
             app_id,
             private_key: private_key_pem.to_vec(),
             app_name: app_name.to_string(),
+            oauth: None,
+            api_base: GITHUB_API_BASE.into(),
+            oauth_base: "https://github.com".into(),
         })
     }
 
@@ -180,9 +198,10 @@ impl GitHubClient {
         &self,
         installation_id: u64,
     ) -> trakkt_core::Result<InstallationToken> {
+        let api_base = &self.api_base;
         let jwt = self.app_jwt()?;
         let url = format!(
-            "{GITHUB_API_BASE}/app/installations/{installation_id}/access_tokens"
+            "{api_base}/app/installations/{installation_id}/access_tokens"
         );
 
         let response = self
@@ -214,7 +233,8 @@ impl GitHubClient {
         number: u64,
         body: &str,
     ) -> trakkt_core::Result<()> {
-        let url = format!("{GITHUB_API_BASE}/repos/{repo}/issues/{number}/comments");
+        let api_base = &self.api_base;
+        let url = format!("{api_base}/repos/{repo}/issues/{number}/comments");
 
         let response = self
             .http
@@ -240,7 +260,8 @@ impl GitHubClient {
         repo: &str,
         number: u64,
     ) -> trakkt_core::Result<()> {
-        let url = format!("{GITHUB_API_BASE}/repos/{repo}/issues/{number}");
+        let api_base = &self.api_base;
+        let url = format!("{api_base}/repos/{repo}/issues/{number}");
 
         let response = self
             .http
@@ -266,7 +287,8 @@ impl GitHubClient {
         repo: &str,
         number: u64,
     ) -> trakkt_core::Result<PullRequest> {
-        let url = format!("{GITHUB_API_BASE}/repos/{repo}/pulls/{number}");
+        let api_base = &self.api_base;
+        let url = format!("{api_base}/repos/{repo}/pulls/{number}");
 
         let response = self
             .http
@@ -292,8 +314,9 @@ impl GitHubClient {
         &self,
         installation_id: u64,
     ) -> trakkt_core::Result<GitHubInstallationDetails> {
+        let api_base = &self.api_base;
         let jwt = self.app_jwt()?;
-        let url = format!("{GITHUB_API_BASE}/app/installations/{installation_id}");
+        let url = format!("{api_base}/app/installations/{installation_id}");
 
         let response = self
             .http
@@ -325,7 +348,8 @@ impl GitHubClient {
         &self,
         token: &str,
     ) -> trakkt_core::Result<Vec<GitHubRepository>> {
-        let url = format!("{GITHUB_API_BASE}/installation/repositories?per_page=100");
+        let api_base = &self.api_base;
+        let url = format!("{api_base}/installation/repositories?per_page=100");
 
         let response = self
             .http
@@ -397,7 +421,9 @@ fn client_from_env() -> trakkt_core::Result<Option<GitHubClient>> {
     let private_key = std::fs::read(&key_path)
         .map_err(|e| Error::Internal(format!("Failed to read GitHub App private key: {e}")))?;
     let app_name = std::env::var("GITHUB_APP_NAME").unwrap_or_else(|_| "trakkt".into());
-    GitHubClient::new(app_id, &private_key, &app_name).map(Some)
+    let mut client = GitHubClient::new(app_id, &private_key, &app_name)?;
+    client.oauth = authorization::OAuthConfig::from_env()?;
+    Ok(Some(client))
 }
 
 /// Initialize the optional GitHub integration and persist its encrypted credentials.
@@ -414,6 +440,10 @@ pub async fn initialize_from_env(
     let webhook_secret = std::env::var("GITHUB_WEBHOOK_SECRET")
         .map_err(|_| Error::Internal("GITHUB_WEBHOOK_SECRET is required".into()))?;
     ensure_configured(db, &client, &webhook_secret, encryption_key).await?;
+    if let Some(oauth) = &client.oauth {
+        let secret = trakkt_auth::encryption::encrypt(&oauth.client_secret, encryption_key)?;
+        trakkt_core::db_execute!(db, "UPDATE github_apps SET client_id = $1, client_secret_encrypted = $2 WHERE app_id = $3", &oauth.client_id, &secret, client.app_id as i64)?;
+    }
     Ok(Some(client))
 }
 
@@ -499,40 +529,15 @@ fn api_headers(token: &str) -> reqwest::header::HeaderMap {
 }
 
 /// Map a GitHub API error response to the appropriate `trakkt_core::Error` variant.
-async fn map_github_error(
-    status: u16,
-    url: &str,
-    response: reqwest::Response,
-) -> Error {
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<failed to read response body>".to_string());
-
+async fn map_github_error(status: u16, url: &str, _response: reqwest::Response) -> Error {
+    // GitHub error bodies can include request data. Never put credential-bearing
+    // responses in logs or user-visible errors.
+    tracing::warn!(url = %url, status, "GitHub API request rejected");
     match status {
-        404 => {
-            tracing::warn!(url = %url, body = %body, "GitHub API returned 404");
-            Error::NotFound(format!("GitHub resource not found: {url}"))
-        }
-        401 => {
-            tracing::warn!(url = %url, body = %body, "GitHub API returned 401");
-            Error::Unauthorized("GitHub authentication failed".to_string())
-        }
-        403 => {
-            tracing::warn!(url = %url, body = %body, "GitHub API returned 403");
-            Error::Forbidden("GitHub API access denied".to_string())
-        }
-        _ => {
-            tracing::warn!(
-                url = %url,
-                status = status,
-                body = %body,
-                "GitHub API returned unexpected error"
-            );
-            Error::Internal(format!(
-                "GitHub API error (status {status}): {body}"
-            ))
-        }
+        404 => Error::NotFound("GitHub resource not found".into()),
+        401 => Error::Unauthorized("GitHub authentication failed".into()),
+        403 => Error::Forbidden("GitHub API access denied".into()),
+        _ => Error::Internal(format!("GitHub API error (status {status})")),
     }
 }
 

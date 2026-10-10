@@ -114,6 +114,9 @@ SMTP is optional. Without it, features like email verification and password rese
 | `GITHUB_APP_ID` | GitHub App ID. When set, enables commit/branch/PR linking to issues. | (none -- disabled) |
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Path to the GitHub App PEM private key file. Required when `GITHUB_APP_ID` is set. | (none) |
 | `GITHUB_APP_NAME` | GitHub App URL slug (the name in `github.com/apps/<slug>`). | `trakkt` |
+| `GITHUB_OAUTH_CLIENT_ID` | GitHub App Client ID, distinct from its numeric App ID. Required for new connection/reconnect. | (none) |
+| `GITHUB_OAUTH_CLIENT_SECRET` | GitHub App client secret. Required with Client ID. | (none) |
+| `GITHUB_OAUTH_CALLBACK_URL` | Registered authorization Callback URL, `<FRONTEND_URL>/integrations/github/oauth/callback`. | (none) |
 | `GITHUB_WEBHOOK_SECRET` | Secret configured on the GitHub App for verifying webhook signatures. Required when `GITHUB_APP_ID` is set. | (none) |
 
 Register a GitHub App in your organization’s [developer settings](https://github.com/organizations/your-org/settings/apps). Use your instance’s public URL for the homepage, `<FRONTEND_URL>/integrations/github/callback` for the **Setup URL**, and `<BASE_URL>/webhooks/github` for the **Webhook URL**. For trakkt.app these are `https://trakkt.app/integrations/github/callback` and `https://trakkt.app/webhooks/github`.
@@ -123,3 +126,25 @@ Grant **Contents: read** and **Pull requests: read and write**, and subscribe to
 Generate a private key, mount the PEM file into the server, and set the variables above. Set the same webhook secret in both GitHub and Trakkt. On restart, Trakkt registers the app in its database and encrypts its credentials using `ENCRYPTION_KEY`. Invalid or incomplete app configuration prevents startup instead of silently disabling the integration. Keep the environment variables and key file available on every restart. Restarting with the same app preserves workspace connections; changing to a different app ID is rejected.
 
 Finally, a workspace admin must open **Settings > Integrations > Connect GitHub**, install the app on the selected repositories, and return to Trakkt to finish linking the workspace. Merely configuring the server does not connect a workspace.
+
+The **Setup URL** and user authorization **Callback URL** have different roles. In the GitHub App registration, set the Callback URL to `<FRONTEND_URL>/integrations/github/oauth/callback` (for trakkt.app, `https://trakkt.app/integrations/github/oauth/callback`) and **disable “Request user authorization (OAuth) during installation”**. Trakkt starts authorization itself after receiving the installation setup callback, using a fresh state and PKCE. Copy the App's **Client ID**, generate a **client secret**, and configure all three `GITHUB_OAUTH_*` variables. Do not use the numeric App ID as Client ID. Leave both OAuth credentials absent (the callback URL alone is harmless) to keep existing webhook automation enabled while disabling new connections and reconnects; settings displays the missing configuration. Partial configuration and invalid callback URLs prevent startup. Legacy database OAuth placeholders are never configuration.
+
+Workspace admins must start from Trakkt settings; installing an App directly or supplying an installation ID does not attach it. Sign into the GitHub user who can access the selected installation (including an active organization SAML session if required). Reconnect authorizes the existing installation without uninstalling it. Reinstall starts setup again and requires the same verified stable account identity. Connection authorization expires after ten minutes and belongs to the starting Trakkt user and workspace even if the active workspace changes. User access tokens are used transiently for verification; PKCE verifiers are encrypted, state is stored only as a hash, and codes/user tokens are not persisted.
+
+Existing connections created before stable account IDs must first be reconciled by the server operator using the identity backfill command, or verified by their owning workspace admin using Reconnect. An unresolved historical foreign connection blocks acquisition of new ownership until its identity is resolved; ownership is retained after disconnect and there is no self-service transfer. If a historical installation has already been deleted before identity verification, ask the server administrator to reconcile its stable account identity from authoritative records; do not remove historical ownership to bypass a conflict.
+
+Before releasing this authorization migration, inventory every legacy row and reconcile stable account IDs. Use the explicit operator command, which never starts the server or reconnects an installation:
+
+```sh
+# Configured App JWT reads the exact stored old installation; dry-run by default.
+cargo run -p trakkt-server --bin github-backfill -- OLD_INSTALLATION_ID
+# Apply only after reviewing the dry-run result.
+cargo run -p trakkt-server --bin github-backfill -- OLD_INSTALLATION_ID --apply
+# A deleted installation requires trusted historical evidence, never a login lookup.
+cargo run -p trakkt-server --bin github-backfill -- OLD_INSTALLATION_ID --evidence /secure/authenticated-installation-response.json
+cargo run -p trakkt-server --bin github-backfill -- OLD_INSTALLATION_ID --evidence /secure/authenticated-installation-response.json --apply
+```
+
+Set `DATABASE_URL` and, for the live lookup, `GITHUB_APP_ID`, `GITHUB_APP_NAME`, `GITHUB_APP_PRIVATE_KEY_PATH`. The command's database connection runs the normal migrations, while dry-run rolls back identity/claim/sync mutations. Evidence must be an original authenticated GitHub installation API response or authenticated webhook installation object proving the **exact old installation ID**, configured App ID, **stable numeric account ID** and account type; server operators are responsible for authenticating its provenance. A mutable login, an unverified user-supplied JSON file or a new installation ID is insufficient. The command checks matching installation/App/type and existing ownership, retains permanent claims, and only sets `github_account_id`; workspace, row ID, links, repository selection, suspension and cached tokens remain intact. Conflicting or unavailable evidence fails closed. Rerun for each legacy installation; resolve all unknown deleted identities before enabling new ownership. Ordinary reconnect can annotate its own still-existing legacy installation independently, without waiting for other workspaces' reconnects.
+
+Configure reverse-proxy and ingress access logs to record the path without query parameters (or disable access logging for both GitHub callback paths): GitHub redirects carry sensitive one-time state and OAuth codes. Trakkt request spans omit query parameters, callback responses use `Referrer-Policy: no-referrer` and `Cache-Control: no-store`, and the callback page removes query parameters from browser history before invoking its server function.

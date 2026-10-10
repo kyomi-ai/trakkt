@@ -134,21 +134,26 @@ one of them.
 
 ## The Postgres dialect suite
 
-Production runs Postgres. Every test in the workspace except this suite runs
-SQLite, so a defect confined to an `is_pg` query arm — a wrong placeholder
+Production runs Postgres. Most workspace tests run SQLite only; the server
+dialect suite and GitHub authorization dual-backend tests execute Postgres too.
+A defect confined to an untested `is_pg` query arm — a wrong placeholder
 index, a missing cast, `RETURNING` versus `last_insert_rowid()` — compiles,
 passes clippy, passes `cargo test`, and ships without anything having executed
 it. `sort_order` decoded as `f64` from a `FLOAT4` column shipped exactly that way
 twice.
 
-The suite lives in `apps/server/tests/postgres_dialect.rs` and its harness in
-`crates/trakkt-core/src/test_helpers/dual_backend.rs`.
+The server suite lives in `apps/server/tests/postgres_dialect.rs` and its harness
+in `crates/trakkt-core/src/test_helpers/dual_backend.rs`. GitHub callback, state,
+ownership race and rollback tests use the same harness in
+`crates/trakkt-github/src/authorization.rs`; CI runs these with
+`cargo test --locked -p trakkt-github authorization::tests -- --include-ignored`
+and requires a nonzero passed count with zero ignored tests.
 
 ### What it covers, and what it does not
 
 Read this before treating a green `Postgres Dialect Tests` job as a statement
-about the Postgres arms in general. It is not one. It says the bodies in that
-file ran, and nothing about the arms none of them reaches.
+about the Postgres arms in general. It is not one. It says the server dialect
+and GitHub authorization bodies ran, and nothing about the arms they do not reach.
 
 As of TRA-10001 the file holds 25 `dual_backend_test!` bodies — 50 tests, one
 pair each — plus three Postgres-only tests that need both backends open at once

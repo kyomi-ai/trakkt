@@ -4,7 +4,7 @@
 //!
 //! # Why this exists
 //!
-//! Production runs Postgres; every other test in the workspace runs SQLite. A
+//! Production runs Postgres; most workspace tests run SQLite only. A
 //! defect confined to a Postgres query arm — a placeholder index, a missing
 //! cast, `RETURNING` versus `last_insert_rowid()` — compiles, passes clippy and
 //! ships, because nothing ever executes it. Two such bugs have shipped already
@@ -19,10 +19,11 @@
 //! # What this module is not
 //!
 //! It is a harness, not a guarantee. It runs the bodies it is given, and the
-//! bodies live in `apps/server/tests/postgres_dialect.rs` — 25 of them as of
+//! server bodies live in `apps/server/tests/postgres_dialect.rs` — 25 of them as of
 //! TRA-10001, against 119 `is_postgres()` call sites and 164 `sql_compat::`
 //! call sites outside the test directories. A green `Postgres Dialect Tests`
-//! job therefore says those 25 bodies passed on both backends. It does not say
+//! job runs those server bodies and GitHub authorization bodies in
+//! `crates/trakkt-github/src/authorization.rs` on both backends. It does not say
 //! the Postgres arms are covered, and reading it that way is how a suite built
 //! for exactly one defect class went two years without covering that class:
 //! the `sort_order` FLOAT4 decode named above had no body of its own until

@@ -44,3 +44,4 @@ data:
   attachment-s3-endpoint: "http://minio.trakkt.svc.cluster.local:9000"
   attachment-s3-bucket: "attachments"
   attachment-s3-region: "us-east-1"
+  github-oauth-callback-url: "https://trakkt.app/integrations/github/oauth/callback"

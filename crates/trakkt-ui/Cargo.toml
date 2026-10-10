@@ -137,6 +137,7 @@ arborium-sysroot = "2.17"
 trakkt-core = { workspace = true, features = ["test-helpers"] }
 trakkt-auth = { workspace = true }
 tokio = { workspace = true }
+any_spawner = { version = "0.3", features = ["tokio"] }
 
 # Browser-hosted tests for the IndexedDB writer.
 # Run: wasm-pack test --headless --firefox crates/trakkt-ui --lib --features hydrate

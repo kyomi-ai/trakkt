@@ -2,61 +2,103 @@
 
 //! GitHub App installation callback page.
 //!
-//! Route: `/integrations/github/callback?installation_id=xxx&setup_action=install`
-//!
-//! After a user installs the GitHub App on their organization, GitHub redirects
-//! here. This page:
-//! 1. Reads `installation_id` and `setup_action` from query params
-//! 2. Calls `process_github_callback()` to verify and store the installation
-//! 3. On success, navigates to `/settings/integrations`
-//! 4. On error, shows an error message with a link back to settings
+//! Setup advances workspace-bound state to OAuth; the distinct OAuth callback
+//! completes verified association. Query credentials are removed before API calls.
 
 use leptos::prelude::*;
 use phosphor_leptos::{Icon, IconWeight};
 
-use crate::components::{Alert, AlertDescription, AlertVariant, ButtonLink, ButtonVariant, Spinner};
-use crate::server_fns::github::process_github_callback;
+use crate::components::{
+    Alert, AlertDescription, AlertVariant, ButtonLink, ButtonVariant, Spinner,
+};
+use crate::server_fns::github::{complete_github_authorization, process_github_callback};
 
 #[component]
 pub fn GitHubCallbackPage() -> impl IntoView {
     let (status, set_status) = signal(CallbackState::Processing);
     let (error_msg, set_error_msg) = signal(String::new());
 
-    // Read query params and process the callback on mount (browser-only).
     #[cfg(target_arch = "wasm32")]
-    let (installation_id_param, setup_action_param) = {
-        let params = web_sys::window()
-            .and_then(|w| w.location().search().ok())
-            .and_then(|s| web_sys::UrlSearchParams::new_with_str(&s).ok());
-        match params {
-            Some(p) => (p.get("installation_id"), p.get("setup_action")),
-            None => (None, None),
+    let params = web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .and_then(|s| web_sys::UrlSearchParams::new_with_str(&s).ok());
+    #[cfg(target_arch = "wasm32")]
+    let (installation_id_param, setup_action_param, state_param, code_param, is_oauth) = {
+        let get = |name| params.as_ref().and_then(|p| p.get(name));
+        let is_oauth = web_sys::window()
+            .and_then(|w| w.location().pathname().ok())
+            .is_some_and(|path| path.ends_with("/oauth/callback"));
+        if let Some(history) = web_sys::window().and_then(|window| window.history().ok()) {
+            let path = if is_oauth {
+                "/integrations/github/oauth/callback"
+            } else {
+                "/integrations/github/callback"
+            };
+            if history
+                .replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(path))
+                .is_err()
+            {
+                tracing::warn!("Could not remove GitHub callback parameters from browser history");
+            }
         }
+        (
+            get("installation_id"),
+            get("setup_action"),
+            get("state"),
+            get("code"),
+            is_oauth,
+        )
     };
     #[cfg(not(target_arch = "wasm32"))]
-    let (installation_id_param, setup_action_param): (Option<String>, Option<String>) =
-        (None, None);
+    let (installation_id_param, setup_action_param, state_param, code_param, is_oauth): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+    ) = (None, None, None, None, false);
 
     #[cfg(target_arch = "wasm32")]
     let navigate = leptos_router::hooks::use_navigate();
 
     leptos::task::spawn_local(async move {
-        // Parse installation_id
-        let installation_id: i64 = match installation_id_param
-            .as_deref()
-            .and_then(|s| s.parse().ok())
-        {
-            Some(id) => id,
-            None => {
-                set_error_msg.set("Missing or invalid installation_id parameter.".to_string());
-                set_status.set(CallbackState::Error);
-                return;
+        let result = if is_oauth {
+            match (state_param, code_param) {
+                (Some(state), Some(code)) => complete_github_authorization(state, code).await,
+                _ => Err(ServerFnError::new(
+                    "Missing GitHub OAuth state or code. Start again from settings.",
+                )),
+            }
+        } else {
+            match (
+                installation_id_param.and_then(|v| v.parse::<i64>().ok()),
+                setup_action_param,
+                state_param,
+            ) {
+                (Some(id), Some(action), Some(state)) => {
+                    match process_github_callback(id, action, state).await {
+                        Ok(url) => {
+                            #[cfg(target_arch = "wasm32")]
+                            if web_sys::window()
+                                .is_some_and(|window| window.location().assign(&url).is_ok())
+                            {
+                                return;
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            drop(url);
+                            Err(ServerFnError::new(
+                                "Could not redirect to GitHub authorization",
+                            ))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                _ => Err(ServerFnError::new(
+                    "Missing GitHub setup authorization. Start again from settings.",
+                )),
             }
         };
-
-        let setup_action = setup_action_param.unwrap_or_else(|| "install".to_string());
-
-        match process_github_callback(installation_id, setup_action).await {
+        match result {
             Ok(()) => {
                 set_status.set(CallbackState::Success);
 

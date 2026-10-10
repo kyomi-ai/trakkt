@@ -2,11 +2,12 @@
 
 //! The Postgres arms of the dual-dialect query layer, executed.
 //!
-//! Production runs Postgres. Every other test in the workspace runs SQLite, so
+//! Production runs Postgres. Most workspace tests run SQLite only, so
 //! a defect confined to a `is_pg` branch — a placeholder index, a missing cast,
 //! `RETURNING` versus `last_insert_rowid()` — compiles, passes clippy, and
 //! ships without anything having run it. This file is where those branches are
-//! run.
+//! run. GitHub authorization also uses this dual-backend harness in
+//! `crates/trakkt-github/src/authorization.rs`.
 //!
 //! Every test below is declared with
 //! [`dual_backend_test!`](trakkt_core::dual_backend_test), which expands one

@@ -104,6 +104,24 @@ spec:
                   name: trakkt-secrets
                   key: github-webhook-secret
                   optional: true
+            - name: GITHUB_OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: github-oauth-client-id
+                  optional: true
+            - name: GITHUB_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: trakkt-secrets
+                  key: github-oauth-client-secret
+                  optional: true
+            - name: GITHUB_OAUTH_CALLBACK_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: trakkt-config
+                  key: github-oauth-callback-url
+                  optional: true
             - name: GITHUB_APP_PRIVATE_KEY_PATH
               value: /var/run/trakkt-github/private-key.pem
 

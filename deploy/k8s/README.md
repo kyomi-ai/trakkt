@@ -223,3 +223,5 @@ kubectl delete namespace trakkt
 ```
 
 This will delete all pods, services, and persistent volumes in the trakkt namespace.
+
+For secure new connections and reconnects, add `github-oauth-client-id` and `github-oauth-client-secret` to the same Secret/SealedSecret and set `github-oauth-callback-url` in `trakkt-config` to your public `/integrations/github/oauth/callback` URL. Register that distinct Callback URL and disable GitHub's automatic OAuth-during-installation option as described in the configuration guide. Leave all three OAuth values absent if only existing webhook automation is needed; configure all three together to enable connection settings. The private deployment repository's `seal-github-secrets.py` workflow accepts optional `oauth-client-id` and `oauth-client-secret` input files together. Keep all plaintext secret files outside source control.

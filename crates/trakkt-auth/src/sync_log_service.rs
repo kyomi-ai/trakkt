@@ -937,7 +937,7 @@ pub(crate) async fn commit_and_deliver(
 /// nothing to deliver *with*. [`SyncBatch::commit_and_deliver`] is the only way
 /// to deliver and it takes the transaction by value, so it cannot run before the
 /// commit it performs itself.
-pub(crate) struct SyncBatch<'a> {
+pub struct SyncBatch<'a> {
     entries: Vec<RecordedEntry<'a>>,
 }
 
@@ -953,8 +953,14 @@ struct RecordedEntry<'a> {
     sync_id: i64,
 }
 
+impl Default for SyncBatch<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> SyncBatch<'a> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
@@ -973,7 +979,7 @@ impl<'a> SyncBatch<'a> {
     /// for the same reason: it decides the `visibility_user_id` column here and
     /// the delivery call later, so the persisted row and the live frame cannot
     /// address different people (see [`SyncAudience`]).
-    pub(crate) async fn record(
+    pub async fn record(
         &mut self,
         tx: &mut DbTx,
         entity_type: &str,
@@ -1013,7 +1019,7 @@ impl<'a> SyncBatch<'a> {
     /// Nothing is delivered if the commit fails: the rows the frames describe do
     /// not exist, and each `sync_id` held above would address a row that was
     /// rolled back.
-    pub(crate) async fn commit_and_deliver(
+    pub async fn commit_and_deliver(
         self,
         tx: DbTx,
         ws_manager: Option<&WebSocketManager>,
