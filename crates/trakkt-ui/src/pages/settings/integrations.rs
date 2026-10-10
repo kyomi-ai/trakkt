@@ -2,7 +2,7 @@
 
 //! Integrations settings page — GitHub App installation self-service UI.
 //!
-//! Lists every retained connection with per-account controls and authoritative
+//! Lists visible connections with per-account controls and authoritative
 //! repository access. Automation rules remain shared across the workspace.
 
 use leptos::prelude::*;
@@ -15,7 +15,7 @@ use crate::components::{
 use crate::server_fns::github::{
     GitHubConnectionDisplay, GitHubIntegrationStatus, TransitionRuleDisplay, disconnect_github,
     get_github_integration_status, get_transition_rules, start_github_connection,
-    toggle_transition_rule,
+    remove_github, toggle_transition_rule,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,7 +239,13 @@ fn ConnectedCard(
 
     let disconnect_action = Action::new(move |_: &()| {
         let id = disconnect_id.clone();
-        async move { disconnect_github(id).await }
+        async move {
+            if active {
+                disconnect_github(id).await
+            } else {
+                remove_github(id).await
+            }
+        }
     });
 
     // React to disconnect result
@@ -299,7 +305,12 @@ fn ConnectedCard(
     } else {
         lifecycle
     };
-    let disconnect_disabled = disconnected;
+    let action_label = if active { "Disconnect" } else { "Remove integration" };
+    let confirmation = if active {
+        "Stop syncing this account? History is retained and the GitHub App stays installed."
+    } else {
+        "Remove this integration from settings? Ticket and PR history is retained. The GitHub App stays installed."
+    };
     let repos_clone = repos.clone();
 
     view! {
@@ -319,7 +330,7 @@ fn ConnectedCard(
                                 view! {
                                     <div class="flex flex-wrap items-center gap-2">
                                         <span class="text-xs text-muted-foreground">
-                                            "Stop syncing this account? History is retained and the GitHub App stays installed."
+                                            {confirmation}
                                         </span>
                                         <Button
                                             variant=ButtonVariant::Outline
@@ -339,10 +350,10 @@ fn ConnectedCard(
                                                 if is_disconnecting.get() {
                                                     view! {
                                                         <Spinner class="text-white"/>
-                                                        "Disconnecting..."
+                                                        {if active { "Disconnecting..." } else { "Removing..." }}
                                                     }.into_any()
                                                 } else {
-                                                    view! { "Yes, disconnect" }.into_any()
+                                                    view! { {if active { "Yes, disconnect" } else { "Yes, remove integration" }} }.into_any()
                                                 }
                                             }}
                                         </Button>
@@ -353,13 +364,12 @@ fn ConnectedCard(
                                     <Button
                                         variant=ButtonVariant::Outline
                                         size=ButtonSize::Sm
-                                        disabled=disconnect_disabled
                                         on:click=move |_| {
                                             set_disconnect_error.set(None);
                                             set_show_confirm.set(true);
                                         }
                                     >
-                                        "Disconnect"
+                                        {action_label}
                                     </Button>
                                 }.into_any()
                             }
@@ -376,7 +386,9 @@ fn ConnectedCard(
                         </Alert>
                     })}
 
-                    <GitHubConnectButton label="Reconnect GitHub" connection_id=connection_id.clone()/>
+                    {(!uninstalled).then(|| view! {
+                        <GitHubConnectButton label="Reconnect GitHub" connection_id=connection_id.clone()/>
+                    })}
                     <GitHubConnectButton label="Reinstall GitHub App" connection_id=connection_id.clone() reinstall=true/>
 
                     // Connection details
@@ -583,6 +595,14 @@ fn format_target_status(category: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    fn boot_executor() {
+        static EXECUTOR: std::sync::Once = std::sync::Once::new();
+        EXECUTOR.call_once(|| {
+            any_spawner::Executor::init_tokio()
+                .expect("native connection rendering initializes the Tokio executor");
+        });
+    }
+
     fn connection(id: &str, repository_selection: &str) -> GitHubConnectionDisplay {
         GitHubConnectionDisplay {
             connection_id: id.into(),
@@ -603,11 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn retained_connections_distinguish_all_and_selected_empty_and_offer_reconnect() {
-        static EXECUTOR: std::sync::Once = std::sync::Once::new();
-        EXECUTOR.call_once(|| {
-            any_spawner::Executor::init_tokio()
-                .expect("native connection rendering initializes the Tokio executor");
-        });
+        boot_executor();
         tokio::task::LocalSet::new().run_until(async {
             let owner = Owner::new();
             let mut pending = connection("pending", "selected");
@@ -627,7 +643,24 @@ mod tests {
             assert!(html.contains("Add account"));
             assert!(html.contains("Repository access needs refresh. Reconnect to refresh permissions."));
             assert_eq!(html.matches("Disconnected").count(), 2);
+            assert_eq!(html.matches("Remove integration").count(), 3);
             assert!(!html.contains("Status Transitions"), "rules belong to the workspace, not the account cards");
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn uninstalled_card_offers_removal_and_reinstall_without_dead_reconnect() {
+        boot_executor();
+        tokio::task::LocalSet::new().run_until(async {
+            let owner = Owner::new();
+            let mut old = connection("old", "all");
+            old.uninstalled = true;
+            let html = owner.with(|| view! {
+                <ConnectedCard connection=old on_disconnected=Callback::new(|()| {})/>
+            }.to_html());
+            assert!(html.contains("Remove integration"));
+            assert!(html.contains("Reinstall GitHub App"));
+            assert!(!html.contains("Reconnect GitHub"));
         }).await;
     }
 }

@@ -36,6 +36,7 @@ pub struct GitHubInstallation {
     pub created_at: String,
     pub suspended_at: Option<String>,
     pub disconnected_at: Option<String>,
+    pub archived_at: Option<String>,
     pub uninstalled_at: Option<String>,
     pub authorization_verified_at: Option<String>,
     pub github_account_id: Option<i64>,
@@ -48,6 +49,7 @@ impl GitHubInstallation {
     /// Legacy connections stay quarantined until user authorization revalidates identity.
     pub fn is_active(&self) -> bool {
         !self.repository_scope_pending
+            && self.archived_at.is_none()
             && self.disconnected_at.is_none()
             && self.suspended_at.is_none()
             && self.uninstalled_at.is_none()
@@ -242,6 +244,7 @@ pub async fn get_installation_by_github_id(
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(suspended_at AS TEXT) AS suspended_at, \
                 CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(archived_at AS TEXT) AS archived_at, \
                 CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
                 CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
                 github_account_id, repository_selection, token_generation, repository_scope_pending \
@@ -267,6 +270,7 @@ pub async fn list_installations_for_workspace(
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(suspended_at AS TEXT) AS suspended_at, \
                 CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(archived_at AS TEXT) AS archived_at, \
                 CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
                 CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
                 github_account_id, repository_selection, token_generation, repository_scope_pending \
@@ -275,6 +279,105 @@ pub async fn list_installations_for_workspace(
         workspace_id
     )?;
     Ok(row)
+}
+
+/// Settings omit removed rows and obsolete uninstalled generations of a stable account.
+/// Historical and provider lookups deliberately retain every immutable installation.
+pub async fn list_visible_installations_for_workspace(
+    db: &DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Vec<GitHubInstallation>> {
+    let rows = list_installations_for_workspace(db, workspace_id).await?;
+    Ok(rows
+        .iter()
+        .filter(|row| {
+            row.archived_at.is_none()
+                && !(row.uninstalled_at.is_some()
+                    && row.github_account_id.is_some()
+                    && rows.iter().any(|newer| {
+                        newer.github_app_id == row.github_app_id
+                            && newer.github_account_id == row.github_account_id
+                            && (newer.created_at > row.created_at
+                                || (newer.created_at == row.created_at
+                                    && newer.github_installation_id > row.github_installation_id))
+                    }))
+        })
+        .cloned()
+        .collect())
+}
+
+/// Remove an inactive settings card without releasing ownership or deleting history.
+pub async fn remove_installation(
+    db: &DbPool,
+    installation_id: &str,
+    workspace_id: &str,
+    user_id: &str,
+) -> trakkt_core::Result<()> {
+    remove_installation_with_delivery(db, installation_id, workspace_id, user_id, None).await
+}
+
+pub async fn remove_installation_with_delivery(
+    db: &DbPool,
+    installation_id: &str,
+    workspace_id: &str,
+    user_id: &str,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    crate::authorization::require_admin(db, user_id, workspace_id).await?;
+    let row = get_installation_by_id(db, installation_id)
+        .await?
+        .ok_or_else(|| trakkt_core::Error::NotFound("GitHub connection not found".into()))?;
+    if row.workspace_id != workspace_id {
+        return Err(trakkt_core::Error::Forbidden(
+            "GitHub connection belongs to another workspace".into(),
+        ));
+    }
+    #[cfg(test)]
+    mutation_pause::wait(&format!("remove-before-membership-{installation_id}")).await;
+    let is_pg = db.is_postgres();
+    let mut tx = db.begin().await?;
+    // Serialize membership revocation with removal; also acquire SQLite's writer
+    // lock before rechecking current role on its single transaction connection.
+    trakkt_core::tx_execute!(
+        &mut tx,
+        "UPDATE workspace_users SET role = role WHERE user_id = $1 AND workspace_id = $2",
+        user_id,
+        workspace_id
+    )?;
+    let admin_sql = format!(
+        "SELECT COUNT(*) FROM workspace_users WHERE user_id = $1 AND workspace_id = $2 AND role = 'workspace_admin' AND active = {}",
+        sql_compat::bool_true(is_pg)
+    );
+    if trakkt_core::tx_fetch_scalar!(&mut tx, i64, &admin_sql, user_id, workspace_id)? == 0 {
+        return Err(trakkt_core::Error::Forbidden(
+            "Current workspace administrator access required".into(),
+        ));
+    }
+    let sql = format!(
+        "UPDATE github_installations SET archived_at = {}, access_token_encrypted = NULL, token_expires_at = NULL, token_generation = token_generation + 1 WHERE installation_id = $1 AND workspace_id = $2 AND archived_at IS NULL AND (disconnected_at IS NOT NULL OR suspended_at IS NOT NULL OR uninstalled_at IS NOT NULL OR authorization_verified_at IS NULL OR repository_scope_pending = {})",
+        sql_compat::now(is_pg),
+        sql_compat::bool_true(is_pg)
+    );
+    let updated = trakkt_core::tx_execute!(&mut tx, &sql, installation_id, workspace_id)?;
+    if updated.rows_affected() == 0 {
+        let archived = trakkt_core::tx_fetch_scalar!(
+            &mut tx,
+            bool,
+            "SELECT archived_at IS NOT NULL FROM github_installations WHERE installation_id = $1",
+            installation_id
+        )?;
+        if !archived {
+            return Err(trakkt_core::Error::Conflict(
+                "Disconnect the GitHub connection before removing it".into(),
+            ));
+        }
+    }
+    let batch = if updated.rows_affected() == 0 {
+        trakkt_auth::sync_log_service::SyncBatch::new()
+    } else {
+        record_installation_change(&mut tx, installation_id).await?
+    };
+    batch.commit_and_deliver(tx, ws_manager).await
 }
 
 /// Legacy single-connection helper: never silently select among multiple connections.
@@ -340,6 +443,7 @@ pub async fn create_installation(
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(suspended_at AS TEXT) AS suspended_at, \
                 CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(archived_at AS TEXT) AS archived_at, \
                 CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
                 CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
                 github_account_id, repository_selection, token_generation, repository_scope_pending \
@@ -676,7 +780,7 @@ pub async fn cache_installation_token(
 ) -> trakkt_core::Result<bool> {
     let expiry = sql_compat::cast_to_timestamptz(db.is_postgres(), "$2");
     let sql = format!(
-        "UPDATE github_installations SET access_token_encrypted = $1, token_expires_at = {expiry} WHERE installation_id = $3 AND token_generation = $4 AND disconnected_at IS NULL AND suspended_at IS NULL AND uninstalled_at IS NULL AND authorization_verified_at IS NOT NULL AND repository_scope_pending = {}",
+        "UPDATE github_installations SET access_token_encrypted = $1, token_expires_at = {expiry} WHERE installation_id = $3 AND token_generation = $4 AND archived_at IS NULL AND disconnected_at IS NULL AND suspended_at IS NULL AND uninstalled_at IS NULL AND authorization_verified_at IS NOT NULL AND repository_scope_pending = {}",
         sql_compat::bool_false(db.is_postgres())
     );
     Ok(trakkt_core::db_execute!(
@@ -722,6 +826,7 @@ impl trakkt_core::db::TransactionAdmission for ConnectionAdmission<'_> {
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(suspended_at AS TEXT) AS suspended_at, \
                 CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(archived_at AS TEXT) AS archived_at, \
                 CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
                 CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
                 github_account_id, repository_selection, token_generation, repository_scope_pending \
@@ -1081,6 +1186,7 @@ pub async fn get_installation_by_id(
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(suspended_at AS TEXT) AS suspended_at, \
                 CAST(disconnected_at AS TEXT) AS disconnected_at, \
+                CAST(archived_at AS TEXT) AS archived_at, \
                 CAST(uninstalled_at AS TEXT) AS uninstalled_at, \
                 CAST(authorization_verified_at AS TEXT) AS authorization_verified_at, \
                 github_account_id, repository_selection, token_generation, repository_scope_pending \

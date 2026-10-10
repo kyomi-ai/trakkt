@@ -92,6 +92,7 @@ struct ConnectionState {
     expected_installation_id: Option<i64>,
     expected_account_id: Option<i64>,
     expected_token_generation: Option<i64>,
+    archived_installation_generations: Option<String>,
     installation_id: Option<i64>,
     verifier_encrypted: String,
     expires_at: i64,
@@ -160,7 +161,7 @@ async fn load_state(
         return Err(invalid_state());
     }
     let row = trakkt_core::db_fetch_optional!(db, ConnectionState,
-        "SELECT state_hash, user_id, workspace_id, action, expected_installation_id, expected_account_id, expected_token_generation, installation_id, verifier_encrypted, expires_at, phase FROM github_connection_states WHERE state_hash = $1", hash(state))?
+        "SELECT state_hash, user_id, workspace_id, action, expected_installation_id, expected_account_id, expected_token_generation, archived_installation_generations, installation_id, verifier_encrypted, expires_at, phase FROM github_connection_states WHERE state_hash = $1", hash(state))?
         .ok_or_else(invalid_state)?;
     if row.user_id != user_id
         || row.phase != phase
@@ -444,6 +445,23 @@ pub async fn start_connection(
     } else {
         None
     };
+    // A fresh Add may intentionally restore a removed account. Capture only
+    // archived rows now, never eligibility discovered later at setup/callback.
+    // A remove or lifecycle change after this snapshot advances its generation.
+    let archived_generations = if existing.is_none() {
+        let rows = crate::schema::list_installations_for_workspace(db, workspace_id).await?;
+        let generations: std::collections::BTreeMap<i64, i64> = rows
+            .into_iter()
+            .filter(|row| row.archived_at.is_some())
+            .map(|row| (row.github_installation_id, row.token_generation))
+            .collect();
+        Some(
+            serde_json::to_string(&generations)
+                .map_err(|_| Error::Internal("Could not record GitHub connection intent".into()))?,
+        )
+    } else {
+        None
+    };
     let state = random_secret()?;
     let verifier = random_secret()?;
     let verifier_encrypted = trakkt_auth::encryption::encrypt(&verifier, key)?;
@@ -476,7 +494,7 @@ pub async fn start_connection(
     )?;
     let inserted = trakkt_core::db_execute!(
         db,
-        "INSERT INTO github_connection_states (state_hash, user_id, workspace_id, action, expected_installation_id, expected_account_id, installation_id, verifier_encrypted, expires_at, phase, expected_token_generation) VALUES ($1, $2, $3, $4, $5, $6, $5, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
+        "INSERT INTO github_connection_states (state_hash, user_id, workspace_id, action, expected_installation_id, expected_account_id, installation_id, verifier_encrypted, expires_at, phase, expected_token_generation, archived_installation_generations) VALUES ($1, $2, $3, $4, $5, $6, $5, $7, $8, $9, $10, $11) ON CONFLICT DO NOTHING",
         hash(&state),
         user_id,
         workspace_id,
@@ -486,7 +504,8 @@ pub async fn start_connection(
         verifier_encrypted,
         expires_at,
         phase,
-        existing.as_ref().map(|row| row.token_generation)
+        existing.as_ref().map(|row| row.token_generation),
+        archived_generations
     )?;
     if inserted.rows_affected() != 1 {
         return Err(Error::Internal(
@@ -520,10 +539,21 @@ pub async fn start_direct_connection(
         return Err(invalid_state());
     }
     require_admin(db, user_id, workspace_id).await?;
-    let own = crate::schema::list_installations_for_workspace(db, workspace_id).await?
-        .into_iter().find(|row| row.github_installation_id == installation_id);
+    let own = crate::schema::list_installations_for_workspace(db, workspace_id)
+        .await?
+        .into_iter()
+        .find(|row| row.github_installation_id == installation_id);
     if let Some(row) = own {
-        return start_connection(db, client, key, user_id, workspace_id, Some(&row.installation_id), false).await;
+        return start_connection(
+            db,
+            client,
+            key,
+            user_id,
+            workspace_id,
+            Some(&row.installation_id),
+            false,
+        )
+        .await;
     }
     let setup_url = start_connection(db, client, key, user_id, workspace_id, None, false).await?;
     let state = reqwest::Url::parse(&setup_url)
@@ -577,7 +607,9 @@ pub async fn complete_connection(
     state: &str,
     code: &str,
 ) -> Result<()> {
-    complete_connection_with_delivery(db, client, key, user_id, state, code, None).await.map(|_| ())
+    complete_connection_with_delivery(db, client, key, user_id, state, code, None)
+        .await
+        .map(|_| ())
 }
 
 pub async fn complete_connection_with_delivery(
@@ -672,6 +704,12 @@ async fn bind_verified_connection(
     verified: &VerifiedConnection,
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
 ) -> Result<()> {
+    let archived_generations: std::collections::BTreeMap<i64, i64> =
+        match state.archived_installation_generations.as_deref() {
+            Some(encoded) => serde_json::from_str(encoded)
+                .map_err(|_| Error::Internal("Invalid stored GitHub connection intent".into()))?,
+            None => std::collections::BTreeMap::new(),
+        };
     let is_pg = db.is_postgres();
     let active = sql_compat::bool_true(is_pg);
     let admin_sql = format!(
@@ -751,13 +789,13 @@ async fn bind_verified_connection(
         verified.app_id
     )?;
     let existing_sql = format!(
-        "SELECT installation_id, github_installation_id, github_account_id, (disconnected_at IS NULL AND suspended_at IS NULL AND uninstalled_at IS NULL AND authorization_verified_at IS NOT NULL AND repository_scope_pending = {}) AS active FROM github_installations WHERE github_installation_id = $1 AND workspace_id = $2{}",
+        "SELECT installation_id, github_installation_id, github_account_id, (archived_at IS NULL AND disconnected_at IS NULL AND suspended_at IS NULL AND uninstalled_at IS NULL AND authorization_verified_at IS NOT NULL AND repository_scope_pending = {}) AS active, (archived_at IS NOT NULL) AS archived, token_generation FROM github_installations WHERE github_installation_id = $1 AND workspace_id = $2{}",
         sql_compat::bool_false(is_pg),
         if is_pg { " FOR UPDATE" } else { "" }
     );
-    let existing: Option<(String, i64, Option<i64>, bool)> = trakkt_core::tx_fetch_optional!(
+    let existing: Option<(String, i64, Option<i64>, bool, bool, i64)> = trakkt_core::tx_fetch_optional!(
         &mut tx,
-        (String, i64, Option<i64>, bool),
+        (String, i64, Option<i64>, bool, bool, i64),
         &existing_sql,
         verified.installation_id,
         &state.workspace_id
@@ -776,23 +814,24 @@ async fn bind_verified_connection(
                 "Reconnect must authorize the existing GitHub account".into(),
             ));
         }
-        // Add-account callbacks may rediscover an active identity, but are not
-        // generation-bound reconnects. Consume them idempotently without
-        // changing permissions, credentials, or lifecycle state.
-        if state.action != "reconnect"
-            || state.expected_installation_id != Some(verified.installation_id)
-        {
+        let explicit_reconnect = state.action == "reconnect"
+            && state.expected_installation_id == Some(verified.installation_id);
+        let fresh_archived_add = state.action == "connect"
+            && existing.4
+            && archived_generations.get(&verified.installation_id) == Some(&existing.5);
+        if !explicit_reconnect && !fresh_archived_add {
+            // An Add that started before removal cannot acquire restoration
+            // intent at setup or callback. Active identities remain idempotent.
             if !existing.3 {
                 return Err(Error::Conflict(
-                    "This GitHub connection requires an explicit reconnect from its settings card."
-                        .into(),
+                    "This GitHub connection changed during authorization. Start again from settings.".into(),
                 ));
             }
             tx.commit().await?;
             return Ok(());
         }
         let sql = format!(
-            "UPDATE github_installations SET github_account_id = $2, account_login = $3, account_type = $4, suspended_at = NULL, disconnected_at = NULL, uninstalled_at = NULL, authorization_verified_at = {}, access_token_encrypted = NULL, token_expires_at = NULL, token_generation = token_generation + 1, repository_scope_pending = {}, repository_selection = $7, target_repos = {repos_cast} WHERE installation_id = $5 AND github_installation_id = $1",
+            "UPDATE github_installations SET github_account_id = $2, account_login = $3, account_type = $4, suspended_at = NULL, disconnected_at = NULL, uninstalled_at = NULL, archived_at = NULL, authorization_verified_at = {}, access_token_encrypted = NULL, token_expires_at = NULL, token_generation = token_generation + 1, repository_scope_pending = {}, repository_selection = $7, target_repos = {repos_cast} WHERE installation_id = $5 AND github_installation_id = $1",
             sql_compat::now(is_pg),
             sql_compat::bool_false(is_pg)
         );
@@ -1147,8 +1186,31 @@ mod tests {
             router.route("/app/installations/123", get(app_details))
         } else {
             router
-        }
-        .with_state(Arc::new(scenario));
+        };
+        let router = if !matches!(scenario.installation_id, 123 | 456) {
+            router
+                .route(
+                    &format!("/app/installations/{}", scenario.installation_id),
+                    get(app_details),
+                )
+                .route(
+                    &format!(
+                        "/user/installations/{}/repositories",
+                        scenario.installation_id
+                    ),
+                    get(repositories),
+                )
+                .route(
+                    &format!(
+                        "/app/installations/{}/access_tokens",
+                        scenario.installation_id
+                    ),
+                    post(installation_token),
+                )
+        } else {
+            router
+        };
+        let router = router.with_state(Arc::new(scenario));
         let task = tokio::spawn(async move {
             axum::serve(listener, router)
                 .await
@@ -1276,6 +1338,206 @@ mod tests {
             .1
             .into_owned()
     }
+    trakkt_core::dual_backend_test! {
+        async fn github_archive_authorization_history_rollback_and_verified_restore(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            let row = crate::schema::get_installation_by_github_id(db,123).await.expect("read active fixture").expect("fixture connected");
+            trakkt_core::test_helpers::seed_team(db,"archive-team","workspace-a","ARC").await.expect("seed archive history team");
+            trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed archive history statuses");
+            let issue = trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"archive-team".into(),creator_id:"admin-a".into(),title:"Historical linked ticket".into(),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create historical linked issue");
+            crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&row.installation_id,link_type:"pull_request",github_id:Some(700),github_node_id:None,repo_full_name:"example/repo",ref_identifier:"700",title:Some("Historical PR"),state:Some("merged"),url:"https://github.com/example/repo/pull/700",author_login:Some("fixture-user"),close_intent:true}).await.expect("seed historical PR link");
+            let event = crate::schema::create_event(db,"archive-history",Some(&row.installation_id),"pull_request",Some("closed"),None).await.expect("seed historical webhook event");
+            let before = snapshot(db).await;
+            assert!(crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a").await.is_err(),"active connections require disconnect first");
+            assert!(crate::schema::remove_installation(db,&row.installation_id,"workspace-b","admin-b").await.is_err(),"foreign workspace administrator cannot remove card");
+            assert!(crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-b").await.is_err(),"nonmember cannot remove card");
+            assert_eq!(before,snapshot(db).await);
+            let member_sql = format!("INSERT INTO workspace_users (workspace_id,user_id,role,active) VALUES ('workspace-a','admin-b','workspace_user',{}) ON CONFLICT DO NOTHING",sql_compat::bool_true(db.is_postgres()));
+            trakkt_core::db_execute!(db,&member_sql).expect("seed current nonadmin member");
+            assert!(crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-b").await.is_err(),"current member cannot remove integration");
+            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("disconnect before removal");
+            let pending = oauth_state(&start_direct_connection(db,&github.client,&KEY,"admin-a","workspace-a",123).await.expect("start reconnect before removal"));
+            let generic_before_remove = start_connection(db,&github.client,&KEY,"admin-a","workspace-a",None,false).await.expect("start generic Add before removal");
+            let rows = crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("snapshot before removal rollback");
+            let before = snapshot(db).await;
+            trakkt_core::test_helpers::dual_backend::reject_sync_log_inserts_of_type(db,"GITHUB_INSTALLATION").await;
+            assert!(crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a").await.is_err(),"failed durable invalidation rolls removal back");
+            assert_eq!(rows,crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("reload removal rollback"));
+            assert_eq!(before,snapshot(db).await);
+            trakkt_core::test_helpers::dual_backend::clear_sync_log_rejection(db).await;
+            crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a").await.expect("remove inactive card");
+            let archived = crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("historical lookup").expect("removed history remains");
+            assert!(archived.archived_at.is_some()); assert!(!archived.is_active());
+            assert_eq!(archived.token_generation,rows[0].token_generation+1);
+            assert!(archived.access_token_encrypted.is_none()); assert!(archived.token_expires_at.is_none());
+            assert!(crate::schema::list_visible_installations_for_workspace(db,"workspace-a").await.expect("visible list").is_empty());
+            let removed = snapshot(db).await;
+            for name in ["accounts","owners","links","rules"] { assert_eq!(before.5[name],removed.5[name],"removal preserves {name}"); }
+            crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a").await.expect("repeated removal is idempotent");
+            assert_eq!(removed,snapshot(db).await);
+            assert_eq!(trakkt_core::db_fetch_scalar!(db,String,"SELECT installation_id FROM github_events WHERE event_id = $1",&event).expect("historical webhook owner remains"),row.installation_id);
+            assert_eq!(crate::schema::list_links_for_issue(db,&issue.issue_id).await.expect("historical PR remains navigable").len(),1);
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&pending,"valid").await.is_err(),"stale callback cannot reverse removal");
+            crate::schema::unsuspend_installation(db,&row.installation_id).await.expect("provider lifecycle update remains safe");
+            assert!(!crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("read webhook result").expect("history remains").is_active());
+            let state = reqwest::Url::parse(&generic_before_remove).expect("parse generic Add setup URL").query_pairs().find(|(key,_)|key=="state").expect("generic Add setup state").1.into_owned();
+            let url = advance_setup(db,&github.client,&KEY,"admin-a",&state,123,"install").await.expect("advance generic Add");
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&oauth_state(&url),"valid").await.is_err(),"generic Add must not resurrect an archived identity");
+            let fresh = oauth_state(&start_direct_connection(db,&github.client,&KEY,"admin-a","workspace-a",123).await.expect("explicit fresh admin confirmation for removed installation"));
+            complete_connection(db,&github.client,&KEY,"admin-a",&fresh,"valid").await.expect("verified intentional reconnect restores same history");
+            let restored=crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("reload restored row").expect("same historical row");
+            assert!(restored.is_active()); assert!(restored.archived_at.is_none());
+            assert_eq!(restored.installation_id,row.installation_id);
+            assert_eq!(crate::schema::list_visible_installations_for_workspace(db,"workspace-a").await.expect("restored visible").len(),1);
+        }
+    }
+
+    fn setup_state(url: &str) -> String {
+        reqwest::Url::parse(url)
+            .expect("parse setup URL")
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .expect("setup state")
+            .1
+            .into_owned()
+    }
+
+    async fn add_oauth_state(db: &DbPool, client: &GitHubClient, installation_id: i64) -> String {
+        let url = start_connection(db, client, &KEY, "admin-a", "workspace-a", None, false)
+            .await
+            .expect("start fresh generic Add account");
+        let url = advance_setup(
+            db,
+            client,
+            &KEY,
+            "admin-a",
+            &setup_state(&url),
+            installation_id,
+            "install",
+        )
+        .await
+        .expect("advance generic Add setup");
+        oauth_state(&url)
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_archive_fresh_normal_add_restores_and_old_setup_oauth_cannot(db) {
+            seed(db).await;
+            let github=controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            let row=crate::schema::get_installation_by_github_id(db,123).await.expect("read original connection").expect("original exists");
+            let pre_setup=start_connection(db,&github.client,&KEY,"admin-a","workspace-a",None,false).await.expect("Add setup started before removal");
+            let pre_oauth=add_oauth_state(db,&github.client,123).await;
+            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("disconnect original");
+            crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a").await.expect("remove original");
+            let archived=crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("read removed row").expect("history remains");
+            let history=snapshot(db).await;
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&pre_oauth,"valid").await.is_err(),"OAuth started before removal cannot restore");
+            let advanced=advance_setup(db,&github.client,&KEY,"admin-a",&setup_state(&pre_setup),123,"install").await.expect("old setup only selects untrusted candidate");
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&oauth_state(&advanced),"valid").await.is_err(),"setup started before removal cannot acquire restore intent later");
+            assert_eq!(history,snapshot(db).await);
+            let a=add_oauth_state(db,&github.client,123).await;
+            let b=add_oauth_state(db,&github.client,123).await;
+            let stored=load_state(db,&a,"admin-a","oauth").await.expect("load server-owned Add snapshot");
+            let generations:std::collections::BTreeMap<i64,i64>=serde_json::from_str(stored.archived_installation_generations.as_deref().expect("fresh Add snapshots archived rows")).expect("decode archived-generation intent");
+            assert_eq!(generations,std::collections::BTreeMap::from([(123,archived.token_generation)]));
+            let (first,second)=tokio::join!(complete_connection(db,&github.client,&KEY,"admin-a",&a,"valid"),complete_connection(db,&github.client,&KEY,"admin-a",&b,"valid"));
+            first.expect("fresh normal Add restores removed account");
+            second.expect("concurrent fresh Add sees active identity idempotently");
+            let restored=crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("read restored identity").expect("same row restored");
+            assert!(restored.is_active());assert!(restored.archived_at.is_none());
+            assert_eq!(restored.token_generation,archived.token_generation+1,"one restoration mutation across concurrent Add callbacks");
+            assert_eq!(crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("one historical installation").len(),1);
+            assert_eq!(crate::schema::list_visible_installations_for_workspace(db,"workspace-a").await.expect("restored card visible").len(),1);
+            let after=snapshot(db).await;
+            for name in ["accounts","owners","links","rules"] {assert_eq!(history.5[name],after.5[name],"fresh normal Add preserves {name}");}
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&a,"valid").await.is_err(),"restore remains single-use");
+            let foreign=start_connection(db,&github.client,&KEY,"admin-b","workspace-b",None,false).await.expect("foreign workspace Add has its own intent");
+            let foreign=advance_setup(db,&github.client,&KEY,"admin-b",&setup_state(&foreign),123,"install").await.expect("foreign candidate only enters OAuth");
+            assert!(complete_connection(db,&github.client,&KEY,"admin-b",&oauth_state(&foreign),"valid").await.is_err(),"archived restore never releases permanent foreign ownership");
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_archive_add_snapshot_cannot_reverse_newer_lifecycle_or_removal(db) {
+            seed(db).await;
+            let github=controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            let row=crate::schema::get_installation_by_github_id(db,123).await.expect("read lifecycle fixture").expect("fixture connected");
+            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("disconnect fixture");
+            crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a").await.expect("remove fixture");
+            let stale=add_oauth_state(db,&github.client,123).await;
+            crate::schema::unsuspend_installation(db,&row.installation_id).await.expect("new provider lifecycle generation while Add pending");
+            let changed=crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("snapshot newer lifecycle");
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&stale,"valid").await.is_err(),"snapshot cannot undo newer lifecycle epoch");
+            assert_eq!(changed,crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("failed callback retains archive"));
+            let stale_again=add_oauth_state(db,&github.client,123).await;
+            reconnect_account(db,&github.client,&changed[0]).await;
+            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("new disconnect after restoration");
+            crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a").await.expect("new removal after restoration");
+            let removed=crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("snapshot newer removal");
+            let history=snapshot(db).await;
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&stale_again,"valid").await.is_err(),"older archived-generation snapshot cannot undo a later remove");
+            assert_eq!(removed,crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("newer removal stays intact"));
+            assert_eq!(history,snapshot(db).await);
+            let fresh=add_oauth_state(db,&github.client,123).await;
+            complete_connection(db,&github.client,&KEY,"admin-a",&fresh,"valid").await.expect("new Add after latest removal remains usable");
+            assert!(crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("read latest restore").expect("same identity").is_active());
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_archive_rechecks_membership_after_concurrent_revocation(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            let row=crate::schema::get_installation_by_github_id(db,123).await.expect("fixture row").expect("connected fixture");
+            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("inactive removal target");
+            let rows=crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("snapshot race target");
+            let before=snapshot(db).await;
+            let (reached,resume)=crate::schema::mutation_pause::register(&format!("remove-before-membership-{}",row.installation_id));
+            let remove=crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a");
+            let revoke=async {
+                reached.notified().await;
+                trakkt_core::db_execute!(db,"UPDATE workspace_users SET role = 'workspace_user' WHERE user_id = 'admin-a' AND workspace_id = 'workspace-a'").expect("revoke admin after initial pool authorization");
+                resume.notify_one();
+            };
+            let (result,())=tokio::time::timeout(std::time::Duration::from_secs(20),async {tokio::join!(remove,revoke)}).await.expect("removal membership race completes without deadlock");
+            assert!(matches!(result,Err(Error::Forbidden(_))),"transaction must reject newly revoked administrator");
+            assert_eq!(rows,crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("no archived state after revocation"));
+            assert_eq!(before,snapshot(db).await,"revocation leaves installation history, claims, rules and sync unchanged");
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_visible_list_uses_stable_identity_preserves_active_and_unrelated(db) {
+            seed(db).await;
+            let old=controlled(Scenario::default()).await;
+            add_account(db,&old.client,123).await;
+            let old_row=crate::schema::get_installation_by_github_id(db,123).await.expect("old row").expect("old connected");
+            let replacement=controlled(Scenario {installation_id:456,account_login:"renamed-account",..Scenario::default()}).await;
+            add_account(db,&replacement.client,456).await;
+            assert_eq!(crate::schema::list_visible_installations_for_workspace(db,"workspace-a").await.expect("active installations stay visible").len(),2);
+            crate::schema::uninstall_installation(db,&old_row.installation_id).await.expect("old provider installation deleted");
+            let unrelated=controlled(Scenario {installation_id:789,account_id:66,..Scenario::default()}).await;
+            add_account(db,&unrelated.client,789).await;
+            let all=crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("all historical installations");
+            let visible=crate::schema::list_visible_installations_for_workspace(db,"workspace-a").await.expect("current settings cards");
+            assert_eq!(all.len(),3); assert_eq!(visible.len(),2);
+            assert!(visible.iter().any(|row|row.github_installation_id==456));
+            assert!(visible.iter().any(|row|row.github_installation_id==789),"same mutable login never groups unrelated stable accounts");
+            let replacement=visible.iter().find(|row|row.github_installation_id==456).expect("new row visible");
+            crate::schema::disconnect_installation(db,&replacement.installation_id,"workspace-a").await.expect("newer disconnected card remains current");
+            assert_eq!(crate::schema::list_visible_installations_for_workspace(db,"workspace-a").await.expect("old duplicate suppressed even when replacement disconnected").len(),2);
+            crate::schema::remove_installation(db,&replacement.installation_id,"workspace-a","admin-a").await.expect("remove latest inactive card");
+            let visible=crate::schema::list_visible_installations_for_workspace(db,"workspace-a").await.expect("removal must not resurrect old duplicate");
+            assert_eq!(visible.len(),1); assert_eq!(visible[0].github_installation_id,789);
+            assert_eq!(crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("all history retained after latest removal").len(),3);
+        }
+    }
+
     type BindingSnapshot = (i64, i64, i64, i64, i64, serde_json::Value);
     type InstallationSnapshot = (
         String,
@@ -1314,8 +1576,15 @@ mod tests {
 
     fn oauth_state(url: &str) -> String {
         let url = reqwest::Url::parse(url).expect("parse direct installation OAuth URL");
-        assert!(url.query_pairs().any(|(key, value)| key == "code_challenge_method" && value == "S256"));
-        url.query_pairs().find(|(key, _)| key == "state").expect("fresh direct authorization state").1.into_owned()
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| key == "code_challenge_method" && value == "S256")
+        );
+        url.query_pairs()
+            .find(|(key, _)| key == "state")
+            .expect("fresh direct authorization state")
+            .1
+            .into_owned()
     }
 
     trakkt_core::dual_backend_test! {

@@ -12,7 +12,7 @@ async function main() {
   const dist = process.env.GITHUB_DIRECT_DIST_DIR;
   if (!binary || !dist) throw new Error('Set GITHUB_DIRECT_SERVER_BINARY and GITHUB_DIRECT_DIST_DIR to freshly built binary/assets');
   await Promise.all([access(resolve(binary)), access(join(resolve(dist), 'index.html'))]);
-  const port = Number(process.env.GITHUB_DIRECT_PORT ?? '3701');
+  const port = Number(process.env.GITHUB_DIRECT_PORT ?? '3702');
   await new Promise((done, reject) => {
     const probe = createServer();
     probe.once('error', reject);

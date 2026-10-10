@@ -54,6 +54,9 @@ on:
       - 'crates/trakkt-ui/src/app.rs'
       - 'crates/trakkt-ui/src/server_fns/github.rs'
       - 'crates/trakkt-github/src/authorization.rs'
+      - 'crates/trakkt-github/src/schema.rs'
+      - 'apps/server/migrations/*github*'
+      - 'apps/server/migrations-sqlite/*github*'
       # The server half of the same path: what gets written to sync_log, what is
       # broadcast live, and what a reconnecting client is replayed.
       - 'crates/trakkt-auth/src/sync_log_service.rs'
