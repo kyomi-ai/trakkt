@@ -107,6 +107,10 @@ pub fn App() -> impl IntoView {
                 <Route path=path!("/auth/recover-passkey/complete") view=PasskeyRecoveryCompletePage/>
                 <Route path=path!("/oauth-complete") view=OAuthCompletePage/>
 
+                // GitHub callbacks handle signed-out direct installs without losing the candidate.
+                <Route path=path!("/integrations/github/callback") view=GitHubCallbackPage/>
+                <Route path=path!("/integrations/github/oauth/callback") view=GitHubCallbackPage/>
+
                 // ── Authenticated routes (Layout provides sidebar + auth guard) ────
                 <ParentRoute path=path!("") view=Layout>
                     <Route path=path!("/") view=|| view! { <Redirect path="/my-issues"/> }/>
@@ -148,8 +152,6 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/projects/:id") view=ProjectDetailPage/>
 
                     // GitHub App installation callback
-                    <Route path=path!("/integrations/github/callback") view=GitHubCallbackPage/>
-                    <Route path=path!("/integrations/github/oauth/callback") view=GitHubCallbackPage/>
 
                     // Settings
                     <ParentRoute path=path!("/settings") view=|| view! {

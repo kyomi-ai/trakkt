@@ -141,6 +141,38 @@ pub async fn start_github_connection(
     .into_sfn()
 }
 
+/// Workspace choices for direct-install confirmation, from active memberships.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GitHubConnectWorkspace {
+    pub workspace_id: String,
+    pub name: String,
+    pub is_current: bool,
+    pub is_admin: bool,
+}
+
+#[server(prefix = "/leptos-api")]
+pub async fn get_github_connect_workspaces() -> Result<Vec<GitHubConnectWorkspace>, ServerFnError> {
+    let auth = super::extract_auth().await?;
+    let ctx = super::extract_context()?;
+    Ok(trakkt_auth::workspace_service::get_user_workspaces(&ctx.db, &auth.user_id)
+        .await.into_sfn()?.into_iter().map(|(workspace, membership)| GitHubConnectWorkspace {
+            is_current: auth.workspace.workspace_id.as_deref() == Some(&workspace.workspace_id),
+            is_admin: membership.role.to_string() == "workspace_admin",
+            workspace_id: workspace.workspace_id,
+            name: workspace.name.unwrap_or_else(|| "Unnamed Workspace".into()),
+        }).collect())
+}
+
+/// Explicitly confirmed workspace; active-workspace switches cannot retarget it.
+#[server(prefix = "/leptos-api")]
+pub async fn start_direct_github_connection(installation_id: i64, workspace_id: String) -> Result<String, ServerFnError> {
+    let auth = super::extract_auth().await?;
+    let ctx = super::extract_context()?;
+    let client = ctx.github_client.as_deref().ok_or_else(|| ServerFnError::new("GitHub App not configured"))?;
+    let key = ctx.encryption_key.as_deref().ok_or_else(|| ServerFnError::new("Credential encryption not configured"))?;
+    trakkt_github::authorization::start_direct_connection(&ctx.db, client, key, &auth.user_id, &workspace_id, installation_id).await.into_sfn()
+}
+
 /// Setup callback selects a candidate and returns a separate OAuth redirect.
 #[server(prefix = "/leptos-api")]
 pub async fn process_github_callback(
@@ -177,7 +209,7 @@ pub async fn process_github_callback(
 pub async fn complete_github_authorization(
     state: String,
     code: String,
-) -> Result<(), ServerFnError> {
+) -> Result<String, ServerFnError> {
     let auth = super::extract_auth().await?;
     let ctx = super::extract_context()?;
     let client = ctx

@@ -155,6 +155,8 @@ pub fn register_server_functions() {
     use server_fns::github::*;
     register_explicit::<GetGithubIntegrationStatus>();
     register_explicit::<ProcessGithubCallback>();
+    register_explicit::<GetGithubConnectWorkspaces>();
+    register_explicit::<StartDirectGithubConnection>();
     register_explicit::<DisconnectGithub>();
 
     // Billing

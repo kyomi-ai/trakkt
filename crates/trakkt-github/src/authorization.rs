@@ -506,6 +506,35 @@ pub async fn start_connection(
     }
 }
 
+/// Direct GitHub installs are an untrusted candidate, never authorization.
+/// Only an explicit authenticated administrator confirmation starts fresh state.
+pub async fn start_direct_connection(
+    db: &DbPool,
+    client: &GitHubClient,
+    key: &[u8; 32],
+    user_id: &str,
+    workspace_id: &str,
+    installation_id: i64,
+) -> Result<String> {
+    if installation_id <= 0 {
+        return Err(invalid_state());
+    }
+    require_admin(db, user_id, workspace_id).await?;
+    let own = crate::schema::list_installations_for_workspace(db, workspace_id).await?
+        .into_iter().find(|row| row.github_installation_id == installation_id);
+    if let Some(row) = own {
+        return start_connection(db, client, key, user_id, workspace_id, Some(&row.installation_id), false).await;
+    }
+    let setup_url = start_connection(db, client, key, user_id, workspace_id, None, false).await?;
+    let state = reqwest::Url::parse(&setup_url)
+        .map_err(|_| Error::Internal("Invalid GitHub setup URL".into()))?
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(invalid_state)?;
+    advance_setup(db, client, key, user_id, &state, installation_id, "install").await
+}
+
 /// Setup IDs select a candidate only; this never changes a connection.
 /// Rotate the state between setup and OAuth so the setup URL cannot replay as
 /// an authorization response.
@@ -548,7 +577,7 @@ pub async fn complete_connection(
     state: &str,
     code: &str,
 ) -> Result<()> {
-    complete_connection_with_delivery(db, client, key, user_id, state, code, None).await
+    complete_connection_with_delivery(db, client, key, user_id, state, code, None).await.map(|_| ())
 }
 
 pub async fn complete_connection_with_delivery(
@@ -559,7 +588,7 @@ pub async fn complete_connection_with_delivery(
     state: &str,
     code: &str,
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
-) -> Result<()> {
+) -> Result<String> {
     client.oauth_config()?;
     let current = load_state(db, state, user_id, "oauth").await?;
     let installation_id = current.installation_id.ok_or_else(invalid_state)?;
@@ -578,7 +607,8 @@ pub async fn complete_connection_with_delivery(
             "Reconnect must authorize the same GitHub account".into(),
         ));
     }
-    bind_verified_connection(db, user_id, &current, &verified, ws_manager).await
+    bind_verified_connection(db, user_id, &current, &verified, ws_manager).await?;
+    Ok(current.workspace_id)
 }
 
 /// Atomic reusable ownership primitive. Must be invoked inside the binding
@@ -1282,6 +1312,64 @@ mod tests {
         )
     }
 
+    fn oauth_state(url: &str) -> String {
+        let url = reqwest::Url::parse(url).expect("parse direct installation OAuth URL");
+        assert!(url.query_pairs().any(|(key, value)| key == "code_challenge_method" && value == "S256"));
+        url.query_pairs().find(|(key, _)| key == "state").expect("fresh direct authorization state").1.into_owned()
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_direct_install_authorization_binds_only_confirmed_admin_workspace(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            let before = snapshot(db).await;
+            let states = trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM github_connection_states").expect("initial state count");
+            assert!(start_direct_connection(db,&github.client,&KEY,"admin-a","workspace-b",123).await.is_err());
+            assert!(start_direct_connection(db,&github.client,&KEY,"admin-a","workspace-a",0).await.is_err());
+            assert_eq!(states,trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM github_connection_states").expect("unauthorized starts create no states"));
+            let url = start_direct_connection(db,&github.client,&KEY,"admin-b","workspace-b",123).await.expect("confirm direct install for explicit workspace");
+            let state = oauth_state(&url);
+            assert_eq!(before,snapshot(db).await,"confirmation starts OAuth without connection mutation");
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&state,"valid").await.is_err());
+            assert_eq!(before,snapshot(db).await);
+            let destination=complete_connection_with_delivery(db,&github.client,&KEY,"admin-b",&state,"valid",None).await.expect("verified direct installation");
+            assert_eq!(destination,"workspace-b","completion returns state-bound destination");
+            let row=crate::schema::get_installation_by_github_id(db,123).await.expect("read direct binding").expect("direct binding exists");
+            assert_eq!(row.workspace_id,"workspace-b");
+            let bound=snapshot(db).await;
+            assert!(complete_connection(db,&github.client,&KEY,"admin-b",&state,"valid").await.is_err());
+            assert_eq!(bound,snapshot(db).await,"replay never mutates");
+            let foreign=oauth_state(&start_direct_connection(db,&github.client,&KEY,"admin-a","workspace-a",123).await.expect("untrusted foreign candidate may request OAuth"));
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&foreign,"valid").await.is_err());
+            assert_eq!(bound,snapshot(db).await,"verified foreign ownership remains unchanged");
+        }
+    }
+    trakkt_core::dual_backend_test! {
+        async fn github_direct_install_reconnect_and_forged_candidate_fail_closed(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            let invalid=oauth_state(&start_direct_connection(db,&github.client,&KEY,"admin-a","workspace-a",999).await.expect("untrusted candidate starts verification only"));
+            let before=snapshot(db).await;
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&invalid,"valid").await.is_err());
+            assert_eq!(before,snapshot(db).await);
+            let good=oauth_state(&start_direct_connection(db,&github.client,&KEY,"admin-a","workspace-a",123).await.expect("direct candidate"));
+            complete_connection(db,&github.client,&KEY,"admin-a",&good,"valid").await.expect("initial verified direct binding");
+            let row=crate::schema::get_installation_by_github_id(db,123).await.expect("read connection").expect("connection exists");
+            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("disconnect retained connection");
+            let before=snapshot(db).await;
+            let reconnect=oauth_state(&start_direct_connection(db,&github.client,&KEY,"admin-a","workspace-a",123).await.expect("own retained candidate chooses generation-bound reconnect"));
+            assert_eq!(before,snapshot(db).await);
+            complete_connection(db,&github.client,&KEY,"admin-a",&reconnect,"valid").await.expect("verified direct reconnect");
+            let after=crate::schema::get_installation_by_github_id(db,123).await.expect("read restored connection").expect("restored connection exists");
+            assert_eq!(row.installation_id,after.installation_id);
+            assert!(after.disconnected_at.is_none());
+            let stale=oauth_state(&start_direct_connection(db,&github.client,&KEY,"admin-a","workspace-a",123).await.expect("start generation bound direct reconnect"));
+            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("newer disconnect");
+            let disconnected=snapshot(db).await;
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&stale,"valid").await.is_err());
+            assert_eq!(disconnected,snapshot(db).await,"old direct reconnect cannot undo newer disconnect");
+        }
+    }
     trakkt_core::dual_backend_test! {
         async fn github_authorization_persists_only_verified_original_workspace(db) {
             seed(db).await;

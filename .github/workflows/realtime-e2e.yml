@@ -51,6 +51,9 @@ on:
       - 'crates/trakkt-ui/src/pages/**'
       - 'crates/trakkt-ui/src/components/**'
       - 'crates/trakkt-ui/src/cache/**'
+      - 'crates/trakkt-ui/src/app.rs'
+      - 'crates/trakkt-ui/src/server_fns/github.rs'
+      - 'crates/trakkt-github/src/authorization.rs'
       # The server half of the same path: what gets written to sync_log, what is
       # broadcast live, and what a reconnecting client is replayed.
       - 'crates/trakkt-auth/src/sync_log_service.rs'
@@ -69,6 +72,9 @@ on:
       - 'e2e/tests/connect/**'
       - 'e2e/helpers/connect-fixture.ts'
       - 'e2e/playwright.connect.config.ts'
+      - 'e2e/tests/integrations/github-direct-install*'
+      - 'e2e/playwright.github-direct.config.ts'
+      - 'e2e/scripts/run-github-direct.cjs'
       - 'e2e/package.json'
       - 'e2e/package-lock.json'
       - '.github/workflows/connect-agent.yml'
@@ -173,7 +179,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libssl-dev
+          sudo apt-get install -y --no-install-recommends build-essential clang pkg-config libssl-dev sqlite3
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -280,6 +286,15 @@ jobs:
       - name: Run the two-client realtime suite
         working-directory: e2e
         run: npx playwright test --config playwright.sync.config.ts
+
+      # An independent SQLite/SaaS fixture performs actual password login and
+      # direct GitHub landing checks without using this job's Postgres server.
+      - name: Run direct GitHub installation regression
+        working-directory: e2e
+        env:
+          GITHUB_DIRECT_SERVER_BINARY: ${{ github.workspace }}/target/dev-server/trakkt
+          GITHUB_DIRECT_DIST_DIR: ${{ github.workspace }}/crates/trakkt-ui/dist
+        run: node scripts/run-github-direct.cjs
 
       - name: Download the customer Connect agent
         uses: actions/download-artifact@v8
