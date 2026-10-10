@@ -145,6 +145,17 @@ cargo run -p trakkt-server --bin github-backfill -- OLD_INSTALLATION_ID --eviden
 cargo run -p trakkt-server --bin github-backfill -- OLD_INSTALLATION_ID --evidence /secure/authenticated-installation-response.json --apply
 ```
 
+The release image also installs the operator command at `/app/github-backfill`. With the Kubernetes deployment in this repository, run it inside the configured application container so it inherits `DATABASE_URL` and the mounted App private key:
+
+```sh
+# Replace OLD_INSTALLATION_ID with the stored numeric installation ID.
+kubectl -n trakkt exec deploy/trakkt -c trakkt -- /app/github-backfill OLD_INSTALLATION_ID
+# Apply only after reviewing the dry-run result.
+kubectl -n trakkt exec deploy/trakkt -c trakkt -- /app/github-backfill OLD_INSTALLATION_ID --apply
+```
+
+For a separate container, override its default server entrypoint with `/app/github-backfill` and supply the same environment and key mount. When using `--evidence`, the authenticated evidence file must be available inside that container at the supplied path.
+
 Set `DATABASE_URL` and, for the live lookup, `GITHUB_APP_ID`, `GITHUB_APP_NAME`, `GITHUB_APP_PRIVATE_KEY_PATH`. The command's database connection runs the normal migrations, while dry-run rolls back identity/claim/sync mutations. Evidence must be an original authenticated GitHub installation API response or authenticated webhook installation object proving the **exact old installation ID**, configured App ID, **stable numeric account ID** and account type; server operators are responsible for authenticating its provenance. A mutable login, an unverified user-supplied JSON file or a new installation ID is insufficient. The command checks matching installation/App/type and existing ownership, retains permanent claims, and only sets `github_account_id`; workspace, row ID, links, repository selection, suspension and cached tokens remain intact. Conflicting or unavailable evidence fails closed. Rerun for each legacy installation; resolve all unknown deleted identities before enabling new ownership. Ordinary reconnect can annotate its own still-existing legacy installation independently, without waiting for other workspaces' reconnects.
 
 Configure reverse-proxy and ingress access logs to record the path without query parameters (or disable access logging for both GitHub callback paths): GitHub redirects carry sensitive one-time state and OAuth codes. Trakkt request spans omit query parameters, callback responses use `Referrer-Policy: no-referrer` and `Cache-Control: no-store`, and the callback page removes query parameters from browser history before invoking its server function.
