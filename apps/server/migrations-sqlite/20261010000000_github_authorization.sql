@@ -2,7 +2,7 @@
 ALTER TABLE github_installations ADD COLUMN github_account_id BIGINT;
 CREATE UNIQUE INDEX github_installations_account_owner ON github_installations(github_app_id, github_account_id) WHERE github_account_id IS NOT NULL;
 CREATE TABLE github_connection_states (
-    state_hash TEXT PRIMARY KEY,
+    state_hash TEXT PRIMARY KEY NOT NULL,
     user_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     action TEXT NOT NULL CHECK (action IN ('connect', 'reconnect')),
@@ -21,7 +21,7 @@ CREATE TABLE github_account_claims (
     PRIMARY KEY (app_id, account_id)
 );
 CREATE TABLE github_installation_claims (
-    installation_id BIGINT PRIMARY KEY,
+    installation_id BIGINT PRIMARY KEY NOT NULL,
     app_id BIGINT NOT NULL,
     account_id BIGINT NOT NULL,
     workspace_id TEXT NOT NULL
