@@ -780,6 +780,34 @@ pub async fn update_issue(
     action_source_label: Option<&str>,
     ws_manager: Option<&WebSocketManager>,
 ) -> trakkt_core::Result<Issue> {
+    update_issue_with_admission(
+        db,
+        workspace_id,
+        team_key,
+        number,
+        updates,
+        actor_user_id,
+        action_source,
+        action_source_label,
+        ws_manager,
+        None,
+    )
+    .await
+}
+
+/// Update an issue with authorization admission held through its mutation commit.
+pub async fn update_issue_with_admission(
+    db: &DbPool,
+    workspace_id: &str,
+    team_key: &str,
+    number: i32,
+    updates: &IssueUpdate,
+    actor_user_id: Option<&str>,
+    action_source: ActionSource,
+    action_source_label: Option<&str>,
+    ws_manager: Option<&WebSocketManager>,
+    admission: Option<&dyn trakkt_core::db::TransactionAdmission>,
+) -> trakkt_core::Result<Issue> {
     let is_pg = db.is_postgres();
     let now = sql_compat::now(is_pg);
 
@@ -934,6 +962,9 @@ pub async fn update_issue(
     );
 
     let mut tx = db.begin().await?;
+    if let Some(admission) = admission {
+        admission.admit(&mut tx).await?;
+    }
 
     // Bind dynamically. Map to rows_affected() inside the closure so both
     // backend arms return the same type (u64).

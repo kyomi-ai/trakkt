@@ -13,8 +13,8 @@
 
 use trakkt_core::DbPool;
 
-use crate::schema::{self, GitHubInstallation, GitHubTransitionRule};
 use crate::GitHubClient;
+use crate::schema::{self, GitHubInstallation, GitHubTransitionRule};
 
 // ─── Trigger Event Mapping ─────────────────────────────────────────────────
 
@@ -88,7 +88,22 @@ async fn get_installation_token(
     github_client: &GitHubClient,
     installation: &GitHubInstallation,
     encryption_key: &[u8; 32],
+    repository: &str,
 ) -> trakkt_core::Result<String> {
+    let current = schema::get_installation_by_id(db, &installation.installation_id)
+        .await?
+        .ok_or_else(|| trakkt_core::Error::NotFound("GitHub connection no longer exists".into()))?;
+    if !current.is_active() {
+        return Err(trakkt_core::Error::Forbidden(
+            "GitHub connection is inactive".into(),
+        ));
+    }
+    if current.token_generation != installation.token_generation {
+        return Err(trakkt_core::Error::Conflict(
+            "GitHub connection changed; retry the event".into(),
+        ));
+    }
+    let installation = &current;
     // Check if the cached token is still valid (with 5-minute buffer).
     if let Some(ref encrypted_token) = installation.access_token_encrypted
         && let Some(ref expires_str) = installation.token_expires_at
@@ -102,19 +117,21 @@ async fn get_installation_token(
 
     // Token expired or missing — request a fresh one.
     let github_installation_id = installation.github_installation_id as u64;
+    let outbound = schema::admit_outbound(db, installation, repository).await?;
     let token_response = github_client
         .request_installation_token(github_installation_id)
         .await?;
+    outbound.commit().await?;
 
     // Encrypt and persist the new token.
     let encrypted = trakkt_auth::encryption::encrypt(&token_response.token, encryption_key)?;
-    schema::update_installation_token(
-        db,
-        &installation.installation_id,
-        &encrypted,
-        &token_response.expires_at,
-    )
-    .await?;
+    if !schema::cache_installation_token(db, installation, &encrypted, &token_response.expires_at)
+        .await?
+    {
+        return Err(trakkt_core::Error::Conflict(
+            "GitHub connection changed during token refresh".into(),
+        ));
+    }
 
     Ok(token_response.token)
 }
@@ -171,6 +188,19 @@ pub async fn apply_transition_rules(
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
     base_url: &str,
 ) -> trakkt_core::Result<()> {
+    let Some(current) = schema::get_installation_by_id(db, &installation.installation_id).await?
+    else {
+        return Ok(());
+    };
+    if current.workspace_id != workspace_id
+        || !payload
+            .pointer("/repository/full_name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|repo| current.allows_repository(repo))
+    {
+        return Ok(());
+    }
+    let installation = &current;
     // Extract PR details from payload.
     let pr = match payload.get("pull_request") {
         Some(pr) => pr,
@@ -182,7 +212,10 @@ pub async fn apply_transition_rules(
         None => return Ok(()),
     };
 
-    let repo = match payload.pointer("/repository/full_name").and_then(|v| v.as_str()) {
+    let repo = match payload
+        .pointer("/repository/full_name")
+        .and_then(|v| v.as_str())
+    {
         Some(r) => r.to_string(),
         None => return Ok(()),
     };
@@ -196,20 +229,17 @@ pub async fn apply_transition_rules(
     };
 
     // Find all PR links for this PR in this workspace.
-    let links = schema::list_pr_links_by_ref(
-        db,
-        workspace_id,
-        &repo,
-        &pr_number.to_string(),
-    )
-    .await?;
+    let links =
+        schema::list_pr_links_by_ref(db, workspace_id, &repo, &pr_number.to_string()).await?;
 
     if links.is_empty() {
         return Ok(());
     }
 
     // Try to get an installation token (needed for bot comments).
-    let token = match get_installation_token(db, github_client, installation, encryption_key).await {
+    let token = match get_installation_token(db, github_client, installation, encryption_key, &repo)
+        .await
+    {
         Ok(t) => Some(t),
         Err(e) => {
             tracing::warn!(
@@ -229,7 +259,13 @@ pub async fn apply_transition_rules(
         };
 
         // Resolve the target status from the rule's category.
-        let target_status = match trakkt_auth::status_service::get_status_by_category(db, workspace_id, &rule.target_status_category).await? {
+        let target_status = match trakkt_auth::status_service::get_status_by_category(
+            db,
+            workspace_id,
+            &rule.target_status_category,
+        )
+        .await?
+        {
             Some(s) => s,
             None => {
                 tracing::warn!(
@@ -269,7 +305,13 @@ pub async fn apply_transition_rules(
             ..Default::default()
         };
 
-        match trakkt_auth::issue_service::update_issue(
+        #[cfg(test)]
+        schema::mutation_pause::wait(&installation.installation_id).await;
+        let admission = schema::ConnectionAdmission {
+            installation,
+            repository: &repo,
+        };
+        match trakkt_auth::issue_service::update_issue_with_admission(
             db,
             workspace_id,
             &issue.team_key,
@@ -279,6 +321,7 @@ pub async fn apply_transition_rules(
             trakkt_types::enums::ActionSource::Api,
             None,
             ws_manager,
+            Some(&admission),
         )
         .await
         {
@@ -303,6 +346,10 @@ pub async fn apply_transition_rules(
 
         // Post bot comment on the PR (best-effort).
         if let Some(ref token) = token {
+            let outbound = match schema::admit_outbound(db, installation, &repo).await {
+                Ok(outbound) => outbound,
+                Err(_) => return Ok(()),
+            };
             let comment_body = format_transition_comment(
                 trigger,
                 &issue.team_key,
@@ -323,6 +370,7 @@ pub async fn apply_transition_rules(
                     "Failed to post bot comment on PR — transition was applied successfully"
                 );
             }
+            outbound.commit().await?;
         }
     }
 
@@ -373,17 +421,25 @@ pub async fn notify_github_links_on_completion(
             }
         };
 
-        // Skip suspended installations.
-        if installation.suspended_at.is_some() {
+        // Skip inactive connections and repositories outside their current access scope.
+        if !installation.allows_repository(&link.repo_full_name) {
             tracing::debug!(
                 installation_id = %installation.installation_id,
-                "Installation is suspended — skipping outbound notification"
+                "Connection is inactive or repository is outside access scope — skipping outbound notification"
             );
             continue;
         }
 
         // Get an installation token.
-        let token = match get_installation_token(db, github_client, &installation, encryption_key).await {
+        let token = match get_installation_token(
+            db,
+            github_client,
+            &installation,
+            encryption_key,
+            &link.repo_full_name,
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(
@@ -407,6 +463,10 @@ pub async fn notify_github_links_on_completion(
             }
         };
 
+        let outbound = match schema::admit_outbound(db, &installation, &link.repo_full_name).await {
+            Ok(outbound) => outbound,
+            Err(_) => continue,
+        };
         if let Err(e) = github_client
             .create_comment(&token, &link.repo_full_name, pr_number, &comment_body)
             .await
@@ -418,6 +478,7 @@ pub async fn notify_github_links_on_completion(
                 "Failed to post outbound completion comment on PR"
             );
         }
+        outbound.commit().await?;
     }
 
     Ok(())
@@ -436,7 +497,10 @@ mod tests {
 
     #[test]
     fn determine_trigger_ready_for_review() {
-        assert_eq!(determine_trigger("ready_for_review", false), Some("pr_opened"));
+        assert_eq!(
+            determine_trigger("ready_for_review", false),
+            Some("pr_opened")
+        );
     }
 
     #[test]

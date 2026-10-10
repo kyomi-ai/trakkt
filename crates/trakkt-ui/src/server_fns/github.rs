@@ -30,16 +30,28 @@ pub enum GitHubIntegrationStatus {
     NotConfigured,
     /// App automation is configured, but self-service authorization is missing.
     AuthorizationNotConfigured,
-    /// App configured but workspace not connected.
-    NotConnected { app_slug: String, retained_installation: bool },
-    /// Workspace connected to GitHub.
-    Connected {
-        account_login: String,
-        account_type: String,
-        repos: Vec<String>,
-        connected_at: String,
-        github_installation_id: i64,
+    /// All retained connections, including inactive lifecycle states.
+    Connections {
+        connections: Vec<GitHubConnectionDisplay>,
     },
+}
+
+/// Display data for one immutable GitHub installation identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubConnectionDisplay {
+    pub connection_id: String,
+    pub account_login: String,
+    pub account_type: String,
+    pub repos: Vec<String>,
+    pub repository_selection: String,
+    pub connected_at: String,
+    pub github_installation_id: i64,
+    pub active: bool,
+    pub disconnected: bool,
+    pub suspended: bool,
+    pub uninstalled: bool,
+    pub verified: bool,
+    pub scope_pending: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,12 +65,7 @@ use super::{AuthenticatedContext, IntoServerFnError, require_workspace_admin};
 // Server functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Query the current GitHub integration status for the workspace.
-///
-/// Returns one of three variants:
-/// - `NotConfigured` if the GitHub App is not set up at all
-/// - `NotConnected` if the App exists but this workspace hasn't installed it
-/// - `Connected` with account details if the workspace has an active installation
+/// Query every retained GitHub connection for the workspace.
 #[server(prefix = "/leptos-api")]
 pub async fn get_github_integration_status() -> Result<GitHubIntegrationStatus, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
@@ -72,46 +79,43 @@ pub async fn get_github_integration_status() -> Result<GitHubIntegrationStatus, 
         return Ok(GitHubIntegrationStatus::AuthorizationNotConfigured);
     }
 
-    // Check if GitHub App is configured via the database
-    let app = trakkt_github::schema::get_github_app(db).await.into_sfn()?;
-
-    // Determine the app slug from the persisted or running configuration.
-    let app_slug = match app {
-        Some(ref a) => a.app_name.clone(),
-        None => client.app_name().to_string(),
-    };
-
-    // Check if workspace has an active installation
-    let installation = trakkt_github::schema::get_installation_for_workspace(db, &ac.ws_id)
+    let installations = trakkt_github::schema::list_installations_for_workspace(db, &ac.ws_id)
         .await
         .into_sfn()?;
-
-    match installation {
-        Some(inst) if inst.suspended_at.is_none() => {
-            // Parse target_repos JSON to get repo names
-            let repos: Vec<String> = match inst.target_repos.as_deref() {
-                None => Vec::new(),
-                Some(json_str) => serde_json::from_str(json_str).map_err(|e| {
-                    tracing::error!(error = %e, "target_repos JSON is corrupt");
-                    ServerFnError::new(format!("stored repo list is invalid: {e}"))
-                })?,
-            };
-
-            Ok(GitHubIntegrationStatus::Connected {
-                account_login: inst.account_login,
-                account_type: inst.account_type,
-                repos,
-                connected_at: inst.created_at,
-                github_installation_id: inst.github_installation_id,
-            })
-        }
-        other => Ok(GitHubIntegrationStatus::NotConnected { app_slug, retained_installation: other.is_some() }),
+    let mut connections = Vec::with_capacity(installations.len());
+    for inst in installations {
+        let repos = match inst.target_repos.as_deref() {
+            None => Vec::new(),
+            Some(json) => serde_json::from_str(json).map_err(|e| {
+                tracing::error!(error = %e, "target_repos JSON is corrupt");
+                ServerFnError::new(format!("stored repo list is invalid: {e}"))
+            })?,
+        };
+        connections.push(GitHubConnectionDisplay {
+            active: inst.is_active(),
+            disconnected: inst.disconnected_at.is_some(),
+            suspended: inst.suspended_at.is_some(),
+            uninstalled: inst.uninstalled_at.is_some(),
+            verified: inst.authorization_verified_at.is_some(),
+            scope_pending: inst.repository_scope_pending,
+            connection_id: inst.installation_id,
+            account_login: inst.account_login,
+            account_type: inst.account_type,
+            repos,
+            repository_selection: inst.repository_selection,
+            connected_at: inst.created_at,
+            github_installation_id: inst.github_installation_id,
+        });
     }
+    Ok(GitHubIntegrationStatus::Connections { connections })
 }
 
 /// Start a workspace-bound installation or reconnect authorization.
 #[server(prefix = "/leptos-api")]
-pub async fn start_github_connection(reinstall: bool) -> Result<String, ServerFnError> {
+pub async fn start_github_connection(
+    connection_id: Option<String>,
+    reinstall: bool,
+) -> Result<String, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     require_workspace_admin(&ac.auth)?;
     let client = ac
@@ -130,6 +134,7 @@ pub async fn start_github_connection(reinstall: bool) -> Result<String, ServerFn
         key,
         &ac.auth.user_id,
         &ac.ws_id,
+        connection_id.as_deref(),
         reinstall,
     )
     .await
@@ -183,41 +188,32 @@ pub async fn complete_github_authorization(
         .encryption_key
         .as_deref()
         .ok_or_else(|| ServerFnError::new("Credential encryption not configured"))?;
-    trakkt_github::authorization::complete_connection(
+    trakkt_github::authorization::complete_connection_with_delivery(
         &ctx.db,
         client,
         key,
         &auth.user_id,
         &state,
         &code,
+        ctx.ws_manager.as_ref(),
     )
     .await
     .into_sfn()
 }
 
-/// Disconnect the GitHub integration for the current workspace.
-///
-/// Marks the installation as suspended (soft delete) so it can be
-/// reactivated later. Requires workspace admin role.
+/// Disconnect one owned connection while retaining its GitHub installation and history.
 #[server(prefix = "/leptos-api")]
-pub async fn disconnect_github() -> Result<(), ServerFnError> {
+pub async fn disconnect_github(connection_id: String) -> Result<(), ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     require_workspace_admin(&ac.auth)?;
-    let db = ac.db();
-
-    let installation = trakkt_github::schema::get_installation_for_workspace(db, &ac.ws_id)
-        .await
-        .into_sfn()?;
-
-    match installation {
-        Some(inst) => {
-            trakkt_github::schema::suspend_installation(db, &inst.installation_id)
-                .await
-                .into_sfn()?;
-            Ok(())
-        }
-        None => Err(ServerFnError::new("No GitHub integration found")),
-    }
+    trakkt_github::schema::disconnect_installation_with_delivery(
+        ac.db(),
+        &connection_id,
+        &ac.ws_id,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,9 +254,15 @@ pub async fn toggle_transition_rule(rule_id: String, enabled: bool) -> Result<()
     require_workspace_admin(&ac.auth)?;
     let db = ac.db();
 
-    trakkt_github::schema::update_transition_rule_enabled(db, &rule_id, &ac.ws_id, enabled)
-        .await
-        .into_sfn()?;
+    trakkt_github::schema::update_transition_rule_enabled_with_delivery(
+        db,
+        &rule_id,
+        &ac.ws_id,
+        enabled,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()?;
 
     Ok(())
 }

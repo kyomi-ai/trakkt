@@ -91,6 +91,7 @@ struct ConnectionState {
     action: String,
     expected_installation_id: Option<i64>,
     expected_account_id: Option<i64>,
+    expected_token_generation: Option<i64>,
     installation_id: Option<i64>,
     verifier_encrypted: String,
     expires_at: i64,
@@ -159,7 +160,7 @@ async fn load_state(
         return Err(invalid_state());
     }
     let row = trakkt_core::db_fetch_optional!(db, ConnectionState,
-        "SELECT state_hash, user_id, workspace_id, action, expected_installation_id, expected_account_id, installation_id, verifier_encrypted, expires_at, phase FROM github_connection_states WHERE state_hash = $1", hash(state))?
+        "SELECT state_hash, user_id, workspace_id, action, expected_installation_id, expected_account_id, expected_token_generation, installation_id, verifier_encrypted, expires_at, phase FROM github_connection_states WHERE state_hash = $1", hash(state))?
         .ok_or_else(invalid_state)?;
     if row.user_id != user_id
         || row.phase != phase
@@ -354,11 +355,7 @@ impl GitHubClient {
                 &token,
             )
             .await?;
-        if details.repository_selection == "selected" && accessible.total_count == 0 {
-            return Err(Error::Forbidden(
-                "No selected GitHub repositories are accessible to the authorized user".into(),
-            ));
-        }
+        let _accessible_count = accessible.total_count;
         let repos =
             if details.repository_selection == "selected" {
                 let installation_token = self
@@ -403,10 +400,8 @@ impl GitHubClient {
                 &token,
             )
             .await?;
-        if final_user.id != user.id
-            || final_user.account_type != "User"
-            || (details.repository_selection == "selected" && final_access.total_count == 0)
-        {
+        let _final_access_count = final_access.total_count;
+        if final_user.id != user.id || final_user.account_type != "User" {
             return Err(Error::Forbidden(
                 "GitHub user access changed during authorization".into(),
             ));
@@ -431,11 +426,24 @@ pub async fn start_connection(
     key: &[u8; 32],
     user_id: &str,
     workspace_id: &str,
+    connection_id: Option<&str>,
     reinstall: bool,
 ) -> Result<String> {
     client.oauth_config()?;
     require_admin(db, user_id, workspace_id).await?;
-    let existing = crate::schema::get_installation_for_workspace(db, workspace_id).await?;
+    let existing = if let Some(id) = connection_id {
+        let row = crate::schema::get_installation_by_id(db, id)
+            .await?
+            .ok_or_else(|| Error::NotFound("GitHub connection not found".into()))?;
+        if row.workspace_id != workspace_id {
+            return Err(Error::Forbidden(
+                "GitHub connection belongs to another workspace".into(),
+            ));
+        }
+        Some(row)
+    } else {
+        None
+    };
     let state = random_secret()?;
     let verifier = random_secret()?;
     let verifier_encrypted = trakkt_auth::encryption::encrypt(&verifier, key)?;
@@ -468,7 +476,7 @@ pub async fn start_connection(
     )?;
     let inserted = trakkt_core::db_execute!(
         db,
-        "INSERT INTO github_connection_states (state_hash, user_id, workspace_id, action, expected_installation_id, expected_account_id, installation_id, verifier_encrypted, expires_at, phase) VALUES ($1, $2, $3, $4, $5, $6, $5, $7, $8, $9) ON CONFLICT DO NOTHING",
+        "INSERT INTO github_connection_states (state_hash, user_id, workspace_id, action, expected_installation_id, expected_account_id, installation_id, verifier_encrypted, expires_at, phase, expected_token_generation) VALUES ($1, $2, $3, $4, $5, $6, $5, $7, $8, $9, $10) ON CONFLICT DO NOTHING",
         hash(&state),
         user_id,
         workspace_id,
@@ -477,7 +485,8 @@ pub async fn start_connection(
         expected_account,
         verifier_encrypted,
         expires_at,
-        phase
+        phase,
+        existing.as_ref().map(|row| row.token_generation)
     )?;
     if inserted.rows_affected() != 1 {
         return Err(Error::Internal(
@@ -539,6 +548,18 @@ pub async fn complete_connection(
     state: &str,
     code: &str,
 ) -> Result<()> {
+    complete_connection_with_delivery(db, client, key, user_id, state, code, None).await
+}
+
+pub async fn complete_connection_with_delivery(
+    db: &DbPool,
+    client: &GitHubClient,
+    key: &[u8; 32],
+    user_id: &str,
+    state: &str,
+    code: &str,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> Result<()> {
     client.oauth_config()?;
     let current = load_state(db, state, user_id, "oauth").await?;
     let installation_id = current.installation_id.ok_or_else(invalid_state)?;
@@ -557,7 +578,7 @@ pub async fn complete_connection(
             "Reconnect must authorize the same GitHub account".into(),
         ));
     }
-    bind_verified_connection(db, user_id, &current, &verified).await
+    bind_verified_connection(db, user_id, &current, &verified, ws_manager).await
 }
 
 /// Atomic reusable ownership primitive. Must be invoked inside the binding
@@ -619,6 +640,7 @@ async fn bind_verified_connection(
     user_id: &str,
     state: &ConnectionState,
     verified: &VerifiedConnection,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
 ) -> Result<()> {
     let is_pg = db.is_postgres();
     let active = sql_compat::bool_true(is_pg);
@@ -642,7 +664,7 @@ async fn bind_verified_connection(
         let _: (String,) = trakkt_core::tx_fetch_one!(
             &mut tx,
             (String,),
-            "SELECT workspace_id FROM workspaces WHERE workspace_id = $1 FOR UPDATE",
+            "SELECT workspace_id FROM workspaces WHERE workspace_id = $1 FOR NO KEY UPDATE",
             &state.workspace_id
         )?;
         let _: Vec<(i32,)> = trakkt_core::tx_fetch_all!(
@@ -653,6 +675,8 @@ async fn bind_verified_connection(
             &state.workspace_id
         )?;
     }
+    #[cfg(test)]
+    crate::schema::mutation_pause::wait(&format!("workspace-lock-{}", state.state_hash)).await;
     let admins =
         trakkt_core::tx_fetch_scalar!(&mut tx, i64, &admin_sql, user_id, &state.workspace_id)?;
     if admins == 0 {
@@ -673,6 +697,22 @@ async fn bind_verified_connection(
     if unresolved > 0 && !own_exact_reconnect {
         return Err(Error::Conflict("Existing GitHub connections require verified account identity backfill before another workspace can connect. Contact your administrator.".into()));
     }
+    if state.action == "reconnect" {
+        let generation_sql = format!(
+            "SELECT token_generation FROM github_installations WHERE github_installation_id = $1 AND workspace_id = $2{}",
+            if is_pg { " FOR UPDATE" } else { "" }
+        );
+        let generation = trakkt_core::tx_fetch_optional!(
+            &mut tx,
+            (i64,),
+            &generation_sql,
+            state.expected_installation_id,
+            &state.workspace_id
+        )?;
+        if generation.map(|row| row.0) != state.expected_token_generation {
+            return Err(Error::Conflict("GitHub connection changed during authorization. Start again from its settings card.".into()));
+        }
+    }
     claim_verified_ownership(&mut tx, &state.workspace_id, verified).await?;
     let app_id = trakkt_core::tx_fetch_scalar!(
         &mut tx,
@@ -680,10 +720,16 @@ async fn bind_verified_connection(
         "SELECT github_app_id FROM github_apps WHERE app_id = $1",
         verified.app_id
     )?;
-    let existing: Option<(String, i64, Option<i64>)> = trakkt_core::tx_fetch_optional!(
+    let existing_sql = format!(
+        "SELECT installation_id, github_installation_id, github_account_id, (disconnected_at IS NULL AND suspended_at IS NULL AND uninstalled_at IS NULL AND authorization_verified_at IS NOT NULL AND repository_scope_pending = {}) AS active FROM github_installations WHERE github_installation_id = $1 AND workspace_id = $2{}",
+        sql_compat::bool_false(is_pg),
+        if is_pg { " FOR UPDATE" } else { "" }
+    );
+    let existing: Option<(String, i64, Option<i64>, bool)> = trakkt_core::tx_fetch_optional!(
         &mut tx,
-        (String, i64, Option<i64>),
-        "SELECT installation_id, github_installation_id, github_account_id FROM github_installations WHERE workspace_id = $1",
+        (String, i64, Option<i64>, bool),
+        &existing_sql,
+        verified.installation_id,
         &state.workspace_id
     )?;
     let repos = verified.repos.as_ref().map(serde_json::Value::to_string);
@@ -700,8 +746,25 @@ async fn bind_verified_connection(
                 "Reconnect must authorize the existing GitHub account".into(),
             ));
         }
+        // Add-account callbacks may rediscover an active identity, but are not
+        // generation-bound reconnects. Consume them idempotently without
+        // changing permissions, credentials, or lifecycle state.
+        if state.action != "reconnect"
+            || state.expected_installation_id != Some(verified.installation_id)
+        {
+            if !existing.3 {
+                return Err(Error::Conflict(
+                    "This GitHub connection requires an explicit reconnect from its settings card."
+                        .into(),
+                ));
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
         let sql = format!(
-            "UPDATE github_installations SET github_installation_id = $1, github_account_id = $2, account_login = $3, account_type = $4, suspended_at = NULL, access_token_encrypted = NULL, token_expires_at = NULL, target_repos = {repos_cast} WHERE installation_id = $5"
+            "UPDATE github_installations SET github_account_id = $2, account_login = $3, account_type = $4, suspended_at = NULL, disconnected_at = NULL, uninstalled_at = NULL, authorization_verified_at = {}, access_token_encrypted = NULL, token_expires_at = NULL, token_generation = token_generation + 1, repository_scope_pending = {}, repository_selection = $7, target_repos = {repos_cast} WHERE installation_id = $5 AND github_installation_id = $1",
+            sql_compat::now(is_pg),
+            sql_compat::bool_false(is_pg)
         );
         trakkt_core::tx_execute!(
             &mut tx,
@@ -711,12 +774,14 @@ async fn bind_verified_connection(
             &verified.account_login,
             &verified.account_type,
             &id,
-            &repos
+            &repos,
+            &verified.repository_selection
         )?;
         SyncActionType::Update
     } else {
         let sql = format!(
-            "INSERT INTO github_installations (installation_id, workspace_id, github_app_id, github_installation_id, github_account_id, target_repos, account_login, account_type) VALUES ($1, $2, $3, $4, $5, {repos_cast}, $7, $8) ON CONFLICT DO NOTHING"
+            "INSERT INTO github_installations (installation_id, workspace_id, github_app_id, github_installation_id, github_account_id, target_repos, account_login, account_type, repository_selection, authorization_verified_at) VALUES ($1, $2, $3, $4, $5, {repos_cast}, $7, $8, $9, {}) ON CONFLICT DO NOTHING",
+            sql_compat::now(is_pg)
         );
         let inserted = trakkt_core::tx_execute!(
             &mut tx,
@@ -728,7 +793,8 @@ async fn bind_verified_connection(
             verified.account_id,
             &repos,
             &verified.account_login,
-            &verified.account_type
+            &verified.account_type,
+            &verified.repository_selection
         )?;
         if inserted.rows_affected() != 1 {
             return Err(conflict());
@@ -736,6 +802,26 @@ async fn bind_verified_connection(
         SyncActionType::Insert
     };
     let mut batch = SyncBatch::new();
+    if let Some(previous) = state
+        .expected_installation_id
+        .filter(|previous| *previous != verified.installation_id)
+    {
+        let previous_id = trakkt_core::tx_fetch_optional!(
+            &mut tx,
+            (String,),
+            "SELECT installation_id FROM github_installations WHERE github_installation_id = $1 AND workspace_id = $2",
+            previous,
+            &state.workspace_id
+        )?;
+        if let Some((previous_id,)) = previous_id {
+            let sql = format!(
+                "UPDATE github_installations SET uninstalled_at = {}, access_token_encrypted = NULL, token_expires_at = NULL, token_generation = token_generation + 1 WHERE installation_id = $1",
+                sql_compat::now(is_pg)
+            );
+            trakkt_core::tx_execute!(&mut tx, &sql, &previous_id)?;
+            batch.record(&mut tx, trakkt_types::sync::entity_types::GITHUB_INSTALLATION, &previous_id, &state.workspace_id, SyncAudience::Workspace, SyncActionType::Update, Some(serde_json::json!({"installation_id":previous_id,"workspace_id":state.workspace_id}))).await?;
+        }
+    }
     batch.record(&mut tx, "GITHUB_INSTALLATION", &id, &state.workspace_id, SyncAudience::Workspace, action, Some(serde_json::json!({"installation_id": id, "workspace_id": state.workspace_id, "github_installation_id": verified.installation_id, "account_login": verified.account_login, "account_type": verified.account_type, "github_account_id": verified.account_id, "target_repos": verified.repos}))).await?;
     for (event, close_intent, category) in [
         ("pr_opened", false, "started"),
@@ -757,7 +843,7 @@ async fn bind_verified_connection(
             batch.record(&mut tx, "GITHUB_TRANSITION_RULE", &rule_id, &state.workspace_id, SyncAudience::Workspace, SyncActionType::Insert, Some(serde_json::json!({"rule_id": rule_id, "workspace_id": state.workspace_id, "trigger_event": event, "close_intent_required": close_intent, "target_status_category": category, "enabled": true}))).await?;
         }
     }
-    batch.commit_and_deliver(tx, None).await
+    batch.commit_and_deliver(tx, ws_manager).await
 }
 
 /// Operator identity reconciliation is separate from user authorization: it
@@ -844,6 +930,27 @@ mod tests {
     };
     use trakkt_core::test_helpers::{seed_user, seed_workspace};
 
+    async fn start_for_test(
+        db: &DbPool,
+        client: &GitHubClient,
+        key: &[u8; 32],
+        user: &str,
+        workspace: &str,
+        reinstall: bool,
+    ) -> Result<String> {
+        let existing = crate::schema::get_installation_for_workspace(db, workspace).await?;
+        start_connection(
+            db,
+            client,
+            key,
+            user,
+            workspace,
+            existing.as_ref().map(|row| row.installation_id.as_str()),
+            reinstall,
+        )
+        .await
+    }
+
     static PEM: LazyLock<Vec<u8>> = LazyLock::new(|| {
         rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048)
             .expect("generate controlled GitHub App test key")
@@ -859,10 +966,13 @@ mod tests {
         installation_id: i64,
         account_id: i64,
         account_type: &'static str,
+        account_login: &'static str,
         wrong_app: bool,
         inaccessible: bool,
         revoked: bool,
         fail_page: bool,
+        repository_selection: &'static str,
+        empty_repositories: bool,
     }
     impl Default for Scenario {
         fn default() -> Self {
@@ -870,15 +980,18 @@ mod tests {
                 installation_id: 123,
                 account_id: 55,
                 account_type: "Organization",
+                account_login: "example",
                 wrong_app: false,
                 inaccessible: false,
                 revoked: false,
                 fail_page: false,
+                repository_selection: "selected",
+                empty_repositories: false,
             }
         }
     }
     fn details(s: &Scenario) -> serde_json::Value {
-        serde_json::json!({"id": s.installation_id, "app_id": if s.wrong_app { 99 } else { 42 }, "account": {"id":s.account_id,"login":"example","type":s.account_type},"target_type":s.account_type,"permissions":{},"events":[],"repository_selection":"selected","suspended_at":null})
+        serde_json::json!({"id": s.installation_id, "app_id": if s.wrong_app { 99 } else { 42 }, "account": {"id":s.account_id,"login":s.account_login,"type":s.account_type},"target_type":s.account_type,"permissions":{},"events":[],"repository_selection":s.repository_selection,"suspended_at":null})
     }
     async fn user() -> Json<serde_json::Value> {
         Json(serde_json::json!({"id":55,"type":"User"}))
@@ -953,9 +1066,11 @@ mod tests {
         }
         (
             StatusCode::OK,
-            Json(
-                serde_json::json!({"total_count":1,"repositories":[{"full_name":"example/repo","name":"repo","private":true}]}),
-            ),
+            Json(if s.empty_repositories {
+                serde_json::json!({"total_count":0,"repositories":[]})
+            } else {
+                serde_json::json!({"total_count":1,"repositories":[{"full_name":"example/repo","name":"repo","private":true}]})
+            }),
         )
     }
     async fn installation_token() -> Json<serde_json::Value> {
@@ -1020,6 +1135,59 @@ mod tests {
         client.oauth_base = base;
         ControlledGitHub { client, task }
     }
+    async fn add_account(db: &DbPool, client: &GitHubClient, installation: i64) {
+        let url = start_connection(db, client, &KEY, "admin-a", "workspace-a", None, false)
+            .await
+            .expect("start Add account even with existing cards");
+        let state = reqwest::Url::parse(&url)
+            .expect("parse Add setup")
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .expect("Add setup state")
+            .1
+            .into_owned();
+        let url = advance_setup(db, client, &KEY, "admin-a", &state, installation, "install")
+            .await
+            .expect("advance selected Add account");
+        let state = reqwest::Url::parse(&url)
+            .expect("parse Add OAuth")
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .expect("Add OAuth state")
+            .1
+            .into_owned();
+        complete_connection(db, client, &KEY, "admin-a", &state, "valid")
+            .await
+            .expect("bind verified additional account");
+    }
+    async fn reconnect_account(
+        db: &DbPool,
+        client: &GitHubClient,
+        row: &crate::schema::GitHubInstallation,
+    ) {
+        let url = start_connection(
+            db,
+            client,
+            &KEY,
+            "admin-a",
+            "workspace-a",
+            Some(&row.installation_id),
+            false,
+        )
+        .await
+        .expect("start reconnect for explicit owned connection");
+        let state = reqwest::Url::parse(&url)
+            .expect("parse explicit reconnect")
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .expect("reconnect state")
+            .1
+            .into_owned();
+        complete_connection(db, client, &KEY, "admin-a", &state, "valid")
+            .await
+            .expect("reconnect exact installation identity");
+    }
+
     async fn seed(db: &DbPool) {
         seed_user(db, "admin-a", "a@example.test")
             .await
@@ -1046,7 +1214,7 @@ mod tests {
         .expect("seed configured GitHub App");
     }
     async fn begin(db: &DbPool, client: &GitHubClient, user: &str, workspace: &str) -> String {
-        let url = start_connection(db, client, &KEY, user, workspace, false)
+        let url = start_for_test(db, client, &KEY, user, workspace, false)
             .await
             .expect("start authorized connection");
         let state = reqwest::Url::parse(&url)
@@ -1129,11 +1297,11 @@ mod tests {
             assert!(complete_connection(db,&github.client,&KEY,"admin-a",&state,"valid").await.is_err());
             assert_eq!(before,snapshot(db).await);
             let wrong=controlled(Scenario {account_id:66,..Scenario::default()}).await;
-            let url=start_connection(db,&wrong.client,&KEY,"admin-a","workspace-a",false).await.expect("start reconnect bound to the current account");
+            let url=start_for_test(db,&wrong.client,&KEY,"admin-a","workspace-a",false).await.expect("start reconnect bound to the current account");
             let wrong_state=reqwest::Url::parse(&url).expect("parse mismatched-account OAuth URL").query_pairs().find(|(k,_)|k=="state").expect("wrong-account state").1.into_owned();
             assert!(complete_connection(db,&wrong.client,&KEY,"admin-a",&wrong_state,"valid").await.is_err(),"a different authorized account cannot replace the workspace connection");
             assert_eq!(before,snapshot(db).await);
-            let url=start_connection(db,&github.client,&KEY,"admin-a","workspace-a",false).await.expect("reconnect directly without uninstall");
+            let url=start_for_test(db,&github.client,&KEY,"admin-a","workspace-a",false).await.expect("reconnect directly without uninstall");
             assert!(url.contains("/login/oauth/authorize"));
             let state=reqwest::Url::parse(&url).expect("parse reconnect URL").query_pairs().find(|(k,_)|k=="state").expect("reconnect state").1.into_owned();
             complete_connection(db,&github.client,&KEY,"admin-a",&state,"valid").await.expect("idempotent verified reconnect");
@@ -1225,7 +1393,11 @@ mod tests {
             assert_eq!(snapshot(db).await.1,0,"dry-run rolls back claims");
             reconcile_legacy_identity(db,123,&response,true).await.expect("apply historical identity without reconnecting");
             let after=crate::schema::get_installation_by_id(db,&legacy.installation_id).await.expect("read annotated legacy metadata").expect("annotated legacy exists");
-            assert_eq!(serde_json::to_value(after).expect("encode annotated metadata"),serde_json::to_value(metadata).expect("encode prior metadata"));
+            assert_eq!(after.github_account_id,Some(55));
+            assert_eq!(after.access_token_encrypted,metadata.access_token_encrypted);
+            assert_eq!(after.suspended_at,metadata.suspended_at);
+            assert_eq!(after.target_repos,metadata.target_repos);
+            assert!(!after.is_active(),"identity annotation must not reconnect or trust old credentials");
             // A second unresolved historical workspace must be independently repairable.
             let other=crate::schema::create_installation(db,"workspace-b",&app.github_app_id,789,"other","Organization",None).await.expect("create second legacy connection");
             let mut other_response: GitHubInstallationDetails=serde_json::from_value(details(&Scenario::default())).expect("decode second trusted evidence");
@@ -1238,13 +1410,14 @@ mod tests {
             assert_eq!(snapshot(db).await,before);
             let github=controlled(Scenario {installation_id:456,..Scenario::default()}).await;
             assert!(github.client.get_installation_details(123).await.is_err(),"deleted old installation is unavailable to the App");
-            let url=start_connection(db,&github.client,&KEY,"admin-a","workspace-a",true).await.expect("start same-account reinstall");
+            let url=start_for_test(db,&github.client,&KEY,"admin-a","workspace-a",true).await.expect("start same-account reinstall");
             let state=reqwest::Url::parse(&url).expect("parse reinstall setup").query_pairs().find(|(k,_)|k=="state").expect("reinstall setup state").1.into_owned();
             let url=advance_setup(db,&github.client,&KEY,"admin-a",&state,456,"install").await.expect("advance reinstall");
             let state=reqwest::Url::parse(&url).expect("parse reinstall OAuth").query_pairs().find(|(k,_)|k=="state").expect("reinstall OAuth state").1.into_owned();
             complete_connection(db,&github.client,&KEY,"admin-a",&state,"valid").await.expect("bind verified same-account reinstall");
-            let installed=crate::schema::get_installation_for_workspace(db,"workspace-a").await.expect("read reinstall binding").expect("reinstall exists");
-            assert_eq!(installed.installation_id,legacy.installation_id,"historical row and link references retained");
+            let installed=crate::schema::get_installation_by_github_id(db,456).await.expect("read reinstall binding").expect("reinstall exists");
+            assert_ne!(installed.installation_id,legacy.installation_id,"reinstall creates a separate immutable row");
+            assert_eq!(crate::schema::get_installation_by_id(db,&legacy.installation_id).await.expect("read preserved historical installation").expect("historical row exists").github_installation_id,123);
             assert_eq!(installed.github_installation_id,456);
             let links=crate::schema::list_links_for_issue(db,&issue.issue_id).await.expect("read historical links after reinstall");
             assert_eq!(links.len(),1);
@@ -1264,13 +1437,13 @@ mod tests {
             reconcile_legacy_identity(db,123,&response,true).await.expect("annotate A while B remains unresolved");
             let github=controlled(Scenario::default()).await;
             for _ in 0..2 {
-                let url=start_connection(db,&github.client,&KEY,"admin-a","workspace-a",false).await.expect("start known exact-installation reconnect");
+                let url=start_for_test(db,&github.client,&KEY,"admin-a","workspace-a",false).await.expect("start known exact-installation reconnect");
                 let state=reqwest::Url::parse(&url).expect("parse known reconnect URL").query_pairs().find(|(k,_)|k=="state").expect("known reconnect state").1.into_owned();
                 complete_connection(db,&github.client,&KEY,"admin-a",&state,"valid").await.expect("known reconnect must not depend on unrelated B backfill");
             }
             assert_eq!(crate::schema::get_installation_for_workspace(db,"workspace-a").await.expect("reload known installation").expect("A remains connected").installation_id,a.installation_id);
             let github=controlled(Scenario {installation_id:456,..Scenario::default()}).await;
-            let url=start_connection(db,&github.client,&KEY,"admin-a","workspace-a",true).await.expect("start reinstall requiring a new installation claim");
+            let url=start_for_test(db,&github.client,&KEY,"admin-a","workspace-a",true).await.expect("start reinstall requiring a new installation claim");
             let state=reqwest::Url::parse(&url).expect("parse blocked reinstall setup").query_pairs().find(|(k,_)|k=="state").expect("blocked reinstall setup state").1.into_owned();
             let url=advance_setup(db,&github.client,&KEY,"admin-a",&state,456,"install").await.expect("advance blocked reinstall");
             let state=reqwest::Url::parse(&url).expect("parse blocked reinstall OAuth").query_pairs().find(|(k,_)|k=="state").expect("blocked reinstall OAuth state").1.into_owned();
@@ -1279,6 +1452,312 @@ mod tests {
             assert_eq!(snapshot(db).await,before);
         }
     }
+    trakkt_core::dual_backend_test! {
+        async fn github_multiple_accounts_keep_immutable_history_rules_and_ownership(db) {
+            seed(db).await;
+            let personal = controlled(Scenario { account_type:"User", ..Scenario::default() }).await;
+            let org = controlled(Scenario { installation_id:456, account_id:66, ..Scenario::default() }).await;
+            // Organization first; the sibling test exercises personal first.
+            add_account(db,&org.client,456).await;
+            let org_row=crate::schema::get_installation_by_github_id(db,456).await.expect("read organization installation").expect("organization connected");
+            let rules=crate::schema::list_transition_rules(db,"workspace-a").await.expect("read workspace shared rules");
+            crate::schema::update_transition_rule_enabled(db,&rules[0].rule_id,"workspace-a",false).await.expect("customize shared rule before adding personal account");
+            let before=crate::schema::list_transition_rules(db,"workspace-a").await.expect("snapshot custom rules");
+            add_account(db,&personal.client,123).await;
+            let rows=crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("list multiple connections");
+            assert_eq!(rows.len(),2);
+            assert!(trakkt_core::db_execute!(db,"UPDATE github_installations SET github_installation_id = 999 WHERE installation_id = $1",&org_row.installation_id).is_err(),"database rejects immutable installation ID replacement");
+            assert!(trakkt_core::db_execute!(db,"UPDATE github_installations SET workspace_id = 'workspace-b' WHERE installation_id = $1",&org_row.installation_id).is_err(),"database rejects silent ownership transfer");
+            assert!(rows.iter().all(crate::schema::GitHubInstallation::is_active));
+            let personal_row=crate::schema::get_installation_by_github_id(db,123).await.expect("read personal installation").expect("personal connected");
+            reconnect_account(db,&personal.client,&personal_row).await;
+            reconnect_account(db,&org.client,&org_row).await;
+            let renamed_org=controlled(Scenario {installation_id:456,account_id:66,account_login:"renamed-organization",..Scenario::default()}).await;
+            reconnect_account(db,&renamed_org.client,&org_row).await;
+            let renamed=crate::schema::get_installation_by_id(db,&org_row.installation_id).await.expect("read stable renamed account").expect("renamed account retained");
+            assert_eq!(renamed.account_login,"renamed-organization");assert_eq!(renamed.github_account_id,Some(66));assert_eq!(renamed.github_installation_id,456);
+            assert_eq!(crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("list idempotent reconnects").len(),2);
+            assert_eq!(serde_json::to_value(before).expect("encode custom rules"),serde_json::to_value(crate::schema::list_transition_rules(db,"workspace-a").await.expect("reload unchanged shared rules")).expect("encode final shared rules"));
+            assert_eq!(crate::schema::get_installation_by_github_id(db,456).await.expect("reload organization").expect("organization retained").installation_id,org_row.installation_id);
+            assert!(start_connection(db,&org.client,&KEY,"admin-b","workspace-b",Some(&org_row.installation_id),false).await.is_err(),"foreign ID never chooses or reconnects another workspace's card");
+            crate::schema::disconnect_installation(db,&personal_row.installation_id,"workspace-a").await.expect("disconnect only personal card");
+            crate::schema::suspend_installation(db,&personal_row.installation_id).await.expect("GitHub suspends disconnected card");
+            crate::schema::unsuspend_installation(db,&personal_row.installation_id).await.expect("GitHub unsuspends without local reconnect");
+            let disconnected=crate::schema::get_installation_by_id(db,&personal_row.installation_id).await.expect("reload disconnected card").expect("disconnected card kept");
+            assert!(disconnected.disconnected_at.is_some());assert!(!disconnected.is_active());
+            assert!(crate::schema::get_installation_by_id(db,&org_row.installation_id).await.expect("reload other active card").expect("organization kept").is_active());
+            let stale_url=start_connection(db,&personal.client,&KEY,"admin-a","workspace-a",Some(&disconnected.installation_id),false).await.expect("start authorization before a newer disconnect");
+            let stale_state=reqwest::Url::parse(&stale_url).expect("parse stale reconnect state").query_pairs().find(|(k,_)|k=="state").expect("stale reconnect state").1.into_owned();
+            crate::schema::disconnect_installation(db,&personal_row.installation_id,"workspace-a").await.expect("newer disconnect invalidates pending reconnect");
+            assert!(complete_connection(db,&personal.client,&KEY,"admin-a",&stale_state,"valid").await.is_err(),"a late callback cannot undo a newer local disconnect");
+            reconnect_account(db,&personal.client,&disconnected).await;
+            assert!(crate::schema::get_installation_by_id(db,&personal_row.installation_id).await.expect("reload verified reconnect").expect("personal kept").is_active());
+        }
+    }
+    trakkt_core::dual_backend_test! {
+        async fn github_multiple_accounts_personal_first_and_same_workspace_callback_race(db) {
+            seed(db).await;
+            let personal=controlled(Scenario {account_type:"User",..Scenario::default()}).await;
+            let org=controlled(Scenario {installation_id:456,account_id:66,..Scenario::default()}).await;
+            add_account(db,&personal.client,123).await;
+            let initial=crate::schema::get_installation_by_github_id(db,123).await.expect("read first personal account").expect("personal connected");
+            let mut states=Vec::new();
+            for _ in 0..2 {
+                let url=start_connection(db,&org.client,&KEY,"admin-a","workspace-a",None,false).await.expect("start concurrent additional account callback");
+                let state=reqwest::Url::parse(&url).expect("parse concurrent setup").query_pairs().find(|(k,_)|k=="state").expect("concurrent setup state").1.into_owned();
+                let url=advance_setup(db,&org.client,&KEY,"admin-a",&state,456,"install").await.expect("advance concurrent account candidate");
+                states.push(reqwest::Url::parse(&url).expect("parse concurrent OAuth").query_pairs().find(|(k,_)|k=="state").expect("concurrent OAuth state").1.into_owned());
+            }
+            let (a,b)=tokio::join!(complete_connection(db,&org.client,&KEY,"admin-a",&states[0],"valid"),complete_connection(db,&org.client,&KEY,"admin-a",&states[1],"valid"));
+            a.expect("first valid callback");b.expect("second callback reconnects exact already-created installation");
+            assert_eq!(crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("list atomic account callbacks").len(),2);
+            assert_eq!(crate::schema::get_installation_by_github_id(db,123).await.expect("read preserved personal").expect("personal retained").installation_id,initial.installation_id);
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_authorization_add_existing_identity_cannot_undo_disconnect(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            add_account(db, &github.client, 123).await;
+            let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load connection").expect("exists");
+            let before = row.clone();
+            add_account(db, &github.client, 123).await;
+            assert_eq!(crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("reload").expect("exists"), before, "Add rediscovery is idempotent, including generation and credentials");
+            let url = start_connection(db,&github.client,&KEY,"admin-a","workspace-a",None,false).await.expect("start unbound Add");
+            let state = reqwest::Url::parse(&url).expect("setup URL").query_pairs().find(|(k,_)|k=="state").expect("state").1.into_owned();
+            let url = advance_setup(db,&github.client,&KEY,"admin-a",&state,123,"install").await.expect("choose existing identity");
+            let state = reqwest::Url::parse(&url).expect("OAuth URL").query_pairs().find(|(k,_)|k=="state").expect("state").1.into_owned();
+            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("disconnect after Add starts");
+            let disconnected = crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("reload").expect("exists");
+            assert!(complete_connection(db,&github.client,&KEY,"admin-a",&state,"valid").await.is_err());
+            assert_eq!(crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("reload").expect("exists"),disconnected);
+            reconnect_account(db,&github.client,&disconnected).await;
+            assert!(crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("reload").expect("exists").is_active());
+            let newer = controlled(Scenario { installation_id:456, ..Scenario::default() }).await;
+            add_account(db,&newer.client,456).await;
+            let target = crate::schema::get_installation_by_github_id(db,456).await.expect("target identity").expect("exists");
+            crate::schema::disconnect_installation(db,&target.installation_id,"workspace-a").await.expect("disconnect historical target");
+            let target = crate::schema::get_installation_by_github_id(db,456).await.expect("target snapshot").expect("exists");
+            let url = start_connection(db,&newer.client,&KEY,"admin-a","workspace-a",Some(&row.installation_id),true).await.expect("start reinstall selected predecessor");
+            let state = reqwest::Url::parse(&url).expect("setup URL").query_pairs().find(|(k,_)|k=="state").expect("state").1.into_owned();
+            let url = advance_setup(db,&newer.client,&KEY,"admin-a",&state,456,"install").await.expect("select different existing historical identity");
+            let state = reqwest::Url::parse(&url).expect("OAuth URL").query_pairs().find(|(k,_)|k=="state").expect("state").1.into_owned();
+            assert!(complete_connection(db,&newer.client,&KEY,"admin-a",&state,"valid").await.is_err(),"a predecessor's generation cannot authorize reactivation of another existing row");
+            assert_eq!(crate::schema::get_installation_by_github_id(db,456).await.expect("target after denied reconnect").expect("exists"),target);
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_mutation_admission_rejects_paused_pr_push_and_status(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            trakkt_core::test_helpers::seed_team(db,"race-team","workspace-a","RAC").await.expect("seed race team");
+            trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed race statuses");
+            let issue = trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"race-team".into(),creator_id:"admin-a".into(),title:"Paused GitHub mutation".into(),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create race issue");
+            let reference = format!("RAC-{}", issue.number);
+            let pr = serde_json::json!({"repository":{"full_name":"example/repo"},"pull_request":{"number":700,"title":reference,"body":"","head":{"ref":reference},"base":{"ref":"main"},"html_url":"https://github.com/example/repo/pull/700","draft":false,"merged":false}});
+            let push = serde_json::json!({"repository":{"full_name":"example/repo"},"ref":format!("refs/heads/{reference}"),"created":true,"commits":[{"id":"abcdef0123456789","message":reference,"url":"https://github.com/example/repo/commit/abcdef0123456789"}]});
+            for event in 0..3 {
+                for narrow in [false,true] {
+                    let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load connection").expect("exists");
+                    reconnect_account(db,&github.client,&row).await;
+                    let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load fresh generation").expect("exists");
+                    if event == 2 {
+                        crate::events::process_pull_request(db,&row,"edited",&pr,None).await.expect("seed status PR link");
+                    }
+                    let links_before = trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM github_links").expect("link count");
+                    let activities_before = trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM issue_activities").expect("activity count");
+                    let (reached,resume) = crate::schema::mutation_pause::register(&row.installation_id);
+                    let process = async {
+                        match event {
+                            0 => crate::events::process_pull_request(db,&row,"opened",&pr,None).await,
+                            1 => crate::events::process_push(db,&row,&push,None).await,
+                            _ => crate::transitions::apply_transition_rules(db,&github.client,&row,"workspace-a","opened",&pr,&KEY,None,"http://localhost").await,
+                        }
+                    };
+                    let change = async {
+                        reached.notified().await;
+                        if narrow {
+                            crate::schema::update_installation_repos(db,&row.installation_id,Some(&serde_json::json!([]))).await.expect("narrow access while event awaits pre-write work");
+                        } else {
+                            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("disconnect while event awaits pre-write work");
+                        }
+                        resume.notify_one();
+                    };
+                    let (result,()) = tokio::time::timeout(std::time::Duration::from_secs(20),async {tokio::join!(process,change)}).await.expect("paused event completes without deadlock");
+                    if event < 2 { assert!(result.is_err(),"stale link mutation must be denied"); } else { result.expect("status handler skips denied admission"); }
+                    assert_eq!(trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM github_links").expect("final link count"),links_before);
+                    assert_eq!(trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM issue_activities").expect("final activity count"),activities_before);
+                    assert_eq!(trakkt_auth::issue_service::get_issue_by_id(db,&issue.issue_id).await.expect("reload issue").expect("exists").status_id,issue.status_id,"stale event cannot transition status");
+                }
+            }
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_outbound_admission_serializes_lifecycle_and_scope(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            for narrow in [false,true] {
+                let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load row").expect("exists");
+                reconnect_account(db,&github.client,&row).await;
+                let row = crate::schema::get_installation_by_github_id(db,123).await.expect("fresh row").expect("exists");
+                let admission = crate::schema::admit_outbound(db,&row,"example/repo").await.expect("admit outbound before lifecycle mutation");
+                let empty = serde_json::json!([]);
+                let change = async {
+                    if narrow {
+                        crate::schema::update_installation_repos(db,&row.installation_id,Some(&empty)).await
+                    } else {
+                        crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await
+                    }
+                };
+                let mut change = Box::pin(change);
+                // Poll the actual lifecycle operation while admission is held.
+                // It must remain pending until the admitted effect releases
+                // its transaction, on both backends.
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(100),&mut change).await.is_err(),"lifecycle/scope cannot commit through an admitted outbound request");
+                admission.commit().await.expect("finish admitted outbound effect");
+                tokio::time::timeout(std::time::Duration::from_secs(10),change).await.expect("waiting mutation completes after admission release").expect("lifecycle mutation commits");
+                assert!(crate::schema::admit_outbound(db,&row,"example/repo").await.is_err(),"old generation cannot admit another effect after lifecycle commit");
+                let current = crate::schema::get_installation_by_github_id(db,123).await.expect("reload current row").expect("exists");
+                assert!(!current.allows_repository("example/repo"));
+                assert!(crate::schema::admit_outbound(db,&current,"example/repo").await.is_err(),"current denied scope cannot admit an effect either");
+            }
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_authorization_workspace_lock_allows_admitted_link_foreign_key(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            trakkt_core::test_helpers::seed_team(db,"lock-team","workspace-a","LCK").await.expect("seed lock team");
+            trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed lock statuses");
+            let issue = trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"lock-team".into(),creator_id:"admin-a".into(),title:"Admitted link during callback".into(),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create lock issue");
+            let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load lock row").expect("exists");
+            let url = start_connection(db,&github.client,&KEY,"admin-a","workspace-a",Some(&row.installation_id),false).await.expect("start generation-bound reconnect");
+            let state = reqwest::Url::parse(&url).expect("OAuth URL").query_pairs().find(|(k,_)|k=="state").expect("state").1.into_owned();
+            let mut admitted = crate::schema::admit_outbound(db,&row,"example/repo").await.expect("admitted mutation holds installation lock");
+            let pause = if db.is_postgres() {Some(crate::schema::mutation_pause::register(&format!("workspace-lock-{}",hash(&state))))} else {None};
+            let callback = complete_connection(db,&github.client,&KEY,"admin-a",&state,"valid");
+            let write = async {
+                if let Some((reached,_)) = &pause { reached.notified().await; }
+                // PostgreSQL callback is now paused with its workspace lock
+                // held. This FK insert must acquire KEY SHARE compatibly,
+                // before releasing the installation lock it will need next.
+                let link_id = uuid::Uuid::new_v4().to_string();
+                trakkt_core::tx_execute!(&mut admitted,
+                    "INSERT INTO github_links (link_id,workspace_id,issue_id,installation_id,link_type,repo_full_name,ref_identifier,url) VALUES ($1,'workspace-a',$2,$3,'branch','example/repo','lock-order','https://github.com/example/repo/tree/lock-order')",
+                    &link_id,&issue.issue_id,&row.installation_id).expect("admitted FK write is compatible with callback workspace lock");
+                admitted.commit().await.expect("commit admitted link before callback installation lock");
+                if let Some((_,resume)) = &pause { resume.notify_one(); }
+            };
+            let (callback,()) = tokio::time::timeout(std::time::Duration::from_secs(20),async {tokio::join!(callback,write)}).await.expect("callback and admitted link finish without inverse-lock deadlock");
+            callback.expect("verified reconnect follows admitted mutation");
+            assert_eq!(crate::schema::list_links_for_issue(db,&issue.issue_id).await.expect("read committed link").len(),1);
+            assert!(crate::schema::get_installation_by_github_id(db,123).await.expect("read verified row").expect("exists").is_active());
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_multiple_accounts_selected_empty_token_generation_and_sync_rollback(db) {
+            seed(db).await;
+            let empty=controlled(Scenario { empty_repositories:true, ..Scenario::default() }).await;
+            add_account(db,&empty.client,123).await;
+            let row=crate::schema::get_installation_by_github_id(db,123).await.expect("load empty selected installation").expect("connected selected empty");
+            assert_eq!(row.repository_selection,"selected");assert_eq!(row.target_repos.as_deref(),Some("[]"));assert!(!row.allows_repository("example/repo"));
+            assert!(crate::schema::cache_installation_token(db,&row,"fixture-cache","2099-01-01T00:00:00Z").await.expect("cache token in unchanged generation"));
+            let cached=crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("read token snapshot").expect("row exists");
+            for mutation in 0..6 {
+                let before=crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("snapshot ordered installation rows");
+                let sync_before=trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM sync_log").expect("snapshot sync rows");
+                trakkt_core::test_helpers::dual_backend::reject_sync_log_inserts_of_type(db,"GITHUB_INSTALLATION").await;
+                let result=match mutation {
+                    0=>crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await,
+                    1=>crate::schema::suspend_installation(db,&row.installation_id).await,
+                    2=>crate::schema::unsuspend_installation(db,&row.installation_id).await,
+                    3=>crate::schema::uninstall_installation(db,&row.installation_id).await,
+                    4=>crate::schema::update_installation_repos(db,&row.installation_id,None).await,
+                    _=>crate::schema::apply_repository_delta(db,&row.installation_id,"selected",&["example/repo".into()],&[]).await,
+                };
+                assert!(result.is_err(),"mutation {mutation} must fail when durable settings invalidation fails");
+                assert_eq!(before,crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("reload ordered rolled back installation rows"));
+                assert_eq!(sync_before,trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM sync_log").expect("read rolled back sync rows"));
+                trakkt_core::test_helpers::dual_backend::clear_sync_log_rejection(db).await;
+            }
+            crate::schema::update_installation_repos(db,&row.installation_id,None).await.expect("all repositories scope");
+            let all=crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("read all scope").expect("all connection");
+            assert_eq!(all.repository_selection,"all");assert!(all.target_repos.is_none());assert!(all.allows_repository("any/repo"));assert!(all.access_token_encrypted.is_none());
+            assert!(!crate::schema::cache_installation_token(db,&cached,"late-old-token","2099-01-01T00:00:00Z").await.expect("reject obsolete in-flight cache"));
+            crate::schema::update_installation_repos(db,&row.installation_id,Some(&serde_json::json!([]))).await.expect("return to selected empty");
+            let first_added=vec!["first/repo".into()];let second_added=vec!["second/repo".into()];
+            let (left,right)=tokio::join!(crate::schema::apply_repository_delta(db,&row.installation_id,"selected",&first_added,&[]),crate::schema::apply_repository_delta(db,&row.installation_id,"selected",&second_added,&[]));
+            left.expect("first concurrent repository delta");right.expect("second concurrent repository delta");
+            let merged=crate::schema::get_installation_by_id(db,&row.installation_id).await.expect("read serialized deltas").expect("delta connection");
+            let merged_repos:Vec<String>=serde_json::from_str(merged.target_repos.as_deref().expect("selected deltas retain a JSON array")).expect("decode backend repository JSON");
+            assert_eq!(merged_repos,vec!["first/repo".to_string(),"second/repo".to_string()]);
+            let before_reconcile=crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("snapshot before failed scope quarantine");
+            trakkt_core::test_helpers::dual_backend::reject_sync_log_inserts_of_type(db,"GITHUB_INSTALLATION").await;
+            assert!(crate::schema::begin_repository_reconciliation(db,&row.installation_id,None).await.is_err());
+            assert_eq!(before_reconcile,crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("scope quarantine sync failure rolls back credentials and epoch"));
+            trakkt_core::test_helpers::dual_backend::clear_sync_log_rejection(db).await;
+            let generation=crate::schema::begin_repository_reconciliation(db,&row.installation_id,None).await.expect("quarantine while fetching current GitHub access");
+            let pending=crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("snapshot pending reconciliation");
+            assert!(pending[0].repository_scope_pending);assert!(!pending[0].is_active());
+            trakkt_core::test_helpers::dual_backend::reject_sync_log_inserts_of_type(db,"GITHUB_INSTALLATION").await;
+            assert!(crate::schema::finish_repository_reconciliation(db,&row.installation_id,generation,None,None).await.is_err());
+            assert_eq!(pending,crate::schema::list_installations_for_workspace(db,"workspace-a").await.expect("scope finish sync failure retains pending state"));
+            trakkt_core::test_helpers::dual_backend::clear_sync_log_rejection(db).await;
+            crate::schema::disconnect_installation(db,&row.installation_id,"workspace-a").await.expect("disconnect invalidates pending repository fetch");
+            assert!(!crate::schema::finish_repository_reconciliation(db,&row.installation_id,generation,None,None).await.expect("stale scope fetch must not expand to all repositories"));
+            let rules=crate::schema::list_transition_rules(db,"workspace-a").await.expect("read rollback rule");
+            trakkt_core::test_helpers::dual_backend::reject_sync_log_inserts_of_type(db,"GITHUB_TRANSITION_RULE").await;
+            assert!(crate::schema::update_transition_rule_enabled(db,&rules[0].rule_id,"workspace-a",false).await.is_err());
+            assert!(crate::schema::list_transition_rules(db,"workspace-a").await.expect("read preserved rule")[0].enabled);
+            trakkt_core::test_helpers::dual_backend::clear_sync_log_rejection(db).await;
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn github_multiple_connections_migration_preserves_legacy_credentials_and_rules(db) {
+            seed(db).await;
+            let app=crate::schema::get_github_app(db).await.expect("read legacy App").expect("legacy App exists");
+            let all=crate::schema::create_installation(db,"workspace-a",&app.github_app_id,123,"legacy-personal","User",None).await.expect("seed old all-repositories connection");
+            let empty=crate::schema::create_installation(db,"workspace-b",&app.github_app_id,456,"legacy-org","Organization",Some(&serde_json::json!([]))).await.expect("seed selected-empty legacy connection");
+            crate::schema::update_installation_token(db,&all.installation_id,"preserved-encrypted-legacy-credential","2099-01-01T00:00:00Z").await.expect("seed credential that must be retained but quarantined");
+            crate::schema::suspend_installation(db,&empty.installation_id).await.expect("seed ambiguous old local/GitHub suspension");
+            crate::schema::seed_default_transition_rules(db,"workspace-a").await.expect("seed legacy shared rules");
+            let rules=crate::schema::list_transition_rules(db,"workspace-a").await.expect("read old shared rule");
+            crate::schema::update_transition_rule_enabled(db,&rules[0].rule_id,"workspace-a",false).await.expect("preserve customized rule toggle");
+            let rules_before=serde_json::to_value(crate::schema::list_transition_rules(db,"workspace-a").await.expect("snapshot customized rules")).expect("encode customized rules");
+            // Reconstruct the preceding schema, then run the exact paired migration
+            // against existing rows instead of only testing empty-database startup.
+            if db.is_postgres() {
+                trakkt_core::db_execute!(db,"DROP TRIGGER github_installations_immutable_identity ON github_installations").expect("remove new Postgres trigger for migration fixture");
+                trakkt_core::db_execute!(db,"DROP FUNCTION protect_github_installation_identity()").expect("remove new Postgres identity function");
+            } else { trakkt_core::db_execute!(db,"DROP TRIGGER github_installations_immutable_identity").expect("remove new SQLite trigger for migration fixture"); }
+            trakkt_core::db_execute!(db,"ALTER TABLE github_connection_states DROP COLUMN expected_token_generation").expect("restore preceding connection state schema");
+            trakkt_core::db_execute!(db,"DROP INDEX github_installations_workspace_list").expect("remove new settings index");
+            for column in ["disconnected_at","uninstalled_at","authorization_verified_at","repository_selection","token_generation","repository_scope_pending"] {
+                trakkt_core::db_execute!(db,&format!("ALTER TABLE github_installations DROP COLUMN {column}")).expect("restore preceding installation schema");
+            }
+            trakkt_core::db_execute!(db,"CREATE UNIQUE INDEX github_installations_account_owner ON github_installations(github_app_id,github_account_id) WHERE github_account_id IS NOT NULL").expect("restore preceding single-account uniqueness");
+            let migration=if db.is_postgres() {include_str!("../../../apps/server/migrations/20261010010000_github_multiple_connections.sql")}else{include_str!("../../../apps/server/migrations-sqlite/20261010010000_github_multiple_connections.sql")};
+            trakkt_core::db_with_pool!(db,|pool| sqlx::raw_sql(migration).execute(pool).await.map(|_| ())).expect("apply exact paired migration to populated legacy schema");
+            let migrated_all=crate::schema::get_installation_by_id(db,&all.installation_id).await.expect("read migrated all-repositories row").expect("old installation preserved");
+            assert_eq!(migrated_all.github_installation_id,123);assert_eq!(migrated_all.repository_selection,"all");assert!(migrated_all.target_repos.is_none());
+            assert_eq!(migrated_all.access_token_encrypted.as_deref(),Some("preserved-encrypted-legacy-credential"));assert!(!migrated_all.is_active());assert!(migrated_all.authorization_verified_at.is_none());
+            let migrated_empty=crate::schema::get_installation_by_id(db,&empty.installation_id).await.expect("read migrated selected-empty row").expect("empty installation preserved");
+            assert_eq!(migrated_empty.target_repos.as_deref(),Some("[]"));assert_eq!(migrated_empty.repository_selection,"selected");assert_eq!(migrated_empty.disconnected_at,migrated_empty.suspended_at);
+            crate::schema::unsuspend_installation(db,&empty.installation_id).await.expect("unsuspend migrated legacy row");
+            assert!(!crate::schema::get_installation_by_id(db,&empty.installation_id).await.expect("read quarantined unsuspend").expect("legacy retained").is_active());
+            assert_eq!(rules_before,serde_json::to_value(crate::schema::list_transition_rules(db,"workspace-a").await.expect("read untouched migrated shared rules")).expect("encode migrated rules"));
+        }
+    }
+
     #[tokio::test]
     async fn missing_oauth_and_forged_setup_fail_closed() {
         let db = trakkt_core::test_helpers::test_pool()
@@ -1305,10 +1784,9 @@ mod tests {
             .await
             .is_err()
         );
-        let setup_url =
-            start_connection(&db, &github.client, &KEY, "admin-a", "workspace-a", false)
-                .await
-                .expect("start candidate-ID forgery test");
+        let setup_url = start_for_test(&db, &github.client, &KEY, "admin-a", "workspace-a", false)
+            .await
+            .expect("start candidate-ID forgery test");
         let setup_state = reqwest::Url::parse(&setup_url)
             .expect("parse forgery setup URL")
             .query_pairs()
@@ -1361,7 +1839,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            start_connection(&db, &github.client, &KEY, "admin-a", "workspace-a", false)
+            start_for_test(&db, &github.client, &KEY, "admin-a", "workspace-a", false)
                 .await
                 .is_err()
         );

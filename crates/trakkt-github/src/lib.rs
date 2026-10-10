@@ -64,6 +64,7 @@ pub struct GitHubRepository {
 /// Wrapper for the paginated list-repos endpoint response.
 #[derive(Debug, Clone, Deserialize)]
 struct ListReposResponse {
+    pub total_count: usize,
     pub repositories: Vec<GitHubRepository>,
 }
 
@@ -168,6 +169,33 @@ impl GitHubClient {
         })
     }
 
+    /// Isolated HTTP fixture client. Never available in production-only builds.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_endpoint(
+        app_id: u64,
+        key_pem: &[u8],
+        endpoint: &str,
+    ) -> trakkt_core::Result<Self> {
+        let url = reqwest::Url::parse(endpoint)
+            .map_err(|_| Error::BadRequest("Invalid fixture endpoint".into()))?;
+        if url.scheme() != "http"
+            || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        {
+            return Err(Error::Forbidden(
+                "GitHub fixtures require a loopback HTTP endpoint".into(),
+            ));
+        }
+        let mut client = Self::new(app_id, key_pem, "isolated-github-fixture")?;
+        client.http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|error| Error::Internal(format!("Cannot create fixture client: {error}")))?;
+        client.api_base = endpoint.trim_end_matches('/').into();
+        client.oauth_base = endpoint.trim_end_matches('/').into();
+        Ok(client)
+    }
+
     /// Generate a JWT for App-level API access (10 min expiry).
     ///
     /// Used to authenticate as the App itself (not as an installation).
@@ -200,9 +228,7 @@ impl GitHubClient {
     ) -> trakkt_core::Result<InstallationToken> {
         let api_base = &self.api_base;
         let jwt = self.app_jwt()?;
-        let url = format!(
-            "{api_base}/app/installations/{installation_id}/access_tokens"
-        );
+        let url = format!("{api_base}/app/installations/{installation_id}/access_tokens");
 
         let response = self
             .http
@@ -219,10 +245,9 @@ impl GitHubClient {
             return Err(map_github_error(status.as_u16(), &url, response).await);
         }
 
-        response
-            .json::<InstallationToken>()
-            .await
-            .map_err(|e| Error::Internal(format!("failed to parse installation token response: {e}")))
+        response.json::<InstallationToken>().await.map_err(|e| {
+            Error::Internal(format!("failed to parse installation token response: {e}"))
+        })
     }
 
     /// Post a comment on a GitHub issue or PR.
@@ -348,29 +373,43 @@ impl GitHubClient {
         &self,
         token: &str,
     ) -> trakkt_core::Result<Vec<GitHubRepository>> {
-        let api_base = &self.api_base;
-        let url = format!("{api_base}/installation/repositories?per_page=100");
-
-        let response = self
-            .http
-            .get(&url)
-            .headers(api_headers(token))
-            .send()
-            .await
-            .map_err(|e| Error::Internal(format!("GitHub API request failed: {e}")))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(map_github_error(status.as_u16(), &url, response).await);
+        let mut repositories = Vec::new();
+        for page in 1..=1000 {
+            let url = format!(
+                "{}/installation/repositories?per_page=100&page={page}",
+                self.api_base
+            );
+            let response = self
+                .http
+                .get(&url)
+                .headers(api_headers(token))
+                .send()
+                .await
+                .map_err(|error| {
+                    Error::Internal(format!("GitHub repository request failed: {error}"))
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(map_github_error(status.as_u16(), &url, response).await);
+            }
+            let parsed: ListReposResponse = response.json().await.map_err(|error| {
+                Error::Internal(format!("Invalid GitHub repository response: {error}"))
+            })?;
+            let count = parsed.repositories.len();
+            repositories.extend(parsed.repositories);
+            if repositories.len() >= parsed.total_count {
+                return Ok(repositories);
+            }
+            if count == 0 {
+                return Err(Error::Internal(
+                    "Incomplete GitHub repository pagination; reconnect to refresh access".into(),
+                ));
+            }
         }
-
-        let parsed: ListReposResponse = response.json().await.map_err(|e| {
-            Error::Internal(format!(
-                "failed to parse installation repos response: {e}"
-            ))
-        })?;
-
-        Ok(parsed.repositories)
+        Err(Error::Internal(
+            "GitHub repository pagination exceeded safety limit; reconnect to refresh access"
+                .into(),
+        ))
     }
 
     /// Accessor for the app name (used in User-Agent).
@@ -442,7 +481,13 @@ pub async fn initialize_from_env(
     ensure_configured(db, &client, &webhook_secret, encryption_key).await?;
     if let Some(oauth) = &client.oauth {
         let secret = trakkt_auth::encryption::encrypt(&oauth.client_secret, encryption_key)?;
-        trakkt_core::db_execute!(db, "UPDATE github_apps SET client_id = $1, client_secret_encrypted = $2 WHERE app_id = $3", &oauth.client_id, &secret, client.app_id as i64)?;
+        trakkt_core::db_execute!(
+            db,
+            "UPDATE github_apps SET client_id = $1, client_secret_encrypted = $2 WHERE app_id = $3",
+            &oauth.client_id,
+            &secret,
+            client.app_id as i64
+        )?;
     }
     Ok(Some(client))
 }
@@ -515,7 +560,9 @@ fn api_headers(token: &str) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "Accept",
-        "application/vnd.github+json".parse().expect("valid header value"),
+        "application/vnd.github+json"
+            .parse()
+            .expect("valid header value"),
     );
     headers.insert(
         "X-GitHub-Api-Version",
@@ -523,7 +570,9 @@ fn api_headers(token: &str) -> reqwest::header::HeaderMap {
     );
     headers.insert(
         "Authorization",
-        format!("Bearer {token}").parse().expect("valid header value"),
+        format!("Bearer {token}")
+            .parse()
+            .expect("valid header value"),
     );
     headers
 }
@@ -547,8 +596,8 @@ async fn map_github_error(status: u16, url: &str, _response: reqwest::Response) 
 mod tests {
     use super::*;
     use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-    use rsa::pkcs8::{EncodePrivateKey, LineEnding};
     use rsa::RsaPrivateKey;
+    use rsa::pkcs8::{EncodePrivateKey, LineEnding};
     use std::sync::LazyLock;
 
     struct TestKeyPair {
@@ -558,19 +607,23 @@ mod tests {
 
     static TEST_KEYS: LazyLock<TestKeyPair> = LazyLock::new(|| {
         let mut rng = rand_core::OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, 2048)
-            .expect("failed to generate test RSA key");
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).expect("failed to generate test RSA key");
         let private_pem = private_key
             .to_pkcs8_pem(LineEnding::LF)
             .expect("failed to encode private key")
             .as_bytes()
             .to_vec();
         let public_key = private_key.to_public_key();
-        let public_pem = rsa::pkcs8::EncodePublicKey::to_public_key_pem(&public_key, LineEnding::LF)
-            .expect("failed to encode public key")
-            .as_bytes()
-            .to_vec();
-        TestKeyPair { private_pem, public_pem }
+        let public_pem =
+            rsa::pkcs8::EncodePublicKey::to_public_key_pem(&public_key, LineEnding::LF)
+                .expect("failed to encode public key")
+                .as_bytes()
+                .to_vec();
+        TestKeyPair {
+            private_pem,
+            public_pem,
+        }
     });
 
     #[tokio::test]
@@ -814,7 +867,9 @@ mod tests {
     fn jwt_generation_produces_valid_token() {
         let client = GitHubClient::new(12345, &TEST_KEYS.private_pem, "test-app")
             .expect("constructing a client from the generated RSA private key PEM");
-        let jwt = client.app_jwt().expect("signing a GitHub App JWT with the client's private key");
+        let jwt = client
+            .app_jwt()
+            .expect("signing a GitHub App JWT with the client's private key");
 
         // Decode and validate with the public key
         let mut validation = Validation::new(Algorithm::RS256);

@@ -13,14 +13,8 @@
 //! 4. Parse and dispatch the event to the appropriate handler
 //! 5. Always return 200 to prevent GitHub from retrying
 
-use axum::{
-    body::Bytes,
-    extract::State,
-    http::HeaderMap,
-    routing::post,
-    Json, Router,
-};
-use serde_json::{json, Value};
+use axum::{Json, Router, body::Bytes, extract::State, http::HeaderMap, routing::post};
+use serde_json::{Value, json};
 
 use trakkt_github::schema;
 use trakkt_github::webhook::verify_signature;
@@ -63,7 +57,10 @@ async fn github_webhook(
 
     // ── 2. Verify signature ────────────────────────────────────────────────
 
-    let signature = match headers.get("x-hub-signature-256").and_then(|v| v.to_str().ok()) {
+    let signature = match headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(sig) => sig,
         None => {
             tracing::warn!("GitHub webhook missing X-Hub-Signature-256 header");
@@ -82,7 +79,10 @@ async fn github_webhook(
 
     // ── 3. Check idempotency via delivery ID ───────────────────────────────
 
-    let delivery_id = match headers.get("x-github-delivery").and_then(|v| v.to_str().ok()) {
+    let delivery_id = match headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(id) => id.to_string(),
         None => {
             tracing::warn!("GitHub webhook missing X-GitHub-Delivery header");
@@ -128,7 +128,10 @@ async fn github_webhook(
         }
     };
 
-    let action = payload.get("action").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let action = payload
+        .get("action")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // ── 5. Extract installation ID and look up in DB ───────────────────────
 
@@ -204,9 +207,17 @@ async fn github_webhook(
 
     let result = match event_key.as_str() {
         // Installation lifecycle events — handle synchronously
-        "installation.deleted" | "installation.suspend" => {
-            Some(handle_installation_suspend(&state, &installation).await)
-        }
+        "installation.deleted" => Some(if let Some(inst) = &installation {
+            schema::uninstall_installation_with_delivery(
+                &state.db,
+                &inst.installation_id,
+                Some(&state.ws_manager),
+            )
+            .await
+        } else {
+            Ok(())
+        }),
+        "installation.suspend" => Some(handle_installation_suspend(&state, &installation).await),
         "installation.unsuspend" => {
             Some(handle_installation_unsuspend(&state, &installation).await)
         }
@@ -223,6 +234,14 @@ async fn github_webhook(
         | "pull_request.ready_for_review"
         | "pull_request.converted_to_draft" => {
             if let Some(inst) = &installation {
+                if !payload
+                    .pointer("/repository/full_name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|repo| inst.allows_repository(repo))
+                {
+                    schema::mark_event_processed(&state.db, &event_id).await?;
+                    return Ok(Json(json!({})));
+                }
                 let link_result = trakkt_github::events::process_pull_request(
                     &state.db,
                     inst,
@@ -234,10 +253,10 @@ async fn github_webhook(
 
                 // After link processing succeeds, apply automatic status transitions.
                 if link_result.is_ok() {
-                    if inst.suspended_at.is_some() {
+                    if !inst.is_active() {
                         tracing::debug!(
                             installation_id = %inst.installation_id,
-                            "Installation is suspended — skipping transition rules"
+                            "GitHub connection is inactive — skipping transition rules"
                         );
                     } else if let Some(ref github_client) = state.github_client
                         && let Err(e) = trakkt_github::transitions::apply_transition_rules(
@@ -267,7 +286,15 @@ async fn github_webhook(
         // Push events — extract refs from branch names and commit messages
         "push" => {
             if let Some(inst) = &installation {
-                Some(trakkt_github::events::process_push(&state.db, inst, &payload, Some(&state.ws_manager)).await)
+                Some(
+                    trakkt_github::events::process_push(
+                        &state.db,
+                        inst,
+                        &payload,
+                        Some(&state.ws_manager),
+                    )
+                    .await,
+                )
             } else {
                 tracing::warn!(event = %event_key, "push event with no installation — marking processed");
                 Some(Ok(()))
@@ -307,7 +334,9 @@ async fn github_webhook(
         }
         Some(Err(e)) => {
             tracing::error!(event_id = %event_id, error = %e, "GitHub event processing failed");
-            if let Err(mark_err) = schema::mark_event_failed(&state.db, &event_id, &e.to_string()).await {
+            if let Err(mark_err) =
+                schema::mark_event_failed(&state.db, &event_id, &e.to_string()).await
+            {
                 tracing::error!(event_id = %event_id, error = %mark_err, "Failed to mark event as failed");
             }
         }
@@ -322,8 +351,7 @@ async fn github_webhook(
 // Event handlers
 // ===========================================================================
 
-/// Handle `installation.deleted` and `installation.suspend` — mark the
-/// installation as suspended so we stop processing events for it.
+/// Handle `installation.suspend` independently of local disconnect and uninstall.
 async fn handle_installation_suspend(
     state: &AppState,
     installation: &Option<schema::GitHubInstallation>,
@@ -331,12 +359,17 @@ async fn handle_installation_suspend(
     let inst = match installation {
         Some(i) => i,
         None => {
-            tracing::warn!("installation.suspend/deleted event but no matching installation in DB");
+            tracing::warn!("installation.suspend event but no matching installation in DB");
             return Ok(());
         }
     };
 
-    schema::suspend_installation(&state.db, &inst.installation_id).await?;
+    schema::suspend_installation_with_delivery(
+        &state.db,
+        &inst.installation_id,
+        Some(&state.ws_manager),
+    )
+    .await?;
     tracing::info!(
         installation_id = %inst.installation_id,
         account = %inst.account_login,
@@ -358,7 +391,12 @@ async fn handle_installation_unsuspend(
         }
     };
 
-    schema::unsuspend_installation(&state.db, &inst.installation_id).await?;
+    schema::unsuspend_installation_with_delivery(
+        &state.db,
+        &inst.installation_id,
+        Some(&state.ws_manager),
+    )
+    .await?;
     tracing::info!(
         installation_id = %inst.installation_id,
         account = %inst.account_login,
@@ -382,87 +420,117 @@ async fn handle_installation_repos_changed(
         }
     };
 
-    // GitHub's `installation_repositories` webhook sends `repository_selection`
-    // ("all" or "selected") plus delta arrays `repositories_added` / `repositories_removed`.
-    // It does NOT send the full current repo list for the "selected" case, so we must
-    // read-modify-write against the DB to maintain an accurate `target_repos`.
-    let repository_selection = payload
+    let selection = payload
         .get("repository_selection")
-        .and_then(|v| v.as_str());
-
-    let target_repos: Option<Value> = match repository_selection {
-        Some("all") => {
-            // "all" means every repo — store NULL per schema convention.
-            None
-        }
-        _ => {
-            // Extract full_name from the delta arrays
-            let added: Vec<String> = payload
-                .get("repositories_added")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|r| r.get("full_name").and_then(|n| n.as_str()))
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let removed: Vec<String> = payload
-                .get("repositories_removed")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|r| r.get("full_name").and_then(|n| n.as_str()))
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // Read current repo list from DB and apply the delta
-            let mut current_repos: Vec<String> = match inst.target_repos.as_deref() {
-                None => Vec::new(),
-                Some(s) => match serde_json::from_str::<Vec<String>>(s) {
-                    Ok(repos) => repos,
-                    Err(e) => {
-                        tracing::warn!(
-                            installation_id = %inst.installation_id,
-                            error = %e,
-                            "Failed to parse target_repos JSON — treating as empty"
-                        );
-                        Vec::new()
-                    }
-                },
-            };
-
-            // Add new repos (avoid duplicates)
-            for repo in &added {
-                if !current_repos.contains(repo) {
-                    current_repos.push(repo.clone());
-                }
-            }
-
-            // Remove repos
-            current_repos.retain(|r| !removed.contains(r));
-
-            current_repos.sort();
-            Some(json!(current_repos))
-        }
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            trakkt_core::Error::BadRequest("Missing GitHub repository selection".into())
+        })?;
+    let names = |key: &str| -> Vec<String> {
+        payload
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|repo| {
+                repo.get("full_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
     };
-
-    schema::update_installation_repos(
-        &state.db,
-        &inst.installation_id,
-        target_repos.as_ref(),
-    )
-    .await?;
+    let current = schema::get_installation_by_id(&state.db, &inst.installation_id)
+        .await?
+        .ok_or_else(|| trakkt_core::Error::NotFound("GitHub connection no longer exists".into()))?;
+    if current.repository_scope_pending
+        || (current.repository_selection == "all" && selection == "selected")
+    {
+        reconcile_repository_scope(state, &current).await?;
+    } else {
+        schema::apply_repository_delta_with_delivery(
+            &state.db,
+            &inst.installation_id,
+            selection,
+            &names("repositories_added"),
+            &names("repositories_removed"),
+            Some(&state.ws_manager),
+        )
+        .await?;
+    }
 
     tracing::info!(
         installation_id = %inst.installation_id,
         account = %inst.account_login,
-        selection = ?repository_selection,
+        selection = %selection,
         "GitHub installation repositories updated"
     );
+    Ok(())
+}
+
+/// Delta payloads cannot identify retained repositories when switching from all.
+/// Quarantine first, fetch complete current permissions, then compare the epoch.
+async fn reconcile_repository_scope(
+    state: &AppState,
+    installation: &schema::GitHubInstallation,
+) -> Result<(), trakkt_core::Error> {
+    let generation = schema::begin_repository_reconciliation(
+        &state.db,
+        &installation.installation_id,
+        Some(&state.ws_manager),
+    )
+    .await?;
+    let client=state.github_client.as_deref().ok_or_else(||trakkt_core::Error::Internal("GitHub repository access needs refresh. Configure the GitHub App client and reconnect from its settings card.".into()))?;
+    let app = schema::get_github_app(&state.db).await?.ok_or_else(|| {
+        trakkt_core::Error::Internal(
+            "GitHub App configuration missing; reconnect after configuration is restored".into(),
+        )
+    })?;
+    let details = client
+        .get_installation_details(installation.github_installation_id as u64)
+        .await?;
+    if details.id != installation.github_installation_id as u64
+        || details.app_id != app.app_id as u64
+        || details.account.id == 0
+        || i64::try_from(details.account.id).is_err()
+        || installation.github_app_id != app.github_app_id
+        || installation
+            .github_account_id
+            .is_some_and(|id| id != details.account.id as i64)
+        || details.account.account_type != installation.account_type
+        || details.target_type != details.account.account_type
+        || details.suspended_at.is_some()
+        || !matches!(details.repository_selection.as_str(), "all" | "selected")
+    {
+        return Err(trakkt_core::Error::Forbidden(
+            "GitHub permissions changed; authorize again from this connection's settings card"
+                .into(),
+        ));
+    }
+    let repos = if details.repository_selection == "all" {
+        None
+    } else {
+        let token = client.request_installation_token(details.id).await?;
+        let mut names: Vec<String> = client
+            .list_installation_repos(&token.token)
+            .await?
+            .into_iter()
+            .map(|repo| repo.full_name)
+            .collect();
+        names.sort();
+        names.dedup();
+        Some(serde_json::json!(names))
+    };
+    let updated = schema::finish_repository_reconciliation(
+        &state.db,
+        &installation.installation_id,
+        generation,
+        repos.as_ref(),
+        Some(&state.ws_manager),
+    )
+    .await?;
+    if !updated {
+        tracing::info!(installation_id=%installation.installation_id,"Repository reconciliation superseded by a newer connection change");
+    }
     Ok(())
 }
 
@@ -531,12 +599,18 @@ fn build_payload_summary(event_type: &str, action: &Option<String>, payload: &Va
     }
 
     // Include repository full name if present
-    if let Some(repo) = payload.pointer("/repository/full_name").and_then(|v| v.as_str()) {
+    if let Some(repo) = payload
+        .pointer("/repository/full_name")
+        .and_then(|v| v.as_str())
+    {
         summary["repository"] = json!(repo);
     }
 
     // Include installation account if present
-    if let Some(account) = payload.pointer("/installation/account/login").and_then(|v| v.as_str()) {
+    if let Some(account) = payload
+        .pointer("/installation/account/login")
+        .and_then(|v| v.as_str())
+    {
         summary["installation_account"] = json!(account);
     }
 

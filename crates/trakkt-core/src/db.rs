@@ -126,6 +126,15 @@ pub enum DbTx {
     Sqlite(sqlx::Transaction<'static, sqlx::Sqlite>),
 }
 
+/// Admission evaluated inside the mutation transaction. Implementations may
+/// lock authorization rows; those locks remain held through the commit.
+pub trait TransactionAdmission: Send + Sync {
+    fn admit<'a>(
+        &'a self,
+        tx: &'a mut DbTx,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>> + Send + 'a>>;
+}
+
 impl DbTx {
     pub fn is_postgres(&self) -> bool {
         matches!(self, Self::Postgres(_))

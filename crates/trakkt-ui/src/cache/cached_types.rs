@@ -94,6 +94,8 @@ use trakkt_types::sync::entity_types;
 /// bootstrap so the cache is a whole list rather than a fragment, and drop the
 /// entry.
 const NOT_CACHED: &[&str] = &[
+    entity_types::GITHUB_INSTALLATION,
+    entity_types::GITHUB_TRANSITION_RULE,
     entity_types::RELEASE,
     entity_types::ACTIVITY,
     entity_types::ATTACHMENT,
