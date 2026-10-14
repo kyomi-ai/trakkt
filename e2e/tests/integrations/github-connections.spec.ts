@@ -51,6 +51,8 @@ test('two GitHub cards retain independent state and durable disconnect reaches a
     await expect(page.getByRole('button', { name: 'Add account', exact: true })).toBeVisible();
     await expect(card(page, personal)).toContainText('User account');
     await expect(card(page, personal)).toContainText('All repositories');
+    await expect(card(page, personal).locator('[data-github-status]')).toHaveText('Connected');
+    await expect(card(page, personal)).not.toContainText('Syncing is stopped');
     await expect(card(page, organization)).toContainText('Organization');
     await expect(card(page, organization)).toContainText('No repositories selected');
     await expect(secondTab.locator('[data-github-connection]')).toHaveCount(2);
@@ -63,6 +65,13 @@ test('two GitHub cards retain independent state and durable disconnect reaches a
     await card(page, personal).getByRole('button', { name: 'Yes, disconnect', exact: true }).click();
     await expect(card(page, personal)).toContainText('Disconnected');
     await expect(card(secondTab, personal)).toContainText('Disconnected', { timeout: 15_000 });
+    for (const tab of [page, secondTab]) {
+      await expect(card(tab, personal).locator('[data-github-status]')).toHaveText('Disconnected');
+      await expect(card(tab, personal)).toContainText('Syncing is stopped');
+      await expect(card(tab, personal)).toContainText('Last configured repository access:');
+      await expect(card(tab, organization).locator('[data-github-status]')).toHaveText('Connected');
+      await expect(card(tab, organization)).not.toContainText('Syncing is stopped');
+    }
     await expect(card(secondTab, organization).getByRole('button', { name: 'Disconnect', exact: true })).toBeEnabled();
     await expect(card(secondTab, personal).getByRole('button', { name: 'Reconnect GitHub', exact: true })).toBeVisible();
     await expect(secondTab.getByRole('button', { name: 'Add account', exact: true })).toBeVisible();
