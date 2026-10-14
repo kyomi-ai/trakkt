@@ -323,6 +323,13 @@ fn ConnectedCard(
                         <CardTitle>"GitHub Integration"</CardTitle>
                     </div>
 
+                    <p
+                        data-github-status=if active { "connected" } else { "inactive" }
+                        class=if active { "text-sm font-medium text-success-foreground" } else { "text-sm font-medium text-error-foreground" }
+                    >
+                        {lifecycle}
+                    </p>
+
                     // Disconnect button / inline confirmation
                     <div class="flex items-center gap-2">
                         {move || {
@@ -379,6 +386,20 @@ fn ConnectedCard(
             </CardHeader>
             <CardContent>
                 <div class="space-y-4">
+                    {(!active).then(|| view! {
+                        <Alert variant=AlertVariant::Warning>
+                            <AlertDescription>
+                                "Syncing is stopped. New pull requests and commits from this account are not being synced to Trakkt. "
+                                {if uninstalled {
+                                    "Reinstall the GitHub App to connect again."
+                                } else if suspended {
+                                    "Unsuspend the GitHub App on GitHub, then reconnect."
+                                } else {
+                                    "Reconnect this account to resume syncing."
+                                }}
+                            </AlertDescription>
+                        </Alert>
+                    })}
                     // Disconnect error
                     {move || disconnect_error.get().map(|e| view! {
                         <Alert variant=AlertVariant::Error>
@@ -403,14 +424,15 @@ fn ConnectedCard(
                         </span>
                     </div>
 
-                    <p class="text-sm text-secondary-foreground">{lifecycle}</p>
                     <div class="text-sm text-muted-foreground">
                         "Installed: " {display_date}
                     </div>
 
                     // Repository list
                     <div class="space-y-2">
-                        <p class="text-sm font-medium text-foreground">"Repositories:"</p>
+                        <p class="text-sm font-medium text-foreground">
+                            {if active { "Repositories:" } else { "Last configured repository access:" }}
+                        </p>
                         {if scope_pending {
                             view! { <p class="text-sm text-secondary-foreground ml-2">"Repository access needs refresh"</p> }.into_any()
                         } else if all_repos {
@@ -645,6 +667,40 @@ mod tests {
             assert_eq!(html.matches("Disconnected").count(), 2);
             assert_eq!(html.matches("Remove integration").count(), 3);
             assert!(!html.contains("Status Transitions"), "rules belong to the workspace, not the account cards");
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn connected_and_inactive_cards_distinguish_live_access_from_saved_configuration() {
+        boot_executor();
+        tokio::task::LocalSet::new().run_until(async {
+            for state in ["connected", "disconnected", "suspended", "unverified", "pending", "uninstalled"] {
+                let owner = Owner::new();
+                let mut row = connection(state, "all");
+                row.active = state == "connected";
+                row.disconnected = state == "disconnected";
+                row.suspended = state == "suspended";
+                row.verified = state != "unverified";
+                row.scope_pending = state == "pending";
+                row.uninstalled = state == "uninstalled";
+                let html = owner.with(|| view! {
+                    <ConnectedCard connection=row on_disconnected=Callback::new(|()| {})/>
+                }.to_html());
+                if state == "connected" {
+                    assert!(html.contains("data-github-status=\"connected\""));
+                    assert!(!html.contains("Syncing is stopped"));
+                    assert!(!html.contains("Last configured repository access:"));
+                } else {
+                    assert!(html.contains("data-github-status=\"inactive\""), "{state}");
+                    assert!(html.contains("Syncing is stopped"), "{state}");
+                    assert!(html.contains("Last configured repository access:"), "{state}");
+                    assert!(!html.contains("data-github-status=\"connected\""), "{state}");
+                    if state == "suspended" {
+                        assert!(html.contains("Unsuspend the GitHub App on GitHub, then reconnect."));
+                        assert!(!html.contains("Reconnect this account to resume syncing."));
+                    }
+                }
+            }
         }).await;
     }
 
