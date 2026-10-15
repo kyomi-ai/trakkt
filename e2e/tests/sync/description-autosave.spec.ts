@@ -497,3 +497,31 @@ test('an older IndexedDB description read cannot replace a newer completed read'
     });
   }
 });
+
+test('floating toolbar formatting keeps its selection and continued typing across autosave', async () => {
+  const page = clients.pageA;
+  const href = await createIssueViaUi(page, `Description toolbar ${Date.now()}`);
+  await page.goto(href);
+  const section = page.locator('.markdown-description').first();
+  const editor = section.locator('[contenteditable="true"]');
+  await editor.click();
+  const plainSaved = page.waitForResponse(response => new URL(response.url()).pathname.startsWith('/leptos-api/update_issue'));
+  await page.keyboard.type('Toolbar words');
+  await (await plainSaved).finished();
+  await page.keyboard.press('ControlOrMeta+a');
+  const formatted = page.waitForResponse(response => new URL(response.url()).pathname.startsWith('/leptos-api/update_issue'));
+  await section.getByTitle('Bold (Ctrl+B)', { exact: true }).click();
+  await expect(editor.locator('strong')).toHaveText('Toolbar words');
+  await (await formatted).finished();
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(editor).toBeFocused();
+  expect(await page.evaluate(() => getSelection()?.toString())).toBe('Toolbar words');
+  // Replace the preserved range directly; end-of-document ArrowRight navigation is tracked in TRA-10105.
+  const continued = page.waitForResponse(response => new URL(response.url()).pathname.startsWith('/leptos-api/update_issue')
+    && response.request().postData()?.includes('Replacement'));
+  await page.keyboard.type('Replacement words');
+  await (await continued).finished();
+  await expect(editor.locator('strong')).toHaveText('Replacement words');
+  await page.reload();
+  await expect(editor.locator('strong')).toHaveText('Replacement words');
+});
