@@ -318,8 +318,8 @@ pub async fn apply_transition_rules(
             issue.number,
             &updates,
             None, // No actor user — system-initiated
-            trakkt_types::enums::ActionSource::Api,
-            None,
+            trakkt_types::enums::ActionSource::Github,
+            Some("GitHub"),
             ws_manager,
             Some(&admission),
         )

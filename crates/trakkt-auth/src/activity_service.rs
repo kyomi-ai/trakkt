@@ -227,29 +227,12 @@ pub struct FieldChangeParams<'a> {
 /// Create one at the start of a request/operation and use its methods to
 /// record all activities generated during that operation.
 ///
-/// # Why the recorder owns its transaction
+/// # Transaction ownership
 ///
-/// TRA-9923 requires a `sync_log` row to commit atomically with the mutation it
-/// describes. For an activity that mutation is *the activity row itself*, so
-/// each activity gets its own transaction: the row and its `sync_log` entry are
-/// written on it, it commits, and only then is the change broadcast. A method
-/// that records several — [`ActivityRecorder::record_issue_diff`] — runs one
-/// such transaction per activity.
-///
-/// It does not instead take the caller's transaction, because there is no
-/// caller transaction to take. Every construction of an `ActivityRecorder`
-/// lives in `trakkt-api` or `trakkt-github` (`comments.rs`, `issues.rs`,
-/// `relations.rs`, `events.rs`), and `grep -rn '\.begin()'` over
-/// `crates/trakkt-api/src/` and `crates/trakkt-github/src/` matches nothing —
-/// neither crate opens a transaction anywhere. Each caller calls a service
-/// function that opens and commits its own transaction and returns, and only
-/// then records the activity describing what already committed.
-///
-/// The remaining non-atomicity is activity-vs-issue-update, and that is the
-/// intended trade. An activity is a derived audit record; a failed activity
-/// write must not roll back a legitimate issue update, and every call site
-/// already treats recording as best-effort (`if let Err(e) = recorder.record(…)`
-/// followed by a log and a continue).
+/// Status changes use `record_status_change_in_tx` inside the issue mutation's
+/// transaction, so the status and its history cannot commit separately. Other
+/// activities use their own transaction after the caller's mutation commits.
+/// Every activity and its sync entry commit together; delivery follows commit.
 ///
 /// # Coalescing read visibility
 ///
@@ -355,30 +338,83 @@ impl<'a> ActivityRecorder<'a> {
         .await
     }
 
-    /// Compare two issue snapshots and record an activity for each difference.
+    /// Record a real status transition in the caller's mutation transaction.
+    /// Names and IDs are retained even if the referenced status is later deleted.
+    pub(crate) async fn record_status_change_in_tx(
+        &self,
+        tx: &mut DbTx,
+        batch: &mut sync_log_service::SyncBatch<'_>,
+        issue_id: &str,
+        before: (&str, &str),
+        after: (&str, &str),
+    ) -> trakkt_core::Result<()> {
+        if before.0 == after.0 {
+            return Ok(());
+        }
+        let metadata = serde_json::json!({
+            "old_status_id": before.0,
+            "new_status_id": after.0,
+        });
+        self.record_field_change_in_tx(
+            tx,
+            batch,
+            &FieldChangeParams {
+                issue_id,
+                action_type: "status_changed",
+                field: "status",
+                old_value: Some(before.1),
+                new_value: Some(after.1),
+                metadata: Some(&metadata),
+            },
+        )
+        .await
+    }
+
+    /// Record a field change and its sync entry inside the mutation's transaction.
+    /// Authorization admission must already have been checked by the caller.
+    async fn record_field_change_in_tx(
+        &self,
+        tx: &mut DbTx,
+        batch: &mut sync_log_service::SyncBatch<'_>,
+        params: &FieldChangeParams<'_>,
+    ) -> trakkt_core::Result<()> {
+        let activity_id = self
+            .insert_activity_row(
+                tx,
+                params.issue_id,
+                params.action_type,
+                Some(params.field),
+                params.old_value,
+                params.new_value,
+                params.metadata,
+            )
+            .await?;
+        let activity = read_activity_for_sync(tx, &activity_id).await?;
+        let payload =
+            sync_log_service::sync_payload(&activity, entity_types::ACTIVITY, &activity_id);
+        batch
+            .record(
+                tx,
+                entity_types::ACTIVITY,
+                &activity_id,
+                self.workspace_id,
+                sync_log_service::SyncAudience::Workspace,
+                SyncActionType::Insert,
+                payload,
+            )
+            .await
+    }
+
+    /// Record non-status differences between two issue snapshots.
+    ///
+    /// Status history is recorded atomically by `issue_service::update_issue`,
+    /// including updates that bypass API and UI wrappers.
     pub async fn record_issue_diff(
         &self,
         issue_id: &str,
         before: &IssueSnapshot,
         after: &IssueSnapshot,
     ) -> trakkt_core::Result<()> {
-        // Status
-        if before.status_id != after.status_id {
-            let meta = serde_json::json!({
-                "old_status_id": before.status_id,
-                "new_status_id": after.status_id,
-            });
-            self.insert_activity(
-                issue_id,
-                "status_changed",
-                Some("status"),
-                Some(&before.status_name),
-                Some(&after.status_name),
-                Some(&meta),
-            )
-            .await?;
-        }
-
         // Priority
         if before.priority != after.priority {
             let meta = serde_json::json!({
@@ -685,10 +721,9 @@ impl<'a> ActivityRecorder<'a> {
     /// Write one `issue_activities` row on an open transaction and return its
     /// generated id.
     ///
-    /// The `sync_log` entry, the commit and the broadcast are the caller's:
-    /// both callers finish through
-    /// [`sync_log_service::commit_and_deliver`], which is what keeps the
-    /// delivery strictly after the commit.
+    /// The caller records the sync entry and commits through
+    /// [`sync_log_service::commit_and_deliver`] or [`sync_log_service::SyncBatch`],
+    /// keeping activity delivery strictly after the commit.
     async fn insert_activity_row(
         &self,
         tx: &mut DbTx,

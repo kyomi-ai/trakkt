@@ -4733,6 +4733,46 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn team_deletion_records_reassigned_status_history_after_status_cascade() {
+        let db = two_user_workspace().await;
+        seed_doomed_team(&db).await;
+
+        crate::team_service::delete_team(&db, "team_doomed", WS, Some("team_vis"), None, None)
+            .await
+            .expect("delete the team and reassign its issue");
+
+        let history = crate::activity_service::list_issue_activities(&db, "iss_doomed")
+            .await
+            .expect("read reassigned issue history after deleting its old status");
+        assert_eq!(history.len(), 1, "one history entry for the status reset");
+        let activity = &history[0];
+        assert_eq!(activity.action_type, "status_changed");
+        assert_eq!(activity.old_value.as_deref(), Some("Doomed Backlog"));
+        assert_eq!(activity.new_value.as_deref(), Some("Backlog"));
+        assert_eq!(activity.action_source, trakkt_types::enums::ActionSource::Api);
+        assert_eq!(activity.action_source_label.as_deref(), Some("Team deletion"));
+        assert!(activity.actor_id.is_none());
+        let metadata: serde_json::Value =
+            serde_json::from_str(activity.metadata.as_deref().expect("status history metadata"))
+                .expect("decode retained status IDs");
+        assert_eq!(metadata["old_status_id"], "sts_doomed");
+        assert_eq!(metadata["new_status_id"], "sts_ws_backlog");
+        let old_status_count: i64 = db_fetch_scalar!(
+            &db,
+            i64,
+            "SELECT COUNT(*) FROM statuses WHERE status_id = $1",
+            "sts_doomed"
+        ).expect("verify the old team status was deleted");
+        assert_eq!(old_status_count, 0);
+        let entries = activity_sync_entries(&db).await;
+        assert_eq!(entries.len(), 1, "the history has one replayable sync entry");
+        let synced: trakkt_types::models::IssueActivity = serde_json::from_value(
+            entries[0].data.clone().expect("history sync payload")
+        ).expect("decode the complete history sync payload");
+        assert_eq!(&synced, activity);
+    }
+
     /// The team delete's own sync entry is the last write in the transaction —
     /// after the reassignments, after the favorites and user-default clears,
     /// after the DELETE and its cascade. Rejecting it proves the whole cascade
@@ -4792,10 +4832,17 @@ mod tests {
              the team entry failed, so it is the proof of the rollback: it must \
              not be left committed on its own"
         );
+        assert!(
+            crate::activity_service::list_issue_activities(&db, "iss_doomed")
+                .await
+                .expect("read history after failed team deletion")
+                .is_empty(),
+            "rolled back reassignment must not leave status history"
+        );
     }
 
-    /// The reassignment loop's entry is the *first* sync write in the same
-    /// transaction. Rejecting it instead proves the loop is inside the
+    /// The reassignment loop's issue entry follows its status-history entry in
+    /// the same transaction. Rejecting it proves the loop is inside the
     /// transaction at all — with the entry written on the pool, the `UPDATE
     /// issues` that precedes it commits regardless.
     #[tokio::test]
@@ -4829,6 +4876,13 @@ mod tests {
         assert_eq!(
             after, before,
             "nothing else the delete touches may be left half-applied"
+        );
+        assert!(
+            crate::activity_service::list_issue_activities(&db, "iss_doomed")
+                .await
+                .expect("read history after rejected reassignment sync")
+                .is_empty(),
+            "history written before the rejected issue sync entry must roll back"
         );
     }
 
@@ -8986,6 +9040,165 @@ mod tests {
             "the transfer itself is untouched, so it is still pending and still \
              completable"
         );
+    }
+
+    async fn status_history_done_status(db: &DbPool) {
+        db_execute!(db,
+            "INSERT INTO statuses (status_id, workspace_id, team_id, name, category) VALUES ($1, $2, $3, $4, $5)",
+            "sts_done", WS, "team_vis", "Done", "completed"
+        ).expect("seed completed status");
+    }
+
+    #[tokio::test]
+    async fn status_history_is_shared_by_user_agent_api_and_github_updates() {
+        use crate::activity_service::{ActivityRecorder, IssueSnapshot};
+        use trakkt_types::{enums::ActionSource, models::IssueUpdate};
+        let db = two_user_workspace().await;
+        status_history_done_status(&db).await;
+        for (source, actor, label) in [
+            (ActionSource::User, Some(USER_A), None),
+            (ActionSource::Agent, Some(USER_A), Some("Codex")),
+            (ActionSource::Api, Some(USER_A), None),
+            (ActionSource::Github, None, Some("GitHub")),
+        ] {
+            for target in ["sts_done", "sts_vis"] {
+                let before = crate::issue_service::get_issue_by_id(&db, "iss_vis")
+                    .await
+                    .expect("read before")
+                    .expect("issue exists");
+                crate::issue_service::update_issue(
+                    &db,
+                    WS,
+                    "VIS",
+                    1,
+                    &IssueUpdate {
+                        status_id: Some(target.into()),
+                        ..Default::default()
+                    },
+                    actor,
+                    source,
+                    label,
+                    None,
+                )
+                .await
+                .expect("status mutation");
+                let after = crate::issue_service::get_issue_by_id(&db, "iss_vis")
+                    .await
+                    .expect("read after")
+                    .expect("issue exists");
+                // API/UI wrappers still diff other fields after the shared mutation.
+                ActivityRecorder::new_with_optional_actor(
+                    &db,
+                    WS,
+                    actor,
+                    source,
+                    label.map(str::to_owned),
+                    None,
+                )
+                .record_issue_diff(
+                    "iss_vis",
+                    &IssueSnapshot::from_issue_with_details(&before),
+                    &IssueSnapshot::from_issue_with_details(&after),
+                )
+                .await
+                .expect("caller diff must not duplicate status history");
+                let history = issue_activities(&db).await;
+                let last = history.last().expect("status history recorded");
+                assert_eq!(last.action_type, "status_changed");
+                assert_eq!(last.old_value.as_deref(), Some(before.status_name.as_str()));
+                assert_eq!(last.new_value.as_deref(), Some(after.status_name.as_str()));
+                assert_eq!(last.action_source, source);
+                assert_eq!(last.actor_id.as_deref(), actor);
+                assert_eq!(last.action_source_label.as_deref(), label);
+                let metadata: serde_json::Value =
+                    serde_json::from_str(last.metadata.as_deref().expect("metadata"))
+                        .expect("status metadata JSON");
+                assert_eq!(metadata["old_status_id"], before.status_id);
+                assert_eq!(metadata["new_status_id"], after.status_id);
+            }
+        }
+        assert_eq!(issue_activities(&db).await.len(), 8);
+        let entries = activity_sync_entries(&db).await;
+        assert_eq!(
+            entries.len(),
+            8,
+            "each transition has one replayable activity"
+        );
+        for (entry, activity) in entries.iter().zip(issue_activities(&db).await) {
+            let payload: trakkt_types::models::IssueActivity =
+                serde_json::from_value(entry.data.clone().expect("sync payload"))
+                    .expect("complete activity payload");
+            assert_eq!(payload, activity);
+        }
+        crate::issue_service::update_issue(
+            &db,
+            WS,
+            "VIS",
+            1,
+            &IssueUpdate {
+                status_id: Some("sts_vis".into()),
+                ..Default::default()
+            },
+            None,
+            ActionSource::Github,
+            Some("GitHub"),
+            None,
+        )
+        .await
+        .expect("same-status update");
+        assert_eq!(issue_activities(&db).await.len(), 8, "no history for no-op");
+    }
+
+    #[tokio::test]
+    async fn status_history_failure_rolls_back_status_and_sync() {
+        use trakkt_types::{enums::ActionSource, models::IssueUpdate};
+        for fail_sync in [false, true] {
+            let db = two_user_workspace().await;
+            status_history_done_status(&db).await;
+            let sync_before = get_entries_since(&db, WS, USER_A, 0, 10_000)
+                .await
+                .expect("initial sync");
+            if fail_sync {
+                reject_sync_log_inserts_for_entity_type(&db, entity_types::ACTIVITY).await;
+            } else {
+                db_execute!(&db,
+                    "CREATE TRIGGER reject_status_history BEFORE INSERT ON issue_activities WHEN NEW.action_type = 'status_changed' BEGIN SELECT RAISE(ABORT, 'status history rejected'); END"
+                ).expect("reject history row");
+            }
+            let error = crate::issue_service::update_issue(
+                &db,
+                WS,
+                "VIS",
+                1,
+                &IssueUpdate {
+                    status_id: Some("sts_done".into()),
+                    ..Default::default()
+                },
+                None,
+                ActionSource::Github,
+                Some("GitHub"),
+                None,
+            )
+            .await
+            .expect_err("history failure must fail the status mutation");
+            assert!(error.to_string().contains("rejected"));
+            let issue = crate::issue_service::get_issue_by_id(&db, "iss_vis")
+                .await
+                .expect("read rolled back issue")
+                .expect("issue exists");
+            assert_eq!(issue.status_id, "sts_vis");
+            assert!(issue.completed_at.is_none());
+            assert!(issue_activities(&db).await.is_empty());
+            assert_eq!(
+                serde_json::to_value(
+                    get_entries_since(&db, WS, USER_A, 0, 10_000)
+                        .await
+                        .expect("sync after rollback")
+                )
+                .expect("serialize sync after"),
+                serde_json::to_value(sync_before).expect("serialize sync before")
+            );
+        }
     }
 
     // ─── Activity rows and their sync entries (TRA-9954) ─────────────────────
