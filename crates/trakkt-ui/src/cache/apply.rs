@@ -519,13 +519,9 @@ pub fn enqueue_cache_writes(writer: &IdbWriter, action: &SyncAction) {
             let (idb_data, content_json) = if entity_type == entity_types::ISSUE {
                 let mut data = entity_data.clone();
                 let description = data.as_object_mut().and_then(|obj| obj.remove("description"));
-                let content = description.and_then(|d| {
-                    if d.is_null() {
-                        None
-                    } else {
-                        Some(serde_json::json!({"description": d}).to_string())
-                    }
-                });
+                // Explicit null clears cached text; an absent field leaves it alone.
+                let content = description
+                    .map(|d| serde_json::json!({"description": d}).to_string());
                 (data, content)
             } else {
                 (entity_data.clone(), None)
@@ -1268,14 +1264,29 @@ mod tests {
     }
 
     #[test]
-    fn an_issue_with_no_body_queues_only_the_issue() {
+    fn an_explicitly_cleared_body_replaces_cached_content() {
         let ops = cache_ops(&action(
             entity_types::ISSUE,
             SyncActionType::Update,
             Some(issue_json(serde_json::Value::Null)),
         ));
 
-        assert_eq!(ops.len(), 1, "expected only the issue record, got {ops:?}");
+        assert_eq!(ops.len(), 2, "a clear must replace the prior body: {ops:?}");
+        assert_eq!(ops[1], r#"upsert:issue_content:issue-1:{"description":null}"#);
+    }
+
+    #[test]
+    fn an_absent_body_does_not_replace_cached_content() {
+        let mut data = issue_json(serde_json::Value::Null);
+        data.as_object_mut()
+            .expect("issue fixture is a JSON object")
+            .remove("description");
+        let ops = cache_ops(&action(
+            entity_types::ISSUE,
+            SyncActionType::Update,
+            Some(data),
+        ));
+        assert_eq!(ops.len(), 1, "an omitted body must stay unchanged: {ops:?}");
     }
 
     #[test]
@@ -1739,9 +1750,11 @@ mod tests {
         ));
         assert_eq!(
             ops.len(),
-            1,
+            2,
             "the issue updates a release emits are still cached, got {ops:?}"
         );
+        assert!(ops[0].starts_with("upsert:issue:issue-1:"));
+        assert_eq!(ops[1], r#"upsert:issue_content:issue-1:{"description":null}"#);
     }
 
     #[test]

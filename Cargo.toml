@@ -11,6 +11,7 @@ members = [
     "apps/trakkt-connect",
     "tools/gen-api-docs",
 ]
+exclude = ["vendor/kode-leptos"]
 resolver = "3"
 
 [workspace.package]
@@ -153,9 +154,3 @@ inherits = "release"
 lto = false
 codegen-units = 16
 opt-level = "s"
-# The Dockerfile strips everything between BEGIN_LOCAL_DEV_PATCHES and
-# END_LOCAL_DEV_PATCHES before `cargo build`, so prod always uses crates.io.
-# BEGIN_LOCAL_DEV_PATCHES
-[patch.crates-io]
-kode-leptos = { path = "../kode/kode-leptos" }
-# END_LOCAL_DEV_PATCHES

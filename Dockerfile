@@ -37,6 +37,7 @@ COPY target/${PROFILE}/trakkt /app/trakkt
 
 # Copy pre-built Leptos frontend assets
 COPY crates/trakkt-ui/dist /app/dist
+COPY vendor/kode-leptos/LICENSE /app/licenses/kode-leptos-LICENSE
 
 ENV PORT=8003 \
     TRUNK_DIST_DIR=/app/dist \

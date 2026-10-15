@@ -137,6 +137,26 @@ pub struct IdbWriter {
     ops: mpsc::UnboundedSender<IdbOp>,
 }
 
+/// Orders on-demand reads after writes already announced to the reactive store.
+/// A follower has no writer: its broadcasts are delivered after cache writes.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+pub struct CacheReadBarrier(
+    pub leptos::prelude::StoredValue<send_wrapper::SendWrapper<Option<IdbWriter>>>,
+);
+
+#[cfg(target_arch = "wasm32")]
+impl CacheReadBarrier {
+    pub async fn wait(self) {
+        use leptos::prelude::WithValue;
+
+        let writer = self.0.try_with_value(|writer| (**writer).clone()).flatten();
+        if let Some(writer) = writer {
+            writer.flush().await;
+        }
+    }
+}
+
 impl IdbWriter {
     /// Append an op to the queue.
     ///

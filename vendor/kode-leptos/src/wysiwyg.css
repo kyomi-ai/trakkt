@@ -1,0 +1,1461 @@
+/* ── Toolbar ───────────────────────────────────────────────────────── */
+
+.kode-toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--kode-toolbar-gap, 2px);
+    padding: var(--kode-toolbar-padding, 6px 8px);
+    background: var(--kode-toolbar-bg, var(--kode-bg));
+    border-bottom: var(--kode-toolbar-border-width, 1px) solid var(--kode-toolbar-border-color, var(--kode-border));
+    font-family: var(--kode-toolbar-font-family, var(--kode-font-family, 'JetBrains Mono', 'Fira Code', monospace));
+    font-size: var(--kode-toolbar-font-size, 13px);
+    user-select: none;
+    flex-wrap: var(--kode-toolbar-wrap, wrap);
+    overflow-x: auto; /* enables scroll when --kode-toolbar-wrap is nowrap */
+    scrollbar-color: var(--kode-toolbar-scrollbar-color, auto);
+}
+
+.kode-toolbar-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--kode-toolbar-button-gap, 0);
+    min-width: var(--kode-toolbar-button-min-width, 28px);
+    height: var(--kode-toolbar-button-height, 28px);
+    padding: var(--kode-toolbar-button-padding, 0 6px);
+    background: transparent;
+    color: var(--kode-fg);
+    border: var(--kode-toolbar-button-border, 1px solid transparent);
+    border-radius: var(--kode-toolbar-button-border-radius, 4px);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: var(--kode-toolbar-button-font-size, 13px);
+    font-weight: var(--kode-toolbar-button-font-weight, 500);
+    transition: all var(--kode-transition-duration, 0.15s) ease;
+}
+
+.kode-toolbar-button:hover {
+    background: var(--kode-toolbar-button-hover-bg, var(--kode-bg-hover));
+    color: var(--kode-toolbar-button-hover-color, var(--kode-fg-bright));
+    border-color: var(--kode-toolbar-button-hover-border, var(--kode-accent));
+}
+
+.kode-toolbar-button:active {
+    background: var(--kode-toolbar-button-active-bg, var(--kode-bg-highlight));
+    color: var(--kode-toolbar-button-active-color, var(--kode-accent));
+    border-color: var(--kode-toolbar-button-active-border, var(--kode-accent));
+}
+
+.kode-toolbar-button.active {
+    background: var(--kode-toolbar-button-selected-bg, var(--kode-accent));
+    color: var(--kode-toolbar-button-selected-color, var(--kode-bg));
+    border-color: var(--kode-toolbar-button-selected-border, var(--kode-accent));
+}
+
+.kode-toolbar-button.active:hover {
+    background: var(--kode-toolbar-button-selected-bg, var(--kode-accent));
+    color: var(--kode-toolbar-button-selected-color, var(--kode-bg));
+    border-color: var(--kode-toolbar-button-selected-border, var(--kode-accent));
+}
+
+.kode-toolbar-button svg {
+    width: var(--kode-toolbar-icon-size, 16px);
+    height: var(--kode-toolbar-icon-size, 16px);
+    flex-shrink: 0;
+}
+
+.kode-toolbar-separator {
+    width: var(--kode-toolbar-separator-width, 1px);
+    height: var(--kode-toolbar-separator-height, 20px);
+    background: var(--kode-toolbar-separator-color, var(--kode-border));
+    margin: var(--kode-toolbar-separator-margin, 0 4px);
+    flex-shrink: 0;
+}
+
+.kode-toolbar-spacer {
+    flex: 1;
+}
+
+/* ── Floating Toolbar ──────────────────────────────────────────────── */
+
+.kode-floating-toolbar {
+    position: absolute;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: var(--kode-toolbar-gap, 2px);
+    padding: var(--kode-floating-toolbar-padding, 4px 6px);
+    background: var(--kode-floating-toolbar-bg, var(--kode-toolbar-bg, var(--kode-bg)));
+    border: var(--kode-floating-toolbar-border-width, 1px) solid var(--kode-floating-toolbar-border-color, var(--kode-border));
+    border-radius: var(--kode-floating-toolbar-border-radius, 8px);
+    box-shadow: var(--kode-floating-toolbar-shadow, 0 4px 16px rgba(0, 0, 0, 0.15));
+    font-family: var(--kode-toolbar-font-family, var(--kode-font-family, 'JetBrains Mono', 'Fira Code', monospace));
+    font-size: var(--kode-toolbar-font-size, 13px);
+    user-select: none;
+    pointer-events: auto;
+    animation: kode-floating-toolbar-in 0.12s ease-out;
+}
+
+@keyframes kode-floating-toolbar-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+/* ── WYSIWYG Block Renderer Styles ─────────────────────────────────── */
+
+/* Container */
+.wysiwyg-container {
+    font-family: var(--kode-content-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif);
+    font-size: var(--kode-content-font-size, inherit);
+    color: var(--kode-fg-bright);
+    background: var(--kode-bg);
+    line-height: var(--kode-content-line-height, 1.7);
+    padding: var(--kode-container-padding, 0);
+    max-width: var(--kode-content-max-width, 800px);
+    position: relative;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    cursor: text;
+}
+
+/* Hidden textarea — stays on-screen so browsers allow focus */
+.wysiwyg-container .kode-hidden-textarea {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0.01;
+    padding: 0;
+    border: none;
+    outline: none;
+    resize: none;
+    overflow: hidden;
+    white-space: pre;
+    z-index: -1;
+}
+
+/* ── Headings ──────────────────────────────────────────────────────── */
+
+.wysiwyg-heading {
+    color: var(--kode-heading-color, var(--kode-fg-bright));
+    font-family: var(--kode-heading-font-family, inherit);
+    font-weight: var(--kode-heading-font-weight, 700);
+    margin-top: var(--kode-heading-margin-top, 1.5em);
+    margin-bottom: var(--kode-heading-margin-bottom, 0.5em);
+    line-height: var(--kode-heading-line-height, 1.3);
+    letter-spacing: var(--kode-heading-letter-spacing, normal);
+}
+
+.wysiwyg-heading:first-child {
+    margin-top: 0;
+}
+
+/* Italic emphasis inside a heading — for editorial themes that want
+ * a spot color (e.g. brand accent) on emphasized words inside titles.
+ * Targets both `<em>` elements (how the tree renderer emits markdown
+ * `*italic*` syntax) and `.wysiwyg-italic` spans (used by some editing
+ * modes that wrap formatted runs in a class rather than a semantic tag). */
+.wysiwyg-heading em,
+.wysiwyg-heading .wysiwyg-italic {
+    color: var(--kode-heading-emphasis-color, inherit);
+}
+
+.wysiwyg-h1 {
+    font-size: var(--kode-h1-font-size, 2em);
+    font-weight: var(--kode-h1-font-weight, var(--kode-heading-font-weight, 700));
+    margin-top: var(--kode-h1-margin-top, var(--kode-heading-margin-top, 1.5em));
+    margin-bottom: var(--kode-h1-margin-bottom, var(--kode-heading-margin-bottom, 0.5em));
+    border-bottom: var(--kode-h1-border-width, 1px) solid var(--kode-h1-border-color, var(--kode-border));
+    padding-bottom: var(--kode-h1-padding-bottom, 0.3em);
+}
+
+.wysiwyg-h2 {
+    font-size: var(--kode-h2-font-size, 1.5em);
+    font-weight: var(--kode-h2-font-weight, var(--kode-heading-font-weight, 700));
+    margin-top: var(--kode-h2-margin-top, var(--kode-heading-margin-top, 1.5em));
+    margin-bottom: var(--kode-h2-margin-bottom, var(--kode-heading-margin-bottom, 0.5em));
+    border-bottom: var(--kode-h2-border-width, 1px) solid var(--kode-h2-border-color, var(--kode-border));
+    padding-bottom: var(--kode-h2-padding-bottom, 0.2em);
+}
+
+.wysiwyg-h3 {
+    font-size: var(--kode-h3-font-size, 1.25em);
+    font-weight: var(--kode-h3-font-weight, var(--kode-heading-font-weight, 700));
+    margin-top: var(--kode-h3-margin-top, var(--kode-heading-margin-top, 1.5em));
+    margin-bottom: var(--kode-h3-margin-bottom, var(--kode-heading-margin-bottom, 0.5em));
+}
+
+.wysiwyg-h4 {
+    font-size: var(--kode-h4-font-size, 1.1em);
+    font-weight: var(--kode-h4-font-weight, var(--kode-heading-font-weight, 700));
+    font-family: var(--kode-h4-font-family, var(--kode-heading-font-family, inherit));
+    color: var(--kode-h4-color, var(--kode-heading-color, var(--kode-fg-bright)));
+    letter-spacing: var(--kode-h4-letter-spacing, var(--kode-heading-letter-spacing, normal));
+    text-transform: var(--kode-h4-text-transform, none);
+}
+
+.wysiwyg-h5 {
+    font-size: var(--kode-h5-font-size, 1em);
+    font-weight: var(--kode-h5-font-weight, var(--kode-heading-font-weight, 700));
+    font-family: var(--kode-h5-font-family, var(--kode-heading-font-family, inherit));
+    color: var(--kode-h5-color, var(--kode-heading-color, var(--kode-fg-bright)));
+    text-transform: var(--kode-h5-text-transform, none);
+    letter-spacing: var(--kode-h5-letter-spacing, var(--kode-heading-letter-spacing, normal));
+}
+
+.wysiwyg-h6 {
+    font-size: var(--kode-h6-font-size, 0.9em);
+    font-weight: var(--kode-h6-font-weight, var(--kode-heading-font-weight, 700));
+    font-family: var(--kode-h6-font-family, var(--kode-heading-font-family, inherit));
+    color: var(--kode-h6-color, var(--kode-fg-dim));
+    text-transform: var(--kode-h6-text-transform, none);
+    letter-spacing: var(--kode-h6-letter-spacing, var(--kode-heading-letter-spacing, normal));
+}
+
+/* ── Paragraph ─────────────────────────────────────────────────────── */
+
+.wysiwyg-paragraph {
+    margin: var(--kode-paragraph-margin, 0.75em 0);
+    line-height: var(--kode-paragraph-line-height, 1.7);
+}
+
+.wysiwyg-paragraph:first-child {
+    margin-top: 0;
+}
+
+/* ── Lists ─────────────────────────────────────────────────────────── */
+
+.wysiwyg-list {
+    margin: var(--kode-list-margin, 0.5em 0);
+    padding-left: var(--kode-list-padding-left, 1.75em);
+}
+
+.wysiwyg-bullet-list {
+    list-style-type: disc;
+}
+
+.wysiwyg-ordered-list {
+    list-style-type: decimal;
+}
+
+.wysiwyg-list-item {
+    margin: var(--kode-list-item-margin, 0.25em 0);
+    line-height: var(--kode-list-item-line-height, 1.6);
+}
+
+/* Marker color — bullets and numerals. Falls back to inheriting the
+ * text color (browser default) so existing consumers see no change. */
+.wysiwyg-list-item::marker {
+    color: var(--kode-list-marker-color, inherit);
+}
+
+/* Ordered-list marker font — lets consumers render numerals in a
+ * monospaced face for ledger-style tabular alignment while keeping
+ * bullet markers in the inherited font. */
+.wysiwyg-ordered-list > .wysiwyg-list-item::marker {
+    font-family: var(--kode-ol-marker-font-family, inherit);
+    font-variant-numeric: var(--kode-ol-marker-font-variant-numeric, normal);
+    color: var(--kode-ol-marker-color, var(--kode-list-marker-color, inherit));
+}
+
+.wysiwyg-bullet-list > .wysiwyg-list-item::marker {
+    color: var(--kode-ul-marker-color, var(--kode-list-marker-color, inherit));
+}
+
+/* Nested list styling */
+.wysiwyg-list .wysiwyg-list {
+    margin: 0.25em 0;
+}
+
+.wysiwyg-bullet-list .wysiwyg-list {
+    list-style-type: circle;
+}
+
+.wysiwyg-bullet-list .wysiwyg-list .wysiwyg-list {
+    list-style-type: square;
+}
+
+/* ── Task list / Checklist ────────────────────────────────────────── */
+
+.wysiwyg-task-list {
+    list-style: none;
+    padding-left: var(--kode-task-list-padding-left, 0.25em);
+}
+
+.kode-checklist-item {
+    display: flex;
+    align-items: baseline;
+    gap: var(--kode-checkbox-gap, 0.5em);
+    margin: var(--kode-checklist-item-margin, 0.25em 0);
+}
+
+.kode-checklist-item > span:not([data-pos-start]) {
+    display: contents;
+}
+
+.kode-checklist-item > span[data-pos-start] {
+    flex: 1;
+    min-width: 0;
+}
+
+.kode-checkbox {
+    width: var(--kode-checkbox-size, 1em);
+    height: var(--kode-checkbox-size, 1em);
+    margin: 0;
+    flex-shrink: 0;
+    cursor: pointer;
+    accent-color: var(--kode-checkbox-accent, var(--kode-accent));
+}
+
+.wysiwyg-readonly .kode-checkbox {
+    cursor: default;
+}
+
+.kode-checklist-item:has(.kode-checkbox-checked) {
+    opacity: var(--kode-checkbox-checked-opacity, 1);
+    text-decoration: var(--kode-checkbox-checked-text-decoration, none);
+}
+
+/* ── Blockquote ────────────────────────────────────────────────────── */
+
+.wysiwyg-blockquote {
+    border-left: var(--kode-blockquote-border-width, 4px) solid var(--kode-blockquote-border-color, var(--kode-accent));
+    background: var(--kode-blockquote-background, var(--kode-bg-highlight));
+    margin: var(--kode-blockquote-margin, 0.75em 0);
+    padding: var(--kode-blockquote-padding, 0.5em 1em);
+    color: var(--kode-blockquote-color, var(--kode-fg));
+    font-family: var(--kode-blockquote-font-family, inherit);
+    font-size: var(--kode-blockquote-font-size, inherit);
+    font-style: var(--kode-blockquote-font-style, italic);
+    line-height: var(--kode-blockquote-line-height, inherit);
+    border-radius: var(--kode-blockquote-border-radius, 0 4px 4px 0);
+}
+
+.wysiwyg-blockquote .wysiwyg-blockquote {
+    margin: 0.5em 0;
+}
+
+/* ── Code blocks ───────────────────────────────────────────────────── */
+
+/* Code blocks use a single <pre> as the positioned element (no wrapper
+ * div) to avoid cursor traps between structural elements.  The language
+ * label is rendered via ::before from the data-lang attribute. */
+
+pre.wysiwyg-code-block {
+    position: relative;
+    margin: var(--kode-code-block-margin, 1em 0);
+    padding: var(--kode-code-block-padding, 1em);
+    border-radius: var(--kode-code-block-border-radius, 6px);
+    overflow-x: auto;
+    background: var(--kode-code-block-background, var(--kode-bg));
+    border: var(--kode-code-block-wrapper-border-width, 1px) solid var(--kode-code-block-wrapper-border-color, var(--kode-border));
+    border-left: var(--kode-code-block-border-left, var(--kode-code-block-wrapper-border-width, 1px) solid var(--kode-code-block-wrapper-border-color, var(--kode-border)));
+    font-size: var(--kode-code-block-font-size, 0.9em);
+    line-height: var(--kode-code-block-line-height, 1.5);
+}
+
+/* Language label rendered as a CSS pseudo-element so it doesn't
+ * participate in the content flow and cannot trap the cursor. */
+pre.wysiwyg-code-block[data-lang]::before {
+    content: attr(data-lang);
+    position: absolute;
+    top: 4px;
+    right: 8px;
+    font-size: var(--kode-code-lang-font-size, 0.7em);
+    color: var(--kode-fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    pointer-events: none;
+    user-select: none;
+}
+
+pre.wysiwyg-code-block code {
+    font-family: var(--kode-code-font-family, "JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", monospace);
+    white-space: pre;
+}
+
+/* ── Code block copy button ───────────────────────────────────────── */
+
+.wysiwyg-code-copy {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid var(--kode-border, rgba(128, 128, 128, 0.3));
+    border-radius: 4px;
+    background: var(--kode-code-block-background, var(--kode-bg));
+    color: var(--kode-fg-dim, #888);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+    z-index: 2;
+    pointer-events: auto;
+    user-select: none;
+}
+
+pre.wysiwyg-code-block:hover .wysiwyg-code-copy,
+div.wysiwyg-code-block:hover .wysiwyg-code-copy,
+.wysiwyg-code-copy:focus-visible {
+    opacity: 1;
+}
+
+.wysiwyg-code-copy:hover {
+    color: var(--kode-fg, #ccc);
+    background: var(--kode-bg-highlight, rgba(128, 128, 128, 0.15));
+}
+
+.wysiwyg-code-copy.copied {
+    color: var(--kode-success, #10b981);
+    opacity: 1;
+}
+
+/* Hide language label when copy button is visible to avoid overlap */
+pre.wysiwyg-code-block:hover[data-lang]::before {
+    opacity: 0;
+}
+
+/* ── Gap cursor (caret between blocks next to atomic elements) ────── */
+
+.kode-gap-cursor {
+    position: absolute;
+    width: 2px;
+    pointer-events: none;
+    z-index: 10;
+    background: var(--kode-gap-cursor-color, var(--kode-fg-bright, #000));
+    animation: kode-gap-cursor-blink 1.06s steps(1) infinite;
+}
+
+@keyframes kode-gap-cursor-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}
+
+/* ── Extension blocks ─────────────────────────────────────────────── */
+
+.kode-extension-block {
+    user-select: none;
+    cursor: default;
+    margin: var(--kode-code-block-margin, 1em 0);
+    padding: var(--kode-extension-block-padding, 16px);
+    border: var(--kode-extension-block-border-width, 1px) solid var(--kode-extension-block-border-color, var(--kode-border));
+    border-radius: var(--kode-code-block-border-radius, 6px);
+    background: var(--kode-extension-block-background, var(--kode-bg-highlight));
+    color: var(--kode-fg);
+}
+
+.kode-extension-content {
+    white-space: pre-wrap;
+    font-family: var(--kode-code-font-family, "JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", monospace);
+    font-size: var(--kode-code-block-font-size, 0.9em);
+    line-height: var(--kode-code-block-line-height, 1.5);
+}
+
+/* ── Inline code ───────────────────────────────────────────────────── */
+
+.wysiwyg-inline-code {
+    font-family: var(--kode-code-font-family, "JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", monospace);
+    background: var(--kode-inline-code-background, var(--kode-bg-highlight));
+    color: var(--kode-inline-code-color, var(--kode-code-fg));
+    padding: var(--kode-inline-code-padding, 0.15em 0.4em);
+    border-radius: var(--kode-inline-code-border-radius, 3px);
+    font-size: var(--kode-inline-code-font-size, 0.9em);
+}
+
+/* Inline code inside a heading — editorial themes often drop the pill
+ * background and colour it with an accent so it reads as part of the
+ * heading rather than as a boxed fragment. Falls back to the normal
+ * inline-code rules so existing consumers see no change. */
+.wysiwyg-heading .wysiwyg-inline-code {
+    background: var(--kode-heading-inline-code-background, var(--kode-inline-code-background, var(--kode-bg-highlight)));
+    color: var(--kode-heading-inline-code-color, var(--kode-inline-code-color, var(--kode-code-fg)));
+    padding: var(--kode-heading-inline-code-padding, var(--kode-inline-code-padding, 0.15em 0.4em));
+    font-size: var(--kode-heading-inline-code-font-size, var(--kode-inline-code-font-size, 0.9em));
+    border-radius: var(--kode-heading-inline-code-border-radius, var(--kode-inline-code-border-radius, 3px));
+}
+
+/* ── Inline formatting ─────────────────────────────────────────────── */
+
+.wysiwyg-bold {
+    font-weight: var(--kode-bold-font-weight, 700);
+}
+
+.wysiwyg-italic {
+    font-style: italic;
+}
+
+.wysiwyg-strikethrough {
+    text-decoration: line-through;
+    opacity: var(--kode-strikethrough-opacity, 0.7);
+}
+
+/* ── Links ─────────────────────────────────────────────────────────── */
+
+.wysiwyg-link {
+    color: var(--kode-link);
+    text-decoration: underline;
+    text-decoration-color: var(--kode-link-decoration-color, var(--kode-accent));
+    text-decoration-thickness: var(--kode-link-decoration-thickness, auto);
+    text-underline-offset: var(--kode-link-underline-offset, 2px);
+    transition: text-decoration-color var(--kode-transition-duration, 0.15s);
+}
+
+.wysiwyg-link:hover {
+    text-decoration-color: var(--kode-link);
+}
+
+/* ── Images ────────────────────────────────────────────────────────── */
+
+.wysiwyg-image {
+    max-width: 100%;
+    height: auto;
+    border-radius: var(--kode-image-border-radius, 6px);
+    margin: var(--kode-image-margin, 0.5em 0);
+    display: block;
+}
+
+/* ── Thematic break ────────────────────────────────────────────────── */
+
+.wysiwyg-hr {
+    border: none;
+    border-top: var(--kode-hr-border-width, 1px) solid var(--kode-hr-border-color, var(--kode-border));
+    margin: var(--kode-hr-margin, 1.5em 0);
+}
+
+/* ── Code blocks (embedded editor variant) ─────────────────────────── */
+
+/* When used inside the view-based renderer (render_doc), the code block
+ * has a wrapper div + inner pre.  These rules keep backward compat. */
+div.wysiwyg-code-block {
+    position: relative;
+    margin: var(--kode-code-block-margin, 1em 0);
+    border-radius: var(--kode-code-block-border-radius, 6px);
+    overflow: hidden;
+    background: var(--kode-code-block-wrapper-background, var(--kode-bg-highlight));
+    border: var(--kode-code-block-wrapper-border-width, 1px) solid var(--kode-code-block-wrapper-border-color, var(--kode-border));
+    border-left: var(--kode-code-block-border-left, var(--kode-code-block-wrapper-border-width, 1px) solid var(--kode-code-block-wrapper-border-color, var(--kode-border)));
+}
+
+div.wysiwyg-code-block pre.kode-content {
+    margin: 0;
+    padding: var(--kode-code-block-padding, 0.75em 1em);
+    background: transparent;
+    font-size: var(--kode-code-block-font-size, 0.9em);
+}
+
+div.wysiwyg-code-block code {
+    font-family: var(--kode-code-font-family, "JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", monospace);
+    white-space: pre;
+}
+
+.wysiwyg-code-lang {
+    position: absolute;
+    top: 4px;
+    right: 8px;
+    font-size: var(--kode-code-lang-font-size, 0.7em);
+    color: var(--kode-fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    pointer-events: none;
+    user-select: none;
+}
+
+/* ── Scroll container ──────────────────────────────────────────────── */
+
+.tree-wysiwyg-scroll-container {
+    overflow-y: auto;
+    height: 100%;
+    min-height: 0;
+    position: relative;
+    padding: var(--kode-content-padding, 1.5rem 2rem);
+    outline: none;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.tree-wysiwyg-scroll-container ::selection {
+    background: var(--kode-selection-bg, rgba(56, 132, 255, 0.3));
+}
+.tree-wysiwyg-scroll-container ::-moz-selection {
+    background: var(--kode-selection-bg, rgba(56, 132, 255, 0.3));
+}
+
+/* Empty blocks need visible height so the cursor has somewhere to land */
+.tree-wysiwyg-scroll-container p:empty,
+.tree-wysiwyg-scroll-container h1:empty,
+.tree-wysiwyg-scroll-container h2:empty,
+.tree-wysiwyg-scroll-container h3:empty,
+.tree-wysiwyg-scroll-container h4:empty,
+.tree-wysiwyg-scroll-container h5:empty,
+.tree-wysiwyg-scroll-container h6:empty,
+.tree-wysiwyg-scroll-container li:empty,
+.tree-wysiwyg-scroll-container blockquote:empty,
+.tree-wysiwyg-scroll-container code:empty {
+    min-height: 1.4em;
+}
+
+.tree-wysiwyg-scroll-container td:empty::before,
+.tree-wysiwyg-scroll-container th:empty::before {
+    content: "\200b";
+}
+
+/* Placeholder on empty paragraphs (only when slash menu is enabled) */
+.kode-slash-enabled p:empty::before {
+    content: var(--kode-placeholder-text, "Type / for commands");
+    color: var(--kode-placeholder-color, var(--kode-fg-dim));
+    opacity: var(--kode-placeholder-opacity, 0.5);
+    pointer-events: none;
+    font-style: var(--kode-placeholder-font-style, normal);
+}
+
+/* ── Tables ────────────────────────────────────────────────────────── */
+
+.wysiwyg-table {
+    border-collapse: collapse;
+    width: 100%;
+    table-layout: auto;
+    margin: var(--kode-table-margin, 1.5em 0);
+    font-family: var(--kode-table-font-family, inherit);
+    font-size: var(--kode-table-font-size, 0.875em);
+    line-height: var(--kode-table-line-height, 1.7142857);
+    /* Optional top/bottom rules for editorial ledger-style tables.
+     * Default 0 preserves the pre-theming look (no outer borders). */
+    border-top: var(--kode-table-border-top-width, 0) var(--kode-table-border-top-style, solid) var(--kode-table-border-top-color, var(--kode-border));
+    border-bottom: var(--kode-table-border-bottom-width, 0) var(--kode-table-border-bottom-style, solid) var(--kode-table-border-bottom-color, var(--kode-border));
+}
+
+.wysiwyg-table-fixed {
+    table-layout: fixed;
+}
+
+.wysiwyg-table thead {
+    border-bottom: var(--kode-table-thead-border-bottom-width, 1px) solid var(--kode-table-thead-border-bottom-color, var(--kode-border));
+}
+
+.wysiwyg-table th {
+    font-family: var(--kode-table-th-font-family, inherit);
+    font-weight: var(--kode-table-th-font-weight, 600);
+    font-size: var(--kode-table-th-font-size, inherit);
+    color: var(--kode-table-th-color, var(--kode-fg));
+    letter-spacing: var(--kode-table-th-letter-spacing, normal);
+    text-transform: var(--kode-table-th-text-transform, none);
+    vertical-align: bottom;
+    padding: var(--kode-table-th-padding, 0 0.5714286em 0.5714286em);
+    text-align: left;
+}
+
+.wysiwyg-table td {
+    color: var(--kode-table-td-color, var(--kode-fg));
+    vertical-align: top;
+    padding: var(--kode-table-td-padding, 0.5714286em);
+    text-align: left;
+}
+
+.wysiwyg-table tbody tr {
+    border-bottom: var(--kode-table-tbody-row-border-width, 1px) solid var(--kode-table-tbody-row-border-color, var(--kode-border));
+}
+
+.wysiwyg-table tbody tr:last-child {
+    border-bottom: var(--kode-table-tbody-last-row-border, none);
+}
+
+/* ── Unknown / fallback blocks ─────────────────────────────────────── */
+
+.wysiwyg-unknown {
+    white-space: pre-wrap;
+    font-family: var(--kode-code-font-family, "JetBrains Mono", "Fira Code", monospace);
+    color: var(--kode-fg-dim);
+    margin: 0.5em 0;
+    padding: 0.5em;
+    background: var(--kode-bg-highlight);
+    border-radius: 4px;
+    font-size: 0.9em;
+}
+
+/* ── Mode toggle ───────────────────────────────────────────────────── */
+
+.kode-mode-toggle {
+    display: flex;
+    gap: var(--kode-toolbar-gap, 2px);
+    padding: var(--kode-mode-toggle-padding, 4px 8px);
+    background: var(--kode-toolbar-bg, var(--kode-bg));
+    border-bottom: var(--kode-toolbar-border-width, 1px) solid var(--kode-toolbar-border-color, var(--kode-border));
+}
+
+.kode-mode-toggle-button {
+    padding: var(--kode-mode-toggle-button-padding, 4px 12px);
+    border: none;
+    border-radius: var(--kode-toolbar-button-border-radius, 4px);
+    cursor: pointer;
+    font-size: var(--kode-mode-toggle-button-font-size, 12px);
+    font-family: inherit;
+    transition: all var(--kode-transition-duration, 0.15s) ease;
+}
+
+.kode-mode-toggle-button.active {
+    background: var(--kode-accent);
+    color: var(--kode-bg);
+}
+
+.kode-mode-toggle-button:not(.active) {
+    background: var(--kode-bg-highlight);
+    color: var(--kode-fg-dim);
+}
+
+/* ── Block grid layout ────────────────────────────────────────────── */
+
+.kode-block-grid {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    gap: var(--kode-block-grid-gap, 1rem);
+    margin: var(--kode-block-grid-margin, 0.75em 0);
+}
+
+.kode-grid-item {
+    min-width: 0;
+}
+
+.kode-grid-item[data-col-span="1"] { grid-column: span 1; }
+.kode-grid-item[data-col-span="2"] { grid-column: span 2; }
+.kode-grid-item[data-col-span="3"] { grid-column: span 3; }
+.kode-grid-item[data-col-span="4"] { grid-column: span 4; }
+.kode-grid-item[data-col-span="5"] { grid-column: span 5; }
+.kode-grid-item[data-col-span="6"] { grid-column: span 6; }
+.kode-grid-item[data-col-span="7"] { grid-column: span 7; }
+.kode-grid-item[data-col-span="8"] { grid-column: span 8; }
+.kode-grid-item[data-col-span="9"] { grid-column: span 9; }
+.kode-grid-item[data-col-span="10"] { grid-column: span 10; }
+.kode-grid-item[data-col-span="11"] { grid-column: span 11; }
+.kode-grid-item[data-col-span="12"] { grid-column: span 12; }
+
+.kode-grid-item > .kode-extension-block {
+    margin: 0;
+}
+
+/* ── Drag-and-drop ────────────────────────────────────────────────── */
+
+.kode-drag-handle {
+    position: absolute;
+    left: var(--kode-drag-handle-left, -32px);
+    top: var(--kode-drag-handle-top, 50%);
+    transform: translateY(-50%);
+    width: var(--kode-drag-handle-size, 20px);
+    height: var(--kode-drag-handle-size, 20px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--kode-drag-handle-font-size, 14px);
+    color: var(--kode-drag-handle-color, var(--kode-fg-dim));
+    cursor: grab;
+    opacity: 0;
+    transition: opacity var(--kode-transition-duration, 0.15s) ease;
+    border-radius: var(--kode-drag-handle-border-radius, 4px);
+    user-select: none;
+    touch-action: none;
+    z-index: 1;
+}
+
+.kode-extension-block:hover > .kode-drag-handle,
+.kode-drag-handle:hover {
+    opacity: 1;
+}
+
+.kode-drag-handle:hover {
+    background: var(--kode-drag-handle-hover-bg, var(--kode-bg-hover));
+    color: var(--kode-drag-handle-hover-color, var(--kode-fg-bright));
+}
+
+.kode-drag-handle:active {
+    cursor: grabbing;
+}
+
+.kode-drop-indicator {
+    height: var(--kode-drop-indicator-height, 3px);
+    background: var(--kode-drop-indicator-color, var(--kode-accent));
+    border-radius: var(--kode-drop-indicator-border-radius, 2px);
+    margin: var(--kode-drop-indicator-margin, 4px 0);
+    pointer-events: none;
+    animation: kode-drop-pulse 1s ease-in-out infinite;
+}
+
+@keyframes kode-drop-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+.kode-block-dragging {
+    opacity: var(--kode-block-dragging-opacity, 0.5);
+    outline: 2px dashed var(--kode-drop-indicator-color, var(--kode-accent));
+    outline-offset: 2px;
+}
+
+body.kode-dragging {
+    user-select: none !important;
+    cursor: grabbing !important;
+}
+
+body.kode-dragging * {
+    cursor: grabbing !important;
+}
+
+/* Checklist item drag handles — positioned tighter than extension blocks
+ * because list items have less horizontal padding. */
+.kode-checklist-item > .kode-drag-handle {
+    left: var(--kode-checklist-drag-handle-left, -24px);
+}
+
+.kode-checklist-item:hover > .kode-drag-handle {
+    opacity: 1;
+}
+
+/* Bullet / ordered list item drag handles — needs position: relative so
+ * the absolutely-positioned handle is anchored to the list item. */
+.wysiwyg-list-item {
+    position: relative;
+}
+
+.wysiwyg-list-item > .kode-drag-handle {
+    left: var(--kode-list-drag-handle-left, -44px);
+}
+
+.wysiwyg-list-item:hover > .kode-drag-handle {
+    opacity: 1;
+}
+
+/* ── Slash Command Menu ────────────────────────────────────────────── */
+
+.kode-slash-menu {
+    position: fixed;
+    z-index: 2147483646;
+    min-width: var(--kode-slash-menu-min-width, 220px);
+    overflow-y: auto;
+    background: var(--kode-slash-menu-bg, var(--kode-toolbar-bg, var(--kode-bg)));
+    border: var(--kode-slash-menu-border-width, 1px) solid var(--kode-slash-menu-border-color, var(--kode-border));
+    border-radius: var(--kode-slash-menu-border-radius, 8px);
+    box-shadow: var(--kode-slash-menu-shadow, 0 4px 16px rgba(0, 0, 0, 0.15));
+    padding: var(--kode-slash-menu-padding, 4px);
+    font-family: var(--kode-content-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+    font-size: var(--kode-slash-menu-font-size, 13px);
+    animation: kode-slash-menu-in 0.1s ease-out;
+}
+
+@keyframes kode-slash-menu-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+.kode-slash-menu-item {
+    display: flex;
+    align-items: baseline;
+    gap: var(--kode-slash-menu-item-gap, 8px);
+    padding: var(--kode-slash-menu-item-padding, 6px 10px);
+    border-radius: var(--kode-slash-menu-item-border-radius, 4px);
+    cursor: pointer;
+    transition: background 0.1s ease;
+    white-space: nowrap;
+}
+
+.kode-slash-menu-item:hover,
+.kode-slash-menu-item.selected {
+    background: var(--kode-slash-menu-item-selected-bg, var(--kode-bg-hover));
+}
+
+.kode-slash-menu-item-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: var(--kode-slash-menu-icon-size, 28px);
+    height: var(--kode-slash-menu-icon-size, 28px);
+    border-radius: var(--kode-toolbar-button-border-radius, 4px);
+    background: var(--kode-slash-menu-icon-bg, var(--kode-bg-highlight));
+    color: var(--kode-fg);
+    font-family: var(--kode-toolbar-font-family, var(--kode-font-family, 'JetBrains Mono', 'Fira Code', monospace));
+    font-size: var(--kode-toolbar-button-font-size, 13px);
+    font-weight: 500;
+    flex-shrink: 0;
+}
+
+.kode-slash-menu-item-icon svg {
+    width: var(--kode-slash-menu-icon-svg-size, 16px);
+    height: var(--kode-slash-menu-icon-svg-size, 16px);
+}
+
+.kode-slash-menu-item-name {
+    font-weight: 500;
+    color: var(--kode-slash-menu-item-name-color, var(--kode-fg-bright));
+}
+
+.kode-slash-menu-item-desc {
+    color: var(--kode-slash-menu-item-desc-color, var(--kode-fg-dim));
+    margin-left: auto;
+}
+
+/* ── Link Popover (floating, near selection) ─────────────────────── */
+
+.kode-link-popover {
+    position: absolute;
+    z-index: 25;
+    display: flex;
+    align-items: center;
+    gap: var(--kode-link-popover-gap, 6px);
+    padding: var(--kode-link-popover-padding, 4px 8px);
+    background: var(--kode-link-popover-bg, var(--kode-toolbar-bg, var(--kode-bg)));
+    border: var(--kode-link-popover-border-width, 1px) solid var(--kode-link-popover-border-color, var(--kode-border));
+    border-radius: var(--kode-link-popover-border-radius, 8px);
+    box-shadow: var(--kode-link-popover-shadow, 0 4px 16px rgba(0, 0, 0, 0.15));
+    font-family: var(--kode-content-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+    font-size: var(--kode-link-popover-font-size, 13px);
+    pointer-events: auto;
+    animation: kode-link-popover-in 0.1s ease-out;
+}
+
+.kode-link-popover.flipped {
+    animation-name: kode-link-popover-in-flipped;
+}
+
+@keyframes kode-link-popover-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes kode-link-popover-in-flipped {
+    from { opacity: 0; transform: translateY(-100%) translateY(-4px); }
+    to   { opacity: 1; transform: translateY(-100%); }
+}
+
+.kode-link-popover-input {
+    flex: 1;
+    min-width: var(--kode-link-popover-input-min-width, 220px);
+    padding: var(--kode-link-popover-input-padding, 4px 8px);
+    border: 1px solid var(--kode-link-popover-input-border-color, var(--kode-border));
+    border-radius: var(--kode-link-popover-input-border-radius, 4px);
+    background: var(--kode-link-popover-input-bg, var(--kode-bg-highlight));
+    color: var(--kode-link-popover-input-color, var(--kode-fg));
+    font-family: inherit;
+    font-size: inherit;
+    outline: none;
+}
+
+.kode-link-popover-input:focus {
+    border-color: var(--kode-link-popover-input-focus-border, var(--kode-accent));
+}
+
+.kode-link-popover-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: var(--kode-link-popover-btn-border-radius, 4px);
+    cursor: pointer;
+    background: transparent;
+    color: var(--kode-link-popover-btn-color, var(--kode-fg-dim));
+}
+
+.kode-link-popover-btn:hover {
+    background: var(--kode-link-popover-btn-hover-bg, var(--kode-bg-hover));
+}
+
+.kode-link-popover-btn.apply {
+    color: var(--kode-link-popover-apply-color, var(--kode-accent));
+}
+
+.kode-link-popover-btn.apply:hover {
+    background: var(--kode-link-popover-apply-hover-bg, var(--kode-accent));
+    color: var(--kode-link-popover-apply-hover-color, var(--kode-bg));
+}
+
+.kode-link-popover-btn svg {
+    width: 16px;
+    height: 16px;
+}
+
+/* ── Table Picker ────────────────────────────────────────────────── */
+
+.kode-table-picker {
+    position: absolute;
+    z-index: 25;
+    padding: var(--kode-table-picker-padding, 8px);
+    background: var(--kode-table-picker-bg, var(--kode-toolbar-bg, var(--kode-bg)));
+    border: var(--kode-table-picker-border-width, 1px) solid var(--kode-table-picker-border-color, var(--kode-border));
+    border-radius: var(--kode-table-picker-border-radius, 8px);
+    box-shadow: var(--kode-table-picker-shadow, 0 4px 16px rgba(0, 0, 0, 0.15));
+    user-select: none;
+    animation: kode-link-popover-in 0.1s ease-out;
+}
+
+.kode-table-picker-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.kode-table-picker-row {
+    display: flex;
+    gap: 2px;
+}
+
+.kode-table-picker-cell {
+    width: var(--kode-table-picker-cell-size, 20px);
+    height: var(--kode-table-picker-cell-size, 20px);
+    border: 1px solid var(--kode-table-picker-cell-border, var(--kode-border));
+    border-radius: 2px;
+    cursor: pointer;
+    background: var(--kode-table-picker-cell-bg, transparent);
+}
+
+.kode-table-picker-cell.selected {
+    background: var(--kode-table-picker-cell-selected-bg, var(--kode-accent));
+    border-color: var(--kode-table-picker-cell-selected-border, var(--kode-accent));
+}
+
+.kode-table-picker-label {
+    text-align: center;
+    margin-top: 6px;
+    font-size: var(--kode-table-picker-label-font-size, 12px);
+    color: var(--kode-table-picker-label-color, var(--kode-fg-dim));
+    font-family: var(--kode-content-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+}
+
+/* ── Table Insert Handles ────────────────────────────────────────── */
+
+.kode-table-wrapper {
+    position: relative;
+    display: inline-block;
+    width: 100%;
+}
+
+/* ── Row insert handles ─────────────────────────────────────────── */
+
+.kode-table-row-insert {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    user-select: none;
+    z-index: 5;
+    opacity: 0;
+    transition: opacity 0.15s;
+    /* Extend click target above/below the thin line. */
+    padding: 6px 0;
+    margin-top: -8px;
+    box-sizing: content-box;
+    font-size: 0;
+    color: transparent;
+}
+
+.kode-table-row-insert::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--kode-table-control-border, var(--kode-border));
+    border-radius: 1px;
+    transition: background 0.15s, height 0.15s;
+}
+
+.kode-table-row-insert::after {
+    content: "+";
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--kode-table-control-bg, var(--kode-bg));
+    border: 1px solid var(--kode-table-control-border, var(--kode-border));
+    color: var(--kode-table-control-color, var(--kode-fg-dim));
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.kode-table-wrapper:hover > .kode-table-row-insert {
+    opacity: 1;
+}
+
+.kode-table-row-insert:hover::before {
+    background: var(--kode-table-control-hover-bg, var(--kode-accent));
+    height: 2px;
+}
+
+.kode-table-row-insert:hover::after {
+    background: var(--kode-table-control-hover-bg, var(--kode-accent));
+    color: var(--kode-table-control-hover-color, var(--kode-bg));
+    border-color: var(--kode-table-control-hover-border, var(--kode-accent));
+}
+
+/* ── Column insert handles ──────────────────────────────────────── */
+
+.kode-table-col-insert {
+    position: absolute;
+    width: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    user-select: none;
+    z-index: 5;
+    opacity: 0;
+    transition: opacity 0.15s;
+    /* Extend click target left/right of the thin line. */
+    padding: 0 6px;
+    margin-left: -8px;
+    box-sizing: content-box;
+    font-size: 0;
+    color: transparent;
+}
+
+.kode-table-col-insert::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--kode-table-control-border, var(--kode-border));
+    border-radius: 1px;
+    transition: background 0.15s, width 0.15s;
+}
+
+.kode-table-col-insert::after {
+    content: "+";
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--kode-table-control-bg, var(--kode-bg));
+    border: 1px solid var(--kode-table-control-border, var(--kode-border));
+    color: var(--kode-table-control-color, var(--kode-fg-dim));
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.kode-table-wrapper:hover > .kode-table-col-insert {
+    opacity: 1;
+}
+
+.kode-table-col-insert:hover::before {
+    background: var(--kode-table-control-hover-bg, var(--kode-accent));
+    width: 2px;
+}
+
+.kode-table-col-insert:hover::after {
+    background: var(--kode-table-control-hover-bg, var(--kode-accent));
+    color: var(--kode-table-control-hover-color, var(--kode-bg));
+    border-color: var(--kode-table-control-hover-border, var(--kode-accent));
+}
+
+/* ── Column header strips (select column) ──────────────────────── */
+
+.kode-table-col-header {
+    position: absolute;
+    height: 12px;
+    cursor: pointer;
+    background: transparent;
+    border-radius: 3px 3px 0 0;
+    opacity: 0;
+    transition: opacity 0.15s, background 0.15s;
+    z-index: 4;
+    user-select: none;
+}
+
+.kode-table-wrapper:hover .kode-table-col-header {
+    opacity: 1;
+    background: var(--kode-table-header-strip-bg, rgba(var(--kode-accent-rgb, 59, 130, 246), 0.1));
+}
+
+.kode-table-col-header:hover {
+    background: var(--kode-table-header-strip-hover-bg, rgba(var(--kode-accent-rgb, 59, 130, 246), 0.25)) !important;
+}
+
+.kode-table-col-header.kode-col-header-active {
+    opacity: 1;
+    background: var(--kode-table-selection-bg, rgba(var(--kode-accent-rgb, 59, 130, 246), 0.2));
+}
+
+/* ── Row selection handles ─────────────────────────────────────── */
+
+.kode-table-row-handle {
+    position: absolute;
+    left: -16px;
+    width: 12px;
+    cursor: pointer;
+    background: transparent;
+    border-radius: 3px 0 0 3px;
+    opacity: 0;
+    transition: opacity 0.15s, background 0.15s;
+    z-index: 4;
+    user-select: none;
+}
+
+.kode-table-wrapper:hover .kode-table-row-handle {
+    opacity: 1;
+    background: var(--kode-table-header-strip-bg, rgba(var(--kode-accent-rgb, 59, 130, 246), 0.1));
+}
+
+.kode-table-row-handle:hover {
+    background: var(--kode-table-header-strip-hover-bg, rgba(var(--kode-accent-rgb, 59, 130, 246), 0.25)) !important;
+}
+
+.kode-table-row-handle.kode-row-handle-active {
+    opacity: 1;
+    background: var(--kode-table-selection-bg, rgba(var(--kode-accent-rgb, 59, 130, 246), 0.2));
+}
+
+/* ── Selection highlights ──────────────────────────────────────── */
+
+td.kode-col-selected,
+th.kode-col-selected {
+    background: var(--kode-table-selection-bg, rgba(var(--kode-accent-rgb, 59, 130, 246), 0.08));
+}
+
+tr.kode-row-selected {
+    background: var(--kode-table-selection-bg, rgba(var(--kode-accent-rgb, 59, 130, 246), 0.08));
+}
+
+/* ── Selection delete button ───────────────────────────────────── */
+
+.kode-table-selection-delete {
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--kode-table-delete-bg, #dc2626);
+    color: var(--kode-table-delete-color, #fff);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+    user-select: none;
+    transition: background 0.15s, transform 0.15s;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.kode-table-selection-delete:hover {
+    background: var(--kode-table-delete-hover-bg, #b91c1c);
+    transform: scale(1.1);
+}
+
+/* Hide table insert handles, column headers, row handles in readonly mode */
+.wysiwyg-readonly .kode-table-row-insert,
+.wysiwyg-readonly .kode-table-col-insert,
+.wysiwyg-readonly .kode-table-col-header,
+.wysiwyg-readonly .kode-table-row-handle,
+.wysiwyg-readonly .kode-table-selection-delete {
+    display: none;
+}
+
+/* ── Table Context Menu ──────────────────────────────────────────── */
+
+.kode-table-context-menu {
+    position: absolute;
+    z-index: 30;
+    min-width: 180px;
+    padding: var(--kode-ctx-menu-padding, 4px 0);
+    background: var(--kode-ctx-menu-bg, var(--kode-toolbar-bg, var(--kode-bg)));
+    border: 1px solid var(--kode-ctx-menu-border, var(--kode-border));
+    border-radius: var(--kode-ctx-menu-border-radius, 8px);
+    box-shadow: var(--kode-ctx-menu-shadow, 0 4px 16px rgba(0, 0, 0, 0.15));
+    font-family: var(--kode-content-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+    font-size: var(--kode-ctx-menu-font-size, 13px);
+    animation: kode-link-popover-in 0.1s ease-out;
+}
+
+.kode-ctx-menu-item {
+    padding: var(--kode-ctx-menu-item-padding, 6px 12px);
+    cursor: pointer;
+    color: var(--kode-ctx-menu-item-color, var(--kode-fg));
+}
+
+.kode-ctx-menu-item:hover {
+    background: var(--kode-ctx-menu-item-hover-bg, var(--kode-bg-hover));
+}
+
+.kode-ctx-menu-item.destructive {
+    color: var(--kode-ctx-menu-destructive-color, #dc2626);
+}
+
+.kode-ctx-menu-item.destructive:hover {
+    background: var(--kode-ctx-menu-destructive-hover-bg, rgba(220, 38, 38, 0.1));
+}
+
+.kode-ctx-menu-separator {
+    height: 1px;
+    margin: 4px 0;
+    background: var(--kode-ctx-menu-separator-color, var(--kode-border));
+}
+
+/* ── Empty table cell placeholders ───────────────────────────────── */
+
+.wysiwyg-scroll-container th:empty::before {
+    content: "Header";
+    color: var(--kode-table-placeholder-color, var(--kode-fg-dim));
+    opacity: 0.4;
+    font-style: italic;
+}
+
+/* .kode-text-segment — wrapper div for text blocks in segment-based rendering.
+   No visual styles needed; used as an innerHTML update target by patch_segments(). */
+
+/* ── Read-only mode ────────────────────────────────────────────────── */
+
+.wysiwyg-readonly .wysiwyg-scroll-container {
+    cursor: default;
+    user-select: text;
+}
+
+.wysiwyg-readonly .kode-gap-cursor {
+    display: none;
+}
+
+/* ── Attachment blocks ─────────────────────────────────────────────── */
+
+.wysiwyg-image-block {
+    position: relative;
+    display: inline-block;
+    max-width: 300px;
+    margin: 4px 0;
+    border: 1px solid var(--kode-border, #e0e0e0);
+    border-radius: 6px;
+    overflow: hidden;
+    cursor: pointer;
+    transition: border-color 0.15s;
+}
+
+.wysiwyg-image-block:hover {
+    border-color: var(--kode-accent, #3b82f6);
+}
+
+.wysiwyg-image-block img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+}
+
+.wysiwyg-file-block {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    margin: 4px 0;
+    border: 1px solid var(--kode-border, #e0e0e0);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.875em;
+    transition: border-color 0.15s;
+}
+
+.wysiwyg-file-block:hover {
+    border-color: var(--kode-accent, #3b82f6);
+}
+
+.wysiwyg-file-icon {
+    display: flex;
+    align-items: center;
+    color: var(--kode-fg-dim, #6b7280);
+}
+
+.wysiwyg-file-name {
+    color: var(--kode-fg-bright, #1f2937);
+    font-weight: 500;
+}
+
+.wysiwyg-file-size {
+    color: var(--kode-fg-dim, #6b7280);
+}
+
+.wysiwyg-attachment-delete {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.5);
+    color: white;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+}
+
+.wysiwyg-image-block:hover .wysiwyg-attachment-delete,
+.wysiwyg-file-block:hover .wysiwyg-attachment-delete {
+    display: flex;
+}
+
+.wysiwyg-attachment-delete:hover {
+    background: rgba(220, 38, 38, 0.8);
+}
+
+/* Hide delete button in readonly mode */
+.wysiwyg-readonly .wysiwyg-attachment-delete {
+    display: none !important;
+}
+
+/* ── Upload placeholder ────────────────────────────────────────────── */
+
+.wysiwyg-upload-placeholder {
+    margin: 8px 0;
+    padding: 16px;
+    border: 2px dashed var(--kode-border, #e0e0e0);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.wysiwyg-upload-placeholder-inner {
+    width: 100%;
+    height: 24px;
+    border-radius: 4px;
+    background: linear-gradient(90deg,
+        var(--kode-bg-dim, #f3f4f6) 25%,
+        var(--kode-bg-bright, #e5e7eb) 50%,
+        var(--kode-bg-dim, #f3f4f6) 75%);
+    background-size: 200% 100%;
+    animation: wysiwyg-placeholder-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes wysiwyg-placeholder-pulse {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* ── Drag over state ───────────────────────────────────────────────── */
+
+.wysiwyg-scroll-container.wysiwyg-drag-over {
+    outline: 2px dashed var(--kode-accent, #3b82f6);
+    outline-offset: -2px;
+    border-radius: 6px;
+}
