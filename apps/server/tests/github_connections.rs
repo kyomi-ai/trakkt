@@ -579,6 +579,27 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
                 .status_id,
             started
         );
+        let opened_history =
+            trakkt_auth::activity_service::list_issue_activities(&f.state.db, &f.issue)
+                .await
+                .expect("read PR-open status history");
+        let opened = opened_history
+            .iter()
+            .rev()
+            .find(|a| a.action_type == "status_changed")
+            .expect("opening a PR records its automatic status change");
+        assert_eq!(
+            opened.old_value.as_deref(),
+            Some(if number == 1 { "Backlog" } else { "Done" }),
+            "a later PR opening must also leave history when it reopens completed work"
+        );
+        assert_eq!(opened.new_value.as_deref(), Some("In Progress"));
+        assert_eq!(
+            opened.action_source,
+            trakkt_types::enums::ActionSource::Github
+        );
+        assert_eq!(opened.action_source_label.as_deref(), Some("GitHub"));
+        assert!(opened.actor_id.is_none());
         deliver(
             &f,
             "pull_request",
@@ -595,6 +616,26 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
             completed
         );
     }
+    let history = trakkt_auth::activity_service::list_issue_activities(&f.state.db, &f.issue)
+        .await
+        .expect("read merge status history");
+    let status_history: Vec<_> = history
+        .iter()
+        .filter(|a| a.action_type == "status_changed")
+        .collect();
+    assert_eq!(
+        status_history.len(),
+        4,
+        "one entry for every open and merge transition"
+    );
+    assert_eq!(
+        status_history
+            .last()
+            .expect("merge history")
+            .new_value
+            .as_deref(),
+        Some("Done")
+    );
     let before_disconnect = calls.lock().expect("snapshot outgoing calls").clone();
     let comments: Vec<_> = before_disconnect
         .iter()

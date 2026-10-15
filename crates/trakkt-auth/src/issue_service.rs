@@ -768,7 +768,8 @@ pub async fn list_issues(
 ///
 /// The UPDATE and every `sync_log` entry it produces — this issue's, plus one
 /// per issue whose derived `is_blocked` flag changed with it — commit as one
-/// transaction. Notifications and the live broadcast follow the commit.
+/// transaction, together with status history. Notifications and the live broadcast
+/// follow the commit. Caller-level activity diffs only record non-status fields.
 pub async fn update_issue(
     db: &DbPool,
     workspace_id: &str,
@@ -966,6 +967,28 @@ pub async fn update_issue_with_admission(
         admission.admit(&mut tx).await?;
     }
 
+    // Lock the issue before reading its status name. Separate queries ensure
+    // a concurrent writer cannot leave the old status/name pair inconsistent.
+    let previous_status = if updates.status_id.is_some() {
+        let lock = if is_pg { " FOR UPDATE" } else { "" };
+        let status_sql = format!("SELECT status_id FROM issues WHERE issue_id = $1{lock}");
+        match trakkt_core::tx_fetch_optional!(&mut tx, (String,), &status_sql, &issue_id)? {
+            Some((status_id,)) => {
+                let name = trakkt_core::tx_fetch_one!(
+                    &mut tx,
+                    (String,),
+                    "SELECT name FROM statuses WHERE status_id = $1",
+                    &status_id
+                )?
+                .0;
+                Some((status_id, name))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Bind dynamically. Map to rows_affected() inside the closure so both
     // backend arms return the same type (u64).
     let affected: u64 = trakkt_core::tx_with!(&mut tx, |e| {
@@ -1026,74 +1049,66 @@ pub async fn update_issue_with_admission(
     // carry the same full issue; without it the client skips both.
     let payload = issue_sync_payload_tx(&mut tx, &issue.issue_id).await?;
 
-    let sync_id = sync_log_service::write_sync_entry_in_tx(
-        &mut tx,
-        entity_types::ISSUE,
-        &issue.issue_id,
-        workspace_id,
-        sync_log_service::SyncAudience::Workspace,
-        SyncActionType::Update,
-        payload.clone(),
-    )
-    .await?;
-
-    // Issues this one blocks: their `is_blocked` flag is computed at query time
-    // from this issue's status, so it has just changed for them too. Their sync
-    // entries belong to this commit — reading them through the transaction is
-    // also what makes them reflect the new status.
-    let mut blocked_frames: Vec<(String, Option<serde_json::Value>, i64)> =
-        Vec::with_capacity(blocked_issue_ids.len());
-    for blocked_id in blocked_issue_ids {
-        // A relation may point at an issue that has since been deleted; there
-        // is nothing to report for it.
-        let Some(blocked_issue) = get_issue_by_id_tx(&mut tx, &blocked_id).await? else {
-            continue;
-        };
-        let data = issue_payload_value(&blocked_issue);
-        let blocked_sync_id = sync_log_service::write_sync_entry_in_tx(
+    let mut batch = sync_log_service::SyncBatch::new();
+    batch
+        .record(
             &mut tx,
             entity_types::ISSUE,
-            &blocked_id,
+            &issue.issue_id,
             workspace_id,
             sync_log_service::SyncAudience::Workspace,
             SyncActionType::Update,
-            data.clone(),
+            payload,
         )
         .await?;
-        blocked_frames.push((blocked_id, data, blocked_sync_id));
+
+    if let Some((old_status_id, old_status_name)) = previous_status
+        && old_status_id != issue.status_id
+    {
+        let new_status_name = trakkt_core::tx_fetch_one!(
+            &mut tx,
+            (String,),
+            "SELECT name FROM statuses WHERE status_id = $1",
+            &issue.status_id
+        )?
+        .0;
+        let recorder = crate::activity_service::ActivityRecorder::new_with_optional_actor(
+            db,
+            workspace_id,
+            actor_user_id,
+            action_source,
+            action_source_label.map(str::to_owned),
+            ws_manager,
+        );
+        recorder
+            .record_status_change_in_tx(
+                &mut tx,
+                &mut batch,
+                &issue.issue_id,
+                (&old_status_id, &old_status_name),
+                (&issue.status_id, &new_status_name),
+            )
+            .await?;
     }
 
-    tx.commit().await?;
-
-    // Everything below reaches for the pool or the socket, so it has to follow
-    // the commit.
-
-    // WebSocket broadcast — send full entity data as SyncResponse.
-    if let Some(ws) = ws_manager {
-        sync_log_service::broadcast_sync_action(
-            ws,
-            workspace_id,
-            entity_types::ISSUE,
-            &issue.issue_id,
-            SyncActionType::Update,
-            payload,
-            sync_id,
-        )
-        .await;
-
-        for (blocked_id, data, blocked_sync_id) in blocked_frames {
-            sync_log_service::broadcast_sync_action(
-                ws,
-                workspace_id,
+    // A status update also changes the derived flags of issues it blocks.
+    for blocked_id in blocked_issue_ids {
+        let Some(blocked_issue) = get_issue_by_id_tx(&mut tx, &blocked_id).await? else {
+            continue;
+        };
+        batch
+            .record(
+                &mut tx,
                 entity_types::ISSUE,
                 &blocked_id,
+                workspace_id,
+                sync_log_service::SyncAudience::Workspace,
                 SyncActionType::Update,
-                data,
-                blocked_sync_id,
+                issue_payload_value(&blocked_issue),
             )
-            .await;
-        }
+            .await?;
     }
+    batch.commit_and_deliver(tx, ws_manager).await?;
 
     // ── Notification triggers (best-effort) ─────────────────────────────
     if let Some(actor_id) = actor_user_id {

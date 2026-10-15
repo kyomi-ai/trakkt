@@ -696,7 +696,8 @@ pub async fn delete_team_icon(
 /// 5. Optionally set a new workspace default team
 /// 6. In one transaction: reassign the issues to the target team with new
 ///    team-scoped numbers and a workspace-scoped status, one ISSUE sync entry
-///    each; delete this team's `favorites` rows; clear `users.default_team_id`;
+///    each and status history for every changed status; delete this team's
+///    `favorites` rows; clear `users.default_team_id`;
 ///    delete the team, which cascades `team_members` and its team-scoped
 ///    `statuses` and `labels`; write the TEAM delete sync entry
 /// 7. Broadcast the reassignments and the delete via WebSocket
@@ -884,6 +885,25 @@ pub async fn delete_team(
     let mut batch = sync_log_service::SyncBatch::new();
 
     if let Some((target_team_id, issue_ids, status_id)) = &reassignment {
+        let target_status_name: String = trakkt_core::tx_fetch_scalar!(
+            &mut tx,
+            String,
+            "SELECT name FROM statuses WHERE status_id = $1",
+            status_id
+        )?;
+        let recorder = crate::activity_service::ActivityRecorder::new_with_optional_actor(
+            db,
+            workspace_id,
+            None,
+            trakkt_types::enums::ActionSource::Api,
+            Some("Team deletion".to_string()),
+            ws_manager,
+        );
+        let previous_status_sql = if tx.is_postgres() {
+            "SELECT status_id FROM issues WHERE issue_id = $1 FOR UPDATE"
+        } else {
+            "SELECT status_id FROM issues WHERE issue_id = $1"
+        };
         // Reassign each issue one at a time so team-scoped numbers are sequential.
         // Dialect comes from the transaction, not the pool: nothing inside this
         // span should have to reach for `db` at all (see `DbTx`).
@@ -896,7 +916,26 @@ pub async fn delete_team(
              WHERE issue_id = $2"
         );
         for issue_id in issue_ids {
+            // Read and lock the persisted status before replacing it. Its
+            // team-scoped definition may be deleted later in this transaction.
+            let previous_status_id =
+                trakkt_core::tx_fetch_scalar!(&mut tx, String, previous_status_sql, issue_id)?;
+            let previous_status_name: String = trakkt_core::tx_fetch_scalar!(
+                &mut tx,
+                String,
+                "SELECT name FROM statuses WHERE status_id = $1",
+                &previous_status_id
+            )?;
             trakkt_core::tx_execute!(&mut tx, &sql, *target_team_id, issue_id, status_id)?;
+            recorder
+                .record_status_change_in_tx(
+                    &mut tx,
+                    &mut batch,
+                    issue_id,
+                    (&previous_status_id, &previous_status_name),
+                    (status_id, &target_status_name),
+                )
+                .await?;
 
             // Read the issue back before the sync log write. The reassignment
             // changed its team, number and status, and none of that reaches a
