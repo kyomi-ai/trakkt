@@ -92,6 +92,7 @@ WORKDIR /app
 COPY --from=builder /build/target/release/trakkt /app/trakkt
 COPY --from=builder /build/target/release/github-backfill /app/github-backfill
 COPY --from=builder /build/crates/trakkt-ui/dist /app/dist
+COPY --from=builder /build/vendor/kode-leptos/LICENSE /app/licenses/kode-leptos-LICENSE
 
 ENV PORT=8003 \
     TRUNK_DIST_DIR=/app/dist \

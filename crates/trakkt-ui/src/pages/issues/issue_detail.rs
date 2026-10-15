@@ -22,7 +22,7 @@ use leptos_router::hooks::{use_location, use_navigate, use_params_map};
 use phosphor_leptos::Icon;
 
 use crate::components::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CopyLinkButton,
+    Alert, AlertVariant, Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, CopyLinkButton,
     DatePicker, DropdownItem, DropdownMenu, DropdownTrigger,
     IssueStatusBadge, IssueStatusVariant,
     LabelBadge, Modal, ModalSize, PriorityIndicator, SearchInput, Select, SelectVariant, Skeleton,
@@ -339,19 +339,28 @@ fn IssueDetailContent(
     // ── Fine-grained memos: only re-render when the specific field changes ──
     let title = Memo::new(move |_| issue.get().title.clone());
     let description = RwSignal::new(initial.get_untracked().description.clone().unwrap_or_default());
+    let description_edit_generation = RwSignal::new(0u64);
 
     #[cfg(target_arch = "wasm32")]
     {
         let issue_id = initial.get_untracked().issue_id.clone();
         let ws_id = initial.get_untracked().workspace_id.clone();
         let desc_sig = description;
+        let read_generation = RwSignal::new(0u64);
+        let cache_barrier = use_context::<crate::cache::idb_writer::CacheReadBarrier>();
         let issue_updated_at = Memo::new(move |_| issue.get().updated_at.clone());
 
         Effect::new(move || {
             let _ = issue_updated_at.get();
+            read_generation.update(|generation| *generation += 1);
+            let request = read_generation.get_untracked();
+            let edit = description_edit_generation.get_untracked();
             let iid = issue_id.clone();
             let wid = ws_id.clone();
             spawn_local(async move {
+                if let Some(barrier) = cache_barrier {
+                    barrier.wait().await;
+                }
                 if let Ok(cache_db) = crate::cache::db::init_cache_db(&wid).await
                     && let Ok(Some((json, _))) = crate::cache::db::read_one(
                         &cache_db,
@@ -365,7 +374,13 @@ fn IssueDetailContent(
                             let desc = content.get("description")
                                 .and_then(|d| d.as_str())
                                 .unwrap_or_default();
-                            desc_sig.set(desc.to_owned());
+                            // A later read or a local edit invalidates this read,
+                            // even if its IDB operation happened to finish last.
+                            if read_generation.try_get_untracked() == Some(request)
+                                && description_edit_generation.try_get_untracked() == Some(edit)
+                            {
+                                let _ = desc_sig.try_set(desc.to_owned());
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse issue_content from IDB: {e}");
@@ -420,6 +435,7 @@ fn IssueDetailContent(
                     team_key=initial_team_key.clone()
                     number=number
                     description=Signal::from(description)
+                    edit_generation=description_edit_generation
                     lightbox_state=lightbox_state
                     issue_id=initial.get_untracked().issue_id.clone()
                 />
@@ -1654,104 +1670,120 @@ fn LabelPicker(
 
 /// Description section using the kode WYSIWYG markdown editor.
 ///
-/// Auto-saves on change with a 500ms debounce using a version counter:
-/// each edit increments the counter; after the delay, save only fires if
-/// the counter has not changed (i.e., no newer edits arrived).
-///
-/// Uses a gated content signal to prevent WebSocket echoes from
-/// overwriting local edits while a save is in flight.
+/// The local document owns editing state. One worker debounces and serializes
+/// saves; acknowledgements never replace the focused document. Clean remote
+/// updates and issue-reference formatting wait for blur while it is focused.
 #[component]
 fn DescriptionEditor(
     team_key: String,
     number: i32,
     description: Signal<String>,
+    edit_generation: RwSignal<u64>,
     lightbox_state: RwSignal<Option<crate::components::attachment_hooks::LightboxState>>,
     /// Issue ID for auto-linking inline uploads to this issue.
     issue_id: String,
 ) -> impl IntoView {
     use crate::components::description::MarkdownDescription;
 
-    let latest_text = RwSignal::new(String::new());
-    let edit_version = RwSignal::new(0u32);
+    use super::description_draft::DescriptionDraft;
 
-    // Gated content signal: suppresses WebSocket echoes while editing.
-    // Only forwards external description changes when no local save is pending.
-    let editing = RwSignal::new(false);
-    let gated_content = RwSignal::new(description.get_untracked());
+    let initial = description.get_untracked();
+    let draft = RwSignal::new(DescriptionDraft::new(initial.clone()));
+    let gated_content = RwSignal::new(crate::utils::auto_link::auto_link_issue_identifiers(&initial));
+    let save_failed = RwSignal::new(false);
+    let error_toast = crate::components::toast::capture_error_toast();
+    let error_toast_for_save = error_toast.clone();
+    let editor_container = NodeRef::<leptos::html::Div>::new();
 
     Effect::new(move || {
         let external = description.get();
-        if !editing.get_untracked()
-            && gated_content.try_set(external).is_some()
-        {
-            tracing::warn!("DescriptionEditor: gated_content signal disposed before sync");
+        if let Some(Some(content)) = draft.try_update(|draft| draft.receive_remote(external)) {
+            let _ = gated_content.try_set(crate::utils::auto_link::auto_link_issue_identifiers(&content));
         }
-    });
-
-    // Derived signal that auto-links issue identifiers in the description markdown.
-    // The editor renders these as clickable links; on_change guards against
-    // saving auto-link-only changes back to the server.
-    let auto_linked_content = Signal::derive(move || {
-        crate::utils::auto_link::auto_link_issue_identifiers(&gated_content.get())
     });
 
     let tk = team_key.clone();
     let on_change: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text: String| {
-        // Detect if this change was caused solely by auto-linking.
-        // If the incoming text matches what auto_link would produce from the
-        // current raw content, but differs from the raw content, it's an
-        // auto-link echo — update gated_content so subsequent edits have the
-        // linked version as baseline, but don't trigger a server save.
-        let current = gated_content.get_untracked();
-        let auto_linked = crate::utils::auto_link::auto_link_issue_identifiers(&current);
-        if text == auto_linked && text != current {
-            gated_content.set(text);
+        let changed = draft.with_untracked(|draft| draft.text != text);
+        if changed {
+            edit_generation.update(|generation| *generation += 1);
+        }
+        let start_worker = draft.try_update(|draft| draft.edit(text)).unwrap_or(false);
+        if !start_worker {
             return;
         }
-
-        editing.set(true);
-        latest_text.set(text);
-        edit_version.update(|v| *v += 1);
-        let snapshot = edit_version.get_untracked();
-
+        save_failed.set(false);
         let tk = tk.clone();
+        let error_toast = error_toast_for_save.clone();
         leptos::task::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(500).await;
-            // Guard: component may have been destroyed during the debounce wait.
-            let Some(current_version) = edit_version.try_get_untracked() else {
-                return;
-            };
-            if current_version != snapshot {
-                return;
+            loop {
+                let Some(snapshot) = draft.try_with_untracked(|draft| draft.snapshot()) else {
+                    return;
+                };
+                gloo_timers::future::TimeoutFuture::new(500).await;
+                let Some(current) = draft.try_get_untracked() else { return };
+                if current.generation != snapshot.generation {
+                    continue;
+                }
+                let description = if snapshot.text.trim().is_empty() {
+                    String::new()
+                } else {
+                    snapshot.text.clone()
+                };
+                let result = update_issue(
+                    tk.clone(), number, None, Some(description),
+                    None, None, None, None, None, None, None, None, None,
+                ).await;
+                match result {
+                    Ok(_) => {
+                        let Some(settled) = draft.try_update(|draft| draft.acknowledge(&snapshot)) else {
+                            return;
+                        };
+                        if settled {
+                            let _ = save_failed.try_set(false);
+                            // Formatting waits for a safe boundary. The focused
+                            // document is never replaced by its acknowledgement.
+                            if let Some(current) = draft.try_get_untracked()
+                                && !current.focused
+                            {
+                                let _ = gated_content.try_set(crate::utils::auto_link::auto_link_issue_identifiers(&current.text));
+                            }
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let Some(settled) = draft.try_update(|draft| draft.fail(&snapshot)) else {
+                            return;
+                        };
+                        tracing::warn!("Failed to save issue description: {error}");
+                        if settled {
+                            let _ = save_failed.try_set(true);
+                            error_toast("Description could not be saved. Your draft is retained; retry to save it.".into());
+                            return;
+                        }
+                    }
+                }
             }
-            let Some(current_text) = latest_text.try_get_untracked() else {
-                return;
-            };
-            let desc = if current_text.trim().is_empty() {
-                Some(String::new())
-            } else {
-                Some(current_text.clone())
-            };
-            let _ = update_issue(
-                tk,
-                number,
-                None,
-                desc,
-                None, None, None, None, None, None, None, None,
-                None,
-            )
-            .await;
-            // Save acknowledged — allow external updates again and sync the
-            // gated signal to what we just saved so kode's content sync Effect
-            // sees no diff against its DocState.
-            // Guard: component may have been destroyed while the save was in flight.
-            let _ = gated_content.try_set(current_text);
-            let _ = editing.try_set(false);
         });
     });
+    let retry = StoredValue::new(on_change.clone());
+    let on_focus_out = move |_event: leptos::ev::FocusEvent| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::JsCast;
+            if let Some(target) = _event.related_target()
+                && let Some(node) = target.dyn_ref::<web_sys::Node>()
+                && editor_container.get_untracked().is_some_and(|container| container.contains(Some(node)))
+            {
+                return;
+            }
+        }
+        if let Some(Some(content)) = draft.try_update(|draft| draft.blur()) {
+            let _ = gated_content.try_set(crate::utils::auto_link::auto_link_issue_identifiers(&content));
+        }
+    };
 
     // Attachment callbacks — pass issue_id so uploads are auto-linked.
-    let error_toast = crate::components::toast::capture_error_toast();
     let upload_complete: RwSignal<Option<kode_leptos::UploadComplete>> = RwSignal::new(None);
     let on_upload = crate::components::attachment_hooks::make_upload_callback(upload_complete, Some(issue_id.clone()), error_toast.clone());
     let on_delete = crate::components::attachment_hooks::make_delete_callback(error_toast.clone());
@@ -1862,7 +1894,7 @@ fn DescriptionEditor(
                         // Append the snippet to the current editor content.
                         // This triggers the content sync Effect in TreeWysiwygEditor,
                         // which re-parses and renders the new image/file node.
-                        let Some(current) = gated_content.try_get_untracked() else {
+                        let Some(current) = draft.try_with_untracked(|draft| draft.text.clone()) else {
                             return;
                         };
                         let updated = format!("{}{}", current.trim_end(), markdown_snippet);
@@ -1883,7 +1915,11 @@ fn DescriptionEditor(
     };
 
     view! {
-        <div class="mt-6" style="min-height: 120px;">
+        <div class="mt-6" style="min-height: 120px;"
+            node_ref=editor_container
+            on:focusin=move |_| draft.update(|draft| draft.focused = true)
+            on:focusout=on_focus_out
+        >
             // Hidden file input for the "Attach file" slash command extension
             <input
                 type="file"
@@ -1893,7 +1929,7 @@ fn DescriptionEditor(
                 on:change=on_attach_file_selected
             />
             <MarkdownDescription
-                content=auto_linked_content
+                content=gated_content
                 on_change=on_change
                 on_upload=on_upload
                 on_delete_attachment=on_delete
@@ -1901,6 +1937,15 @@ fn DescriptionEditor(
                 upload_complete=upload_complete
                 extensions=vec![attach_ext as Arc<dyn kode_leptos::Extension>]
             />
+            <Show when=move || save_failed.get()>
+                <Alert variant=AlertVariant::Error class="flex items-center gap-2">
+                    "Description not saved. Your draft is retained."
+                    <Button variant=ButtonVariant::Ghost size=ButtonSize::Sm
+                        on:click=move |_| retry.with_value(|retry| retry(draft.with_untracked(|draft| draft.text.clone())))>
+                        "Retry"
+                    </Button>
+                </Alert>
+            </Show>
         </div>
     }
 }

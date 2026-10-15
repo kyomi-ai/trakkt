@@ -179,6 +179,7 @@ pub fn Layout() -> impl IntoView {
         // starts servicing other tabs' deletes without re-registering anything.
         let cache_writer: StoredValue<send_wrapper::SendWrapper<Option<IdbWriter>>> =
             StoredValue::new(send_wrapper::SendWrapper::new(None));
+        provide_context(crate::cache::idb_writer::CacheReadBarrier(cache_writer));
 
         Effect::new(move |_| {
             // Re-runs when leadership is granted; both halves below are guarded.

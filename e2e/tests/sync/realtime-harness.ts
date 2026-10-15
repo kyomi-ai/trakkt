@@ -69,11 +69,21 @@ export function expectNoPanics(clients: TwoClients) {
  * origin per profile, so two pages in one context would give one real
  * WebSocket and one BroadcastChannel follower.
  */
-export async function launchTwoClients(): Promise<TwoClients> {
+async function loginFixture(page: Page) {
+  await page.goto('/login');
+  await page.waitForSelector('#login-email', { timeout: 30_000 });
+  await page.waitForTimeout(1000);
+  await page.fill('#login-email', EMAIL);
+  await page.fill('#login-password', PASSWORD);
+  await page.locator('button[type="submit"]').click();
+  await page.waitForURL((u) => !/\/(signup|login)/.test(u.pathname), { timeout: 30_000 });
+}
+
+export async function launchTwoClients(storageState?: string): Promise<TwoClients> {
   const panics: string[] = [];
   const browser = await chromium.launch();
 
-  const ctxA = await browser.newContext({ baseURL: BASE_URL });
+  const ctxA = await browser.newContext({ baseURL: BASE_URL, ...(storageState ? { storageState } : {}) });
   const pageA = await ctxA.newPage();
   watchForPanics('A', pageA, panics);
   // Surface which request 404s rather than leaving a bare console line.
@@ -81,44 +91,50 @@ export async function launchTwoClients(): Promise<TwoClients> {
     if (r.status() >= 400) console.log(`[A HTTP ${r.status()}] ${r.url()}`);
   });
 
-  // Try signup; fall back to login if this database already has its one user.
-  await pageA.goto('/signup');
-  await pageA.waitForSelector('#signup-email', { timeout: 30_000 });
-  await pageA.waitForTimeout(1000); // let hydration settle before typing
-  await pageA.fill('#signup-email', EMAIL);
+  if (!storageState) {
+    // Try signup; fall back to login if this database already has its one user.
+    await pageA.goto('/signup');
+    await pageA.waitForSelector('#signup-email', { timeout: 30_000 });
+    await pageA.waitForTimeout(1000); // let hydration settle before typing
+    await pageA.fill('#signup-email', EMAIL);
 
-  const nameInput = pageA.locator('#signup-name');
-  if (await nameInput.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await nameInput.fill('Sync Tester');
-  }
-  await pageA.fill('#signup-password', PASSWORD);
-  await pageA.locator('button[type="submit"]').click();
-
-  const signedUp = await pageA
-    .waitForURL((u) => !/\/(signup|login)/.test(u.pathname), { timeout: 20_000 })
-    .then(() => true)
-    .catch(() => false);
-
-  if (!signedUp) {
-    // Signup can be refused for more than one reason — "registration is
-    // closed" once this database has its first user, or "already registered"
-    // on a rerun against the same database. Both mean the same thing here:
-    // the account exists, so log in instead.
-    const notice = await pageA
-      .locator('p, div')
-      .filter({ hasText: /closed|already|exists|invalid/i })
-      .first()
-      .textContent({ timeout: 2000 })
-      .catch(() => null);
-    console.log(`[signup refused] notice=${JSON.stringify(notice)} — falling back to login`);
-
-    await pageA.goto('/login');
-    await pageA.waitForSelector('#login-email', { timeout: 30_000 });
-    await pageA.waitForTimeout(1000);
-    await pageA.fill('#login-email', EMAIL);
-    await pageA.fill('#login-password', PASSWORD);
+    const nameInput = pageA.locator('#signup-name');
+    if (await nameInput.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await nameInput.fill('Sync Tester');
+    }
+    await pageA.fill('#signup-password', PASSWORD);
     await pageA.locator('button[type="submit"]').click();
-    await pageA.waitForURL((u) => !/\/(signup|login)/.test(u.pathname), { timeout: 30_000 });
+
+    const signedUp = await pageA
+      .waitForURL((u) => !/\/(signup|login)/.test(u.pathname), { timeout: 20_000 })
+      .then(() => true)
+      .catch(() => false);
+
+    if (!signedUp) {
+      // Signup can be refused for more than one reason — "registration is
+      // closed" once this database has its first user, or "already registered"
+      // on a rerun against the same database. Both mean the same thing here:
+      // the account exists, so log in instead.
+      const notice = await pageA
+        .locator('p, div')
+        .filter({ hasText: /closed|already|exists|invalid/i })
+        .first()
+        .textContent({ timeout: 2000 })
+        .catch(() => null);
+      console.log(`[signup refused] notice=${JSON.stringify(notice)} — falling back to login`);
+
+      await loginFixture(pageA);
+    }
+
+  } else {
+    // Stored fixtures can outlive refresh-token rotation's grace period. Warm
+    // the real app before cloning B, and log in again if the fixture expired.
+    const user = pageA.waitForResponse(response =>
+      new URL(response.url()).pathname.startsWith('/leptos-api/get_sidebar_user'));
+    await pageA.goto('/workspace');
+    if (!(await user).ok()) {
+      await loginFixture(pageA);
+    }
   }
 
   const state = await ctxA.storageState();
