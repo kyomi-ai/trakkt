@@ -10,7 +10,10 @@ use axum::http::Method;
 use serde_json::json;
 
 use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
-use trakkt_auth::{activity_service, comment_service, issue_service, relation_service, search_service, team_service};
+use trakkt_auth::{
+    activity_service, comment_service, issue_service, relation_service, search_service,
+    team_service,
+};
 use trakkt_types::api::{
     CreateIssueApiParams, DeleteIssueApiParams, FilterClause, GetIssueApiParams, InlineRelation,
     IssueListRow, ListIssuesApiParams, ListIssuesResponse, SearchIssuesApiParams,
@@ -124,9 +127,8 @@ pub async fn list_issues(
 
     // Parse composable filter clauses from the JSON string, if provided.
     let clauses: Vec<FilterClause> = match params.filters.as_deref() {
-        Some(s) if !s.is_empty() => serde_json::from_str(s).map_err(|e| {
-            ApiError::BadRequest(format!("Invalid filters JSON: {e}"))
-        })?,
+        Some(s) if !s.is_empty() => serde_json::from_str(s)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid filters JSON: {e}")))?,
         _ => Vec::new(),
     };
     let has_clauses = !clauses.is_empty();
@@ -184,8 +186,7 @@ pub async fn list_issues(
     .await?;
 
     let mut issues =
-        issue_service::list_issues(ctx.db, &ctx.workspace_id, team_id.as_deref(), &filters)
-            .await?;
+        issue_service::list_issues(ctx.db, &ctx.workspace_id, team_id.as_deref(), &filters).await?;
 
     if has_clauses {
         // Apply composable filter clauses post-fetch (all AND-ed).
@@ -234,11 +235,16 @@ pub async fn get_issue(
 
     let comments = comment_service::list_comments(ctx.db, &issue.issue_id).await?;
     let activities = activity_service::list_issue_activities(ctx.db, &issue.issue_id).await?;
-    let relations = relation_service::list_relations_for_issue(ctx.db, &issue.issue_id, &ctx.workspace_id).await?;
+    let relations =
+        relation_service::list_relations_for_issue(ctx.db, &issue.issue_id, &ctx.workspace_id)
+            .await?;
 
     let mut issue_value = serde_json::to_value(&issue)?;
     if let serde_json::Value::Object(ref mut map) = issue_value {
-        map.insert("key".to_string(), serde_json::Value::String(format!("{}-{}", issue.team_key, issue.number)));
+        map.insert(
+            "key".to_string(),
+            serde_json::Value::String(format!("{}-{}", issue.team_key, issue.number)),
+        );
     }
 
     let result = json!({
@@ -271,18 +277,19 @@ async fn process_inline_relation(
     new_issue_id: &str,
     inline_rel: &InlineRelation,
 ) -> Result<serde_json::Value, String> {
-    let (target_key, target_num) =
-        parse_issue_identifier(&inline_rel.issue).ok_or_else(|| {
-            format!("Invalid issue identifier format: {}", inline_rel.issue)
-        })?;
+    let (target_key, target_num) = parse_issue_identifier(&inline_rel.issue)
+        .ok_or_else(|| format!("Invalid issue identifier format: {}", inline_rel.issue))?;
 
     let target_issue = issue_service::get_issue(ctx.db, &ctx.workspace_id, &target_key, target_num)
         .await
         .map_err(|e| format!("{e}"))?
         .ok_or_else(|| format!("Issue {} not found", inline_rel.issue))?;
 
-    let (source_id, target_id, relation_type) =
-        normalize_relation_direction(new_issue_id, &target_issue.issue_id, &inline_rel.relation_type);
+    let (source_id, target_id, relation_type) = normalize_relation_direction(
+        new_issue_id,
+        &target_issue.issue_id,
+        &inline_rel.relation_type,
+    );
 
     let relation = relation_service::create_relation(
         ctx.db,
@@ -308,6 +315,22 @@ pub async fn create_issue(
     ctx: &ApiCtx<'_>,
     params: CreateIssueApiParams,
 ) -> ApiResult<serde_json::Value> {
+    create_issue_impl(ctx, params, false).await
+}
+
+/// MCP preserves an applied primary issue when the requested parent link fails.
+pub async fn create_issue_with_outcomes(
+    ctx: &ApiCtx<'_>,
+    params: CreateIssueApiParams,
+) -> ApiResult<serde_json::Value> {
+    create_issue_impl(ctx, params, true).await
+}
+
+async fn create_issue_impl(
+    ctx: &ApiCtx<'_>,
+    params: CreateIssueApiParams,
+    report_parent_failure: bool,
+) -> ApiResult<serde_json::Value> {
     let (resolved_team_id, resolved_team_key) = if let Some(ref key) = params.team_key {
         let team = team_service::get_team_by_key(ctx.db, &ctx.workspace_id, key)
             .await?
@@ -320,8 +343,7 @@ pub async fn create_issue(
         let team = team_service::get_team_in_workspace(ctx.db, id, &ctx.workspace_id).await?;
         (team.team_id, team.key)
     } else {
-        let default_team =
-            team_service::get_default_team(ctx.db, &ctx.workspace_id).await?;
+        let default_team = team_service::get_default_team(ctx.db, &ctx.workspace_id).await?;
         (default_team.team_id, default_team.key)
     };
 
@@ -345,12 +367,13 @@ pub async fn create_issue(
         estimate: params.estimate,
     };
 
-    let issue =
-        issue_service::create_issue(ctx.db, &create_params, ctx.ws_manager).await?;
+    let issue = issue_service::create_issue(ctx.db, &create_params, ctx.ws_manager).await?;
+
+    let mut relation_warnings = Vec::new();
 
     // If a parent was specified, create the parent relation after issue creation.
     if let Some(ref parent_id) = parent_issue_id {
-        relation_service::set_parent(
+        let result = relation_service::set_parent(
             ctx.db,
             &ctx.workspace_id,
             &issue.issue_id,
@@ -360,12 +383,18 @@ pub async fn create_issue(
             ctx.action_source_label.as_deref(),
             ctx.ws_manager,
         )
-        .await?;
+        .await;
+        if let Err(error) = result {
+            if !report_parent_failure {
+                return Err(error.into());
+            }
+            tracing::warn!(issue_id = %issue.issue_id, %parent_id, %error, "Issue saved but parent link failed");
+            relation_warnings.push("Issue saved; parent link failed. Retry the parent relation separately, not create_issue.".to_string());
+        }
     }
 
     // Process inline relations — failures are warnings, not errors.
     let mut relations_created = Vec::new();
-    let mut relation_warnings = Vec::new();
 
     if let Some(ref inline_rels) = inline_relations {
         for inline_rel in inline_rels {
@@ -380,19 +409,35 @@ pub async fn create_issue(
     }
 
     // Record activity — never fails the mutation.
-    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
+    let recorder = ActivityRecorder::new(
+        ctx.db,
+        &ctx.workspace_id,
+        &ctx.user_id,
+        ctx.action_source,
+        ctx.action_source_label.clone(),
+        ctx.ws_manager,
+    );
     if let Err(e) = recorder.record(&issue.issue_id, "created", None).await {
         tracing::warn!(issue_id = %issue.issue_id, "Failed to record create activity: {e}");
     }
 
     let mut response = serde_json::to_value(&issue)?;
     if let serde_json::Value::Object(ref mut map) = response {
-        map.insert("key".to_string(), serde_json::Value::String(format!("{}-{}", resolved_team_key, issue.number)));
+        map.insert(
+            "key".to_string(),
+            serde_json::Value::String(format!("{}-{}", resolved_team_key, issue.number)),
+        );
         if !relations_created.is_empty() {
-            map.insert("relations_created".to_string(), serde_json::Value::Array(relations_created));
+            map.insert(
+                "relations_created".to_string(),
+                serde_json::Value::Array(relations_created),
+            );
         }
         if !relation_warnings.is_empty() {
-            map.insert("relation_warnings".to_string(), serde_json::to_value(&relation_warnings)?);
+            map.insert(
+                "relation_warnings".to_string(),
+                serde_json::to_value(&relation_warnings)?,
+            );
         }
     }
     Ok(response)
@@ -414,7 +459,9 @@ pub async fn update_issue(
     // Snapshot before update — used to diff changes for activity recording.
     let before_issue =
         issue_service::get_issue(ctx.db, &ctx.workspace_id, &team_key, number).await?;
-    let before_snapshot = before_issue.as_ref().map(IssueSnapshot::from_issue_with_details);
+    let before_snapshot = before_issue
+        .as_ref()
+        .map(IssueSnapshot::from_issue_with_details);
 
     // Track whether a status_id change was requested (before the value is moved).
     let status_change_requested = params.status_id.is_some();
@@ -520,9 +567,18 @@ pub async fn update_issue(
     // Record activity diff — never fails the mutation.
     if let Some(ref before) = before_snapshot {
         let after = IssueSnapshot::from_issue_with_details(&updated);
-        let recorder =
-            ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
-        if let Err(e) = recorder.record_issue_diff(&issue.issue_id, before, &after).await {
+        let recorder = ActivityRecorder::new(
+            ctx.db,
+            &ctx.workspace_id,
+            &ctx.user_id,
+            ctx.action_source,
+            ctx.action_source_label.clone(),
+            ctx.ws_manager,
+        );
+        if let Err(e) = recorder
+            .record_issue_diff(&issue.issue_id, before, &after)
+            .await
+        {
             tracing::warn!(issue_id = %issue.issue_id, "Failed to record activity diff: {e}");
         }
     }
@@ -555,7 +611,10 @@ pub async fn update_issue(
 
     let mut response = serde_json::to_value(&updated)?;
     if let serde_json::Value::Object(ref mut map) = response {
-        map.insert("key".to_string(), serde_json::Value::String(format!("{}-{}", updated.team_key, updated.number)));
+        map.insert(
+            "key".to_string(),
+            serde_json::Value::String(format!("{}-{}", updated.team_key, updated.number)),
+        );
     }
     Ok(response)
 }
@@ -573,14 +632,8 @@ pub async fn delete_issue(
         params.issue_number,
     )?;
 
-    issue_service::delete_issue(
-        ctx.db,
-        &ctx.workspace_id,
-        &team_key,
-        number,
-        ctx.ws_manager,
-    )
-    .await?;
+    issue_service::delete_issue(ctx.db, &ctx.workspace_id, &team_key, number, ctx.ws_manager)
+        .await?;
 
     Ok(json!({ "message": format!("Issue {team_key}-{number} deleted") }))
 }
