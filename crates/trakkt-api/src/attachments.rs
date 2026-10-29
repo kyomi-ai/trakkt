@@ -28,9 +28,17 @@ pub async fn upload_attachment(
     ctx: &ApiCtx<'_>,
     params: UploadAttachmentApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let storage = ctx.attachment_storage.ok_or_else(|| {
-        ApiError::Internal("Attachment storage not configured".into())
-    })?;
+    Ok(upload_attachment_with_outcome(ctx, params).await?.0)
+}
+
+/// Upload with the requested issue-link outcome for MCP, leaving REST metadata unchanged.
+pub async fn upload_attachment_with_outcome(
+    ctx: &ApiCtx<'_>,
+    params: UploadAttachmentApiParams,
+) -> ApiResult<(serde_json::Value, Option<serde_json::Value>)> {
+    let storage = ctx
+        .attachment_storage
+        .ok_or_else(|| ApiError::Internal("Attachment storage not configured".into()))?;
 
     // Decode base64 content
     let bytes = base64::engine::general_purpose::STANDARD
@@ -71,33 +79,43 @@ pub async fn upload_attachment(
     )
     .await?;
 
-    // Auto-link to issue if issue_id was provided (inline upload from issue detail).
-    if let Some(ref issue_id) = params.issue_id
-        && !issue_id.is_empty()
-        && let Err(e) = attachment_service::attach_to_issue(
-            ctx.db,
-            &ctx.workspace_id,
-            issue_id,
-            &attachment.attachment_id,
-            ctx.ws_manager,
-        )
-        .await
+    // The upload is already persisted: a link failure must not invite an upload retry.
+    let link_outcome = if let Some(issue_id) =
+        params.issue_id.as_deref().filter(|id| !id.is_empty())
     {
-        tracing::warn!(
-            attachment_id = %attachment.attachment_id,
-            issue_id = %issue_id,
-            error = %e,
-            "Failed to auto-link attachment to issue"
-        );
-    }
+        Some(
+            match attachment_service::attach_to_issue(
+                ctx.db,
+                &ctx.workspace_id,
+                issue_id,
+                &attachment.attachment_id,
+                ctx.ws_manager,
+            )
+            .await
+            {
+                Ok(()) => serde_json::json!({"issue_id": issue_id, "status": "linked"}),
+                Err(e) => {
+                    tracing::warn!(attachment_id = %attachment.attachment_id, %issue_id, error = %e,
+                    "Failed to auto-link attachment to issue");
+                    serde_json::json!({"issue_id": issue_id, "status": "failed",
+                    "warning": "Upload saved; issue link failed. Retry attach_to_issue with this attachment_id, not upload_attachment."})
+                }
+            },
+        )
+    } else {
+        None
+    };
 
-    Ok(serde_json::json!({
-        "attachment_id": attachment.attachment_id,
-        "filename": attachment.filename,
-        "content_type": attachment.content_type,
-        "size_bytes": attachment.size_bytes,
-        "url": format!("/api/v1/attachments/{}/download", attachment.attachment_id),
-    }))
+    Ok((
+        serde_json::json!({
+            "attachment_id": attachment.attachment_id,
+            "filename": attachment.filename,
+            "content_type": attachment.content_type,
+            "size_bytes": attachment.size_bytes,
+            "url": format!("/api/v1/attachments/{}/download", attachment.attachment_id),
+        }),
+        link_outcome,
+    ))
 }
 
 /// Download an attachment file by ID. Returns base64-encoded content for MCP
@@ -107,9 +125,9 @@ pub async fn download_attachment(
     ctx: &ApiCtx<'_>,
     params: DownloadAttachmentApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let storage = ctx.attachment_storage.ok_or_else(|| {
-        ApiError::Internal("Attachment storage not configured".into())
-    })?;
+    let storage = ctx
+        .attachment_storage
+        .ok_or_else(|| ApiError::Internal("Attachment storage not configured".into()))?;
 
     // Get the DB record (workspace-scoped)
     let attachment =
@@ -137,9 +155,9 @@ pub async fn delete_attachment(
     ctx: &ApiCtx<'_>,
     params: DeleteAttachmentApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let storage = ctx.attachment_storage.ok_or_else(|| {
-        ApiError::Internal("Attachment storage not configured".into())
-    })?;
+    let storage = ctx
+        .attachment_storage
+        .ok_or_else(|| ApiError::Internal("Attachment storage not configured".into()))?;
 
     // Delete DB record (returns storage_path for file cleanup)
     let storage_path = attachment_service::delete_attachment(
@@ -170,8 +188,7 @@ pub async fn list_attachments(
     ctx: &ApiCtx<'_>,
     _params: ListAttachmentsApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let attachments =
-        attachment_service::list_attachments(ctx.db, &ctx.workspace_id).await?;
+    let attachments = attachment_service::list_attachments(ctx.db, &ctx.workspace_id).await?;
 
     let response: Vec<serde_json::Value> = attachments
         .iter()

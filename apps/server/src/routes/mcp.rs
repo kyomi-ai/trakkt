@@ -27,18 +27,18 @@
 //!
 //! In personal mode, both are bypassed — a local user context is injected.
 
+use super::auth_shared::{self, ResolvedAuth};
+use crate::state::AppState;
 use axum::{
+    Json, Router,
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use crate::state::AppState;
-use super::auth_shared::{self, ResolvedAuth};
+use serde_json::{Value, json};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MCP_SERVER_NAME: &str = "trakkt-mcp";
@@ -76,7 +76,12 @@ struct JsonRpcError {
 
 impl JsonRpcResponse {
     fn success(id: Option<Value>, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     fn error(id: Option<Value>, code: i32, message: impl Into<String>) -> Self {
@@ -84,7 +89,10 @@ impl JsonRpcResponse {
             jsonrpc: "2.0",
             id,
             result: None,
-            error: Some(JsonRpcError { code, message: message.into() }),
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+            }),
         }
     }
 }
@@ -166,7 +174,11 @@ async fn handle_post(
     } else {
         let auth = auth_shared::resolve_auth(&headers, &state).await;
         if auth.is_none() {
-            return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Not authenticated"}))).into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"detail": "Not authenticated"})),
+            )
+                .into_response();
         }
         auth
     };
@@ -180,7 +192,11 @@ async fn handle_post(
         "tools/call" => handle_tools_call(request.id, request.params, &headers, &state).await,
         "resources/list" => handle_resources_list(request.id),
         "ping" => JsonRpcResponse::success(request.id, json!({})),
-        _ => JsonRpcResponse::error(request.id, -32601, format!("Method not found: {}", request.method)),
+        _ => JsonRpcResponse::error(
+            request.id,
+            -32601,
+            format!("Method not found: {}", request.method),
+        ),
     };
 
     let mut resp_headers = HeaderMap::new();
@@ -203,12 +219,13 @@ async fn handle_post(
 // GET /mcp — SSE stream (placeholder)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn handle_sse(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if !state.config.is_personal() && auth_shared::resolve_auth(&headers, &state).await.is_none() {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Not authenticated"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"detail": "Not authenticated"})),
+        )
+            .into_response();
     }
     (StatusCode::OK, "event: ping\ndata: {}\n\n").into_response()
 }
@@ -217,10 +234,7 @@ async fn handle_sse(
 // DELETE /mcp — session termination
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn handle_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_delete(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // Authenticate in non-personal mode, exactly as the two siblings on this
     // route do — `handle_post` above and `handle_sse` at `:206`. Personal mode
     // (single-user desktop, no login) bypasses auth in all three. The resolved
@@ -232,12 +246,19 @@ async fn handle_delete(
     } else {
         let auth = auth_shared::resolve_auth(&headers, &state).await;
         if auth.is_none() {
-            return (StatusCode::UNAUTHORIZED, Json(json!({"detail": "Not authenticated"}))).into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"detail": "Not authenticated"})),
+            )
+                .into_response();
         }
         auth
     };
 
-    if let Some(session_id) = headers.get(MCP_SESSION_ID_HEADER).and_then(|v| v.to_str().ok()) {
+    if let Some(session_id) = headers
+        .get(MCP_SESSION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
         // Authentication alone would still let any authenticated user of any
         // other workspace terminate this session, so ownership is checked too.
         // `create_session` records the workspace `initialize` authenticated as
@@ -276,17 +297,20 @@ async fn handle_delete(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn handle_initialize(id: Option<Value>, _params: Option<Value>) -> JsonRpcResponse {
-    JsonRpcResponse::success(id, json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "serverInfo": {
-            "name": MCP_SERVER_NAME,
-            "version": MCP_SERVER_VERSION,
-        },
-        "capabilities": {
-            "tools": { "listChanged": true },
-            "resources": { "subscribe": false, "listChanged": false },
-        },
-    }))
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "serverInfo": {
+                "name": MCP_SERVER_NAME,
+                "version": MCP_SERVER_VERSION,
+            },
+            "capabilities": {
+                "tools": { "listChanged": true },
+                "resources": { "subscribe": false, "listChanged": false },
+            },
+        }),
+    )
 }
 
 /// Rewrite a schemars-generated JSON Schema into the OpenAI function-calling
@@ -425,9 +449,12 @@ async fn handle_tools_call(
     let result = dispatch_registry_tool(tool_name, arguments, &auth, state, &ops).await;
 
     match result {
-        Ok(content) => JsonRpcResponse::success(id, json!({
-            "content": [{ "type": "text", "text": content }]
-        })),
+        Ok(content) => JsonRpcResponse::success(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": content }]
+            }),
+        ),
         Err(e) => {
             // Map domain errors to MCP error responses with appropriate codes.
             let (code, message) = match &e {
@@ -482,7 +509,49 @@ async fn dispatch_registry_tool(
         auth.action_source_label.clone(),
     );
 
-    let result = (op.handler)(ctx, arguments).await.map_err(|e| match e {
+    let result = match name {
+        "create_issue" => {
+            trakkt_api::issues::create_issue_with_outcomes(
+                &ctx,
+                parse_mcp_arguments(arguments.clone())?,
+            )
+            .await
+        }
+        "upload_attachment" => {
+            match trakkt_api::attachments::upload_attachment_with_outcome(
+                &ctx,
+                parse_mcp_arguments(arguments.clone())?,
+            )
+            .await
+            {
+                Ok((mut response, outcome)) => {
+                    if let Some(outcome) = outcome {
+                        response["issue_link"] = outcome;
+                    }
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        "add_relation" => {
+            match trakkt_api::relations::add_relation_with_outcome(
+                &ctx,
+                parse_mcp_arguments(arguments.clone())?,
+            )
+            .await
+            {
+                Ok((mut response, outcome)) => {
+                    if let Some(outcome) = outcome {
+                        response["auto_close"] = outcome;
+                    }
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        _ => (op.handler)(ctx, arguments.clone()).await,
+    }
+    .map_err(|e| match e {
         trakkt_api::ApiError::NotFound(msg) => trakkt_core::Error::NotFound(msg),
         trakkt_api::ApiError::BadRequest(msg) => trakkt_core::Error::BadRequest(msg),
         trakkt_api::ApiError::Unauthorized(msg) => trakkt_core::Error::Forbidden(msg),
@@ -490,16 +559,210 @@ async fn dispatch_registry_tool(
         trakkt_api::ApiError::Conflict(msg) => trakkt_core::Error::Conflict(msg),
         trakkt_api::ApiError::TooManyRequests(msg) => trakkt_core::Error::TooManyRequests(msg, 0),
         trakkt_api::ApiError::NotImplemented(msg) => trakkt_core::Error::NotImplemented(msg),
-        trakkt_api::ApiError::ServiceUnavailable(msg) => trakkt_core::Error::ServiceUnavailable(msg),
+        trakkt_api::ApiError::ServiceUnavailable(msg) => {
+            trakkt_core::Error::ServiceUnavailable(msg)
+        }
         trakkt_api::ApiError::Internal(msg) => trakkt_core::Error::Internal(msg),
     })?;
 
-    serde_json::to_string_pretty(&result).map_err(trakkt_core::Error::from)
+    serde_json::to_string(&mutation_receipt(name, &arguments, result))
+        .map_err(trakkt_core::Error::from)
+}
+
+/// Match shared API parameter failures instead of reclassifying malformed input as internal errors.
+fn parse_mcp_arguments<T: serde::de::DeserializeOwned>(arguments: Value) -> trakkt_core::Result<T> {
+    serde_json::from_value(arguments)
+        .map_err(|error| trakkt_core::Error::BadRequest(format!("JSON error: {error}")))
+}
+
+/// MCP-only allowlists keep write acknowledgements independent of entity prose.
+/// Small metadata and acknowledgement operations deliberately retain their existing fields.
+fn mutation_receipt(name: &str, arguments: &Value, result: Value) -> Value {
+    let fields: &[&str] = match name {
+        "create_issue" | "update_issue" => &[
+            "issue_id",
+            "key",
+            "team_id",
+            "status_id",
+            "status_name",
+            "status_category",
+            "priority",
+            "created_at",
+            "updated_at",
+            "started_at",
+            "completed_at",
+            "released_at",
+            "archived_at",
+            "relations_created",
+            "relation_warnings",
+        ],
+        "add_comment" => &[
+            "comment_id",
+            "issue_id",
+            "parent_id",
+            "created_at",
+            "updated_at",
+        ],
+        "create_project" | "update_project" => {
+            &["project_id", "status", "created_at", "updated_at"]
+        }
+        "create_milestone" | "update_milestone" => &[
+            "milestone_id",
+            "project_id",
+            "target_date",
+            "sort_order",
+            "created_at",
+        ],
+        "create_release" => &[
+            "release_id",
+            "team_key",
+            "tag_name",
+            "previous_tag",
+            "created_at",
+            "issue_count",
+        ],
+        "update_team_settings" => &["team_id", "key", "settings"],
+        _ => return result,
+    };
+    let mut receipt = serde_json::Map::new();
+    receipt.insert("success".into(), json!(true));
+    for field in fields {
+        if let Some(value) = result.get(*field).filter(|value| !value.is_null()) {
+            let value = if *field == "relation_warnings" {
+                Value::Array(
+                    value
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|warning| match warning.as_str() {
+                            Some(text) if text.chars().count() > 512 => {
+                                json!(format!("{}…", text.chars().take(511).collect::<String>()))
+                            }
+                            _ => warning.clone(),
+                        })
+                        .collect(),
+                )
+            } else {
+                value.clone()
+            };
+            receipt.insert((*field).into(), value);
+        }
+    }
+    // Preserve effective values for requested scalar changes, including explicit clears.
+    let effective: &[(&str, &str)] = match name {
+        "create_issue" | "update_issue" => &[
+            ("assignee", "assignee_id"),
+            ("due_date", "due_date"),
+            ("project_id", "project_id"),
+            ("milestone_id", "milestone_id"),
+            ("estimate", "estimate"),
+        ],
+        "create_project" | "update_project" => &[
+            ("lead_id", "lead_id"),
+            ("start_date", "start_date"),
+            ("target_date", "target_date"),
+            ("archived_at", "archived_at"),
+        ],
+        "update_milestone" => &[("target_date", "target_date")],
+        _ => &[],
+    };
+    for (argument, field) in effective {
+        if arguments.get(*argument).is_some()
+            && let Some(value) = result.get(*field)
+        {
+            receipt.insert((*field).into(), value.clone());
+        }
+    }
+    Value::Object(receipt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_exposed_mutation_has_an_explicit_receipt_policy() {
+        let mut expected = vec![
+            "create_issue",
+            "update_issue",
+            "add_comment",
+            "create_project",
+            "update_project",
+            "create_milestone",
+            "update_milestone",
+            "create_release",
+            "update_team_settings",
+            "create_label",
+            "add_relation",
+            "upload_attachment",
+            "delete_issue",
+            "delete_project",
+            "delete_milestone",
+            "remove_relation",
+            "delete_attachment",
+            "attach_to_issue",
+            "detach_from_issue",
+            "star_issue",
+            "unstar_issue",
+        ];
+        expected.sort_unstable();
+        let mut actual: Vec<_> = trakkt_api::all_operations()
+            .into_iter()
+            .filter(|operation| operation.rest_method != axum::http::Method::GET)
+            .map(|operation| operation.name)
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "new mutations need an explicit documented receipt policy"
+        );
+        for name in [
+            "create_label",
+            "add_relation",
+            "upload_attachment",
+            "delete_issue",
+            "delete_project",
+            "delete_milestone",
+            "remove_relation",
+            "delete_attachment",
+            "attach_to_issue",
+            "detach_from_issue",
+            "star_issue",
+            "unstar_issue",
+        ] {
+            let result = json!({"retained": "operation metadata or acknowledgement"});
+            assert_eq!(mutation_receipt(name, &json!({}), result.clone()), result);
+        }
+    }
+
+    #[test]
+    fn warning_text_is_bounded_but_warning_count_and_other_outcomes_survive() {
+        let receipt = mutation_receipt(
+            "create_issue",
+            &json!({}),
+            json!({
+                "issue_id":"saved", "key":"RCP-1", "relations_created":[{"relation_id":"rel"}],
+                "relation_warnings":["x".repeat(10000), "short actionable warning"]
+            }),
+        );
+        assert_eq!(receipt["relations_created"][0]["relation_id"], "rel");
+        assert_eq!(
+            receipt["relation_warnings"]
+                .as_array()
+                .expect("retained warnings")
+                .len(),
+            2
+        );
+        assert_eq!(
+            receipt["relation_warnings"][0]
+                .as_str()
+                .expect("bounded warning")
+                .chars()
+                .count(),
+            512
+        );
+        assert_eq!(receipt["relation_warnings"][1], "short actionable warning");
+    }
 
     #[test]
     fn sanitize_flattens_nullable_unions_and_strips_dialect() {

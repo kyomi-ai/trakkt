@@ -11,8 +11,8 @@ use serde_json::json;
 
 use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
 use trakkt_auth::{issue_service, relation_service, status_service};
-use trakkt_types::models::IssueUpdate;
 use trakkt_types::api::{AddRelationApiParams, ListRelationsApiParams, RemoveRelationApiParams};
+use trakkt_types::models::IssueUpdate;
 
 use crate::context::{parse_issue_identifier, resolve_issue_key_and_number};
 use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
@@ -33,33 +33,37 @@ pub async fn add_relation(
     ctx: &ApiCtx<'_>,
     params: AddRelationApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let source_identifier = params.source_issue.as_deref().ok_or_else(|| {
-        ApiError::BadRequest("source_issue is required".to_string())
-    })?;
+    Ok(add_relation_with_outcome(ctx, params).await?.0)
+}
+
+/// Create a relation and report duplicate auto-close separately from the committed relation.
+pub async fn add_relation_with_outcome(
+    ctx: &ApiCtx<'_>,
+    params: AddRelationApiParams,
+) -> ApiResult<(serde_json::Value, Option<serde_json::Value>)> {
+    let source_identifier = params
+        .source_issue
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("source_issue is required".to_string()))?;
 
     // Resolve source issue identifier to issue_id.
-    let (source_key, source_num) =
-        parse_issue_identifier(source_identifier).ok_or_else(|| {
-            ApiError::BadRequest("Invalid source_issue format. Expected 'TRA-35'".to_string())
-        })?;
-    let source_issue =
-        issue_service::get_issue(ctx.db, &ctx.workspace_id, &source_key, source_num)
-            .await?
-            .ok_or_else(|| {
-                ApiError::NotFound(format!("Source issue {source_identifier} not found"))
-            })?;
+    let (source_key, source_num) = parse_issue_identifier(source_identifier).ok_or_else(|| {
+        ApiError::BadRequest("Invalid source_issue format. Expected 'TRA-35'".to_string())
+    })?;
+    let source_issue = issue_service::get_issue(ctx.db, &ctx.workspace_id, &source_key, source_num)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Source issue {source_identifier} not found")))?;
 
     // Resolve target issue identifier to issue_id.
     let (target_key, target_num) =
         parse_issue_identifier(&params.target_issue).ok_or_else(|| {
             ApiError::BadRequest("Invalid target_issue format. Expected 'TRA-35'".to_string())
         })?;
-    let target_issue =
-        issue_service::get_issue(ctx.db, &ctx.workspace_id, &target_key, target_num)
-            .await?
-            .ok_or_else(|| {
-                ApiError::NotFound(format!("Target issue {} not found", params.target_issue))
-            })?;
+    let target_issue = issue_service::get_issue(ctx.db, &ctx.workspace_id, &target_key, target_num)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Target issue {} not found", params.target_issue))
+        })?;
 
     let relation = relation_service::create_relation(
         ctx.db,
@@ -75,7 +79,14 @@ pub async fn add_relation(
     .await?;
 
     // Record activity on both issues — never fails the mutation.
-    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
+    let recorder = ActivityRecorder::new(
+        ctx.db,
+        &ctx.workspace_id,
+        &ctx.user_id,
+        ctx.action_source,
+        ctx.action_source_label.clone(),
+        ctx.ws_manager,
+    );
 
     let source_identifier = format!("{source_key}-{source_num}");
     let target_identifier = format!("{target_key}-{target_num}");
@@ -111,12 +122,19 @@ pub async fn add_relation(
     // Auto-close: when a duplicate relation is created, transition the source
     // (duplicate) issue to the first global status in the "cancelled" category.
     // Best-effort — don't fail the relation creation if this errors.
+    let mut auto_close = (params.relation_type == "duplicate").then(|| {
+        json!({
+            "status": "already_cancelled", "status_id": source_issue.status_id
+        })
+    });
     if params.relation_type == "duplicate" && source_issue.status_category != "cancelled" {
+        auto_close = Some(json!({"status": "failed", "warning":
+            "Relation saved; duplicate auto-close failed. Update the source issue status separately; do not retry add_relation."}));
         match status_service::get_status_by_category(ctx.db, &ctx.workspace_id, "cancelled").await {
             Ok(Some(cancelled_status)) => {
                 let before = IssueSnapshot::from_issue_with_details(&source_issue);
                 let update = IssueUpdate {
-                    status_id: Some(cancelled_status.status_id),
+                    status_id: Some(cancelled_status.status_id.clone()),
                     ..Default::default()
                 };
                 match issue_service::update_issue(
@@ -133,14 +151,23 @@ pub async fn add_relation(
                 .await
                 {
                     Ok(_) => {
+                        auto_close = Some(
+                            json!({"status": "closed", "status_id": cancelled_status.status_id}),
+                        );
                         match issue_service::get_issue(
-                            ctx.db, &ctx.workspace_id, &source_key, source_num
-                        ).await {
+                            ctx.db,
+                            &ctx.workspace_id,
+                            &source_key,
+                            source_num,
+                        )
+                        .await
+                        {
                             Ok(Some(updated)) => {
                                 let after = IssueSnapshot::from_issue_with_details(&updated);
-                                if let Err(e) = recorder.record_issue_diff(
-                                    &source_issue.issue_id, &before, &after
-                                ).await {
+                                if let Err(e) = recorder
+                                    .record_issue_diff(&source_issue.issue_id, &before, &after)
+                                    .await
+                                {
                                     tracing::warn!(
                                         issue_id = %source_issue.issue_id,
                                         "Failed to record auto-close activity: {e}"
@@ -184,7 +211,7 @@ pub async fn add_relation(
         }
     }
 
-    Ok(serde_json::to_value(&relation)?)
+    Ok((serde_json::to_value(&relation)?, auto_close))
 }
 
 /// Remove a relation between two issues by its relation ID.
@@ -196,8 +223,7 @@ pub async fn remove_relation(
 ) -> ApiResult<serde_json::Value> {
     // Fetch the relation before deletion so we can record activity on both issues.
     let relation_before =
-        relation_service::get_relation_by_id(ctx.db, &params.relation_id, &ctx.workspace_id)
-            .await;
+        relation_service::get_relation_by_id(ctx.db, &params.relation_id, &ctx.workspace_id).await;
 
     relation_service::delete_relation(
         ctx.db,
@@ -210,15 +236,28 @@ pub async fn remove_relation(
     // Record activity on both issues — never fails the mutation.
     // Look up both issues to get their identifiers for rich activity metadata
     // (matches the shape of relation_added metadata).
-    let recorder = ActivityRecorder::new(ctx.db, &ctx.workspace_id, &ctx.user_id, ctx.action_source, ctx.action_source_label.clone(), ctx.ws_manager);
+    let recorder = ActivityRecorder::new(
+        ctx.db,
+        &ctx.workspace_id,
+        &ctx.user_id,
+        ctx.action_source,
+        ctx.action_source_label.clone(),
+        ctx.ws_manager,
+    );
     match relation_before {
         Ok(Some(rel)) => {
             let source_issue = issue_service::get_issue_by_id(ctx.db, &rel.source_issue_id).await;
             let target_issue = issue_service::get_issue_by_id(ctx.db, &rel.target_issue_id).await;
 
-            let source_identifier = source_issue.as_ref().ok().and_then(|o| o.as_ref())
+            let source_identifier = source_issue
+                .as_ref()
+                .ok()
+                .and_then(|o| o.as_ref())
                 .map(|i| format!("{}-{}", i.team_key, i.number));
-            let target_identifier = target_issue.as_ref().ok().and_then(|o| o.as_ref())
+            let target_identifier = target_issue
+                .as_ref()
+                .ok()
+                .and_then(|o| o.as_ref())
                 .map(|i| format!("{}-{}", i.team_key, i.number));
 
             let source_meta = json!({
