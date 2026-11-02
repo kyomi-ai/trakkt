@@ -341,7 +341,7 @@ where
                     </div>
 
                     // Submit button
-                    <Button size=ButtonSize::Lg class="w-full" disabled=btn_disabled>
+                    <Button button_type="submit" size=ButtonSize::Lg class="w-full" disabled=btn_disabled>
                         {if is_submitting {
                             view! {
                                 <div class="flex items-center justify-center space-x-2">
@@ -402,5 +402,39 @@ fn error_view() -> impl IntoView {
                 "Back to Login"
             </ButtonLink>
         </div>
+    }
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_password_action_submits_its_form() {
+        let owner = Owner::new();
+        owner.with(|| {
+            let (new_password, set_new_password) = signal("NewPassword456!".to_string());
+            let (confirm_password, set_confirm_password) = signal("NewPassword456!".to_string());
+            let html = ready_view(ReadyViewParams {
+                has_passkeys: false,
+                is_submitting: false,
+                btn_disabled: false,
+                current_error: None,
+                new_password,
+                set_new_password,
+                confirm_password,
+                set_confirm_password,
+                on_submit: |_| {},
+            })
+            .to_html();
+
+            assert!(html.contains("Set New Password"));
+            assert_eq!(html.matches("<form ").count(), 1);
+            assert_eq!(html.matches("<button ").count(), 1);
+            assert!(
+                html.contains("type=\"submit\""),
+                "recovery action must submit its owning form: {html}"
+            );
+        });
     }
 }
