@@ -20,6 +20,6 @@
     "otplib": "^13.4.1"
   },
   "dependencies": {
-    "argon2": "^0.45.1"
+    "argon2": "^0.45.2"
   }
 }
