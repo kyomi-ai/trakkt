@@ -43,8 +43,21 @@ pub struct SearchResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
+    /// Number of distinct matching issues, counted up to [`SEARCH_FETCH_CAP`]
+    /// rows. When `truncated` is true this is a lower bound.
     pub total: i64,
+    /// More results can be fetched by repeating the request with
+    /// `offset = next_offset`.
+    pub has_more: bool,
+    /// Offset of the next page; `None` when `has_more` is false.
+    pub next_offset: Option<i64>,
+    /// The search hit its internal fetch cap: matches ranked below the cap are
+    /// not reachable by paging and `total` is a lower bound. Narrow the query.
+    pub truncated: bool,
 }
+
+/// Most rows one search will fetch before deduplicating and paging.
+pub const SEARCH_FETCH_CAP: i64 = 1000;
 
 impl From<SearchResultRow> for SearchResult {
     fn from(row: SearchResultRow) -> Self {
@@ -96,6 +109,9 @@ pub async fn search(
         return Ok(SearchResponse {
             results: Vec::new(),
             total: 0,
+            has_more: false,
+            next_offset: None,
+            truncated: false,
         });
     }
 
@@ -111,15 +127,20 @@ pub async fn search(
         include_archived: params.include_archived,
         include_closed: params.include_closed,
         include_comments: params.include_comments,
-        limit: 1000,
+        // One past the cap, so a result set of exactly the cap is not
+        // mistaken for a truncated one.
+        limit: SEARCH_FETCH_CAP + 1,
         offset: 0,
     };
 
-    let rows = if db.is_postgres() {
+    let mut rows = if db.is_postgres() {
         search_postgres(db, &uncapped_params, &identifier).await?
     } else {
         search_sqlite(db, &uncapped_params, &identifier).await?
     };
+
+    let truncated = rows.len() as i64 > SEARCH_FETCH_CAP;
+    rows.truncate(SEARCH_FETCH_CAP as usize);
 
     // Dedup by issue_id, keeping the entry with the highest rank (identifier
     // matches have rank 2.0 so they win over tsvector / LIKE matches).
@@ -135,9 +156,18 @@ pub async fn search(
     // Apply pagination in Rust.
     let offset = params.offset as usize;
     let limit = params.limit as usize;
-    let results = all_results.into_iter().skip(offset).take(limit).collect();
+    let results: Vec<SearchResult> = all_results.into_iter().skip(offset).take(limit).collect();
 
-    Ok(SearchResponse { results, total })
+    let next = (offset + results.len()) as i64;
+    let has_more = next < total;
+
+    Ok(SearchResponse {
+        results,
+        total,
+        has_more,
+        next_offset: has_more.then_some(next),
+        truncated,
+    })
 }
 
 // ─── Shared condition builders ─────────────────────────────────────────────

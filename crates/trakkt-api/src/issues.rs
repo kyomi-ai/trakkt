@@ -10,6 +10,7 @@ use axum::http::Method;
 use serde_json::json;
 
 use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
+use trakkt_auth::issue_service::{IssueSort, IssueSortField, SortDir};
 use trakkt_auth::{
     activity_service, comment_service, issue_service, relation_service, search_service,
     team_service,
@@ -27,11 +28,6 @@ use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 // ─────────────────────────────────────────────────────────────────────────────
 // Composable filter clause support
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Multiplier applied to the requested limit when composable filter clauses
-/// are present. Over-fetching from the DB compensates for rows eliminated by
-/// post-fetch filtering, so the final page is likely full.
-const FILTER_PREFETCH_MULTIPLIER: i64 = 5;
 
 /// Known boolean filter fields that ignore `values` — the operator alone
 /// determines the match.
@@ -122,8 +118,27 @@ pub async fn list_issues(
     ctx: &ApiCtx<'_>,
     params: ListIssuesApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let limit_raw = params.limit.unwrap_or(50);
-    let limit = limit_raw.clamp(1, 100);
+    let limit_raw = params.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    let limit = limit_raw.clamp(1, MAX_LIST_LIMIT);
+
+    let sort_field = match params.sort_by.as_deref() {
+        None | Some("") => IssueSortField::Priority,
+        Some(s) => IssueSortField::parse(s).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "Invalid sort_by '{s}': expected priority, created_at, updated_at or number"
+            ))
+        })?,
+    };
+    let sort_dir = match params.sort_dir.as_deref() {
+        None | Some("") => sort_field.default_dir(),
+        Some(s) => SortDir::parse(s).ok_or_else(|| {
+            ApiError::BadRequest(format!("Invalid sort_dir '{s}': expected asc or desc"))
+        })?,
+    };
+    let sort = IssueSort {
+        field: sort_field,
+        dir: sort_dir,
+    };
 
     // Parse composable filter clauses from the JSON string, if provided.
     let clauses: Vec<FilterClause> = match params.filters.as_deref() {
@@ -131,15 +146,30 @@ pub async fn list_issues(
             .map_err(|e| ApiError::BadRequest(format!("Invalid filters JSON: {e}")))?,
         _ => Vec::new(),
     };
-    let has_clauses = !clauses.is_empty();
 
-    // When post-fetch filter clauses are present, fetch more rows from the DB
-    // so that after filtering we still have enough results. Use a multiplier.
-    let db_limit = if has_clauses {
-        limit * FILTER_PREFETCH_MULTIPLIER
-    } else {
-        limit
-    };
+    // A cursor is only valid for the query that produced it. Everything that
+    // selects or orders rows goes into the fingerprint.
+    let fingerprint = [
+        params.team_key.as_deref().unwrap_or(""),
+        params.team_id.as_deref().unwrap_or(""),
+        params.status_id.as_deref().unwrap_or(""),
+        params.status_category.as_deref().unwrap_or(""),
+        &params.include_closed.unwrap_or(false).to_string(),
+        &params.priority.map(|p| p.to_string()).unwrap_or_default(),
+        params.assignee.as_deref().unwrap_or(""),
+        params.label.as_deref().unwrap_or(""),
+        params.search.as_deref().unwrap_or(""),
+        params.filters.as_deref().unwrap_or(""),
+        sort.field.as_str(),
+        sort.dir.as_str(),
+    ]
+    .join("\u{1f}");
+    let cursor = params
+        .cursor
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .map(|c| decode_cursor(c, &fingerprint))
+        .transpose()?;
 
     let status_id = params.status_id;
     let status_categories: Option<Vec<String>> = params.status_category.map(|s| {
@@ -171,7 +201,9 @@ pub async fn list_issues(
                 .collect()
         }),
         search: params.search,
-        limit: Some(db_limit),
+        // Paging happens below, after the composable clauses, so that `total`
+        // and the cursor see the complete filtered result.
+        limit: None,
         offset: None,
         include_archived: None,
         only_archived: None,
@@ -185,34 +217,108 @@ pub async fn list_issues(
     )
     .await?;
 
-    let mut issues =
-        issue_service::list_issues(ctx.db, &ctx.workspace_id, team_id.as_deref(), &filters).await?;
+    let mut issues = issue_service::list_issues_sorted(
+        ctx.db,
+        &ctx.workspace_id,
+        team_id.as_deref(),
+        &filters,
+        sort,
+    )
+    .await?;
 
-    if has_clauses {
-        // Apply composable filter clauses post-fetch (all AND-ed).
+    // Apply composable filter clauses post-fetch (all AND-ed).
+    if !clauses.is_empty() {
         issues.retain(|issue| clauses.iter().all(|clause| apply_clause(clause, issue)));
+    }
 
-        let total_matched = issues.len();
-        let limit_usize = limit as usize;
-        let truncated = total_matched > limit_usize;
-        issues.truncate(limit_usize);
-
-        // Project to lean rows only after filtering, so clauses keep access to
-        // every field of the full issue.
-        let rows: Vec<IssueListRow> = issues.into_iter().map(IssueListRow::from).collect();
-        let returned_count = rows.len();
-
-        let response = ListIssuesResponse {
-            issues: rows,
-            matched_count: total_matched,
-            returned_count,
-            truncated,
-        };
-        Ok(serde_json::to_value(&response)?)
+    let total = issues.len();
+    // Resume after the last row the caller saw. If that issue is gone or no
+    // longer matches, fall back to the position the cursor recorded.
+    let start = match &cursor {
+        None => 0,
+        Some(c) => issues
+            .iter()
+            .position(|i| i.issue_id == c.anchor)
+            .map_or(c.offset.min(total), |p| p + 1),
+    };
+    let end = start.saturating_add(limit as usize).min(total);
+    let has_more = end < total;
+    // `has_more` implies `start < end < total` (limit >= 1), so `end - 1` is the
+    // last row of this page.
+    let next_cursor = if has_more {
+        issues
+            .get(end - 1)
+            .map(|last| encode_cursor(end, &last.issue_id, &fingerprint))
     } else {
-        // No composable clauses — return the flat array for backward compat.
-        let rows: Vec<IssueListRow> = issues.into_iter().map(IssueListRow::from).collect();
-        Ok(serde_json::to_value(&rows)?)
+        None
+    };
+
+    // Project to lean rows only after filtering, so clauses keep access to
+    // every field of the full issue.
+    let rows: Vec<IssueListRow> = issues
+        .drain(start..end)
+        .map(IssueListRow::from)
+        .collect();
+
+    let response = ListIssuesResponse {
+        returned_count: rows.len(),
+        issues: rows,
+        total,
+        has_more,
+        next_cursor,
+        limit,
+        sort_by: sort.field.as_str().to_string(),
+        sort_dir: sort.dir.as_str().to_string(),
+        matched_count: total,
+        truncated: has_more,
+    };
+    Ok(serde_json::to_value(&response)?)
+}
+
+/// Default and maximum page size for `list_issues`.
+const DEFAULT_LIST_LIMIT: i64 = 50;
+const MAX_LIST_LIMIT: i64 = 100;
+
+/// What an opaque `list_issues` cursor carries.
+struct ListCursor {
+    /// Number of rows already returned.
+    offset: usize,
+    /// `issue_id` of the last row returned.
+    anchor: String,
+}
+
+const CURSOR_VERSION: &str = "v1";
+const CURSOR_SEP: char = '\u{1e}';
+
+fn encode_cursor(offset: usize, anchor: &str, fingerprint: &str) -> String {
+    use base64::Engine;
+    let raw = format!("{CURSOR_VERSION}{CURSOR_SEP}{offset}{CURSOR_SEP}{anchor}{CURSOR_SEP}{fingerprint}");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+/// Decode a cursor, rejecting anything not produced by [`encode_cursor`] for
+/// this same query.
+fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<ListCursor> {
+    use base64::Engine;
+    let bad = || {
+        ApiError::BadRequest(
+            "Invalid cursor: pass next_cursor from a previous response to the same query unchanged"
+                .to_string(),
+        )
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| bad())?;
+    let text = String::from_utf8(bytes).map_err(|_| bad())?;
+    let mut parts = text.splitn(4, CURSOR_SEP);
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(CURSOR_VERSION), Some(offset), Some(anchor), Some(fp)) if fp == fingerprint => {
+            Ok(ListCursor {
+                offset: offset.parse().map_err(|_| bad())?,
+                anchor: anchor.to_string(),
+            })
+        }
+        _ => Err(bad()),
     }
 }
 
@@ -681,7 +787,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_issues",
-            description: "Find issues in the workspace with optional filters. Returns issues ordered Urgent (1), High (2), Medium (3), Low (4), None (0), then by creation date (newest first), before the result limit is applied. Priority numbers are stored identifiers, not ascending rank. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Response shape: a flat array without composable filters; with composable filters, `{issues, matched_count, returned_count, truncated}`. Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
+            description: "Find issues in the workspace with optional filters. Returns `{issues, total, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false; each matching issue appears exactly once. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues",
@@ -697,7 +803,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "search_issues",
-            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total}` where results are ranked by relevance with snippet context, and total is the full match count for pagination. Supports `offset` for pagination. By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.",
+            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of matches ignoring limit/offset; when `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. A search considers at most its 1000 best-ranked matches: when `truncated` is true, `total` is a lower bound and lower-ranked matches cannot be reached by paging, so narrow the query (team, include_closed, include_comments). By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues/search",
@@ -873,6 +979,9 @@ mod tests {
             search: None,
             limit: Some(50),
             filters: filters.map(str::to_string),
+            cursor: None,
+            sort_by: None,
+            sort_dir: None,
         }
     }
 
@@ -906,9 +1015,9 @@ mod tests {
         }
     }
 
-    /// The no-clauses path returns a flat array of lean rows.
+    /// The no-clauses path returns an envelope of lean rows.
     #[tokio::test]
-    async fn flat_array_path_returns_lean_rows() {
+    async fn unfiltered_path_returns_lean_rows() {
         let (db, workspace_id, user_id) = seeded_workspace(3).await;
         let ctx = ApiCtx::from_leptos(
             workspace_id,
@@ -924,8 +1033,15 @@ mod tests {
             .await
             .expect("list_issues should succeed");
 
-        let rows = value.as_array().expect("no-clauses path returns an array");
+        let rows = value["issues"].as_array().expect("envelope carries issues");
         assert_eq!(rows.len(), 3);
+        assert_eq!(value["total"], 3);
+        assert_eq!(value["has_more"], false);
+        assert!(value["next_cursor"].is_null());
+        assert!(
+            rows.iter().all(|r| r["created_at"].as_str().is_some_and(|c| !c.is_empty())),
+            "every row carries created_at"
+        );
         assert_rows_are_lean(rows);
     }
 
@@ -965,7 +1081,7 @@ mod tests {
     /// TRA-10096: stored priority zero must rank last before either response
     /// path applies its limit. Fixed timestamps also exercise newest-first ties.
     #[tokio::test]
-    async fn priority_order_precedes_limit_for_flat_and_filtered_responses() {
+    async fn priority_order_precedes_limit_for_unfiltered_and_filtered_responses() {
         let (db, workspace_id, user_id) = seeded_workspace(7).await;
         // Number 7 is the newest None; it must not displace assigned priorities.
         for (number, priority, created_at) in [
@@ -1006,11 +1122,7 @@ mod tests {
                 // Also exercise the SQL search filter without changing the matches.
                 params.search = Some("Seeded issue".to_string());
                 let value = list_issues(&ctx, params).await.expect("list ranked issues");
-                let rows = if clauses.is_some() {
-                    value["issues"].as_array().expect("filtered envelope rows")
-                } else {
-                    value.as_array().expect("flat response rows")
-                };
+                let rows = value["issues"].as_array().expect("envelope rows");
                 assert_eq!(
                     rows.iter()
                         .map(|row| row["number"].as_i64().expect("issue number"))
@@ -1030,6 +1142,343 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// TRA-10113 (reproduction): 260 matching issues, one request at the max
+    /// limit. A capped response must say so — `total` and `has_more` — instead
+    /// of looking like a complete list.
+    #[tokio::test]
+    async fn capped_page_reports_total_and_has_more() {
+        let (db, workspace_id, user_id) = seeded_workspace(260).await;
+        let ctx = ApiCtx::from_leptos(
+            workspace_id,
+            user_id,
+            &db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        );
+        let mut params = list_params(None);
+        params.limit = Some(100);
+        let value = list_issues(&ctx, params).await.expect("list capped page");
+        assert_eq!(value["total"], 260, "total must ignore the limit: {value}");
+        assert_eq!(value["has_more"], true);
+        assert_eq!(value["issues"].as_array().expect("issues").len(), 100);
+    }
+
+    fn test_ctx<'a>(db: &'a DbPool, workspace_id: &str, user_id: &str) -> ApiCtx<'a> {
+        ApiCtx::from_leptos(
+            workspace_id.to_string(),
+            user_id.to_string(),
+            db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        )
+    }
+
+    /// Walk every page of `params`, returning the page count and every row in
+    /// the order served. Asserts the paging contract on each page.
+    async fn walk_pages(
+        ctx: &ApiCtx<'_>,
+        base: ListIssuesApiParams,
+        expected_total: usize,
+    ) -> (usize, Vec<serde_json::Value>) {
+        let mut rows = Vec::new();
+        let mut pages = 0;
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = base.clone();
+            params.cursor = cursor.clone();
+            let value = list_issues(ctx, params).await.expect("list a page");
+            pages += 1;
+            assert_eq!(value["total"], expected_total, "total on page {pages}");
+            let page = value["issues"].as_array().expect("issues").clone();
+            assert_eq!(value["returned_count"], page.len());
+            rows.extend(page);
+            if value["has_more"] == true {
+                assert_eq!(value["truncated"], true);
+                cursor = Some(
+                    value["next_cursor"]
+                        .as_str()
+                        .expect("has_more implies next_cursor")
+                        .to_string(),
+                );
+            } else {
+                assert!(value["next_cursor"].is_null(), "no cursor on the last page");
+                break;
+            }
+            assert!(pages < 50, "paging must terminate");
+        }
+        (pages, rows)
+    }
+
+    /// TRA-10113 acceptance: 260 issues, every sort, walking cursors returns
+    /// each issue exactly once, in the requested order, with created_at.
+    #[tokio::test]
+    async fn walking_cursors_returns_every_issue_once_in_sort_order() {
+        const COUNT: usize = 260;
+        let (db, workspace_id, user_id) = seeded_workspace(COUNT as i32).await;
+        // Spread priorities and timestamps; leave plenty of ties.
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET priority = number % 5, \
+             created_at = '2026-07-01 00:00:' || substr('0' || ((number / 7) % 60), -2), \
+             updated_at = '2026-08-01 00:00:' || substr('0' || ((number / 11) % 60), -2) \
+             WHERE workspace_id = $1",
+            &workspace_id
+        )
+        .expect("spread fixture priorities and timestamps");
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+
+        for (sort_by, sort_dir) in [
+            (None, None),
+            (Some("priority"), Some("desc")),
+            (Some("created_at"), None),
+            (Some("created_at"), Some("asc")),
+            (Some("updated_at"), Some("desc")),
+            (Some("number"), Some("asc")),
+            (Some("number"), None),
+        ] {
+            let mut params = list_params(None);
+            params.limit = Some(100);
+            params.sort_by = sort_by.map(str::to_string);
+            params.sort_dir = sort_dir.map(str::to_string);
+            let (pages, rows) = walk_pages(&ctx, params, COUNT).await;
+            assert_eq!(pages, 3, "260 rows at 100 per page ({sort_by:?} {sort_dir:?})");
+            assert_eq!(rows.len(), COUNT);
+            let mut numbers: Vec<i64> = rows
+                .iter()
+                .map(|r| r["number"].as_i64().expect("number"))
+                .collect();
+            numbers.sort_unstable();
+            assert_eq!(numbers, (1..=COUNT as i64).collect::<Vec<_>>(), "each exactly once");
+            assert!(rows.iter().all(|r| r["created_at"].as_str().is_some_and(|c| !c.is_empty())));
+
+            let key = |r: &serde_json::Value| -> String {
+                match sort_by {
+                    Some("created_at") => r["created_at"].as_str().expect("created_at").to_string(),
+                    Some("updated_at") => r["updated_at"].as_str().expect("updated_at").to_string(),
+                    Some("number") => format!("{:08}", r["number"].as_i64().expect("number")),
+                    _ => {
+                        let p = r["priority"].as_i64().expect("priority");
+                        format!("{}", if p == 0 { 5 } else { p })
+                    }
+                }
+            };
+            let descending = match (sort_by, sort_dir) {
+                (_, Some("desc")) => true,
+                (_, Some(_)) => false,
+                (None | Some("priority"), None) => false,
+                _ => true,
+            };
+            for pair in rows.windows(2) {
+                let (a, b) = (key(&pair[0]), key(&pair[1]));
+                assert!(
+                    if descending { a >= b } else { a <= b },
+                    "rows out of order for {sort_by:?} {sort_dir:?}: {a} then {b}"
+                );
+            }
+        }
+
+        // Ties are deterministic: two independent walks agree exactly.
+        let mut params = list_params(None);
+        params.limit = Some(100);
+        params.sort_by = Some("created_at".to_string());
+        let (_, first) = walk_pages(&ctx, params.clone(), COUNT).await;
+        let (_, second) = walk_pages(&ctx, params, COUNT).await;
+        assert_eq!(first, second);
+    }
+
+    /// Paging composes with filter clauses: `total` counts post-clause matches
+    /// and no match is lost to the old 5x prefetch window.
+    #[tokio::test]
+    async fn pagination_composes_with_filter_clauses() {
+        let (db, workspace_id, user_id) = seeded_workspace(260).await;
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET priority = CASE WHEN number <= 230 THEN 4 ELSE 2 END WHERE workspace_id = $1",
+            &workspace_id
+        )
+        .expect("set priorities");
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut params = list_params(Some(
+            r#"[{"field":"priority","operator":"any_of","values":["4"]}]"#,
+        ));
+        params.limit = Some(10);
+        let (pages, rows) = walk_pages(&ctx, params, 230).await;
+        assert_eq!(pages, 23);
+        assert_eq!(rows.len(), 230);
+    }
+
+    #[tokio::test]
+    async fn invalid_sort_and_cursor_are_rejected() {
+        let (db, workspace_id, user_id) = seeded_workspace(5).await;
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+
+        for mutate in [
+            (|p: &mut ListIssuesApiParams| p.sort_by = Some("title".to_string())) as fn(&mut _),
+            |p| p.sort_dir = Some("sideways".to_string()),
+            |p| p.cursor = Some("not-a-cursor".to_string()),
+        ] {
+            let mut params = list_params(None);
+            mutate(&mut params);
+            assert!(matches!(
+                list_issues(&ctx, params).await,
+                Err(ApiError::BadRequest(_))
+            ));
+        }
+
+        // A cursor from one query is refused by a different query.
+        let mut first = list_params(None);
+        first.limit = Some(2);
+        let page = list_issues(&ctx, first).await.expect("first page");
+        let mut other = list_params(None);
+        other.limit = Some(2);
+        other.sort_by = Some("number".to_string());
+        other.cursor = Some(page["next_cursor"].as_str().expect("cursor").to_string());
+        assert!(matches!(
+            list_issues(&ctx, other).await,
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    /// A cursor survives an insert and a delete between pages: no row is
+    /// repeated and the rows not yet seen are still served.
+    #[tokio::test]
+    async fn cursor_resumes_after_anchor_when_rows_change_between_pages() {
+        let (db, workspace_id, user_id) = seeded_workspace(10).await;
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut params = list_params(None);
+        params.limit = Some(4);
+        params.sort_by = Some("number".to_string());
+        params.sort_dir = Some("asc".to_string());
+        let first = list_issues(&ctx, params.clone()).await.expect("page 1");
+        let seen: Vec<i64> = first["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .map(|r| r["number"].as_i64().expect("number"))
+            .collect();
+        assert_eq!(seen, vec![1, 2, 3, 4]);
+
+        // Delete an already-served row: offset alone would skip number 5.
+        trakkt_core::db_execute!(
+            &db,
+            "DELETE FROM issues WHERE workspace_id = $1 AND number = 1",
+            &workspace_id
+        )
+        .expect("delete a served row");
+        params.cursor = first["next_cursor"].as_str().map(str::to_string);
+        let second = list_issues(&ctx, params).await.expect("page 2");
+        let numbers: Vec<i64> = second["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .map(|r| r["number"].as_i64().expect("number"))
+            .collect();
+        assert_eq!(numbers, vec![5, 6, 7, 8]);
+    }
+
+    /// TRA-10113 audit: `search_issues` pages with has_more / next_offset and
+    /// every match is reachable exactly once.
+    #[tokio::test]
+    async fn search_issues_reports_has_more_and_walks_every_match() {
+        let (db, workspace_id, user_id) = seeded_workspace(35).await;
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut offset = 0;
+        let mut seen = std::collections::HashSet::new();
+        let mut pages = 0;
+        loop {
+            let value = search_issues(
+                &ctx,
+                SearchIssuesApiParams {
+                    query: "Seeded".to_string(),
+                    team_key: None,
+                    team_id: None,
+                    include_closed: None,
+                    include_archived: None,
+                    include_comments: Some(false),
+                    limit: Some(10),
+                    offset: Some(offset),
+                },
+            )
+            .await
+            .expect("search a page");
+            pages += 1;
+            assert_eq!(value["total"], 35);
+            assert_eq!(value["truncated"], false);
+            for r in value["results"].as_array().expect("results") {
+                assert!(seen.insert(r["issue_id"].as_str().expect("issue_id").to_string()));
+            }
+            if value["has_more"] == true {
+                offset = value["next_offset"].as_i64().expect("next_offset when has_more");
+            } else {
+                assert!(value["next_offset"].is_null());
+                break;
+            }
+        }
+        assert_eq!((pages, seen.len()), (4, 35));
+    }
+
+    /// TRA-10113 audit: workspace activities answer has_more from the data,
+    /// not from the page being full, and page without gaps or repeats.
+    #[tokio::test]
+    async fn workspace_activities_report_has_more_and_page_stably() {
+        let (db, workspace_id, user_id) = seeded_workspace(1).await;
+        let issue = issue_service::get_issue(&db, &workspace_id, "TRK", 1)
+            .await
+            .expect("load issue")
+            .expect("seeded issue exists");
+        let recorder = ActivityRecorder::new(
+            &db,
+            &workspace_id,
+            &user_id,
+            trakkt_types::enums::ActionSource::Api,
+            None,
+            None,
+        );
+        for _ in 0..25 {
+            recorder
+                .record(&issue.issue_id, "comment_added", None)
+                .await
+                .expect("record activity");
+        }
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+
+        let mut offset = 0;
+        let mut ids = Vec::new();
+        loop {
+            let value = crate::activities::list_workspace_activities(
+                &ctx,
+                trakkt_types::api::ListWorkspaceActivitiesApiParams {
+                    team_key: None,
+                    action_type: Some("comment_added".to_string()),
+                    actor_id: None,
+                    action_source: None,
+                    created_after: None,
+                    created_before: None,
+                    limit: Some(10),
+                    offset: Some(offset),
+                },
+            )
+            .await
+            .expect("list a page");
+            for a in value["activities"].as_array().expect("activities") {
+                ids.push(a["activity_id"].as_str().expect("activity_id").to_string());
+            }
+            if value["has_more"] == true {
+                offset = value["next_offset"].as_i64().expect("next_offset");
+            } else {
+                // A last page that is exactly full must still say it is the end.
+                assert!(value["next_offset"].is_null());
+                break;
+            }
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!((ids.len(), unique.len()), (25, 25));
     }
 
     /// TRA-9915: a full page of spec-sized issues used to serialize to ~226 KB
@@ -1091,7 +1540,10 @@ mod tests {
             .expect("full issues should serialize")
             .len();
 
-        assert_eq!(value.as_array().expect("array").len(), PAGE_SIZE as usize);
+        assert_eq!(
+            value["issues"].as_array().expect("issues").len(),
+            PAGE_SIZE as usize
+        );
         assert!(
             response_bytes < MAX_RESPONSE_BYTES,
             "a {PAGE_SIZE}-issue page must serialize under {MAX_RESPONSE_BYTES} bytes; \

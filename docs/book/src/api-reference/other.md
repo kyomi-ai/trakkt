@@ -113,7 +113,7 @@ Returns `200 OK` on success with the result as JSON.
 
 **Operation:** `list_unreleased_issues`
 
-List issues that are completed/cancelled but not yet included in any release (completed_at IS NOT NULL, released_at IS NULL).
+List issues that are completed/cancelled but not yet included in any release (completed_at IS NOT NULL, released_at IS NULL). Returns every matching issue as a flat array, most recently completed first; there is no limit or truncation, so the array is always the complete set.
 
 **Scope:** `issues:read`
 
@@ -135,3 +135,4 @@ curl "https://your-trakkt-instance.com/api/v1/unreleased-issues" \
 Returns `200 OK` on success with the result as JSON.
 
 ---
+

@@ -8,8 +8,8 @@ See the [Issues API Reference](../api-reference/issues.md) for parameter details
 
 | Tool | Description | Scope |
 |------|-------------|-------|
-| `list_issues` | Find issues with optional filters. Ordered by priority (urgent first), then creation date. Excludes completed/cancelled by default -- pass `include_closed=true` to include them. Rows are lean: `number`, `key`, `title`, `priority`, `status_id`, `status_name`, `updated_at`, `labels` (id and name only). Never includes descriptions, comments, or activities -- call `get_issue` to read a ticket. | `issues:read` |
-| `search_issues` | Full-text search across titles, descriptions, and comments. Returns ranked results with snippet context. | `issues:read` |
+| `list_issues` | Find issues with optional filters. Returns `{issues, total, has_more, next_cursor, ...}`: `total` is the exact match count, and the list is complete only when `has_more` is false -- otherwise pass `next_cursor` as `cursor` to get the next page (page size `limit`: default 50, max 100). Sort with `sort_by` (`priority` default, `created_at`, `updated_at`, `number`) and `sort_dir` (`asc`/`desc`); ties break deterministically. Excludes completed/cancelled by default -- pass `include_closed=true` to include them. Rows are lean: `number`, `key`, `title`, `priority`, `status_id`, `status_name`, `created_at`, `updated_at`, `labels` (id and name only). Never includes descriptions, comments, or activities -- call `get_issue` to read a ticket. | `issues:read` |
+| `search_issues` | Full-text search across titles, descriptions, and comments. Returns ranked results with snippet context plus `total`, `has_more`, `next_offset` and `truncated` (a search considers its 1000 best matches; when `truncated` is true narrow the query). Page with `limit` (default 20, max 100) and `offset`. | `issues:read` |
 | `get_issue` | Read a single issue in full by identifier (e.g., `ENG-42`): description, comments, activity log, and relations. This is the way to read a ticket's content -- `list_issues` deliberately omits it. | `issues:read` |
 | `create_issue` | Create a new issue. Specify `team_key` (e.g., `"ENG"`) or `team_id` to assign to a team. Starts in backlog status. | `issues:write` |
 | `update_issue` | Update an existing issue. Only provided fields change; omit a field to leave it unchanged, set to `null` to clear it. | `issues:write` |
@@ -110,7 +110,7 @@ See the [Activities API Reference](../api-reference/activities.md) for parameter
 | Tool | Description | Scope |
 |------|-------------|-------|
 | `list_issue_activities` | List all activity entries for an issue, ordered chronologically. | `issues:read` |
-| `list_workspace_activities` | List activity entries across all teams, ordered by most recent first. | `issues:read` |
+| `list_workspace_activities` | List activity entries across all teams, most recent first. Returns `{activities, limit, offset, has_more, next_offset}`; repeat with `offset` = `next_offset` while `has_more` is true (`limit` default 50, max 200). | `issues:read` |
 
 ## GitHub (3 tools)
 

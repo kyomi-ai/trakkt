@@ -4,7 +4,7 @@
 
 **Operation:** `list_workspace_activities`
 
-List activity entries across all teams in the workspace, ordered by most recent first.
+List activity entries across all teams in the workspace, most recent first (ties broken by activity id so pages are stable). Returns `{activities, limit, offset, has_more, next_offset}`. `limit` is the page size (default 50, max 200, clamped; the applied value is echoed). A response is complete only when `has_more` is false; otherwise repeat the request with `offset` set to `next_offset`.
 
 **Scope:** `issues:read`
 
@@ -17,8 +17,8 @@ List activity entries across all teams in the workspace, ordered by most recent 
 | `actor_id` | query | string (nullable) | No | Filter by actor user ID |
 | `created_after` | query | string (nullable) | No | Filter to activities created at or after this ISO 8601 datetime |
 | `created_before` | query | string (nullable) | No | Filter to activities created at or before this ISO 8601 datetime |
-| `limit` | query | integer (int64) (nullable) | No | Maximum number of activities to return (default: 50, max: 200) |
-| `offset` | query | integer (int64) (nullable) | No | Offset for pagination |
+| `limit` | query | integer (int64) (nullable) | No | Page size (default: 50, max: 200; values outside 1..=200 are clamped) |
+| `offset` | query | integer (int64) (nullable) | No | Offset of the first activity (default: 0). When the response has `has_more`, repeat the request with `offset` = `next_offset`. |
 | `team_key` | query | string (nullable) | No | Filter by team key (e.g. "TRA") |
 
 ### Example

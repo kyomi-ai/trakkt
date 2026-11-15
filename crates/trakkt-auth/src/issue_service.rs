@@ -593,6 +593,128 @@ pub async fn list_issues(
     team_id: Option<&str>,
     filters: &IssueFilters,
 ) -> trakkt_core::Result<Vec<IssueWithDetails>> {
+    list_issues_sorted(db, workspace_id, team_id, filters, IssueSort::default()).await
+}
+
+/// Field a list of issues can be ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSortField {
+    /// Urgent, High, Medium, Low, then None (stored 0 ranks last).
+    Priority,
+    CreatedAt,
+    UpdatedAt,
+    Number,
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl IssueSortField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::CreatedAt => "created_at",
+            Self::UpdatedAt => "updated_at",
+            Self::Number => "number",
+        }
+    }
+
+    /// Parse a caller-supplied field name; `None` for an unknown name.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "priority" => Some(Self::Priority),
+            "created_at" => Some(Self::CreatedAt),
+            "updated_at" => Some(Self::UpdatedAt),
+            "number" => Some(Self::Number),
+            _ => None,
+        }
+    }
+
+    /// Direction used when the caller does not pick one: Urgent first for
+    /// priority, newest first for everything else.
+    pub fn default_dir(self) -> SortDir {
+        match self {
+            Self::Priority => SortDir::Asc,
+            _ => SortDir::Desc,
+        }
+    }
+}
+
+impl SortDir {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "asc" => Some(Self::Asc),
+            "desc" => Some(Self::Desc),
+            _ => None,
+        }
+    }
+
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
+    }
+}
+
+/// A complete, deterministic ordering for [`list_issues_sorted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssueSort {
+    pub field: IssueSortField,
+    pub dir: SortDir,
+}
+
+impl Default for IssueSort {
+    /// Priority rank ascending, newest first within a rank.
+    fn default() -> Self {
+        Self {
+            field: IssueSortField::Priority,
+            dir: IssueSortField::Priority.default_dir(),
+        }
+    }
+}
+
+impl IssueSort {
+    /// `ORDER BY` body. Every ordering ends in `i.issue_id`, which is unique,
+    /// so equal sort keys (second-granularity timestamps, equal numbers in
+    /// different teams) can never reorder between calls.
+    fn order_by_sql(self) -> String {
+        let d = self.dir.sql();
+        match self.field {
+            IssueSortField::Priority => format!(
+                "CASE i.priority WHEN 0 THEN 5 ELSE i.priority END {d}, \
+                 i.created_at DESC, i.number DESC, i.issue_id ASC"
+            ),
+            IssueSortField::CreatedAt => {
+                format!("i.created_at {d}, i.number {d}, i.issue_id ASC")
+            }
+            IssueSortField::UpdatedAt => {
+                format!("i.updated_at {d}, i.number {d}, i.issue_id ASC")
+            }
+            IssueSortField::Number => format!("i.number {d}, t.key ASC, i.issue_id ASC"),
+        }
+    }
+}
+
+/// [`list_issues`] with an explicit ordering.
+pub async fn list_issues_sorted(
+    db: &DbPool,
+    workspace_id: &str,
+    team_id: Option<&str>,
+    filters: &IssueFilters,
+    sort: IssueSort,
+) -> trakkt_core::Result<Vec<IssueWithDetails>> {
     let is_pg = db.is_postgres();
 
     // Dynamic WHERE clause construction.
@@ -684,8 +806,8 @@ pub async fn list_issues(
     let sql = format!(
         "{ISSUE_DETAIL_SELECT} \
          WHERE {where_clause} \
-         ORDER BY CASE i.priority WHEN 0 THEN 5 ELSE i.priority END ASC, \
-         i.created_at DESC{limit_offset}"
+         ORDER BY {order_by}{limit_offset}",
+        order_by = sort.order_by_sql(),
     );
 
     // Prepare the search term with wildcards, escaping LIKE special chars.

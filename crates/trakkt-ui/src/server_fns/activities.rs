@@ -56,8 +56,14 @@ pub async fn list_workspace_activities(
         limit,
         offset,
     };
-    let result = trakkt_api::activities::list_workspace_activities(&ctx, params)
+    let mut result = trakkt_api::activities::list_workspace_activities(&ctx, params)
         .await
         .into_sfn()?;
-    serde_json::from_value(result).into_sfn()
+    // The API answers `{activities, has_more, ...}`. This server fn keeps its
+    // plain-list signature; the page infers "load more" from the page length.
+    let activities = result
+        .get_mut("activities")
+        .map(serde_json::Value::take)
+        .ok_or_else(|| ServerFnError::new("workspace activities response had no `activities`"))?;
+    serde_json::from_value(activities).into_sfn()
 }
