@@ -10,7 +10,7 @@ use axum::http::Method;
 use serde_json::json;
 
 use trakkt_auth::activity_service::{ActivityRecorder, IssueSnapshot};
-use trakkt_auth::issue_service::{IssueSort, IssueSortField, SortDir};
+use trakkt_auth::issue_service::{IssueSort, IssueSortField, IssueSortKey, SortDir};
 use trakkt_auth::{
     activity_service, comment_service, issue_service, relation_service, search_service,
     team_service,
@@ -118,8 +118,7 @@ pub async fn list_issues(
     ctx: &ApiCtx<'_>,
     params: ListIssuesApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let limit_raw = params.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-    let limit = limit_raw.clamp(1, MAX_LIST_LIMIT);
+    let limit = clamp_limit(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
 
     let sort_field = match params.sort_by.as_deref() {
         None | Some("") => IssueSortField::Priority,
@@ -232,14 +231,15 @@ pub async fn list_issues(
     }
 
     let total = issues.len();
-    // Resume after the last row the caller saw. If that issue is gone or no
-    // longer matches, fall back to the position the cursor recorded.
+    // Resume strictly after the last row the caller saw, by sort key rather
+    // than position: the anchor may since have been deleted, filtered out or
+    // edited, and rows already served still sort before the key.
     let start = match &cursor {
         None => 0,
         Some(c) => issues
             .iter()
-            .position(|i| i.issue_id == c.anchor)
-            .map_or(c.offset.min(total), |p| p + 1),
+            .position(|i| sort.compare(&IssueSortKey::from(i), c) == std::cmp::Ordering::Greater)
+            .unwrap_or(total),
     };
     let end = start.saturating_add(limit as usize).min(total);
     let has_more = end < total;
@@ -248,7 +248,7 @@ pub async fn list_issues(
     let next_cursor = if has_more {
         issues
             .get(end - 1)
-            .map(|last| encode_cursor(end, &last.issue_id, &fingerprint))
+            .map(|last| encode_cursor(&IssueSortKey::from(last), &fingerprint))
     } else {
         None
     };
@@ -279,26 +279,36 @@ pub async fn list_issues(
 const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 100;
 
-/// What an opaque `list_issues` cursor carries.
-struct ListCursor {
-    /// Number of rows already returned.
-    offset: usize,
-    /// `issue_id` of the last row returned.
-    anchor: String,
+/// Page size for a list operation: the default when unset, else clamped to
+/// `1..=max`.
+pub(crate) fn clamp_limit(raw: Option<i64>, default: i64, max: i64) -> i64 {
+    raw.unwrap_or(default).clamp(1, max)
 }
 
-const CURSOR_VERSION: &str = "v1";
+const CURSOR_VERSION: &str = "v2";
 const CURSOR_SEP: char = '\u{1e}';
 
-fn encode_cursor(offset: usize, anchor: &str, fingerprint: &str) -> String {
+/// An opaque cursor is the sort key of the last row served plus the query
+/// fingerprint it is valid for.
+fn encode_cursor(key: &IssueSortKey, fingerprint: &str) -> String {
     use base64::Engine;
-    let raw = format!("{CURSOR_VERSION}{CURSOR_SEP}{offset}{CURSOR_SEP}{anchor}{CURSOR_SEP}{fingerprint}");
+    let raw = [
+        CURSOR_VERSION,
+        &key.priority.to_string(),
+        &key.created_at,
+        &key.updated_at,
+        &key.number.to_string(),
+        &key.team_key,
+        &key.issue_id,
+        fingerprint,
+    ]
+    .join(&CURSOR_SEP.to_string());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
 /// Decode a cursor, rejecting anything not produced by [`encode_cursor`] for
 /// this same query.
-fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<ListCursor> {
+fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<IssueSortKey> {
     use base64::Engine;
     let bad = || {
         ApiError::BadRequest(
@@ -310,12 +320,18 @@ fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<ListCursor> {
         .decode(cursor)
         .map_err(|_| bad())?;
     let text = String::from_utf8(bytes).map_err(|_| bad())?;
-    let mut parts = text.splitn(4, CURSOR_SEP);
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(CURSOR_VERSION), Some(offset), Some(anchor), Some(fp)) if fp == fingerprint => {
-            Ok(ListCursor {
-                offset: offset.parse().map_err(|_| bad())?,
-                anchor: anchor.to_string(),
+    let parts: Vec<&str> = text.splitn(8, CURSOR_SEP).collect();
+    match parts.as_slice() {
+        [CURSOR_VERSION, priority, created_at, updated_at, number, team_key, issue_id, fp]
+            if *fp == fingerprint =>
+        {
+            Ok(IssueSortKey {
+                priority: priority.parse().map_err(|_| bad())?,
+                created_at: created_at.to_string(),
+                updated_at: updated_at.to_string(),
+                number: number.parse().map_err(|_| bad())?,
+                team_key: team_key.to_string(),
+                issue_id: issue_id.to_string(),
             })
         }
         _ => Err(bad()),
@@ -752,8 +768,7 @@ pub async fn search_issues(
     ctx: &ApiCtx<'_>,
     params: SearchIssuesApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let limit_raw = params.limit.unwrap_or(20);
-    let limit = limit_raw.clamp(1, 100);
+    let limit = clamp_limit(params.limit, 20, 100);
 
     let team_id = resolve_team(
         ctx.db,
@@ -787,7 +802,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_issues",
-            description: "Find issues in the workspace with optional filters. Returns `{issues, total, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false; each matching issue appears exactly once. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
+            description: "Find issues in the workspace with optional filters. Returns `{issues, total, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. The cursor resumes after the last row served by its sort key, so unchanged issues appear exactly once even if other issues are created, deleted or edited between pages; an issue edited so that it now sorts before the cursor (for example a `sort_by=updated_at` walk) can be missed. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues",
@@ -1479,6 +1494,102 @@ mod tests {
         }
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!((ids.len(), unique.len()), (25, 25));
+    }
+
+    /// The keyset comparator must order rows exactly as the SQL `ORDER BY`,
+    /// or a cursor would resume at the wrong place.
+    #[tokio::test]
+    async fn cursor_comparator_agrees_with_sql_order() {
+        let (db, workspace_id, _user_id) = seeded_workspace(60).await;
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET priority = number % 5, \
+             created_at = '2026-07-01 00:00:' || substr('0' || ((number / 7) % 60), -2), \
+             updated_at = '2026-08-01 00:00:' || substr('0' || ((number / 11) % 60), -2) \
+             WHERE workspace_id = $1",
+            &workspace_id
+        )
+        .expect("spread fixture");
+        let filters = IssueFilters {
+            status_id: None,
+            status_categories: None,
+            exclude_status_categories: None,
+            priority: None,
+            assignee_id: None,
+            creator_id: None,
+            label_ids: None,
+            search: None,
+            limit: None,
+            offset: None,
+            include_archived: None,
+            only_archived: None,
+        };
+        for field in [
+            IssueSortField::Priority,
+            IssueSortField::CreatedAt,
+            IssueSortField::UpdatedAt,
+            IssueSortField::Number,
+        ] {
+            for dir in [SortDir::Asc, SortDir::Desc] {
+                let sort = IssueSort { field, dir };
+                let rows = issue_service::list_issues_sorted(&db, &workspace_id, None, &filters, sort)
+                    .await
+                    .expect("list sorted");
+                assert_eq!(rows.len(), 60);
+                for pair in rows.windows(2) {
+                    assert_eq!(
+                        sort.compare(&IssueSortKey::from(&pair[0]), &IssueSortKey::from(&pair[1])),
+                        std::cmp::Ordering::Less,
+                        "SQL order and comparator disagree for {field:?} {dir:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An anchor that is edited (moving to the top of an `updated_at` walk) or
+    /// deleted along with other served rows must not replay or skip the rest.
+    #[tokio::test]
+    async fn cursor_survives_anchor_edit_and_deletions() {
+        let (db, workspace_id, user_id) = seeded_workspace(12).await;
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET updated_at = '2026-08-01 00:00:' || substr('0' || number, -2) WHERE workspace_id = $1",
+            &workspace_id
+        )
+        .expect("distinct updated_at");
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut params = list_params(None);
+        params.limit = Some(4);
+        params.sort_by = Some("updated_at".to_string());
+        params.sort_dir = Some("desc".to_string());
+        let nums = |v: &serde_json::Value| -> Vec<i64> {
+            v["issues"]
+                .as_array()
+                .expect("issues")
+                .iter()
+                .map(|r| r["number"].as_i64().expect("number"))
+                .collect()
+        };
+        let first = list_issues(&ctx, params.clone()).await.expect("page 1");
+        assert_eq!(nums(&first), vec![12, 11, 10, 9]);
+
+        // Edit the anchor (9) so it now sorts first; delete two served rows.
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET updated_at = '2026-09-01 00:00:00' WHERE workspace_id = $1 AND number = 9",
+            &workspace_id
+        )
+        .expect("edit anchor");
+        trakkt_core::db_execute!(
+            &db,
+            "DELETE FROM issues WHERE workspace_id = $1 AND number IN (11, 12)",
+            &workspace_id
+        )
+        .expect("delete served rows");
+        params.cursor = first["next_cursor"].as_str().map(str::to_string);
+        let second = list_issues(&ctx, params).await.expect("page 2");
+        assert_eq!(nums(&second), vec![8, 7, 6, 5]);
     }
 
     /// TRA-9915: a full page of spec-sized issues used to serialize to ~226 KB

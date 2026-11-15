@@ -345,7 +345,7 @@ async fn search_postgres(
     }
 
     let sql = format!(
-        "{} ORDER BY rank DESC LIMIT {} OFFSET {}",
+        "{} ORDER BY rank DESC, issue_id ASC, match_field ASC LIMIT {} OFFSET {}",
         parts.join(" UNION ALL "),
         params.limit,
         params.offset
@@ -471,7 +471,7 @@ async fn search_sqlite(
     }
 
     let sql = format!(
-        "{} ORDER BY rank DESC LIMIT {} OFFSET {}",
+        "{} ORDER BY rank DESC, issue_id ASC, match_field ASC LIMIT {} OFFSET {}",
         parts.join(" UNION ALL "),
         params.limit,
         params.offset

@@ -57,17 +57,22 @@ Errors return a JSON object with an `error` field:
 
 ## Pagination
 
-List endpoints accept `limit` and `offset` query parameters:
+Every list operation that caps its results says so in the response: a
+response is complete only when `has_more` is `false`.
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `limit` | integer | 50 | Maximum results to return (max: 100) |
-| `offset` | integer | 0 | Number of results to skip |
+| Operation | Page size (`limit`) | How to get the next page |
+|-----------|---------------------|--------------------------|
+| `GET /issues` | default 50, max 100 | pass the response's `next_cursor` as `cursor`; `total` is the exact match count; `sort_by`/`sort_dir` choose the order |
+| `GET /issues/search` | default 20, max 100 | pass `next_offset` as `offset` |
+| `GET /activities` | default 50, max 200 | pass `next_offset` as `offset` |
 
-Example:
+`limit` values outside the range are clamped, never rejected. Example:
 
 ```bash
-curl "https://your-trakkt-instance.com/api/v1/issues?limit=25&offset=50" \
+curl "https://your-trakkt-instance.com/api/v1/issues?limit=25&sort_by=created_at&sort_dir=asc" \
+  -H "Authorization: Bearer <token>"
+# then, while has_more is true:
+curl "https://your-trakkt-instance.com/api/v1/issues?limit=25&sort_by=created_at&sort_dir=asc&cursor=<next_cursor>" \
   -H "Authorization: Bearer <token>"
 ```
 
