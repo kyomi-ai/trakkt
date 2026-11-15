@@ -256,12 +256,12 @@ impl IssueLabelRow {
     }
 }
 
-/// Fetch labels for a list of issue IDs in a single query (avoids N+1).
-///
-/// Returns a map from issue_id to its labels.
 /// Issue ids per label query (see [`fetch_labels_for_issues`]).
 const LABEL_FETCH_CHUNK: usize = 500;
 
+/// Fetch labels for a list of issue IDs in a single query (avoids N+1).
+///
+/// Returns a map from issue_id to its labels.
 async fn fetch_labels_for_issues(
     db: &DbPool,
     issue_ids: &[String],
@@ -719,7 +719,9 @@ impl IssueSort {
     /// Compare two keys exactly as [`Self::order_by_sql`] orders rows, so a
     /// keyset cursor can resume "strictly after" a row that may since have
     /// been deleted or edited. Timestamps compare as text, which matches the
-    /// database order because each backend renders them in one fixed format.
+    /// database order while the session time zone is a fixed-offset one (the
+    /// deployment renders `+00`); a DST-observing Postgres `TimeZone` would
+    /// break that.
     pub fn compare(self, a: &IssueSortKey, b: &IssueSortKey) -> std::cmp::Ordering {
         let dir = |o: std::cmp::Ordering| match self.dir {
             SortDir::Asc => o,
@@ -746,20 +748,23 @@ impl IssueSort {
     /// `ORDER BY` body. Every ordering ends in `i.issue_id`, which is unique,
     /// so equal sort keys (second-granularity timestamps, equal numbers in
     /// different teams) can never reorder between calls.
-    fn order_by_sql(self) -> String {
+    fn order_by_sql(self, is_pg: bool) -> String {
         let d = self.dir.sql();
+        // `IssueSort::compare` orders these strings bytewise; Postgres would
+        // otherwise use the database collation (SQLite is already bytewise).
+        let c = if is_pg { r#" COLLATE "C""# } else { "" };
         match self.field {
             IssueSortField::Priority => format!(
                 "CASE i.priority WHEN 0 THEN 5 ELSE i.priority END {d}, \
-                 i.created_at DESC, i.number DESC, i.issue_id ASC"
+                 i.created_at DESC, i.number DESC, i.issue_id{c} ASC"
             ),
             IssueSortField::CreatedAt => {
-                format!("i.created_at {d}, i.number {d}, i.issue_id ASC")
+                format!("i.created_at {d}, i.number {d}, i.issue_id{c} ASC")
             }
             IssueSortField::UpdatedAt => {
-                format!("i.updated_at {d}, i.number {d}, i.issue_id ASC")
+                format!("i.updated_at {d}, i.number {d}, i.issue_id{c} ASC")
             }
-            IssueSortField::Number => format!("i.number {d}, t.key ASC, i.issue_id ASC"),
+            IssueSortField::Number => format!("i.number {d}, t.key{c} ASC, i.issue_id{c} ASC"),
         }
     }
 }
@@ -886,7 +891,7 @@ async fn list_issues_ordered(
         "{select} \
          WHERE {where_clause} \
          ORDER BY {order_by}{limit_offset}",
-        order_by = sort.order_by_sql(),
+        order_by = sort.order_by_sql(is_pg),
     );
 
     // Prepare the search term with wildcards, escaping LIKE special chars.

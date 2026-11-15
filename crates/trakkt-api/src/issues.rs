@@ -1536,6 +1536,10 @@ mod tests {
                     .await
                     .expect("list sorted");
                 assert_eq!(rows.len(), 60);
+                assert!(
+                    rows.iter().all(|r| r.description.is_none()),
+                    "list_issues_sorted must not load descriptions"
+                );
                 for pair in rows.windows(2) {
                     assert_eq!(
                         sort.compare(&IssueSortKey::from(&pair[0]), &IssueSortKey::from(&pair[1])),
@@ -1545,6 +1549,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The unsorted service list keeps loading descriptions (UI and sync use it).
+    #[tokio::test]
+    async fn service_list_issues_still_loads_descriptions() {
+        let (db, workspace_id, _user_id) = seeded_workspace(2).await;
+        let rows = issue_service::list_issues(
+            &db,
+            &workspace_id,
+            None,
+            &IssueFilters {
+                status_id: None,
+                status_categories: None,
+                exclude_status_categories: None,
+                priority: None,
+                assignee_id: None,
+                creator_id: None,
+                label_ids: None,
+                search: None,
+                limit: None,
+                offset: None,
+                include_archived: None,
+                only_archived: None,
+            },
+        )
+        .await
+        .expect("list");
+        assert!(rows.iter().all(|r| r.description.is_some()));
     }
 
     /// An anchor that is edited (moving to the top of an `updated_at` walk) or
