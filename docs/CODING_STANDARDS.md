@@ -156,10 +156,14 @@ about the Postgres arms in general. It is not one. It says the server dialect
 and GitHub authorization bodies ran, and nothing about the arms they do not reach.
 
 As of TRA-10001 the file holds 25 `dual_backend_test!` bodies — 50 tests, one
-pair each — plus three Postgres-only tests that need both backends open at once
-and one SQLite-only test about SQLite's rowid rule. What those bodies execute:
+pair each — plus three Postgres-only tests that need both backends open at once,
+two Postgres-only tests that need overlapping transactions (SQLite's pool is one
+connection, so it cannot overlap them), and one SQLite-only test about SQLite's
+rowid rule. What those bodies execute:
 
 - the six `tx_*` macros, and `write_sync_entry_in_tx`'s `RETURNING sync_id`;
+- that `sync_id` order is commit order under concurrent writers, so a delta
+  client's cursor can never step over an entry that commits later;
 - the rollback contract, in all three of its shapes — a mutation's first entry
   rejected, an entry rejected after an earlier one was accepted, and an entry
   rejected after the statement has already fired `ON DELETE CASCADE`;
