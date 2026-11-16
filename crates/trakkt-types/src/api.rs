@@ -60,8 +60,9 @@ pub struct ListIssuesApiParams {
 /// A single composable filter clause: a `(field, operator, values)` triple.
 ///
 /// One (field, operator, values) triple of the shared issue filter model.
-/// `list_issues` and search compile the same clauses to SQL, and the UI
-/// applies them with [`FilterClause::matches`]. Boolean fields (e.g.
+/// Search compiles the clauses to SQL (`trakkt_auth::filter_sql`), `list_issues`
+/// and the issue list apply them with [`FilterClause::matches`], and the two
+/// are held together by a dual-backend parity test. Boolean fields (e.g.
 /// `is_sub_issue`) ignore `values` — the operator alone determines the match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FilterClause {
@@ -87,12 +88,42 @@ pub const BOOLEAN_FILTER_FIELDS: &[&str] = &[
 impl FilterClause {
     /// Parse the `filters` parameter shared by `list_issues`, `search_issues`
     /// and the UI server function: a JSON array of clauses, or an empty list
-    /// for absent/blank input.
+    /// when the parameter is absent or the empty string.
     pub fn parse_list(raw: Option<&str>) -> Result<Vec<FilterClause>, serde_json::Error> {
         match raw {
             Some(s) if !s.is_empty() => serde_json::from_str(s),
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Whether this (field, operator) pair is one the shared model implements.
+    /// Unknown pairs pass everything in [`FilterClause::matches`] and compile
+    /// to no condition, so nothing should claim they filter.
+    pub fn supported(&self) -> bool {
+        matches!(
+            (self.field.as_str(), self.operator.as_str()),
+            ("status" | "priority" | "project" | "issue_id", "any_of" | "none_of")
+                | ("label", "any_of" | "none_of" | "all_of" | "not_any_of" | "not_all_of")
+                | (
+                    "is_sub_issue" | "is_parent" | "is_blocked" | "is_blocking" | "has_relations",
+                    "any_of" | "none_of"
+                )
+        )
+    }
+
+    /// Whether this clause actually restricts anything — the rule
+    /// [`FilterClause::matches`] and the SQL translation both implement.
+    /// Non-boolean clauses with no values and unknown field/operator pairs
+    /// constrain nothing; an empty `issue_id any_of` ("no starred issues")
+    /// restricts to nothing, and therefore does.
+    pub fn is_effective(&self) -> bool {
+        if !self.supported() {
+            return false;
+        }
+        if BOOLEAN_FILTER_FIELDS.contains(&self.field.as_str()) {
+            return true;
+        }
+        !self.values.is_empty() || (self.field == "issue_id" && self.operator == "any_of")
     }
 
     /// Whether `issue` passes this clause.

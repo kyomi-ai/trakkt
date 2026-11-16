@@ -147,6 +147,13 @@ impl SearchParams {
         if self.exclude_archived {
             conditions.push("i.archived_at IS NULL".to_string());
         }
+        // Placeholders and bound values must stay in step; conditions may add
+        // no binds (team, exclusions, boolean clauses, match-none).
+        debug_assert_eq!(
+            next,
+            3 + usize::from(self.team_id.is_some()) + args.len(),
+            "filter plan placeholders and bound values disagree"
+        );
         FilterPlan {
             conditions,
             args,
@@ -217,7 +224,6 @@ pub async fn search(
     // The SQL already keeps one best-ranked row per issue (identifier matches
     // rank 2.0 so they win over tsvector / LIKE matches), so the cap counts
     // distinct issues and comment rows cannot crowd out other hits.
-    debug_assert!(plan.conditions.len() + 2 <= plan.next_param);
     let all_results: Vec<SearchResult> = rows.into_iter().map(SearchResult::from).collect();
 
     let total = all_results.len() as i64;

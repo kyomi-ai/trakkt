@@ -4263,6 +4263,22 @@ dual_backend_test! {
         let ident_excluded = search(db, &p).await.expect("identifier excluded by filter");
         assert!(hit_numbers(&ident_excluded).is_empty());
 
+        // Filters that add conditions but no bind values (both exclusion flags,
+        // a boolean clause, an empty Starred set) must still execute.
+        let mut p = base("Zebra");
+        p.exclude_closed = true;
+        p.exclude_archived = true;
+        let no_binds = search(db, &p).await.expect("no-bind conditions");
+        assert_eq!(hit_numbers(&no_binds), vec![dia(1)]);
+        let mut p = base("Zebra");
+        p.clauses = vec![clause("is_blocked", "none_of", &[])];
+        let boolean_only = search(db, &p).await.expect("boolean clause with no binds");
+        assert_eq!(hit_numbers(&boolean_only), vec![dia(1), dia(2), dia(3), dia(4), oth(1)]);
+        let mut p = base("Zebra");
+        p.clauses = vec![clause("issue_id", "any_of", &[])];
+        let no_stars = search(db, &p).await.expect("empty starred set");
+        assert!(hit_numbers(&no_stars).is_empty());
+
         // Explicit archived exclusion.
         let mut p = base("Zebra");
         p.exclude_archived = true;
@@ -4486,11 +4502,8 @@ dual_backend_test! {
             .await
             .unwrap_or_else(|e| panic!("identifier search with {clauses:?}: {e}"));
             let numbers: Vec<i64> = response.results.iter().map(|r| r.number).collect();
-            assert_eq!(
-                numbers.contains(&2),
-                expect_match,
-                "identifier search with {clauses:?} returned {numbers:?}"
-            );
+            let expected = if expect_match { vec![2] } else { Vec::new() };
+            assert_eq!(numbers, expected, "identifier search with {clauses:?}");
         }
 
         for clauses in case_sets {

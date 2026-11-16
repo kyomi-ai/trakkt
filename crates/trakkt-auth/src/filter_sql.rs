@@ -76,19 +76,18 @@ fn distinct(values: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// A UUID set bound as one text parameter instead of one parameter per ID, so
-/// a large starred set cannot exceed the backend's parameter limit.
-fn issue_set_arg(values: &[&str], is_pg: bool) -> String {
-    if is_pg {
-        values.join(",")
-    } else {
-        serde_json::to_string(values).expect("a list of strings always serialises")
-    }
+/// An issue-ID set bound as one JSON parameter instead of one parameter per
+/// ID, so a large starred set cannot exceed the backend's parameter limit. The
+/// JSON encoding is used on both backends so a value containing a comma (or any
+/// other separator) still compares whole, exactly as `FilterClause::matches`
+/// does.
+fn issue_set_arg(values: &[&str]) -> String {
+    serde_json::to_string(values).expect("a list of strings always serialises")
 }
 
 fn issue_set_membership(param: &str, is_pg: bool, negated: bool) -> String {
     let membership = if is_pg {
-        format!("i.issue_id = ANY(string_to_array({param}, ','))")
+        format!("i.issue_id IN (SELECT jsonb_array_elements_text(CAST({param} AS jsonb)))")
     } else {
         format!("i.issue_id IN (SELECT value FROM json_each({param}))")
     };
@@ -100,10 +99,13 @@ fn issue_set_membership(param: &str, is_pg: bool, negated: bool) -> String {
 }
 
 /// Compile `clauses` to SQL, numbering placeholders from `start_param`.
+/// `is_pg` selects the backend's membership syntax for issue-ID sets (JSON on
+/// both sides; `jsonb_array_elements_text` on Postgres, `json_each` on SQLite).
 ///
 /// Clauses that [`FilterClause::matches`] treats as pass-everything (no
 /// values on a non-boolean field, unknown field or operator) produce no
-/// condition.
+/// condition — except an empty `issue_id any_of`, which matches nothing and
+/// compiles to the constant `1 = 0`.
 pub fn clauses_to_sql(
     clauses: &[FilterClause],
     start_param: usize,
@@ -161,7 +163,7 @@ pub fn clauses_to_sql(
             ("issue_id", "any_of" | "none_of") => {
                 let param = format!("${}", out.next_param);
                 out.next_param += 1;
-                out.args.push(SqlArg::Text(issue_set_arg(&values, is_pg)));
+                out.args.push(SqlArg::Text(issue_set_arg(&values)));
                 issue_set_membership(&param, is_pg, op == "none_of")
             }
             ("project", "any_of") => format!("i.project_id IN ({})", text_in(&mut out)),
@@ -286,8 +288,11 @@ mod tests {
     #[test]
     fn issue_sets_bind_one_parameter_per_backend() {
         let pg = clauses_to_sql(&[clause("issue_id", "any_of", &["a", "b"])], 4, true);
-        assert_eq!(pg.conditions, vec!["i.issue_id = ANY(string_to_array($4, ','))"]);
-        assert_eq!(pg.args, vec![SqlArg::Text("a,b".into())]);
+        assert_eq!(
+            pg.conditions,
+            vec!["i.issue_id IN (SELECT jsonb_array_elements_text(CAST($4 AS jsonb)))"]
+        );
+        assert_eq!(pg.args, vec![SqlArg::Text(r#"["a","b"]"#.into())]);
         let sq = clauses_to_sql(&[clause("issue_id", "none_of", &["a", "b"])], 4, false);
         assert_eq!(
             sq.conditions,

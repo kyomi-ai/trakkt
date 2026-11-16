@@ -1295,18 +1295,6 @@ pub fn find_field_def(key: &str) -> Option<&'static FilterFieldDef> {
     all_filter_fields().iter().find(|f| f.key == key).copied()
 }
 
-/// Whether a clause actually restricts anything. Mirrors
-/// [`FilterClause::matches`]: non-boolean clauses with no values pass
-/// everything, except an empty `issue_id any_of` ("no starred issues"), which
-/// matches nothing.
-pub fn clause_is_effective(clause: &FilterClause) -> bool {
-    if !clause.values.is_empty() {
-        return true;
-    }
-    crate::pages::views::BOOLEAN_FILTER_FIELDS.contains(&clause.field.as_str())
-        || (clause.field == "issue_id" && clause.operator == "any_of")
-}
-
 /// One-line description of exactly what a search is scoped to, so no filter
 /// is ever applied invisibly. Search has no hidden defaults: without a status
 /// filter it covers every status. `status_names` maps status IDs to names so a
@@ -1318,7 +1306,7 @@ pub fn search_scope_summary(
 ) -> String {
     let status_part = clauses
         .iter()
-        .filter(|c| c.field == "status" && clause_is_effective(c))
+        .filter(|c| c.field == "status" && c.is_effective())
         .map(|c| {
             let names: Vec<&str> = c
                 .values
@@ -1336,7 +1324,7 @@ pub fn search_scope_summary(
     };
     let others: Vec<&str> = clauses
         .iter()
-        .filter(|c| c.field != "status" && clause_is_effective(c))
+        .filter(|c| c.field != "status" && c.is_effective())
         .map(|c| match c.field.as_str() {
             "issue_id" => "Starred issues",
             other => find_field_def(other).map_or(other, |d| d.label),
@@ -2199,28 +2187,23 @@ mod search_scope_tests {
         assert_eq!(ui_booleans, shared);
         for field in all_filter_fields() {
             for op in field.operators {
-                let handled = matches!(
-                    (field.key, op.key),
-                    ("status" | "priority" | "project" | "issue_id", "any_of" | "none_of")
-                        | ("label", "any_of" | "none_of" | "all_of" | "not_any_of" | "not_all_of")
-                        | (
-                            "is_sub_issue" | "is_parent" | "is_blocked" | "is_blocking"
-                                | "has_relations",
-                            "any_of" | "none_of"
-                        )
-                );
-                assert!(handled, "no shared matcher arm for {}/{}", field.key, op.key);
+                let clause = clause(field.key, op.key, &["x"]);
+                assert!(clause.supported(), "no shared matcher arm for {}/{}", field.key, op.key);
             }
         }
     }
 
     #[test]
     fn ineffective_clauses_are_not_shown() {
-        assert!(!clause_is_effective(&clause("priority", "any_of", &[])));
-        assert!(clause_is_effective(&clause("priority", "any_of", &["1"])));
-        assert!(clause_is_effective(&clause("is_parent", "any_of", &[])));
-        assert!(clause_is_effective(&clause("issue_id", "any_of", &[])));
-        assert!(!clause_is_effective(&clause("issue_id", "none_of", &[])));
+        assert!(!clause("priority", "any_of", &[]).is_effective());
+        assert!(clause("priority", "any_of", &["1"]).is_effective());
+        assert!(clause("is_parent", "any_of", &[]).is_effective());
+        assert!(clause("issue_id", "any_of", &[]).is_effective());
+        assert!(!clause("issue_id", "none_of", &[]).is_effective());
+        // Unknown fields and operators constrain nothing, so they are not shown.
+        assert!(!clause("bogus", "any_of", &["x"]).is_effective());
+        assert!(!clause("status", "all_of", &["s1"]).is_effective());
+        assert!(!clause("is_parent", "wat", &[]).is_effective());
         assert_eq!(
             search_scope_summary(&[clause("priority", "any_of", &[])], false, &HashMap::new()),
             "All statuses · archived excluded"
