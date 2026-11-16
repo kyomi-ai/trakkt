@@ -20,7 +20,7 @@ use trakkt_types::api::{
     IssueListRow, ListIssuesApiParams, ListIssuesResponse, SearchIssuesApiParams,
     UpdateIssueApiParams,
 };
-use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate, IssueWithDetails};
+use trakkt_types::models::{CreateIssueParams, IssueFilters, IssueUpdate};
 
 use crate::context::{parse_issue_identifier, resolve_issue_key_and_number, resolve_team};
 use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
@@ -28,11 +28,6 @@ use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 // ─────────────────────────────────────────────────────────────────────────────
 // Composable filter clause support
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Apply a single filter clause to an issue (see [`FilterClause::matches`]).
-fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
-    clause.matches(issue)
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Handlers
@@ -100,7 +95,12 @@ pub async fn list_issues(
         .transpose()?;
 
     let status_id = params.status_id;
-    let status_categories = parse_csv(params.status_category.as_deref());
+    // Blank input keeps its historical meaning (supplied, selects nothing),
+    // so it still suppresses the closed default below.
+    let status_categories = params
+        .status_category
+        .as_deref()
+        .map(|raw| parse_csv(Some(raw)).unwrap_or_default());
     let include_closed = params.include_closed.unwrap_or(false);
 
     let exclude_status_categories =
@@ -117,7 +117,10 @@ pub async fn list_issues(
         priority: params.priority,
         assignee_id: params.assignee,
         creator_id: None,
-        label_ids: parse_csv(params.label.as_deref()),
+        label_ids: params
+            .label
+            .as_deref()
+            .map(|raw| parse_csv(Some(raw)).unwrap_or_default()),
         search: params.search,
         // Paging happens below, after the composable clauses, so that `total`
         // and the cursor see the complete filtered result.
@@ -146,7 +149,7 @@ pub async fn list_issues(
 
     // Apply composable filter clauses post-fetch (all AND-ed).
     if !clauses.is_empty() {
-        issues.retain(|issue| clauses.iter().all(|clause| apply_clause(clause, issue)));
+        issues.retain(|issue| clauses.iter().all(|clause| clause.matches(issue)));
     }
 
     let total = issues.len();
@@ -681,11 +684,8 @@ pub async fn delete_issue(
 
 /// Parse the JSON `filters` parameter shared by `list_issues` and `search_issues`.
 fn parse_filter_clauses(raw: Option<&str>) -> ApiResult<Vec<FilterClause>> {
-    match raw {
-        Some(s) if !s.is_empty() => serde_json::from_str(s)
-            .map_err(|e| ApiError::BadRequest(format!("Invalid filters JSON: {e}"))),
-        _ => Ok(Vec::new()),
-    }
+    FilterClause::parse_list(raw)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid filters JSON: {e}")))
 }
 
 /// Split a comma-separated filter value; blank or empty input means "no filter".
@@ -745,7 +745,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_issues",
-            description: "Find issues in the workspace with optional filters. Returns `{issues, total, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. The cursor resumes after the last row served by its sort key, so unchanged issues appear exactly once even if other issues are created, deleted or edited between pages; an issue edited so that it now sorts before the cursor (for example a `sort_by=updated_at` walk) can be missed. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
+            description: "Find issues in the workspace with optional filters. Returns `{issues, total, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. The cursor resumes after the last row served by its sort key, so unchanged issues appear exactly once even if other issues are created, deleted or edited between pages; an issue edited so that it now sorts before the cursor (for example a `sort_by=updated_at` walk) can be missed. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view). Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues",
@@ -1163,6 +1163,39 @@ mod tests {
         assert_eq!(result_numbers(&value), vec![1, 3]);
     }
 
+
+    /// TRA-10114 shared `parse_csv`: a blank `status_category` is still
+    /// "supplied, selects nothing", so it keeps including closed issues.
+    #[tokio::test]
+    async fn list_issues_blank_status_category_keeps_its_meaning() {
+        let (db, workspace_id, user_id) = workspace_with_closed_issues().await;
+        let ctx = ApiCtx::from_leptos(
+            workspace_id,
+            user_id,
+            &db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        );
+
+        for blank in ["", " ", ","] {
+            let mut params = list_params(None);
+            params.status_category = Some(blank.to_string());
+            let value = list_issues(&ctx, params).await.expect("list_issues");
+            let numbers: Vec<i64> = value["issues"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|row| row["number"].as_i64().expect("number"))
+                .collect();
+            assert_eq!(numbers.len(), 3, "blank status_category {blank:?} must not filter");
+        }
+
+        // Omitting it keeps the documented default.
+        let value = list_issues(&ctx, list_params(None)).await.expect("list_issues");
+        assert_eq!(value["issues"].as_array().expect("rows").len(), 1);
+    }
 
     /// The no-clauses path returns an envelope of lean rows.
     #[tokio::test]

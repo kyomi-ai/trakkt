@@ -403,11 +403,8 @@ pub async fn search_issues(
         exclude_closed: include_closed == Some(false),
         status_id: None,
         status_categories: None,
-        clauses: match filters.as_deref() {
-            Some(s) if !s.is_empty() => serde_json::from_str(s)
-                .map_err(|e| ServerFnError::new(format!("Invalid filters: {e}")))?,
-            _ => Vec::new(),
-        },
+        clauses: trakkt_types::api::FilterClause::parse_list(filters.as_deref())
+            .map_err(|e| ServerFnError::new(format!("Invalid filters: {e}")))?,
         include_comments: include_comments.unwrap_or(true),
         limit: limit.unwrap_or(50),
         offset: 0,

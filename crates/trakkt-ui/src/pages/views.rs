@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 // Re-export from the canonical definition in trakkt-types.
-pub use trakkt_types::api::FilterClause;
+pub use trakkt_types::api::{FilterClause, BOOLEAN_FILTER_FIELDS};
 
 /// New composable view filters — replaces the old flat field-per-filter struct.
 ///

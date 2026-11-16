@@ -4434,6 +4434,10 @@ dual_backend_test! {
             vec![clause("has_relations", "none_of", &[])],
             vec![clause("issue_id", "any_of", &[&ids[&1], &ids[&3]])],
             vec![clause("issue_id", "none_of", &[&ids[&1]])],
+            // An empty Starred set restricts to nothing; excluding nothing
+            // restricts to everything.
+            vec![clause("issue_id", "any_of", &[])],
+            vec![clause("issue_id", "none_of", &[])],
             // Pass-through clauses constrain nothing.
             vec![clause("status", "any_of", &[])],
             vec![clause("nope", "any_of", &["x"])],
@@ -4449,6 +4453,45 @@ dual_backend_test! {
                 clause("project", "none_of", &[&project]),
             ],
         ];
+
+        // Identifier queries with clauses: the clause binds sit before the
+        // identifier number/key binds, and a clause the user set still filters
+        // the identifier match.
+        let identifier_cases = vec![
+            (vec![clause("priority", "any_of", &["2"])], true),
+            (vec![clause("priority", "any_of", &["1"])], false),
+            (vec![clause("status", "any_of", &[&done])], true),
+            (vec![clause("status", "none_of", &[&done])], false),
+            (vec![clause("is_blocked", "any_of", &[])], false),
+            (vec![clause("label", "any_of", &[label_a])], true),
+            (vec![clause("label", "not_any_of", &[label_a])], false),
+        ];
+        for (clauses, expect_match) in identifier_cases {
+            let response = search(
+                db,
+                &SearchParams {
+                    query: "DIA-2".to_owned(),
+                    workspace_id: WORKSPACE.to_owned(),
+                    team_id: Some(TEAM.to_owned()),
+                    exclude_archived: false,
+                    exclude_closed: false,
+                    status_id: None,
+                    status_categories: None,
+                    clauses: clauses.clone(),
+                    include_comments: false,
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("identifier search with {clauses:?}: {e}"));
+            let numbers: Vec<i64> = response.results.iter().map(|r| r.number).collect();
+            assert_eq!(
+                numbers.contains(&2),
+                expect_match,
+                "identifier search with {clauses:?} returned {numbers:?}"
+            );
+        }
 
         for clauses in case_sets {
             let mut expected: Vec<i64> = all

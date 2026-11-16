@@ -59,7 +59,9 @@ pub struct SearchResponse {
     pub truncated: bool,
 }
 
-/// Most rows one search will fetch before deduplicating and paging.
+/// Most distinct issues one search returns before paging. Deduplication
+/// happens in SQL (one best-ranked row per issue), so the cap counts issues,
+/// not match rows; the database still processes every matching row.
 pub const SEARCH_FETCH_CAP: i64 = 1000;
 
 impl From<SearchResultRow> for SearchResult {
@@ -113,7 +115,7 @@ struct FilterPlan {
 
 impl SearchParams {
     /// Build the filter conditions. Only filters the caller set appear.
-    fn plan(&self) -> FilterPlan {
+    fn plan(&self, is_pg: bool) -> FilterPlan {
         let mut conditions = Vec::new();
         let mut args = Vec::new();
         let mut next = 3;
@@ -135,7 +137,7 @@ impl SearchParams {
             args.extend(categories.iter().cloned().map(SqlArg::Text));
             next = after;
         }
-        let compiled = clauses_to_sql(&self.clauses, next);
+        let compiled = clauses_to_sql(&self.clauses, next, is_pg);
         conditions.extend(compiled.conditions);
         args.extend(compiled.args);
         next = compiled.next_param;
@@ -162,10 +164,11 @@ impl SearchParams {
 /// `LIKE '%query%'` without ranking or snippets.
 ///
 /// Returns a [`SearchResponse`] containing the paginated results and the total
-/// number of matching items (before offset/limit are applied). Pagination is
+/// number of matching issues (before offset/limit are applied). Pagination is
 /// performed in Rust so that `total` reflects the true match count. The SQL
-/// queries are run with a high cap (1000 rows) and no offset; deduplication
-/// and slicing happen after.
+/// keeps one best-ranked row per issue and returns at most the cap
+/// ([`SEARCH_FETCH_CAP`]) plus one row to detect truncation; slicing happens
+/// after.
 pub async fn search(
     db: &DbPool,
     params: &SearchParams,
@@ -182,9 +185,9 @@ pub async fn search(
 
     let identifier = parse_identifier_number(&params.query);
 
-    // Fetch all matching rows (up to a reasonable cap) so we can report the
-    // true total count. SQL LIMIT/OFFSET are bypassed here; pagination is
-    // applied in Rust below.
+    // Fetch every distinct matching issue (up to the cap) so we can report the
+    // true total count. SQL OFFSET is bypassed here; pagination is applied in
+    // Rust below.
     let uncapped_params = SearchParams {
         query: params.query.clone(),
         workspace_id: params.workspace_id.clone(),
@@ -201,10 +204,11 @@ pub async fn search(
         offset: 0,
     };
 
+    let plan = uncapped_params.plan(db.is_postgres());
     let mut rows = if db.is_postgres() {
-        search_postgres(db, &uncapped_params, &identifier).await?
+        search_postgres(db, &uncapped_params, &plan, &identifier).await?
     } else {
-        search_sqlite(db, &uncapped_params, &identifier).await?
+        search_sqlite(db, &uncapped_params, &plan, &identifier).await?
     };
 
     let truncated = rows.len() as i64 > SEARCH_FETCH_CAP;
@@ -213,6 +217,7 @@ pub async fn search(
     // The SQL already keeps one best-ranked row per issue (identifier matches
     // rank 2.0 so they win over tsvector / LIKE matches), so the cap counts
     // distinct issues and comment rows cannot crowd out other hits.
+    debug_assert!(plan.conditions.len() + 2 <= plan.next_param);
     let all_results: Vec<SearchResult> = rows.into_iter().map(SearchResult::from).collect();
 
     let total = all_results.len() as i64;
@@ -238,20 +243,20 @@ pub async fn search(
 
 /// Build the WHERE conditions shared between issue and comment arms (Postgres).
 /// Workspace is always `$2`, team_id is `$3` when present.
-fn shared_conditions_pg(params: &SearchParams) -> Vec<String> {
-    shared_conditions("i.workspace_id = $2", params)
+fn shared_conditions_pg(plan: &FilterPlan) -> Vec<String> {
+    shared_conditions("i.workspace_id = $2", plan)
 }
 
 /// Build the WHERE conditions shared between issue and comment arms (SQLite).
 /// Workspace is always `$1`, team_id is `$3` when present.
-fn shared_conditions_sqlite(params: &SearchParams) -> Vec<String> {
-    shared_conditions("i.workspace_id = $1", params)
+fn shared_conditions_sqlite(plan: &FilterPlan) -> Vec<String> {
+    shared_conditions("i.workspace_id = $1", plan)
 }
 
 /// Only filters the caller explicitly set become conditions.
-fn shared_conditions(workspace_cond: &str, params: &SearchParams) -> Vec<String> {
+fn shared_conditions(workspace_cond: &str, plan: &FilterPlan) -> Vec<String> {
     let mut conds = vec![workspace_cond.to_string()];
-    conds.extend(params.plan().conditions);
+    conds.extend(plan.conditions.iter().cloned());
     conds
 }
 
@@ -313,19 +318,20 @@ fn escape_like_pattern(query: &str) -> String {
 async fn search_postgres(
     db: &DbPool,
     params: &SearchParams,
+    plan: &FilterPlan,
     identifier: &Option<(Option<String>, i64)>,
 ) -> trakkt_core::Result<Vec<SearchResultRow>> {
     // Bind positions:
     //   $1 = search query text
     //   $2 = workspace_id
     //   $3 = team_id (when team filter is active)
+    //   then, in order: the status binds, the filter-clause binds
     //   $N = identifier number (when identifier detected)
     //   $N+1 = parsed team_key (when identifier has "KEY-NUM" format)
 
-    let plan_args = params.plan().args;
-    let mut next_param = params.plan().next_param;
+    let mut next_param = plan.next_param;
 
-    let mut issue_conditions = shared_conditions_pg(params);
+    let mut issue_conditions = shared_conditions_pg(plan);
     issue_conditions.push("i.search_vector @@ query".to_string());
     let issue_where = issue_conditions.join(" AND ");
 
@@ -350,7 +356,7 @@ async fn search_postgres(
         let number_param = format!("${next_param}");
         next_param += 1;
 
-        let mut id_conditions = shared_conditions_pg(params);
+        let mut id_conditions = shared_conditions_pg(plan);
         id_conditions.push(format!("i.number = {number_param}"));
 
         // When the query contained a team key (e.g. "TRA-216"), also match team.
@@ -377,7 +383,7 @@ async fn search_postgres(
     };
 
     let comment_sql = if params.include_comments {
-        let mut comment_conditions = shared_conditions_pg(params);
+        let mut comment_conditions = shared_conditions_pg(plan);
         comment_conditions.push("c.search_vector @@ query".to_string());
         let comment_where = comment_conditions.join(" AND ");
 
@@ -418,7 +424,7 @@ async fn search_postgres(
         if let Some(team_id) = &params.team_id {
             query = query.bind(team_id);
         }
-        for arg in &plan_args {
+        for arg in &plan.args {
             query = match arg {
                 SqlArg::Text(v) => query.bind(v),
                 SqlArg::Int(n) => query.bind(*n),
@@ -441,6 +447,7 @@ async fn search_postgres(
 async fn search_sqlite(
     db: &DbPool,
     params: &SearchParams,
+    plan: &FilterPlan,
     identifier: &Option<(Option<String>, i64)>,
 ) -> trakkt_core::Result<Vec<SearchResultRow>> {
     let pattern = escape_like_pattern(&params.query);
@@ -449,13 +456,13 @@ async fn search_sqlite(
     //   $1 = workspace_id
     //   $2 = LIKE pattern
     //   $3 = team_id (when team filter is active)
+    //   then, in order: the status binds, the filter-clause binds
     //   $N = identifier number (when identifier detected)
     //   $N+1 = parsed team_key (when identifier has "KEY-NUM" format)
 
-    let plan_args = params.plan().args;
-    let mut next_param = params.plan().next_param;
+    let mut next_param = plan.next_param;
 
-    let mut issue_conditions = shared_conditions_sqlite(params);
+    let mut issue_conditions = shared_conditions_sqlite(plan);
     issue_conditions
         .push("(i.title LIKE $2 ESCAPE '\\' OR i.description LIKE $2 ESCAPE '\\')".to_string());
     let issue_where = issue_conditions.join(" AND ");
@@ -481,7 +488,7 @@ async fn search_sqlite(
         let number_param = format!("${next_param}");
         next_param += 1;
 
-        let mut id_conditions = shared_conditions_sqlite(params);
+        let mut id_conditions = shared_conditions_sqlite(plan);
         id_conditions.push(format!("i.number = {number_param}"));
 
         if parsed_key.is_some() {
@@ -507,7 +514,7 @@ async fn search_sqlite(
     };
 
     let comment_sql = if params.include_comments {
-        let mut comment_conditions = shared_conditions_sqlite(params);
+        let mut comment_conditions = shared_conditions_sqlite(plan);
         comment_conditions.push("c.body LIKE $2 ESCAPE '\\'".to_string());
         let comment_where = comment_conditions.join(" AND ");
 
@@ -546,7 +553,7 @@ async fn search_sqlite(
         if let Some(team_id) = &params.team_id {
             query = query.bind(team_id);
         }
-        for arg in &plan_args {
+        for arg in &plan.args {
             query = match arg {
                 SqlArg::Text(v) => query.bind(v),
                 SqlArg::Int(n) => query.bind(*n),
@@ -606,7 +613,7 @@ mod tests {
     #[test]
     fn pg_conditions_default() {
         let params = default_params();
-        let conds = shared_conditions_pg(&params);
+        let conds = shared_conditions_pg(&params.plan(false));
         // No hidden defaults: only the workspace scope applies.
         assert_eq!(conds, vec!["i.workspace_id = $2"]);
     }
@@ -615,7 +622,7 @@ mod tests {
     fn pg_conditions_with_team() {
         let mut params = default_params();
         params.team_id = Some("team-1".to_string());
-        let conds = shared_conditions_pg(&params);
+        let conds = shared_conditions_pg(&params.plan(false));
         assert!(conds.contains(&"i.team_id = $3".to_string()));
     }
 
@@ -624,7 +631,7 @@ mod tests {
         let mut params = default_params();
         params.exclude_closed = true;
         params.exclude_archived = true;
-        let conds = shared_conditions_pg(&params);
+        let conds = shared_conditions_pg(&params.plan(false));
         assert!(conds.iter().any(|c| c.contains("NOT IN ('completed'")));
         assert!(conds.iter().any(|c| c.contains("archived_at IS NULL")));
     }
@@ -635,10 +642,10 @@ mod tests {
         params.team_id = Some("team-1".to_string());
         params.status_id = Some("s1".to_string());
         params.status_categories = Some(vec!["completed".to_string(), "cancelled".to_string()]);
-        let conds = shared_conditions_pg(&params);
+        let conds = shared_conditions_pg(&params.plan(false));
         assert!(conds.contains(&"i.status_id = $4".to_string()));
         assert!(conds.contains(&"s.category IN ($5, $6)".to_string()));
-        let plan = params.plan();
+        let plan = params.plan(false);
         assert_eq!(
             plan.args,
             vec![
@@ -660,7 +667,7 @@ mod tests {
             operator: "any_of".to_string(),
             values: vec!["l1".to_string(), "l2".to_string()],
         }];
-        let plan = params.plan();
+        let plan = params.plan(false);
         assert!(plan.conditions.iter().any(|c| c.contains("il.label_id IN ($5, $6)")));
         assert_eq!(plan.next_param, 7);
     }
@@ -675,7 +682,7 @@ mod tests {
     #[test]
     fn sqlite_conditions_default() {
         let params = default_params();
-        let conds = shared_conditions_sqlite(&params);
+        let conds = shared_conditions_sqlite(&params.plan(false));
         assert_eq!(conds, vec!["i.workspace_id = $1"]);
     }
 
@@ -683,7 +690,7 @@ mod tests {
     fn sqlite_conditions_with_team() {
         let mut params = default_params();
         params.team_id = Some("team-1".to_string());
-        let conds = shared_conditions_sqlite(&params);
+        let conds = shared_conditions_sqlite(&params.plan(false));
         assert!(conds.contains(&"i.team_id = $3".to_string()));
     }
 
@@ -763,8 +770,8 @@ mod tests {
         params.status_id = Some("s1".to_string());
         params.status_categories = Some(vec!["started".to_string()]);
 
-        let pg = shared_conditions_pg(&params);
-        let sqlite = shared_conditions_sqlite(&params);
+        let pg = shared_conditions_pg(&params.plan(false));
+        let sqlite = shared_conditions_sqlite(&params.plan(false));
 
         assert_eq!(pg.len(), sqlite.len());
         for (p, s) in pg.iter().zip(sqlite.iter()) {

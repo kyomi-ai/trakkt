@@ -38,7 +38,7 @@ use crate::components::{
 };
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{
-    apply_clause, group_issues, parse_sort_field, search_scope_summary,
+    group_issues, parse_sort_field, search_scope_summary,
     sort_field_to_str, sort_issues, FilterBar, GroupDropdown, GroupField, SortDirection, SortDropdown, SortField,
 };
 use crate::pages::issues::issue_row::IssueRow;
@@ -580,7 +580,17 @@ pub(crate) fn IssueListInner(
             let filters = if clauses.is_empty() {
                 None
             } else {
-                serde_json::to_string(&clauses).ok()
+                match serde_json::to_string(&clauses) {
+                    Ok(json) => Some(json),
+                    Err(e) => {
+                        // Never fall back to an unfiltered search while the
+                        // filter bar still shows these filters.
+                        tracing::error!(error = %e, "failed to serialise search filters");
+                        return Err(ServerFnError::new(format!(
+                            "Failed to send filters: {e}"
+                        )));
+                    }
+                }
             };
             search_issues(
                 query,
@@ -1046,7 +1056,7 @@ pub(crate) fn IssueListInner(
                 }
                 // Apply each composable filter clause.
                 for clause in &clauses {
-                    if !apply_clause(clause, issue) {
+                    if !clause.matches(issue) {
                         return false;
                     }
                 }
@@ -1774,16 +1784,15 @@ pub(crate) fn IssueListInner(
                                 let groups = grouped_search_results.get();
                                 let query = debounced_search.get();
                                 let scope_line = {
+                                    // Same source as the board columns, so the
+                                    // names resolve before the sync store has
+                                    // loaded instead of showing raw IDs.
                                     let status_names: std::collections::HashMap<String, String> =
-                                        sync_store
-                                            .map(|st| {
-                                                st.statuses()
-                                                    .get()
-                                                    .into_iter()
-                                                    .map(|s| (s.status_id, s.name))
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default();
+                                        board_statuses
+                                            .get()
+                                            .into_iter()
+                                            .map(|s| (s.status_id, s.name))
+                                            .collect();
                                     let base = search_scope_summary(
                                         &filter_clauses.get(),
                                         include_archived_search.get(),

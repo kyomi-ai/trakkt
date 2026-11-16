@@ -32,7 +32,10 @@ pub struct ClauseSql {
     pub conditions: Vec<String>,
     /// Values for the placeholders used by `conditions`, in order.
     pub args: Vec<SqlArg>,
-    /// The first placeholder index not used by these clauses.
+    /// The first placeholder index not used by these clauses. Invariant:
+    /// `next_param == start_param + args.len()`, because every placeholder has
+    /// exactly one arg and the boolean conditions consume neither. Callers that
+    /// append their own args can rely on it to continue numbering.
     pub next_param: usize,
 }
 
@@ -65,13 +68,35 @@ fn boolean_condition(field: &str, want_true: bool) -> Option<String> {
 
 /// Distinct values, first occurrence order (so placeholders are stable).
 fn distinct(values: &[String]) -> Vec<&str> {
-    let mut seen: Vec<&str> = Vec::new();
-    for v in values {
-        if !seen.contains(&v.as_str()) {
-            seen.push(v);
-        }
+    let mut seen = std::collections::HashSet::new();
+    values
+        .iter()
+        .map(String::as_str)
+        .filter(|v| seen.insert(*v))
+        .collect()
+}
+
+/// A UUID set bound as one text parameter instead of one parameter per ID, so
+/// a large starred set cannot exceed the backend's parameter limit.
+fn issue_set_arg(values: &[&str], is_pg: bool) -> String {
+    if is_pg {
+        values.join(",")
+    } else {
+        serde_json::to_string(values).expect("a list of strings always serialises")
     }
-    seen
+}
+
+fn issue_set_membership(param: &str, is_pg: bool, negated: bool) -> String {
+    let membership = if is_pg {
+        format!("i.issue_id = ANY(string_to_array({param}, ','))")
+    } else {
+        format!("i.issue_id IN (SELECT value FROM json_each({param}))")
+    };
+    if negated {
+        format!("NOT ({membership})")
+    } else {
+        membership
+    }
 }
 
 /// Compile `clauses` to SQL, numbering placeholders from `start_param`.
@@ -79,7 +104,11 @@ fn distinct(values: &[String]) -> Vec<&str> {
 /// Clauses that [`FilterClause::matches`] treats as pass-everything (no
 /// values on a non-boolean field, unknown field or operator) produce no
 /// condition.
-pub fn clauses_to_sql(clauses: &[FilterClause], start_param: usize) -> ClauseSql {
+pub fn clauses_to_sql(
+    clauses: &[FilterClause],
+    start_param: usize,
+    is_pg: bool,
+) -> ClauseSql {
     let mut out = ClauseSql {
         next_param: start_param,
         ..ClauseSql::default()
@@ -100,6 +129,12 @@ pub fn clauses_to_sql(clauses: &[FilterClause], start_param: usize) -> ClauseSql
             continue;
         }
         if clause.values.is_empty() {
+            // An empty issue set is a restriction only when it is the set to
+            // include ("no starred issues"); excluding nothing constrains
+            // nothing.
+            if field == "issue_id" && op == "any_of" {
+                out.conditions.push("1 = 0".to_string());
+            }
             continue;
         }
 
@@ -121,8 +156,14 @@ pub fn clauses_to_sql(clauses: &[FilterClause], start_param: usize) -> ClauseSql
         let condition = match (field, op) {
             ("status", "any_of") => format!("i.status_id IN ({})", text_in(&mut out)),
             ("status", "none_of") => format!("i.status_id NOT IN ({})", text_in(&mut out)),
-            ("issue_id", "any_of") => format!("i.issue_id IN ({})", text_in(&mut out)),
-            ("issue_id", "none_of") => format!("i.issue_id NOT IN ({})", text_in(&mut out)),
+            // The Starred view's issue set: one bound parameter however many
+            // IDs it holds.
+            ("issue_id", "any_of" | "none_of") => {
+                let param = format!("${}", out.next_param);
+                out.next_param += 1;
+                out.args.push(SqlArg::Text(issue_set_arg(&values, is_pg)));
+                issue_set_membership(&param, is_pg, op == "none_of")
+            }
             ("project", "any_of") => format!("i.project_id IN ({})", text_in(&mut out)),
             // NULL project_id is "not in" the set, as in `FilterClause::matches`.
             ("project", "none_of") => format!(
@@ -195,6 +236,7 @@ mod tests {
                 clause("label", "all_of", &["l1", "l1", "l2"]),
             ],
             5,
+            true,
         );
         assert_eq!(sql.conditions[0], "i.status_id IN ($5, $6)");
         assert_eq!(sql.conditions[1], "i.priority NOT IN ($7, $8)");
@@ -223,6 +265,7 @@ mod tests {
                 clause("is_parent", "wat", &[]),
             ],
             3,
+            true,
         );
         assert!(sql.conditions.is_empty());
         assert!(sql.args.is_empty());
@@ -232,17 +275,40 @@ mod tests {
     #[test]
     fn unmatchable_priority_values_never_match_and_never_exclude() {
         assert_eq!(
-            clauses_to_sql(&[clause("priority", "any_of", &["x", "03"])], 3).conditions,
+            clauses_to_sql(&[clause("priority", "any_of", &["x", "03"])], 3, false).conditions,
             vec!["1 = 0"]
         );
-        assert!(clauses_to_sql(&[clause("priority", "none_of", &["x"])], 3)
+        assert!(clauses_to_sql(&[clause("priority", "none_of", &["x"])], 3, false)
             .conditions
             .is_empty());
     }
 
     #[test]
+    fn issue_sets_bind_one_parameter_per_backend() {
+        let pg = clauses_to_sql(&[clause("issue_id", "any_of", &["a", "b"])], 4, true);
+        assert_eq!(pg.conditions, vec!["i.issue_id = ANY(string_to_array($4, ','))"]);
+        assert_eq!(pg.args, vec![SqlArg::Text("a,b".into())]);
+        let sq = clauses_to_sql(&[clause("issue_id", "none_of", &["a", "b"])], 4, false);
+        assert_eq!(
+            sq.conditions,
+            vec!["NOT (i.issue_id IN (SELECT value FROM json_each($4)))"]
+        );
+        assert_eq!(sq.args, vec![SqlArg::Text(r#"["a","b"]"#.into())]);
+        assert_eq!(sq.next_param, 5);
+    }
+
+    #[test]
+    fn empty_issue_sets_match_none_or_all() {
+        let none = clauses_to_sql(&[clause("issue_id", "any_of", &[])], 4, true);
+        assert_eq!(none.conditions, vec!["1 = 0"]);
+        assert!(none.args.is_empty());
+        let all = clauses_to_sql(&[clause("issue_id", "none_of", &[])], 4, true);
+        assert!(all.conditions.is_empty());
+    }
+
+    #[test]
     fn boolean_clauses_ignore_values_and_need_no_binds() {
-        let sql = clauses_to_sql(&[clause("is_blocked", "none_of", &["ignored"])], 3);
+        let sql = clauses_to_sql(&[clause("is_blocked", "none_of", &["ignored"])], 3, false);
         assert!(sql.conditions[0].starts_with("NOT EXISTS"));
         assert!(sql.args.is_empty());
     }

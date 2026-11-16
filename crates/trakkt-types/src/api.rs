@@ -40,7 +40,8 @@ pub struct ListIssuesApiParams {
     /// JSON array of composable filter clauses, AND-ed together. Each clause is
     /// `{"field","operator","values"}`.
     /// Fields: status, priority, label, project, is_sub_issue, is_parent,
-    /// is_blocked, is_blocking, has_relations.
+    /// is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs,
+    /// used by the Starred view).
     /// Operators: any_of, none_of, all_of, not_any_of, not_all_of.
     /// Example: `[{"field":"label","operator":"none_of","values":["label-id-1"]}]`
     pub filters: Option<String>,
@@ -58,7 +59,9 @@ pub struct ListIssuesApiParams {
 
 /// A single composable filter clause: a `(field, operator, values)` triple.
 ///
-/// Used by `list_issues` for post-fetch filtering. Boolean fields (e.g.
+/// One (field, operator, values) triple of the shared issue filter model.
+/// `list_issues` and search compile the same clauses to SQL, and the UI
+/// applies them with [`FilterClause::matches`]. Boolean fields (e.g.
 /// `is_sub_issue`) ignore `values` — the operator alone determines the match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FilterClause {
@@ -69,6 +72,10 @@ pub struct FilterClause {
 }
 
 /// Filter fields whose clauses ignore `values`: the operator alone decides.
+///
+/// Must stay in sync with the UI's `ValueKind::Boolean` filter field
+/// definitions (`crates/trakkt-ui/src/pages/issues/filters.rs`); a
+/// `trakkt-ui` test asserts the two lists match.
 pub const BOOLEAN_FILTER_FIELDS: &[&str] = &[
     "is_sub_issue",
     "is_parent",
@@ -78,16 +85,29 @@ pub const BOOLEAN_FILTER_FIELDS: &[&str] = &[
 ];
 
 impl FilterClause {
+    /// Parse the `filters` parameter shared by `list_issues`, `search_issues`
+    /// and the UI server function: a JSON array of clauses, or an empty list
+    /// for absent/blank input.
+    pub fn parse_list(raw: Option<&str>) -> Result<Vec<FilterClause>, serde_json::Error> {
+        match raw {
+            Some(s) if !s.is_empty() => serde_json::from_str(s),
+            _ => Ok(Vec::new()),
+        }
+    }
+
     /// Whether `issue` passes this clause.
     ///
     /// This is the single definition of the filter semantics: the issue list,
     /// `list_issues` and search all use it (search also compiles the same
     /// clauses to SQL, and a parity test holds the two together). Non-boolean
     /// clauses with no values, and unknown field/operator pairs, pass
-    /// everything.
+    /// everything — except an empty `issue_id any_of`, which is the "no starred
+    /// issues" set and therefore matches nothing.
     pub fn matches(&self, issue: &crate::models::IssueWithDetails) -> bool {
         if self.values.is_empty() && !BOOLEAN_FILTER_FIELDS.contains(&self.field.as_str()) {
-            return true;
+            // An empty issue set is a real restriction (the Starred view with
+            // no stars), not an unset filter.
+            return !(self.field == "issue_id" && self.operator == "any_of");
         }
         let has_label = |id: &String| issue.labels.iter().any(|l| l.label_id == *id);
         match (self.field.as_str(), self.operator.as_str()) {
@@ -356,7 +376,8 @@ pub struct SearchIssuesApiParams {
     /// the search itself (before ranking and paging). Same format as
     /// `list_issues`: each clause is `{"field","operator","values"}`.
     /// Fields: status, priority, label, project, is_sub_issue, is_parent,
-    /// is_blocked, is_blocking, has_relations.
+    /// is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs,
+    /// used by the Starred view).
     /// Operators: any_of, none_of, all_of, not_any_of, not_all_of.
     pub filters: Option<String>,
     /// Deprecated, kept for compatibility. Omitted or true: no status
