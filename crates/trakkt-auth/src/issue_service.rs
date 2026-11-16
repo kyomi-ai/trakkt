@@ -835,17 +835,18 @@ macro_rules! bind_args {
 }
 
 /// Postgres renders a zero offset as `+00`; SQLite's `datetime()` only parses
-/// `±HH:MM`. This is a SQL expression, so the repair is a nested `printf` on the
-/// bind's text: `substr` the last three characters when they look like `±HH`
-/// and append `:00`.
-fn sqlite_offset_with_minutes(placeholder: &str) -> String {
-    format!(
-        "CASE WHEN substr({placeholder}, -3, 1) IN ('+', '-') \
-              AND substr({placeholder}, -6, 1) = ':' \
-              AND substr({placeholder}, -2) NOT GLOB '*[^0-9]*' \
-              THEN substr({placeholder}, 1, length({placeholder}) - 3) || substr({placeholder}, -3) || ':00' \
-              ELSE {placeholder} END"
-    )
+/// `±HH:MM`. Give a bare hour offset its minutes so both sides normalise to the
+/// same instant.
+fn sqlite_timestamp(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let sign_at = text.len().checked_sub(3);
+    if let Some(i) = sign_at
+        && matches!(bytes.get(i), Some(b'+' | b'-'))
+        && bytes[i + 1..].iter().all(u8::is_ascii_digit)
+    {
+        return format!("{text}:00");
+    }
+    text.to_string()
 }
 
 /// The `WHERE` clause of a list query and its binds, numbered `$1..`.
@@ -953,15 +954,18 @@ impl ListWhere {
     /// timestamp on Postgres so comparisons are chronological, whatever the
     /// session time zone rendered the text in.
     fn timestamp(&mut self, text: &str) -> String {
-        let p = self.param(SqlArg::Text(text.to_string()));
+        let text = if self.is_pg {
+            text.to_string()
+        } else {
+            sqlite_timestamp(text)
+        };
+        let p = self.param(SqlArg::Text(text));
         if self.is_pg {
             format!("CAST({p} AS TIMESTAMPTZ)")
         } else {
             // Match `KeyCol::expr`'s normalisation so a stored value in either
-            // accepted format compares against the bound one. A bare hour
-            // offset (`+00`), which Postgres renders, is not parseable by
-            // `datetime()`; give it minutes first.
-            format!("datetime({})", sqlite_offset_with_minutes(&p))
+            // accepted format compares against the bound one.
+            format!("datetime({p})")
         }
     }
 
@@ -1065,6 +1069,11 @@ pub struct IssueWalk<'a> {
     pub served: i64,
 }
 
+/// Largest `served_count` a cursor may carry (and the most a walk reports): far
+/// above any real backlog, and small enough that a cursor this endpoint
+/// generated is always accepted back.
+pub const MAX_WALK_SERVED: i64 = 1_000_000_100;
+
 /// One page of a keyset-paginated issue list.
 pub struct IssuePageRequest<'a> {
     pub workspace_id: &'a str,
@@ -1123,6 +1132,8 @@ pub struct IssuePage {
 ///   priority edit) stamp `updated_at`, so they follow the rules above — visible
 ///   as a repeat if the write was already in flight, and outside the walk
 ///   entirely if it was not.
+///
+/// `served_count` saturates at [`MAX_WALK_SERVED`].
 ///
 /// `served_count` is therefore `total` plus any repeat, minus rows that stopped
 /// matching before they were served, minus rows such a write moved to before the
@@ -1184,7 +1195,8 @@ pub async fn list_issues_page(
         .resume
         .as_ref()
         .map_or(0, |walk| walk.served)
-        .saturating_add(issues.len() as i64);
+        .saturating_add(issues.len() as i64)
+        .min(MAX_WALK_SERVED);
 
     Ok(IssuePage {
         issues,

@@ -53,10 +53,10 @@ pub struct ListIssuesApiParams {
     /// Sort field: priority (default), created_at, updated_at or number.
     /// Ties are always broken deterministically — priority walks by creation
     /// time, number and then issue id; created_at and updated_at walks by
-    /// number then issue id; number walks by team id then issue id. Team id is
-    /// not changed by a team rename, and the id columns never change; moving an
-    /// issue to another team does (it renumbers it and stamps `updated_at`), so
-    /// that write follows the snapshot rules like any other.
+    /// number then issue id; number walks by team id then issue id. A team
+    /// rename changes none of them. Moving an issue to another team does
+    /// (it changes `team_id` and `number`), and that write stamps `updated_at`,
+    /// so it follows the walk's snapshot rules like any other write.
     pub sort_by: Option<String>,
     /// Sort direction: asc or desc. Default: asc for priority (Urgent first),
     /// desc for created_at, updated_at and number (newest first).

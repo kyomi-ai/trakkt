@@ -202,8 +202,6 @@ const CURSOR_VERSION: &str = "v4";
 /// Upper bound on `total`/`served_count` in a cursor: far above any real
 /// backlog, and small enough that accumulating a page cannot overflow.
 const MAX_WALK_COUNT: i64 = 1_000_000_000;
-/// `served_count` may pass `total` by the repeats/entries of one page.
-const MAX_WALK_SERVED: i64 = MAX_WALK_COUNT + MAX_LIST_LIMIT;
 const CURSOR_SEP: char = '\u{1e}';
 
 /// What an opaque `list_issues` cursor carries.
@@ -272,7 +270,7 @@ fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<ListCursor> {
             if total < 0
                 || served < 0
                 || total > MAX_WALK_COUNT
-                || served > MAX_WALK_SERVED
+                || served > issue_service::MAX_WALK_SERVED
                 || ![created_at, updated_at, snapshot_at]
                     .iter()
                     .all(|t| is_db_timestamp(t))
@@ -852,7 +850,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_issues",
-            description: "Find issues in the workspace with optional filters. Returns `{issues, total, snapshot_at, served_count, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. A walk is a snapshot as of `snapshot_at` (the database clock when its first page was read). A write stamped at or before `snapshot_at` counts as of the walk's start: `total` is counted once then and is the same on every page, every page lists issues last modified at or before `snapshot_at`, and every issue that still matches and was visible when the walk began is returned exactly once. If such a write moves an already-served issue past the cursor, that issue can appear once more — sorting by a mutable field (`updated_at`) is what allows this; walks ordered by a stable key (`number`, `created_at`) are exact. `served_count` reports how many rows the walk has returned so far: it is `total` plus any repeat, minus rows that stopped matching before they were served, minus rows a pre-snapshot write moved before the cursor before they were served, plus rows that started matching without a write that moves `updated_at` and were served. `has_more` false ends the walk whatever it says. An issue modified after `snapshot_at` is not part of that walk; it appears in a fresh walk (a request without `cursor`). An issue deleted, archived or otherwise no longer matching during the walk is absent from later pages. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view). Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
+            description: "Find issues in the workspace with optional filters. Returns `{issues, total, snapshot_at, served_count, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. A walk is a snapshot as of `snapshot_at` (the database clock when its first page was read). A write stamped at or before `snapshot_at` counts as of the walk's start: `total` is counted once then and is the same on every page, and every page lists issues last modified at or before `snapshot_at`. A write stamped at or before `snapshot_at` that moves an already-served issue past the cursor can return that issue once more, and one that moves an issue the walk had not reached to before the cursor can leave it out of that walk (it appears in a fresh walk). Both are visible in `served_count`. An ordinary edit does not move an issue in a `number` or `created_at` walk; only a write that changes those keys or a priority rank (a team move, a delete-team reassignment, a priority edit) can, and those stamp `updated_at` and follow the same rules. `served_count` reports how many rows this walk has returned so far: it is `total` plus any repeat, minus rows that stopped matching before they were served, minus rows a pre-snapshot write moved before the cursor before they were served, plus rows that started matching without a write that moves `updated_at` and were served. `has_more` false ends the walk whatever it says. An issue modified after `snapshot_at` is not part of that walk; it appears in a fresh walk (a request without `cursor`). An issue deleted, archived or otherwise no longer matching during the walk is absent from later pages. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view). Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues",
@@ -2211,33 +2209,44 @@ mod tests {
         list_issues(&ctx, ok).await.expect("the genuine cursor");
     }
 
-    /// A Postgres-rendered cursor carries a bare `+00` offset; SQLite's
-    /// `datetime()` needs minutes, so the bound text is repaired for it. A
-    /// page walked across that form must still serve rows, not silently end.
+    /// A Postgres-rendered cursor carries a bare `+00` offset, with or without
+    /// fractional seconds; SQLite's `datetime()` needs minutes, so the bound
+    /// text is repaired for it. A page walked across either form must still
+    /// serve rows, not silently end.
     #[tokio::test]
     async fn a_bare_offset_in_the_snapshot_still_pages_on_sqlite() {
+        use base64::Engine;
         let (db, workspace_id, user_id) = seeded_workspace(6).await;
         let ctx = test_ctx(&db, &workspace_id, &user_id);
         let mut params = list_params(None);
         params.limit = Some(2);
         let first = list_issues(&ctx, params.clone()).await.expect("page 1");
-        let snapshot = first["snapshot_at"].as_str().expect("snapshot");
-        let bare = format!("{snapshot}+00");
+        let snapshot = first["snapshot_at"].as_str().expect("snapshot").to_string();
         let cursor = first["next_cursor"].as_str().expect("cursor");
-        // Replace the snapshot field of a genuine cursor with the bare form.
-        use base64::Engine;
         let raw = String::from_utf8(
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(cursor)
                 .expect("base64"),
         )
         .expect("utf8");
-        let mut parts: Vec<String> = raw.split('\u{1e}').map(str::to_string).collect();
-        parts[7] = bare;
-        let mut p = params;
-        p.cursor = Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(parts.join("\u{1e}")));
-        let page = list_issues(&ctx, p).await.expect("page 2");
-        assert!(!page["issues"].as_array().expect("issues").is_empty());
+        let parts: Vec<String> = raw.split('\u{1e}').map(str::to_string).collect();
+
+        for bare in [
+            format!("{snapshot}+00"),
+            format!("{snapshot}.123456+00"),
+        ] {
+            let mut forged = parts.clone();
+            forged[7] = bare.clone();
+            let mut p = params.clone();
+            p.cursor = Some(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(forged.join("\u{1e}")),
+            );
+            let page = list_issues(&ctx, p).await.expect("page 2");
+            assert!(
+                !page["issues"].as_array().expect("issues").is_empty(),
+                "a cursor carrying {bare} must still page"
+            );
+        }
     }
 
     #[test]
