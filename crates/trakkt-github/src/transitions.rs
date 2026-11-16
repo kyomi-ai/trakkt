@@ -30,13 +30,13 @@ fn determine_trigger(action: &str, merged: bool) -> Option<&'static str> {
     }
 }
 
-/// Whether a status category means the issue was deliberately abandoned.
+/// Whether a status category means the issue's work is over.
 ///
-/// GitHub events never move an issue out of it. `completed` is not included:
-/// a new PR on finished work reopening it is documented behaviour, asserted by
-/// `shared_merge_rules_use_each_account_token_and_disconnected_events_send_nothing`.
-fn is_cancelled_category(category: &str) -> bool {
-    category == "cancelled"
+/// GitHub events never move an issue out of one of these. Reopening finished or
+/// abandoned work is a decision for a person, not a side effect of a PR that
+/// happens to name the ticket.
+fn is_closed_category(category: &str) -> bool {
+    matches!(category, "completed" | "cancelled")
 }
 
 // ─── Rule Matching ─────────────────────────────────────────────────────────
@@ -308,16 +308,17 @@ pub async fn apply_transition_rules(
             continue;
         }
 
-        // A cancelled issue stays cancelled. Someone, or something, abandoned
-        // it on purpose, and a PR that merely names it — in a title, a body, a
-        // branch — is not a decision to revive it. Without this, any PR that
-        // mentioned a cancelled ticket quietly moved it back to In Progress and
-        // posted "Status moved to In Progress" on the PR.
-        if is_cancelled_category(&issue.status_category) {
+        // A completed or cancelled issue stays that way. Someone, or something,
+        // closed it on purpose, and a PR that merely names it — in a title, a
+        // body, a branch — is not a decision to reopen it. Without this, any PR
+        // that mentioned a closed ticket quietly moved it back to In Progress
+        // and posted "Status moved to In Progress" on the PR.
+        if is_closed_category(&issue.status_category) {
             tracing::debug!(
                 issue_id = %link.issue_id,
+                status = %issue.status_name,
                 trigger = %trigger,
-                "Issue is cancelled — leaving it alone"
+                "Issue is completed or cancelled — leaving it alone"
             );
             continue;
         }
@@ -514,10 +515,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_cancelled_is_left_alone() {
-        assert!(is_cancelled_category("cancelled"));
-        for other in ["backlog", "unstarted", "started", "completed"] {
-            assert!(!is_cancelled_category(other), "{other} may still be moved");
+    fn only_completed_and_cancelled_are_left_alone() {
+        assert!(is_closed_category("completed"));
+        assert!(is_closed_category("cancelled"));
+        for open in ["backlog", "unstarted", "started"] {
+            assert!(!is_closed_category(open), "{open} is still open work");
         }
     }
 

@@ -1954,10 +1954,11 @@ mod tests {
     }
 
     trakkt_core::dual_backend_test! {
-        /// Naming a ticket in a PR must not revive one that was cancelled. A
-        /// Backlog ticket does move, which is what proves the rules are live
-        /// and the cancelled assertion is not passing because nothing fired.
-        async fn a_pr_event_never_moves_a_cancelled_issue(db) {
+        /// Naming a ticket in a PR must not reopen one that was finished or
+        /// cancelled. A Backlog ticket does move, which is what proves the
+        /// rules are live and the assertions for the others are not passing
+        /// because nothing fired.
+        async fn a_pr_event_never_moves_a_completed_or_cancelled_issue(db) {
             seed(db).await;
             let github = controlled(Scenario::default()).await;
             add_account(db,&github.client,123).await;
@@ -1965,7 +1966,7 @@ mod tests {
             trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed statuses");
 
             // (starting category, whether the PR may move it)
-            for (n, (category, may_move)) in [("backlog", true), ("cancelled", false)].into_iter().enumerate() {
+            for (n, (category, may_move)) in [("backlog", true), ("cancelled", false), ("completed", false)].into_iter().enumerate() {
                 let issue = trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"closed-team".into(),creator_id:"admin-a".into(),title:format!("Mentioned in a PR while {category}"),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create issue");
                 let start = trakkt_auth::status_service::get_status_by_category(db,"workspace-a",category).await.expect("look up status").expect("category has a status");
                 if category != "backlog" {
