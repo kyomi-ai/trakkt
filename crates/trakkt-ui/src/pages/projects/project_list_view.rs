@@ -325,10 +325,7 @@ pub fn ProjectListView(
                         return false;
                     }
                 }
-                if !search_val.is_empty() && !issue.title.to_lowercase().contains(&search_val) {
-                    return false;
-                }
-                true
+                search_val.is_empty() || issue.title.to_lowercase().contains(&search_val)
             })
             .collect();
 

@@ -751,8 +751,10 @@ impl Grid {
             return;
         }
         let end = end.min(self.cols);
-        for col in start..end {
-            self.cells[row][col] = Cell::default();
+        if start < end {
+            for cell in &mut self.cells[row][start..end] {
+                *cell = Cell::default();
+            }
         }
         self.dirty_rows.insert(row);
     }
