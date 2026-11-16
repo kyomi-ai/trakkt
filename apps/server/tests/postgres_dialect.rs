@@ -4205,6 +4205,7 @@ dual_backend_test! {
             exclude_closed: false,
             status_id: None,
             status_categories: None,
+            clauses: Vec::new(),
             include_comments: false,
             limit: 50,
             offset: 0,
@@ -4273,5 +4274,277 @@ dual_backend_test! {
         p.exclude_closed = true;
         let open = search(db, &p).await.expect("closed-excluded search");
         assert_eq!(hit_numbers(&open), vec![dia(1)]);
+    }
+}
+
+// ─── Search: composable filter clauses ───────────────────────────────────────
+
+/// Seed one workspace with eight "Parity" issues that exercise every field of
+/// the composable filter model, and return their IDs by number.
+///
+/// 1: Todo, urgent, label A, project P        2: Done, high, labels A+B, parent of 3
+/// 3: Todo, medium, sub-issue of 2            4: In Progress, low, blocks 5
+/// 5: Todo, no priority, blocked by 4         6: Done, urgent, blocks 7
+/// 7: Todo, medium, "blocked" by a closed issue   8: Todo, low, archived
+async fn seed_parity_fixture(db: &DbPool) -> (HashMap<i64, String>, Vec<String>, String) {
+    use trakkt_auth::{issue_service, label_service, project_service, relation_service};
+
+    seed_tenancy(db).await;
+    let mut ids: HashMap<i64, String> = HashMap::new();
+    for n in 1..=8 {
+        let issue = create_issue(db, &format!("Parity issue {n}")).await;
+        ids.insert(issue.number as i64, issue.issue_id);
+    }
+    let label_a = label_service::create_label(db, WORKSPACE, "A", "#111111", Some(TEAM), None)
+        .await
+        .expect("label A");
+    let label_b = label_service::create_label(db, WORKSPACE, "B", "#222222", Some(TEAM), None)
+        .await
+        .expect("label B");
+    let project = project_service::create_project(
+        db,
+        &project_service::CreateProjectParams {
+            workspace_id: WORKSPACE,
+            name: "Parity project",
+            description: None,
+            icon: None,
+            color: None,
+            lead_id: None,
+            start_date: None,
+            target_date: None,
+        },
+        None,
+    )
+    .await
+    .expect("project");
+
+    for (n, labels) in [(1, vec![&label_a]), (2, vec![&label_a, &label_b])] {
+        let label_ids: Vec<String> = labels.iter().map(|l| l.label_id.clone()).collect();
+        issue_service::set_issue_labels(
+            db,
+            &ids[&n],
+            &label_ids,
+            Some(USER),
+            ActionSource::Api,
+            None,
+            None,
+        )
+        .await
+        .expect("set labels");
+    }
+    db_execute!(db, "UPDATE issues SET project_id = $1 WHERE issue_id = $2", &project.project_id, &ids[&1])
+        .expect("set project");
+
+    for (n, priority, status) in [
+        (1, 1, "todo"),
+        (2, 2, "done"),
+        (3, 3, "todo"),
+        (4, 4, "in_progress"),
+        (5, 0, "todo"),
+        (6, 1, "done"),
+        (7, 3, "todo"),
+        (8, 4, "todo"),
+    ] {
+        let status_id = format!("{WORKSPACE}::{status}");
+        db_execute!(
+            db,
+            "UPDATE issues SET priority = $1, status_id = $2 WHERE issue_id = $3",
+            priority, &status_id, &ids[&n]
+        )
+        .expect("set priority and status");
+    }
+    db_execute!(db, "UPDATE issues SET archived_at = CURRENT_TIMESTAMP WHERE issue_id = $1", &ids[&8])
+        .expect("archive issue 8");
+
+    relation_service::set_parent(db, WORKSPACE, &ids[&3], &ids[&2], Some(USER), ActionSource::Api, None, None)
+        .await
+        .expect("parent 2 -> 3");
+    for (blocker, blocked) in [(4, 5), (6, 7)] {
+        relation_service::create_relation(
+            db, WORKSPACE, &ids[&blocker], &ids[&blocked], "blocks",
+            Some(USER), ActionSource::Api, None, None,
+        )
+        .await
+        .expect("blocks relation");
+    }
+    (ids, vec![label_a.label_id, label_b.label_id], project.project_id)
+}
+
+fn clause(field: &str, operator: &str, values: &[&str]) -> trakkt_types::api::FilterClause {
+    trakkt_types::api::FilterClause {
+        field: field.to_owned(),
+        operator: operator.to_owned(),
+        values: values.iter().map(|v| (*v).to_owned()).collect(),
+    }
+}
+
+dual_backend_test! {
+    /// TRA-10114: every composable filter clause the issue list understands is
+    /// applied by the search itself, with the same meaning as
+    /// `FilterClause::matches`, on both backends.
+    ///
+    /// For each field/operator pair the SQL search must return exactly the
+    /// issues `matches` accepts out of the full issue list (archived included,
+    /// since search has no hidden defaults). Clause values sit at different
+    /// placeholder positions in the combined cases, so a bind-order mistake on
+    /// Postgres changes or fails a result.
+    async fn search_filter_clauses_match_the_issue_list_semantics(db) {
+        use trakkt_auth::search_service::{search, SearchParams};
+        use trakkt_types::models::IssueFilters;
+
+        let (ids, labels, project) = seed_parity_fixture(db).await;
+        let (label_a, label_b) = (labels[0].as_str(), labels[1].as_str());
+        let done = format!("{WORKSPACE}::done");
+        let todo = format!("{WORKSPACE}::todo");
+
+        let all = trakkt_auth::issue_service::list_issues(
+            db,
+            WORKSPACE,
+            None,
+            &IssueFilters { include_archived: Some(true), ..IssueFilters::default() },
+        )
+        .await
+        .expect("list every issue");
+        assert_eq!(all.len(), 8);
+
+        let case_sets: Vec<Vec<trakkt_types::api::FilterClause>> = vec![
+            vec![clause("status", "any_of", &[&done])],
+            vec![clause("status", "none_of", &[&done, &todo])],
+            vec![clause("priority", "any_of", &["1", "3"])],
+            vec![clause("priority", "none_of", &["1", "x"])],
+            vec![clause("priority", "any_of", &["x"])],
+            vec![clause("priority", "any_of", &["0"])],
+            vec![clause("label", "any_of", &[label_a, label_b])],
+            vec![clause("label", "all_of", &[label_a, label_b])],
+            vec![clause("label", "all_of", &[label_a, label_a])],
+            vec![clause("label", "not_any_of", &[label_b])],
+            vec![clause("label", "none_of", &[label_b])],
+            vec![clause("label", "not_all_of", &[label_a, label_b])],
+            vec![clause("project", "any_of", &[&project])],
+            vec![clause("project", "none_of", &[&project])],
+            vec![clause("is_sub_issue", "any_of", &[])],
+            vec![clause("is_sub_issue", "none_of", &[])],
+            vec![clause("is_parent", "any_of", &[])],
+            vec![clause("is_parent", "none_of", &[])],
+            vec![clause("is_blocked", "any_of", &[])],
+            vec![clause("is_blocked", "none_of", &[])],
+            vec![clause("is_blocking", "any_of", &[])],
+            vec![clause("is_blocking", "none_of", &[])],
+            vec![clause("has_relations", "any_of", &[])],
+            vec![clause("has_relations", "none_of", &[])],
+            vec![clause("issue_id", "any_of", &[&ids[&1], &ids[&3]])],
+            vec![clause("issue_id", "none_of", &[&ids[&1]])],
+            // Pass-through clauses constrain nothing.
+            vec![clause("status", "any_of", &[])],
+            vec![clause("nope", "any_of", &["x"])],
+            // Combined: status + priority + label + relations in one query.
+            vec![
+                clause("status", "none_of", &[&done]),
+                clause("priority", "any_of", &["0", "1", "3"]),
+                clause("label", "not_any_of", &[label_b]),
+                clause("is_blocked", "none_of", &[]),
+            ],
+            vec![
+                clause("label", "any_of", &[label_a]),
+                clause("project", "none_of", &[&project]),
+            ],
+        ];
+
+        for clauses in case_sets {
+            let mut expected: Vec<i64> = all
+                .iter()
+                .filter(|issue| clauses.iter().all(|c| c.matches(issue)))
+                .map(|issue| issue.number as i64)
+                .collect();
+            expected.sort_unstable();
+
+            // Alone, and again behind a team filter and a status filter so the
+            // clause placeholders start further along.
+            for (team, status_categories) in [
+                (None, None),
+                (Some(TEAM.to_owned()), Some(vec!["unstarted".to_owned(), "completed".to_owned(), "started".to_owned(), "backlog".to_owned(), "cancelled".to_owned()])),
+            ] {
+                let response = search(
+                    db,
+                    &SearchParams {
+                        query: "Parity".to_owned(),
+                        workspace_id: WORKSPACE.to_owned(),
+                        team_id: team,
+                        exclude_archived: false,
+                        exclude_closed: false,
+                        status_id: None,
+                        status_categories,
+                        clauses: clauses.clone(),
+                        include_comments: false,
+                        limit: 50,
+                        offset: 0,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("search with {clauses:?}: {e}"));
+                let mut actual: Vec<i64> = response.results.iter().map(|r| r.number).collect();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "search disagrees with FilterClause::matches for {clauses:?}");
+            }
+        }
+    }
+}
+
+dual_backend_test! {
+    /// TRA-10114: a filter narrows what is searched, not just what is shown, so
+    /// matches beyond the first page are filtered correctly; and the fetch cap
+    /// counts distinct issues, so one issue's many matching comments cannot
+    /// crowd other issues out of the result.
+    async fn search_filters_apply_before_paging_and_the_cap_counts_distinct_issues(db) {
+        use trakkt_auth::search_service::{search, SearchParams, SEARCH_FETCH_CAP};
+
+        seed_tenancy(db).await;
+        let mut issue_ids = Vec::new();
+        for n in 1..=4 {
+            issue_ids.push(create_issue(db, &format!("Crowd issue {n}")).await.issue_id);
+        }
+        issue_ids.sort();
+        // The issue whose ID sorts first gets more matching comments than the cap.
+        let crowder = issue_ids[0].clone();
+        for k in 0..(SEARCH_FETCH_CAP + 100) {
+            db_execute!(
+                db,
+                "INSERT INTO comments (comment_id, issue_id, user_id, body) VALUES ($1, $2, $3, $4)",
+                &format!("c-{k}"), &crowder, USER, "Crowd comment"
+            )
+            .expect("insert a matching comment");
+        }
+        // Only the last issue is urgent: it must be found with page size one.
+        let last = issue_ids[3].clone();
+        db_execute!(db, "UPDATE issues SET priority = 1 WHERE issue_id = $1", &last)
+            .expect("set priority");
+
+        let base = |clauses: Vec<trakkt_types::api::FilterClause>, limit: i64| SearchParams {
+            query: "Crowd".to_owned(),
+            workspace_id: WORKSPACE.to_owned(),
+            team_id: None,
+            exclude_archived: false,
+            exclude_closed: false,
+            status_id: None,
+            status_categories: None,
+            clauses,
+            include_comments: true,
+            limit,
+            offset: 0,
+        };
+
+        let everything = search(db, &base(Vec::new(), 50)).await.expect("unfiltered search");
+        let mut found: Vec<String> = everything.results.iter().map(|r| r.issue_id.clone()).collect();
+        found.sort();
+        assert_eq!(found, issue_ids, "comment rows crowded other issues out of the result");
+        assert_eq!(everything.total, 4);
+        assert!(!everything.truncated, "four distinct issues are far below the cap");
+
+        let urgent = search(db, &base(vec![clause("priority", "any_of", &["1"])], 1))
+            .await
+            .expect("filtered, page size one");
+        assert_eq!(urgent.total, 1);
+        assert_eq!(urgent.results.len(), 1);
+        assert_eq!(urgent.results[0].issue_id, last);
     }
 }

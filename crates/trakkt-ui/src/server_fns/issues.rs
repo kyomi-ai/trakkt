@@ -381,6 +381,8 @@ pub struct SearchResultItem {
 ///
 /// Only filters the caller sets are applied: `None` for `include_closed` /
 /// `include_archived` means no filtering, and only `Some(false)` excludes.
+/// `filters` is the issue-list filter clauses as JSON; the search applies them
+/// itself, before ranking and paging.
 #[server(prefix = "/leptos-api")]
 pub async fn search_issues(
     query: String,
@@ -389,6 +391,7 @@ pub async fn search_issues(
     include_archived: Option<bool>,
     include_comments: Option<bool>,
     limit: Option<i64>,
+    filters: Option<String>,
 ) -> Result<Vec<SearchResultItem>, ServerFnError> {
     let ac = AuthenticatedContext::extract().await?;
     let params = trakkt_auth::search_service::SearchParams {
@@ -400,6 +403,11 @@ pub async fn search_issues(
         exclude_closed: include_closed == Some(false),
         status_id: None,
         status_categories: None,
+        clauses: match filters.as_deref() {
+            Some(s) if !s.is_empty() => serde_json::from_str(s)
+                .map_err(|e| ServerFnError::new(format!("Invalid filters: {e}")))?,
+            _ => Vec::new(),
+        },
         include_comments: include_comments.unwrap_or(true),
         limit: limit.unwrap_or(50),
         offset: 0,

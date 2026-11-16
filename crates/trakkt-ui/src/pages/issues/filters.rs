@@ -1297,14 +1297,31 @@ pub fn find_field_def(key: &str) -> Option<&'static FilterFieldDef> {
 
 /// One-line description of exactly what a search is scoped to, so no filter
 /// is ever applied invisibly. Search has no hidden defaults: without a status
-/// filter it covers every status.
-pub fn search_scope_summary(clauses: &[FilterClause], include_archived: bool) -> String {
-    let status = if clauses.iter().any(|c| c.field == "status" && !c.values.is_empty()) {
-        "Status filter applied"
+/// filter it covers every status. `status_names` maps status IDs to names so a
+/// status filter says which statuses it selects.
+pub fn search_scope_summary(
+    clauses: &[FilterClause],
+    include_archived: bool,
+    status_names: &std::collections::HashMap<String, String>,
+) -> String {
+    let status_part = clauses
+        .iter()
+        .filter(|c| c.field == "status" && !c.values.is_empty())
+        .map(|c| {
+            let names: Vec<&str> = c
+                .values
+                .iter()
+                .map(|v| status_names.get(v).map_or(v.as_str(), String::as_str))
+                .collect();
+            let verb = if c.operator == "none_of" { "not " } else { "" };
+            format!("Status {verb}{}", names.join(" / "))
+        })
+        .collect::<Vec<_>>();
+    let mut parts = if status_part.is_empty() {
+        vec!["All statuses".to_string()]
     } else {
-        "All statuses"
+        status_part
     };
-    let mut parts = vec![status.to_string()];
     let others: Vec<&str> = clauses
         .iter()
         .filter(|c| c.field != "status")
@@ -1318,32 +1335,6 @@ pub fn search_scope_summary(clauses: &[FilterClause], include_archived: bool) ->
     }
     parts.push(if include_archived { "archived included" } else { "archived excluded" }.to_string());
     parts.join(" · ")
-}
-
-/// Apply the user's filter clauses to search hits with the same matcher the
-/// issue list uses. Returns the matching hits and how many could not be
-/// checked (the issue is not in the loaded set, e.g. archived or not synced
-/// yet) and were therefore left out; callers must surface that count.
-pub fn filter_search_hits(
-    hits: Vec<crate::server_fns::issues::SearchResultItem>,
-    clauses: &[FilterClause],
-    issues: &[IssueWithDetails],
-) -> (Vec<crate::server_fns::issues::SearchResultItem>, usize) {
-    if clauses.is_empty() {
-        return (hits, 0);
-    }
-    let mut unverified_ids = std::collections::HashSet::new();
-    let kept = hits
-        .into_iter()
-        .filter(|hit| match issues.iter().find(|i| i.issue_id == hit.issue_id) {
-            Some(issue) => clauses.iter().all(|c| apply_clause(c, issue)),
-            None => {
-                unverified_ids.insert(hit.issue_id.clone());
-                false
-            }
-        })
-        .collect();
-    (kept, unverified_ids.len())
 }
 
 /// Look up an operator definition for a given field and operator key.
@@ -2183,103 +2174,39 @@ pub fn FilterBar(
 #[cfg(test)]
 mod search_scope_tests {
     use super::*;
+    use std::collections::HashMap;
 
-    fn clause(field: &str) -> FilterClause {
+    fn clause(field: &str, op: &str, values: &[&str]) -> FilterClause {
         FilterClause {
             field: field.to_string(),
-            operator: "any_of".to_string(),
-            values: vec!["x".to_string()],
+            operator: op.to_string(),
+            values: values.iter().map(|v| v.to_string()).collect(),
         }
     }
 
     #[test]
     fn no_filters_says_all_statuses() {
-        assert_eq!(search_scope_summary(&[], false), "All statuses · archived excluded");
-        assert_eq!(search_scope_summary(&[], true), "All statuses · archived included");
+        let none = HashMap::new();
+        assert_eq!(search_scope_summary(&[], false, &none), "All statuses · archived excluded");
+        assert_eq!(search_scope_summary(&[], true, &none), "All statuses · archived included");
     }
 
     #[test]
-    fn status_and_other_filters_are_named() {
-        let s = search_scope_summary(&[clause("status"), clause("priority")], true);
-        assert!(s.starts_with("Status filter applied"));
-        assert!(s.contains("Filters: Priority"));
-    }
-
-    fn hit(id: &str) -> crate::server_fns::issues::SearchResultItem {
-        crate::server_fns::issues::SearchResultItem {
-            issue_id: id.to_string(),
-            number: 1,
-            team_key: "TRA".to_string(),
-            title: "t".to_string(),
-            status_name: "Done".to_string(),
-            status_category: "completed".to_string(),
-            priority: 0,
-            snippet: None,
-            match_field: "title".to_string(),
-            rank: 0.0,
-        }
-    }
-
-    fn issue(id: &str, status_id: &str) -> IssueWithDetails {
-        IssueWithDetails {
-            issue_id: id.to_string(),
-            workspace_id: "ws".to_string(),
-            team_id: "tea".to_string(),
-            team_key: "TRA".to_string(),
-            number: 1,
-            title: "t".to_string(),
-            description: None,
-            status_id: status_id.to_string(),
-            status_name: "s".to_string(),
-            status_category: "completed".to_string(),
-            priority: 0,
-            assignee_id: None,
-            assignee_name: None,
-            creator_id: "u".to_string(),
-            creator_name: None,
-            due_date: None,
-            project_id: None,
-            project_name: None,
-            milestone_id: None,
-            estimate: None,
-            parent_identifier: None,
-            parent_title: None,
-            sort_order: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            started_at: None,
-            completed_at: None,
-            released_at: None,
-            archived_at: None,
-            has_children: false,
-            is_blocked: false,
-            is_blocking: false,
-            has_relations: false,
-            labels: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn hits_pass_through_unfiltered_when_no_clauses() {
-        let (kept, unverified) = filter_search_hits(vec![hit("a"), hit("zzz")], &[], &[]);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(unverified, 0);
-    }
-
-    #[test]
-    fn hits_are_filtered_and_unresolvable_hits_are_counted() {
-        let status = FilterClause {
-            field: "status".to_string(),
-            operator: "any_of".to_string(),
-            values: vec!["done".to_string()],
-        };
-        let issues = [issue("a", "done"), issue("b", "todo")];
-        let (kept, unverified) = filter_search_hits(
-            vec![hit("a"), hit("b"), hit("archived"), hit("archived")],
-            &[status],
-            &issues,
+    fn selected_statuses_and_other_filters_are_named() {
+        let names = HashMap::from([
+            ("s-done".to_string(), "Done".to_string()),
+            ("s-can".to_string(), "Cancelled".to_string()),
+        ]);
+        let s = search_scope_summary(
+            &[
+                clause("status", "any_of", &["s-done", "s-can"]),
+                clause("priority", "any_of", &["1"]),
+            ],
+            true,
+            &names,
         );
-        assert_eq!(kept.iter().map(|h| h.issue_id.as_str()).collect::<Vec<_>>(), vec!["a"]);
-        assert_eq!(unverified, 1);
+        assert_eq!(s, "Status Done / Cancelled · Filters: Priority · archived included");
+        let excluded = search_scope_summary(&[clause("status", "none_of", &["s-done"])], false, &names);
+        assert_eq!(excluded, "Status not Done · archived excluded");
     }
 }

@@ -38,7 +38,7 @@ use crate::components::{
 };
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{
-    apply_clause, filter_search_hits, group_issues, parse_sort_field, search_scope_summary,
+    apply_clause, group_issues, parse_sort_field, search_scope_summary,
     sort_field_to_str, sort_issues, FilterBar, GroupDropdown, GroupField, SortDirection, SortDropdown, SortField,
 };
 use crate::pages::issues::issue_row::IssueRow;
@@ -566,15 +566,22 @@ pub(crate) fn IssueListInner(
             debounced_search.get(),
             resolved_team.get().map(|t| t.team_id.clone()),
             include_archived_search.get(),
+            filter_clauses.get(),
         ),
-        move |(query, team_id, include_archived)| async move {
+        move |(query, team_id, include_archived, clauses)| async move {
             if query.trim().is_empty() {
                 return Ok(Vec::new());
             }
             // No hidden defaults: no status filter is sent (all statuses are
             // searched). The visible "Include archived" toggle and the filter
-            // bar are the only narrowing; filter clauses are applied to the
-            // hits below. One extra row is requested to detect truncation.
+            // bar are the only narrowing, and the server applies every filter
+            // clause itself (before ranking and paging). One extra row is
+            // requested to detect truncation.
+            let filters = if clauses.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&clauses).ok()
+            };
             search_issues(
                 query,
                 team_id,
@@ -582,6 +589,7 @@ pub(crate) fn IssueListInner(
                 Some(include_archived),
                 Some(true),
                 Some(SEARCH_PAGE_SIZE + 1),
+                filters,
             ).await
         },
     );
@@ -591,7 +599,7 @@ pub(crate) fn IssueListInner(
         !search.get().trim().is_empty() && search_resource.get().is_none()
     });
     let search_error = RwSignal::new(Option::<String>::None);
-    // Visible notes about truncated or unverifiable search hits.
+    // Visible note when the result page is truncated.
     let search_note = RwSignal::new(String::new());
 
 
@@ -986,27 +994,15 @@ pub(crate) fn IssueListInner(
         let results = match search_resource.get() {
             Some(Ok(items)) => {
                 search_error.set(None);
-                // Apply the user's filter clauses with the same matcher the
-                // issue list uses. Hits we cannot resolve are dropped when a
-                // filter is set, since we cannot show they match it.
                 let mut items = items;
                 let truncated = items.len() > SEARCH_PAGE_SIZE as usize;
                 items.truncate(SEARCH_PAGE_SIZE as usize);
-                let (kept, unverified) =
-                    filter_search_hits(items, &filter_clauses.get(), &team_issues.get());
-                let mut notes = Vec::new();
-                if truncated {
-                    notes.push(format!(
-                        "showing only the first {SEARCH_PAGE_SIZE} matches, refine your search"
-                    ));
-                }
-                if unverified > 0 {
-                    notes.push(format!(
-                        "{unverified} match(es) not shown: they cannot be checked against the filters (archived or not loaded yet)"
-                    ));
-                }
-                search_note.set(notes.join("; "));
-                kept
+                search_note.set(if truncated {
+                    format!("showing only the first {SEARCH_PAGE_SIZE} matches, refine your search")
+                } else {
+                    String::new()
+                });
+                items
             }
             Some(Err(e)) => {
                 search_error.set(Some(format!("Search failed: {e}")));
@@ -1778,9 +1774,20 @@ pub(crate) fn IssueListInner(
                                 let groups = grouped_search_results.get();
                                 let query = debounced_search.get();
                                 let scope_line = {
+                                    let status_names: std::collections::HashMap<String, String> =
+                                        sync_store
+                                            .map(|st| {
+                                                st.statuses()
+                                                    .get()
+                                                    .into_iter()
+                                                    .map(|s| (s.status_id, s.name))
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
                                     let base = search_scope_summary(
                                         &filter_clauses.get(),
                                         include_archived_search.get(),
+                                        &status_names,
                                     );
                                     let note = search_note.get();
                                     if note.is_empty() {

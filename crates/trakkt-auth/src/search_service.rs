@@ -7,6 +7,9 @@
 //! without ranking or snippets.
 
 use trakkt_core::DbPool;
+use trakkt_types::api::FilterClause;
+
+use crate::filter_sql::{clauses_to_sql, SqlArg};
 
 // ─── Row types ──────────────────────────────────────────────────────────────
 
@@ -91,28 +94,62 @@ pub struct SearchParams {
     pub status_id: Option<String>,
     /// Restrict to these status categories (same meaning as the issue-list filter).
     pub status_categories: Option<Vec<String>>,
+    /// Composable issue-list filter clauses (status, priority, label,
+    /// project, relations, ...), applied in SQL before ranking and paging.
+    pub clauses: Vec<FilterClause>,
     pub include_comments: bool,
     pub limit: i64,
     pub offset: i64,
 }
 
-impl SearchParams {
-    /// Values bound after the team ID, in placeholder order: the status ID
-    /// (when set) followed by each status category.
-    fn status_binds(&self) -> Vec<&str> {
-        let mut binds: Vec<&str> = Vec::new();
-        if let Some(id) = &self.status_id {
-            binds.push(id);
-        }
-        if let Some(categories) = &self.status_categories {
-            binds.extend(categories.iter().map(String::as_str));
-        }
-        binds
-    }
+/// Everything the caller's filters add to the query: the shared WHERE
+/// conditions and the values bound after the team ID, in placeholder order.
+struct FilterPlan {
+    conditions: Vec<String>,
+    args: Vec<SqlArg>,
+    /// First placeholder index not used by the workspace/query/team/filters.
+    next_param: usize,
+}
 
-    /// First free placeholder index after the workspace/query/team binds.
-    fn first_free_param(&self) -> usize {
-        3 + usize::from(self.team_id.is_some()) + self.status_binds().len()
+impl SearchParams {
+    /// Build the filter conditions. Only filters the caller set appear.
+    fn plan(&self) -> FilterPlan {
+        let mut conditions = Vec::new();
+        let mut args = Vec::new();
+        let mut next = 3;
+        if self.team_id.is_some() {
+            conditions.push("i.team_id = $3".to_string());
+            next = 4;
+        }
+        if let Some(id) = &self.status_id {
+            conditions.push(format!("i.status_id = ${next}"));
+            args.push(SqlArg::Text(id.clone()));
+            next += 1;
+        }
+        if let Some(categories) = &self.status_categories
+            && !categories.is_empty()
+        {
+            let (in_clause, after) =
+                trakkt_core::db::in_clause_placeholders(categories.len(), next);
+            conditions.push(format!("s.category IN {in_clause}"));
+            args.extend(categories.iter().cloned().map(SqlArg::Text));
+            next = after;
+        }
+        let compiled = clauses_to_sql(&self.clauses, next);
+        conditions.extend(compiled.conditions);
+        args.extend(compiled.args);
+        next = compiled.next_param;
+        if self.exclude_closed {
+            conditions.push("s.category NOT IN ('completed', 'cancelled')".to_string());
+        }
+        if self.exclude_archived {
+            conditions.push("i.archived_at IS NULL".to_string());
+        }
+        FilterPlan {
+            conditions,
+            args,
+            next_param: next,
+        }
     }
 }
 
@@ -156,6 +193,7 @@ pub async fn search(
         exclude_closed: params.exclude_closed,
         status_id: params.status_id.clone(),
         status_categories: params.status_categories.clone(),
+        clauses: params.clauses.clone(),
         include_comments: params.include_comments,
         // One past the cap, so a result set of exactly the cap is not
         // mistaken for a truncated one.
@@ -172,14 +210,10 @@ pub async fn search(
     let truncated = rows.len() as i64 > SEARCH_FETCH_CAP;
     rows.truncate(SEARCH_FETCH_CAP as usize);
 
-    // Dedup by issue_id, keeping the entry with the highest rank (identifier
-    // matches have rank 2.0 so they win over tsvector / LIKE matches).
-    let mut seen = std::collections::HashSet::new();
-    let all_results: Vec<SearchResult> = rows
-        .into_iter()
-        .map(SearchResult::from)
-        .filter(|r| seen.insert(r.issue_id.clone()))
-        .collect();
+    // The SQL already keeps one best-ranked row per issue (identifier matches
+    // rank 2.0 so they win over tsvector / LIKE matches), so the cap counts
+    // distinct issues and comment rows cannot crowd out other hits.
+    let all_results: Vec<SearchResult> = rows.into_iter().map(SearchResult::from).collect();
 
     let total = all_results.len() as i64;
 
@@ -214,31 +248,24 @@ fn shared_conditions_sqlite(params: &SearchParams) -> Vec<String> {
     shared_conditions("i.workspace_id = $1", params)
 }
 
-/// Only filters the caller explicitly set become conditions. Status binds
-/// follow the optional team bind starting at `$3`/`$4`.
+/// Only filters the caller explicitly set become conditions.
 fn shared_conditions(workspace_cond: &str, params: &SearchParams) -> Vec<String> {
     let mut conds = vec![workspace_cond.to_string()];
-    if params.team_id.is_some() {
-        conds.push("i.team_id = $3".to_string());
-    }
-    let mut next = if params.team_id.is_some() { 4 } else { 3 };
-    if params.status_id.is_some() {
-        conds.push(format!("i.status_id = ${next}"));
-        next += 1;
-    }
-    if let Some(categories) = &params.status_categories
-        && !categories.is_empty()
-    {
-        let (in_clause, _) = trakkt_core::db::in_clause_placeholders(categories.len(), next);
-        conds.push(format!("s.category IN {in_clause}"));
-    }
-    if params.exclude_closed {
-        conds.push("s.category NOT IN ('completed', 'cancelled')".to_string());
-    }
-    if params.exclude_archived {
-        conds.push("i.archived_at IS NULL".to_string());
-    }
+    conds.extend(params.plan().conditions);
     conds
+}
+
+/// Keep one best-ranked row per issue, then order and page. Applied in SQL so
+/// the row cap counts distinct issues.
+fn dedup_and_page(union_sql: &str, limit: i64, offset: i64) -> String {
+    format!(
+        "SELECT issue_id, number, team_key, title, status_name, status_category, \
+         priority, snippet, match_field, rank FROM (\
+         SELECT u.*, ROW_NUMBER() OVER (PARTITION BY u.issue_id \
+         ORDER BY u.rank DESC, u.match_field ASC) AS rn FROM ({union_sql}) u) d \
+         WHERE rn = 1 ORDER BY rank DESC, issue_id ASC, match_field ASC \
+         LIMIT {limit} OFFSET {offset}"
+    )
 }
 
 /// Parse an issue identifier from a search query.
@@ -295,7 +322,8 @@ async fn search_postgres(
     //   $N = identifier number (when identifier detected)
     //   $N+1 = parsed team_key (when identifier has "KEY-NUM" format)
 
-    let mut next_param = params.first_free_param();
+    let plan_args = params.plan().args;
+    let mut next_param = params.plan().next_param;
 
     let mut issue_conditions = shared_conditions_pg(params);
     issue_conditions.push("i.search_vector @@ query".to_string());
@@ -381,12 +409,7 @@ async fn search_postgres(
         parts.push(c_sql.as_str());
     }
 
-    let sql = format!(
-        "{} ORDER BY rank DESC, issue_id ASC, match_field ASC LIMIT {} OFFSET {}",
-        parts.join(" UNION ALL "),
-        params.limit,
-        params.offset
-    );
+    let sql = dedup_and_page(&parts.join(" UNION ALL "), params.limit, params.offset);
 
     let rows: Vec<SearchResultRow> = trakkt_core::db_with_pool!(db, |p| {
         let mut query = sqlx::query_as::<_, SearchResultRow>(&sql);
@@ -395,8 +418,11 @@ async fn search_postgres(
         if let Some(team_id) = &params.team_id {
             query = query.bind(team_id);
         }
-        for value in params.status_binds() {
-            query = query.bind(value);
+        for arg in &plan_args {
+            query = match arg {
+                SqlArg::Text(v) => query.bind(v),
+                SqlArg::Int(n) => query.bind(*n),
+            };
         }
         if let Some((parsed_key, number)) = identifier {
             query = query.bind(number);
@@ -426,7 +452,8 @@ async fn search_sqlite(
     //   $N = identifier number (when identifier detected)
     //   $N+1 = parsed team_key (when identifier has "KEY-NUM" format)
 
-    let mut next_param = params.first_free_param();
+    let plan_args = params.plan().args;
+    let mut next_param = params.plan().next_param;
 
     let mut issue_conditions = shared_conditions_sqlite(params);
     issue_conditions
@@ -510,12 +537,7 @@ async fn search_sqlite(
         parts.push(c_sql.as_str());
     }
 
-    let sql = format!(
-        "{} ORDER BY rank DESC, issue_id ASC, match_field ASC LIMIT {} OFFSET {}",
-        parts.join(" UNION ALL "),
-        params.limit,
-        params.offset
-    );
+    let sql = dedup_and_page(&parts.join(" UNION ALL "), params.limit, params.offset);
 
     let rows: Vec<SearchResultRow> = trakkt_core::db_with_pool!(db, |p| {
         let mut query = sqlx::query_as::<_, SearchResultRow>(&sql);
@@ -524,8 +546,11 @@ async fn search_sqlite(
         if let Some(team_id) = &params.team_id {
             query = query.bind(team_id);
         }
-        for value in params.status_binds() {
-            query = query.bind(value);
+        for arg in &plan_args {
+            query = match arg {
+                SqlArg::Text(v) => query.bind(v),
+                SqlArg::Int(n) => query.bind(*n),
+            };
         }
         if let Some((parsed_key, number)) = identifier {
             query = query.bind(number);
@@ -554,6 +579,7 @@ mod tests {
             exclude_closed: false,
             status_id: None,
             status_categories: None,
+            clauses: Vec::new(),
             include_comments: true,
             limit: 20,
             offset: 0,
@@ -612,8 +638,38 @@ mod tests {
         let conds = shared_conditions_pg(&params);
         assert!(conds.contains(&"i.status_id = $4".to_string()));
         assert!(conds.contains(&"s.category IN ($5, $6)".to_string()));
-        assert_eq!(params.status_binds(), vec!["s1", "completed", "cancelled"]);
-        assert_eq!(params.first_free_param(), 7);
+        let plan = params.plan();
+        assert_eq!(
+            plan.args,
+            vec![
+                SqlArg::Text("s1".into()),
+                SqlArg::Text("completed".into()),
+                SqlArg::Text("cancelled".into()),
+            ]
+        );
+        assert_eq!(plan.next_param, 7);
+    }
+
+    #[test]
+    fn clauses_bind_after_status_filters() {
+        let mut params = default_params();
+        params.team_id = Some("team-1".to_string());
+        params.status_id = Some("s1".to_string());
+        params.clauses = vec![FilterClause {
+            field: "label".to_string(),
+            operator: "any_of".to_string(),
+            values: vec!["l1".to_string(), "l2".to_string()],
+        }];
+        let plan = params.plan();
+        assert!(plan.conditions.iter().any(|c| c.contains("il.label_id IN ($5, $6)")));
+        assert_eq!(plan.next_param, 7);
+    }
+
+    #[test]
+    fn dedup_wraps_the_union_without_changing_its_columns() {
+        let sql = dedup_and_page("SELECT 1", 10, 0);
+        assert!(sql.contains("ROW_NUMBER() OVER (PARTITION BY u.issue_id"));
+        assert!(sql.ends_with("LIMIT 10 OFFSET 0"));
     }
 
     #[test]

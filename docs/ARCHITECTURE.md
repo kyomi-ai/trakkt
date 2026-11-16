@@ -306,7 +306,7 @@ Streamable HTTP transport at `/mcp`, served by the same Axum binary.
 | `add_comment` | `issue_number`, `body` | Created comment |
 | `list_labels` | — | All labels |
 | `create_label` | `name`, `color` | Created label |
-| `search_issues` | `query`, `limit?` | Matching issues |
+| `search_issues` | `query`, `limit?`, `offset?`, `team_key?`/`team_id?`, `status_id?`, `status_category?`, `filters?` (the same composable clauses as `list_issues`, applied in SQL before ranking and paging), `include_comments?`, `include_archived?`, `include_closed?` (deprecated) | Ranked matches `{results, total, has_more, next_offset, truncated}`; no filter is applied unless passed |
 
 All tools write through the same service layer as the UI, which means mutations hit `sync_log` and broadcast to connected WebSocket clients. An agent creating an issue shows up instantly in every open browser tab.
 

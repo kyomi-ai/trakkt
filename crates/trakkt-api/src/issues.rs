@@ -73,11 +73,7 @@ pub async fn list_issues(
     };
 
     // Parse composable filter clauses from the JSON string, if provided.
-    let clauses: Vec<FilterClause> = match params.filters.as_deref() {
-        Some(s) if !s.is_empty() => serde_json::from_str(s)
-            .map_err(|e| ApiError::BadRequest(format!("Invalid filters JSON: {e}")))?,
-        _ => Vec::new(),
-    };
+    let clauses = parse_filter_clauses(params.filters.as_deref())?;
 
     // A cursor is only valid for the query that produced it. Everything that
     // selects or orders rows goes into the fingerprint.
@@ -104,12 +100,7 @@ pub async fn list_issues(
         .transpose()?;
 
     let status_id = params.status_id;
-    let status_categories: Option<Vec<String>> = params.status_category.map(|s| {
-        s.split(',')
-            .map(|c| c.trim().to_string())
-            .filter(|c| !c.is_empty())
-            .collect()
-    });
+    let status_categories = parse_csv(params.status_category.as_deref());
     let include_closed = params.include_closed.unwrap_or(false);
 
     let exclude_status_categories =
@@ -126,12 +117,7 @@ pub async fn list_issues(
         priority: params.priority,
         assignee_id: params.assignee,
         creator_id: None,
-        label_ids: params.label.map(|s| {
-            s.split(',')
-                .map(|id| id.trim().to_string())
-                .filter(|id| !id.is_empty())
-                .collect()
-        }),
+        label_ids: parse_csv(params.label.as_deref()),
         search: params.search,
         // Paging happens below, after the composable clauses, so that `total`
         // and the cursor see the complete filtered result.
@@ -693,6 +679,15 @@ pub async fn delete_issue(
     Ok(json!({ "message": format!("Issue {team_key}-{number} deleted") }))
 }
 
+/// Parse the JSON `filters` parameter shared by `list_issues` and `search_issues`.
+fn parse_filter_clauses(raw: Option<&str>) -> ApiResult<Vec<FilterClause>> {
+    match raw {
+        Some(s) if !s.is_empty() => serde_json::from_str(s)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid filters JSON: {e}"))),
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Split a comma-separated filter value; blank or empty input means "no filter".
 fn parse_csv(raw: Option<&str>) -> Option<Vec<String>> {
     let values: Vec<String> = raw?
@@ -712,6 +707,7 @@ pub async fn search_issues(
     params: SearchIssuesApiParams,
 ) -> ApiResult<serde_json::Value> {
     let limit = clamp_limit(params.limit, 20, 100);
+    let clauses = parse_filter_clauses(params.filters.as_deref())?;
 
     let team_id = resolve_team(
         ctx.db,
@@ -730,6 +726,7 @@ pub async fn search_issues(
         exclude_closed: params.include_closed == Some(false),
         status_id: params.status_id.filter(|s| !s.is_empty()),
         status_categories: parse_csv(params.status_category.as_deref()),
+        clauses,
         include_comments: params.include_comments.unwrap_or(true),
         limit,
         offset: params.offset.unwrap_or(0).max(0),
@@ -764,7 +761,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "search_issues",
-            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of matches ignoring limit/offset; when `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. A search considers at most its 1000 best-ranked matches: when `truncated` is true, `total` is a lower bound and lower-ranked matches cannot be reached by paging, so narrow the query (team, status filters, include_comments). Search applies only the filters you pass and no hidden defaults: with no status filter it covers every status, including Done and Cancelled, and archived issues. Narrow with status_id, status_category (comma-separated: backlog, unstarted, started, completed, cancelled), team_key/team_id, include_archived=false, or include_comments=false (comments are searched by default). An exact identifier such as 'TRA-35' always matches that issue unless a filter you set excludes it. include_closed is deprecated and kept for compatibility: omitted or true means no status filtering; only an explicit false excludes completed and cancelled issues.",
+            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of matches ignoring limit/offset; when `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. A search considers at most its 1000 best-ranked matches: when `truncated` is true, `total` is a lower bound and lower-ranked matches cannot be reached by paging, so narrow the query (team, status filters, include_comments). Search applies only the filters you pass and no hidden defaults: with no status filter it covers every status, including Done and Cancelled, and archived issues. Narrow with status_id, status_category (comma-separated: backlog, unstarted, started, completed, cancelled), the same composable `filters` as list_issues (a JSON array of `{field, operator, values}` clauses AND-ed together; fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations; operators: any_of, none_of, all_of, not_any_of, not_all_of), applied before ranking and paging, team_key/team_id, include_archived=false, or include_comments=false (comments are searched by default). An exact identifier such as 'TRA-35' always matches that issue unless a filter you set excludes it. include_closed is deprecated and kept for compatibility: omitted or true means no status filtering; only an explicit false excludes completed and cancelled issues.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues/search",
@@ -983,6 +980,7 @@ mod tests {
             team_id: None,
             status_id: None,
             status_category: None,
+            filters: None,
             include_closed: None,
             include_archived: None,
             include_comments: Some(false),
@@ -1551,6 +1549,7 @@ mod tests {
                     team_id: None,
                     status_id: None,
                     status_category: None,
+                    filters: None,
                     include_closed: None,
                     include_archived: None,
                     include_comments: Some(false),

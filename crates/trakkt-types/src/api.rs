@@ -352,6 +352,13 @@ pub struct SearchIssuesApiParams {
     /// started, completed, cancelled. Omit to search every status, including
     /// completed and cancelled.
     pub status_category: Option<String>,
+    /// JSON array of composable filter clauses, AND-ed together, applied by
+    /// the search itself (before ranking and paging). Same format as
+    /// `list_issues`: each clause is `{"field","operator","values"}`.
+    /// Fields: status, priority, label, project, is_sub_issue, is_parent,
+    /// is_blocked, is_blocking, has_relations.
+    /// Operators: any_of, none_of, all_of, not_any_of, not_all_of.
+    pub filters: Option<String>,
     /// Deprecated, kept for compatibility. Omitted or true: no status
     /// filtering (completed and cancelled issues are searched). Only an
     /// explicit false excludes completed and cancelled issues; prefer
