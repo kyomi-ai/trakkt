@@ -3,19 +3,21 @@
 //! Integrations settings page — GitHub App installation self-service UI.
 //!
 //! Lists visible connections with per-account controls and authoritative
-//! repository access. Automation rules remain shared across the workspace.
+//! repository access. Automation rules are shared across the workspace; a team
+//! can override each step, and the PR linkback comment can be turned off.
 
 use leptos::prelude::*;
 use phosphor_leptos::{Icon, IconWeight};
 
 use crate::components::{
     Alert, AlertDescription, AlertVariant, Button, ButtonSize, ButtonVariant, Card, CardContent,
-    CardHeader, CardTitle, Skeleton, Spinner, Switch,
+    CardHeader, CardTitle, Select, Skeleton, Spinner, Switch,
 };
 use crate::server_fns::github::{
-    GitHubConnectionDisplay, GitHubIntegrationStatus, TransitionRuleDisplay, disconnect_github,
-    get_github_integration_status, get_transition_rules, start_github_connection,
-    remove_github, toggle_transition_rule,
+    AutomationSettingsDisplay, GitHubConnectionDisplay, GitHubIntegrationStatus,
+    TeamAutomationDisplay, TransitionRuleDisplay, disconnect_github, get_automation_settings,
+    get_github_integration_status, get_transition_rules, remove_github, set_github_linkback,
+    set_team_automation_rule, start_github_connection, toggle_transition_rule,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +76,7 @@ pub fn IntegrationsPage() -> impl IntoView {
                                             <ConnectedCard connection=connection on_disconnected=Callback::new(move |()| set_version.update(|v| *v += 1))/>
                                         }).collect_view()}
                                         <Card><CardContent><TransitionRulesSection/></CardContent></Card>
+                                        <Card><CardContent><TeamAutomationSection/></CardContent></Card>
                                     </div>
                                 }.into_any()
                             }
@@ -521,11 +524,15 @@ fn TransitionRulesSection() -> impl IntoView {
                                         }).collect_view()}
                                     </div>
                                     <p class="text-xs text-muted-foreground mt-3">
-                                        "Rules with "
-                                        <span class="font-medium">"close intent"</span>
-                                        " only fire when the PR description contains "
-                                        <span class="font-mono text-[11px]">"\"Closes TRA-N\""</span>
-                                        " or similar keywords."
+                                        "A PR links to an issue through its branch name, its title, or a magic word before the issue key ("
+                                        <span class="font-mono text-[11px]">"Fixes TRA-N"</span>
+                                        ", "
+                                        <span class="font-mono text-[11px]">"Refs TRA-N"</span>
+                                        ", "
+                                        <span class="font-mono text-[11px]">"Related to TRA-N"</span>
+                                        "). Only closing words complete the issue on merge. "
+                                        <span class="font-mono text-[11px]">"Skip TRA-N"</span>
+                                        " prevents linking. A key mentioned in the description never changes status. Drafts do nothing until marked ready, and issues are never moved backwards or out of Done or Cancelled."
                                     </p>
                                 }.into_any()
                             }
@@ -546,13 +553,160 @@ fn TransitionRulesSection() -> impl IntoView {
     }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Team automation section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The steps a team can override, with the label shown for each.
+const TEAM_STEPS: [(&str, &str); 4] = [
+    ("pr_draft", "PR opened as draft"),
+    ("pr_opened", "PR opened or ready for review"),
+    ("pr_merged", "PR merged"),
+    ("pr_closed", "PR closed without merge"),
+];
+
+/// What a team's step can be set to. `default` removes the override.
+fn team_step_options() -> Vec<(String, String)> {
+    [
+        ("default", "Workspace default"),
+        ("none", "No action"),
+        ("backlog", "Backlog"),
+        ("unstarted", "Todo"),
+        ("started", "In Progress"),
+        ("completed", "Done"),
+        ("cancelled", "Cancelled"),
+    ]
+    .into_iter()
+    .map(|(value, label)| (value.to_string(), label.to_string()))
+    .collect()
+}
+
+/// The PR linkback comment switch and each team's overrides of the shared rules.
+#[component]
+fn TeamAutomationSection() -> impl IntoView {
+    let (version, set_version) = signal(0u32);
+    let settings = Resource::new(move || version.get(), |_| get_automation_settings());
+
+    view! {
+        <div class="space-y-3" data-github-team-automation>
+            <p class="text-sm font-medium text-foreground">"Team automation"</p>
+            <Transition fallback=move || view! { <Skeleton class="h-4 w-full"/> }>
+                {move || Suspend::new(async move {
+                    match settings.await {
+                        Ok(settings) => view! {
+                            <TeamAutomationBody settings=settings on_changed=Callback::new(move |()| set_version.update(|v| *v += 1))/>
+                        }.into_any(),
+                        Err(e) => view! {
+                            <Alert variant=AlertVariant::Error>
+                                <AlertDescription>
+                                    {format!("Failed to load team automation: {e}")}
+                                </AlertDescription>
+                            </Alert>
+                        }.into_any(),
+                    }
+                })}
+            </Transition>
+        </div>
+    }
+}
+
+#[component]
+fn TeamAutomationBody(
+    settings: AutomationSettingsDisplay,
+    on_changed: Callback<()>,
+) -> impl IntoView {
+    let (linkback, set_linkback) = signal(settings.linkback_enabled);
+    let linkback_action = Action::new(move |enabled: &bool| {
+        let enabled = *enabled;
+        async move { set_github_linkback(enabled).await }
+    });
+    Effect::new(move || {
+        if let Some(Err(e)) = linkback_action.value().get() {
+            tracing::warn!("Failed to change linkback comment setting: {e}");
+            set_linkback.update(|v| *v = !*v);
+        }
+    });
+    let on_linkback = Callback::new(move |enabled: bool| {
+        set_linkback.set(enabled);
+        linkback_action.dispatch(enabled);
+    });
+
+    view! {
+        <div class="flex items-center justify-between py-1.5">
+            <p class="text-sm text-foreground">"Comment on the PR when it changes an issue's status"</p>
+            <Switch checked=Signal::derive(move || linkback.get()) on_change=on_linkback/>
+        </div>
+        <p class="text-xs text-muted-foreground">
+            "Each team can replace a shared rule above for its own issues, or turn a step off."
+        </p>
+        <div class="space-y-4">
+            {settings.teams.into_iter().map(|team| {
+                view! { <TeamAutomationRow team=team on_changed=on_changed/> }
+            }).collect_view()}
+        </div>
+    }
+}
+
+#[component]
+fn TeamAutomationRow(team: TeamAutomationDisplay, on_changed: Callback<()>) -> impl IntoView {
+    let team_id = team.team_id.clone();
+    let save = Action::new(move |(trigger, choice): &(String, String)| {
+        let team_id = team_id.clone();
+        let (trigger, choice) = (trigger.clone(), choice.clone());
+        async move {
+            let result = set_team_automation_rule(team_id, trigger, choice).await;
+            if result.is_ok() {
+                on_changed.run(());
+            }
+            result
+        }
+    });
+    let failure = move || {
+        save.value()
+            .get()
+            .and_then(|r| r.err())
+            .map(|e| format!("Could not save: {e}"))
+    };
+
+    view! {
+        <div class="space-y-1" data-github-team=team.key.clone()>
+            <p class="text-sm font-medium text-foreground">{format!("{} ({})", team.name, team.key)}</p>
+            {TEAM_STEPS.into_iter().map(|(step, label)| {
+                let current = team
+                    .overrides
+                    .iter()
+                    .find(|o| o.trigger_event == step)
+                    .map(|o| o.choice.clone())
+                    .unwrap_or_else(|| "default".to_string());
+                let step_owned = step.to_string();
+                view! {
+                    <div class="flex items-center justify-between gap-3 py-0.5">
+                        <span class="text-sm text-muted-foreground">{label}</span>
+                        <Select
+                            value=Signal::derive(move || current.clone())
+                            options=Signal::derive(team_step_options)
+                            on_change=Callback::new(move |choice: String| {
+                                save.dispatch((step_owned.clone(), choice));
+                            })
+                        />
+                    </div>
+                }
+            }).collect_view()}
+            {move || failure().map(|message| view! {
+                <p class="text-xs text-destructive">{message}</p>
+            })}
+        </div>
+    }
+}
+
 /// A single transition rule row with a description and toggle switch.
 #[component]
 fn TransitionRuleRow(rule: TransitionRuleDisplay) -> impl IntoView {
     let rule_id = rule.rule_id.clone();
     let (enabled, set_enabled) = signal(rule.enabled);
 
-    let description = format_rule_description(&rule.trigger_event, rule.close_intent_required);
+    let description = format_rule_description(&rule.trigger_event);
     let target = format_target_status(&rule.target_status_category);
 
     let toggle_action = Action::new(move |new_val: &bool| {
@@ -591,14 +745,12 @@ fn TransitionRuleRow(rule: TransitionRuleDisplay) -> impl IntoView {
     }
 }
 
-fn format_rule_description(trigger_event: &str, close_intent: bool) -> String {
-    match (trigger_event, close_intent) {
-        ("pr_opened", _) => "When a PR is opened".to_string(),
-        ("pr_merged", true) => "When a PR is merged (with close intent)".to_string(),
-        ("pr_merged", false) => "When any PR is merged".to_string(),
-        ("pr_closed", true) => "When a PR is closed without merge (with close intent)".to_string(),
-        ("pr_closed", false) => "When any PR is closed without merge".to_string(),
-        (other, _) => other.to_string(),
+fn format_rule_description(trigger_event: &str) -> String {
+    match trigger_event {
+        "pr_opened" => "When a PR linked to the issue is opened or marked ready for review".to_string(),
+        "pr_merged" => "When the last PR that closes the issue is merged".to_string(),
+        "pr_closed" => "When the last PR that closes the issue is closed without merge".to_string(),
+        other => other.to_string(),
     }
 }
 

@@ -277,6 +277,34 @@ then asserts the summary line reports `0 ignored`: in CI a database is present,
 so `ignored` would mean a Postgres arm quietly not exercised on a PR about to
 merge.
 
+## GitHub links and automation
+
+The rules live in docs/ARCHITECTURE.md ("GitHub Link Intent"); these are what
+that asks of a change.
+
+- **Never decide a status change from "a key was found".** A status change is
+  decided from the link's `LinkKind` (`patterns.rs`) through `behavior()` in
+  `transitions.rs`. Reading text for keys goes through `patterns::parse_text` and
+  `combine`; do not add a second `extract_issue_refs`-style loop that creates links.
+- **One word list.** Magic words are the four constants in `patterns.rs`, exactly
+  Linear's lists. Adding or removing a word is a deliberate product change, made
+  there and tested in `patterns.rs`.
+- **One behaviour table.** What a kind may do is `behavior()`. A new kind, step or
+  deviation is a row there plus a row in the table-driven test
+  (`link_kind_by_event_by_starting_category_decides_the_status`), whose expectations
+  are written out as data rather than derived from the code under test.
+- **Guards stay guards.** Completed/cancelled issues are never moved, moves are
+  forward-only, merge and close wait for the last open closing PR. Each has a test
+  that fails without it; keep it that way when touching `apply_transition_rules`.
+- **Test the webhook, not only the function.** A change to link or automation
+  behaviour adds an end-to-end case to `apps/server/tests/github_connections.rs`
+  (signed delivery through the real route), and a schema or query change runs
+  through `dual_backend_test!` on SQLite and Postgres.
+- **A migration that changes link semantics is tested on populated rows**, as
+  `link_intent_migration_backfills_kinds_conservatively` does, and backfills
+  conservatively: anything that cannot be shown to be a working link becomes
+  `related`.
+
 ## Leptos / Frontend
 
 ### Component Patterns

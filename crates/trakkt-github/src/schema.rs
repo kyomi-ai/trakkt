@@ -45,6 +45,16 @@ pub struct GitHubInstallation {
     pub repository_scope_pending: bool,
 }
 
+impl GitHubLink {
+    /// The stored kind. A value the schema's CHECK would have rejected is a
+    /// corrupt row, which must not be read as a permissive default.
+    pub fn kind(&self) -> trakkt_core::Result<crate::patterns::LinkKind> {
+        crate::patterns::LinkKind::parse(&self.link_kind).ok_or_else(|| {
+            trakkt_core::Error::Internal(format!("unknown link kind '{}'", self.link_kind))
+        })
+    }
+}
+
 impl GitHubInstallation {
     /// Legacy connections stay quarantined until user authorization revalidates identity.
     pub fn is_active(&self) -> bool {
@@ -96,7 +106,8 @@ pub struct GitHubLink {
     pub state: Option<String>,
     pub url: String,
     pub author_login: Option<String>,
-    pub close_intent: bool,
+    /// What this link may do; see [`crate::patterns::LinkKind`].
+    pub link_kind: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -878,7 +889,7 @@ pub async fn list_links_for_issue(
         GitHubLink,
         "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
                 github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, close_intent, \
+                title, state, url, author_login, link_kind, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM github_links \
@@ -945,13 +956,13 @@ pub struct CreateLinkParams<'a> {
     pub state: Option<&'a str>,
     pub url: &'a str,
     pub author_login: Option<&'a str>,
-    pub close_intent: bool,
+    pub link_kind: crate::patterns::LinkKind,
 }
 
 /// Upsert a GitHub link — create or update on conflict.
 ///
 /// On conflict (same workspace, issue, link_type, repo, ref_identifier),
-/// update the mutable fields: title, state, url, author_login, close_intent,
+/// update the mutable fields: title, state, url, author_login, link_kind,
 /// github_id, github_node_id. Returns the resulting row.
 pub async fn upsert_link(
     db: &DbPool,
@@ -980,7 +991,7 @@ pub async fn upsert_link_with_admission(
         "INSERT INTO github_links \
          (link_id, workspace_id, issue_id, installation_id, link_type, \
           github_id, github_node_id, repo_full_name, ref_identifier, \
-          title, state, url, author_login, close_intent, created_at, updated_at) \
+          title, state, url, author_login, link_kind, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, {now}, {now}) \
          ON CONFLICT (workspace_id, issue_id, link_type, repo_full_name, ref_identifier) \
          DO UPDATE SET \
@@ -988,7 +999,7 @@ pub async fn upsert_link_with_admission(
             state = EXCLUDED.state, \
             url = EXCLUDED.url, \
             author_login = EXCLUDED.author_login, \
-            close_intent = EXCLUDED.close_intent, \
+            link_kind = EXCLUDED.link_kind, \
             github_id = EXCLUDED.github_id, \
             github_node_id = EXCLUDED.github_node_id, \
             updated_at = {now}"
@@ -1009,7 +1020,7 @@ pub async fn upsert_link_with_admission(
         params.state,
         params.url,
         params.author_login,
-        params.close_intent
+        params.link_kind.as_str()
     )?;
 
     // Fetch the row — either newly created or updated (conflict case).
@@ -1018,7 +1029,7 @@ pub async fn upsert_link_with_admission(
         GitHubLink,
         "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
                 github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, close_intent, \
+                title, state, url, author_login, link_kind, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM github_links \
@@ -1133,7 +1144,7 @@ pub async fn list_pr_links_by_ref(
         GitHubLink,
         "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
                 github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, close_intent, \
+                title, state, url, author_login, link_kind, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM github_links \
@@ -1147,10 +1158,10 @@ pub async fn list_pr_links_by_ref(
     Ok(rows)
 }
 
-/// Find all PR links for a specific issue that have close_intent set.
+/// Find the closing PR links for an issue.
 ///
 /// Used for outbound notifications when an issue is manually completed.
-pub async fn list_close_intent_links_for_issue(
+pub async fn list_closing_pr_links_for_issue(
     db: &DbPool,
     issue_id: &str,
 ) -> trakkt_core::Result<Vec<GitHubLink>> {
@@ -1159,14 +1170,38 @@ pub async fn list_close_intent_links_for_issue(
         GitHubLink,
         "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
                 github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, close_intent, \
+                title, state, url, author_login, link_kind, \
                 CAST(created_at AS TEXT) AS created_at, \
                 CAST(updated_at AS TEXT) AS updated_at \
          FROM github_links \
-         WHERE issue_id = $1 AND link_type = $2 AND close_intent = $3",
+         WHERE issue_id = $1 AND link_type = $2 AND link_kind = $3",
         issue_id,
         "pull_request",
-        true
+        crate::patterns::LinkKind::Closing.as_str()
+    )?;
+    Ok(rows)
+}
+
+/// Every pull request link on an issue, whatever its kind or state.
+///
+/// Used to decide whether a merge is the last one: the merge status applies
+/// only when no other closing pull request is still open.
+pub async fn list_pr_links_for_issue(
+    db: &DbPool,
+    issue_id: &str,
+) -> trakkt_core::Result<Vec<GitHubLink>> {
+    let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
+        db,
+        GitHubLink,
+        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
+                github_id, github_node_id, repo_full_name, ref_identifier, \
+                title, state, url, author_login, link_kind, \
+                CAST(created_at AS TEXT) AS created_at, \
+                CAST(updated_at AS TEXT) AS updated_at \
+         FROM github_links \
+         WHERE issue_id = $1 AND link_type = $2",
+        issue_id,
+        "pull_request"
     )?;
     Ok(rows)
 }
@@ -1390,6 +1425,164 @@ pub async fn update_transition_rule_enabled_with_delivery(
     let mut batch = SyncBatch::new();
     batch.record(&mut tx, trakkt_types::sync::entity_types::GITHUB_TRANSITION_RULE, rule_id, workspace_id, SyncAudience::Workspace, trakkt_types::sync::SyncActionType::Update, Some(serde_json::json!({"rule_id":rule_id,"workspace_id":workspace_id,"enabled":enabled}))).await?;
     batch.commit_and_deliver(tx, ws_manager).await
+}
+
+// ─── per-team automation ─────────────────────────────────────────────────────
+
+/// The automation steps a rule can configure. A draft PR, a PR opened or marked
+/// ready for review, a merge, and a close without merge.
+pub const AUTOMATION_TRIGGERS: [&str; 4] = ["pr_draft", "pr_opened", "pr_merged", "pr_closed"];
+
+/// The status categories a rule can target.
+pub const STATUS_CATEGORIES: [&str; 5] =
+    ["backlog", "unstarted", "started", "completed", "cancelled"];
+
+/// A team's override of one workspace default rule. A `None` target means the
+/// step does nothing for that team.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
+pub struct GitHubTeamTransitionRule {
+    pub rule_id: String,
+    pub workspace_id: String,
+    pub team_id: String,
+    pub trigger_event: String,
+    pub target_status_category: Option<String>,
+    pub created_at: String,
+}
+
+/// List a workspace's per-team rules.
+pub async fn list_team_transition_rules(
+    db: &DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Vec<GitHubTeamTransitionRule>> {
+    Ok(trakkt_core::db_fetch_all!(
+        db,
+        GitHubTeamTransitionRule,
+        "SELECT rule_id, workspace_id, team_id, trigger_event, target_status_category, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM github_team_transition_rules \
+         WHERE workspace_id = $1 \
+         ORDER BY team_id ASC, trigger_event ASC",
+        workspace_id
+    )?)
+}
+
+/// Set a team's rule for one step, replacing any existing one.
+///
+/// `target` of `None` makes the step do nothing for that team.
+pub async fn set_team_transition_rule(
+    db: &DbPool,
+    workspace_id: &str,
+    team_id: &str,
+    trigger_event: &str,
+    target: Option<&str>,
+) -> trakkt_core::Result<()> {
+    if !AUTOMATION_TRIGGERS.contains(&trigger_event) {
+        return Err(trakkt_core::Error::BadRequest(format!(
+            "unknown automation step '{trigger_event}'"
+        )));
+    }
+    if let Some(category) = target
+        && !STATUS_CATEGORIES.contains(&category)
+    {
+        return Err(trakkt_core::Error::BadRequest(format!(
+            "unknown status category '{category}'"
+        )));
+    }
+    let in_workspace = trakkt_core::db_fetch_optional!(
+        db,
+        (String,),
+        "SELECT team_id FROM teams WHERE team_id = $1 AND workspace_id = $2",
+        team_id,
+        workspace_id
+    )?;
+    if in_workspace.is_none() {
+        return Err(trakkt_core::Error::NotFound("Team not found".into()));
+    }
+    let now = sql_compat::now(db.is_postgres());
+    let sql = format!(
+        "INSERT INTO github_team_transition_rules \
+         (rule_id, workspace_id, team_id, trigger_event, target_status_category, created_at) \
+         VALUES ($1, $2, $3, $4, $5, {now}) \
+         ON CONFLICT (team_id, trigger_event) \
+         DO UPDATE SET target_status_category = EXCLUDED.target_status_category"
+    );
+    trakkt_core::db_execute!(
+        db,
+        &sql,
+        uuid::Uuid::new_v4().to_string(),
+        workspace_id,
+        team_id,
+        trigger_event,
+        target
+    )?;
+    Ok(())
+}
+
+/// Remove a team's rule for one step, so the workspace default applies again.
+pub async fn clear_team_transition_rule(
+    db: &DbPool,
+    workspace_id: &str,
+    team_id: &str,
+    trigger_event: &str,
+) -> trakkt_core::Result<()> {
+    trakkt_core::db_execute!(
+        db,
+        "DELETE FROM github_team_transition_rules \
+         WHERE workspace_id = $1 AND team_id = $2 AND trigger_event = $3",
+        workspace_id,
+        team_id,
+        trigger_event
+    )?;
+    Ok(())
+}
+
+/// A team's override for one step, if it has one.
+pub async fn get_team_transition_rule(
+    db: &DbPool,
+    team_id: &str,
+    trigger_event: &str,
+) -> trakkt_core::Result<Option<GitHubTeamTransitionRule>> {
+    Ok(trakkt_core::db_fetch_optional!(
+        db,
+        GitHubTeamTransitionRule,
+        "SELECT rule_id, workspace_id, team_id, trigger_event, target_status_category, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM github_team_transition_rules \
+         WHERE team_id = $1 AND trigger_event = $2",
+        team_id,
+        trigger_event
+    )?)
+}
+
+// ─── github_automation_settings ──────────────────────────────────────────────
+
+/// Whether the workspace posts a comment on the PR when a link changes status.
+/// On unless the workspace turned it off.
+pub async fn linkback_enabled(db: &DbPool, workspace_id: &str) -> trakkt_core::Result<bool> {
+    let setting = trakkt_core::db_fetch_optional!(
+        db,
+        (bool,),
+        "SELECT linkback_enabled FROM github_automation_settings WHERE workspace_id = $1",
+        workspace_id
+    )?;
+    Ok(setting.is_none_or(|(enabled,)| enabled))
+}
+
+/// Turn the PR linkback comment on or off for a workspace.
+pub async fn set_linkback_enabled(
+    db: &DbPool,
+    workspace_id: &str,
+    enabled: bool,
+) -> trakkt_core::Result<()> {
+    trakkt_core::db_execute!(
+        db,
+        "INSERT INTO github_automation_settings (workspace_id, linkback_enabled) \
+         VALUES ($1, $2) \
+         ON CONFLICT (workspace_id) DO UPDATE SET linkback_enabled = EXCLUDED.linkback_enabled",
+        workspace_id,
+        enabled
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

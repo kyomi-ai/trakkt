@@ -2,9 +2,10 @@
 
 //! Event processing for GitHub webhook events.
 //!
-//! Processes `pull_request` and `push` events by extracting issue references
-//! from PR titles, bodies, branch names, and commit messages, then creating
-//! or updating GitHub links in the database.
+//! Processes `pull_request` and `push` events by reading link intent from PR
+//! titles, bodies, branch names, and commit messages, then creating or
+//! updating GitHub links in the database. What a link may do is its
+//! [`LinkKind`]; see `patterns` and docs/ARCHITECTURE.md.
 
 use std::collections::HashSet;
 
@@ -13,7 +14,7 @@ use trakkt_auth::websocket::WebSocketManager;
 use trakkt_core::DbPool;
 use trakkt_types::enums::ActionSource;
 
-use crate::patterns::{self, IssueRef};
+use crate::patterns::{self, IssueRef, LinkKind};
 use crate::schema::{self, CreateLinkParams, GitHubInstallation};
 
 // ===========================================================================
@@ -22,15 +23,18 @@ use crate::schema::{self, CreateLinkParams, GitHubInstallation};
 
 /// Process a `pull_request` webhook event.
 ///
-/// Extracts issue references from the PR title, body, and branch name,
-/// validates them against the database, and upserts GitHub links. For
-/// "edited" actions, also removes links to issues no longer referenced.
+/// Reads link intent from the PR title, body, and branch name, validates the
+/// issues against the database, and upserts GitHub links carrying the kind of
+/// link each one is. For "edited" actions, also removes links to issues no
+/// longer referenced. `app_url` is this application's base URL, the only host
+/// whose issue URLs count as references.
 pub async fn process_pull_request(
     db: &DbPool,
     installation: &GitHubInstallation,
     action: &str,
     payload: &serde_json::Value,
     ws_manager: Option<&WebSocketManager>,
+    app_url: &str,
 ) -> trakkt_core::Result<()> {
     let current = schema::get_installation_by_id(db, &installation.installation_id).await?;
     let Some(current) = current else {
@@ -125,35 +129,22 @@ pub async fn process_pull_request(
 
     let pr_state = determine_pr_state(action, merged, draft);
 
-    // ── Collect text and extract refs ─────────────────────────────────────
+    // ── Read link intent ──────────────────────────────────────────────────
+    //
+    // The title and branch are working links; a bare key in the body is a
+    // mention. A magic word raises any of them, `skip` removes the issue.
 
-    let mut text = title.clone();
-    if let Some(ref b) = body {
-        text.push(' ');
-        text.push_str(b);
-    }
-
-    let text_refs = patterns::extract_issue_refs(&text);
-    let branch_refs = patterns::extract_issue_refs(&branch_name);
-
-    // Merge and deduplicate
-    let mut seen = HashSet::new();
-    let mut all_refs = Vec::new();
-    for r in text_refs.into_iter().chain(branch_refs) {
-        if seen.insert(r.clone()) {
-            all_refs.push(r);
-        }
-    }
-
-    // Extract close intent refs from the text (not the branch name)
-    let close_refs = patterns::extract_close_intent_refs(&text);
-    let close_set: HashSet<IssueRef> = close_refs.into_iter().collect();
+    let links = patterns::combine(vec![
+        patterns::parse_text(&title, LinkKind::BranchTitle, app_url),
+        patterns::parse_text(body.as_deref().unwrap_or(""), LinkKind::Related, app_url),
+        patterns::parse_text(&branch_name, LinkKind::BranchTitle, app_url),
+    ]);
 
     // ── Validate refs and upsert links ────────────────────────────────────
 
     let mut valid_issue_ids: Vec<String> = Vec::new();
 
-    for issue_ref in &all_refs {
+    for (issue_ref, link_kind) in &links {
         let issue = match validate_issue_ref(db, &installation.workspace_id, issue_ref).await? {
             Some(i) => i,
             None => continue,
@@ -174,7 +165,7 @@ pub async fn process_pull_request(
                 state: Some(&pr_state),
                 url: &html_url,
                 author_login: author.as_deref(),
-                close_intent: close_set.contains(issue_ref),
+                link_kind: *link_kind,
             },
             Some(&admission),
         )
@@ -264,13 +255,15 @@ pub async fn process_pull_request(
 
 /// Process a `push` webhook event.
 ///
-/// Extracts issue references from the branch name and each commit message,
-/// validates them against the database, and upserts GitHub links.
+/// Reads the branch name and each commit message, validates the issues against
+/// the database, and upserts GitHub links. A commit never changes status, so
+/// its link kind only decides how the link is shown.
 pub async fn process_push(
     db: &DbPool,
     installation: &GitHubInstallation,
     payload: &serde_json::Value,
     ws_manager: Option<&WebSocketManager>,
+    app_url: &str,
 ) -> trakkt_core::Result<()> {
     let current = schema::get_installation_by_id(db, &installation.installation_id).await?;
     let Some(current) = current else {
@@ -316,12 +309,12 @@ pub async fn process_push(
 
     // ── Process branch refs ───────────────────────────────────────────────
 
-    let branch_refs = patterns::extract_issue_refs(&branch_name);
+    let branch_refs = patterns::parse_text(&branch_name, LinkKind::BranchTitle, app_url).refs;
     let branch_url = format!("https://github.com/{repo}/tree/{branch_name}");
     let mut total_branch_links: usize = 0;
     let mut branch_issue_ids: Vec<String> = Vec::new();
 
-    for issue_ref in &branch_refs {
+    for (issue_ref, _) in &branch_refs {
         if let Some(issue) = validate_issue_ref(db, &installation.workspace_id, issue_ref).await? {
             schema::upsert_link_with_admission(
                 db,
@@ -338,7 +331,7 @@ pub async fn process_push(
                     state: None,
                     url: &branch_url,
                     author_login: None,
-                    close_intent: false,
+                    link_kind: LinkKind::BranchTitle,
                 },
                 Some(&admission),
             )
@@ -438,14 +431,12 @@ pub async fn process_push(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let commit_refs = patterns::extract_issue_refs(message);
-        let close_refs = patterns::extract_close_intent_refs(message);
-        let close_set: HashSet<IssueRef> = close_refs.into_iter().collect();
+        let commit_refs = patterns::parse_text(message, LinkKind::Related, app_url).refs;
 
         // Use the first line of the commit message as the link title
         let commit_title = message.lines().next().unwrap_or(message);
 
-        for issue_ref in &commit_refs {
+        for (issue_ref, link_kind) in &commit_refs {
             if let Some(issue) =
                 validate_issue_ref(db, &installation.workspace_id, issue_ref).await?
             {
@@ -464,7 +455,7 @@ pub async fn process_push(
                         state: None,
                         url: &url,
                         author_login: author_login.as_deref(),
-                        close_intent: close_set.contains(issue_ref),
+                        link_kind: *link_kind,
                     },
                     Some(&admission),
                 )

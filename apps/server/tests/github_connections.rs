@@ -1051,3 +1051,390 @@ async fn signed_all_to_selected_fetches_retained_repositories_and_cannot_revive_
     shutdown.send(()).expect("shutdown scope API fixture");
     trakkt_core::test_helpers::task::join_soon(server, "scope API graceful shutdown").await;
 }
+
+// ─── TRA-10115: link and automate by intent ─────────────────────────────────
+//
+// These drive the signed webhook route end to end against a loopback GitHub
+// stub, because the incident was a webhook delivery that moved tickets. Every
+// case reads the ticket's status back through the issue service.
+
+/// A loopback GitHub that answers token and comment requests and remembers the
+/// comment bodies, so a test can assert what was (not) posted on the PR.
+struct GithubStub {
+    comments: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    server: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl GithubStub {
+    async fn attach(f: &mut Fixture) -> Self {
+        use axum::{Json, extract::State};
+        use std::sync::{Arc, Mutex};
+        type Comments = Arc<Mutex<Vec<String>>>;
+        async fn answer(
+            State(comments): State<Comments>,
+            uri: axum::http::Uri,
+            body: String,
+        ) -> Json<Value> {
+            if uri.path().ends_with("/access_tokens") {
+                return Json(json!({"token":"stub-token","expires_at":
+                    (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()}));
+            }
+            assert!(
+                uri.path().ends_with("/comments"),
+                "unexpected outbound mutation: {}",
+                uri.path()
+            );
+            let parsed: Value = serde_json::from_str(&body).expect("comment body is JSON");
+            comments
+                .lock()
+                .expect("lock comment ledger")
+                .push(parsed["body"].as_str().unwrap_or_default().to_owned());
+            Json(json!({"id":1}))
+        }
+        let comments: Comments = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind GitHub stub");
+        let endpoint = format!("http://{}", listener.local_addr().expect("stub address"));
+        let api = Router::new().fallback(answer).with_state(comments.clone());
+        let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, api)
+                .with_graceful_shutdown(async {
+                    stopped.await.expect("receive stub shutdown");
+                })
+                .await
+                .expect("serve GitHub stub");
+        });
+        f.state.github_client = Some(Arc::new(
+            trakkt_github::GitHubClient::for_test_endpoint(42, &TEST_KEY, &endpoint)
+                .expect("build loopback-only GitHub client"),
+        ));
+        f.router = Router::new()
+            .nest("/webhooks", trakkt_server::routes::github::routes())
+            .with_state(f.state.clone());
+        schema::seed_default_transition_rules(&f.state.db, WORKSPACE)
+            .await
+            .expect("seed default workspace rules");
+        Self {
+            comments,
+            shutdown: Some(shutdown),
+            server: Some(server),
+        }
+    }
+
+    fn comments(&self) -> Vec<String> {
+        self.comments.lock().expect("read comment ledger").clone()
+    }
+
+    async fn stop(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(server) = self.server.take() {
+            trakkt_core::test_helpers::task::join_soon(server, "GitHub stub shutdown").await;
+        }
+    }
+}
+
+/// What a pull request says about itself.
+struct Pr<'a> {
+    number: i64,
+    title: &'a str,
+    body: &'a str,
+    branch: &'a str,
+    base: &'a str,
+    draft: bool,
+}
+
+impl<'a> Pr<'a> {
+    fn new(number: i64, title: &'a str, body: &'a str, branch: &'a str) -> Self {
+        Self {
+            number,
+            title,
+            body,
+            branch,
+            base: "main",
+            draft: false,
+        }
+    }
+
+    fn event(&self, inst: &GitHubInstallation, action: &str, merged: bool) -> Value {
+        json!({"action":action,"installation":{"id":inst.github_installation_id},
+            "repository":{"full_name":format!("{}/repo",inst.account_login)},
+            "pull_request":{"number":self.number,"title":self.title,"body":self.body,
+                "head":{"ref":self.branch},"base":{"ref":self.base},"merged":merged,
+                "draft":self.draft,
+                "html_url":format!("https://github.com/{}/repo/pull/{}",inst.account_login,self.number),
+                "user":{"login":"fixture-author"}}})
+    }
+}
+
+async fn status_category(f: &Fixture, issue_id: &str) -> String {
+    trakkt_auth::issue_service::get_issue_by_id(&f.state.db, issue_id)
+        .await
+        .expect("read ticket status")
+        .expect("issue exists")
+        .status_category
+}
+
+async fn send(f: &Fixture, delivery: &str, pr: &Pr<'_>, action: &str, merged: bool) {
+    deliver(f, "pull_request", delivery, pr.event(&f.personal, action, merged)).await;
+}
+
+#[tokio::test]
+async fn a_pull_request_that_only_mentions_a_ticket_never_changes_it_or_comments() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    assert_eq!(status_category(&f, &f.issue).await, "backlog");
+    let mention = Pr::new(
+        10,
+        "Tidy the settings page",
+        "This is unrelated to, but was noticed while reading, KEY-1.",
+        "feature/settings-tidy",
+    );
+    send(&f, "mention-open", &mention, "opened", false).await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "backlog",
+        "a bare mention in the body started the ticket"
+    );
+    send(&f, "mention-merge", &mention, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "backlog");
+    assert!(
+        stub.comments().is_empty(),
+        "a mention posted a status comment: {:?}",
+        stub.comments()
+    );
+    stub.stop().await;
+}
+
+fn mentions(f: &Fixture, comments: &[String]) -> usize {
+    let _ = f;
+    comments.iter().filter(|c| c.contains("Status moved")).count()
+}
+
+#[tokio::test]
+async fn fixes_starts_on_open_and_completes_on_merge_and_says_so_once_each() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let pr = Pr::new(11, "Tidy", "Fixes KEY-1", "feature/tidy");
+    send(&f, "fixes-open", &pr, "opened", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    send(&f, "fixes-merge", &pr, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "completed");
+    let comments = stub.comments();
+    assert_eq!(comments.len(), 2, "one comment per real change: {comments:?}");
+    assert_eq!(mentions(&f, &comments), 1);
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn refs_starts_the_ticket_but_a_merge_never_completes_it() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let pr = Pr::new(12, "Groundwork", "Refs KEY-1", "feature/groundwork");
+    send(&f, "refs-open", &pr, "opened", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    send(&f, "refs-merge", &pr, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn related_to_links_the_ticket_for_display_and_changes_nothing() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let pr = Pr::new(13, "Sibling work", "Related to KEY-1", "feature/sibling");
+    send(&f, "related-open", &pr, "opened", false).await;
+    send(&f, "related-merge", &pr, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "backlog");
+    let linked = links(&f, &f.issue).await;
+    assert_eq!(linked.len(), 1, "the relation is still shown on the issue");
+    assert_eq!(linked[0].link_kind, "related");
+    assert!(stub.comments().is_empty());
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn ignore_suppresses_even_a_branch_name_link() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let pr = Pr::new(14, "Rework", "Ignore KEY-1", "feature/KEY-1-rework");
+    send(&f, "ignore-open", &pr, "opened", false).await;
+    send(&f, "ignore-merge", &pr, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "backlog");
+    assert!(links(&f, &f.issue).await.is_empty(), "skip means no link at all");
+    assert!(stub.comments().is_empty());
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_branch_name_links_and_starts_without_any_magic_word() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let pr = Pr::new(15, "Tidy", "", "feature/KEY-1-tidy");
+    send(&f, "branch-open", &pr, "opened", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    assert_eq!(links(&f, &f.issue).await[0].link_kind, "branch_title");
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn two_closing_prs_complete_the_ticket_only_after_both_merge() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let first = Pr::new(20, "Part one", "Fixes KEY-1", "feature/one");
+    let second = Pr::new(21, "Part two", "Fixes KEY-1", "feature/two");
+    send(&f, "two-open-1", &first, "opened", false).await;
+    send(&f, "two-open-2", &second, "opened", false).await;
+    send(&f, "two-merge-1", &first, "closed", true).await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "started",
+        "the other closing PR is still open"
+    );
+    send(&f, "two-merge-2", &second, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "completed");
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_pr_closed_without_merging_never_completes_the_ticket() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let pr = Pr::new(22, "Abandoned", "Fixes KEY-1", "feature/abandoned");
+    send(&f, "closed-open", &pr, "opened", false).await;
+    send(&f, "closed-close", &pr, "closed", false).await;
+    assert_ne!(status_category(&f, &f.issue).await, "completed");
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_draft_pr_does_not_start_the_ticket_and_marking_it_ready_does() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let mut pr = Pr::new(30, "Work in progress", "Fixes KEY-1", "feature/wip");
+    pr.draft = true;
+    send(&f, "draft-open", &pr, "opened", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "backlog");
+    assert_eq!(links(&f, &f.issue).await[0].state.as_deref(), Some("draft"));
+    pr.draft = false;
+    send(&f, "draft-ready", &pr, "ready_for_review", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    assert_eq!(links(&f, &f.issue).await[0].state.as_deref(), Some("open"));
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn commits_only_ever_leave_activity_and_links_never_a_status_change() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let mut payload = push(&f.personal);
+    payload["ref"] = json!("refs/heads/feature/unrelated");
+    payload["commits"] = json!([
+        {"id":"c1","message":"Fixes KEY-1","url":"https://github.com/fixture/repo/commit/c1"},
+        {"id":"c2","message":"see KEY-1 for background","url":"https://github.com/fixture/repo/commit/c2"},
+        {"id":"c3","message":"Ignore KEY-1","url":"https://github.com/fixture/repo/commit/c3"}
+    ]);
+    deliver(&f, "push", "commit-mentions", payload).await;
+    assert_eq!(status_category(&f, &f.issue).await, "backlog");
+    let mut kinds: Vec<(String, String)> = links(&f, &f.issue)
+        .await
+        .into_iter()
+        .map(|l| (l.ref_identifier, l.link_kind))
+        .collect();
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        vec![
+            ("c1".to_string(), "closing".to_string()),
+            ("c2".to_string(), "related".to_string())
+        ],
+        "a skipped commit links nothing"
+    );
+    assert!(stub.comments().is_empty());
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_pr_in_the_other_connected_repository_that_mentions_the_ticket_changes_nothing() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let pr = Pr::new(40, "Unrelated product work", "Mirrors KEY-1 over there", "feature/x");
+    for (delivery, action, merged) in [("org-open", "opened", false), ("org-merge", "closed", true)] {
+        deliver(&f, "pull_request", delivery, pr.event(&f.organization, action, merged)).await;
+    }
+    assert_eq!(status_category(&f, &f.issue).await, "backlog");
+    assert!(stub.comments().is_empty());
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn editing_a_pr_to_add_or_drop_a_magic_word_changes_the_link_kind() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let mention = Pr::new(50, "Notes", "mentions KEY-1", "feature/notes");
+    send(&f, "edit-open", &mention, "opened", false).await;
+    assert_eq!(links(&f, &f.issue).await[0].link_kind, "related");
+    let closing = Pr::new(50, "Notes", "Fixes KEY-1", "feature/notes");
+    send(&f, "edit-up", &closing, "edited", false).await;
+    assert_eq!(links(&f, &f.issue).await[0].link_kind, "closing");
+    send(&f, "edit-merge", &closing, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "completed");
+    let nothing = Pr::new(51, "Other", "mentions KEY-1", "feature/other");
+    send(&f, "edit-open-2", &nothing, "opened", false).await;
+    let gone = Pr::new(51, "Other", "no longer mentions anything", "feature/other");
+    send(&f, "edit-drop", &gone, "edited", false).await;
+    assert!(
+        links(&f, &f.issue)
+            .await
+            .iter()
+            .all(|l| l.ref_identifier != "51"),
+        "dropping the key drops the link"
+    );
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn linkback_can_be_turned_off_without_stopping_the_status_change() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    schema::set_linkback_enabled(&f.state.db, WORKSPACE, false)
+        .await
+        .expect("turn linkback off");
+    let pr = Pr::new(60, "Tidy", "Fixes KEY-1", "feature/quiet");
+    send(&f, "quiet-open", &pr, "opened", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    assert!(stub.comments().is_empty(), "{:?}", stub.comments());
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_team_can_silence_or_retarget_a_step_and_the_workspace_default_returns_when_cleared() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let team = "github-team";
+    schema::set_team_transition_rule(&f.state.db, WORKSPACE, team, "pr_opened", None)
+        .await
+        .expect("team opts out of the opened step");
+    let pr = Pr::new(70, "Tidy", "Fixes KEY-1", "feature/team");
+    send(&f, "team-open", &pr, "opened", false).await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "backlog",
+        "a no-action team rule beats the workspace default"
+    );
+    schema::set_team_transition_rule(&f.state.db, WORKSPACE, team, "pr_opened", Some("unstarted"))
+        .await
+        .expect("team retargets the opened step");
+    send(&f, "team-reopen", &pr, "reopened", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "unstarted");
+    schema::clear_team_transition_rule(&f.state.db, WORKSPACE, team, "pr_opened")
+        .await
+        .expect("remove the override");
+    send(&f, "team-ready", &pr, "ready_for_review", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    stub.stop().await;
+}

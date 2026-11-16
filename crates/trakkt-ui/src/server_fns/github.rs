@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 pub struct TransitionRuleDisplay {
     pub rule_id: String,
     pub trigger_event: String,
-    pub close_intent_required: bool,
     pub target_status_category: String,
     pub enabled: bool,
 }
@@ -286,7 +285,6 @@ pub async fn get_transition_rules() -> Result<Vec<TransitionRuleDisplay>, Server
         .map(|r| TransitionRuleDisplay {
             rule_id: r.rule_id,
             trigger_event: r.trigger_event,
-            close_intent_required: r.close_intent_required,
             target_status_category: r.target_status_category,
             enabled: r.enabled,
         })
@@ -316,6 +314,140 @@ pub async fn toggle_transition_rule(rule_id: String, enabled: bool) -> Result<()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Team automation server functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One team's override of one automation step, for display.
+///
+/// `choice` is `none` for "no action" or a status category.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamRuleChoice {
+    pub trigger_event: String,
+    pub choice: String,
+}
+
+/// A team and its automation overrides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamAutomationDisplay {
+    pub team_id: String,
+    pub key: String,
+    pub name: String,
+    pub overrides: Vec<TeamRuleChoice>,
+}
+
+/// Workspace automation beyond the shared rules: the linkback comment and each
+/// team's overrides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationSettingsDisplay {
+    pub linkback_enabled: bool,
+    pub teams: Vec<TeamAutomationDisplay>,
+}
+
+/// Read the workspace's linkback setting and every team's overrides.
+///
+/// Requires workspace admin role.
+#[server(prefix = "/leptos-api")]
+pub async fn get_automation_settings() -> Result<AutomationSettingsDisplay, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    let db = ac.db();
+
+    let teams = trakkt_auth::team_service::list_teams(db, &ac.ws_id, None)
+        .await
+        .into_sfn()?;
+    let rules = trakkt_github::schema::list_team_transition_rules(db, &ac.ws_id)
+        .await
+        .into_sfn()?;
+    let linkback_enabled = trakkt_github::schema::linkback_enabled(db, &ac.ws_id)
+        .await
+        .into_sfn()?;
+
+    Ok(AutomationSettingsDisplay {
+        linkback_enabled,
+        teams: teams
+            .into_iter()
+            .map(|team| TeamAutomationDisplay {
+                overrides: rules
+                    .iter()
+                    .filter(|r| r.team_id == team.team_id)
+                    .map(|r| TeamRuleChoice {
+                        trigger_event: r.trigger_event.clone(),
+                        choice: r
+                            .target_status_category
+                            .clone()
+                            .unwrap_or_else(|| "none".to_string()),
+                    })
+                    .collect(),
+                team_id: team.team_id,
+                key: team.key,
+                name: team.name,
+            })
+            .collect(),
+    })
+}
+
+/// Set a team's override for one automation step.
+///
+/// `choice` is `default` (remove the override, the workspace rule applies),
+/// `none` (the step does nothing for this team) or a status category.
+/// Requires workspace admin role.
+#[server(prefix = "/leptos-api")]
+pub async fn set_team_automation_rule(
+    team_id: String,
+    trigger_event: String,
+    choice: String,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    let db = ac.db();
+
+    match choice.as_str() {
+        "default" => {
+            trakkt_github::schema::clear_team_transition_rule(
+                db,
+                &ac.ws_id,
+                &team_id,
+                &trigger_event,
+            )
+            .await
+        }
+        "none" => {
+            trakkt_github::schema::set_team_transition_rule(
+                db,
+                &ac.ws_id,
+                &team_id,
+                &trigger_event,
+                None,
+            )
+            .await
+        }
+        category => {
+            trakkt_github::schema::set_team_transition_rule(
+                db,
+                &ac.ws_id,
+                &team_id,
+                &trigger_event,
+                Some(category),
+            )
+            .await
+        }
+    }
+    .into_sfn()
+}
+
+/// Turn the PR linkback comment on or off for the workspace.
+///
+/// Requires workspace admin role.
+#[server(prefix = "/leptos-api")]
+pub async fn set_github_linkback(enabled: bool) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    trakkt_github::schema::set_linkback_enabled(ac.db(), &ac.ws_id, enabled)
+        .await
+        .into_sfn()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GitHub link display types and server functions
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -330,7 +462,8 @@ pub struct GitHubLinkDisplay {
     pub state: Option<String>,
     pub url: String,
     pub author_login: Option<String>,
-    pub close_intent: bool,
+    /// `closing`, `contributing`, `branch_title` or `related`.
+    pub link_kind: String,
     pub created_at: String,
 }
 
@@ -363,7 +496,7 @@ pub async fn list_github_links_for_issue(
             state: link.state,
             url: link.url,
             author_login: link.author_login,
-            close_intent: link.close_intent,
+            link_kind: link.link_kind,
             created_at: link.created_at,
         })
         .collect();

@@ -366,6 +366,100 @@ All list endpoints support `?status=`, `?priority=`, `?label=`, `?assignee=`, `?
 }
 ```
 
+### GitHub Link Intent
+
+The GitHub integration follows Linear's model: a key found in text is not a link.
+A link is made by *intent*, and what a link may do to an issue's status is decided
+by the **link kind**, never by "a key was found". Modelled on
+[Linear's GitHub integration](https://linear.app/docs/github) and its
+[2019](https://linear.app/changelog/2019-07-11-github-workflow-configuration),
+[2020](https://linear.app/changelog/2020-05-05),
+[2022](https://linear.app/changelog/2022-02-03-github-commit-linking) and
+[2023](https://linear.app/changelog/2023-11-15-github-workflow-updates) changelogs.
+Code: `crates/trakkt-github/src/patterns.rs` (reading intent),
+`events.rs` (links), `transitions.rs` (status).
+
+**Link sources**
+
+| Source | Link kind |
+| --- | --- |
+| Branch name containing the key | `branch_title` |
+| PR title containing the key | `branch_title` |
+| Closing magic word + key (title, body) | `closing` |
+| Non-closing magic word + key | `contributing` |
+| Relation word + key | `related` |
+| Full issue URL of this application after a magic word | the word's kind |
+| Bare key in the PR **body** | `related` |
+| Bare key in a commit message | `related` |
+| Magic word in a commit message | the word's kind (a commit never changes status) |
+| Anything in a PR *comment* | no link: only `pull_request` and `push` events are processed |
+| `skip` / `ignore` + key | no link at all, even if the branch name has the key |
+
+When several sources name one issue the strongest kind wins
+(`closing` > `contributing` > `branch_title` > `related`); `skip` in any part of the
+PR removes the issue entirely. The words are exactly Linear's lists
+(`CLOSING_WORDS`, `CONTRIBUTING_WORDS`, `RELATED_WORDS`, `SKIP_WORDS`); several keys
+may follow one word (`Fixes ENG-123, DES-5, and ENG-256`); a word must directly
+precede the key (`Fixes the crash in TRA-5` is a mention). A URL only counts when
+its host is this application's.
+
+**What each kind does** (one table: `behavior()` in `transitions.rs`)
+
+| Kind | Draft / opened / ready for review | Merged / closed without merge |
+| --- | --- | --- |
+| `closing` | fires | fires |
+| `contributing` | fires | never |
+| `branch_title` | fires | never (proposed deviation, see below) |
+| `related` | never | never |
+
+`related` links are shown on the issue and the PR and never change status or post a
+comment. Commit mentions stay activity only.
+
+**Automation steps.** Built: *draft* (`pr_draft`), *opened / ready for review*
+(`pr_opened`, also fired by `reopened`), *merged* (`pr_merged`) and *closed without
+merge* (`pr_closed`). A draft PR fires `pr_draft`, which has no default rule, so a
+draft does nothing until a team configures it; `ready_for_review` fires `pr_opened`.
+Automation fires on lifecycle events, not on edits. The workspace rules
+(`github_transition_rules`, defaults: opened -> started, merged -> completed,
+closed -> cancelled) are the default; a **team** may override any step
+(`github_team_transition_rules`) with a status category or *no action*. The rule's
+`close_intent_required` column is no longer consulted: which kinds may fire which
+step is the `behavior()` table's job.
+
+**Order of decisions** for each linked issue: the kind may fire the step; a rule
+exists (team override, else enabled workspace rule); for merged/closed, no *other*
+closing PR on the issue is still open or draft (the merge status applies when the
+last one merges, and a PR closed without merging is never a merge); the move is
+forward and the issue is not completed or cancelled.
+
+**Deliberate deviations from Linear** (decided by the owner unless marked proposed)
+
+- GitHub events never move a *Completed or Cancelled* issue (PR #366). Linear does
+  not document this; we keep it on purpose.
+- *Forward-only*: a GitHub event never moves an issue backwards or sideways. Status
+  categories rank backlog < unstarted < started < completed/cancelled; the target
+  must outrank the current category, so In Review is never pulled back to In Progress.
+- A bare key in a PR body is a related-only link: shown, never acts.
+- Cross-repository mentions have no special case: a PR in any connected repository
+  follows the same rules, so a key named without a working link changes nothing.
+- Proposed (pending owner confirmation): a `branch_title` link starts but does not
+  complete the issue on merge, which matches the behaviour before this change and the
+  safe reading of the incident; Linear completes on merge for branch-linked PRs.
+  Flipping `completes` on that row of `behavior()` (and the matching row of
+  `expected_category` in the tests) changes it.
+- A PR closed without merging cancels the issue only through the existing workspace
+  `pr_closed` rule, only for `closing` links, and only when no other closing PR is
+  open or already merged. Linear does not do this.
+
+**Linkback.** The bot comment on the PR is posted only when a link actually changed
+the issue's status, and can be turned off per workspace
+(`github_automation_settings.linkback_enabled`, Settings > Integrations).
+
+**Not built** (tracked as follow-ups): the review-requested step (TRA-10116), the
+ready-to-merge step (TRA-10117), and per-target-branch overrides with regex and no
+action (TRA-10118). Assigning the linker to an unassigned issue is not built and not
+planned (owner decision).
+
 ### Deployment Modes
 
 | Mode | Trigger | Database | KV | Auth |

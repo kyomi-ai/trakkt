@@ -248,6 +248,7 @@ async fn github_webhook(
                     action.as_deref().unwrap_or(""),
                     &payload,
                     Some(&state.ws_manager),
+                    &state.config.frontend_url,
                 )
                 .await;
 
@@ -292,6 +293,7 @@ async fn github_webhook(
                         inst,
                         &payload,
                         Some(&state.ws_manager),
+                        &state.config.frontend_url,
                     )
                     .await,
                 )
