@@ -199,9 +199,8 @@ pub(crate) fn clamp_limit(raw: Option<i64>, default: i64, max: i64) -> i64 {
 }
 
 const CURSOR_VERSION: &str = "v4";
-/// Upper bound on `total`/`served_count` in a cursor: far above any real
-/// backlog, and small enough that accumulating a page cannot overflow.
-/// Upper bound on a cursor's `total`: far above any real backlog.
+/// Upper bound on a cursor's `total`: far above any real backlog. A cursor's
+/// `served` is bounded by [`issue_service::MAX_WALK_SERVED`].
 const MAX_WALK_COUNT: i64 = 1_000_000_000;
 const CURSOR_SEP: char = '\u{1e}';
 
