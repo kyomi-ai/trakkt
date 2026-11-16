@@ -86,11 +86,7 @@ fn issue_set_arg(values: &[&str]) -> String {
 }
 
 fn issue_set_membership(param: &str, is_pg: bool, negated: bool) -> String {
-    let membership = if is_pg {
-        format!("i.issue_id IN (SELECT jsonb_array_elements_text(CAST({param} AS jsonb)))")
-    } else {
-        format!("i.issue_id IN (SELECT value FROM json_each({param}))")
-    };
+    let membership = trakkt_core::sql_compat::value_in_json_array(is_pg, param, "i.issue_id");
     if negated {
         format!("NOT ({membership})")
     } else {
@@ -117,15 +113,16 @@ pub fn clauses_to_sql(
     };
 
     for clause in clauses {
+        // The shared pair table is authoritative: a pair it does not know
+        // passes everything, so it compiles to no condition.
+        if !clause.supported() {
+            continue;
+        }
         let field = clause.field.as_str();
         let op = clause.operator.as_str();
 
         if BOOLEAN_FILTER_FIELDS.contains(&field) {
-            let want_true = match op {
-                "any_of" => true,
-                "none_of" => false,
-                _ => continue,
-            };
+            let want_true = op == "any_of";
             out.conditions
                 .extend(boolean_condition(field, want_true));
             continue;
@@ -175,10 +172,7 @@ pub fn clauses_to_sql(
             ("priority", "any_of" | "none_of") => {
                 // A value is a match only if it is the canonical text of the
                 // stored integer (`matches` compares `priority.to_string()`).
-                let ints: Vec<i32> = values
-                    .iter()
-                    .filter_map(|v| v.parse::<i32>().ok().filter(|n| n.to_string() == *v))
-                    .collect();
+                let ints: Vec<i32> = clause.canonical_priority_values();
                 if ints.is_empty() {
                     if op == "any_of" {
                         out.conditions.push("1 = 0".to_string());
@@ -293,6 +287,10 @@ mod tests {
             vec!["i.issue_id IN (SELECT jsonb_array_elements_text(CAST($4 AS jsonb)))"]
         );
         assert_eq!(pg.args, vec![SqlArg::Text(r#"["a","b"]"#.into())]);
+        // A value containing the old separator stays one value.
+        let comma = clauses_to_sql(&[clause("issue_id", "any_of", &["a,b"])], 4, true);
+        assert_eq!(comma.args, vec![SqlArg::Text(r#"["a,b"]"#.into())]);
+        assert_eq!(comma.next_param, 5);
         let sq = clauses_to_sql(&[clause("issue_id", "none_of", &["a", "b"])], 4, false);
         assert_eq!(
             sq.conditions,

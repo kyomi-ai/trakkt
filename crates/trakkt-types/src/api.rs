@@ -123,7 +123,23 @@ impl FilterClause {
         if BOOLEAN_FILTER_FIELDS.contains(&self.field.as_str()) {
             return true;
         }
-        !self.values.is_empty() || (self.field == "issue_id" && self.operator == "any_of")
+        if self.values.is_empty() {
+            // Only the empty "include this set" is a restriction.
+            return self.field == "issue_id" && self.operator == "any_of";
+        }
+        if self.field == "priority" && self.operator == "none_of" {
+            // Values that are not a canonical stored priority exclude nothing.
+            return !self.canonical_priority_values().is_empty();
+        }
+        true
+    }
+
+    /// The clause's priority values that can equal a stored priority.
+    pub fn canonical_priority_values(&self) -> Vec<i32> {
+        self.values
+            .iter()
+            .filter_map(|v| v.parse::<i32>().ok().filter(|n| n.to_string() == *v))
+            .collect()
     }
 
     /// Whether `issue` passes this clause.
@@ -135,6 +151,11 @@ impl FilterClause {
     /// everything — except an empty `issue_id any_of`, which is the "no starred
     /// issues" set and therefore matches nothing.
     pub fn matches(&self, issue: &crate::models::IssueWithDetails) -> bool {
+        // The shared pair table decides what filters at all; anything else
+        // passes every issue.
+        if !self.supported() {
+            return true;
+        }
         if self.values.is_empty() && !BOOLEAN_FILTER_FIELDS.contains(&self.field.as_str()) {
             // An empty issue set is a real restriction (the Starred view with
             // no stars), not an unset filter.

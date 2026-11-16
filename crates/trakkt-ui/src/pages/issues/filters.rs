@@ -2204,6 +2204,9 @@ mod search_scope_tests {
         assert!(!clause("bogus", "any_of", &["x"]).is_effective());
         assert!(!clause("status", "all_of", &["s1"]).is_effective());
         assert!(!clause("is_parent", "wat", &[]).is_effective());
+        // A priority exclusion with no canonical stored value excludes nothing.
+        assert!(!clause("priority", "none_of", &["x", "03"]).is_effective());
+        assert!(clause("priority", "any_of", &["x"]).is_effective());
         assert_eq!(
             search_scope_summary(&[clause("priority", "any_of", &[])], false, &HashMap::new()),
             "All statuses · archived excluded"

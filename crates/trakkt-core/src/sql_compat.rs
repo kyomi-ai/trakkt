@@ -129,6 +129,20 @@ pub fn any_in_array(is_pg: bool, param: &str, column: &str) -> String {
     }
 }
 
+/// Membership of a text column in a JSON array bound as one parameter.
+/// Postgres: `column IN (SELECT jsonb_array_elements_text(CAST(param AS jsonb)))`,
+/// SQLite: `column IN (SELECT value FROM json_each(param))`.
+///
+/// One parameter instead of one per value keeps large sets under the backend's
+/// parameter limit, and JSON keeps values that contain a delimiter whole.
+pub fn value_in_json_array(is_pg: bool, param: &str, column: &str) -> String {
+    if is_pg {
+        format!("{column} IN (SELECT jsonb_array_elements_text(CAST({param} AS jsonb)))")
+    } else {
+        format!("{column} IN (SELECT value FROM json_each({param}))")
+    }
+}
+
 /// Timestamp comparison: is the column within the last N seconds?
 /// Postgres: `column > NOW() - INTERVAL 'N seconds'`
 /// SQLite: `column > datetime('now', '-N seconds')`
@@ -255,6 +269,18 @@ mod tests {
     #[test]
     fn test_cast_to_text_sqlite() {
         assert_eq!(cast_to_text(false, "column"), "column");
+    }
+
+    #[test]
+    fn test_value_in_json_array_dialects() {
+        assert_eq!(
+            value_in_json_array(true, "$4", "i.issue_id"),
+            "i.issue_id IN (SELECT jsonb_array_elements_text(CAST($4 AS jsonb)))"
+        );
+        assert_eq!(
+            value_in_json_array(false, "$4", "i.issue_id"),
+            "i.issue_id IN (SELECT value FROM json_each($4))"
+        );
     }
 
     #[test]
