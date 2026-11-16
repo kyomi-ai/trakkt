@@ -14,6 +14,7 @@ use trakkt_types::enums::{ActionSource, FavoriteTarget};
 use trakkt_types::models::{CreateIssueParams, Issue, IssueFilters, IssueUpdate, IssueWithDetails, Label};
 use trakkt_types::sync::{SyncActionType, entity_types};
 
+use crate::filter_sql::SqlArg;
 use crate::sync_log_service;
 use crate::sync_log_service::CascadedIdRow;
 use crate::websocket::WebSocketManager;
@@ -598,7 +599,19 @@ pub async fn list_issues(
     team_id: Option<&str>,
     filters: &IssueFilters,
 ) -> trakkt_core::Result<Vec<IssueWithDetails>> {
-    list_issues_ordered(db, workspace_id, team_id, filters, IssueSort::default(), true).await
+    let is_pg = db.is_postgres();
+    let mut q = ListWhere::new(is_pg, workspace_id, team_id, filters);
+    let limit_offset = match (filters.limit, filters.offset.filter(|&o| o > 0)) {
+        (Some(limit), Some(offset)) => format!(" LIMIT {limit} OFFSET {offset}"),
+        (Some(limit), None) => format!(" LIMIT {limit}"),
+        (None, _) => String::new(),
+    };
+    let sql = format!(
+        "{ISSUE_DETAIL_SELECT} WHERE {} ORDER BY {}{limit_offset}",
+        q.sql(),
+        IssueSort::default().order_by_sql(is_pg)
+    );
+    fetch_issue_details(db, &sql, &q.take_binds()).await
 }
 
 /// Field a list of issues can be ordered by.
@@ -664,16 +677,9 @@ impl SortDir {
             _ => None,
         }
     }
-
-    fn sql(self) -> &'static str {
-        match self {
-            Self::Asc => "ASC",
-            Self::Desc => "DESC",
-        }
-    }
 }
 
-/// A complete, deterministic ordering for [`list_issues_sorted`].
+/// A complete, deterministic ordering of issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IssueSort {
     pub field: IssueSortField,
@@ -690,15 +696,18 @@ impl Default for IssueSort {
     }
 }
 
-/// The fields any [`IssueSort`] orders by — what a keyset cursor must remember
-/// about the last row it served.
+/// The values of every column any [`IssueSort`] orders by for one row: what a
+/// keyset cursor remembers about the last row it served. Timestamps are the
+/// database's own text rendering and are only ever handed back to the
+/// database, which compares them as typed values (Postgres casts the bind to
+/// `TIMESTAMPTZ`; SQLite normalises both sides through `datetime()`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueSortKey {
     pub priority: i32,
     pub created_at: String,
     pub updated_at: String,
     pub number: i32,
-    pub team_key: String,
+    pub team_id: String,
     pub issue_id: String,
 }
 
@@ -709,243 +718,326 @@ impl From<&IssueWithDetails> for IssueSortKey {
             created_at: i.created_at.clone(),
             updated_at: i.updated_at.clone(),
             number: i.number,
-            team_key: i.team_key.clone(),
+            team_id: i.team_id.clone(),
             issue_id: i.issue_id.clone(),
         }
     }
 }
 
-impl IssueSort {
-    /// Compare two keys exactly as [`Self::order_by_sql`] orders rows, so a
-    /// keyset cursor can resume "strictly after" a row that may since have
-    /// been deleted or edited. Timestamps compare as text, which matches the
-    /// database order while the session time zone is a fixed-offset one (the
-    /// deployment renders `+00`); a DST-observing Postgres `TimeZone` would
-    /// break that.
-    pub fn compare(self, a: &IssueSortKey, b: &IssueSortKey) -> std::cmp::Ordering {
-        let dir = |o: std::cmp::Ordering| match self.dir {
-            SortDir::Asc => o,
-            SortDir::Desc => o.reverse(),
-        };
-        let rank = |p: i32| if p == 0 { 5 } else { p };
-        match self.field {
-            IssueSortField::Priority => dir(rank(a.priority).cmp(&rank(b.priority)))
-                .then_with(|| b.created_at.cmp(&a.created_at))
-                .then_with(|| b.number.cmp(&a.number))
-                .then_with(|| a.issue_id.cmp(&b.issue_id)),
-            IssueSortField::CreatedAt => dir(a.created_at.cmp(&b.created_at))
-                .then_with(|| dir(a.number.cmp(&b.number)))
-                .then_with(|| a.issue_id.cmp(&b.issue_id)),
-            IssueSortField::UpdatedAt => dir(a.updated_at.cmp(&b.updated_at))
-                .then_with(|| dir(a.number.cmp(&b.number)))
-                .then_with(|| a.issue_id.cmp(&b.issue_id)),
-            IssueSortField::Number => dir(a.number.cmp(&b.number))
-                .then_with(|| a.team_key.cmp(&b.team_key))
-                .then_with(|| a.issue_id.cmp(&b.issue_id)),
-        }
-    }
+/// One `ORDER BY` column. The `ORDER BY` clause and the keyset "strictly after
+/// this row" predicate are both generated from [`IssueSort::columns`], so they
+/// cannot disagree about order.
+#[derive(Debug, Clone, Copy)]
+enum KeyCol {
+    /// Priority rank: 1..=4, with stored 0 (none) ranking last as 5.
+    Rank,
+    CreatedAt,
+    UpdatedAt,
+    Number,
+    /// `issues.team_id`. `issues.number` is unique only within a team, and a
+    /// team id never changes (a team's `key` can be renamed mid-walk).
+    TeamId,
+    IssueId,
+}
 
-    /// `ORDER BY` body. Every ordering ends in `i.issue_id`, which is unique,
-    /// so equal sort keys (second-granularity timestamps, equal numbers in
-    /// different teams) can never reorder between calls.
-    fn order_by_sql(self, is_pg: bool) -> String {
-        let d = self.dir.sql();
-        // `IssueSort::compare` orders these strings bytewise; Postgres would
-        // otherwise use the database collation (SQLite is already bytewise).
+impl KeyCol {
+    /// SQL expression. String columns compare bytewise (`COLLATE "C"`) on
+    /// Postgres, the same as SQLite's default, so order never depends on the
+    /// database's locale. Timestamps are typed on Postgres and normalised
+    /// through SQLite's `datetime()` on SQLite, where a stored value may be
+    /// either `YYYY-MM-DD HH:MM:SS` or the schema default's
+    /// `YYYY-MM-DDTHH:MM:SSZ` and the two only compare correctly once parsed.
+    fn expr(self, is_pg: bool) -> String {
         let c = if is_pg { r#" COLLATE "C""# } else { "" };
+        match self {
+            Self::Rank => "CASE i.priority WHEN 0 THEN 5 ELSE i.priority END".to_string(),
+            Self::CreatedAt if is_pg => "i.created_at".to_string(),
+            Self::UpdatedAt if is_pg => "i.updated_at".to_string(),
+            Self::CreatedAt => "datetime(i.created_at)".to_string(),
+            Self::UpdatedAt => "datetime(i.updated_at)".to_string(),
+            Self::Number => "i.number".to_string(),
+            Self::TeamId => format!("i.team_id{c}"),
+            Self::IssueId => format!("i.issue_id{c}"),
+        }
+    }
+
+    /// This column's value for `key`, as a bind.
+    fn bind(self, key: &IssueSortKey) -> SqlArg {
+        match self {
+            Self::Rank => SqlArg::Int(if key.priority == 0 { 5 } else { key.priority }),
+            Self::CreatedAt => SqlArg::Text(key.created_at.clone()),
+            Self::UpdatedAt => SqlArg::Text(key.updated_at.clone()),
+            Self::Number => SqlArg::Int(key.number),
+            Self::TeamId => SqlArg::Text(key.team_id.clone()),
+            Self::IssueId => SqlArg::Text(key.issue_id.clone()),
+        }
+    }
+
+    fn is_timestamp(self) -> bool {
+        matches!(self, Self::CreatedAt | Self::UpdatedAt)
+    }
+}
+
+impl IssueSort {
+    /// The ordering as `(column, descending)` pairs. Every ordering ends in
+    /// `i.issue_id`, which is unique, so equal sort keys (second-granularity
+    /// timestamps, equal numbers in different teams) can never reorder between
+    /// calls.
+    fn columns(self) -> Vec<(KeyCol, bool)> {
+        let d = self.dir == SortDir::Desc;
         match self.field {
-            IssueSortField::Priority => format!(
-                "CASE i.priority WHEN 0 THEN 5 ELSE i.priority END {d}, \
-                 i.created_at DESC, i.number DESC, i.issue_id{c} ASC"
-            ),
-            IssueSortField::CreatedAt => {
-                format!("i.created_at {d}, i.number {d}, i.issue_id{c} ASC")
-            }
-            IssueSortField::UpdatedAt => {
-                format!("i.updated_at {d}, i.number {d}, i.issue_id{c} ASC")
-            }
-            IssueSortField::Number => format!("i.number {d}, t.key{c} ASC, i.issue_id{c} ASC"),
+            IssueSortField::Priority => vec![
+                (KeyCol::Rank, d),
+                (KeyCol::CreatedAt, true),
+                (KeyCol::Number, true),
+                (KeyCol::IssueId, false),
+            ],
+            IssueSortField::CreatedAt => vec![
+                (KeyCol::CreatedAt, d),
+                (KeyCol::Number, d),
+                (KeyCol::IssueId, false),
+            ],
+            IssueSortField::UpdatedAt => vec![
+                (KeyCol::UpdatedAt, d),
+                (KeyCol::Number, d),
+                (KeyCol::IssueId, false),
+            ],
+            IssueSortField::Number => vec![
+                (KeyCol::Number, d),
+                (KeyCol::TeamId, false),
+                (KeyCol::IssueId, false),
+            ],
         }
     }
+
+    /// `ORDER BY` body.
+    fn order_by_sql(self, is_pg: bool) -> String {
+        self.columns()
+            .into_iter()
+            .map(|(col, desc)| format!("{} {}", col.expr(is_pg), if desc { "DESC" } else { "ASC" }))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
-/// [`list_issues`] with an explicit ordering, for callers that only need list
-/// rows: `description` is not loaded and comes back `None`, since descriptions
-/// are multi-KB and this is called to read every match of a query.
-pub async fn list_issues_sorted(
-    db: &DbPool,
-    workspace_id: &str,
-    team_id: Option<&str>,
-    filters: &IssueFilters,
-    sort: IssueSort,
-) -> trakkt_core::Result<Vec<IssueWithDetails>> {
-    list_issues_ordered(db, workspace_id, team_id, filters, sort, false).await
+/// Bind every argument, in order, onto a sqlx query.
+macro_rules! bind_args {
+    ($query:expr, $args:expr) => {{
+        let mut query = $query;
+        for arg in $args {
+            query = match arg {
+                SqlArg::Text(t) => query.bind(t.as_str()),
+                SqlArg::Int(i) => query.bind(*i),
+            };
+        }
+        query
+    }};
 }
 
-async fn list_issues_ordered(
-    db: &DbPool,
-    workspace_id: &str,
-    team_id: Option<&str>,
-    filters: &IssueFilters,
-    sort: IssueSort,
-    with_description: bool,
-) -> trakkt_core::Result<Vec<IssueWithDetails>> {
-    let is_pg = db.is_postgres();
-
-    // Dynamic WHERE clause construction.
-    // $1 is always workspace_id. Additional params start at $2.
-    let mut conditions = vec!["i.workspace_id = $1".to_string()];
-    let mut param_idx: usize = 2;
-
-    // We build the SQL string with numbered placeholders and bind values
-    // dynamically via db_with_pool! below. Params are bound in the same
-    // order as they appear in the SQL.
-
-    // Archive filtering: only_archived takes precedence over include_archived.
-    if filters.only_archived.unwrap_or(false) {
-        conditions.push("i.archived_at IS NOT NULL".to_string());
-    } else if !filters.include_archived.unwrap_or(false) {
-        conditions.push("i.archived_at IS NULL".to_string());
-    }
-
-    if team_id.is_some() {
-        conditions.push(format!("i.team_id = ${param_idx}"));
-        param_idx += 1;
-    }
-
-    if filters.status_id.is_some() {
-        conditions.push(format!("i.status_id = ${param_idx}"));
-        param_idx += 1;
-    }
-
-    if let Some(ref cats) = filters.status_categories
-        && !cats.is_empty()
+/// Postgres renders a zero offset as `+00`; SQLite's `datetime()` only parses
+/// `±HH:MM`. Give a bare hour offset its minutes so both sides normalise to the
+/// same instant.
+fn sqlite_timestamp(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let sign_at = text.len().checked_sub(3);
+    if let Some(i) = sign_at
+        && matches!(bytes.get(i), Some(b'+' | b'-'))
+        && bytes[i + 1..].iter().all(u8::is_ascii_digit)
     {
-        let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(cats.len(), param_idx);
-        conditions.push(format!("s.category IN {in_clause}"));
-        param_idx = next_idx;
+        return format!("{text}:00");
+    }
+    text.to_string()
+}
+
+/// The `WHERE` clause of a list query and its binds, numbered `$1..`.
+///
+/// Every condition goes through [`ListWhere::param`], so a placeholder's
+/// number and its bind are created together and cannot drift apart.
+struct ListWhere {
+    is_pg: bool,
+    conditions: Vec<String>,
+    binds: Vec<SqlArg>,
+}
+
+impl ListWhere {
+    /// The query's base filters. `$1` is always the workspace.
+    fn new(
+        is_pg: bool,
+        workspace_id: &str,
+        team_id: Option<&str>,
+        filters: &IssueFilters,
+    ) -> Self {
+        let mut q = Self {
+            is_pg,
+            conditions: Vec::new(),
+            binds: Vec::new(),
+        };
+        let ws = q.param(SqlArg::Text(workspace_id.to_string()));
+        q.conditions.push(format!("i.workspace_id = {ws}"));
+
+        // Archive filtering: only_archived takes precedence over include_archived.
+        if filters.only_archived.unwrap_or(false) {
+            q.conditions.push("i.archived_at IS NOT NULL".to_string());
+        } else if !filters.include_archived.unwrap_or(false) {
+            q.conditions.push("i.archived_at IS NULL".to_string());
+        }
+        if let Some(team_id) = team_id {
+            let p = q.param(SqlArg::Text(team_id.to_string()));
+            q.conditions.push(format!("i.team_id = {p}"));
+        }
+        if let Some(status_id) = &filters.status_id {
+            let p = q.param(SqlArg::Text(status_id.clone()));
+            q.conditions.push(format!("i.status_id = {p}"));
+        }
+        if let Some(cats) = filters.status_categories.as_ref().filter(|c| !c.is_empty()) {
+            let list = q.text_list(cats);
+            q.conditions.push(format!("s.category IN {list}"));
+        }
+        if let Some(cats) = filters
+            .exclude_status_categories
+            .as_ref()
+            .filter(|c| !c.is_empty())
+        {
+            let list = q.text_list(cats);
+            q.conditions.push(format!("s.category NOT IN {list}"));
+        }
+        if let Some(priority) = filters.priority {
+            let p = q.param(SqlArg::Int(priority));
+            // CAST for Postgres compatibility per CODING_STANDARDS.md.
+            q.conditions.push(if is_pg {
+                format!("i.priority = CAST({p} AS INTEGER)")
+            } else {
+                format!("i.priority = {p}")
+            });
+        }
+        if let Some(assignee) = &filters.assignee_id {
+            let p = q.param(SqlArg::Text(assignee.clone()));
+            q.conditions.push(format!("i.assignee_id = {p}"));
+        }
+        if let Some(creator) = &filters.creator_id {
+            let p = q.param(SqlArg::Text(creator.clone()));
+            q.conditions.push(format!("i.creator_id = {p}"));
+        }
+        if let Some(ids) = filters.label_ids.as_ref().filter(|i| !i.is_empty()) {
+            let list = q.text_list(ids);
+            q.conditions.push(format!(
+                "EXISTS (SELECT 1 FROM issue_labels WHERE issue_id = i.issue_id AND label_id IN {list})"
+            ));
+        }
+        if let Some(search) = &filters.search {
+            // Escape LIKE special characters in the caller's text.
+            let escaped = search
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let p = q.param(SqlArg::Text(format!("%{escaped}%")));
+            q.conditions
+                .push(format!("i.title LIKE {p} ESCAPE '\\'"));
+        }
+        q
     }
 
-    if let Some(ref cats) = filters.exclude_status_categories
-        && !cats.is_empty()
-    {
-        let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(cats.len(), param_idx);
-        conditions.push(format!("s.category NOT IN {in_clause}"));
-        param_idx = next_idx;
+    /// AND in composable filter clauses, compiled by [`crate::filter_sql`].
+    fn clauses(&mut self, clauses: &[trakkt_types::api::FilterClause]) {
+        let c = crate::filter_sql::clauses_to_sql(clauses, self.binds.len() + 1, self.is_pg);
+        self.conditions.extend(c.conditions);
+        self.binds.extend(c.args);
     }
 
-    if filters.priority.is_some() {
-        // CAST for Postgres compatibility per CODING_STANDARDS.md.
-        if is_pg {
-            conditions.push(format!("i.priority = CAST(${param_idx} AS INTEGER)"));
+    /// Add a bind and return its placeholder (`$n`).
+    fn param(&mut self, bind: SqlArg) -> String {
+        self.binds.push(bind);
+        format!("${}", self.binds.len())
+    }
+
+    /// Placeholder for a timestamp carried as text: cast back to a typed
+    /// timestamp on Postgres so comparisons are chronological, whatever the
+    /// session time zone rendered the text in.
+    fn timestamp(&mut self, text: &str) -> String {
+        let text = if self.is_pg {
+            text.to_string()
         } else {
-            conditions.push(format!("i.priority = ${param_idx}"));
+            sqlite_timestamp(text)
+        };
+        let p = self.param(SqlArg::Text(text));
+        if self.is_pg {
+            format!("CAST({p} AS TIMESTAMPTZ)")
+        } else {
+            // Match `KeyCol::expr`'s normalisation so a stored value in either
+            // accepted format compares against the bound one.
+            format!("datetime({p})")
         }
-        param_idx += 1;
     }
 
-    if filters.assignee_id.is_some() {
-        conditions.push(format!("i.assignee_id = ${param_idx}"));
-        param_idx += 1;
+    /// `($a, $b, …)` for a list of text values.
+    fn text_list(&mut self, values: &[String]) -> String {
+        let (clause, _) =
+            trakkt_core::db::in_clause_placeholders(values.len(), self.binds.len() + 1);
+        self.binds
+            .extend(values.iter().map(|v| SqlArg::Text(v.clone())));
+        clause
     }
 
-    if filters.creator_id.is_some() {
-        conditions.push(format!("i.creator_id = ${param_idx}"));
-        param_idx += 1;
+    /// Restrict to rows strictly after `key` in `sort` order.
+    ///
+    /// Expands to `(c1 > v1) OR (c1 = v1 AND c2 > v2) OR …` over the same
+    /// columns, directions and collations as the `ORDER BY`.
+    fn after(&mut self, sort: IssueSort, key: &IssueSortKey) {
+        let cols = sort.columns();
+        let values: Vec<String> = cols
+            .iter()
+            .map(|(col, _)| {
+                if col.is_timestamp() {
+                    match col.bind(key) {
+                        SqlArg::Text(t) => self.timestamp(&t),
+                        SqlArg::Int(_) => unreachable!("timestamps bind as text"),
+                    }
+                } else {
+                    self.param(col.bind(key))
+                }
+            })
+            .collect();
+        let mut alternatives = Vec::new();
+        for (k, (col, desc)) in cols.iter().enumerate() {
+            let mut parts: Vec<String> = cols[..k]
+                .iter()
+                .zip(&values)
+                .map(|((c, _), v)| format!("{} = {v}", c.expr(self.is_pg)))
+                .collect();
+            let op = if *desc { "<" } else { ">" };
+            parts.push(format!("{} {op} {}", col.expr(self.is_pg), values[k]));
+            alternatives.push(format!("({})", parts.join(" AND ")));
+        }
+        self.conditions.push(format!("({})", alternatives.join(" OR ")));
     }
 
-    if let Some(ref ids) = filters.label_ids
-        && !ids.is_empty()
-    {
-        let (in_clause, next_idx) = trakkt_core::db::in_clause_placeholders(ids.len(), param_idx);
-        conditions.push(format!(
-            "EXISTS (SELECT 1 FROM issue_labels WHERE issue_id = i.issue_id AND label_id IN {in_clause})"
-        ));
-        param_idx = next_idx;
+    /// Restrict to rows last modified at or before `snapshot` (see
+    /// [`list_issues_page`]).
+    fn modified_by(&mut self, snapshot: &str) {
+        let ts = self.timestamp(snapshot);
+        let updated = KeyCol::UpdatedAt.expr(self.is_pg);
+        self.conditions.push(format!("{updated} <= {ts}"));
     }
 
-    // search must be the last filter — it does not increment param_idx.
-    if filters.search.is_some() {
-        conditions.push(format!("i.title LIKE ${param_idx} ESCAPE '\\'"));
+    fn sql(&self) -> String {
+        self.conditions.join(" AND ")
     }
 
-    let where_clause = conditions.join(" AND ");
+    fn take_binds(&mut self) -> Vec<SqlArg> {
+        std::mem::take(&mut self.binds)
+    }
+}
 
-    // Inline LIMIT/OFFSET per CODING_STANDARDS.md (sanitized i64 values).
-    let limit_offset = match (filters.limit, filters.offset.filter(|&o| o > 0)) {
-        (Some(limit), Some(offset)) => format!(" LIMIT {limit} OFFSET {offset}"),
-        (Some(limit), None) => format!(" LIMIT {limit}"),
-        (None, _) => String::new(),
-    };
-
-    let select = if with_description {
-        ISSUE_DETAIL_SELECT.to_string()
-    } else {
-        ISSUE_DETAIL_SELECT.replacen(
-            "i.description,",
-            "CAST(NULL AS TEXT) AS description,",
-            1,
-        )
-    };
-    let sql = format!(
-        "{select} \
-         WHERE {where_clause} \
-         ORDER BY {order_by}{limit_offset}",
-        order_by = sort.order_by_sql(is_pg),
-    );
-
-    // Prepare the search term with wildcards, escaping LIKE special chars.
-    let search_pattern = filters
-        .search
-        .as_ref()
-        .map(|s| {
-            let escaped = s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-            format!("%{escaped}%")
-        });
-
-    // Bind dynamically using db_with_pool!.
+/// Run a list query built from [`ISSUE_DETAIL_SELECT`] and attach labels.
+async fn fetch_issue_details(
+    db: &DbPool,
+    sql: &str,
+    binds: &[SqlArg],
+) -> trakkt_core::Result<Vec<IssueWithDetails>> {
     let rows: Vec<IssueDetailRow> = trakkt_core::db_with_pool!(db, |p| {
-        let mut query = sqlx::query_as::<_, IssueDetailRow>(&sql);
-
-        // $1: workspace_id (always present)
-        query = query.bind(workspace_id);
-
-        // Bind remaining params in order of their slot assignment.
-        if let Some(ref v) = team_id {
-            query = query.bind(v);
-        }
-        if let Some(ref v) = filters.status_id {
-            query = query.bind(v);
-        }
-        if let Some(ref cats) = filters.status_categories {
-            for cat in cats {
-                query = query.bind(cat);
-            }
-        }
-        if let Some(ref cats) = filters.exclude_status_categories {
-            for cat in cats {
-                query = query.bind(cat);
-            }
-        }
-        if let Some(v) = filters.priority {
-            query = query.bind(v);
-        }
-        if let Some(ref v) = filters.assignee_id {
-            query = query.bind(v);
-        }
-        if let Some(ref v) = filters.creator_id {
-            query = query.bind(v);
-        }
-        if let Some(ref ids) = filters.label_ids {
-            for id in ids {
-                query = query.bind(id);
-            }
-        }
-        if let Some(ref v) = search_pattern {
-            query = query.bind(v);
-        }
-
-        query.fetch_all(p).await
+        bind_args!(sqlx::query_as::<_, IssueDetailRow>(sql), binds)
+            .fetch_all(p)
+            .await
     })?;
 
     if rows.is_empty() {
@@ -956,15 +1048,172 @@ async fn list_issues_ordered(
     let issue_ids: Vec<String> = rows.iter().map(|r| r.issue_id.clone()).collect();
     let mut labels_map = fetch_labels_for_issues(db, &issue_ids).await?;
 
-    let results = rows
+    Ok(rows
         .into_iter()
         .map(|r| {
             let labels = labels_map.remove(&r.issue_id).unwrap_or_default();
             r.into_dto(labels)
         })
-        .collect();
+        .collect())
+}
 
-    Ok(results)
+/// Where a walk resumes: everything a page after the first needs.
+pub struct IssueWalk<'a> {
+    /// Resume strictly after this row.
+    pub after: &'a IssueSortKey,
+    /// The walk's snapshot instant, as returned by its first page.
+    pub snapshot_at: &'a str,
+    /// The walk's total, as returned by its first page.
+    pub total: i64,
+    /// Rows returned by the walk so far, as reported by its previous page.
+    pub served: i64,
+}
+
+/// Largest `served_count` a cursor may carry (and the most a walk reports): far
+/// above any real backlog, and small enough that a cursor this endpoint
+/// generated is always accepted back.
+pub const MAX_WALK_SERVED: i64 = 1_000_000_100;
+
+/// One page of a keyset-paginated issue list.
+pub struct IssuePageRequest<'a> {
+    pub workspace_id: &'a str,
+    pub team_id: Option<&'a str>,
+    pub filters: &'a IssueFilters,
+    /// Composable filter clauses, AND-ed with `filters`.
+    pub clauses: &'a [trakkt_types::api::FilterClause],
+    pub sort: IssueSort,
+    /// `None` for the first page of a walk.
+    pub resume: Option<IssueWalk<'a>>,
+    pub limit: i64,
+}
+
+/// A page and what a caller needs to continue the walk.
+pub struct IssuePage {
+    /// At most `limit` rows. `description` is not loaded (`None`).
+    pub issues: Vec<IssueWithDetails>,
+    pub has_more: bool,
+    /// Matching rows in the whole walk, counted once on its first page.
+    pub total: i64,
+    /// The walk's snapshot instant.
+    pub snapshot_at: String,
+    /// Rows this walk has returned so far, this page included. See
+    /// [`list_issues_page`] for how it relates to `total`.
+    pub served_count: i64,
+}
+
+/// One page of issues in `sort` order. Each page reads `limit + 1` rows in one
+/// query; the first page of a walk also counts its matches once, and later
+/// pages carry that total instead of recounting.
+///
+/// Paging is a keyset: each page is `WHERE <filters> AND <modified at or
+/// before the snapshot> AND <strictly after the last row served> ORDER BY
+/// <sort> LIMIT limit + 1`, evaluated by the database on typed values.
+///
+/// # What a walk promises
+///
+/// The first page reads the **database** clock (never the application's) as
+/// `snapshot_at`, then counts and reads under `updated_at <= snapshot_at`;
+/// every later page applies the same bound. Writers stamp `updated_at` with
+/// the database clock when their transaction starts, so a write stamped at or
+/// before `snapshot_at` counts as of the walk's start. Across one walk:
+/// - `total` and `snapshot_at` are the same on every page;
+/// - an issue modified after `snapshot_at` is outside the walk and appears in a
+///   fresh one (a request without `cursor`);
+/// - a row that stops matching mid-walk (deleted, archived, relabelled, a
+///   relation change — none of which move `updated_at` for a label or relation
+///   write) is absent from later pages, and `total` remains the walk's size at
+///   its start;
+/// - a write stamped at or before `snapshot_at` that moves an already-served
+///   issue past the cursor makes that issue appear once more. A Postgres
+///   transaction that began before page 1 carries such a stamp, as does any
+///   SQLite write in the same whole second as `snapshot_at`. An ordinary edit
+///   does not change the keys a `number` or `created_at` walk orders by; the
+///   writes that do (moving an issue to another team, a delete-team
+///   reassignment) stamp `updated_at`, so they follow the rules above — a
+///   repeat if the row was already served, a slip behind the cursor if it was
+///   not. A priority walk moves on a priority edit, which also stamps
+///   `updated_at`.
+///
+/// `served_count` saturates at [`MAX_WALK_SERVED`].
+///
+/// `served_count` is therefore `total` plus any repeat, minus rows that stopped
+/// matching before they were served, minus rows such a write moved to before the
+/// cursor before they were served, plus rows that started matching without a
+/// write that moves `updated_at` and were served.
+pub async fn list_issues_page(
+    db: &DbPool,
+    req: &IssuePageRequest<'_>,
+) -> trakkt_core::Result<IssuePage> {
+    let is_pg = db.is_postgres();
+
+    let snapshot_at: String = match &req.resume {
+        Some(walk) => walk.snapshot_at.to_string(),
+        None => {
+            let sql = format!("SELECT {}", sql_compat::cast_to_text(is_pg, sql_compat::now(is_pg)));
+            trakkt_core::db_fetch_scalar!(db, String, &sql)?
+        }
+    };
+
+    let mut q = ListWhere::new(is_pg, req.workspace_id, req.team_id, req.filters);
+    q.clauses(req.clauses);
+    q.modified_by(&snapshot_at);
+
+    // Counted without the keyset condition: the total of the whole walk, not
+    // of the rest of it. Later pages carry it instead of recounting.
+    let total = match &req.resume {
+        Some(walk) => walk.total,
+        None => {
+            let sql = format!(
+                "SELECT COUNT(*) FROM issues i \
+                 JOIN statuses s ON s.status_id = i.status_id \
+                 WHERE {}",
+                q.sql()
+            );
+            count_rows(db, &sql, &q.binds).await?
+        }
+    };
+
+    if let Some(walk) = &req.resume {
+        q.after(req.sort, walk.after);
+    }
+
+    // The list never needs descriptions: they are multi-KB and rows are lean.
+    let select = ISSUE_DETAIL_SELECT.replacen(
+        "i.description,",
+        "CAST(NULL AS TEXT) AS description,",
+        1,
+    );
+    let sql = format!(
+        "{select} WHERE {} ORDER BY {} LIMIT {}",
+        q.sql(),
+        req.sort.order_by_sql(is_pg),
+        req.limit + 1
+    );
+    let mut issues = fetch_issue_details(db, &sql, &q.take_binds()).await?;
+    let has_more = issues.len() as i64 > req.limit;
+    issues.truncate(req.limit as usize);
+    let served_count = req
+        .resume
+        .as_ref()
+        .map_or(0, |walk| walk.served)
+        .saturating_add(issues.len() as i64)
+        .min(MAX_WALK_SERVED);
+
+    Ok(IssuePage {
+        issues,
+        has_more,
+        total,
+        snapshot_at,
+        served_count,
+    })
+}
+
+async fn count_rows(db: &DbPool, sql: &str, binds: &[SqlArg]) -> trakkt_core::Result<i64> {
+    Ok(trakkt_core::db_with_pool!(db, |p| {
+        bind_args!(sqlx::query_scalar::<_, i64>(sql), binds)
+            .fetch_one(p)
+            .await
+    })?)
 }
 
 /// Update an issue by team key + number (e.g. "ENG-42").

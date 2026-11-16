@@ -26,10 +26,6 @@ use crate::context::{parse_issue_identifier, resolve_issue_key_and_number, resol
 use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Composable filter clause support
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -38,8 +34,7 @@ use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 /// Returns lean [`IssueListRow`]s, never full issue records: `description`,
 /// comments, and activities are projected away at this boundary so that listing
 /// a mature queue stays small. Callers that need an issue's content call
-/// [`get_issue`]. The projection happens *after* [`FilterClause::matches`] filtering, so
-/// no filterable field is lost.
+/// [`get_issue`].
 ///
 /// Ported from `tool_list_issues` in `routes/mcp.rs`.
 pub async fn list_issues(
@@ -138,61 +133,57 @@ pub async fn list_issues(
     )
     .await?;
 
-    let mut issues = issue_service::list_issues_sorted(
+    let resume = cursor.as_ref().map(|c| issue_service::IssueWalk {
+        after: &c.after,
+        snapshot_at: &c.snapshot_at,
+        total: c.total,
+        served: c.served,
+    });
+    let page = issue_service::list_issues_page(
         ctx.db,
-        &ctx.workspace_id,
-        team_id.as_deref(),
-        &filters,
-        sort,
+        &issue_service::IssuePageRequest {
+            workspace_id: &ctx.workspace_id,
+            team_id: team_id.as_deref(),
+            filters: &filters,
+            clauses: &clauses,
+            sort,
+            resume,
+            limit,
+        },
     )
     .await?;
 
-    // Apply composable filter clauses post-fetch (all AND-ed).
-    if !clauses.is_empty() {
-        issues.retain(|issue| clauses.iter().all(|clause| clause.matches(issue)));
-    }
-
-    let total = issues.len();
-    // Resume strictly after the last row the caller saw, by sort key rather
-    // than position: the anchor may since have been deleted, filtered out or
-    // edited, and rows already served still sort before the key.
-    let start = match &cursor {
-        None => 0,
-        Some(c) => issues
-            .iter()
-            .position(|i| sort.compare(&IssueSortKey::from(i), c) == std::cmp::Ordering::Greater)
-            .unwrap_or(total),
-    };
-    let end = start.saturating_add(limit as usize).min(total);
-    let has_more = end < total;
-    // `has_more` implies `start < end < total` (limit >= 1), so `end - 1` is the
-    // last row of this page.
-    let next_cursor = if has_more {
-        issues
-            .get(end - 1)
-            .map(|last| encode_cursor(&IssueSortKey::from(last), &fingerprint))
+    let next_cursor = if page.has_more {
+        page.issues.last().map(|last| {
+            encode_cursor(
+                &ListCursor {
+                    after: IssueSortKey::from(last),
+                    snapshot_at: page.snapshot_at.clone(),
+                    total: page.total,
+                    served: page.served_count,
+                },
+                &fingerprint,
+            )
+        })
     } else {
         None
     };
 
-    // Project to lean rows only after filtering, so clauses keep access to
-    // every field of the full issue.
-    let rows: Vec<IssueListRow> = issues
-        .drain(start..end)
-        .map(IssueListRow::from)
-        .collect();
+    let rows: Vec<IssueListRow> = page.issues.into_iter().map(IssueListRow::from).collect();
 
     let response = ListIssuesResponse {
         returned_count: rows.len(),
         issues: rows,
-        total,
-        has_more,
+        total: page.total as usize,
+        snapshot_at: page.snapshot_at,
+        served_count: page.served_count,
+        has_more: page.has_more,
         next_cursor,
         limit,
         sort_by: sort.field.as_str().to_string(),
         sort_dir: sort.dir.as_str().to_string(),
-        matched_count: total,
-        truncated: has_more,
+        matched_count: page.total as usize,
+        truncated: page.has_more,
     };
     Ok(serde_json::to_value(&response)?)
 }
@@ -207,21 +198,38 @@ pub(crate) fn clamp_limit(raw: Option<i64>, default: i64, max: i64) -> i64 {
     raw.unwrap_or(default).clamp(1, max)
 }
 
-const CURSOR_VERSION: &str = "v2";
+const CURSOR_VERSION: &str = "v4";
+/// Upper bound on a cursor's `total`: far above any real backlog. A cursor's
+/// `served` is bounded by [`issue_service::MAX_WALK_SERVED`].
+const MAX_WALK_COUNT: i64 = 1_000_000_000;
 const CURSOR_SEP: char = '\u{1e}';
 
-/// An opaque cursor is the sort key of the last row served plus the query
-/// fingerprint it is valid for.
-fn encode_cursor(key: &IssueSortKey, fingerprint: &str) -> String {
+/// What an opaque `list_issues` cursor carries.
+struct ListCursor {
+    /// Sort key of the last row served.
+    after: IssueSortKey,
+    /// The walk's snapshot instant (database clock, first page).
+    snapshot_at: String,
+    /// Matching rows in the whole walk, counted on the first page.
+    total: i64,
+    /// Rows the walk has returned, this page included.
+    served: i64,
+}
+
+fn encode_cursor(c: &ListCursor, fingerprint: &str) -> String {
     use base64::Engine;
+    let k = &c.after;
     let raw = [
         CURSOR_VERSION,
-        &key.priority.to_string(),
-        &key.created_at,
-        &key.updated_at,
-        &key.number.to_string(),
-        &key.team_key,
-        &key.issue_id,
+        &k.priority.to_string(),
+        &k.created_at,
+        &k.updated_at,
+        &k.number.to_string(),
+        &k.team_id,
+        &k.issue_id,
+        &c.snapshot_at,
+        &c.total.to_string(),
+        &c.served.to_string(),
         fingerprint,
     ]
     .join(&CURSOR_SEP.to_string());
@@ -230,7 +238,7 @@ fn encode_cursor(key: &IssueSortKey, fingerprint: &str) -> String {
 
 /// Decode a cursor, rejecting anything not produced by [`encode_cursor`] for
 /// this same query.
-fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<IssueSortKey> {
+fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<ListCursor> {
     use base64::Engine;
     let bad = || {
         ApiError::BadRequest(
@@ -242,21 +250,118 @@ fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<IssueSortKey> {
         .decode(cursor)
         .map_err(|_| bad())?;
     let text = String::from_utf8(bytes).map_err(|_| bad())?;
-    let parts: Vec<&str> = text.splitn(8, CURSOR_SEP).collect();
+    let parts: Vec<&str> = text.splitn(11, CURSOR_SEP).collect();
     match parts.as_slice() {
-        [CURSOR_VERSION, priority, created_at, updated_at, number, team_key, issue_id, fp]
+        [CURSOR_VERSION, priority, created_at, updated_at, number, team_id, issue_id, snapshot_at, total, served, fp]
             if *fp == fingerprint =>
         {
-            Ok(IssueSortKey {
-                priority: priority.parse().map_err(|_| bad())?,
-                created_at: created_at.to_string(),
-                updated_at: updated_at.to_string(),
-                number: number.parse().map_err(|_| bad())?,
-                team_key: team_key.to_string(),
-                issue_id: issue_id.to_string(),
+            let priority: i32 = priority.parse().map_err(|_| bad())?;
+            let total: i64 = total.parse().map_err(|_| bad())?;
+            let served: i64 = served.parse().map_err(|_| bad())?;
+            // The timestamps are cast to a typed timestamp by the database, and
+            // the numbers are bound as integers: reject anything the database
+            // would not accept as this cursor's own output, so a forged cursor
+            // is a 400 on every backend rather than a 500 on Postgres.
+            // Priority and number are plain integers the write paths accept
+            // without a range, so they are not range-checked here: a cursor this
+            // endpoint generated must always be accepted back. The counts do
+            // come from this endpoint's own responses; bound them so a forged
+            // cursor cannot overflow the per-page accumulation.
+            if total < 0
+                || served < 0
+                || total > MAX_WALK_COUNT
+                || served > issue_service::MAX_WALK_SERVED
+                || ![created_at, updated_at, snapshot_at]
+                    .iter()
+                    .all(|t| is_db_timestamp(t))
+            {
+                return Err(bad());
+            }
+            Ok(ListCursor {
+                after: IssueSortKey {
+                    priority,
+                    created_at: created_at.to_string(),
+                    updated_at: updated_at.to_string(),
+                    number: number.parse().map_err(|_| bad())?,
+                    team_id: team_id.to_string(),
+                    issue_id: issue_id.to_string(),
+                },
+                snapshot_at: snapshot_at.to_string(),
+                total,
+                served,
             })
         }
         _ => Err(bad()),
+    }
+}
+
+/// Whether `t` is a timestamp the database renders and accepts back:
+/// `YYYY-MM-DD[ T]HH:MM:SS[.f…]` optionally followed by `Z` or a `±HH[:MM]`
+/// offset (SQLite renders no offset, Postgres `+00`-style ones).
+fn is_db_timestamp(t: &str) -> bool {
+    let b = t.as_bytes();
+    let digits = |r: std::ops::Range<usize>| -> Option<u32> {
+        let part = b.get(r)?;
+        if part.iter().all(u8::is_ascii_digit) {
+            std::str::from_utf8(part).ok()?.parse().ok()
+        } else {
+            None
+        }
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(min), Some(sec)) = (
+        digits(0..4),
+        digits(5..7),
+        digits(8..10),
+        digits(11..13),
+        digits(14..16),
+        digits(17..19),
+    ) else {
+        return false;
+    };
+    let separators_ok = b.get(4) == Some(&b'-')
+        && b.get(7) == Some(&b'-')
+        && matches!(b.get(10), Some(b' ' | b'T'))
+        && b.get(13) == Some(&b':')
+        && b.get(16) == Some(&b':');
+    // Postgres has no year 0 (`'0000-01-01'::timestamptz` is out of range), so
+    // accepting it would let a forged cursor reach a cast error — a 500.
+    if year == 0 {
+        return false;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if !separators_ok || day == 0 || day > days_in_month || hour > 23 || min > 59 || sec > 59 {
+        return false;
+    }
+    let mut rest = &t[19..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        let n = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if n == 0 || n > 9 {
+            return false;
+        }
+        rest = &frac[n..];
+    }
+    match rest {
+        "" | "Z" => true,
+        _ => {
+            let Some(sign_rest) = rest.strip_prefix(['+', '-']) else {
+                return false;
+            };
+            let (hh, mm) = match sign_rest.split_once(':') {
+                Some((hh, mm)) => (hh, Some(mm)),
+                None => (sign_rest, None),
+            };
+            hh.len() == 2
+                && hh.bytes().all(|c| c.is_ascii_digit())
+                && hh.parse::<u32>().is_ok_and(|h| h <= 15)
+                && mm.is_none_or(|m| m.len() == 2 && m.bytes().all(|c| c.is_ascii_digit()) && m.parse::<u32>().is_ok_and(|m| m <= 59))
+        }
     }
 }
 
@@ -745,7 +850,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_issues",
-            description: "Find issues in the workspace with optional filters. Returns `{issues, total, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. The cursor resumes after the last row served by its sort key, so unchanged issues appear exactly once even if other issues are created, deleted or edited between pages; an issue edited so that it now sorts before the cursor (for example a `sort_by=updated_at` walk) can be missed. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view). Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
+            description: "Find issues in the workspace with optional filters. Returns `{issues, total, snapshot_at, served_count, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. A walk is a snapshot as of `snapshot_at` (the database clock when its first page was read). A write stamped at or before `snapshot_at` counts as of the walk's start: `total` is counted once then and is the same on every page, and every page lists issues last modified at or before `snapshot_at`. A write stamped at or before `snapshot_at` that moves an already-served issue past the cursor can return that issue once more, and one that moves an issue the walk had not reached to before the cursor can leave it out of that walk (it appears in a fresh walk). Both are visible in `served_count`. An ordinary edit does not move an issue in a `number` or `created_at` walk; only a write that changes its key (`number` by a team move or a delete-team reassignment, `created_at` never) can, and those stamp `updated_at` and follow the same rules. A priority walk moves on a priority edit, which also stamps `updated_at`. `served_count` reports how many rows this walk has returned so far: it is `total` plus any repeat, minus rows that stopped matching before they were served, minus rows a pre-snapshot write moved before the cursor before they were served, plus rows that started matching without a write that moves `updated_at` and were served. `has_more` false ends the walk whatever it says. An issue modified after `snapshot_at` is not part of that walk; it appears in a fresh walk (a request without `cursor`). An issue deleted, archived or otherwise no longer matching during the walk is absent from later pages. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view). Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues",
@@ -761,7 +866,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "search_issues",
-            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of matches ignoring limit/offset; when `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. A search considers at most its 1000 best-ranked matches: when `truncated` is true, `total` is a lower bound and lower-ranked matches cannot be reached by paging, so narrow the query (team, status filters, include_comments). Search applies only the filters you pass and no hidden defaults: with no status filter it covers every status, including Done and Cancelled, and archived issues. Narrow with status_id, status_category (comma-separated: backlog, unstarted, started, completed, cancelled), the same composable `filters` as list_issues (a JSON array of `{field, operator, values}` clauses AND-ed together; fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view); operators: any_of, none_of, all_of, not_any_of, not_all_of), applied before ranking and paging, team_key/team_id, include_archived=false, or include_comments=false (comments are searched by default). An exact identifier such as 'TRA-35' always matches that issue unless a filter you set excludes it. include_closed is deprecated and kept for compatibility: omitted or true means no status filtering; only an explicit false excludes completed and cancelled issues.",
+            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). A query returns up to its 1000 best-ranked matches: `total` is the number of distinct matching issues within that window — exact when `truncated` is false — and `truncated` true means more matches exist beyond it. When `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. Search applies only the filters you pass and no hidden defaults: with no status filter it covers every status, including Done and Cancelled, and archived issues. Narrow with status_id, status_category (comma-separated: backlog, unstarted, started, completed, cancelled), the same composable `filters` as list_issues (a JSON array of `{field, operator, values}` clauses AND-ed together; fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view); operators: any_of, none_of, all_of, not_any_of, not_all_of), applied before ranking and paging, team_key/team_id, include_archived=false, or include_comments=false (comments are searched by default). An exact identifier such as 'TRA-35' always matches that issue unless a filter you set excludes it. include_closed is deprecated and kept for compatibility: omitted or true means no status filtering; only an explicit false excludes completed and cancelled issues.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues/search",
@@ -1608,6 +1713,169 @@ mod tests {
         assert_eq!((pages, seen.len()), (4, 35));
     }
 
+    /// The search window is a stated contract: below 1000 matches `total` is
+    /// exact and `truncated` is false; past it, `total` counts the 1000
+    /// best-ranked matches and `truncated` says more exist.
+    #[tokio::test]
+    async fn search_reports_the_cap_explicitly() {
+        let (db, workspace_id, user_id) = seeded_workspace(
+            (trakkt_auth::search_service::SEARCH_FETCH_CAP + 5) as i32,
+        )
+        .await;
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let params = |limit| SearchIssuesApiParams {
+            query: "Seeded".to_string(),
+            status_id: None,
+            status_category: None,
+            team_key: None,
+            team_id: None,
+            include_closed: None,
+            include_archived: None,
+            include_comments: Some(false),
+            filters: None,
+            limit: Some(limit),
+            offset: Some(0),
+        };
+
+        let past = search_issues(&ctx, params(10)).await.expect("search");
+        assert_eq!(past["truncated"], true);
+        assert_eq!(past["total"], trakkt_auth::search_service::SEARCH_FETCH_CAP);
+        assert_eq!(past["has_more"], true);
+        assert_eq!(past["results"].as_array().expect("results").len(), 10);
+
+        // Narrowing the query below the cap makes total exact again.
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET title = 'aardvark zebra' WHERE workspace_id = $1 AND number = 3",
+            &workspace_id
+        )
+        .expect("give one issue a unique title");
+        let mut narrow = params(10);
+        narrow.query = "aardvark".to_string();
+        let below = search_issues(&ctx, narrow).await.expect("search");
+        assert_eq!(below["truncated"], false);
+        assert_eq!(below["total"], 1);
+        assert_eq!(below["has_more"], false);
+        assert!(below["next_offset"].is_null());
+    }
+
+    /// The documented contract for a mutable sort: a write stamped exactly at
+    /// `snapshot_at` (the `<=` boundary) counts as of the walk's start, so
+    /// moving an already-served issue past the cursor makes it appear once
+    /// more, and `served_count` shows it. Under a stable-key sort the same
+    /// write changes nothing.
+    #[tokio::test]
+    async fn a_write_stamped_at_the_snapshot_can_repeat_a_served_row() {
+        let (db, workspace_id, user_id) = seeded_workspace(9).await;
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET updated_at = '2026-08-01 00:00:' || substr('0' || number, -2) WHERE workspace_id = $1",
+            &workspace_id
+        )
+        .expect("distinct updated_at");
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+
+        for (sort_by, repeats) in [("updated_at", true), ("number", false)] {
+            let mut params = list_params(None);
+            params.limit = Some(3);
+            params.sort_by = Some(sort_by.to_string());
+            params.sort_dir = Some("asc".to_string());
+            let first = list_issues(&ctx, params.clone()).await.expect("page 1");
+            let served: Vec<i64> = numbers(&first);
+            let total = first["total"].as_i64().expect("total");
+            let snapshot_at = first["snapshot_at"].as_str().expect("snapshot_at").to_string();
+
+            // The last served row is stamped exactly at the walk's snapshot:
+            // the `<=` boundary counts it as of the walk's start. Under the
+            // ascending mutable sort it now sorts after the cursor and is
+            // served again; under the stable sort its position is unchanged.
+            trakkt_core::db_execute!(
+                &db,
+                "UPDATE issues SET updated_at = $1 WHERE workspace_id = $2 AND number = $3",
+                &snapshot_at,
+                &workspace_id,
+                *served.last().expect("a served row") as i32
+            )
+            .expect("write a served row at the snapshot instant");
+
+            let mut seen = served.clone();
+            let mut last_page = first.clone();
+            let mut cursor = first["next_cursor"].as_str().map(str::to_string);
+            while let Some(c) = cursor {
+                let mut p = params.clone();
+                p.cursor = Some(c);
+                let page = list_issues(&ctx, p).await.expect("next page");
+                assert_eq!(page["total"], total, "total is fixed for the walk");
+                seen.extend(numbers(&page));
+                cursor = page["next_cursor"].as_str().map(str::to_string);
+                last_page = page;
+            }
+            let unique: std::collections::HashSet<_> = seen.iter().collect();
+            let served_count = last_page["served_count"].as_i64().expect("served_count");
+            assert_eq!(last_page["has_more"], false);
+            assert_eq!(served_count, seen.len() as i64, "served_count counts every row returned");
+            if repeats {
+                assert_eq!(
+                    seen.len() as i64,
+                    total + 1,
+                    "one repeat at the snapshot boundary: {seen:?}"
+                );
+                assert_eq!(unique.len() as i64, total);
+                assert_eq!(served_count, total + 1);
+            } else {
+                assert_eq!(seen.len() as i64, total, "stable-key walks are exact: {seen:?}");
+                assert_eq!(unique.len() as i64, total);
+                assert_eq!(served_count, total);
+            }
+        }
+    }
+
+    /// A row that stops matching mid-walk (deleted or archived, neither of
+    /// which moves `updated_at`) is absent from later pages while `total`
+    /// stays the walk's size at its start, and no other row is disturbed.
+    #[tokio::test]
+    async fn rows_that_stop_matching_mid_walk_are_absent_from_later_pages() {
+        let (db, workspace_id, user_id) = seeded_workspace(12).await;
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut params = list_params(None);
+        params.limit = Some(4);
+        params.sort_by = Some("number".to_string());
+        params.sort_dir = Some("asc".to_string());
+        let first = list_issues(&ctx, params.clone()).await.expect("page 1");
+        assert_eq!(numbers(&first), vec![1, 2, 3, 4]);
+
+        trakkt_core::db_execute!(
+            &db,
+            "DELETE FROM issues WHERE workspace_id = $1 AND number = 7",
+            &workspace_id
+        )
+        .expect("delete an unreturned row");
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET archived_at = '2026-01-01 00:00:00' WHERE workspace_id = $1 AND number = 10",
+            &workspace_id
+        )
+        .expect("archive an unreturned row");
+
+        let mut seen = numbers(&first);
+        let mut cursor = first["next_cursor"].as_str().map(str::to_string);
+        let mut last_page = first.clone();
+        while let Some(c) = cursor {
+            let mut p = params.clone();
+            p.cursor = Some(c);
+            let page = list_issues(&ctx, p).await.expect("next page");
+            assert_eq!(page["total"], 12, "total is the walk's size at its start");
+            seen.extend(numbers(&page));
+            cursor = page["next_cursor"].as_str().map(str::to_string);
+            last_page = page;
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 8, 9, 11, 12]);
+        assert_eq!(
+            last_page["served_count"], 10,
+            "served_count counts rows returned: total minus the two that stopped matching"
+        );
+    }
+
     /// TRA-10113 audit: workspace activities answer has_more from the data,
     /// not from the page being full, and page without gaps or repeats.
     #[tokio::test]
@@ -1666,58 +1934,346 @@ mod tests {
         assert_eq!((ids.len(), unique.len()), (25, 25));
     }
 
-    /// The keyset comparator must order rows exactly as the SQL `ORDER BY`,
-    /// or a cursor would resume at the wrong place.
+    /// TRA-10113 follow-up (reproduction): an already-served row edited so it
+    /// now sorts *after* the cursor must not be served a second time, and the
+    /// walk's `total` must not change under the edit.
     #[tokio::test]
-    async fn cursor_comparator_agrees_with_sql_order() {
-        let (db, workspace_id, _user_id) = seeded_workspace(60).await;
+    async fn a_served_row_edited_to_sort_later_is_not_repeated() {
+        let (db, workspace_id, user_id) = seeded_workspace(12).await;
         trakkt_core::db_execute!(
             &db,
-            "UPDATE issues SET priority = number % 5, \
-             created_at = '2026-07-01 00:00:' || substr('0' || ((number / 7) % 60), -2), \
-             updated_at = '2026-08-01 00:00:' || substr('0' || ((number / 11) % 60), -2) \
-             WHERE workspace_id = $1",
+            "UPDATE issues SET priority = 2, created_at = '2026-07-01 00:00:' || substr('0' || number, -2), \
+             updated_at = '2026-08-01 00:00:00' WHERE workspace_id = $1",
             &workspace_id
         )
-        .expect("spread fixture");
-        let filters = IssueFilters {
-            status_id: None,
-            status_categories: None,
-            exclude_status_categories: None,
-            priority: None,
-            assignee_id: None,
-            creator_id: None,
-            label_ids: None,
-            search: None,
-            limit: None,
-            offset: None,
-            include_archived: None,
-            only_archived: None,
-        };
-        for field in [
-            IssueSortField::Priority,
-            IssueSortField::CreatedAt,
-            IssueSortField::UpdatedAt,
-            IssueSortField::Number,
-        ] {
-            for dir in [SortDir::Asc, SortDir::Desc] {
-                let sort = IssueSort { field, dir };
-                let rows = issue_service::list_issues_sorted(&db, &workspace_id, None, &filters, sort)
-                    .await
-                    .expect("list sorted");
-                assert_eq!(rows.len(), 60);
-                assert!(
-                    rows.iter().all(|r| r.description.is_none()),
-                    "list_issues_sorted must not load descriptions"
-                );
-                for pair in rows.windows(2) {
-                    assert_eq!(
-                        sort.compare(&IssueSortKey::from(&pair[0]), &IssueSortKey::from(&pair[1])),
-                        std::cmp::Ordering::Less,
-                        "SQL order and comparator disagree for {field:?} {dir:?}"
-                    );
-                }
+        .expect("fix the fixture's sort keys");
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut params = list_params(None);
+        params.limit = Some(4);
+        let first = list_issues(&ctx, params.clone()).await.expect("page 1");
+        let served: Vec<i64> = first["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .map(|r| r["number"].as_i64().expect("number"))
+            .collect();
+
+        // Demote a served row to Low: it now sorts after every other row.
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET priority = 4, updated_at = '2999-01-01 00:00:00' WHERE workspace_id = $1 AND number = $2",
+            &workspace_id,
+            served[0] as i32
+        )
+        .expect("demote a served row");
+
+        let mut seen = served.clone();
+        let mut cursor = first["next_cursor"].as_str().map(str::to_string);
+        while let Some(c) = cursor {
+            let mut p = params.clone();
+            p.cursor = Some(c);
+            let page = list_issues(&ctx, p).await.expect("next page");
+            assert_eq!(page["total"], first["total"], "total is fixed for the walk");
+            for r in page["issues"].as_array().expect("issues") {
+                seen.push(r["number"].as_i64().expect("number"));
             }
+            cursor = page["next_cursor"].as_str().map(str::to_string);
+        }
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(seen.len(), unique.len(), "a row was served twice: {seen:?}");
+    }
+
+    fn numbers(v: &serde_json::Value) -> Vec<i64> {
+        v["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .map(|r| r["number"].as_i64().expect("number"))
+            .collect()
+    }
+
+    /// The walk is a snapshot by modification time: a row modified after the
+    /// first page is absent from that walk, present in a fresh one, every
+    /// unchanged row is served exactly once, and `total` and `snapshot_at`
+    /// never change.
+    #[tokio::test]
+    async fn walk_is_a_snapshot_by_modification_time() {
+        let (db, workspace_id, user_id) = seeded_workspace(12).await;
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET updated_at = '2026-08-01 00:00:' || substr('0' || number, -2) WHERE workspace_id = $1",
+            &workspace_id
+        )
+        .expect("distinct updated_at");
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut params = list_params(None);
+        params.limit = Some(4);
+        params.sort_by = Some("number".to_string());
+        params.sort_dir = Some("asc".to_string());
+        let first = list_issues(&ctx, params.clone()).await.expect("page 1");
+        assert_eq!(numbers(&first), vec![1, 2, 3, 4]);
+        assert_eq!(first["total"], 12);
+        let snapshot_at = first["snapshot_at"].as_str().expect("snapshot_at").to_string();
+
+        // Modify an unreturned row (7) after the walk began, the way a real
+        // edit does: stamped with the database clock. SQLite stamps whole
+        // seconds, so wait one out.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET title = 'edited', updated_at = datetime('now') WHERE workspace_id = $1 AND number = 7",
+            &workspace_id
+        )
+        .expect("modify an unreturned row mid-walk");
+
+        let mut seen = numbers(&first);
+        let mut cursor = first["next_cursor"].as_str().map(str::to_string);
+        while let Some(c) = cursor {
+            let mut p = params.clone();
+            p.cursor = Some(c);
+            let page = list_issues(&ctx, p).await.expect("next page");
+            assert_eq!(page["total"], 12, "total is constant for the walk");
+            assert_eq!(page["snapshot_at"], snapshot_at.as_str());
+            seen.extend(numbers(&page));
+            cursor = page["next_cursor"].as_str().map(str::to_string);
+        }
+        assert_eq!(
+            seen,
+            vec![1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12],
+            "every unchanged row once, the modified row not part of this walk"
+        );
+
+        // A fresh walk sees it, and counts it.
+        let mut fresh = params.clone();
+        fresh.limit = Some(100);
+        let fresh = list_issues(&ctx, fresh).await.expect("fresh walk");
+        assert_eq!(fresh["total"], 12);
+        assert!(numbers(&fresh).contains(&7));
+    }
+
+    /// A row that becomes visible after page 1 but carries an *earlier*
+    /// `updated_at` (a transaction that committed late) is an ordinary row of
+    /// the walk: never served twice, and the walk is otherwise unaffected.
+    #[tokio::test]
+    async fn a_late_committing_row_with_an_earlier_timestamp_never_repeats() {
+        let (db, workspace_id, user_id) = seeded_workspace(8).await;
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut params = list_params(None);
+        params.limit = Some(3);
+        params.sort_by = Some("number".to_string());
+        params.sort_dir = Some("asc".to_string());
+        let first = list_issues(&ctx, params.clone()).await.expect("page 1");
+
+        // Insert a ninth issue now, stamped long before the snapshot.
+        let team = trakkt_auth::team_service::get_default_team(&db, &workspace_id)
+            .await
+            .expect("default team");
+        issue_service::create_issue(
+            &db,
+            &CreateIssueParams {
+                workspace_id: workspace_id.clone(),
+                team_id: team.team_id,
+                creator_id: user_id.clone(),
+                title: "late".to_string(),
+                description: None,
+                priority: 2,
+                assignee_id: None,
+                due_date: None,
+                label_ids: Vec::new(),
+                project_id: None,
+                milestone_id: None,
+                estimate: None,
+            },
+            None,
+        )
+        .await
+        .expect("create the late row");
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET updated_at = '2020-01-01 00:00:00' WHERE workspace_id = $1 AND number = 9",
+            &workspace_id
+        )
+        .expect("back-date the late row");
+
+        let mut seen = numbers(&first);
+        let mut cursor = first["next_cursor"].as_str().map(str::to_string);
+        while let Some(c) = cursor {
+            let mut p = params.clone();
+            p.cursor = Some(c);
+            let page = list_issues(&ctx, p).await.expect("next page");
+            seen.extend(numbers(&page));
+            cursor = page["next_cursor"].as_str().map(str::to_string);
+        }
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(seen.len(), unique.len(), "a row repeated: {seen:?}");
+        assert!((1..=8).all(|n| seen.contains(&n)), "an original row was lost: {seen:?}");
+    }
+
+    /// SQLite stores timestamps in two accepted shapes: the writer's
+    /// `datetime('now')` (`YYYY-MM-DD HH:MM:SS`) and the schema default's
+    /// `strftime(...,'%Y-%m-%dT%H:%M:%SZ')`. A walk must order and bound both
+    /// as the same instant, so the paging SQL normalises them through
+    /// `datetime()`. This inserts one row in the default shape beside the
+    /// writer-shaped ones and walks it.
+    #[tokio::test]
+    async fn sqlite_walks_rows_stored_in_either_timestamp_shape() {
+        let (db, workspace_id, user_id) = seeded_workspace(9).await;
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let team = trakkt_auth::team_service::get_default_team(&db, &workspace_id)
+            .await
+            .expect("default team");
+        let teen_id = format!("{workspace_id}::backlog");
+        // An insert that names no timestamps, as the e2e fixtures do.
+        trakkt_core::db_execute!(
+            &db,
+            "INSERT INTO issues (issue_id, workspace_id, team_id, number, title, status_id, \
+             priority, creator_id) \
+             VALUES ('default-stamped', $1, $2, 10, 'default stamp', $3, 2, $4)",
+            &workspace_id,
+            &team.team_id,
+            &teen_id,
+            &user_id
+        )
+        .expect("insert a row stamped by the schema default");
+        let shape: String = trakkt_core::db_fetch_scalar!(
+            &db,
+            String,
+            "SELECT updated_at FROM issues WHERE issue_id = 'default-stamped'"
+        )
+        .expect("read the default stamp");
+        assert!(shape.contains('T') && shape.ends_with('Z'), "schema default shape: {shape}");
+
+        for (sort_by, sort_dir) in [(Some("updated_at"), "asc"), (Some("updated_at"), "desc"), (Some("number"), "asc")] {
+            let mut params = list_params(None);
+            params.limit = Some(3);
+            params.sort_by = sort_by.map(str::to_string);
+            params.sort_dir = Some(sort_dir.to_string());
+            let (_, rows) = walk_pages(&ctx, params, 10).await;
+            let numbers: Vec<i64> = rows.iter().map(|r| r["number"].as_i64().expect("number")).collect();
+            assert_eq!(numbers.len(), 10, "both shapes are inside the walk: {numbers:?}");
+            assert!(numbers.contains(&10), "the default-stamped row was skipped: {numbers:?}");
+        }
+    }
+
+    /// A cursor is the caller's input: every field the database will see is
+    /// validated, so a forged cursor is a 400 on every backend.
+    #[tokio::test]
+    async fn forged_cursor_fields_are_bad_requests() {
+        use base64::Engine;
+        let (db, workspace_id, user_id) = seeded_workspace(6).await;
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut params = list_params(None);
+        params.limit = Some(2);
+        let first = list_issues(&ctx, params.clone()).await.expect("page 1");
+        let cursor = first["next_cursor"].as_str().expect("next_cursor");
+        let raw = String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(cursor)
+                .expect("cursor is base64"),
+        )
+        .expect("cursor is utf-8");
+        let parts: Vec<&str> = raw.split('\u{1e}').collect();
+        assert_eq!(parts.len(), 11);
+
+        // (field index, forged value): version, priority, created_at,
+        // updated_at, number, team, id, snapshot_at, total, served.
+        for (idx, forged) in [
+            (0, "v1"),
+            (2, "yesterday"),
+            (2, "2026-02-30 00:00:00"),
+            (3, "2026-13-01 00:00:00"),
+            (4, "many"),
+            (7, "now()"),
+            (7, "2026-11-16"),
+            (8, "-5"),
+            (8, "lots"),
+            (8, "2000000000"),
+            (9, "-1"),
+            (9, "2000000000"),
+        ] {
+            let mut forged_parts = parts.clone();
+            forged_parts[idx] = forged;
+            let mut p = params.clone();
+            p.cursor = Some(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(forged_parts.join("\u{1e}")),
+            );
+            assert!(
+                matches!(list_issues(&ctx, p).await, Err(ApiError::BadRequest(_))),
+                "forged field {idx} = {forged:?} must be a bad request"
+            );
+        }
+        // The untouched cursor still works.
+        let mut ok = params;
+        ok.cursor = Some(cursor.to_string());
+        list_issues(&ctx, ok).await.expect("the genuine cursor");
+    }
+
+    /// A Postgres-rendered cursor carries a bare `+00` offset, with or without
+    /// fractional seconds; SQLite's `datetime()` needs minutes, so the bound
+    /// text is repaired for it. A page walked across either form must still
+    /// serve rows, not silently end.
+    #[tokio::test]
+    async fn a_bare_offset_in_the_snapshot_still_pages_on_sqlite() {
+        use base64::Engine;
+        let (db, workspace_id, user_id) = seeded_workspace(6).await;
+        let ctx = test_ctx(&db, &workspace_id, &user_id);
+        let mut params = list_params(None);
+        params.limit = Some(2);
+        let first = list_issues(&ctx, params.clone()).await.expect("page 1");
+        let snapshot = first["snapshot_at"].as_str().expect("snapshot").to_string();
+        let cursor = first["next_cursor"].as_str().expect("cursor");
+        let raw = String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(cursor)
+                .expect("base64"),
+        )
+        .expect("utf8");
+        let parts: Vec<String> = raw.split('\u{1e}').map(str::to_string).collect();
+
+        for bare in [
+            format!("{snapshot}+00"),
+            format!("{snapshot}.123456+00"),
+        ] {
+            let mut forged = parts.clone();
+            forged[7] = bare.clone();
+            let mut p = params.clone();
+            p.cursor = Some(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(forged.join("\u{1e}")),
+            );
+            let page = list_issues(&ctx, p).await.expect("page 2");
+            assert!(
+                !page["issues"].as_array().expect("issues").is_empty(),
+                "a cursor carrying {bare} must still page"
+            );
+        }
+    }
+
+    #[test]
+    fn db_timestamps_are_recognised_in_every_rendering() {
+        for ok in [
+            "2026-11-16 00:30:05",
+            "2026-11-16 00:30:05.123456+00",
+            "2026-11-01 01:30:00-04",
+            "2026-11-01 01:30:00.5-05:00",
+            "2026-11-16T00:30:05Z",
+            "2024-02-29 12:00:00",
+        ] {
+            assert!(is_db_timestamp(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "",
+            "2026-11-16",
+            "2026-02-29 00:00:00",
+            "2026-11-16 24:00:00",
+            "2026-11-16 00:60:00",
+            "2026-11-16 00:00:00.",
+            "2026-11-16 00:00:00+",
+            "2026-11-16 00:00:00+1",
+            "2026-11-16 00:00:00 UTC",
+            "'; DROP TABLE issues; --",
+        ] {
+            assert!(!is_db_timestamp(bad), "{bad:?} should be rejected");
         }
     }
 

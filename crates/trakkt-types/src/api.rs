@@ -47,10 +47,16 @@ pub struct ListIssuesApiParams {
     pub filters: Option<String>,
     /// Opaque pagination cursor: the `next_cursor` of a previous response to
     /// the same query (same filters, sort_by and sort_dir). Omit for page 1.
+    /// All pages of a walk are a snapshot as of the first response's
+    /// `snapshot_at`; issues modified after it appear in a fresh walk.
     pub cursor: Option<String>,
     /// Sort field: priority (default), created_at, updated_at or number.
-    /// Ties are always broken deterministically (by creation time, number,
-    /// then issue id) so pagination is stable.
+    /// Ties are always broken deterministically — priority walks by creation
+    /// time, number and then issue id; created_at and updated_at walks by
+    /// number then issue id; number walks by team id then issue id. A team
+    /// rename changes none of them. Moving an issue to another team does
+    /// (it changes `team_id` and `number`), and that write stamps `updated_at`,
+    /// so it follows the walk's snapshot rules like any other write.
     pub sort_by: Option<String>,
     /// Sort direction: asc or desc. Default: asc for priority (Urgent first),
     /// desc for created_at, updated_at and number (newest first).
@@ -60,9 +66,10 @@ pub struct ListIssuesApiParams {
 /// A single composable filter clause: a `(field, operator, values)` triple.
 ///
 /// One (field, operator, values) triple of the shared issue filter model.
-/// Search compiles the clauses to SQL (`trakkt_auth::filter_sql`), `list_issues`
-/// and the issue list apply them with [`FilterClause::matches`], and the two
-/// are held together by a dual-backend parity test. Boolean fields (e.g.
+/// Search and `list_issues` compile the clauses to SQL
+/// (`trakkt_auth::filter_sql`); the UI issue list applies them with
+/// [`FilterClause::matches`], and the two are held together by a dual-backend
+/// parity test. Boolean fields (e.g.
 /// `is_sub_issue`) ignore `values` — the operator alone determines the match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FilterClause {
@@ -147,9 +154,9 @@ impl FilterClause {
 
     /// Whether `issue` passes this clause.
     ///
-    /// This is the single definition of the filter semantics: the issue list,
-    /// `list_issues` and search all use it (search also compiles the same
-    /// clauses to SQL, and a parity test holds the two together). Non-boolean
+    /// This is the single definition of the filter semantics: the UI issue list
+    /// uses it directly, and search and `list_issues` compile the same clauses
+    /// to SQL (a parity test holds the two together). Non-boolean
     /// clauses with no values, and unknown field/operator pairs, pass
     /// everything — except an empty `issue_id any_of`, which is the "no starred
     /// issues" set and therefore matches nothing.
@@ -283,9 +290,25 @@ impl From<crate::models::IssueWithDetails> for IssueListRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListIssuesResponse {
     pub issues: Vec<IssueListRow>,
-    /// Exact number of issues matching every filter, ignoring `limit` and
-    /// `cursor`.
+    /// Number of issues matching every filter as of `snapshot_at`, ignoring
+    /// `limit` and `cursor`. Counted on the first page and identical on every
+    /// page of the walk.
     pub total: usize,
+    /// The instant this walk's snapshot was taken (database clock, first
+    /// page). Every page of the walk lists issues last modified at or before it; an
+    /// issue modified after `snapshot_at` is not part of the walk and appears
+    /// in a fresh one (a request without `cursor`), and an issue that stops
+    /// matching during the walk is absent from later pages.
+    pub snapshot_at: String,
+    /// Rows this walk has returned so far, this page included: `total` plus any
+    /// issue served more than once (a write stamped at or before `snapshot_at`
+    /// that moved an already-served issue past the cursor), minus any issue that
+    /// stopped matching before it was served, minus any issue such a write moved
+    /// to before the cursor before it was served, plus any issue that started
+    /// matching without a write that moves `updated_at` (a label or relation
+    /// change) and was served. `has_more` false ends the walk whatever this
+    /// says.
+    pub served_count: i64,
     /// Whether matching issues remain after this page.
     pub has_more: bool,
     /// Pass as `cursor` to get the next page; null when `has_more` is false.

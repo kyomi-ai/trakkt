@@ -46,16 +46,16 @@ pub struct SearchResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
-    /// Number of distinct matching issues, counted up to [`SEARCH_FETCH_CAP`]
-    /// rows. When `truncated` is true this is a lower bound.
+    /// Number of distinct matching issues found within the search window: the
+    /// [`SEARCH_FETCH_CAP`] best-ranked rows. Exact when `truncated` is false.
     pub total: i64,
     /// More results can be fetched by repeating the request with
     /// `offset = next_offset`.
     pub has_more: bool,
     /// Offset of the next page; `None` when `has_more` is false.
     pub next_offset: Option<i64>,
-    /// The search hit its internal fetch cap: matches ranked below the cap are
-    /// not reachable by paging and `total` is a lower bound. Narrow the query.
+    /// More distinct matches exist beyond the 1000 best-ranked, so `total`
+    /// counts the window, not every match.
     pub truncated: bool,
 }
 
@@ -170,12 +170,12 @@ impl SearchParams {
 /// results and `ts_headline` for snippet context. On SQLite, falls back to
 /// `LIKE '%query%'` without ranking or snippets.
 ///
-/// Returns a [`SearchResponse`] containing the paginated results and the total
-/// number of matching issues (before offset/limit are applied). Pagination is
-/// performed in Rust so that `total` reflects the true match count. The SQL
-/// keeps one best-ranked row per issue and returns at most the cap
-/// ([`SEARCH_FETCH_CAP`]) plus one row to detect truncation; slicing happens
-/// after.
+/// Returns a [`SearchResponse`] containing the paginated results and the
+/// number of distinct matching issues **within the search window** — the
+/// [`SEARCH_FETCH_CAP`] best-ranked rows, before offset/limit are applied. The
+/// SQL keeps one best-ranked row per issue and returns at most the cap plus one
+/// row to detect truncation; slicing happens after, and `truncated` says when
+/// more matches exist beyond the window.
 pub async fn search(
     db: &DbPool,
     params: &SearchParams,
