@@ -30,6 +30,7 @@ pub mod rate_limiter;
 pub mod release_service;
 pub mod relation_service;
 pub mod redis_ops;
+pub mod filter_sql;
 pub mod search_service;
 pub mod security_service;
 pub mod session;
