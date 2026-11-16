@@ -1358,50 +1358,7 @@ fn find_operator_def(field_def: &FilterFieldDef, operator_key: &str) -> Option<&
 /// Apply a single filter clause to an issue, returning `true` if the issue
 /// passes the filter (should be included).
 pub fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
-    if clause.values.is_empty() {
-        // Boolean fields have no values — they match on field/operator alone.
-        // Non-boolean fields with no values selected pass everything.
-        let is_boolean = find_field_def(&clause.field)
-            .is_some_and(|def| def.value_kind == ValueKind::Boolean);
-        if !is_boolean {
-            return true;
-        }
-    }
-    match (clause.field.as_str(), clause.operator.as_str()) {
-        ("status", "any_of") => clause.values.contains(&issue.status_id),
-        ("status", "none_of") => !clause.values.contains(&issue.status_id),
-        ("priority", "any_of") => clause.values.contains(&issue.priority.to_string()),
-        ("priority", "none_of") => !clause.values.contains(&issue.priority.to_string()),
-        // Label: all_of — issue must have ALL selected labels.
-        ("label", "all_of") => clause.values.iter().all(|v| issue.labels.iter().any(|l| &l.label_id == v)),
-        // Label: any_of — issue has at least one of the selected labels.
-        ("label", "any_of") => issue.labels.iter().any(|l| clause.values.contains(&l.label_id)),
-        // Label: not_any_of — issue has NONE of the selected labels.
-        ("label", "not_any_of") => !issue.labels.iter().any(|l| clause.values.contains(&l.label_id)),
-        // Label: not_all_of — issue does NOT have all of the selected labels (may have some).
-        ("label", "not_all_of") => !clause.values.iter().all(|v| issue.labels.iter().any(|l| &l.label_id == v)),
-        // Backward-compat arm for pre-TRA-104 persisted filter clauses that used "none_of" for labels.
-        ("label", "none_of") => !issue.labels.iter().any(|l| clause.values.contains(&l.label_id)),
-        ("project", "any_of") => issue.project_id.as_ref().is_some_and(|pid| clause.values.contains(pid)),
-        ("project", "none_of") => !issue.project_id.as_ref().is_some_and(|pid| clause.values.contains(pid)),
-        // Relation boolean filters (TRA-105)
-        ("is_sub_issue", "any_of") => issue.parent_identifier.is_some(),
-        ("is_sub_issue", "none_of") => issue.parent_identifier.is_none(),
-        ("is_parent", "any_of") => issue.has_children,
-        ("is_parent", "none_of") => !issue.has_children,
-        ("is_blocked", "any_of") => issue.is_blocked,
-        ("is_blocked", "none_of") => !issue.is_blocked,
-        ("is_blocking", "any_of") => issue.is_blocking,
-        ("is_blocking", "none_of") => !issue.is_blocking,
-        ("has_relations", "any_of") => issue.has_relations,
-        ("has_relations", "none_of") => !issue.has_relations,
-        // Issue ID set filter — used by the "Starred" view to restrict to
-        // a specific set of issue IDs fetched from the server.
-        ("issue_id", "any_of") => clause.values.contains(&issue.issue_id),
-        ("issue_id", "none_of") => !clause.values.contains(&issue.issue_id),
-        // Unknown field/operator — pass through (don't block issues).
-        _ => true,
-    }
+    clause.matches(issue)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -29,76 +29,9 @@ use crate::{ApiCtx, ApiError, ApiOperation, ApiResult};
 // Composable filter clause support
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Known boolean filter fields that ignore `values` — the operator alone
-/// determines the match.
-// Must be kept in sync with ValueKind::Boolean fields in
-// crates/trakkt-ui/src/pages/issues/filters.rs.
-const BOOLEAN_FIELDS: &[&str] = &[
-    "is_sub_issue",
-    "is_parent",
-    "is_blocked",
-    "is_blocking",
-    "has_relations",
-];
-
-/// Apply a single filter clause to an issue, returning `true` if the issue
-/// passes the filter (should be included).
-///
-/// Ported from `crates/trakkt-ui/src/pages/issues/filters.rs` `apply_clause`.
+/// Apply a single filter clause to an issue (see [`FilterClause::matches`]).
 fn apply_clause(clause: &FilterClause, issue: &IssueWithDetails) -> bool {
-    if clause.values.is_empty() && !BOOLEAN_FIELDS.contains(&clause.field.as_str()) {
-        // Non-boolean fields with no values selected — pass everything.
-        return true;
-    }
-
-    match (clause.field.as_str(), clause.operator.as_str()) {
-        ("status", "any_of") => clause.values.contains(&issue.status_id),
-        ("status", "none_of") => !clause.values.contains(&issue.status_id),
-        ("priority", "any_of") => clause.values.contains(&issue.priority.to_string()),
-        ("priority", "none_of") => !clause.values.contains(&issue.priority.to_string()),
-        // Label: all_of — issue must have ALL selected labels.
-        ("label", "all_of") => clause
-            .values
-            .iter()
-            .all(|v| issue.labels.iter().any(|l| l.label_id == *v)),
-        // Label: any_of — issue has at least one of the selected labels.
-        ("label", "any_of") => issue
-            .labels
-            .iter()
-            .any(|l| clause.values.contains(&l.label_id)),
-        // Label: not_any_of / none_of — issue has NONE of the selected labels.
-        // "none_of" is a backward-compat alias from pre-TRA-104 persisted filters.
-        ("label", "not_any_of" | "none_of") => !issue
-            .labels
-            .iter()
-            .any(|l| clause.values.contains(&l.label_id)),
-        // Label: not_all_of — issue does NOT have all values (may have some).
-        ("label", "not_all_of") => !clause
-            .values
-            .iter()
-            .all(|v| issue.labels.iter().any(|l| l.label_id == *v)),
-        ("project", "any_of") => issue
-            .project_id
-            .as_ref()
-            .is_some_and(|pid| clause.values.contains(pid)),
-        ("project", "none_of") => !issue
-            .project_id
-            .as_ref()
-            .is_some_and(|pid| clause.values.contains(pid)),
-        // Boolean relation filters — values are ignored.
-        ("is_sub_issue", "any_of") => issue.parent_identifier.is_some(),
-        ("is_sub_issue", "none_of") => issue.parent_identifier.is_none(),
-        ("is_parent", "any_of") => issue.has_children,
-        ("is_parent", "none_of") => !issue.has_children,
-        ("is_blocked", "any_of") => issue.is_blocked,
-        ("is_blocked", "none_of") => !issue.is_blocked,
-        ("is_blocking", "any_of") => issue.is_blocking,
-        ("is_blocking", "none_of") => !issue.is_blocking,
-        ("has_relations", "any_of") => issue.has_relations,
-        ("has_relations", "none_of") => !issue.has_relations,
-        // Unknown field/operator — pass through (don't block issues).
-        _ => true,
-    }
+    clause.matches(issue)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1146,6 +1079,55 @@ mod tests {
         with_team.status_category = Some("completed".to_string());
         let value = search_issues(&ctx, with_team).await.expect("search");
         assert_eq!(result_numbers(&value), vec![2]);
+    }
+
+    /// TRA-10114: composable filter clauses are applied by the search itself,
+    /// before ranking and paging.
+    #[tokio::test]
+    async fn search_applies_filter_clauses_server_side() {
+        let (db, workspace_id, user_id) = workspace_with_closed_issues().await;
+        for (number, priority) in [(1, 1), (2, 1), (3, 4)] {
+            trakkt_core::db_execute!(
+                &db,
+                "UPDATE issues SET priority = $1 WHERE workspace_id = $2 AND number = $3",
+                priority,
+                &workspace_id,
+                number
+            )
+            .expect("set fixture priority");
+        }
+        let ctx = search_ctx(&db, &workspace_id, &user_id);
+
+        let params: SearchIssuesApiParams = serde_json::from_value(serde_json::json!({
+            "query": "Seeded",
+            "include_comments": false,
+            "filters": r#"[{"field":"priority","operator":"any_of","values":["1"]}]"#,
+        }))
+        .expect("params");
+        let value = search_issues(&ctx, params).await.expect("search");
+        assert_eq!(result_numbers(&value), vec![1, 2]);
+
+        // A page size of one still pages through only the filtered matches.
+        let params: SearchIssuesApiParams = serde_json::from_value(serde_json::json!({
+            "query": "Seeded",
+            "include_comments": false,
+            "limit": 1,
+            "filters": r#"[{"field":"priority","operator":"none_of","values":["1"]}]"#,
+        }))
+        .expect("params");
+        let value = search_issues(&ctx, params).await.expect("search");
+        assert_eq!(value["total"], 1);
+        assert_eq!(result_numbers(&value), vec![3]);
+
+        let bad: SearchIssuesApiParams = serde_json::from_value(serde_json::json!({
+            "query": "Seeded",
+            "filters": "not json",
+        }))
+        .expect("params");
+        assert!(matches!(
+            search_issues(&ctx, bad).await,
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     /// `include_closed` stays accepted: only an explicit false filters.

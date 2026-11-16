@@ -68,6 +68,64 @@ pub struct FilterClause {
     pub values: Vec<String>,
 }
 
+/// Filter fields whose clauses ignore `values`: the operator alone decides.
+pub const BOOLEAN_FILTER_FIELDS: &[&str] = &[
+    "is_sub_issue",
+    "is_parent",
+    "is_blocked",
+    "is_blocking",
+    "has_relations",
+];
+
+impl FilterClause {
+    /// Whether `issue` passes this clause.
+    ///
+    /// This is the single definition of the filter semantics: the issue list,
+    /// `list_issues` and search all use it (search also compiles the same
+    /// clauses to SQL, and a parity test holds the two together). Non-boolean
+    /// clauses with no values, and unknown field/operator pairs, pass
+    /// everything.
+    pub fn matches(&self, issue: &crate::models::IssueWithDetails) -> bool {
+        if self.values.is_empty() && !BOOLEAN_FILTER_FIELDS.contains(&self.field.as_str()) {
+            return true;
+        }
+        let has_label = |id: &String| issue.labels.iter().any(|l| l.label_id == *id);
+        match (self.field.as_str(), self.operator.as_str()) {
+            ("status", "any_of") => self.values.contains(&issue.status_id),
+            ("status", "none_of") => !self.values.contains(&issue.status_id),
+            ("priority", "any_of") => self.values.contains(&issue.priority.to_string()),
+            ("priority", "none_of") => !self.values.contains(&issue.priority.to_string()),
+            ("label", "all_of") => self.values.iter().all(has_label),
+            ("label", "any_of") => self.values.iter().any(has_label),
+            // `none_of` is a backward-compat alias from pre-TRA-104 persisted filters.
+            ("label", "not_any_of" | "none_of") => !self.values.iter().any(has_label),
+            ("label", "not_all_of") => !self.values.iter().all(has_label),
+            ("project", "any_of") => issue
+                .project_id
+                .as_ref()
+                .is_some_and(|pid| self.values.contains(pid)),
+            ("project", "none_of") => !issue
+                .project_id
+                .as_ref()
+                .is_some_and(|pid| self.values.contains(pid)),
+            ("is_sub_issue", "any_of") => issue.parent_identifier.is_some(),
+            ("is_sub_issue", "none_of") => issue.parent_identifier.is_none(),
+            ("is_parent", "any_of") => issue.has_children,
+            ("is_parent", "none_of") => !issue.has_children,
+            ("is_blocked", "any_of") => issue.is_blocked,
+            ("is_blocked", "none_of") => !issue.is_blocked,
+            ("is_blocking", "any_of") => issue.is_blocking,
+            ("is_blocking", "none_of") => !issue.is_blocking,
+            ("has_relations", "any_of") => issue.has_relations,
+            ("has_relations", "none_of") => !issue.has_relations,
+            // Issue ID set — used by the "Starred" view.
+            ("issue_id", "any_of") => self.values.contains(&issue.issue_id),
+            ("issue_id", "none_of") => !self.values.contains(&issue.issue_id),
+            _ => true,
+        }
+    }
+}
+
 /// A label as it appears on a lean issue list row: identity only.
 ///
 /// `color`, `created_at`, `workspace_id`, and `team_id` are deliberately
