@@ -185,61 +185,69 @@ pub async fn write_sync_entry(
     action: SyncActionType,
     data: Option<serde_json::Value>,
 ) -> trakkt_core::Result<i64> {
-    let is_pg = db.is_postgres();
-    let visibility_user_id = audience.visibility_user_id();
-    let action_str = action_type_to_str(&action);
-    let data_str = serialise_sync_entry_data(data.as_ref())?;
-    let sql = sync_entry_insert_sql(is_pg);
-
-    let sync_id: i64 = if is_pg {
-        // Postgres: RETURNING hands back the assigned BIGSERIAL id.
-        db_fetch_scalar!(
-            db,
-            i64,
-            &sql,
-            entity_type,
-            entity_id,
-            workspace_id,
-            action_str,
-            data_str,
-            visibility_user_id
-        )
-        .map_err(|e| trakkt_core::Error::Internal(format!("failed to write sync entry: {e}")))?
-    } else {
-        // SQLite: INSERT then query last_insert_rowid(). Correct only because
-        // the SQLite pool is pinned to a single connection, so both statements
-        // land on the same one — see `write_sync_entry_in_tx` for the form that
-        // does not depend on that.
-        db_execute!(
-            db,
-            &sql,
-            entity_type,
-            entity_id,
-            workspace_id,
-            action_str,
-            data_str,
-            visibility_user_id
-        )
-        .map_err(|e| trakkt_core::Error::Internal(format!("failed to write sync entry: {e}")))?;
-
-        db_fetch_scalar!(db, i64, "SELECT last_insert_rowid()").map_err(|e| {
-            trakkt_core::Error::Internal(format!(
-                "failed to get last_insert_rowid after sync entry insert: {e}"
-            ))
-        })?
-    };
-
-    tracing::debug!(
-        sync_id,
+    // A transaction of its own, rather than one auto-committed statement, so the
+    // write takes the same commit-ordering lock as every other entry — see
+    // `serialise_sync_log_writers`. A bare insert here could be issued a higher
+    // id than a still-open transaction and commit ahead of it.
+    let mut tx = db.begin().await?;
+    let sync_id = write_sync_entry_in_tx(
+        &mut tx,
         entity_type,
         entity_id,
         workspace_id,
-        visibility_user_id,
-        action = action_str,
-        "Wrote sync log entry"
-    );
-
+        audience,
+        action,
+        data,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(sync_id)
+}
+
+// ─── commit-ordered sync ids ─────────────────────────────────────────────────
+
+/// Make `sync_id` order match commit order for a workspace, on Postgres.
+///
+/// `sync_id` is a BIGSERIAL, so Postgres issues it when the row is *inserted*,
+/// not when the transaction commits. Two overlapping transactions can commit in
+/// the opposite order to their ids. A delta client that reads between the two
+/// commits is handed the higher id, advances its cursor past the lower one, and
+/// is never sent it again — the change stays missing from its cache until the
+/// cache is wiped. A hundred concurrent updates from one agent turn make this
+/// routine rather than rare.
+///
+/// The fix is to serialise the writers: a transaction-scoped advisory lock,
+/// taken before the insert and released by Postgres at commit or rollback. The
+/// next writer cannot insert, and so cannot be issued an id, until the previous
+/// one is committed and visible. Every id is therefore issued after every lower
+/// id has committed, and a reader that sees id N sees everything below it.
+///
+/// The lock is per workspace, because the cursor is. It is taken again by every
+/// entry a transaction writes, which Postgres treats as a no-op for the holder.
+///
+/// What this costs: a transaction that writes a sync entry holds its workspace's
+/// log for the rest of its life. Call this as late as possible — it is only ever
+/// called from the entry write itself, after the mutation statements — and keep
+/// transactions that write sync entries short. A transaction that takes the lock
+/// and *then* waits on a row another sync-writing transaction holds can
+/// deadlock; Postgres detects that and fails one of them, which surfaces as an
+/// error rather than a lost entry.
+///
+/// SQLite needs nothing: its pool is pinned to one connection, so transactions
+/// cannot overlap.
+async fn serialise_sync_log_writers(tx: &mut DbTx, workspace_id: &str) -> trakkt_core::Result<()> {
+    if !tx.is_postgres() {
+        return Ok(());
+    }
+    tx_execute!(
+        &mut *tx,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        format!("sync_log:{workspace_id}")
+    )
+    .map_err(|e| {
+        trakkt_core::Error::Internal(format!("failed to order sync log writers: {e}"))
+    })?;
+    Ok(())
 }
 
 // ─── write_sync_entry_in_tx ──────────────────────────────────────────────────
@@ -274,6 +282,10 @@ pub async fn write_sync_entry_in_tx(
     let action_str = action_type_to_str(&action);
     let data_str = serialise_sync_entry_data(data.as_ref())?;
     let sql = sync_entry_insert_sql(is_pg);
+
+    // Before the insert, so the id is issued only once every lower id has
+    // committed. See `serialise_sync_log_writers`.
+    serialise_sync_log_writers(tx, workspace_id).await?;
 
     let sync_id: i64 = if is_pg {
         tx_fetch_scalar!(

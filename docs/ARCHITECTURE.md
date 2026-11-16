@@ -287,6 +287,8 @@ Same as Kyomi's sync engine:
 3. **Schema mismatch**: Client detects `SCHEMA_HASH` change → wipes IDB → re-bootstraps.
 4. **Writes**: Mutations go through server functions → server writes to DB + appends to `sync_log` → broadcasts delta to connected WebSocket clients → all clients update IDB + signals.
 
+   `sync_id` order must equal commit order, because a client's cursor is the last id it received and anything below it is never sent again. On Postgres a BIGSERIAL is issued at insert, not commit, so every `sync_log` write first takes a per-workspace transaction-scoped advisory lock (`serialise_sync_log_writers`). It is held until commit, which serialises sync-writing transactions within a workspace; keep them short.
+
 Entity types in sync store: `issue`, `comment`, `label`, `notification`.
 
 ### MCP Server

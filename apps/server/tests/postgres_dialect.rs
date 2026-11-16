@@ -1560,6 +1560,161 @@ dual_backend_test! {
     }
 }
 
+// ─── sync_log ids are issued in commit order ─────────────────────────────────
+//
+// `sync_id` is a BIGSERIAL, so Postgres hands it out when the row is inserted,
+// not when the transaction commits. Two transactions that overlap can therefore
+// commit in the opposite order to their ids. A delta client that reads in
+// between sees the higher id, moves its cursor past the lower one, and never
+// asks for it again: the entity change it describes is lost to that client
+// until its cache is wiped. SQLite cannot show this — its pool is pinned to one
+// connection, so transactions cannot overlap — which is why these are
+// Postgres-only.
+//
+// This is not exotic. An agent that issues a hundred tool calls in one
+// iteration produces exactly this: a hundred overlapping issue updates.
+
+/// Read what a delta client reads: everything above `cursor`, and the cursor it
+/// then holds — the last id delivered, as `drain_delta` advances it.
+async fn delta_read(db: &DbPool, cursor: i64) -> (Vec<i64>, i64) {
+    let entries = get_entries_since(db, WORKSPACE, USER, cursor, 100_000)
+        .await
+        .expect("read the sync entries above the cursor");
+    let ids: Vec<i64> = entries.iter().map(|entry| entry.sync_id).collect();
+    let next = ids.last().copied().unwrap_or(cursor);
+    (ids, next)
+}
+
+/// A takes the lower id and is still open when B, which started later, commits.
+/// A delta read in that window must not hand the client a cursor that steps
+/// over A's entry.
+#[tokio::test]
+#[ignore = "requires a live Postgres — see crates/trakkt-core/src/test_helpers/dual_backend.rs"]
+async fn a_delta_client_never_skips_an_entry_that_commits_after_a_higher_id() {
+    on_postgres(|db| async move {
+        seed_tenancy(&db).await;
+
+        let mut tx_a = db.begin().await.expect("open transaction A");
+        let id_a = write_sync_entry_in_tx(
+            &mut tx_a,
+            entity_types::ISSUE,
+            "iss_a",
+            WORKSPACE,
+            SyncAudience::Workspace,
+            SyncActionType::Update,
+            Some(serde_json::json!({ "title": "a" })),
+        )
+        .await
+        .expect("write A's entry, leaving A open");
+
+        let db_b = db.clone();
+        let task_b = tokio::spawn(async move {
+            let mut tx_b = db_b.begin().await.expect("open transaction B");
+            let id_b = write_sync_entry_in_tx(
+                &mut tx_b,
+                entity_types::ISSUE,
+                "iss_b",
+                WORKSPACE,
+                SyncAudience::Workspace,
+                SyncActionType::Update,
+                Some(serde_json::json!({ "title": "b" })),
+            )
+            .await
+            .expect("write B's entry");
+            tx_b.commit().await.expect("commit B");
+            id_b
+        });
+
+        // Long enough for B to commit if nothing stops it, or to park behind A
+        // if something does. Either is a legitimate design; what is asserted
+        // below is only what the client ends up holding.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let (seen_before_a_commits, cursor) = delta_read(&db, 0).await;
+
+        tx_a.commit().await.expect("commit A");
+        let id_b = task_b.await.expect("B's task completes");
+        assert!(id_a < id_b, "A was opened first, so it holds the lower id");
+
+        let (seen_after, _) = delta_read(&db, cursor).await;
+        let seen: BTreeSet<i64> = seen_before_a_commits
+            .into_iter()
+            .chain(seen_after)
+            .collect();
+
+        assert_eq!(
+            seen,
+            BTreeSet::from([id_a, id_b]),
+            "a client that synced while A was still open must still receive A's \
+             entry on its next delta. It was handed B (id {id_b}) first, so its \
+             cursor moved past A (id {id_a}) and A's change never reaches it"
+        );
+    })
+    .await;
+}
+
+/// The same hazard at the scale it occurs at: a hundred concurrent writers,
+/// each holding its transaction open a little after writing its entry, with a
+/// client polling delta throughout. Every committed entry must reach it.
+#[tokio::test]
+#[ignore = "requires a live Postgres — see crates/trakkt-core/src/test_helpers/dual_backend.rs"]
+async fn a_hundred_concurrent_writers_are_all_delivered_to_a_polling_delta_client() {
+    on_postgres(|db| async move {
+        seed_tenancy(&db).await;
+
+        let writers: Vec<_> = (0..100u64)
+            .map(|i| {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    let mut tx = db.begin().await.expect("open a writer transaction");
+                    let id = write_sync_entry_in_tx(
+                        &mut tx,
+                        entity_types::ISSUE,
+                        &format!("iss_{i}"),
+                        WORKSPACE,
+                        SyncAudience::Workspace,
+                        SyncActionType::Update,
+                        Some(serde_json::json!({ "n": i })),
+                    )
+                    .await
+                    .expect("write the writer's entry");
+                    // The rest of a real mutation: activity rows, a notification
+                    // fan-out, the commit round trip. Varied so commit order
+                    // does not happen to follow id order.
+                    tokio::time::sleep(std::time::Duration::from_millis((i * 7919) % 25)).await;
+                    tx.commit().await.expect("commit the writer's transaction");
+                    id
+                })
+            })
+            .collect();
+
+        let mut cursor = 0;
+        let mut seen: BTreeSet<i64> = BTreeSet::new();
+        while !writers.iter().all(|writer| writer.is_finished()) {
+            let (ids, next) = delta_read(&db, cursor).await;
+            seen.extend(ids);
+            cursor = next;
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        let (ids, _) = delta_read(&db, cursor).await;
+        seen.extend(ids);
+
+        let mut committed: BTreeSet<i64> = BTreeSet::new();
+        for writer in writers {
+            committed.insert(writer.await.expect("a writer task completes"));
+        }
+
+        let lost: Vec<i64> = committed.difference(&seen).copied().collect();
+        assert!(
+            lost.is_empty(),
+            "{} of {} committed sync entries never reached the delta client: {lost:?}",
+            lost.len(),
+            committed.len()
+        );
+    })
+    .await;
+}
+
 // ─── The harness itself ──────────────────────────────────────────────────────
 
 /// A failing Postgres body still drops its throwaway database, and still fails.
