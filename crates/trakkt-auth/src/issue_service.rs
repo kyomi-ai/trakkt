@@ -699,14 +699,15 @@ impl Default for IssueSort {
 /// The values of every column any [`IssueSort`] orders by for one row: what a
 /// keyset cursor remembers about the last row it served. Timestamps are the
 /// database's own text rendering and are only ever handed back to the
-/// database (cast to a timestamp there), never compared as strings.
+/// database, which compares them as typed values (Postgres casts the bind to
+/// `TIMESTAMPTZ`; SQLite normalises both sides through `datetime()`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueSortKey {
     pub priority: i32,
     pub created_at: String,
     pub updated_at: String,
     pub number: i32,
-    pub team_key: String,
+    pub team_id: String,
     pub issue_id: String,
 }
 
@@ -717,7 +718,7 @@ impl From<&IssueWithDetails> for IssueSortKey {
             created_at: i.created_at.clone(),
             updated_at: i.updated_at.clone(),
             number: i.number,
-            team_key: i.team_key.clone(),
+            team_id: i.team_id.clone(),
             issue_id: i.issue_id.clone(),
         }
     }
@@ -733,22 +734,29 @@ enum KeyCol {
     CreatedAt,
     UpdatedAt,
     Number,
-    TeamKey,
+    /// `issues.team_id`. `issues.number` is unique only within a team, and a
+    /// team id never changes (a team's `key` can be renamed mid-walk).
+    TeamId,
     IssueId,
 }
 
 impl KeyCol {
     /// SQL expression. String columns compare bytewise (`COLLATE "C"`) on
     /// Postgres, the same as SQLite's default, so order never depends on the
-    /// database's locale.
+    /// database's locale. Timestamps are typed on Postgres and normalised
+    /// through SQLite's `datetime()` on SQLite, where a stored value may be
+    /// either `YYYY-MM-DD HH:MM:SS` or the schema default's
+    /// `YYYY-MM-DDTHH:MM:SSZ` and the two only compare correctly once parsed.
     fn expr(self, is_pg: bool) -> String {
         let c = if is_pg { r#" COLLATE "C""# } else { "" };
         match self {
             Self::Rank => "CASE i.priority WHEN 0 THEN 5 ELSE i.priority END".to_string(),
-            Self::CreatedAt => "i.created_at".to_string(),
-            Self::UpdatedAt => "i.updated_at".to_string(),
+            Self::CreatedAt if is_pg => "i.created_at".to_string(),
+            Self::UpdatedAt if is_pg => "i.updated_at".to_string(),
+            Self::CreatedAt => "datetime(i.created_at)".to_string(),
+            Self::UpdatedAt => "datetime(i.updated_at)".to_string(),
             Self::Number => "i.number".to_string(),
-            Self::TeamKey => format!("t.key{c}"),
+            Self::TeamId => format!("i.team_id{c}"),
             Self::IssueId => format!("i.issue_id{c}"),
         }
     }
@@ -760,7 +768,7 @@ impl KeyCol {
             Self::CreatedAt => SqlArg::Text(key.created_at.clone()),
             Self::UpdatedAt => SqlArg::Text(key.updated_at.clone()),
             Self::Number => SqlArg::Int(key.number),
-            Self::TeamKey => SqlArg::Text(key.team_key.clone()),
+            Self::TeamId => SqlArg::Text(key.team_id.clone()),
             Self::IssueId => SqlArg::Text(key.issue_id.clone()),
         }
     }
@@ -796,7 +804,7 @@ impl IssueSort {
             ],
             IssueSortField::Number => vec![
                 (KeyCol::Number, d),
-                (KeyCol::TeamKey, false),
+                (KeyCol::TeamId, false),
                 (KeyCol::IssueId, false),
             ],
         }
@@ -935,7 +943,9 @@ impl ListWhere {
         if self.is_pg {
             format!("CAST({p} AS TIMESTAMPTZ)")
         } else {
-            p
+            // Match `KeyCol::expr`'s normalisation so a stored value in either
+            // accepted format compares against the bound one.
+            format!("datetime({p})")
         }
     }
 
@@ -985,7 +995,8 @@ impl ListWhere {
     /// [`list_issues_page`]).
     fn modified_by(&mut self, snapshot: &str) {
         let ts = self.timestamp(snapshot);
-        self.conditions.push(format!("i.updated_at <= {ts}"));
+        let updated = KeyCol::UpdatedAt.expr(self.is_pg);
+        self.conditions.push(format!("{updated} <= {ts}"));
     }
 
     fn sql(&self) -> String {
@@ -1060,14 +1071,14 @@ pub struct IssuePage {
     pub total: i64,
     /// The walk's snapshot instant.
     pub snapshot_at: String,
-    /// Rows this walk has returned so far, this page included. Equal to
-    /// `total` at the end of a walk unless a documented repeat occurred (see
-    /// [`list_issues_page`]).
+    /// Rows this walk has returned so far, this page included. See
+    /// [`list_issues_page`] for how it relates to `total`.
     pub served_count: i64,
 }
 
-/// One page of issues in `sort` order, in time proportional to the page, not to
-/// the number of matches (apart from the single `COUNT` on the first page).
+/// One page of issues in `sort` order. Each page reads `limit + 1` rows in one
+/// query; the first page of a walk also counts its matches once, and later
+/// pages carry that total instead of recounting.
 ///
 /// Paging is a keyset: each page is `WHERE <filters> AND <modified at or
 /// before the snapshot> AND <strictly after the last row served> ORDER BY
@@ -1078,22 +1089,25 @@ pub struct IssuePage {
 /// The first page reads the **database** clock (never the application's) as
 /// `snapshot_at`, then counts and reads under `updated_at <= snapshot_at`;
 /// every later page applies the same bound. Writers stamp `updated_at` with
-/// the database clock when their transaction starts, so across one walk:
+/// the database clock when their transaction starts, so a write stamped at or
+/// before `snapshot_at` counts as of the walk's start. Across one walk:
 /// - `total` and `snapshot_at` are the same on every page;
-/// - the keyset only moves forward, so a row is never served twice, and a row
-///   edited after the walk began is stamped after `snapshot_at` and is outside
-///   the walk (it appears in a fresh one);
-/// - a row not modified since `snapshot_at` that still matches is served
-///   exactly once;
-/// - a row that stops matching mid-walk (deleted, archived, relabelled,
-///   relation changes — none of which move `updated_at`) is simply absent from
-///   later pages; `total` is the walk's size at its start.
+/// - an issue modified after `snapshot_at` is outside the walk and appears in a
+///   fresh one (a request without `cursor`);
+/// - a row that stops matching mid-walk (deleted, archived, relabelled, a
+///   relation change — none of which move `updated_at` for a label or relation
+///   write) is absent from later pages, and `total` remains the walk's size at
+///   its start;
+/// - a write stamped at or before `snapshot_at` that moves an already-served
+///   issue past the cursor makes that issue appear once more. A Postgres
+///   transaction that began before page 1 carries such a stamp, as does any
+///   SQLite write in the same whole second as `snapshot_at`. Sorting by a
+///   stable key (`number`, `created_at`) cannot move a served row, so a walk in
+///   those orders reports each row once for as long as it keeps matching.
 ///
-/// A write counts as of the walk's start when the database stamped it at or
-/// before `snapshot_at`. Postgres stamps a transaction's start time, so a
-/// transaction already in flight when the walk began is stamped before it;
-/// SQLite stamps whole seconds, so a write in the same second as `snapshot_at`
-/// is too.
+/// `served_count` is therefore `total` plus any repeat, minus rows that stopped
+/// matching before they were served, plus rows that started matching without a
+/// write that moves `updated_at`.
 pub async fn list_issues_page(
     db: &DbPool,
     req: &IssuePageRequest<'_>,
@@ -1146,7 +1160,11 @@ pub async fn list_issues_page(
     let mut issues = fetch_issue_details(db, &sql, &q.take_binds()).await?;
     let has_more = issues.len() as i64 > req.limit;
     issues.truncate(req.limit as usize);
-    let served_count = req.resume.as_ref().map_or(0, |walk| walk.served) + issues.len() as i64;
+    let served_count = req
+        .resume
+        .as_ref()
+        .map_or(0, |walk| walk.served)
+        .saturating_add(issues.len() as i64);
 
     Ok(IssuePage {
         issues,

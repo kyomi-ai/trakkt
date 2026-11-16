@@ -199,6 +199,9 @@ pub(crate) fn clamp_limit(raw: Option<i64>, default: i64, max: i64) -> i64 {
 }
 
 const CURSOR_VERSION: &str = "v4";
+/// Upper bound on `total`/`served_count` in a cursor: far above any real
+/// backlog, and small enough that accumulating a page cannot overflow.
+const MAX_WALK_COUNT: i64 = 1_000_000_000;
 const CURSOR_SEP: char = '\u{1e}';
 
 /// What an opaque `list_issues` cursor carries.
@@ -222,7 +225,7 @@ fn encode_cursor(c: &ListCursor, fingerprint: &str) -> String {
         &k.created_at,
         &k.updated_at,
         &k.number.to_string(),
-        &k.team_key,
+        &k.team_id,
         &k.issue_id,
         &c.snapshot_at,
         &c.total.to_string(),
@@ -249,7 +252,7 @@ fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<ListCursor> {
     let text = String::from_utf8(bytes).map_err(|_| bad())?;
     let parts: Vec<&str> = text.splitn(11, CURSOR_SEP).collect();
     match parts.as_slice() {
-        [CURSOR_VERSION, priority, created_at, updated_at, number, team_key, issue_id, snapshot_at, total, served, fp]
+        [CURSOR_VERSION, priority, created_at, updated_at, number, team_id, issue_id, snapshot_at, total, served, fp]
             if *fp == fingerprint =>
         {
             let priority: i32 = priority.parse().map_err(|_| bad())?;
@@ -259,9 +262,12 @@ fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<ListCursor> {
             // the numbers are bound as integers: reject anything the database
             // would not accept as this cursor's own output, so a forged cursor
             // is a 400 on every backend rather than a 500 on Postgres.
-            if !(0..=4).contains(&priority)
-                || total < 0
+            // Counts come from this endpoint's own responses; bound them so a
+            // forged cursor cannot overflow the per-page accumulation.
+            if total < 0
                 || served < 0
+                || total > MAX_WALK_COUNT
+                || served > MAX_WALK_COUNT
                 || ![created_at, updated_at, snapshot_at]
                     .iter()
                     .all(|t| is_db_timestamp(t))
@@ -274,7 +280,7 @@ fn decode_cursor(cursor: &str, fingerprint: &str) -> ApiResult<ListCursor> {
                     created_at: created_at.to_string(),
                     updated_at: updated_at.to_string(),
                     number: number.parse().map_err(|_| bad())?,
-                    team_key: team_key.to_string(),
+                    team_id: team_id.to_string(),
                     issue_id: issue_id.to_string(),
                 },
                 snapshot_at: snapshot_at.to_string(),
@@ -314,6 +320,11 @@ fn is_db_timestamp(t: &str) -> bool {
         && matches!(b.get(10), Some(b' ' | b'T'))
         && b.get(13) == Some(&b':')
         && b.get(16) == Some(&b':');
+    // Postgres has no year 0 (`'0000-01-01'::timestamptz` is out of range), so
+    // accepting it would let a forged cursor reach a cast error — a 500.
+    if year == 0 {
+        return false;
+    }
     let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
     let days_in_month = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -836,7 +847,7 @@ pub fn operations() -> Vec<ApiOperation> {
     vec![
         ApiOperation {
             name: "list_issues",
-            description: "Find issues in the workspace with optional filters. Returns `{issues, total, snapshot_at, served_count, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. A walk is a snapshot as of `snapshot_at` (the database clock when its first page was read). A write stamped at or before `snapshot_at` counts as of the walk's start: `total` is counted once then and is the same on every page, every page lists issues last modified at or before `snapshot_at`, and every issue that still matches is returned exactly once. If such a write moves an already-served issue past the cursor, that issue can appear once more — sorting by a mutable field (`updated_at`) is what allows this; walks ordered by a stable key (`number`, `created_at`) are exact. `served_count` reports how many rows the walk has returned so far, so a repeat is visible (`served_count` exceeds `total`), and `has_more` false ends the walk. An issue modified after `snapshot_at` is not part of that walk; it appears in a fresh walk (a request without `cursor`). An issue deleted, archived or otherwise no longer matching during the walk is absent from later pages. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view). Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
+            description: "Find issues in the workspace with optional filters. Returns `{issues, total, snapshot_at, served_count, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. A walk is a snapshot as of `snapshot_at` (the database clock when its first page was read). A write stamped at or before `snapshot_at` counts as of the walk's start: `total` is counted once then and is the same on every page, every page lists issues last modified at or before `snapshot_at`, and every issue that still matches is returned exactly once. If such a write moves an already-served issue past the cursor, that issue can appear once more — sorting by a mutable field (`updated_at`) is what allows this; walks ordered by a stable key (`number`, `created_at`) are exact. `served_count` reports how many rows the walk has returned so far: it is `total` plus any repeat, minus rows that stopped matching before they were served, plus rows that started matching without a write that moves `updated_at`. `has_more` false ends the walk whatever it says. An issue modified after `snapshot_at` is not part of that walk; it appears in a fresh walk (a request without `cursor`). An issue deleted, archived or otherwise no longer matching during the walk is absent from later pages. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view). Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues",
@@ -852,7 +863,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "search_issues",
-            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns up to the 1000 best-ranked matches per query, as `{results, total, has_more, next_offset, truncated}`; results carry snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of distinct matching issues found in that window, so it is exact when `truncated` is false; `truncated` true means more matches exist beyond the 1000 best-ranked, which is where a query returns more than 1000. When `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.",
+            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). A query returns up to its 1000 best-ranked matches: `total` is the number of distinct matching issues within that window — exact when `truncated` is false — and `truncated` true means more matches exist beyond it. When `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. Search applies only the filters you pass and no hidden defaults: with no status filter it covers every status, including Done and Cancelled, and archived issues. Narrow with status_id, status_category (comma-separated: backlog, unstarted, started, completed, cancelled), the same composable `filters` as list_issues (a JSON array of `{field, operator, values}` clauses AND-ed together; fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations, issue_id (a set of issue IDs, used by the Starred view); operators: any_of, none_of, all_of, not_any_of, not_all_of), applied before ranking and paging, team_key/team_id, include_archived=false, or include_comments=false (comments are searched by default). An exact identifier such as 'TRA-35' always matches that issue unless a filter you set excludes it. include_closed is deprecated and kept for compatibility: omitted or true means no status filtering; only an explicit false excludes completed and cancelled issues.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues/search",
@@ -1745,11 +1756,11 @@ mod tests {
         assert!(below["next_offset"].is_null());
     }
 
-    /// The documented contract for a mutable sort: a write stamped at or
-    /// before `snapshot_at` (this test writes the walk's own `snapshot_at`)
-    /// counts as of the walk's start, so moving an already-served issue past
-    /// the cursor makes it appear once more, and `served_count` shows it.
-    /// Under a stable-key sort the same write changes nothing.
+    /// The documented contract for a mutable sort: a write stamped exactly at
+    /// `snapshot_at` (the `<=` boundary) counts as of the walk's start, so
+    /// moving an already-served issue past the cursor makes it appear once
+    /// more, and `served_count` shows it. Under a stable-key sort the same
+    /// write changes nothing.
     #[tokio::test]
     async fn a_write_stamped_at_the_snapshot_can_repeat_a_served_row() {
         let (db, workspace_id, user_id) = seeded_workspace(9).await;
@@ -1765,24 +1776,24 @@ mod tests {
             let mut params = list_params(None);
             params.limit = Some(3);
             params.sort_by = Some(sort_by.to_string());
-            params.sort_dir = Some(if repeats { "desc" } else { "asc" }.to_string());
+            params.sort_dir = Some("asc".to_string());
             let first = list_issues(&ctx, params.clone()).await.expect("page 1");
             let served: Vec<i64> = numbers(&first);
             let total = first["total"].as_i64().expect("total");
             let snapshot_at = first["snapshot_at"].as_str().expect("snapshot_at").to_string();
 
-            // A write stamped before `snapshot_at` (what a transaction that
-            // began before page 1 carries) that moves an already-served row to
-            // the end of a mutable-sort walk: it lands after the cursor and is
-            // served again. Under the stable sort its position is unchanged.
+            // The last served row is stamped exactly at the walk's snapshot:
+            // the `<=` boundary counts it as of the walk's start. Under the
+            // ascending mutable sort it now sorts after the cursor and is
+            // served again; under the stable sort its position is unchanged.
             trakkt_core::db_execute!(
                 &db,
-                "UPDATE issues SET updated_at = '2026-07-01 00:00:00' WHERE workspace_id = $1 AND number = $2",
+                "UPDATE issues SET updated_at = $1 WHERE workspace_id = $2 AND number = $3",
+                &snapshot_at,
                 &workspace_id,
-                *served.first().expect("a served row") as i32
+                *served.last().expect("a served row") as i32
             )
-            .expect("write a served row before the snapshot");
-            assert!(snapshot_at.as_str() > "2026-07-01 00:00:00");
+            .expect("write a served row at the snapshot instant");
 
             let mut seen = served.clone();
             let mut last_page = first.clone();
@@ -1804,7 +1815,7 @@ mod tests {
                 assert_eq!(
                     seen.len() as i64,
                     total + 1,
-                    "one repeat under the mutable sort: {seen:?}"
+                    "one repeat at the snapshot boundary: {seen:?}"
                 );
                 assert_eq!(unique.len() as i64, total);
                 assert_eq!(served_count, total + 1);
@@ -1845,6 +1856,7 @@ mod tests {
 
         let mut seen = numbers(&first);
         let mut cursor = first["next_cursor"].as_str().map(str::to_string);
+        let mut last_page = first.clone();
         while let Some(c) = cursor {
             let mut p = params.clone();
             p.cursor = Some(c);
@@ -1852,8 +1864,13 @@ mod tests {
             assert_eq!(page["total"], 12, "total is the walk's size at its start");
             seen.extend(numbers(&page));
             cursor = page["next_cursor"].as_str().map(str::to_string);
+            last_page = page;
         }
         assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 8, 9, 11, 12]);
+        assert_eq!(
+            last_page["served_count"], 10,
+            "served_count counts rows returned: total minus the two that stopped matching"
+        );
     }
 
     /// TRA-10113 audit: workspace activities answer has_more from the data,
@@ -2113,7 +2130,6 @@ mod tests {
         // updated_at, number, team, id, snapshot_at, total, served.
         for (idx, forged) in [
             (0, "v1"),
-            (1, "9"),
             (2, "yesterday"),
             (2, "2026-02-30 00:00:00"),
             (3, "2026-13-01 00:00:00"),

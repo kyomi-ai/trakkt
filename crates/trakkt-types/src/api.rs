@@ -51,8 +51,10 @@ pub struct ListIssuesApiParams {
     /// `snapshot_at`; issues modified after it appear in a fresh walk.
     pub cursor: Option<String>,
     /// Sort field: priority (default), created_at, updated_at or number.
-    /// Ties are always broken deterministically (by creation time, number,
-    /// then issue id) so pagination is stable.
+    /// Ties are always broken deterministically — priority walks by creation
+    /// time, number and then issue id; created_at and updated_at walks by
+    /// number then issue id; number walks by team id then issue id — all on
+    /// columns that never change for an issue, so a walk is stable.
     pub sort_by: Option<String>,
     /// Sort direction: asc or desc. Default: asc for priority (Urgent first),
     /// desc for created_at, updated_at and number (newest first).
@@ -295,11 +297,12 @@ pub struct ListIssuesResponse {
     /// in a fresh one (a request without `cursor`), and an issue that stops
     /// matching during the walk is absent from later pages.
     pub snapshot_at: String,
-    /// Rows this walk has returned so far, this page included. It equals
-    /// `total` at the end of a walk unless a write stamped at or before
-    /// `snapshot_at` moved an already-served issue past the cursor, in which
-    /// case that issue appears once more and `served_count` exceeds `total`
-    /// by one per such repeat. `has_more` false still ends the walk.
+    /// Rows this walk has returned so far, this page included: `total` plus
+    /// any issue served more than once (a write stamped at or before
+    /// `snapshot_at` that moved an already-served issue past the cursor), minus
+    /// any issue that stopped matching before it was served, plus any issue that
+    /// started matching without a write that moves `updated_at` (a label or
+    /// relation change). `has_more` false ends the walk whatever this says.
     pub served_count: i64,
     /// Whether matching issues remain after this page.
     pub has_more: bool,

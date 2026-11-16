@@ -4006,7 +4006,6 @@ dual_backend_test! {
 struct ListFx {
     id: &'static str,
     team_id: &'static str,
-    team_key: &'static str,
     number: i32,
     created: &'static str,
     updated: &'static str,
@@ -4024,22 +4023,21 @@ struct ListFx {
 /// `01:30-04` and `01:30-05`: equal as clock text, ordered only as instants.
 fn list_fixtures() -> Vec<ListFx> {
     const SHAPE: [(i32, &str, &str, i32); 4] = [
-        (1, "2026-11-01 05:30:00+00", "2026-08-02 00:00:00+00", 3),
-        (2, "2026-07-01 00:00:00+00", "2026-11-01 05:30:00+00", 0),
-        (3, "2026-11-01 06:30:00+00", "2026-08-01 00:00:00+00", 3),
-        (4, "2026-07-02 00:00:00+00", "2026-11-01 06:30:00+00", 0),
+        (1, "2026-11-01 05:30:00+00:00", "2026-08-02 00:00:00+00:00", 3),
+        (2, "2026-07-01 00:00:00+00:00", "2026-11-01 05:30:00+00:00", 0),
+        (3, "2026-11-01 06:30:00+00:00", "2026-08-01 00:00:00+00:00", 3),
+        (4, "2026-07-02 00:00:00+00:00", "2026-11-01 06:30:00+00:00", 0),
     ];
-    const TEAMS: [(&str, &str, [&str; 4]); 2] = [
-        (TEAM, TEAM_KEY, ["a-1", "B-1", "_x", "b-2"]),
-        ("team_aa", "aa", ["A-9", "c-1", "Z-1", "_y"]),
+    const TEAMS: [(&str, [&str; 4]); 2] = [
+        (TEAM, ["a-1", "B-1", "_x", "b-2"]),
+        ("team_aa", ["A-9", "c-1", "Z-1", "_y"]),
     ];
     let mut out = Vec::new();
-    for (team_id, team_key, ids) in TEAMS {
+    for (team_id, ids) in TEAMS {
         for ((number, created, updated, priority), id) in SHAPE.iter().zip(ids) {
             out.push(ListFx {
                 id,
                 team_id,
-                team_key,
                 number: *number,
                 created,
                 updated,
@@ -4121,7 +4119,7 @@ fn expected_order(
             .then(d(a.number.cmp(&b.number)))
             .then(a.id.cmp(b.id)),
         F::Number => d(a.number.cmp(&b.number))
-            .then(a.team_key.cmp(b.team_key))
+            .then(a.team_id.cmp(b.team_id))
             .then(a.id.cmp(b.id)),
     });
     rows.into_iter().map(|f| f.id).collect()
@@ -4298,40 +4296,19 @@ dual_backend_test! {
 }
 
 dual_backend_test! {
-    /// The documented contract for a write the walk did not see: a Postgres
-    /// transaction that began before page 1 stamps `NOW()` = its start time, so
-    /// its write counts as of the walk's start even though it commits mid-walk.
-    /// If it moves an already-served issue past the cursor, that issue appears
-    /// once more and `served_count` reports it; a stable-key walk over the same
-    /// writes stays exactly once. (SQLite cannot hold a second connection to an
-    /// in-memory database; its same-instant case is covered in
-    /// `crates/trakkt-api/src/issues.rs`.)
-    async fn issue_list_walk_contract_for_a_write_already_in_flight(db) {
+    /// A `number`-sorted walk stays exact when a team is renamed mid-walk: the
+    /// tie-break below `number` is `i.team_id`, which no team edit changes.
+    /// (A team *key* can be renamed without touching any issue's `updated_at`,
+    /// so ordering by it would move rows inside a walk.)
+    async fn issue_list_number_walk_is_exact_across_a_team_rename(db) {
         use trakkt_auth::issue_service::{
-            list_issues_page, IssuePageRequest, IssueSort, IssueSortField, IssueSortKey,
-            IssueWalk, SortDir,
+            list_issues_page, IssuePageRequest, IssueSort, IssueSortField, IssueSortKey, IssueWalk,
+            SortDir,
         };
-        if !db.is_postgres() {
-            return;
-        }
         let fixtures = list_fixtures();
         seed_list_fixtures(db, &fixtures).await;
         let filters = trakkt_types::models::IssueFilters::default();
-
-        // A second connection, whose transaction starts before page 1.
-        let name: String = db_fetch_scalar!(db, String, "SELECT current_database()")
-            .expect("name the throwaway database");
-        let mut url = url::Url::parse(&trakkt_core::test_helpers::dual_backend::pg_maintenance_url())
-            .expect("TEST_DATABASE_URL is a URL");
-        url.set_path(&name);
-        let other = sqlx::PgPool::connect(url.as_str())
-            .await
-            .expect("open the in-flight connection");
-        let mut txn = other.begin().await.expect("begin the in-flight transaction");
-        sqlx::query("UPDATE issues SET updated_at = NOW() WHERE issue_id = 'A-9'")
-            .execute(&mut *txn)
-            .await
-            .expect("write a served row from the in-flight transaction");
+        let sort = IssueSort { field: IssueSortField::Number, dir: SortDir::Asc };
 
         async fn walk(
             db: &DbPool,
@@ -4360,152 +4337,343 @@ dual_backend_test! {
             .expect("read one page")
         }
 
-        // Mutable sort, ascending: the row is served on page 1, then the
-        // in-flight write (stamped at its transaction start, before the
-        // snapshot) commits and moves it past the cursor; the walk counts it as
-        // of its start and serves it once more at the end.
-        let sort = IssueSort { field: IssueSortField::UpdatedAt, dir: SortDir::Asc };
         let first = walk(db, &filters, sort, None).await;
-        assert_eq!(first.total, 8);
-        assert!(first.issues.iter().any(|r| r.issue_id == "A-9"));
-        txn.commit().await.expect("commit the in-flight transaction");
-
+        let mut served = first.served_count;
         let mut seen: Vec<String> = first.issues.iter().map(|r| r.issue_id.clone()).collect();
         let mut after = IssueSortKey::from(first.issues.last().expect("a full page"));
-        let mut page = first;
-        while page.has_more {
-            let next = walk(
-                db,
-                &filters,
-                sort,
-                Some((&after, page.snapshot_at.clone(), page.total, page.served_count)),
-            )
-            .await;
-            assert_eq!(next.total, 8, "total is fixed for the walk");
-            seen.extend(next.issues.iter().map(|r| r.issue_id.clone()));
-            if let Some(last) = next.issues.last() {
-                after = IssueSortKey::from(last);
-            }
-            page = next;
-        }
-        assert_eq!(page.served_count, 9, "one documented repeat");
-        assert_eq!(seen.len(), 9);
-        assert_eq!(seen.iter().filter(|id| *id == "A-9").count(), 2);
 
-        // Stable-key sort over an equivalent write: exactly once.
-        sqlx::query("UPDATE issues SET updated_at = '2026-07-01 00:00:00' WHERE issue_id = 'B-1'")
-            .execute(&other)
-            .await
-            .expect("move a served row under the stable sort");
-        let sort = IssueSort { field: IssueSortField::Number, dir: SortDir::Asc };
-        let mut page = walk(db, &filters, sort, None).await;
-        let mut seen: Vec<String> = page.issues.iter().map(|r| r.issue_id.clone()).collect();
-        let mut after = IssueSortKey::from(page.issues.last().expect("a full page"));
-        while page.has_more {
-            let next = walk(
+        // Rename the team whose rows the walk has been serving, to a key that
+        // sorts on the other side of the other team.
+        trakkt_auth::team_service::update_team(
+            db,
+            TEAM,
+            WORKSPACE,
+            None,
+            Some("ZZZ".to_string()),
+            None,
+        )
+        .await
+        .expect("rename the team mid-walk");
+
+        let mut has_more = first.has_more;
+        while has_more {
+            let page = walk(
                 db,
                 &filters,
                 sort,
-                Some((&after, page.snapshot_at.clone(), page.total, page.served_count)),
+                Some((&after, first.snapshot_at.clone(), first.total, served)),
             )
             .await;
-            seen.extend(next.issues.iter().map(|r| r.issue_id.clone()));
-            if let Some(last) = next.issues.last() {
+            assert_eq!(page.total, 8, "total is fixed for the walk");
+            served = page.served_count;
+            seen.extend(page.issues.iter().map(|r| r.issue_id.clone()));
+            has_more = page.has_more;
+            if let Some(last) = page.issues.last() {
                 after = IssueSortKey::from(last);
             }
-            page = next;
         }
-        assert_eq!(page.served_count, 8, "stable-key walks are exact");
-        assert_eq!(seen.len(), 8);
-        other.close().await;
+        let unique: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(seen.len(), 8, "every issue once: {seen:?}");
+        assert_eq!(unique.len(), 8);
+        assert_eq!(served, 8, "no row repeated");
     }
 }
 
 dual_backend_test! {
-    /// A walk is a snapshot by modification time: an issue modified after the
-    /// first page is stamped after `snapshot_at`, so it is absent from that
-    /// walk's later pages (and does not disturb `total`), while every other
-    /// issue is served exactly once; a fresh walk includes it.
-    async fn issue_list_walk_excludes_rows_modified_after_its_snapshot(db) {
-        use trakkt_auth::issue_service::{
-            list_issues_page, IssuePageRequest, IssueSort, IssueSortField, IssueSortKey,
-            IssueWalk, SortDir,
-        };
+    /// A cursor is caller input on both backends: every field the database
+    /// will see is validated before it is bound, so a forged cursor is a `400`
+    /// rather than a Postgres cast error (`500`) or a silent SQLite
+    /// miscomparison. The year-zero case is the one Postgres cannot represent.
+    async fn list_issues_rejects_a_forged_cursor_on_either_backend(db) {
+        use base64::Engine;
+
         let fixtures = list_fixtures();
         seed_list_fixtures(db, &fixtures).await;
-        let filters = trakkt_types::models::IssueFilters::default();
-        let sort = IssueSort { field: IssueSortField::Number, dir: SortDir::Asc };
-        fn request<'a>(
-            filters: &'a trakkt_types::models::IssueFilters,
-            sort: IssueSort,
-            resume: Option<IssueWalk<'a>>,
-        ) -> IssuePageRequest<'a> {
-            IssuePageRequest {
+        let ctx = trakkt_api::ApiCtx::from_leptos(
+            WORKSPACE.to_string(),
+            USER.to_string(),
+            db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        );
+        let params = || trakkt_types::api::ListIssuesApiParams {
+            team_key: None,
+            team_id: None,
+            status_id: None,
+            status_category: None,
+            include_closed: None,
+            priority: None,
+            assignee: None,
+            label: None,
+            search: None,
+            limit: Some(3),
+            filters: None,
+            cursor: None,
+            sort_by: None,
+            sort_dir: None,
+        };
+        let first = trakkt_api::issues::list_issues(&ctx, params())
+            .await
+            .expect("page 1");
+        let cursor = first["next_cursor"].as_str().expect("a next cursor");
+        let raw = String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(cursor)
+                .expect("cursor is base64"),
+        )
+        .expect("cursor is utf-8");
+        let parts: Vec<&str> = raw.split('\u{1e}').collect();
+        assert_eq!(parts.len(), 11);
+
+        for (idx, forged) in [
+            (0, "v1"),
+            (2, "yesterday"),
+            (2, "2026-02-30 00:00:00"),
+            (3, "2026-13-01 00:00:00"),
+            (7, "0000-01-01 00:00:00"),
+            (7, "now()"),
+            (8, "-1"),
+            (9, "-1"),
+        ] {
+            let mut forged_parts = parts.clone();
+            forged_parts[idx] = forged;
+            let mut p = params();
+            p.cursor = Some(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(forged_parts.join("\u{1e}")),
+            );
+            assert!(
+                matches!(
+                    trakkt_api::issues::list_issues(&ctx, p).await,
+                    Err(trakkt_api::ApiError::BadRequest(_))
+                ),
+                "forged field {idx} = {forged:?} must be a bad request on this backend"
+            );
+        }
+    }
+}
+
+    /// The documented contract for a write the walk did not see: a Postgres
+    /// transaction that began before page 1 stamps `NOW()` = its start time, so
+    /// its write counts as of the walk's start even though it commits mid-walk.
+    /// If it moves an already-served issue past the cursor, that issue appears
+    /// once more and `served_count` reports it; a stable-key walk over a
+    /// mid-walk write stays exactly once.
+    ///
+    /// Postgres-only (it needs a second connection to the same database, which
+    /// an in-memory SQLite database cannot offer), so it is written out rather
+    /// than as a `dual_backend_test!` whose SQLite half would assert nothing.
+    /// The SQLite same-instant case is covered by
+    /// `a_write_stamped_at_the_snapshot_can_repeat_a_served_row`.
+    #[tokio::test]
+    #[ignore = "requires a live Postgres — see crates/trakkt-core/src/test_helpers/dual_backend.rs"]
+    async fn issue_list_walk_contract_for_a_write_already_in_flight() {
+        on_postgres(|db| async move {
+            in_flight_walk_contract(&db).await
+        })
+        .await
+    }
+
+async fn in_flight_walk_contract(db: &DbPool) {
+    use trakkt_auth::issue_service::{
+        list_issues_page, IssuePageRequest, IssueSort, IssueSortField, IssueSortKey,
+        IssueWalk, SortDir,
+    };
+    let fixtures = list_fixtures();
+    seed_list_fixtures(db, &fixtures).await;
+    let filters = trakkt_types::models::IssueFilters::default();
+
+    // A second connection, whose transaction starts before page 1.
+    let name: String = db_fetch_scalar!(db, String, "SELECT current_database()")
+        .expect("name the throwaway database");
+    let mut url = url::Url::parse(&trakkt_core::test_helpers::dual_backend::pg_maintenance_url())
+        .expect("TEST_DATABASE_URL is a URL");
+    url.set_path(&name);
+    let other = sqlx::PgPool::connect(url.as_str())
+        .await
+        .expect("open the in-flight connection");
+    let mut txn = other.begin().await.expect("begin the in-flight transaction");
+    sqlx::query("UPDATE issues SET updated_at = NOW() WHERE issue_id = 'A-9'")
+        .execute(&mut *txn)
+        .await
+        .expect("write a served row from the in-flight transaction");
+
+    async fn walk(
+        db: &DbPool,
+        filters: &trakkt_types::models::IssueFilters,
+        sort: IssueSort,
+        resume: Option<(&IssueSortKey, String, i64, i64)>,
+    ) -> trakkt_auth::issue_service::IssuePage {
+        list_issues_page(
+            db,
+            &IssuePageRequest {
                 workspace_id: WORKSPACE,
                 team_id: None,
                 filters,
                 clauses: &[],
                 sort,
-                resume,
+                resume: resume.as_ref().map(|(after, snapshot_at, total, served)| IssueWalk {
+                    after,
+                    snapshot_at,
+                    total: *total,
+                    served: *served,
+                }),
                 limit: 3,
-            }
-        }
-
-        let first = list_issues_page(db, &request(&filters, sort, None)).await.expect("page 1");
-        assert_eq!(first.total, 8);
-        let mut seen: Vec<String> = first.issues.iter().map(|r| r.issue_id.clone()).collect();
-        let last = IssueSortKey::from(first.issues.last().expect("a full first page"));
-        // The unreturned issue with the highest sort position.
-        let victim = expected_order(&fixtures, IssueSortField::Number, SortDir::Asc, |_| true)[7];
-
-        // A real edit: stamped by the database clock, after the snapshot. SQLite
-        // stamps whole seconds, so wait one out.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        let later = if db.is_postgres() { "NOW()" } else { "datetime('now')" };
-        db_execute!(
-            db,
-            &format!("UPDATE issues SET title = 'edited', updated_at = {later} WHERE issue_id = $1"),
-            victim
+            },
         )
-        .expect("modify an unreturned issue mid-walk");
-
-        let mut after = last;
-        let mut served = first.served_count;
-        loop {
-            let page = list_issues_page(
-                db,
-                &request(
-                    &filters,
-                    sort,
-                    Some(IssueWalk {
-                        after: &after,
-                        snapshot_at: &first.snapshot_at,
-                        total: first.total,
-                        served,
-                    }),
-                ),
-            )
-            .await
-            .expect("a later page");
-            assert_eq!(page.total, 8, "total is constant for the walk");
-            assert_eq!(page.snapshot_at, first.snapshot_at);
-            served = page.served_count;
-            seen.extend(page.issues.iter().map(|r| r.issue_id.clone()));
-            match (page.has_more, page.issues.last()) {
-                (true, Some(l)) => after = IssueSortKey::from(l),
-                _ => break,
-            }
-        }
-        assert_eq!(served, 7, "unmodified-walk rows served");
-        let mut expected: Vec<&str> =
-            expected_order(&fixtures, IssueSortField::Number, SortDir::Asc, |_| true);
-        expected.retain(|id| *id != victim);
-        assert_eq!(seen, expected, "every unmodified issue once; the edited one is not in this walk");
-
-        // A fresh walk takes a new snapshot, which includes the edit.
-        let fresh = walk_list(db, sort, &[], 100, 8).await;
-        assert!(fresh.iter().any(|id| id == victim));
+        .await
+        .expect("read one page")
     }
+
+    // Mutable sort, ascending: the row is served on page 1, then the
+    // in-flight write (stamped at its transaction start, before the
+    // snapshot) commits and moves it past the cursor; the walk counts it as
+    // of its start and serves it once more at the end.
+    let sort = IssueSort { field: IssueSortField::UpdatedAt, dir: SortDir::Asc };
+    let first = walk(db, &filters, sort, None).await;
+    assert_eq!(first.total, 8);
+    assert!(first.issues.iter().any(|r| r.issue_id == "A-9"));
+    txn.commit().await.expect("commit the in-flight transaction");
+
+    let mut seen: Vec<String> = first.issues.iter().map(|r| r.issue_id.clone()).collect();
+    let mut after = IssueSortKey::from(first.issues.last().expect("a full page"));
+    let mut page = first;
+    while page.has_more {
+        let next = walk(
+            db,
+            &filters,
+            sort,
+            Some((&after, page.snapshot_at.clone(), page.total, page.served_count)),
+        )
+        .await;
+        assert_eq!(next.total, 8, "total is fixed for the walk");
+        seen.extend(next.issues.iter().map(|r| r.issue_id.clone()));
+        if let Some(last) = next.issues.last() {
+            after = IssueSortKey::from(last);
+        }
+        page = next;
+    }
+    assert_eq!(page.served_count, 9, "one documented repeat");
+    assert_eq!(seen.len(), 9);
+    assert_eq!(seen.iter().filter(|id| *id == "A-9").count(), 2);
+
+    // Stable-key sort with the same kind of mid-walk write (a served row
+    // stamped now, after page 1): the row cannot move, so exactly once.
+    let sort = IssueSort { field: IssueSortField::Number, dir: SortDir::Asc };
+    let mut page = walk(db, &filters, sort, None).await;
+    let mut seen: Vec<String> = page.issues.iter().map(|r| r.issue_id.clone()).collect();
+    let served_first = page.issues[0].issue_id.clone();
+    sqlx::query("UPDATE issues SET updated_at = NOW() WHERE issue_id = $1")
+        .bind(&served_first)
+        .execute(&other)
+        .await
+        .expect("write a served row mid-walk under the stable sort");
+    let mut after = IssueSortKey::from(page.issues.last().expect("a full page"));
+    while page.has_more {
+        let next = walk(
+            db,
+            &filters,
+            sort,
+            Some((&after, page.snapshot_at.clone(), page.total, page.served_count)),
+        )
+        .await;
+        seen.extend(next.issues.iter().map(|r| r.issue_id.clone()));
+        if let Some(last) = next.issues.last() {
+            after = IssueSortKey::from(last);
+        }
+        page = next;
+    }
+    assert_eq!(page.served_count, 8, "stable-key walks are exact");
+    assert_eq!(seen.len(), 8);
+    other.close().await;
+}
+
+dual_backend_test! {
+/// A walk is a snapshot by modification time: an issue modified after the
+/// first page is stamped after `snapshot_at`, so it is absent from that
+/// walk's later pages (and does not disturb `total`), while every other
+/// issue is served exactly once; a fresh walk includes it.
+async fn issue_list_walk_excludes_rows_modified_after_its_snapshot(db) {
+    use trakkt_auth::issue_service::{
+        list_issues_page, IssuePageRequest, IssueSort, IssueSortField, IssueSortKey,
+        IssueWalk, SortDir,
+    };
+    let fixtures = list_fixtures();
+    seed_list_fixtures(db, &fixtures).await;
+    let filters = trakkt_types::models::IssueFilters::default();
+    let sort = IssueSort { field: IssueSortField::Number, dir: SortDir::Asc };
+    fn request<'a>(
+        filters: &'a trakkt_types::models::IssueFilters,
+        sort: IssueSort,
+        resume: Option<IssueWalk<'a>>,
+    ) -> IssuePageRequest<'a> {
+        IssuePageRequest {
+            workspace_id: WORKSPACE,
+            team_id: None,
+            filters,
+            clauses: &[],
+            sort,
+            resume,
+            limit: 3,
+        }
+    }
+
+    let first = list_issues_page(db, &request(&filters, sort, None)).await.expect("page 1");
+    assert_eq!(first.total, 8);
+    let mut seen: Vec<String> = first.issues.iter().map(|r| r.issue_id.clone()).collect();
+    let last = IssueSortKey::from(first.issues.last().expect("a full first page"));
+    // The unreturned issue with the highest sort position.
+    let victim = expected_order(&fixtures, IssueSortField::Number, SortDir::Asc, |_| true)[7];
+
+    // A real edit: stamped by the database clock, after the snapshot. SQLite
+    // stamps whole seconds, so wait one out.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let later = if db.is_postgres() { "NOW()" } else { "datetime('now')" };
+    db_execute!(
+        db,
+        &format!("UPDATE issues SET title = 'edited', updated_at = {later} WHERE issue_id = $1"),
+        victim
+    )
+    .expect("modify an unreturned issue mid-walk");
+
+    let mut after = last;
+    let mut served = first.served_count;
+    loop {
+        let page = list_issues_page(
+            db,
+            &request(
+                &filters,
+                sort,
+                Some(IssueWalk {
+                    after: &after,
+                    snapshot_at: &first.snapshot_at,
+                    total: first.total,
+                    served,
+                }),
+            ),
+        )
+        .await
+        .expect("a later page");
+        assert_eq!(page.total, 8, "total is constant for the walk");
+        assert_eq!(page.snapshot_at, first.snapshot_at);
+        served = page.served_count;
+        seen.extend(page.issues.iter().map(|r| r.issue_id.clone()));
+        match (page.has_more, page.issues.last()) {
+            (true, Some(l)) => after = IssueSortKey::from(l),
+            _ => break,
+        }
+    }
+    assert_eq!(served, 7, "unmodified-walk rows served");
+    let mut expected: Vec<&str> =
+        expected_order(&fixtures, IssueSortField::Number, SortDir::Asc, |_| true);
+    expected.retain(|id| *id != victim);
+    assert_eq!(seen, expected, "every unmodified issue once; the edited one is not in this walk");
+
+    // A fresh walk takes a new snapshot, which includes the edit.
+    let fresh = walk_list(db, sort, &[], 100, 8).await;
+    assert!(fresh.iter().any(|id| id == victim));
+}
 }
 
 // ─── Search ──────────────────────────────────────────────────────────────────
