@@ -1567,6 +1567,8 @@ mod tests {
                     query: "Seeded".to_string(),
                     team_key: None,
                     team_id: None,
+                    status_id: None,
+                    status_category: None,
                     include_closed: None,
                     include_archived: None,
                     include_comments: Some(false),
