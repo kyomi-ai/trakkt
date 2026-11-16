@@ -47,6 +47,8 @@ pub struct ListIssuesApiParams {
     pub filters: Option<String>,
     /// Opaque pagination cursor: the `next_cursor` of a previous response to
     /// the same query (same filters, sort_by and sort_dir). Omit for page 1.
+    /// All pages of a walk are a snapshot as of the first response's
+    /// `snapshot_at`; issues modified after it appear in a fresh walk.
     pub cursor: Option<String>,
     /// Sort field: priority (default), created_at, updated_at or number.
     /// Ties are always broken deterministically (by creation time, number,
@@ -283,9 +285,22 @@ impl From<crate::models::IssueWithDetails> for IssueListRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListIssuesResponse {
     pub issues: Vec<IssueListRow>,
-    /// Exact number of issues matching every filter, ignoring `limit` and
-    /// `cursor`.
+    /// Number of issues matching every filter as of `snapshot_at`, ignoring
+    /// `limit` and `cursor`. Counted on the first page and identical on every
+    /// page of the walk.
     pub total: usize,
+    /// The instant this walk's snapshot was taken (database clock, first
+    /// page). Every page of the walk lists issues last modified at or before it; an
+    /// issue modified after `snapshot_at` is not part of the walk and appears
+    /// in a fresh one (a request without `cursor`), and an issue that stops
+    /// matching during the walk is absent from later pages.
+    pub snapshot_at: String,
+    /// Rows this walk has returned so far, this page included. It equals
+    /// `total` at the end of a walk unless a write stamped at or before
+    /// `snapshot_at` moved an already-served issue past the cursor, in which
+    /// case that issue appears once more and `served_count` exceeds `total`
+    /// by one per such repeat. `has_more` false still ends the walk.
+    pub served_count: i64,
     /// Whether matching issues remain after this page.
     pub has_more: bool,
     /// Pass as `cursor` to get the next page; null when `has_more` is false.

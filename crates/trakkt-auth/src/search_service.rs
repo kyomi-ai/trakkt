@@ -46,16 +46,16 @@ pub struct SearchResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
-    /// Number of distinct matching issues, counted up to [`SEARCH_FETCH_CAP`]
-    /// rows. When `truncated` is true this is a lower bound.
+    /// Number of distinct matching issues found within the search window: the
+    /// [`SEARCH_FETCH_CAP`] best-ranked rows. Exact when `truncated` is false.
     pub total: i64,
     /// More results can be fetched by repeating the request with
     /// `offset = next_offset`.
     pub has_more: bool,
     /// Offset of the next page; `None` when `has_more` is false.
     pub next_offset: Option<i64>,
-    /// The search hit its internal fetch cap: matches ranked below the cap are
-    /// not reachable by paging and `total` is a lower bound. Narrow the query.
+    /// More distinct matches exist beyond the 1000 best-ranked, so `total`
+    /// counts the window, not every match.
     pub truncated: bool,
 }
 

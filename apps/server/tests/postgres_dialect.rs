@@ -4000,123 +4000,511 @@ dual_backend_test! {
 
 // ─── Issue list ordering (TRA-10113) ─────────────────────────────────────────
 
-dual_backend_test! {
-    /// `list_issues_sorted` orders by the SQL `ORDER BY` its sort builds
-    /// (`COLLATE "C"` string tie-breaks on Postgres), and the keyset cursor
-    /// resumes with `IssueSort::compare`. If the two ever disagree on a
-    /// backend, a cursor resumes early or late.
-    ///
-    /// The fixture is built so each tie-break is *reached*, not just present:
-    /// - two teams whose keys sort differently under a locale collation and
-    ///   under `"C"` ("DIA" vs "aa"), with equal numbers in both, so the
-    ///   `number` sort falls through to `t.key`;
-    /// - equal `created_at`/`updated_at`/number/priority across those teams,
-    ///   with hand-picked `issue_id`s whose order differs between a locale
-    ///   collation and `"C"` ("B-1" vs "a-1", "_x" vs "A-9"), so every other
-    ///   sort falls through to `issue_id`;
-    /// - distinct fixed-offset timestamps, shuffled against `number`, so the
-    ///   `created_at` and `updated_at` sorts are not the `number` sort in
-    ///   disguise.
-    /// Every sort and direction must read back strictly ascending under the
-    /// comparator, and the list path must not load descriptions.
-    async fn issue_list_sql_order_agrees_with_the_cursor_comparator(db) {
-        use trakkt_auth::issue_service::{
-            list_issues_sorted, IssueSort, IssueSortField, IssueSortKey, SortDir,
-        };
+/// One fixture issue for the list-ordering tests: every column any sort looks
+/// at. Timestamps are UTC text in a fixed-width form, so comparing them as
+/// strings *in this oracle* is chronological; the code under test never does.
+struct ListFx {
+    id: &'static str,
+    team_id: &'static str,
+    team_key: &'static str,
+    number: i32,
+    created: &'static str,
+    updated: &'static str,
+    priority: i32,
+}
 
-        seed_tenancy(db).await;
-        seed_team(db, "team_aa", WORKSPACE, "aa")
-            .await
-            .expect("seed a second team whose key sorts differently under \"C\"");
-        let status_id: String = db_fetch_scalar!(
-            db,
-            String,
-            "SELECT status_id FROM statuses WHERE workspace_id = $1 ORDER BY status_id LIMIT 1",
-            WORKSPACE
-        )
-        .expect("read a status id the raw issue rows can reference");
-
-        let is_pg = db.is_postgres();
-        let ts = |n: u8| {
-            if is_pg {
-                format!("CAST(${n} AS TIMESTAMPTZ)")
-            } else {
-                format!("${n}")
-            }
-        };
-        let (c, u) = (ts(7), ts(8));
-        let insert = format!(
-            "INSERT INTO issues (issue_id, workspace_id, team_id, number, title, status_id, \
-             priority, creator_id, created_at, updated_at) \
-             VALUES ($1, $2, $3, CAST($4 AS INTEGER), $5, $6, CAST($9 AS INTEGER), $10, {c}, {u})"
-        );
-        // (number, created_at, updated_at, priority): created_at and updated_at
-        // run against number and against each other.
-        let shape = [
-            (1, "2026-07-03 00:00:00+00", "2026-08-02 00:00:00+00", 3),
-            (2, "2026-07-01 00:00:00+00", "2026-08-04 00:00:00+00", 0),
-            (3, "2026-07-04 00:00:00+00", "2026-08-01 00:00:00+00", 3),
-            (4, "2026-07-02 00:00:00+00", "2026-08-03 00:00:00+00", 0),
-        ];
-        let teams = [
-            (TEAM, ["a-1", "B-1", "_x", "b-2"]),
-            ("team_aa", ["A-9", "c-1", "Z-1", "_y"]),
-        ];
-        for (team_id, ids) in teams {
-            for ((number, created, updated, priority), id) in shape.iter().zip(ids) {
-                let number = number.to_string();
-                let priority = priority.to_string();
-                db_execute!(
-                    db,
-                    &insert,
-                    id,
-                    WORKSPACE,
-                    team_id,
-                    &number,
-                    format!("tie {id}"),
-                    &status_id,
-                    *created,
-                    *updated,
-                    &priority,
-                    USER
-                )
-                .expect("insert an issue with hand-picked tie-break keys");
-            }
+/// Two teams whose keys order differently bytewise ("DIA" < "aa") and under an
+/// `en_US` locale ("aa" < "DIA"), with the same numbers, timestamps and
+/// priorities in both, and hand-picked issue ids whose order also differs
+/// between the two collations ("B-1" < "a-1" bytewise, the reverse under
+/// `en_US`). So every tie-break column is reached: team key by the `number`
+/// sort, issue id by every other. Timestamps are distinct and shuffled against
+/// `number`, and two pairs sit an hour apart across the US fall-back instant
+/// (2026-11-01 06:00 UTC) so that, rendered in `America/New_York`, they read
+/// `01:30-04` and `01:30-05`: equal as clock text, ordered only as instants.
+fn list_fixtures() -> Vec<ListFx> {
+    const SHAPE: [(i32, &str, &str, i32); 4] = [
+        (1, "2026-11-01 05:30:00+00", "2026-08-02 00:00:00+00", 3),
+        (2, "2026-07-01 00:00:00+00", "2026-11-01 05:30:00+00", 0),
+        (3, "2026-11-01 06:30:00+00", "2026-08-01 00:00:00+00", 3),
+        (4, "2026-07-02 00:00:00+00", "2026-11-01 06:30:00+00", 0),
+    ];
+    const TEAMS: [(&str, &str, [&str; 4]); 2] = [
+        (TEAM, TEAM_KEY, ["a-1", "B-1", "_x", "b-2"]),
+        ("team_aa", "aa", ["A-9", "c-1", "Z-1", "_y"]),
+    ];
+    let mut out = Vec::new();
+    for (team_id, team_key, ids) in TEAMS {
+        for ((number, created, updated, priority), id) in SHAPE.iter().zip(ids) {
+            out.push(ListFx {
+                id,
+                team_id,
+                team_key,
+                number: *number,
+                created,
+                updated,
+                priority: *priority,
+            });
         }
+    }
+    out
+}
 
-        for field in [
-            IssueSortField::Priority,
-            IssueSortField::CreatedAt,
-            IssueSortField::UpdatedAt,
-            IssueSortField::Number,
-        ] {
-            for dir in [SortDir::Asc, SortDir::Desc] {
-                let sort = IssueSort { field, dir };
-                let rows = list_issues_sorted(
-                    db,
-                    WORKSPACE,
-                    None,
-                    &trakkt_types::models::IssueFilters::default(),
-                    sort,
-                )
-                .await
-                .expect("list both teams' issues in this order");
-                assert_eq!(rows.len(), 8);
-                assert!(
-                    rows.iter().all(|r| r.description.is_none()),
-                    "the list path must not load descriptions"
-                );
-                for pair in rows.windows(2) {
+async fn seed_list_fixtures(db: &DbPool, fixtures: &[ListFx]) {
+    seed_tenancy(db).await;
+    seed_team(db, "team_aa", WORKSPACE, "aa")
+        .await
+        .expect("seed a second team whose key sorts differently under \"C\"");
+    let status_id: String = db_fetch_scalar!(
+        db,
+        String,
+        "SELECT status_id FROM statuses WHERE workspace_id = $1 ORDER BY status_id LIMIT 1",
+        WORKSPACE
+    )
+    .expect("read a status id the raw issue rows can reference");
+
+    let is_pg = db.is_postgres();
+    let ts = |n: u8| {
+        if is_pg {
+            format!("CAST(${n} AS TIMESTAMPTZ)")
+        } else {
+            format!("${n}")
+        }
+    };
+    let (c, u) = (ts(7), ts(8));
+    let insert = format!(
+        "INSERT INTO issues (issue_id, workspace_id, team_id, number, title, status_id, \
+         priority, creator_id, created_at, updated_at) \
+         VALUES ($1, $2, $3, CAST($4 AS INTEGER), $5, $6, CAST($9 AS INTEGER), $10, {c}, {u})"
+    );
+    for f in fixtures {
+        db_execute!(
+            db,
+            &insert,
+            f.id,
+            WORKSPACE,
+            f.team_id,
+            &f.number.to_string(),
+            format!("tie {}", f.id),
+            &status_id,
+            f.created,
+            f.updated,
+            &f.priority.to_string(),
+            USER
+        )
+        .expect("insert an issue with hand-picked tie-break keys");
+    }
+}
+
+/// The order `sort` must produce, computed here from the fixture values alone
+/// (bytewise strings, UTC text), independently of any SQL.
+fn expected_order(
+    fixtures: &[ListFx],
+    field: trakkt_auth::issue_service::IssueSortField,
+    dir: trakkt_auth::issue_service::SortDir,
+    keep: impl Fn(&ListFx) -> bool,
+) -> Vec<&'static str> {
+    use std::cmp::Ordering;
+    use trakkt_auth::issue_service::{IssueSortField as F, SortDir};
+    let mut rows: Vec<&ListFx> = fixtures.iter().filter(|f| keep(f)).collect();
+    let d = |o: Ordering| if dir == SortDir::Desc { o.reverse() } else { o };
+    let rank = |p: i32| if p == 0 { 5 } else { p };
+    rows.sort_by(|a, b| match field {
+        F::Priority => d(rank(a.priority).cmp(&rank(b.priority)))
+            .then(b.created.cmp(a.created))
+            .then(b.number.cmp(&a.number))
+            .then(a.id.cmp(b.id)),
+        F::CreatedAt => d(a.created.cmp(b.created))
+            .then(d(a.number.cmp(&b.number)))
+            .then(a.id.cmp(b.id)),
+        F::UpdatedAt => d(a.updated.cmp(b.updated))
+            .then(d(a.number.cmp(&b.number)))
+            .then(a.id.cmp(b.id)),
+        F::Number => d(a.number.cmp(&b.number))
+            .then(a.team_key.cmp(b.team_key))
+            .then(a.id.cmp(b.id)),
+    });
+    rows.into_iter().map(|f| f.id).collect()
+}
+
+/// Walk `sort` to the end in pages of `limit`, returning the ids in order.
+async fn walk_list(
+    db: &DbPool,
+    sort: trakkt_auth::issue_service::IssueSort,
+    clauses: &[trakkt_types::api::FilterClause],
+    limit: i64,
+    expect_total: i64,
+) -> Vec<String> {
+    use trakkt_auth::issue_service::{list_issues_page, IssuePageRequest, IssueSortKey, IssueWalk};
+    let filters = trakkt_types::models::IssueFilters::default();
+    let mut ids = Vec::new();
+    let mut resume: Option<(IssueSortKey, String, i64, i64)> = None;
+    loop {
+        let page = list_issues_page(
+            db,
+            &IssuePageRequest {
+                workspace_id: WORKSPACE,
+                team_id: None,
+                filters: &filters,
+                clauses,
+                sort,
+                resume: resume.as_ref().map(|(after, snapshot_at, total, served)| IssueWalk {
+                    after,
+                    snapshot_at,
+                    total: *total,
+                    served: *served,
+                }),
+                limit,
+            },
+        )
+        .await
+        .expect("read one page");
+        assert_eq!(page.total, expect_total, "total is counted once and carried");
+        assert!(
+            page.issues.iter().all(|r| r.description.is_none()),
+            "the list path must not load descriptions"
+        );
+        if let Some(last) = page.issues.last() {
+            resume = Some((
+                IssueSortKey::from(last),
+                page.snapshot_at.clone(),
+                page.total,
+                page.served_count,
+            ));
+        }
+        ids.extend(page.issues.into_iter().map(|r| r.issue_id));
+        if !page.has_more {
+            return ids;
+        }
+    }
+}
+
+/// Every sort and direction, one-shot and in pages of 3, with and without a
+/// composable clause, must equal the independently computed order.
+async fn assert_list_orders(db: &DbPool, fixtures: &[ListFx]) {
+    use trakkt_auth::issue_service::{IssueSort, IssueSortField, SortDir};
+    let priority_3 = [trakkt_types::api::FilterClause {
+        field: "priority".to_string(),
+        operator: "any_of".to_string(),
+        values: vec!["3".to_string()],
+    }];
+    for field in [
+        IssueSortField::Priority,
+        IssueSortField::CreatedAt,
+        IssueSortField::UpdatedAt,
+        IssueSortField::Number,
+    ] {
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            let sort = IssueSort { field, dir };
+            for (clauses, keep_n3) in [(&[][..], false), (&priority_3[..], true)] {
+                let expected = expected_order(fixtures, field, dir, |f| !keep_n3 || f.priority == 3);
+                for limit in [100, 3] {
+                    let got = walk_list(db, sort, clauses, limit, expected.len() as i64).await;
                     assert_eq!(
-                        sort.compare(&IssueSortKey::from(&pair[0]), &IssueSortKey::from(&pair[1])),
-                        std::cmp::Ordering::Less,
-                        "SQL order and cursor comparator disagree for {field:?} {dir:?}: {} then {}",
-                        pair[0].issue_id,
-                        pair[1].issue_id
+                        got, expected,
+                        "{field:?} {dir:?} clauses={keep_n3} limit={limit} disagrees with the independent order"
                     );
                 }
             }
         }
+    }
+}
+
+dual_backend_test! {
+    /// `list_issues_page` pages by keyset: the "strictly after the last row"
+    /// predicate and the `ORDER BY` are generated from one column list, with
+    /// `COLLATE "C"` string tie-breaks and typed timestamps on Postgres. Every
+    /// sort and direction, one-shot and in pages of 3, with and without a
+    /// clause, must equal the order computed independently from the fixtures —
+    /// so a wrong collation, a dropped tie-break or a keyset that disagrees
+    /// with the `ORDER BY` each fail here.
+    ///
+    /// On Postgres the throwaway database's default collation must not be "C"
+    /// or "POSIX": under those the `COLLATE "C"` tie-breaks are
+    /// indistinguishable from the default and the test could pass without
+    /// exercising them.
+    async fn issue_list_keyset_paging_reproduces_the_expected_order(db) {
+        if db.is_postgres() {
+            let collation: String = db_fetch_scalar!(
+                db,
+                String,
+                "SELECT datcollate FROM pg_database WHERE datname = current_database()"
+            )
+            .expect("read the test database's default collation");
+            assert!(
+                collation != "C" && collation != "POSIX",
+                "the test database collates as {collation}; the COLLATE \"C\" assertions \
+                 would pass vacuously"
+            );
+        }
+        let fixtures = list_fixtures();
+        seed_list_fixtures(db, &fixtures).await;
+        assert_list_orders(db, &fixtures).await;
+    }
+}
+
+dual_backend_test! {
+    /// Timestamps are compared as typed values in the database, whatever the
+    /// session renders them as. The session here runs in `America/New_York`,
+    /// where the fixtures' fall-back pairs render as `01:30:00-04` and
+    /// `01:30:00-05` — equal as clock text, an hour apart as instants — and
+    /// the cursor carries that rendered text. The orders must still be the
+    /// chronological ones. (SQLite stores no zone; it runs the same checks.)
+    async fn issue_list_keyset_is_chronological_in_a_dst_session(db) {
+        let fixtures = list_fixtures();
+        seed_list_fixtures(db, &fixtures).await;
+        if !db.is_postgres() {
+            assert_list_orders(db, &fixtures).await;
+            return;
+        }
+        let name: String = db_fetch_scalar!(db, String, "SELECT current_database()")
+            .expect("name the throwaway database");
+        // sqlx opens every session in UTC, which would hide the problem, so
+        // build a pool whose sessions are switched to a DST-observing zone.
+        let mut url = url::Url::parse(&trakkt_core::test_helpers::dual_backend::pg_maintenance_url())
+            .expect("TEST_DATABASE_URL is a URL");
+        url.set_path(&name);
+        let ny = DbPool::Postgres(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(4)
+                .after_connect(|conn, _| {
+                    Box::pin(async move {
+                        sqlx::Executor::execute(conn, "SET TIME ZONE 'America/New_York'").await?;
+                        Ok(())
+                    })
+                })
+                .connect(url.as_str())
+                .await
+                .expect("connect a pool whose sessions run in America/New_York"),
+        );
+        let zone: String = db_fetch_scalar!(&ny, String, "SHOW timezone")
+            .expect("read the session time zone");
+        assert_eq!(zone, "America/New_York");
+
+        // The rendering really is the ambiguous one the cursor will carry.
+        for (id, expected) in [("a-1", "2026-11-01 01:30:00-04"), ("_x", "2026-11-01 01:30:00-05")] {
+            let rendered: String = db_fetch_scalar!(
+                &ny,
+                String,
+                "SELECT CAST(created_at AS TEXT) FROM issues WHERE issue_id = $1",
+                id
+            )
+            .expect("read the rendered timestamp");
+            assert_eq!(rendered, expected);
+        }
+
+        assert_list_orders(&ny, &fixtures).await;
+    }
+}
+
+dual_backend_test! {
+    /// The documented contract for a write the walk did not see: a Postgres
+    /// transaction that began before page 1 stamps `NOW()` = its start time, so
+    /// its write counts as of the walk's start even though it commits mid-walk.
+    /// If it moves an already-served issue past the cursor, that issue appears
+    /// once more and `served_count` reports it; a stable-key walk over the same
+    /// writes stays exactly once. (SQLite cannot hold a second connection to an
+    /// in-memory database; its same-instant case is covered in
+    /// `crates/trakkt-api/src/issues.rs`.)
+    async fn issue_list_walk_contract_for_a_write_already_in_flight(db) {
+        use trakkt_auth::issue_service::{
+            list_issues_page, IssuePageRequest, IssueSort, IssueSortField, IssueSortKey,
+            IssueWalk, SortDir,
+        };
+        if !db.is_postgres() {
+            return;
+        }
+        let fixtures = list_fixtures();
+        seed_list_fixtures(db, &fixtures).await;
+        let filters = trakkt_types::models::IssueFilters::default();
+
+        // A second connection, whose transaction starts before page 1.
+        let name: String = db_fetch_scalar!(db, String, "SELECT current_database()")
+            .expect("name the throwaway database");
+        let mut url = url::Url::parse(&trakkt_core::test_helpers::dual_backend::pg_maintenance_url())
+            .expect("TEST_DATABASE_URL is a URL");
+        url.set_path(&name);
+        let other = sqlx::PgPool::connect(url.as_str())
+            .await
+            .expect("open the in-flight connection");
+        let mut txn = other.begin().await.expect("begin the in-flight transaction");
+        sqlx::query("UPDATE issues SET updated_at = NOW() WHERE issue_id = 'A-9'")
+            .execute(&mut *txn)
+            .await
+            .expect("write a served row from the in-flight transaction");
+
+        async fn walk(
+            db: &DbPool,
+            filters: &trakkt_types::models::IssueFilters,
+            sort: IssueSort,
+            resume: Option<(&IssueSortKey, String, i64, i64)>,
+        ) -> trakkt_auth::issue_service::IssuePage {
+            list_issues_page(
+                db,
+                &IssuePageRequest {
+                    workspace_id: WORKSPACE,
+                    team_id: None,
+                    filters,
+                    clauses: &[],
+                    sort,
+                    resume: resume.as_ref().map(|(after, snapshot_at, total, served)| IssueWalk {
+                        after,
+                        snapshot_at,
+                        total: *total,
+                        served: *served,
+                    }),
+                    limit: 3,
+                },
+            )
+            .await
+            .expect("read one page")
+        }
+
+        // Mutable sort, ascending: the row is served on page 1, then the
+        // in-flight write (stamped at its transaction start, before the
+        // snapshot) commits and moves it past the cursor; the walk counts it as
+        // of its start and serves it once more at the end.
+        let sort = IssueSort { field: IssueSortField::UpdatedAt, dir: SortDir::Asc };
+        let first = walk(db, &filters, sort, None).await;
+        assert_eq!(first.total, 8);
+        assert!(first.issues.iter().any(|r| r.issue_id == "A-9"));
+        txn.commit().await.expect("commit the in-flight transaction");
+
+        let mut seen: Vec<String> = first.issues.iter().map(|r| r.issue_id.clone()).collect();
+        let mut after = IssueSortKey::from(first.issues.last().expect("a full page"));
+        let mut page = first;
+        while page.has_more {
+            let next = walk(
+                db,
+                &filters,
+                sort,
+                Some((&after, page.snapshot_at.clone(), page.total, page.served_count)),
+            )
+            .await;
+            assert_eq!(next.total, 8, "total is fixed for the walk");
+            seen.extend(next.issues.iter().map(|r| r.issue_id.clone()));
+            if let Some(last) = next.issues.last() {
+                after = IssueSortKey::from(last);
+            }
+            page = next;
+        }
+        assert_eq!(page.served_count, 9, "one documented repeat");
+        assert_eq!(seen.len(), 9);
+        assert_eq!(seen.iter().filter(|id| *id == "A-9").count(), 2);
+
+        // Stable-key sort over an equivalent write: exactly once.
+        sqlx::query("UPDATE issues SET updated_at = '2026-07-01 00:00:00' WHERE issue_id = 'B-1'")
+            .execute(&other)
+            .await
+            .expect("move a served row under the stable sort");
+        let sort = IssueSort { field: IssueSortField::Number, dir: SortDir::Asc };
+        let mut page = walk(db, &filters, sort, None).await;
+        let mut seen: Vec<String> = page.issues.iter().map(|r| r.issue_id.clone()).collect();
+        let mut after = IssueSortKey::from(page.issues.last().expect("a full page"));
+        while page.has_more {
+            let next = walk(
+                db,
+                &filters,
+                sort,
+                Some((&after, page.snapshot_at.clone(), page.total, page.served_count)),
+            )
+            .await;
+            seen.extend(next.issues.iter().map(|r| r.issue_id.clone()));
+            if let Some(last) = next.issues.last() {
+                after = IssueSortKey::from(last);
+            }
+            page = next;
+        }
+        assert_eq!(page.served_count, 8, "stable-key walks are exact");
+        assert_eq!(seen.len(), 8);
+        other.close().await;
+    }
+}
+
+dual_backend_test! {
+    /// A walk is a snapshot by modification time: an issue modified after the
+    /// first page is stamped after `snapshot_at`, so it is absent from that
+    /// walk's later pages (and does not disturb `total`), while every other
+    /// issue is served exactly once; a fresh walk includes it.
+    async fn issue_list_walk_excludes_rows_modified_after_its_snapshot(db) {
+        use trakkt_auth::issue_service::{
+            list_issues_page, IssuePageRequest, IssueSort, IssueSortField, IssueSortKey,
+            IssueWalk, SortDir,
+        };
+        let fixtures = list_fixtures();
+        seed_list_fixtures(db, &fixtures).await;
+        let filters = trakkt_types::models::IssueFilters::default();
+        let sort = IssueSort { field: IssueSortField::Number, dir: SortDir::Asc };
+        fn request<'a>(
+            filters: &'a trakkt_types::models::IssueFilters,
+            sort: IssueSort,
+            resume: Option<IssueWalk<'a>>,
+        ) -> IssuePageRequest<'a> {
+            IssuePageRequest {
+                workspace_id: WORKSPACE,
+                team_id: None,
+                filters,
+                clauses: &[],
+                sort,
+                resume,
+                limit: 3,
+            }
+        }
+
+        let first = list_issues_page(db, &request(&filters, sort, None)).await.expect("page 1");
+        assert_eq!(first.total, 8);
+        let mut seen: Vec<String> = first.issues.iter().map(|r| r.issue_id.clone()).collect();
+        let last = IssueSortKey::from(first.issues.last().expect("a full first page"));
+        // The unreturned issue with the highest sort position.
+        let victim = expected_order(&fixtures, IssueSortField::Number, SortDir::Asc, |_| true)[7];
+
+        // A real edit: stamped by the database clock, after the snapshot. SQLite
+        // stamps whole seconds, so wait one out.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let later = if db.is_postgres() { "NOW()" } else { "datetime('now')" };
+        db_execute!(
+            db,
+            &format!("UPDATE issues SET title = 'edited', updated_at = {later} WHERE issue_id = $1"),
+            victim
+        )
+        .expect("modify an unreturned issue mid-walk");
+
+        let mut after = last;
+        let mut served = first.served_count;
+        loop {
+            let page = list_issues_page(
+                db,
+                &request(
+                    &filters,
+                    sort,
+                    Some(IssueWalk {
+                        after: &after,
+                        snapshot_at: &first.snapshot_at,
+                        total: first.total,
+                        served,
+                    }),
+                ),
+            )
+            .await
+            .expect("a later page");
+            assert_eq!(page.total, 8, "total is constant for the walk");
+            assert_eq!(page.snapshot_at, first.snapshot_at);
+            served = page.served_count;
+            seen.extend(page.issues.iter().map(|r| r.issue_id.clone()));
+            match (page.has_more, page.issues.last()) {
+                (true, Some(l)) => after = IssueSortKey::from(l),
+                _ => break,
+            }
+        }
+        assert_eq!(served, 7, "unmodified-walk rows served");
+        let mut expected: Vec<&str> =
+            expected_order(&fixtures, IssueSortField::Number, SortDir::Asc, |_| true);
+        expected.retain(|id| *id != victim);
+        assert_eq!(seen, expected, "every unmodified issue once; the edited one is not in this walk");
+
+        // A fresh walk takes a new snapshot, which includes the edit.
+        let fresh = walk_list(db, sort, &[], 100, 8).await;
+        assert!(fresh.iter().any(|id| id == victim));
     }
 }
 
