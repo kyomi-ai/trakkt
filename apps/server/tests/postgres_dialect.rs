@@ -4002,22 +4002,85 @@ dual_backend_test! {
     /// `list_issues_sorted` orders by the SQL `ORDER BY` its sort builds
     /// (`COLLATE "C"` string tie-breaks on Postgres), and the keyset cursor
     /// resumes with `IssueSort::compare`. If the two ever disagree on a
-    /// backend, a cursor resumes early or late — so every sort and direction
-    /// must read back strictly ascending under the comparator, on both
-    /// dialects, and the list path must not load descriptions.
+    /// backend, a cursor resumes early or late.
+    ///
+    /// The fixture is built so each tie-break is *reached*, not just present:
+    /// - two teams whose keys sort differently under a locale collation and
+    ///   under `"C"` ("DIA" vs "aa"), with equal numbers in both, so the
+    ///   `number` sort falls through to `t.key`;
+    /// - equal `created_at`/`updated_at`/number/priority across those teams,
+    ///   with hand-picked `issue_id`s whose order differs between a locale
+    ///   collation and `"C"` ("B-1" vs "a-1", "_x" vs "A-9"), so every other
+    ///   sort falls through to `issue_id`;
+    /// - distinct fixed-offset timestamps, shuffled against `number`, so the
+    ///   `created_at` and `updated_at` sorts are not the `number` sort in
+    ///   disguise.
+    /// Every sort and direction must read back strictly ascending under the
+    /// comparator, and the list path must not load descriptions.
     async fn issue_list_sql_order_agrees_with_the_cursor_comparator(db) {
         use trakkt_auth::issue_service::{
             list_issues_sorted, IssueSort, IssueSortField, IssueSortKey, SortDir,
         };
 
         seed_tenancy(db).await;
-        for n in 0..12 {
-            create_issue(db, &format!("ordered {n}")).await;
+        seed_team(db, "team_aa", WORKSPACE, "aa")
+            .await
+            .expect("seed a second team whose key sorts differently under \"C\"");
+        let status_id: String = db_fetch_scalar!(
+            db,
+            String,
+            "SELECT status_id FROM statuses WHERE workspace_id = $1 ORDER BY status_id LIMIT 1",
+            WORKSPACE
+        )
+        .expect("read a status id the raw issue rows can reference");
+
+        let is_pg = db.is_postgres();
+        let ts = |n: u8| {
+            if is_pg {
+                format!("CAST(${n} AS TIMESTAMPTZ)")
+            } else {
+                format!("${n}")
+            }
+        };
+        let (c, u) = (ts(7), ts(8));
+        let insert = format!(
+            "INSERT INTO issues (issue_id, workspace_id, team_id, number, title, status_id, \
+             priority, creator_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, CAST($4 AS INTEGER), $5, $6, CAST($9 AS INTEGER), $10, {c}, {u})"
+        );
+        // (number, created_at, updated_at, priority): created_at and updated_at
+        // run against number and against each other.
+        let shape = [
+            (1, "2026-07-03 00:00:00+00", "2026-08-02 00:00:00+00", 3),
+            (2, "2026-07-01 00:00:00+00", "2026-08-04 00:00:00+00", 0),
+            (3, "2026-07-04 00:00:00+00", "2026-08-01 00:00:00+00", 3),
+            (4, "2026-07-02 00:00:00+00", "2026-08-03 00:00:00+00", 0),
+        ];
+        let teams = [
+            (TEAM, ["a-1", "B-1", "_x", "b-2"]),
+            ("team_aa", ["A-9", "c-1", "Z-1", "_y"]),
+        ];
+        for (team_id, ids) in teams {
+            for ((number, created, updated, priority), id) in shape.iter().zip(ids) {
+                let number = number.to_string();
+                let priority = priority.to_string();
+                db_execute!(
+                    db,
+                    &insert,
+                    id,
+                    WORKSPACE,
+                    team_id,
+                    &number,
+                    format!("tie {id}"),
+                    &status_id,
+                    *created,
+                    *updated,
+                    &priority,
+                    USER
+                )
+                .expect("insert an issue with hand-picked tie-break keys");
+            }
         }
-        // Spread priorities so every rank (and the 0-ranks-last rule) is
-        // present, with many ties on the first sort key.
-        db_execute!(db, "UPDATE issues SET priority = number % 5 WHERE workspace_id = $1", WORKSPACE)
-            .expect("spread priorities so the sort keys tie");
 
         for field in [
             IssueSortField::Priority,
@@ -4030,13 +4093,13 @@ dual_backend_test! {
                 let rows = list_issues_sorted(
                     db,
                     WORKSPACE,
-                    Some(TEAM),
+                    None,
                     &trakkt_types::models::IssueFilters::default(),
                     sort,
                 )
                 .await
-                .expect("list the team's issues in this order");
-                assert_eq!(rows.len(), 12);
+                .expect("list both teams' issues in this order");
+                assert_eq!(rows.len(), 8);
                 assert!(
                     rows.iter().all(|r| r.description.is_none()),
                     "the list path must not load descriptions"
@@ -4045,7 +4108,9 @@ dual_backend_test! {
                     assert_eq!(
                         sort.compare(&IssueSortKey::from(&pair[0]), &IssueSortKey::from(&pair[1])),
                         std::cmp::Ordering::Less,
-                        "SQL order and cursor comparator disagree for {field:?} {dir:?}"
+                        "SQL order and cursor comparator disagree for {field:?} {dir:?}: {} then {}",
+                        pair[0].issue_id,
+                        pair[1].issue_id
                     );
                 }
             }
