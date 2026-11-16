@@ -33,7 +33,9 @@ pub struct ListIssuesApiParams {
     pub label: Option<String>,
     /// Search text to match against issue titles
     pub search: Option<String>,
-    /// Maximum number of issues to return (default: 50, max: 100)
+    /// Page size (default: 50, max: 100; values outside 1..=100 are clamped).
+    /// The response always carries `total` and `has_more`; when `has_more` is
+    /// true, pass `next_cursor` as `cursor` to fetch the next page.
     pub limit: Option<i64>,
     /// JSON array of composable filter clauses, AND-ed together. Each clause is
     /// `{"field","operator","values"}`.
@@ -42,6 +44,16 @@ pub struct ListIssuesApiParams {
     /// Operators: any_of, none_of, all_of, not_any_of, not_all_of.
     /// Example: `[{"field":"label","operator":"none_of","values":["label-id-1"]}]`
     pub filters: Option<String>,
+    /// Opaque pagination cursor: the `next_cursor` of a previous response to
+    /// the same query (same filters, sort_by and sort_dir). Omit for page 1.
+    pub cursor: Option<String>,
+    /// Sort field: priority (default), created_at, updated_at or number.
+    /// Ties are always broken deterministically (by creation time, number,
+    /// then issue id) so pagination is stable.
+    pub sort_by: Option<String>,
+    /// Sort direction: asc or desc. Default: asc for priority (Urgent first),
+    /// desc for created_at, updated_at and number (newest first).
+    pub sort_dir: Option<String>,
 }
 
 /// A single composable filter clause: a `(field, operator, values)` triple.
@@ -99,6 +111,10 @@ pub struct IssueListRow {
     pub priority_name: String,
     pub status_id: String,
     pub status_name: String,
+    /// Creation time, so callers can sort or filter by age without a
+    /// `get_issue` per row. Absent in rows from before TRA-10113.
+    #[serde(default)]
+    pub created_at: String,
     pub updated_at: String,
     pub labels: Vec<IssueListLabel>,
 }
@@ -115,26 +131,39 @@ impl From<crate::models::IssueWithDetails> for IssueListRow {
                 .to_string(),
             status_id: issue.status_id,
             status_name: issue.status_name,
+            created_at: issue.created_at,
             updated_at: issue.updated_at,
             labels: issue.labels.into_iter().map(IssueListLabel::from).collect(),
         }
     }
 }
 
-/// Wrapper response for `list_issues` that includes truncation metadata.
+/// Response for `list_issues`: one page plus the metadata needed to know
+/// whether it is the whole result and how to fetch the rest.
 ///
-/// When composable filter clauses reduce the result set below the raw DB fetch,
-/// callers need to know whether more results exist beyond the returned page.
+/// Always an object (earlier versions returned a bare array unless composable
+/// filters were used, which made a capped page look complete).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListIssuesResponse {
     pub issues: Vec<IssueListRow>,
-    /// Number of issues that passed all filters within the server's fetch window
-    /// (approximately 5× the requested limit). When `truncated` is true, the true
-    /// total may exceed this count.
+    /// Exact number of issues matching every filter, ignoring `limit` and
+    /// `cursor`.
+    pub total: usize,
+    /// Whether matching issues remain after this page.
+    pub has_more: bool,
+    /// Pass as `cursor` to get the next page; null when `has_more` is false.
+    pub next_cursor: Option<String>,
+    /// The page size that was applied after clamping to 1..=100.
+    pub limit: i64,
+    /// The sort field that was applied.
+    pub sort_by: String,
+    /// The sort direction that was applied.
+    pub sort_dir: String,
+    /// Same as `total`. Kept for callers of the pre-TRA-10113 filtered shape.
     pub matched_count: usize,
-    /// Number of issues actually returned (after limit).
+    /// Number of issues in this page.
     pub returned_count: usize,
-    /// Whether more matching issues exist beyond the returned page.
+    /// Same as `has_more`. Kept for callers of the pre-TRA-10113 filtered shape.
     pub truncated: bool,
 }
 
@@ -265,9 +294,10 @@ pub struct SearchIssuesApiParams {
     pub include_archived: Option<bool>,
     /// Also search comment bodies (default: true)
     pub include_comments: Option<bool>,
-    /// Max results (default: 20, max: 100)
+    /// Page size (default: 20, max: 100; values outside 1..=100 are clamped)
     pub limit: Option<i64>,
-    /// Offset for pagination (default: 0)
+    /// Offset of the first result (default: 0). When the response has
+    /// `has_more`, repeat the request with `offset` = `next_offset`.
     pub offset: Option<i64>,
 }
 
@@ -613,9 +643,10 @@ pub struct ListWorkspaceActivitiesApiParams {
     pub created_after: Option<String>,
     /// Filter to activities created at or before this ISO 8601 datetime
     pub created_before: Option<String>,
-    /// Maximum number of activities to return (default: 50, max: 200)
+    /// Page size (default: 50, max: 200; values outside 1..=200 are clamped)
     pub limit: Option<i64>,
-    /// Offset for pagination
+    /// Offset of the first activity (default: 0). When the response has
+    /// `has_more`, repeat the request with `offset` = `next_offset`.
     pub offset: Option<i64>,
 }
 
@@ -789,6 +820,7 @@ mod tests {
         assert_eq!(
             object.keys().map(String::as_str).collect::<Vec<_>>(),
             vec![
+                "created_at",
                 "key",
                 "labels",
                 "number",

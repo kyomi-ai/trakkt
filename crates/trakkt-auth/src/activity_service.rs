@@ -938,7 +938,7 @@ pub async fn list_workspace_activities(
            AND ($5{cast_text} IS NULL OR a.action_source = $5) \
            AND ($6{cast_text} IS NULL OR a.created_at >= {cast_after}) \
            AND ($7{cast_text} IS NULL OR a.created_at <= {cast_before}) \
-         ORDER BY a.created_at DESC \
+         ORDER BY a.created_at DESC, a.activity_id DESC \
          LIMIT {limit} OFFSET {offset}"
     );
 

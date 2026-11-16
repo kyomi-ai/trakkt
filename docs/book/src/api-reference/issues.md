@@ -4,7 +4,7 @@
 
 **Operation:** `list_issues`
 
-Find issues in the workspace with optional filters. Returns issues ordered by priority (urgent first), then by creation date (newest first). By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Response shape: `{issues, matched_count, returned_count, truncated}`. Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `status_id`, `status_name`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.
+Find issues in the workspace with optional filters. Returns `{issues, total, has_more, next_cursor, limit, sort_by, sort_dir, matched_count, returned_count, truncated}`. `total` is the exact number of matching issues ignoring `limit`; a response is complete only when `has_more` is false. Pagination: `limit` is the page size (default 50, max 100; out-of-range values are clamped and the applied value is echoed as `limit`). When `has_more` is true, call again with the same filters and `cursor` set to `next_cursor` (an opaque string; changing any filter or sort invalidates it) until `has_more` is false. The cursor resumes after the last row served by its sort key, so unchanged issues appear exactly once even if other issues are created, deleted or edited between pages; an issue edited so that it now sorts before the cursor (for example a `sort_by=updated_at` walk) can be missed. Sorting: `sort_by` is priority (default), created_at, updated_at or number; `sort_dir` is asc or desc (default asc for priority, so Urgent (1), High (2), Medium (3), Low (4), None (0) last, newest first within a priority; default desc for created_at, updated_at and number). Ties are broken deterministically so pages are stable. By default, completed and cancelled issues are excluded — pass include_closed=true to include them. Supports a `filters` parameter: a JSON array of `{field, operator, values}` clauses AND-ed together. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. `matched_count` equals `total` and `truncated` equals `has_more` (kept for older callers). Each row is lean by design — `number`, `key` (e.g. 'TRA-35'), `title`, `priority`, `priority_name` (Urgent, High, Medium, Low, or No priority), `status_id`, `status_name`, `created_at`, `updated_at`, and `labels` (id and name only) — enough to find, sort, and triage. Rows never include the issue description, comments, or activities, and there is no option to add them: descriptions are multi-KB and would dominate the payload. To read a ticket, call get_issue with the row's `key`.
 
 **Scope:** `issues:read`
 
@@ -13,12 +13,15 @@ Find issues in the workspace with optional filters. Returns issues ordered by pr
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
 | `assignee` | query | string (nullable) | No | Filter by assignee user ID |
+| `cursor` | query | string (nullable) | No | Opaque pagination cursor: the `next_cursor` of a previous response to the same query (same filters, sort_by and sort_dir). Omit for page 1. |
 | `filters` | query | string (nullable) | No | JSON array of composable filter clauses, AND-ed together. Each clause is `{"field","operator","values"}`. Fields: status, priority, label, project, is_sub_issue, is_parent, is_blocked, is_blocking, has_relations. Operators: any_of, none_of, all_of, not_any_of, not_all_of. Example: `[{"field":"label","operator":"none_of","values":["label-id-1"]}]` |
 | `include_closed` | query | boolean (nullable) | No | If true, include completed and cancelled issues |
 | `label` | query | string (nullable) | No | Filter by label ID(s). Comma-separated for multiple (OR logic) |
-| `limit` | query | integer (int64) (nullable) | No | Maximum number of issues to return (default: 50, max: 100) |
+| `limit` | query | integer (int64) (nullable) | No | Page size (default: 50, max: 100; values outside 1..=100 are clamped). The response always carries `total` and `has_more`; when `has_more` is true, pass `next_cursor` as `cursor` to fetch the next page. |
 | `priority` | query | integer (int32) (nullable) | No | Filter by priority: 0=none, 1=urgent, 2=high, 3=medium, 4=low |
 | `search` | query | string (nullable) | No | Search text to match against issue titles |
+| `sort_by` | query | string (nullable) | No | Sort field: priority (default), created_at, updated_at or number. Ties are always broken deterministically (by creation time, number, then issue id) so pagination is stable. |
+| `sort_dir` | query | string (nullable) | No | Sort direction: asc or desc. Default: asc for priority (Urgent first), desc for created_at, updated_at and number (newest first). |
 | `status_category` | query | string (nullable) | No | Comma-separated status categories: backlog, unstarted, started, completed, cancelled |
 | `status_id` | query | string (nullable) | No | Filter by status ID |
 | `team_id` | query | string (nullable) | No | Filter by team ID |
@@ -82,7 +85,7 @@ Returns `201 Created` on success with the created resource as JSON.
 
 **Operation:** `search_issues`
 
-Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total}` where results are ranked by relevance with snippet context, and total is the full match count for pagination. Supports `offset` for pagination. By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.
+Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of matches ignoring limit/offset; when `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. A search considers at most its 1000 best-ranked matches: when `truncated` is true, `total` is a lower bound and lower-ranked matches cannot be reached by paging, so narrow the query (team, include_closed, include_comments). By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.
 
 **Scope:** `issues:read`
 
@@ -93,8 +96,8 @@ Search for issues by text query. Uses full-text search across titles, descriptio
 | `include_archived` | query | boolean (nullable) | No | Include archived issues in results (default: false) |
 | `include_closed` | query | boolean (nullable) | No | If true, include completed and cancelled issues |
 | `include_comments` | query | boolean (nullable) | No | Also search comment bodies (default: true) |
-| `limit` | query | integer (int64) (nullable) | No | Max results (default: 20, max: 100) |
-| `offset` | query | integer (int64) (nullable) | No | Offset for pagination (default: 0) |
+| `limit` | query | integer (int64) (nullable) | No | Page size (default: 20, max: 100; values outside 1..=100 are clamped) |
+| `offset` | query | integer (int64) (nullable) | No | Offset of the first result (default: 0). When the response has `has_more`, repeat the request with `offset` = `next_offset`. |
 | `query` | query | string | Yes | Search text (required) |
 | `team_id` | query | string (nullable) | No | Filter by team ID |
 | `team_key` | query | string (nullable) | No | Filter by team key |

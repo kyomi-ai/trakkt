@@ -48,10 +48,12 @@ pub async fn list_workspace_activities(
     ctx: &ApiCtx<'_>,
     params: ListWorkspaceActivitiesApiParams,
 ) -> ApiResult<serde_json::Value> {
-    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let limit = crate::issues::clamp_limit(params.limit, 50, 200);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    let activities = activity_service::list_workspace_activities(
+    // Ask for one row more than the page so "is there another page?" is
+    // answered by the data rather than guessed from the page being full.
+    let mut activities = activity_service::list_workspace_activities(
         ctx.db,
         &ctx.workspace_id,
         params.team_key.as_deref(),
@@ -60,12 +62,21 @@ pub async fn list_workspace_activities(
         params.action_source.as_deref(),
         params.created_after.as_deref(),
         params.created_before.as_deref(),
-        limit,
+        limit + 1,
         offset,
     )
     .await?;
 
-    Ok(serde_json::to_value(&activities)?)
+    let has_more = activities.len() as i64 > limit;
+    activities.truncate(limit as usize);
+
+    Ok(serde_json::json!({
+        "activities": activities,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+        "next_offset": has_more.then_some(offset + limit),
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,7 +106,7 @@ pub fn operations() -> Vec<ApiOperation> {
         ApiOperation {
             name: "list_workspace_activities",
             description:
-                "List activity entries across all teams in the workspace, ordered by most recent first.",
+                "List activity entries across all teams in the workspace, most recent first (ties broken by activity id so pages are stable). Returns `{activities, limit, offset, has_more, next_offset}`. `limit` is the page size (default 50, max 200, clamped; the applied value is echoed). A response is complete only when `has_more` is false; otherwise repeat the request with `offset` set to `next_offset`. Paging is by offset over a newest-first feed, so activities recorded between requests can shift later pages and repeat a row.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/activities",

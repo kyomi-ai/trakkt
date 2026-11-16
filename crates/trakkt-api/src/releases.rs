@@ -179,7 +179,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "list_unreleased_issues",
-            description: "List issues that are completed/cancelled but not yet included in any release (completed_at IS NOT NULL, released_at IS NULL).",
+            description: "List issues that are completed/cancelled but not yet included in any release (completed_at IS NOT NULL, released_at IS NULL). Returns every matching issue as a flat array, most recently completed first; there is no limit or truncation, so the array is always the complete set.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/unreleased-issues",

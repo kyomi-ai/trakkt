@@ -256,6 +256,9 @@ impl IssueLabelRow {
     }
 }
 
+/// Issue ids per label query (see [`fetch_labels_for_issues`]).
+const LABEL_FETCH_CHUNK: usize = 500;
+
 /// Fetch labels for a list of issue IDs in a single query (avoids N+1).
 ///
 /// Returns a map from issue_id to its labels.
@@ -267,20 +270,22 @@ async fn fetch_labels_for_issues(
         return Ok(std::collections::HashMap::new());
     }
 
-    // Build IN clause with numbered placeholders.
-    let (in_clause, _) = trakkt_core::db::in_clause_placeholders(issue_ids.len(), 1);
-
-    let sql = format!("{ISSUE_LABELS_SELECT} IN {in_clause} ORDER BY l.name ASC");
-
-    // We need to bind each issue_id individually. Since the macro expands binds
-    // at compile time, we use db_with_pool! and build the query manually.
-    let rows: Vec<IssueLabelRow> = trakkt_core::db_with_pool!(db, |p| {
-        let mut query = sqlx::query_as::<_, IssueLabelRow>(&sql);
-        for id in issue_ids {
-            query = query.bind(id);
-        }
-        query.fetch_all(p).await
-    })?;
+    // Chunked so a large result set stays under the bind-parameter limit of
+    // either backend (SQLite 32766, Postgres 65535).
+    let mut rows: Vec<IssueLabelRow> = Vec::new();
+    for chunk in issue_ids.chunks(LABEL_FETCH_CHUNK) {
+        let (in_clause, _) = trakkt_core::db::in_clause_placeholders(chunk.len(), 1);
+        let sql = format!("{ISSUE_LABELS_SELECT} IN {in_clause} ORDER BY l.name ASC");
+        // The macro expands binds at compile time, so bind each id manually.
+        let part: Vec<IssueLabelRow> = trakkt_core::db_with_pool!(db, |p| {
+            let mut query = sqlx::query_as::<_, IssueLabelRow>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query.fetch_all(p).await
+        })?;
+        rows.extend(part);
+    }
 
     let mut map: std::collections::HashMap<String, Vec<Label>> =
         std::collections::HashMap::new();
@@ -593,6 +598,198 @@ pub async fn list_issues(
     team_id: Option<&str>,
     filters: &IssueFilters,
 ) -> trakkt_core::Result<Vec<IssueWithDetails>> {
+    list_issues_ordered(db, workspace_id, team_id, filters, IssueSort::default(), true).await
+}
+
+/// Field a list of issues can be ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSortField {
+    /// Urgent, High, Medium, Low, then None (stored 0 ranks last).
+    Priority,
+    CreatedAt,
+    UpdatedAt,
+    Number,
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+impl IssueSortField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::CreatedAt => "created_at",
+            Self::UpdatedAt => "updated_at",
+            Self::Number => "number",
+        }
+    }
+
+    /// Parse a caller-supplied field name; `None` for an unknown name.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "priority" => Some(Self::Priority),
+            "created_at" => Some(Self::CreatedAt),
+            "updated_at" => Some(Self::UpdatedAt),
+            "number" => Some(Self::Number),
+            _ => None,
+        }
+    }
+
+    /// Direction used when the caller does not pick one: Urgent first for
+    /// priority, newest first for everything else.
+    pub fn default_dir(self) -> SortDir {
+        match self {
+            Self::Priority => SortDir::Asc,
+            _ => SortDir::Desc,
+        }
+    }
+}
+
+impl SortDir {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "asc" => Some(Self::Asc),
+            "desc" => Some(Self::Desc),
+            _ => None,
+        }
+    }
+
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
+    }
+}
+
+/// A complete, deterministic ordering for [`list_issues_sorted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssueSort {
+    pub field: IssueSortField,
+    pub dir: SortDir,
+}
+
+impl Default for IssueSort {
+    /// Priority rank ascending, newest first within a rank.
+    fn default() -> Self {
+        Self {
+            field: IssueSortField::Priority,
+            dir: IssueSortField::Priority.default_dir(),
+        }
+    }
+}
+
+/// The fields any [`IssueSort`] orders by — what a keyset cursor must remember
+/// about the last row it served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueSortKey {
+    pub priority: i32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub number: i32,
+    pub team_key: String,
+    pub issue_id: String,
+}
+
+impl From<&IssueWithDetails> for IssueSortKey {
+    fn from(i: &IssueWithDetails) -> Self {
+        Self {
+            priority: i.priority,
+            created_at: i.created_at.clone(),
+            updated_at: i.updated_at.clone(),
+            number: i.number,
+            team_key: i.team_key.clone(),
+            issue_id: i.issue_id.clone(),
+        }
+    }
+}
+
+impl IssueSort {
+    /// Compare two keys exactly as [`Self::order_by_sql`] orders rows, so a
+    /// keyset cursor can resume "strictly after" a row that may since have
+    /// been deleted or edited. Timestamps compare as text, which matches the
+    /// database order while the session time zone is a fixed-offset one (the
+    /// deployment renders `+00`); a DST-observing Postgres `TimeZone` would
+    /// break that.
+    pub fn compare(self, a: &IssueSortKey, b: &IssueSortKey) -> std::cmp::Ordering {
+        let dir = |o: std::cmp::Ordering| match self.dir {
+            SortDir::Asc => o,
+            SortDir::Desc => o.reverse(),
+        };
+        let rank = |p: i32| if p == 0 { 5 } else { p };
+        match self.field {
+            IssueSortField::Priority => dir(rank(a.priority).cmp(&rank(b.priority)))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.number.cmp(&a.number))
+                .then_with(|| a.issue_id.cmp(&b.issue_id)),
+            IssueSortField::CreatedAt => dir(a.created_at.cmp(&b.created_at))
+                .then_with(|| dir(a.number.cmp(&b.number)))
+                .then_with(|| a.issue_id.cmp(&b.issue_id)),
+            IssueSortField::UpdatedAt => dir(a.updated_at.cmp(&b.updated_at))
+                .then_with(|| dir(a.number.cmp(&b.number)))
+                .then_with(|| a.issue_id.cmp(&b.issue_id)),
+            IssueSortField::Number => dir(a.number.cmp(&b.number))
+                .then_with(|| a.team_key.cmp(&b.team_key))
+                .then_with(|| a.issue_id.cmp(&b.issue_id)),
+        }
+    }
+
+    /// `ORDER BY` body. Every ordering ends in `i.issue_id`, which is unique,
+    /// so equal sort keys (second-granularity timestamps, equal numbers in
+    /// different teams) can never reorder between calls.
+    fn order_by_sql(self, is_pg: bool) -> String {
+        let d = self.dir.sql();
+        // `IssueSort::compare` orders these strings bytewise; Postgres would
+        // otherwise use the database collation (SQLite is already bytewise).
+        let c = if is_pg { r#" COLLATE "C""# } else { "" };
+        match self.field {
+            IssueSortField::Priority => format!(
+                "CASE i.priority WHEN 0 THEN 5 ELSE i.priority END {d}, \
+                 i.created_at DESC, i.number DESC, i.issue_id{c} ASC"
+            ),
+            IssueSortField::CreatedAt => {
+                format!("i.created_at {d}, i.number {d}, i.issue_id{c} ASC")
+            }
+            IssueSortField::UpdatedAt => {
+                format!("i.updated_at {d}, i.number {d}, i.issue_id{c} ASC")
+            }
+            IssueSortField::Number => format!("i.number {d}, t.key{c} ASC, i.issue_id{c} ASC"),
+        }
+    }
+}
+
+/// [`list_issues`] with an explicit ordering, for callers that only need list
+/// rows: `description` is not loaded and comes back `None`, since descriptions
+/// are multi-KB and this is called to read every match of a query.
+pub async fn list_issues_sorted(
+    db: &DbPool,
+    workspace_id: &str,
+    team_id: Option<&str>,
+    filters: &IssueFilters,
+    sort: IssueSort,
+) -> trakkt_core::Result<Vec<IssueWithDetails>> {
+    list_issues_ordered(db, workspace_id, team_id, filters, sort, false).await
+}
+
+async fn list_issues_ordered(
+    db: &DbPool,
+    workspace_id: &str,
+    team_id: Option<&str>,
+    filters: &IssueFilters,
+    sort: IssueSort,
+    with_description: bool,
+) -> trakkt_core::Result<Vec<IssueWithDetails>> {
     let is_pg = db.is_postgres();
 
     // Dynamic WHERE clause construction.
@@ -681,11 +878,20 @@ pub async fn list_issues(
         (None, _) => String::new(),
     };
 
+    let select = if with_description {
+        ISSUE_DETAIL_SELECT.to_string()
+    } else {
+        ISSUE_DETAIL_SELECT.replacen(
+            "i.description,",
+            "CAST(NULL AS TEXT) AS description,",
+            1,
+        )
+    };
     let sql = format!(
-        "{ISSUE_DETAIL_SELECT} \
+        "{select} \
          WHERE {where_clause} \
-         ORDER BY CASE i.priority WHEN 0 THEN 5 ELSE i.priority END ASC, \
-         i.created_at DESC{limit_offset}"
+         ORDER BY {order_by}{limit_offset}",
+        order_by = sort.order_by_sql(is_pg),
     );
 
     // Prepare the search term with wildcards, escaping LIKE special chars.
