@@ -288,9 +288,18 @@ pub struct SearchIssuesApiParams {
     pub team_key: Option<String>,
     /// Filter by team ID
     pub team_id: Option<String>,
-    /// If true, include completed and cancelled issues
+    /// Filter by status ID. Omit to search every status.
+    pub status_id: Option<String>,
+    /// Comma-separated status categories to restrict to: backlog, unstarted,
+    /// started, completed, cancelled. Omit to search every status, including
+    /// completed and cancelled.
+    pub status_category: Option<String>,
+    /// Deprecated, kept for compatibility. Omitted or true: no status
+    /// filtering (completed and cancelled issues are searched). Only an
+    /// explicit false excludes completed and cancelled issues; prefer
+    /// `status_category`.
     pub include_closed: Option<bool>,
-    /// Include archived issues in results (default: false)
+    /// Omitted or true: archived issues are searched. Pass false to exclude them.
     pub include_archived: Option<bool>,
     /// Also search comment bodies (default: true)
     pub include_comments: Option<bool>,

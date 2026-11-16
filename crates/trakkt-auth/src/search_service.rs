@@ -81,11 +81,39 @@ pub struct SearchParams {
     pub query: String,
     pub workspace_id: String,
     pub team_id: Option<String>,
-    pub include_archived: bool,
-    pub include_closed: bool,
+    /// Exclude archived issues. Only set when the caller asked for it: search
+    /// applies exactly the filters the user set and nothing implicit.
+    pub exclude_archived: bool,
+    /// Exclude completed and cancelled issues. Only set when the caller asked
+    /// for it (e.g. legacy `include_closed=false`).
+    pub exclude_closed: bool,
+    /// Restrict to one status ID (same meaning as the issue-list filter).
+    pub status_id: Option<String>,
+    /// Restrict to these status categories (same meaning as the issue-list filter).
+    pub status_categories: Option<Vec<String>>,
     pub include_comments: bool,
     pub limit: i64,
     pub offset: i64,
+}
+
+impl SearchParams {
+    /// Values bound after the team ID, in placeholder order: the status ID
+    /// (when set) followed by each status category.
+    fn status_binds(&self) -> Vec<&str> {
+        let mut binds: Vec<&str> = Vec::new();
+        if let Some(id) = &self.status_id {
+            binds.push(id);
+        }
+        if let Some(categories) = &self.status_categories {
+            binds.extend(categories.iter().map(String::as_str));
+        }
+        binds
+    }
+
+    /// First free placeholder index after the workspace/query/team binds.
+    fn first_free_param(&self) -> usize {
+        3 + usize::from(self.team_id.is_some()) + self.status_binds().len()
+    }
 }
 
 // ─── Main search function ───────────────────────────────────────────────────
@@ -124,8 +152,10 @@ pub async fn search(
         query: params.query.clone(),
         workspace_id: params.workspace_id.clone(),
         team_id: params.team_id.clone(),
-        include_archived: params.include_archived,
-        include_closed: params.include_closed,
+        exclude_archived: params.exclude_archived,
+        exclude_closed: params.exclude_closed,
+        status_id: params.status_id.clone(),
+        status_categories: params.status_categories.clone(),
         include_comments: params.include_comments,
         // One past the cap, so a result set of exactly the cap is not
         // mistaken for a truncated one.
@@ -175,30 +205,37 @@ pub async fn search(
 /// Build the WHERE conditions shared between issue and comment arms (Postgres).
 /// Workspace is always `$2`, team_id is `$3` when present.
 fn shared_conditions_pg(params: &SearchParams) -> Vec<String> {
-    let mut conds = vec!["i.workspace_id = $2".to_string()];
-    if !params.include_closed {
-        conds.push("s.category NOT IN ('completed', 'cancelled')".to_string());
-    }
-    if params.team_id.is_some() {
-        conds.push("i.team_id = $3".to_string());
-    }
-    if !params.include_archived {
-        conds.push("i.archived_at IS NULL".to_string());
-    }
-    conds
+    shared_conditions("i.workspace_id = $2", params)
 }
 
 /// Build the WHERE conditions shared between issue and comment arms (SQLite).
 /// Workspace is always `$1`, team_id is `$3` when present.
 fn shared_conditions_sqlite(params: &SearchParams) -> Vec<String> {
-    let mut conds = vec!["i.workspace_id = $1".to_string()];
-    if !params.include_closed {
-        conds.push("s.category NOT IN ('completed', 'cancelled')".to_string());
-    }
+    shared_conditions("i.workspace_id = $1", params)
+}
+
+/// Only filters the caller explicitly set become conditions. Status binds
+/// follow the optional team bind starting at `$3`/`$4`.
+fn shared_conditions(workspace_cond: &str, params: &SearchParams) -> Vec<String> {
+    let mut conds = vec![workspace_cond.to_string()];
     if params.team_id.is_some() {
         conds.push("i.team_id = $3".to_string());
     }
-    if !params.include_archived {
+    let mut next = if params.team_id.is_some() { 4 } else { 3 };
+    if params.status_id.is_some() {
+        conds.push(format!("i.status_id = ${next}"));
+        next += 1;
+    }
+    if let Some(categories) = &params.status_categories
+        && !categories.is_empty()
+    {
+        let (in_clause, _) = trakkt_core::db::in_clause_placeholders(categories.len(), next);
+        conds.push(format!("s.category IN {in_clause}"));
+    }
+    if params.exclude_closed {
+        conds.push("s.category NOT IN ('completed', 'cancelled')".to_string());
+    }
+    if params.exclude_archived {
         conds.push("i.archived_at IS NULL".to_string());
     }
     conds
@@ -258,7 +295,7 @@ async fn search_postgres(
     //   $N = identifier number (when identifier detected)
     //   $N+1 = parsed team_key (when identifier has "KEY-NUM" format)
 
-    let mut next_param = if params.team_id.is_some() { 4 } else { 3 };
+    let mut next_param = params.first_free_param();
 
     let mut issue_conditions = shared_conditions_pg(params);
     issue_conditions.push("i.search_vector @@ query".to_string());
@@ -358,6 +395,9 @@ async fn search_postgres(
         if let Some(team_id) = &params.team_id {
             query = query.bind(team_id);
         }
+        for value in params.status_binds() {
+            query = query.bind(value);
+        }
         if let Some((parsed_key, number)) = identifier {
             query = query.bind(number);
             if let Some(key) = parsed_key {
@@ -386,7 +426,7 @@ async fn search_sqlite(
     //   $N = identifier number (when identifier detected)
     //   $N+1 = parsed team_key (when identifier has "KEY-NUM" format)
 
-    let mut next_param = if params.team_id.is_some() { 4 } else { 3 };
+    let mut next_param = params.first_free_param();
 
     let mut issue_conditions = shared_conditions_sqlite(params);
     issue_conditions
@@ -484,6 +524,9 @@ async fn search_sqlite(
         if let Some(team_id) = &params.team_id {
             query = query.bind(team_id);
         }
+        for value in params.status_binds() {
+            query = query.bind(value);
+        }
         if let Some((parsed_key, number)) = identifier {
             query = query.bind(number);
             if let Some(key) = parsed_key {
@@ -507,8 +550,10 @@ mod tests {
             query: "test".to_string(),
             workspace_id: "ws-1".to_string(),
             team_id: None,
-            include_archived: false,
-            include_closed: false,
+            exclude_archived: false,
+            exclude_closed: false,
+            status_id: None,
+            status_categories: None,
             include_comments: true,
             limit: 20,
             offset: 0,
@@ -536,11 +581,8 @@ mod tests {
     fn pg_conditions_default() {
         let params = default_params();
         let conds = shared_conditions_pg(&params);
-        assert_eq!(conds, vec![
-            "i.workspace_id = $2",
-            "s.category NOT IN ('completed', 'cancelled')",
-            "i.archived_at IS NULL",
-        ]);
+        // No hidden defaults: only the workspace scope applies.
+        assert_eq!(conds, vec!["i.workspace_id = $2"]);
     }
 
     #[test]
@@ -552,30 +594,33 @@ mod tests {
     }
 
     #[test]
-    fn pg_conditions_include_closed() {
+    fn pg_conditions_explicit_exclusions() {
         let mut params = default_params();
-        params.include_closed = true;
+        params.exclude_closed = true;
+        params.exclude_archived = true;
         let conds = shared_conditions_pg(&params);
-        assert!(!conds.iter().any(|c| c.contains("completed")));
+        assert!(conds.iter().any(|c| c.contains("NOT IN ('completed'")));
+        assert!(conds.iter().any(|c| c.contains("archived_at IS NULL")));
     }
 
     #[test]
-    fn pg_conditions_include_archived() {
+    fn status_filters_bind_after_team() {
         let mut params = default_params();
-        params.include_archived = true;
+        params.team_id = Some("team-1".to_string());
+        params.status_id = Some("s1".to_string());
+        params.status_categories = Some(vec!["completed".to_string(), "cancelled".to_string()]);
         let conds = shared_conditions_pg(&params);
-        assert!(!conds.iter().any(|c| c.contains("archived_at")));
+        assert!(conds.contains(&"i.status_id = $4".to_string()));
+        assert!(conds.contains(&"s.category IN ($5, $6)".to_string()));
+        assert_eq!(params.status_binds(), vec!["s1", "completed", "cancelled"]);
+        assert_eq!(params.first_free_param(), 7);
     }
 
     #[test]
     fn sqlite_conditions_default() {
         let params = default_params();
         let conds = shared_conditions_sqlite(&params);
-        assert_eq!(conds, vec![
-            "i.workspace_id = $1",
-            "s.category NOT IN ('completed', 'cancelled')",
-            "i.archived_at IS NULL",
-        ]);
+        assert_eq!(conds, vec!["i.workspace_id = $1"]);
     }
 
     #[test]
@@ -657,8 +702,10 @@ mod tests {
     fn pg_and_sqlite_conditions_stay_in_sync() {
         let mut params = default_params();
         params.team_id = Some("team-1".to_string());
-        params.include_closed = true;
-        params.include_archived = true;
+        params.exclude_closed = true;
+        params.exclude_archived = true;
+        params.status_id = Some("s1".to_string());
+        params.status_categories = Some(vec!["started".to_string()]);
 
         let pg = shared_conditions_pg(&params);
         let sqlite = shared_conditions_sqlite(&params);

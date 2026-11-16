@@ -4117,3 +4117,161 @@ dual_backend_test! {
         }
     }
 }
+
+// ─── Search ──────────────────────────────────────────────────────────────────
+
+fn hit_numbers(response: &trakkt_auth::search_service::SearchResponse) -> Vec<(String, i64)> {
+    let mut hits: Vec<(String, i64)> = response
+        .results
+        .iter()
+        .map(|r| (r.team_key.clone(), r.number))
+        .collect();
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+dual_backend_test! {
+    /// TRA-10114: search applies only the filters the caller set, and every
+    /// filter's bind position lines up on this backend.
+    ///
+    /// The Postgres arm numbers its placeholders as query `$1`, workspace `$2`,
+    /// team `$3`, then the status binds, then the identifier binds, across every
+    /// UNION arm. A shifted placeholder fails to execute or filters on the wrong
+    /// value, so the cases combine neighbouring binds: team + status_id, team +
+    /// status_id + categories, and an identifier (number and key binds) with
+    /// team + one category, and with team + status_id + two categories, which
+    /// makes the status binds longer than one entry.
+    async fn search_applies_only_explicit_filters_with_aligned_binds(db) {
+        use trakkt_auth::search_service::{search, SearchParams};
+
+        seed_tenancy(db).await;
+        seed_team(db, "team_other", WORKSPACE, "OTH")
+            .await
+            .expect("seed a second team the team filter must exclude");
+
+        // DIA-1 Backlog, DIA-2 Done, DIA-3 Cancelled, DIA-4 Done + archived.
+        for n in 1..=4 {
+            create_issue(db, &format!("Zebra issue {n}")).await;
+        }
+        // OTH-1 Done, in the other team.
+        trakkt_auth::issue_service::create_issue(
+            db,
+            &CreateIssueParams {
+                workspace_id: WORKSPACE.to_owned(),
+                team_id: "team_other".to_owned(),
+                creator_id: USER.to_owned(),
+                title: "Zebra other team".to_owned(),
+                description: None,
+                priority: 0,
+                assignee_id: None,
+                due_date: None,
+                label_ids: Vec::new(),
+                project_id: None,
+                milestone_id: None,
+                estimate: None,
+            },
+            None,
+        )
+        .await
+        .expect("create the other team's issue");
+
+        for (team, number, status) in [
+            (TEAM, 2, "done"),
+            (TEAM, 3, "cancelled"),
+            (TEAM, 4, "done"),
+            ("team_other", 1, "done"),
+        ] {
+            let status_id = format!("{WORKSPACE}::{status}");
+            db_execute!(
+                db,
+                "UPDATE issues SET status_id = $1 WHERE team_id = $2 AND number = $3",
+                &status_id, team, number
+            )
+            .expect("move the fixture issue to a closed status");
+        }
+        db_execute!(
+            db,
+            "UPDATE issues SET archived_at = CURRENT_TIMESTAMP WHERE team_id = $1 AND number = 4",
+            TEAM
+        )
+        .expect("archive the fixture issue");
+
+        let base = |query: &str| SearchParams {
+            query: query.to_owned(),
+            workspace_id: WORKSPACE.to_owned(),
+            team_id: None,
+            exclude_archived: false,
+            exclude_closed: false,
+            status_id: None,
+            status_categories: None,
+            include_comments: false,
+            limit: 50,
+            offset: 0,
+        };
+        let dia = |n: i64| ("DIA".to_owned(), n);
+        let oth = |n: i64| ("OTH".to_owned(), n);
+
+        // No filters: every status, archived included, both teams.
+        let all = search(db, &base("Zebra")).await.expect("unfiltered search");
+        assert_eq!(hit_numbers(&all), vec![dia(1), dia(2), dia(3), dia(4), oth(1)]);
+
+        // Status category filter alone.
+        let mut p = base("Zebra");
+        p.status_categories = Some(vec!["completed".to_owned(), "cancelled".to_owned()]);
+        let closed = search(db, &p).await.expect("category search");
+        assert_eq!(hit_numbers(&closed), vec![dia(2), dia(3), dia(4), oth(1)]);
+
+        // Status id filter + team filter: binds $3 (team) and $4 (status).
+        let mut p = base("Zebra");
+        p.team_id = Some(TEAM.to_owned());
+        p.status_id = Some(format!("{WORKSPACE}::done"));
+        let done_in_team = search(db, &p).await.expect("status id + team search");
+        assert_eq!(hit_numbers(&done_in_team), vec![dia(2), dia(4)]);
+
+        // Team + status id + categories together.
+        let mut p = base("Zebra");
+        p.team_id = Some("team_other".to_owned());
+        p.status_id = Some(format!("{WORKSPACE}::done"));
+        p.status_categories = Some(vec!["completed".to_owned()]);
+        let other = search(db, &p).await.expect("team + status + category search");
+        assert_eq!(hit_numbers(&other), vec![oth(1)]);
+
+        // Identifier on a Done issue, with and without other binds.
+        let ident = search(db, &base("DIA-2")).await.expect("identifier search");
+        assert_eq!(hit_numbers(&ident), vec![dia(2)]);
+        let mut p = base("DIA-2");
+        p.team_id = Some(TEAM.to_owned());
+        p.status_categories = Some(vec!["completed".to_owned()]);
+        let ident_filtered = search(db, &p).await.expect("identifier + team + category");
+        assert_eq!(hit_numbers(&ident_filtered), vec![dia(2)]);
+        // Identifier with team + status_id + two categories: the status binds are
+        // three long, so the identifier number/key binds must start after them.
+        let mut p = base("DIA-2");
+        p.team_id = Some(TEAM.to_owned());
+        p.status_id = Some(format!("{WORKSPACE}::done"));
+        p.status_categories = Some(vec!["completed".to_owned(), "cancelled".to_owned()]);
+        let ident_long = search(db, &p).await.expect("identifier + team + status_id + categories");
+        assert_eq!(hit_numbers(&ident_long), vec![dia(2)]);
+        // Same binds, but a status_id that does not match the issue.
+        p.status_id = Some(format!("{WORKSPACE}::todo"));
+        let ident_long_miss = search(db, &p).await.expect("identifier with non-matching status_id");
+        assert!(hit_numbers(&ident_long_miss).is_empty());
+        // The identifier honours a filter the caller set that excludes it.
+        p.status_categories = Some(vec!["started".to_owned()]);
+        let ident_excluded = search(db, &p).await.expect("identifier excluded by filter");
+        assert!(hit_numbers(&ident_excluded).is_empty());
+
+        // Explicit archived exclusion.
+        let mut p = base("Zebra");
+        p.exclude_archived = true;
+        let live = search(db, &p).await.expect("archived-excluded search");
+        assert_eq!(hit_numbers(&live), vec![dia(1), dia(2), dia(3), oth(1)]);
+
+        // Explicit closed exclusion (legacy include_closed=false).
+        let mut p = base("Zebra");
+        p.exclude_closed = true;
+        let open = search(db, &p).await.expect("closed-excluded search");
+        assert_eq!(hit_numbers(&open), vec![dia(1)]);
+    }
+}

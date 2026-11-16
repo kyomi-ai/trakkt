@@ -760,6 +760,16 @@ pub async fn delete_issue(
     Ok(json!({ "message": format!("Issue {team_key}-{number} deleted") }))
 }
 
+/// Split a comma-separated filter value; blank or empty input means "no filter".
+fn parse_csv(raw: Option<&str>) -> Option<Vec<String>> {
+    let values: Vec<String> = raw?
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    (!values.is_empty()).then_some(values)
+}
+
 /// Search issues by text query using full-text search.
 ///
 /// On Postgres, uses tsvector with GIN indexes for ranked results and
@@ -782,8 +792,11 @@ pub async fn search_issues(
         query: params.query,
         workspace_id: ctx.workspace_id.clone(),
         team_id,
-        include_archived: params.include_archived.unwrap_or(false),
-        include_closed: params.include_closed.unwrap_or(false),
+        // No hidden defaults: only filters the caller set are applied.
+        exclude_archived: params.include_archived == Some(false),
+        exclude_closed: params.include_closed == Some(false),
+        status_id: params.status_id.filter(|s| !s.is_empty()),
+        status_categories: parse_csv(params.status_category.as_deref()),
         include_comments: params.include_comments.unwrap_or(true),
         limit,
         offset: params.offset.unwrap_or(0).max(0),
@@ -818,7 +831,7 @@ pub fn operations() -> Vec<ApiOperation> {
         },
         ApiOperation {
             name: "search_issues",
-            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of matches ignoring limit/offset; when `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. A search considers at most its 1000 best-ranked matches: when `truncated` is true, `total` is a lower bound and lower-ranked matches cannot be reached by paging, so narrow the query (team, include_closed, include_comments). By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.",
+            description: "Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of matches ignoring limit/offset; when `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. A search considers at most its 1000 best-ranked matches: when `truncated` is true, `total` is a lower bound and lower-ranked matches cannot be reached by paging, so narrow the query (team, status filters, include_comments). Search applies only the filters you pass and no hidden defaults: with no status filter it covers every status, including Done and Cancelled, and archived issues. Narrow with status_id, status_category (comma-separated: backlog, unstarted, started, completed, cancelled), team_key/team_id, include_archived=false, or include_comments=false (comments are searched by default). An exact identifier such as 'TRA-35' always matches that issue unless a filter you set excludes it. include_closed is deprecated and kept for compatibility: omitted or true means no status filtering; only an explicit false excludes completed and cancelled issues.",
             scope: "issues:read",
             rest_method: Method::GET,
             rest_path: "/issues/search",
@@ -1029,6 +1042,147 @@ mod tests {
             }
         }
     }
+
+    fn search_params(query: &str) -> SearchIssuesApiParams {
+        SearchIssuesApiParams {
+            query: query.to_string(),
+            team_key: None,
+            team_id: None,
+            status_id: None,
+            status_category: None,
+            include_closed: None,
+            include_archived: None,
+            include_comments: Some(false),
+            limit: Some(50),
+            offset: None,
+        }
+    }
+
+    fn search_ctx<'a>(db: &'a DbPool, workspace_id: &str, user_id: &str) -> ApiCtx<'a> {
+        ApiCtx::from_leptos(
+            workspace_id.to_string(),
+            user_id.to_string(),
+            db,
+            None,
+            None,
+            None,
+            "http://localhost:3100",
+        )
+    }
+
+    /// Issue 1 stays Backlog, 2 is Done, 3 is Cancelled; all titles share "Seeded".
+    async fn workspace_with_closed_issues() -> (DbPool, String, String) {
+        let (db, workspace_id, user_id) = seeded_workspace(3).await;
+        for (number, status) in [(2, "done"), (3, "cancelled")] {
+            let status_id = format!("{workspace_id}::{status}");
+            trakkt_core::db_execute!(
+                &db,
+                "UPDATE issues SET status_id = $1 WHERE workspace_id = $2 AND number = $3",
+                &status_id,
+                &workspace_id,
+                number
+            )
+            .expect("move fixture issue to a closed status");
+        }
+        (db, workspace_id, user_id)
+    }
+
+    fn result_numbers(value: &serde_json::Value) -> Vec<i64> {
+        let mut numbers: Vec<i64> = value["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .map(|r| r["number"].as_i64().expect("number"))
+            .collect();
+        numbers.sort_unstable();
+        numbers
+    }
+
+    /// TRA-10114: with no filters set, search covers every status.
+    #[tokio::test]
+    async fn search_without_filters_returns_done_and_cancelled_issues() {
+        let (db, workspace_id, user_id) = workspace_with_closed_issues().await;
+        let ctx = search_ctx(&db, &workspace_id, &user_id);
+
+        let value = search_issues(&ctx, search_params("Seeded")).await.expect("search");
+        assert_eq!(result_numbers(&value), vec![1, 2, 3]);
+    }
+
+    /// TRA-10114: an exact identifier matches a Done issue.
+    #[tokio::test]
+    async fn search_by_identifier_matches_done_issue() {
+        let (db, workspace_id, user_id) = workspace_with_closed_issues().await;
+        let ctx = search_ctx(&db, &workspace_id, &user_id);
+
+        let value = search_issues(&ctx, search_params("TRK-2")).await.expect("search");
+        assert_eq!(result_numbers(&value), vec![2]);
+    }
+
+    /// TRA-10114: a status filter restricts results to exactly those statuses.
+    #[tokio::test]
+    async fn search_status_filters_restrict_results() {
+        let (db, workspace_id, user_id) = workspace_with_closed_issues().await;
+        let ctx = search_ctx(&db, &workspace_id, &user_id);
+
+        let mut by_id = search_params("Seeded");
+        by_id.status_id = Some(format!("{workspace_id}::done"));
+        let value = search_issues(&ctx, by_id).await.expect("search");
+        assert_eq!(result_numbers(&value), vec![2]);
+
+        let mut by_category = search_params("Seeded");
+        by_category.status_category = Some("completed, cancelled".to_string());
+        let value = search_issues(&ctx, by_category).await.expect("search");
+        assert_eq!(result_numbers(&value), vec![2, 3]);
+
+        // Identifier lookups honour filters the user set explicitly.
+        let mut identifier = search_params("TRK-1");
+        identifier.status_category = Some("completed".to_string());
+        let value = search_issues(&ctx, identifier).await.expect("search");
+        assert!(result_numbers(&value).is_empty());
+
+        // Combined with a team filter the bind positions still line up.
+        let mut with_team = search_params("TRK-2");
+        with_team.team_key = Some("TRK".to_string());
+        with_team.status_category = Some("completed".to_string());
+        let value = search_issues(&ctx, with_team).await.expect("search");
+        assert_eq!(result_numbers(&value), vec![2]);
+    }
+
+    /// `include_closed` stays accepted: only an explicit false filters.
+    #[tokio::test]
+    async fn search_include_closed_is_compatible() {
+        let (db, workspace_id, user_id) = workspace_with_closed_issues().await;
+        let ctx = search_ctx(&db, &workspace_id, &user_id);
+
+        for (flag, expected) in [(Some(true), vec![1, 2, 3]), (Some(false), vec![1]), (None, vec![1, 2, 3])] {
+            let mut params = search_params("Seeded");
+            params.include_closed = flag;
+            let value = search_issues(&ctx, params).await.expect("search");
+            assert_eq!(result_numbers(&value), expected, "include_closed={flag:?}");
+        }
+    }
+
+    /// Archived issues are neither hidden implicitly nor ignored when asked.
+    #[tokio::test]
+    async fn search_archived_is_an_explicit_filter() {
+        let (db, workspace_id, user_id) = workspace_with_closed_issues().await;
+        trakkt_core::db_execute!(
+            &db,
+            "UPDATE issues SET archived_at = '2026-01-01T00:00:00Z' WHERE workspace_id = $1 AND number = 2",
+            &workspace_id
+        )
+        .expect("archive fixture issue");
+        let ctx = search_ctx(&db, &workspace_id, &user_id);
+
+        let value = search_issues(&ctx, search_params("Seeded")).await.expect("search");
+        assert_eq!(result_numbers(&value), vec![1, 2, 3]);
+
+        let mut params = search_params("Seeded");
+        params.include_archived = Some(false);
+        let value = search_issues(&ctx, params).await.expect("search");
+        assert_eq!(result_numbers(&value), vec![1, 3]);
+    }
+
 
     /// The no-clauses path returns an envelope of lean rows.
     #[tokio::test]
@@ -1413,6 +1567,8 @@ mod tests {
                     query: "Seeded".to_string(),
                     team_key: None,
                     team_id: None,
+                    status_id: None,
+                    status_category: None,
                     include_closed: None,
                     include_archived: None,
                     include_comments: Some(false),
