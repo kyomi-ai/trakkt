@@ -4138,8 +4138,10 @@ dual_backend_test! {
     /// The Postgres arm numbers its placeholders as query `$1`, workspace `$2`,
     /// team `$3`, then the status binds, then the identifier binds, across every
     /// UNION arm. A shifted placeholder fails to execute or filters on the wrong
-    /// value, so each case below combines filters whose binds sit next to each
-    /// other: status + team, and status + team + identifier.
+    /// value, so the cases combine neighbouring binds: team + status_id, team +
+    /// status_id + categories, and an identifier (number and key binds) with
+    /// team + one category, and with team + status_id + two categories, which
+    /// makes the status binds longer than one entry.
     async fn search_applies_only_explicit_filters_with_aligned_binds(db) {
         use trakkt_auth::search_service::{search, SearchParams};
 
@@ -4243,6 +4245,18 @@ dual_backend_test! {
         p.status_categories = Some(vec!["completed".to_owned()]);
         let ident_filtered = search(db, &p).await.expect("identifier + team + category");
         assert_eq!(hit_numbers(&ident_filtered), vec![dia(2)]);
+        // Identifier with team + status_id + two categories: the status binds are
+        // three long, so the identifier number/key binds must start after them.
+        let mut p = base("DIA-2");
+        p.team_id = Some(TEAM.to_owned());
+        p.status_id = Some(format!("{WORKSPACE}::done"));
+        p.status_categories = Some(vec!["completed".to_owned(), "cancelled".to_owned()]);
+        let ident_long = search(db, &p).await.expect("identifier + team + status_id + categories");
+        assert_eq!(hit_numbers(&ident_long), vec![dia(2)]);
+        // Same binds, but a status_id that does not match the issue.
+        p.status_id = Some(format!("{WORKSPACE}::todo"));
+        let ident_long_miss = search(db, &p).await.expect("identifier with non-matching status_id");
+        assert!(hit_numbers(&ident_long_miss).is_empty());
         // The identifier honours a filter the caller set that excludes it.
         p.status_categories = Some(vec!["started".to_owned()]);
         let ident_excluded = search(db, &p).await.expect("identifier excluded by filter");
