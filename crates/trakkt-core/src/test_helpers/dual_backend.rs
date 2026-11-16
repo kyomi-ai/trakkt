@@ -20,7 +20,7 @@
 //!
 //! It is a harness, not a guarantee. It runs the bodies it is given, and the
 //! server bodies live in `apps/server/tests/postgres_dialect.rs` — 25 of them as of
-//! TRA-10001, against 119 `is_postgres()` call sites and 164 `sql_compat::`
+//! TRA-10001, against 119 `is_postgres()` call sites and 165 `sql_compat::`
 //! call sites outside the test directories. A green `Postgres Dialect Tests`
 //! job runs those server bodies and GitHub authorization bodies in
 //! `crates/trakkt-github/src/authorization.rs` on both backends. It does not say

@@ -171,8 +171,11 @@ pub fn clauses_to_sql(
             ),
             ("priority", "any_of" | "none_of") => {
                 // A value is a match only if it is the canonical text of the
-                // stored integer (`matches` compares `priority.to_string()`).
-                let ints: Vec<i32> = clause.canonical_priority_values();
+                // stored integer (`matches` compares `priority.to_string()`),
+                // deduplicated so duplicate values cost one placeholder.
+                let mut ints: Vec<i32> = clause.canonical_priority_values();
+                ints.sort_unstable();
+                ints.dedup();
                 if ints.is_empty() {
                     if op == "any_of" {
                         out.conditions.push("1 = 0".to_string());
@@ -204,7 +207,11 @@ pub fn clauses_to_sql(
                     text_in(&mut out)
                 )
             }
-            _ => continue,
+            _ => {
+                // `supported()` admitted this pair, so it must have an arm.
+                debug_assert!(false, "no SQL translation for supported pair {field}/{op}");
+                continue;
+            }
         };
         out.conditions.push(condition);
     }
@@ -266,6 +273,14 @@ mod tests {
         assert!(sql.conditions.is_empty());
         assert!(sql.args.is_empty());
         assert_eq!(sql.next_param, 3);
+    }
+
+    #[test]
+    fn duplicate_priority_values_cost_one_placeholder() {
+        let sql = clauses_to_sql(&[clause("priority", "any_of", &["1", "1", "03"])], 4, true);
+        assert_eq!(sql.conditions, vec!["i.priority IN ($4)"]);
+        assert_eq!(sql.args, vec![SqlArg::Int(1)]);
+        assert_eq!(sql.next_param, 5);
     }
 
     #[test]

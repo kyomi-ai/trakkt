@@ -113,9 +113,12 @@ impl FilterClause {
 
     /// Whether this clause actually restricts anything — the rule
     /// [`FilterClause::matches`] and the SQL translation both implement.
-    /// Non-boolean clauses with no values and unknown field/operator pairs
-    /// constrain nothing; an empty `issue_id any_of` ("no starred issues")
-    /// restricts to nothing, and therefore does.
+    ///
+    /// Unknown field/operator pairs constrain nothing. So do non-boolean
+    /// clauses with no values, except an empty `issue_id any_of` ("no starred
+    /// issues"), which restricts to nothing and therefore does restrict. A
+    /// `priority none_of` whose values are not canonical stored priorities
+    /// excludes nothing, so it does not restrict either.
     pub fn is_effective(&self) -> bool {
         if !self.supported() {
             return false;
@@ -193,7 +196,11 @@ impl FilterClause {
             // Issue ID set — used by the "Starred" view.
             ("issue_id", "any_of") => self.values.contains(&issue.issue_id),
             ("issue_id", "none_of") => !self.values.contains(&issue.issue_id),
-            _ => true,
+            _ => {
+                // `supported()` admitted this pair, so it must have an arm.
+                debug_assert!(false, "no matcher arm for supported pair {}/{}", self.field, self.operator);
+                true
+            }
         }
     }
 }

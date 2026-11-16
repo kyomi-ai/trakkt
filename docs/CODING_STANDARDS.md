@@ -163,7 +163,7 @@ and one SQLite-only test about SQLite's rowid rule. What those bodies execute:
 - the rollback contract, in all three of its shapes — a mutation's first entry
   rejected, an entry rejected after an earlier one was accepted, and an entry
   rejected after the statement has already fired `ON DELETE CASCADE`;
-- the eight `sql_compat` helpers production builds SQL with (see the ledger at
+- the nine `sql_compat` helpers production builds SQL with (see the ledger at
   the head of that file's `sql_compat` section, which also names the twelve it
   does not and why);
 - the `sort_order` decode — the FLOAT4-versus-`f64` class that shipped twice —
@@ -175,7 +175,7 @@ and one SQLite-only test about SQLite's rowid rule. What those bodies execute:
 What it does not cover, stated so nobody has to infer it:
 
 - **Most `is_pg` branch points.** There are 119 `is_postgres()` call sites
-  outside `apps/server/tests`, and 164 `sql_compat::` call sites. The suite
+  outside `apps/server/tests`, and 165 `sql_compat::` call sites. The suite
   reaches a minority of them, because each body is written for a defect class
   rather than swept over a list.
 - **All 60 rollback tests** in `crates/trakkt-auth/src/sync_log_service.rs`,

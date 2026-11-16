@@ -583,17 +583,18 @@ dual_backend_test! {
 // with it. A helper nothing calls has no arm to keep working: a body here would
 // have to invent a query around a fragment, and would then be asserting that
 // the test's own SQL runs. The ledger is stated rather than implied, because
-// "the sql_compat helpers are covered" and "eight of twenty are, and the other
-// twelve are dead" are very different claims to leave a reader holding.
+// "the sql_compat helpers are covered" and "nine of twenty-one are, and the
+// other twelve are dead" are very different claims to leave a reader holding.
 //
 // Called by production, and executed here on both backends. The figure beside
 // each is `sql_compat::<name>(` call sites outside `apps/server/tests`, so it
 // includes the crates' own `#[cfg(test)]` modules; it is there to show which
 // helpers carry weight, not as an exact production count. What *was* checked
 // exactly, one helper at a time, is the split between this list and the next.
-// Every name below is called from code that ships — seven from `pub` service
-// functions, and `within_seconds` from `activity_service::coalesce_or_insert_activity`,
-// a private helper on the activity write path. Every name in the second list
+// Every name below is called from code that ships — eight from `pub` functions
+// (seven services, plus `filter_sql::clauses_to_sql`), and `within_seconds` from
+// `activity_service::coalesce_or_insert_activity`, a private helper on the
+// activity write path. Every name in the second list
 // has no call site at all outside `sql_compat.rs`'s own unit tests and this
 // file.
 //
@@ -606,6 +607,7 @@ dual_backend_test! {
 //   ago_days              2             — sync_log_pruning_selects_by_age_on_both_dialects
 //   within_seconds        1             — this section
 //   cast_to_timestamptz   1             — project_dates_and_archive_stamp_survive_the_round_trip
+//   value_in_json_array   1             — search_filter_clauses_match_the_issue_list_semantics
 //
 // Not called by production, and therefore not executed here:
 //
