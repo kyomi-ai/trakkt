@@ -378,6 +378,9 @@ pub struct SearchResultItem {
 ///
 /// Delegates to `trakkt_auth::search_service::search` which uses tsvector/GIN
 /// on Postgres and LIKE fallback on SQLite.
+///
+/// Only filters the caller sets are applied: `None` for `include_closed` /
+/// `include_archived` means no filtering, and only `Some(false)` excludes.
 #[server(prefix = "/leptos-api")]
 pub async fn search_issues(
     query: String,
@@ -392,8 +395,11 @@ pub async fn search_issues(
         query,
         workspace_id: ac.ws_id.clone(),
         team_id,
-        include_archived: include_archived.unwrap_or(false),
-        include_closed: include_closed.unwrap_or(false),
+        // No hidden defaults: only filters the caller set are applied.
+        exclude_archived: include_archived == Some(false),
+        exclude_closed: include_closed == Some(false),
+        status_id: None,
+        status_categories: None,
         include_comments: include_comments.unwrap_or(true),
         limit: limit.unwrap_or(50),
         offset: 0,

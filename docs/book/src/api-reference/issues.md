@@ -85,7 +85,7 @@ Returns `201 Created` on success with the created resource as JSON.
 
 **Operation:** `search_issues`
 
-Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of matches ignoring limit/offset; when `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. A search considers at most its 1000 best-ranked matches: when `truncated` is true, `total` is a lower bound and lower-ranked matches cannot be reached by paging, so narrow the query (team, include_closed, include_comments). By default searches comments too — pass include_comments=false to search only titles and descriptions. By default excludes archived issues — pass include_archived=true to include them.
+Search for issues by text query. Uses full-text search across titles, descriptions, and comments (Postgres) or LIKE matching (SQLite). Returns `{results, total, has_more, next_offset, truncated}`; results are ranked by relevance with snippet context. `limit` is the page size (default 20, max 100, clamped). `total` is the number of matches ignoring limit/offset; when `has_more` is true, repeat the request with `offset` set to `next_offset` until `has_more` is false. A search considers at most its 1000 best-ranked matches: when `truncated` is true, `total` is a lower bound and lower-ranked matches cannot be reached by paging, so narrow the query (team, status filters, include_comments). Search applies only the filters you pass and no hidden defaults: with no status filter it covers every status, including Done and Cancelled, and archived issues. Narrow with status_id, status_category (comma-separated: backlog, unstarted, started, completed, cancelled), team_key/team_id, include_archived=false, or include_comments=false (comments are searched by default). An exact identifier such as 'TRA-35' always matches that issue unless a filter you set excludes it. include_closed is deprecated and kept for compatibility: omitted or true means no status filtering; only an explicit false excludes completed and cancelled issues.
 
 **Scope:** `issues:read`
 
@@ -93,12 +93,14 @@ Search for issues by text query. Uses full-text search across titles, descriptio
 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
-| `include_archived` | query | boolean (nullable) | No | Include archived issues in results (default: false) |
-| `include_closed` | query | boolean (nullable) | No | If true, include completed and cancelled issues |
+| `include_archived` | query | boolean (nullable) | No | Omitted or true: archived issues are searched. Pass false to exclude them. |
+| `include_closed` | query | boolean (nullable) | No | Deprecated, kept for compatibility. Omitted or true: no status filtering (completed and cancelled issues are searched). Only an explicit false excludes completed and cancelled issues; prefer `status_category`. |
 | `include_comments` | query | boolean (nullable) | No | Also search comment bodies (default: true) |
 | `limit` | query | integer (int64) (nullable) | No | Page size (default: 20, max: 100; values outside 1..=100 are clamped) |
 | `offset` | query | integer (int64) (nullable) | No | Offset of the first result (default: 0). When the response has `has_more`, repeat the request with `offset` = `next_offset`. |
 | `query` | query | string | Yes | Search text (required) |
+| `status_category` | query | string (nullable) | No | Comma-separated status categories to restrict to: backlog, unstarted, started, completed, cancelled. Omit to search every status, including completed and cancelled. |
+| `status_id` | query | string (nullable) | No | Filter by status ID. Omit to search every status. |
 | `team_id` | query | string (nullable) | No | Filter by team ID |
 | `team_key` | query | string (nullable) | No | Filter by team key |
 

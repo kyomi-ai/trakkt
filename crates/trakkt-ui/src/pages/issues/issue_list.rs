@@ -38,8 +38,8 @@ use crate::components::{
 };
 use crate::pages::board::BoardContent;
 use crate::pages::issues::filters::{
-    apply_clause, group_issues, parse_sort_field, sort_field_to_str, sort_issues, FilterBar,
-    GroupDropdown, GroupField, SortDirection, SortDropdown, SortField,
+    apply_clause, filter_search_hits, group_issues, parse_sort_field, search_scope_summary,
+    sort_field_to_str, sort_issues, FilterBar, GroupDropdown, GroupField, SortDirection, SortDropdown, SortField,
 };
 use crate::pages::issues::issue_row::IssueRow;
 use crate::pages::issues::{is_archived, resolve_archive_days};
@@ -374,6 +374,9 @@ fn apply_view_filters_from_store(
 // Issue List Page
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Matches requested from search per query (one more is fetched to detect truncation).
+const SEARCH_PAGE_SIZE: i64 = 200;
+
 /// Main issue list page — zero-arg entry point used by the router.
 ///
 /// Shows all workspace issues (no team filtering). For team-scoped views,
@@ -568,13 +571,17 @@ pub(crate) fn IssueListInner(
             if query.trim().is_empty() {
                 return Ok(Vec::new());
             }
+            // No hidden defaults: no status filter is sent (all statuses are
+            // searched). The visible "Include archived" toggle and the filter
+            // bar are the only narrowing; filter clauses are applied to the
+            // hits below. One extra row is requested to detect truncation.
             search_issues(
                 query,
                 team_id,
-                Some(false),
+                None,
                 Some(include_archived),
                 Some(true),
-                Some(50),
+                Some(SEARCH_PAGE_SIZE + 1),
             ).await
         },
     );
@@ -584,35 +591,9 @@ pub(crate) fn IssueListInner(
         !search.get().trim().is_empty() && search_resource.get().is_none()
     });
     let search_error = RwSignal::new(Option::<String>::None);
+    // Visible notes about truncated or unverifiable search hits.
+    let search_note = RwSignal::new(String::new());
 
-    let grouped_search_results = Memo::new(move |_| {
-        if !is_search_active.get() {
-            search_error.set(None);
-            return Vec::new();
-        }
-        let results = match search_resource.get() {
-            Some(Ok(items)) => {
-                search_error.set(None);
-                items
-            }
-            Some(Err(e)) => {
-                search_error.set(Some(format!("Search failed: {e}")));
-                return Vec::new();
-            }
-            None => return Vec::new(),
-        };
-        let mut groups: Vec<(String, Vec<SearchResultItem>)> = Vec::new();
-        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for item in results {
-            if let Some(&idx) = seen.get(&item.issue_id) {
-                groups[idx].1.push(item);
-            } else {
-                seen.insert(item.issue_id.clone(), groups.len());
-                groups.push((item.issue_id.clone(), vec![item]));
-            }
-        }
-        groups
-    });
 
     // ── Custom views (team-scoped or workspace-scoped) ─────────────────
     // Exclude views whose names collide with the hardcoded preset tabs
@@ -994,6 +975,60 @@ pub(crate) fn IssueListInner(
                 }
             })
             .collect::<Vec<_>>()
+    });
+
+    let grouped_search_results = Memo::new(move |_| {
+        if !is_search_active.get() {
+            search_error.set(None);
+            search_note.set(String::new());
+            return Vec::new();
+        }
+        let results = match search_resource.get() {
+            Some(Ok(items)) => {
+                search_error.set(None);
+                // Apply the user's filter clauses with the same matcher the
+                // issue list uses. Hits we cannot resolve are dropped when a
+                // filter is set, since we cannot show they match it.
+                let mut items = items;
+                let truncated = items.len() > SEARCH_PAGE_SIZE as usize;
+                items.truncate(SEARCH_PAGE_SIZE as usize);
+                let (kept, unverified) =
+                    filter_search_hits(items, &filter_clauses.get(), &team_issues.get());
+                let mut notes = Vec::new();
+                if truncated {
+                    notes.push(format!(
+                        "showing only the first {SEARCH_PAGE_SIZE} matches, refine your search"
+                    ));
+                }
+                if unverified > 0 {
+                    notes.push(format!(
+                        "{unverified} match(es) not shown: they cannot be checked against the filters (archived or not loaded yet)"
+                    ));
+                }
+                search_note.set(notes.join("; "));
+                kept
+            }
+            Some(Err(e)) => {
+                search_error.set(Some(format!("Search failed: {e}")));
+                search_note.set(String::new());
+                return Vec::new();
+            }
+            None => {
+                search_note.set(String::new());
+                return Vec::new();
+            }
+        };
+        let mut groups: Vec<(String, Vec<SearchResultItem>)> = Vec::new();
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for item in results {
+            if let Some(&idx) = seen.get(&item.issue_id) {
+                groups[idx].1.push(item);
+            } else {
+                seen.insert(item.issue_id.clone(), groups.len());
+                groups.push((item.issue_id.clone(), vec![item]));
+            }
+        }
+        groups
     });
 
     // Filtered issue list for list view — excludes archived issues, applies
@@ -1742,6 +1777,18 @@ pub(crate) fn IssueListInner(
                             {move || {
                                 let groups = grouped_search_results.get();
                                 let query = debounced_search.get();
+                                let scope_line = {
+                                    let base = search_scope_summary(
+                                        &filter_clauses.get(),
+                                        include_archived_search.get(),
+                                    );
+                                    let note = search_note.get();
+                                    if note.is_empty() {
+                                        format!("· {base}")
+                                    } else {
+                                        format!("· {base} · {note}")
+                                    }
+                                };
 
                                 if !query.trim().is_empty() && search_resource.get().is_none() && groups.is_empty() {
                                     view! {
@@ -1763,6 +1810,9 @@ pub(crate) fn IssueListInner(
                                             <p class="text-muted-foreground text-sm">
                                                 {format!("No results for \"{query}\"")}
                                             </p>
+                                            <p class="text-muted-foreground text-xs mt-1" data-testid="search-scope">
+                                                {scope_line}
+                                            </p>
                                         </div>
                                     }.into_any()
                                 } else {
@@ -1771,6 +1821,9 @@ pub(crate) fn IssueListInner(
                                         <div>
                                             <div class="px-5 py-2 text-xs text-muted-foreground border-b border-border">
                                                 {format!("{} {} found", total_matches, if total_matches == 1 { "result" } else { "results" })}
+                                                <span class="ml-2" data-testid="search-scope">
+                                                    {scope_line}
+                                                </span>
                                             </div>
                                             <div role="list">
                                                 {groups.into_iter().map(|(_, matches)| {
