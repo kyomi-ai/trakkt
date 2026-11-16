@@ -1128,10 +1128,11 @@ pub struct IssuePage {
 ///   transaction that began before page 1 carries such a stamp, as does any
 ///   SQLite write in the same whole second as `snapshot_at`. An ordinary edit
 ///   does not change the keys a `number` or `created_at` walk orders by; the
-///   writes that do (moving an issue to another team, an explicit renumber, a
-///   priority edit) stamp `updated_at`, so they follow the rules above — visible
-///   as a repeat if the write was already in flight, and outside the walk
-///   entirely if it was not.
+///   writes that do (moving an issue to another team, a delete-team
+///   reassignment) stamp `updated_at`, so they follow the rules above — a
+///   repeat if the row was already served, a slip behind the cursor if it was
+///   not. A priority walk moves on a priority edit, which also stamps
+///   `updated_at`.
 ///
 /// `served_count` saturates at [`MAX_WALK_SERVED`].
 ///
