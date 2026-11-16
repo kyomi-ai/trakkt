@@ -1954,6 +1954,43 @@ mod tests {
     }
 
     trakkt_core::dual_backend_test! {
+        /// Naming a ticket in a PR must not reopen one that was finished or
+        /// cancelled. A Backlog ticket does move, which is what proves the
+        /// rules are live and the assertions for the others are not passing
+        /// because nothing fired.
+        async fn a_pr_event_never_moves_a_completed_or_cancelled_issue(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            trakkt_core::test_helpers::seed_team(db,"closed-team","workspace-a","CLO").await.expect("seed team");
+            trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed statuses");
+
+            // (starting category, whether the PR may move it)
+            for (n, (category, may_move)) in [("backlog", true), ("cancelled", false), ("completed", false)].into_iter().enumerate() {
+                let issue = trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"closed-team".into(),creator_id:"admin-a".into(),title:format!("Mentioned in a PR while {category}"),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create issue");
+                let start = trakkt_auth::status_service::get_status_by_category(db,"workspace-a",category).await.expect("look up status").expect("category has a status");
+                if category != "backlog" {
+                    trakkt_auth::issue_service::update_issue(db,"workspace-a","CLO",issue.number,&trakkt_types::models::IssueUpdate {status_id:Some(start.status_id.clone()),..Default::default()},Some("admin-a"),trakkt_types::enums::ActionSource::User,None,None).await.expect("move issue to its starting status");
+                }
+
+                let reference = format!("CLO-{}", issue.number);
+                let number = 900 + n as i64;
+                let pr = serde_json::json!({"repository":{"full_name":"example/repo"},"pull_request":{"number":number,"title":reference,"body":"","head":{"ref":reference},"base":{"ref":"main"},"html_url":format!("https://github.com/example/repo/pull/{number}"),"draft":false,"merged":false}});
+                let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load connection").expect("exists");
+                crate::events::process_pull_request(db,&row,"opened",&pr,None).await.expect("link the PR to the issue");
+                crate::transitions::apply_transition_rules(db,&github.client,&row,"workspace-a","opened",&pr,&KEY,None,"http://localhost").await.expect("apply transition rules");
+
+                let after = trakkt_auth::issue_service::get_issue_by_id(db,&issue.issue_id).await.expect("reload issue").expect("exists");
+                if may_move {
+                    assert_ne!(after.status_id,start.status_id,"an open {category} issue is moved by its PR, so the rules are live");
+                } else {
+                    assert_eq!(after.status_id,start.status_id,"a PR that names a {category} issue must leave it {category}, but it is now {}",after.status_name);
+                }
+            }
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
         async fn github_outbound_admission_serializes_lifecycle_and_scope(db) {
             seed(db).await;
             let github = controlled(Scenario::default()).await;

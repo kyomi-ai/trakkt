@@ -474,6 +474,36 @@ async fn invalid_signature_cannot_record_or_mutate_a_connection() {
 
 /// Exercise the outgoing HTTP boundary as well as the incoming signed route.
 /// The client constructor refuses non-loopback URLs and disables redirects.
+/// Put the ticket back in Backlog the way a person would. A GitHub event never
+/// reopens finished work, so a test that needs it open again has to say so.
+async fn reopen_by_hand(f: &Fixture) {
+    let issue = trakkt_auth::issue_service::get_issue_by_id(&f.state.db, &f.issue)
+        .await
+        .expect("read the ticket to reopen")
+        .expect("issue exists");
+    let backlog =
+        trakkt_auth::status_service::get_status_by_category(&f.state.db, WORKSPACE, "backlog")
+            .await
+            .expect("resolve backlog status")
+            .expect("backlog status seeded");
+    trakkt_auth::issue_service::update_issue(
+        &f.state.db,
+        WORKSPACE,
+        &issue.team_key,
+        issue.number,
+        &trakkt_types::models::IssueUpdate {
+            status_id: Some(backlog.status_id),
+            ..Default::default()
+        },
+        None,
+        trakkt_types::enums::ActionSource::Api,
+        None,
+        None,
+    )
+    .await
+    .expect("reopen the ticket by hand");
+}
+
 #[tokio::test]
 async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_nothing() {
     use axum::{
@@ -564,6 +594,41 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
             .expect("completed status seeded")
             .status_id;
     for (inst, number) in [(&f.personal, 1), (&f.organization, 2)] {
+        if number == 2 {
+            // The ticket is Done from the first PR's merge. Opening another PR
+            // that names it is not a decision to reopen it.
+            let comment_count = || {
+                calls
+                    .lock()
+                    .expect("count comments")
+                    .iter()
+                    .filter(|(path, _)| path.ends_with("/comments"))
+                    .count()
+            };
+            let comments_before = comment_count();
+            deliver(
+                &f,
+                "pull_request",
+                "outbound-open-2-on-finished-work",
+                pr(inst, number, "opened"),
+            )
+            .await;
+            assert_eq!(
+                trakkt_auth::issue_service::get_issue_by_id(&f.state.db, &f.issue)
+                    .await
+                    .expect("read finished ticket")
+                    .expect("issue exists")
+                    .status_id,
+                completed,
+                "a PR opened on a Done ticket must leave it Done"
+            );
+            assert_eq!(
+                comment_count(),
+                comments_before,
+                "nothing moved, so nothing is announced on the PR"
+            );
+            reopen_by_hand(&f).await;
+        }
         deliver(
             &f,
             "pull_request",
@@ -590,8 +655,8 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
             .expect("opening a PR records its automatic status change");
         assert_eq!(
             opened.old_value.as_deref(),
-            Some(if number == 1 { "Backlog" } else { "Done" }),
-            "a later PR opening must also leave history when it reopens completed work"
+            Some("Backlog"),
+            "opening a PR on an open ticket records the automatic move"
         );
         assert_eq!(opened.new_value.as_deref(), Some("In Progress"));
         assert_eq!(
@@ -625,8 +690,8 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
         .collect();
     assert_eq!(
         status_history.len(),
-        4,
-        "one entry for every open and merge transition"
+        5,
+        "an open and a merge for each PR, plus the manual reopen between them"
     );
     assert_eq!(
         status_history
@@ -707,6 +772,7 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
         2,
         "historical links remain, disconnected PR adds none"
     );
+    reopen_by_hand(&f).await;
     deliver(
         &f,
         "pull_request",

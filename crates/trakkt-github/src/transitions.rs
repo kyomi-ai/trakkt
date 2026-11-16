@@ -30,6 +30,15 @@ fn determine_trigger(action: &str, merged: bool) -> Option<&'static str> {
     }
 }
 
+/// Whether a status category means the issue's work is over.
+///
+/// GitHub events never move an issue out of one of these. Reopening finished or
+/// abandoned work is a decision for a person, not a side effect of a PR that
+/// happens to name the ticket.
+fn is_closed_category(category: &str) -> bool {
+    matches!(category, "completed" | "cancelled")
+}
+
 // ─── Rule Matching ─────────────────────────────────────────────────────────
 
 /// Find the most specific enabled transition rule for the given event.
@@ -299,6 +308,21 @@ pub async fn apply_transition_rules(
             continue;
         }
 
+        // A completed or cancelled issue stays that way. Someone, or something,
+        // closed it on purpose, and a PR that merely names it — in a title, a
+        // body, a branch — is not a decision to reopen it. Without this, any PR
+        // that mentioned a closed ticket quietly moved it back to In Progress
+        // and posted "Status moved to In Progress" on the PR.
+        if is_closed_category(&issue.status_category) {
+            tracing::debug!(
+                issue_id = %link.issue_id,
+                status = %issue.status_name,
+                trigger = %trigger,
+                "Issue is completed or cancelled — leaving it alone"
+            );
+            continue;
+        }
+
         // Apply the status update via the issue service.
         let updates = trakkt_types::models::IssueUpdate {
             status_id: Some(target_status.status_id.clone()),
@@ -489,6 +513,15 @@ pub async fn notify_github_links_on_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_completed_and_cancelled_are_left_alone() {
+        assert!(is_closed_category("completed"));
+        assert!(is_closed_category("cancelled"));
+        for open in ["backlog", "unstarted", "started"] {
+            assert!(!is_closed_category(open), "{open} is still open work");
+        }
+    }
 
     #[test]
     fn determine_trigger_pr_opened() {
