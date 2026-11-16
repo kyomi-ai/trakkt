@@ -3995,3 +3995,60 @@ dual_backend_test! {
             .await.expect("reject family revoked by theft detection"));
     }
 }
+
+// ─── Issue list ordering (TRA-10113) ─────────────────────────────────────────
+
+dual_backend_test! {
+    /// `list_issues_sorted` orders by the SQL `ORDER BY` its sort builds
+    /// (`COLLATE "C"` string tie-breaks on Postgres), and the keyset cursor
+    /// resumes with `IssueSort::compare`. If the two ever disagree on a
+    /// backend, a cursor resumes early or late — so every sort and direction
+    /// must read back strictly ascending under the comparator, on both
+    /// dialects, and the list path must not load descriptions.
+    async fn issue_list_sql_order_agrees_with_the_cursor_comparator(db) {
+        use trakkt_auth::issue_service::{
+            list_issues_sorted, IssueSort, IssueSortField, IssueSortKey, SortDir,
+        };
+
+        seed_tenancy(db).await;
+        for n in 0..12 {
+            create_issue(db, &format!("ordered {n}")).await;
+        }
+        // Spread priorities so every rank (and the 0-ranks-last rule) is
+        // present, with many ties on the first sort key.
+        db_execute!(db, "UPDATE issues SET priority = number % 5 WHERE workspace_id = $1", WORKSPACE)
+            .expect("spread priorities so the sort keys tie");
+
+        for field in [
+            IssueSortField::Priority,
+            IssueSortField::CreatedAt,
+            IssueSortField::UpdatedAt,
+            IssueSortField::Number,
+        ] {
+            for dir in [SortDir::Asc, SortDir::Desc] {
+                let sort = IssueSort { field, dir };
+                let rows = list_issues_sorted(
+                    db,
+                    WORKSPACE,
+                    Some(TEAM),
+                    &trakkt_types::models::IssueFilters::default(),
+                    sort,
+                )
+                .await
+                .expect("list the team's issues in this order");
+                assert_eq!(rows.len(), 12);
+                assert!(
+                    rows.iter().all(|r| r.description.is_none()),
+                    "the list path must not load descriptions"
+                );
+                for pair in rows.windows(2) {
+                    assert_eq!(
+                        sort.compare(&IssueSortKey::from(&pair[0]), &IssueSortKey::from(&pair[1])),
+                        std::cmp::Ordering::Less,
+                        "SQL order and cursor comparator disagree for {field:?} {dir:?}"
+                    );
+                }
+            }
+        }
+    }
+}
