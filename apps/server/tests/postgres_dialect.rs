@@ -4002,7 +4002,8 @@ dual_backend_test! {
 
 /// One fixture issue for the list-ordering tests: every column any sort looks
 /// at. Timestamps are UTC text in a fixed-width form, so comparing them as
-/// strings *in this oracle* is chronological; the code under test never does.
+/// strings *in this oracle* is chronological; the code under test compares them
+/// as typed values on Postgres and normalised through `datetime()` on SQLite.
 struct ListFx {
     id: &'static str,
     team_id: &'static str,
@@ -4012,15 +4013,18 @@ struct ListFx {
     priority: i32,
 }
 
-/// Two teams whose keys order differently bytewise ("DIA" < "aa") and under an
-/// `en_US` locale ("aa" < "DIA"), with the same numbers, timestamps and
-/// priorities in both, and hand-picked issue ids whose order also differs
-/// between the two collations ("B-1" < "a-1" bytewise, the reverse under
-/// `en_US`). So every tie-break column is reached: team key by the `number`
-/// sort, issue id by every other. Timestamps are distinct and shuffled against
-/// `number`, and two pairs sit an hour apart across the US fall-back instant
-/// (2026-11-01 06:00 UTC) so that, rendered in `America/New_York`, they read
-/// `01:30-04` and `01:30-05`: equal as clock text, ordered only as instants.
+/// Two teams with the same numbers, timestamps and priorities, and hand-picked
+/// issue ids whose order differs between a locale collation and `"C"` ("B-1" <
+/// "a-1" bytewise, the reverse under `en_US`). Every sort falls through to
+/// `issue_id` on ties, so that collation is what the bytewise assertions
+/// exercise: dropping `COLLATE "C"` from `i.issue_id` makes them fail. The
+/// `number` sort's next tie-break is the team *id* (a UUID, immutable; see
+/// `issue_list_number_walk_is_exact_across_a_team_rename`), which is why the
+/// team keys are no longer part of any ordering. Timestamps are distinct and
+/// shuffled against `number`, and two pairs sit an hour apart across the US
+/// fall-back instant (2026-11-01 06:00 UTC) so that, rendered in
+/// `America/New_York`, they read `01:30-04` and `01:30-05`: equal as clock
+/// text, ordered only as instants.
 fn list_fixtures() -> Vec<ListFx> {
     const SHAPE: [(i32, &str, &str, i32); 4] = [
         (1, "2026-11-01 05:30:00+00:00", "2026-08-02 00:00:00+00:00", 3),
@@ -4052,7 +4056,7 @@ async fn seed_list_fixtures(db: &DbPool, fixtures: &[ListFx]) {
     seed_tenancy(db).await;
     seed_team(db, "team_aa", WORKSPACE, "aa")
         .await
-        .expect("seed a second team whose key sorts differently under \"C\"");
+        .expect("seed a second team with its own issue numbers");
     let status_id: String = db_fetch_scalar!(
         db,
         String,
@@ -4380,10 +4384,13 @@ dual_backend_test! {
 }
 
 dual_backend_test! {
-    /// A cursor is caller input on both backends: every field the database
-    /// will see is validated before it is bound, so a forged cursor is a `400`
+    /// A cursor is caller input on both backends: the fields the database will
+    /// see are validated before they are bound, so a forged cursor is a `400`
     /// rather than a Postgres cast error (`500`) or a silent SQLite
     /// miscomparison. The year-zero case is the one Postgres cannot represent.
+    /// Priority and number are bound as plain integers and the write paths
+    /// accept any `i32`, so they are deliberately not range-checked: a cursor
+    /// this endpoint generated must always be accepted back.
     async fn list_issues_rejects_a_forged_cursor_on_either_backend(db) {
         use base64::Engine;
 
@@ -4436,6 +4443,8 @@ dual_backend_test! {
             (7, "now()"),
             (8, "-1"),
             (9, "-1"),
+            (8, "2000000000"),
+            (9, "2000000000"),
         ] {
             let mut forged_parts = parts.clone();
             forged_parts[idx] = forged;

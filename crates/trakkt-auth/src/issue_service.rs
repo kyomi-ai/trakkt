@@ -834,6 +834,20 @@ macro_rules! bind_args {
     }};
 }
 
+/// Postgres renders a zero offset as `+00`; SQLite's `datetime()` only parses
+/// `±HH:MM`. This is a SQL expression, so the repair is a nested `printf` on the
+/// bind's text: `substr` the last three characters when they look like `±HH`
+/// and append `:00`.
+fn sqlite_offset_with_minutes(placeholder: &str) -> String {
+    format!(
+        "CASE WHEN substr({placeholder}, -3, 1) IN ('+', '-') \
+              AND substr({placeholder}, -6, 1) = ':' \
+              AND substr({placeholder}, -2) NOT GLOB '*[^0-9]*' \
+              THEN substr({placeholder}, 1, length({placeholder}) - 3) || substr({placeholder}, -3) || ':00' \
+              ELSE {placeholder} END"
+    )
+}
+
 /// The `WHERE` clause of a list query and its binds, numbered `$1..`.
 ///
 /// Every condition goes through [`ListWhere::param`], so a placeholder's
@@ -944,8 +958,10 @@ impl ListWhere {
             format!("CAST({p} AS TIMESTAMPTZ)")
         } else {
             // Match `KeyCol::expr`'s normalisation so a stored value in either
-            // accepted format compares against the bound one.
-            format!("datetime({p})")
+            // accepted format compares against the bound one. A bare hour
+            // offset (`+00`), which Postgres renders, is not parseable by
+            // `datetime()`; give it minutes first.
+            format!("datetime({})", sqlite_offset_with_minutes(&p))
         }
     }
 
@@ -1101,13 +1117,17 @@ pub struct IssuePage {
 /// - a write stamped at or before `snapshot_at` that moves an already-served
 ///   issue past the cursor makes that issue appear once more. A Postgres
 ///   transaction that began before page 1 carries such a stamp, as does any
-///   SQLite write in the same whole second as `snapshot_at`. Sorting by a
-///   stable key (`number`, `created_at`) cannot move a served row, so a walk in
-///   those orders reports each row once for as long as it keeps matching.
+///   SQLite write in the same whole second as `snapshot_at`. An ordinary edit
+///   does not change the keys a `number` or `created_at` walk orders by; the
+///   writes that do (moving an issue to another team, an explicit renumber, a
+///   priority edit) stamp `updated_at`, so they follow the rules above — visible
+///   as a repeat if the write was already in flight, and outside the walk
+///   entirely if it was not.
 ///
 /// `served_count` is therefore `total` plus any repeat, minus rows that stopped
-/// matching before they were served, plus rows that started matching without a
-/// write that moves `updated_at`.
+/// matching before they were served, minus rows such a write moved to before the
+/// cursor before they were served, plus rows that started matching without a
+/// write that moves `updated_at` and were served.
 pub async fn list_issues_page(
     db: &DbPool,
     req: &IssuePageRequest<'_>,

@@ -62,7 +62,7 @@ response is complete only when `has_more` is `false`.
 
 | Operation | Page size (`limit`) | How to get the next page |
 |-----------|---------------------|--------------------------|
-| `GET /issues` | default 50, max 100 | pass the response's `next_cursor` as `cursor`; `total` is the exact match count, fixed for the walk; the walk is a snapshot as of `snapshot_at` (writes after it appear in a fresh walk), and `served_count` shows the rows returned so far (`total` plus repeats, minus rows that stopped matching, plus rows that started matching); `sort_by`/`sort_dir` choose the order |
+| `GET /issues` | default 50, max 100 | pass the response's `next_cursor` as `cursor`; `total` is the exact match count, fixed for the walk; the walk is a snapshot as of `snapshot_at` (writes after it appear in a fresh walk), and `served_count` shows the rows returned so far (`total` plus repeats, minus rows that stopped matching or slipped behind the cursor, plus rows that started matching); `sort_by`/`sort_dir` choose the order |
 | `GET /issues/search` | default 20, max 100 | pass `next_offset` as `offset` |
 | `GET /activities` | default 50, max 200 | pass `next_offset` as `offset` |
 

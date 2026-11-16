@@ -170,12 +170,12 @@ impl SearchParams {
 /// results and `ts_headline` for snippet context. On SQLite, falls back to
 /// `LIKE '%query%'` without ranking or snippets.
 ///
-/// Returns a [`SearchResponse`] containing the paginated results and the total
-/// number of matching issues (before offset/limit are applied). Pagination is
-/// performed in Rust so that `total` reflects the true match count. The SQL
-/// keeps one best-ranked row per issue and returns at most the cap
-/// ([`SEARCH_FETCH_CAP`]) plus one row to detect truncation; slicing happens
-/// after.
+/// Returns a [`SearchResponse`] containing the paginated results and the
+/// number of distinct matching issues **within the search window** — the
+/// [`SEARCH_FETCH_CAP`] best-ranked rows, before offset/limit are applied. The
+/// SQL keeps one best-ranked row per issue and returns at most the cap plus one
+/// row to detect truncation; slicing happens after, and `truncated` says when
+/// more matches exist beyond the window.
 pub async fn search(
     db: &DbPool,
     params: &SearchParams,

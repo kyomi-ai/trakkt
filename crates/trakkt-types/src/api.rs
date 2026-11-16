@@ -53,8 +53,10 @@ pub struct ListIssuesApiParams {
     /// Sort field: priority (default), created_at, updated_at or number.
     /// Ties are always broken deterministically — priority walks by creation
     /// time, number and then issue id; created_at and updated_at walks by
-    /// number then issue id; number walks by team id then issue id — all on
-    /// columns that never change for an issue, so a walk is stable.
+    /// number then issue id; number walks by team id then issue id. Team id is
+    /// not changed by a team rename, and the id columns never change; moving an
+    /// issue to another team does (it renumbers it and stamps `updated_at`), so
+    /// that write follows the snapshot rules like any other.
     pub sort_by: Option<String>,
     /// Sort direction: asc or desc. Default: asc for priority (Urgent first),
     /// desc for created_at, updated_at and number (newest first).
@@ -64,9 +66,10 @@ pub struct ListIssuesApiParams {
 /// A single composable filter clause: a `(field, operator, values)` triple.
 ///
 /// One (field, operator, values) triple of the shared issue filter model.
-/// Search compiles the clauses to SQL (`trakkt_auth::filter_sql`), `list_issues`
-/// and the issue list apply them with [`FilterClause::matches`], and the two
-/// are held together by a dual-backend parity test. Boolean fields (e.g.
+/// Search and `list_issues` compile the clauses to SQL
+/// (`trakkt_auth::filter_sql`); the UI issue list applies them with
+/// [`FilterClause::matches`], and the two are held together by a dual-backend
+/// parity test. Boolean fields (e.g.
 /// `is_sub_issue`) ignore `values` — the operator alone determines the match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FilterClause {
@@ -151,9 +154,9 @@ impl FilterClause {
 
     /// Whether `issue` passes this clause.
     ///
-    /// This is the single definition of the filter semantics: the issue list,
-    /// `list_issues` and search all use it (search also compiles the same
-    /// clauses to SQL, and a parity test holds the two together). Non-boolean
+    /// This is the single definition of the filter semantics: the UI issue list
+    /// uses it directly, and search and `list_issues` compile the same clauses
+    /// to SQL (a parity test holds the two together). Non-boolean
     /// clauses with no values, and unknown field/operator pairs, pass
     /// everything — except an empty `issue_id any_of`, which is the "no starred
     /// issues" set and therefore matches nothing.
@@ -297,12 +300,14 @@ pub struct ListIssuesResponse {
     /// in a fresh one (a request without `cursor`), and an issue that stops
     /// matching during the walk is absent from later pages.
     pub snapshot_at: String,
-    /// Rows this walk has returned so far, this page included: `total` plus
-    /// any issue served more than once (a write stamped at or before
-    /// `snapshot_at` that moved an already-served issue past the cursor), minus
-    /// any issue that stopped matching before it was served, plus any issue that
-    /// started matching without a write that moves `updated_at` (a label or
-    /// relation change). `has_more` false ends the walk whatever this says.
+    /// Rows this walk has returned so far, this page included: `total` plus any
+    /// issue served more than once (a write stamped at or before `snapshot_at`
+    /// that moved an already-served issue past the cursor), minus any issue that
+    /// stopped matching before it was served, minus any issue such a write moved
+    /// to before the cursor before it was served, plus any issue that started
+    /// matching without a write that moves `updated_at` (a label or relation
+    /// change) and was served. `has_more` false ends the walk whatever this
+    /// says.
     pub served_count: i64,
     /// Whether matching issues remain after this page.
     pub has_more: bool,
