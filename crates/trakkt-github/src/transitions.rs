@@ -812,10 +812,14 @@ pub async fn settle_after_reach_change(
     github_client: Option<&GitHubClient>,
     encryption_key: Option<&[u8; 32]>,
     workspace_id: &str,
-    reached_installation_id: Option<&str>,
+    reached_installation_id: &str,
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
 ) {
     let (Some(github_client), Some(encryption_key)) = (github_client, encryption_key) else {
+        tracing::debug!(
+            workspace_id,
+            "No GitHub client or key configured: held completions are not settled"
+        );
         return;
     };
     let env = Env {
@@ -832,13 +836,12 @@ pub async fn settle_after_reach_change(
 
 async fn settle_held_completions(
     env: Env<'_>,
-    reached_installation_id: Option<&str>,
+    reached_installation_id: &str,
 ) -> trakkt_core::Result<()> {
     let mut issue_ids =
         schema::list_issue_ids_with_pending_completion(env.db, env.workspace_id).await?;
-    if let Some(installation_id) = reached_installation_id {
-        issue_ids.extend(schema::list_issue_ids_with_open_links_on(env.db, installation_id).await?);
-    }
+    issue_ids
+        .extend(schema::list_issue_ids_with_open_links_on(env.db, reached_installation_id).await?);
     issue_ids.sort_unstable();
     issue_ids.dedup();
     let mut run = Run::new(env, None, false);

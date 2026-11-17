@@ -1968,7 +1968,7 @@ async fn the_settings_actions_settle_held_merges_through_the_same_sweep() {
         Some(&client),
         Some(&f.state.encryption_key),
         WORKSPACE,
-        Some(&f.organization.installation_id),
+        &f.organization.installation_id,
         None,
     )
     .await;
@@ -2029,7 +2029,7 @@ async fn removing_a_suspended_connection_releases_the_merge_its_open_pr_was_hold
         Some(&client),
         Some(&f.state.encryption_key),
         WORKSPACE,
-        Some(&f.organization.installation_id),
+        &f.organization.installation_id,
         None,
     )
     .await;

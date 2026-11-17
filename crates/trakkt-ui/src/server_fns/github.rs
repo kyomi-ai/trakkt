@@ -68,7 +68,7 @@ use super::{AuthenticatedContext, IntoServerFnError, require_workspace_admin};
 /// A settings action changed a connection's reach: release the completions held
 /// back by its PRs. See `trakkt_github::transitions::settle_after_reach_change`.
 #[cfg(feature = "ssr")]
-async fn settle_held_completions(
+async fn settle_after_reach_change(
     ctx: &super::ServerContext,
     workspace_id: &str,
     installation_id: &str,
@@ -78,7 +78,7 @@ async fn settle_held_completions(
         ctx.github_client.as_deref(),
         ctx.encryption_key.as_deref(),
         workspace_id,
-        Some(installation_id),
+        installation_id,
         ctx.ws_manager.as_ref(),
     )
     .await;
@@ -250,7 +250,7 @@ pub async fn complete_github_authorization(
     )
     .await
     .into_sfn()?;
-    settle_held_completions(&ctx, &connected.workspace_id, &connected.installation_id).await;
+    settle_after_reach_change(&ctx, &connected.workspace_id, &connected.installation_id).await;
     Ok(connected.workspace_id)
 }
 
@@ -267,7 +267,7 @@ pub async fn disconnect_github(connection_id: String) -> Result<(), ServerFnErro
     )
     .await
     .into_sfn()?;
-    settle_held_completions(&ac.ctx, &ac.ws_id, &connection_id).await;
+    settle_after_reach_change(&ac.ctx, &ac.ws_id, &connection_id).await;
     Ok(())
 }
 
@@ -285,7 +285,7 @@ pub async fn remove_github(connection_id: String) -> Result<(), ServerFnError> {
     )
     .await
     .into_sfn()?;
-    settle_held_completions(&ac.ctx, &ac.ws_id, &connection_id).await;
+    settle_after_reach_change(&ac.ctx, &ac.ws_id, &connection_id).await;
     Ok(())
 }
 

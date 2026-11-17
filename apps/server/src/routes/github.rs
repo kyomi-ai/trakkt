@@ -421,7 +421,7 @@ async fn settle_after_reach_change(state: &AppState, installation: &schema::GitH
         state.github_client.as_deref(),
         Some(&state.encryption_key),
         &installation.workspace_id,
-        Some(&installation.installation_id),
+        &installation.installation_id,
         Some(&state.ws_manager),
     )
     .await;
