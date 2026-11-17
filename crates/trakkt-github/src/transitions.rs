@@ -799,7 +799,7 @@ pub async fn apply_transition_rules(
 /// repository, or is removed, disconnected or uninstalled, its merge or close
 /// may never have been delivered, and nothing else will ever wake the issue.
 /// Every issue with a `completion_pending` mark is settled again, and so is every
-/// issue with an open working PR on `reached`, the connection that just changed
+/// issue with an open PR on `reached`, the connection that just changed
 /// (its PR may be the issue's only one, so no mark exists). `verify_holder` asks
 /// GitHub about whichever open PR still holds an issue. One issue failing does
 /// not stop the rest. A sweep moves issues; it posts no comment.
