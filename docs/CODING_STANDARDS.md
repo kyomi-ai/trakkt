@@ -289,17 +289,20 @@ that asks of a change.
 - **One word list.** Magic words are the four constants in `patterns.rs`, exactly
   Linear's lists. Adding or removing a word is a deliberate product change, made
   there and tested in `patterns.rs`.
-- **One behaviour table.** What a kind may do is `behavior()`. A new kind, step or
-  deviation is a row there plus a row in the table-driven test
+- **One behaviour table.** What a kind may do is `behavior()`; shared vocabulary
+  (`LinkKind`, `GitHubAutomationStep`, `StatusCategory`) lives in `trakkt-types`, not
+  as strings. A new kind, step or deviation is a row there plus a row in the table-driven test
   (`link_kind_by_event_by_starting_category_decides_the_status`), whose expectations
   are written out as data rather than derived from the code under test.
 - **Guards stay guards.** Completed/cancelled issues are never moved, moves are
-  forward-only, merge and close wait for the last open closing PR. Each has a test
+  forward-only, merge and close wait for the last open working-link PR and are
+  re-evaluated when one lets go, and the status write is a compare-and-set. Each has a test
   that fails without it; keep it that way when touching `apply_transition_rules`.
 - **Test the webhook, not only the function.** A change to link or automation
   behaviour adds an end-to-end case to `apps/server/tests/github_connections.rs`
   (signed delivery through the real route), and a schema or query change runs
-  through `dual_backend_test!` on SQLite and Postgres.
+  through `dual_backend_test!` on SQLite and Postgres. Settings writes (team rules,
+  linkback) record a sync entry in the same transaction and have a rollback test.
 - **A migration that changes link semantics is tested on populated rows**, as
   `link_intent_migration_backfills_kinds_conservatively` does, and backfills
   conservatively: anything that cannot be shown to be a working link becomes

@@ -8,6 +8,7 @@
 
 use leptos::prelude::*;
 use phosphor_leptos::{Icon, IconWeight};
+use trakkt_types::enums::{GitHubAutomationStep, StatusCategory};
 
 use crate::components::{
     Alert, AlertDescription, AlertVariant, Button, ButtonSize, ButtonVariant, Card, CardContent,
@@ -15,9 +16,10 @@ use crate::components::{
 };
 use crate::server_fns::github::{
     AutomationSettingsDisplay, GitHubConnectionDisplay, GitHubIntegrationStatus,
-    TeamAutomationDisplay, TransitionRuleDisplay, disconnect_github, get_automation_settings,
-    get_github_integration_status, get_transition_rules, remove_github, set_github_linkback,
-    set_team_automation_rule, start_github_connection, toggle_transition_rule,
+    TeamAutomationDisplay, TeamStepSetting, TransitionRuleDisplay, clear_team_automation_rule,
+    disconnect_github, get_automation_settings, get_github_integration_status,
+    get_transition_rules, remove_github, set_github_linkback, set_team_automation_rule,
+    start_github_connection, toggle_transition_rule,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -532,7 +534,7 @@ fn TransitionRulesSection() -> impl IntoView {
                                         <span class="font-mono text-[11px]">"Related to TRA-N"</span>
                                         "). Only closing words complete the issue on merge. "
                                         <span class="font-mono text-[11px]">"Skip TRA-N"</span>
-                                        " prevents linking. A key mentioned in the description never changes status. Drafts do nothing until marked ready, and issues are never moved backwards or out of Done or Cancelled."
+                                        " prevents linking. A key mentioned in the description never changes status. A draft PR does nothing unless a team gives the draft step a rule, and issues are never moved backwards or out of Done or Cancelled."
                                     </p>
                                 }.into_any()
                             }
@@ -558,44 +560,100 @@ fn TransitionRulesSection() -> impl IntoView {
 // Team automation section
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The steps a team can override, with the label shown for each.
-const TEAM_STEPS: [(&str, &str); 4] = [
-    ("pr_draft", "PR opened as draft"),
-    ("pr_opened", "PR opened or ready for review"),
-    ("pr_merged", "PR merged"),
-    ("pr_closed", "PR closed without merge"),
-];
+/// What a team's step is set to, as the select offers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamStepChoice {
+    /// No override: the workspace rule applies.
+    WorkspaceDefault,
+    /// The step does nothing for this team.
+    NoAction,
+    /// Move the issue to this status category.
+    Target(StatusCategory),
+}
 
-/// What a team's step can be set to. `default` removes the override.
+impl TeamStepChoice {
+    fn value(self) -> String {
+        match self {
+            Self::WorkspaceDefault => "default".to_string(),
+            Self::NoAction => "none".to_string(),
+            Self::Target(category) => category.as_str().to_string(),
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::WorkspaceDefault),
+            "none" => Some(Self::NoAction),
+            other => StatusCategory::parse(other).map(Self::Target),
+        }
+    }
+
+    fn from_override(setting: Option<&TeamStepSetting>) -> Self {
+        match setting {
+            None => Self::WorkspaceDefault,
+            Some(TeamStepSetting { target: None, .. }) => Self::NoAction,
+            Some(TeamStepSetting {
+                target: Some(category),
+                ..
+            }) => Self::Target(*category),
+        }
+    }
+}
+
+/// What a team's step can be set to.
 fn team_step_options() -> Vec<(String, String)> {
-    [
-        ("default", "Workspace default"),
-        ("none", "No action"),
-        ("backlog", "Backlog"),
-        ("unstarted", "Todo"),
-        ("started", "In Progress"),
-        ("completed", "Done"),
-        ("cancelled", "Cancelled"),
-    ]
-    .into_iter()
-    .map(|(value, label)| (value.to_string(), label.to_string()))
-    .collect()
+    let mut options = vec![
+        (TeamStepChoice::WorkspaceDefault, "Workspace default"),
+        (TeamStepChoice::NoAction, "No action"),
+    ];
+    options.extend(
+        StatusCategory::all()
+            .iter()
+            .map(|c| (TeamStepChoice::Target(*c), format_target_status(c.as_str()))),
+    );
+    options
+        .into_iter()
+        .map(|(choice, label)| (choice.value(), label.to_string()))
+        .collect()
 }
 
 /// The PR linkback comment switch and each team's overrides of the shared rules.
 #[component]
 fn TeamAutomationSection() -> impl IntoView {
     let (version, set_version) = signal(0u32);
-    let settings = Resource::new(move || version.get(), |_| get_automation_settings());
+    let (save_error, set_save_error) = signal(None::<String>);
+    let settings_version = use_context::<crate::cache::store::SyncStore>()
+        .map(|store| store.integration_settings_version());
+    let settings = Resource::new(
+        move || {
+            (
+                version.get(),
+                settings_version.as_ref().map(|v| v.get()).unwrap_or(0),
+            )
+        },
+        |_| get_automation_settings(),
+    );
 
     view! {
         <div class="space-y-3" data-github-team-automation>
             <p class="text-sm font-medium text-foreground">"Team automation"</p>
+            {move || save_error.get().map(|message| view! {
+                <Alert variant=AlertVariant::Error>
+                    <AlertDescription>{message}</AlertDescription>
+                </Alert>
+            })}
             <Transition fallback=move || view! { <Skeleton class="h-4 w-full"/> }>
                 {move || Suspend::new(async move {
                     match settings.await {
                         Ok(settings) => view! {
-                            <TeamAutomationBody settings=settings on_changed=Callback::new(move |()| set_version.update(|v| *v += 1))/>
+                            <TeamAutomationBody
+                                settings=settings
+                                // Reloading rebuilds every select from what the
+                                // server holds, so a failed save never leaves a
+                                // choice on screen that was not saved.
+                                on_changed=Callback::new(move |()| set_version.update(|v| *v += 1))
+                                on_error=Callback::new(move |message: Option<String>| set_save_error.set(message))
+                            />
                         }.into_any(),
                         Err(e) => view! {
                             <Alert variant=AlertVariant::Error>
@@ -615,6 +673,7 @@ fn TeamAutomationSection() -> impl IntoView {
 fn TeamAutomationBody(
     settings: AutomationSettingsDisplay,
     on_changed: Callback<()>,
+    on_error: Callback<Option<String>>,
 ) -> impl IntoView {
     let (linkback, set_linkback) = signal(settings.linkback_enabled);
     let linkback_action = Action::new(move |enabled: &bool| {
@@ -625,16 +684,18 @@ fn TeamAutomationBody(
         if let Some(Err(e)) = linkback_action.value().get() {
             tracing::warn!("Failed to change linkback comment setting: {e}");
             set_linkback.update(|v| *v = !*v);
+            on_error.run(Some(format!("Could not save the PR comment setting: {e}")));
         }
     });
     let on_linkback = Callback::new(move |enabled: bool| {
+        on_error.run(None);
         set_linkback.set(enabled);
         linkback_action.dispatch(enabled);
     });
 
     view! {
         <div class="flex items-center justify-between py-1.5">
-            <p class="text-sm text-foreground">"Comment on the PR when it changes an issue's status"</p>
+            <p class="text-sm text-foreground">"Comment on the PR when automation changes an issue's status"</p>
             <Switch checked=Signal::derive(move || linkback.get()) on_change=on_linkback/>
         </div>
         <p class="text-xs text-muted-foreground">
@@ -642,60 +703,64 @@ fn TeamAutomationBody(
         </p>
         <div class="space-y-4">
             {settings.teams.into_iter().map(|team| {
-                view! { <TeamAutomationRow team=team on_changed=on_changed/> }
+                view! { <TeamAutomationRow team=team on_changed=on_changed on_error=on_error/> }
             }).collect_view()}
         </div>
     }
 }
 
 #[component]
-fn TeamAutomationRow(team: TeamAutomationDisplay, on_changed: Callback<()>) -> impl IntoView {
+fn TeamAutomationRow(
+    team: TeamAutomationDisplay,
+    on_changed: Callback<()>,
+    on_error: Callback<Option<String>>,
+) -> impl IntoView {
     let team_id = team.team_id.clone();
-    let save = Action::new(move |(trigger, choice): &(String, String)| {
+    let save = Action::new(move |(step, choice): &(GitHubAutomationStep, TeamStepChoice)| {
         let team_id = team_id.clone();
-        let (trigger, choice) = (trigger.clone(), choice.clone());
+        let (step, choice) = (*step, *choice);
         async move {
-            let result = set_team_automation_rule(team_id, trigger, choice).await;
-            if result.is_ok() {
-                on_changed.run(());
+            let result = match choice {
+                TeamStepChoice::WorkspaceDefault => clear_team_automation_rule(team_id, step).await,
+                TeamStepChoice::NoAction => set_team_automation_rule(team_id, step, None).await,
+                TeamStepChoice::Target(category) => {
+                    set_team_automation_rule(team_id, step, Some(category)).await
+                }
+            };
+            match &result {
+                Ok(()) => on_error.run(None),
+                Err(e) => on_error.run(Some(format!("Could not save the team rule: {e}"))),
             }
+            // Success or not, show what the server now holds.
+            on_changed.run(());
             result
         }
     });
-    let failure = move || {
-        save.value()
-            .get()
-            .and_then(|r| r.err())
-            .map(|e| format!("Could not save: {e}"))
-    };
 
     view! {
         <div class="space-y-1" data-github-team=team.key.clone()>
             <p class="text-sm font-medium text-foreground">{format!("{} ({})", team.name, team.key)}</p>
-            {TEAM_STEPS.into_iter().map(|(step, label)| {
-                let current = team
-                    .overrides
-                    .iter()
-                    .find(|o| o.trigger_event == step)
-                    .map(|o| o.choice.clone())
-                    .unwrap_or_else(|| "default".to_string());
-                let step_owned = step.to_string();
+            {GitHubAutomationStep::all().iter().map(|step| {
+                let step = *step;
+                let current = TeamStepChoice::from_override(
+                    team.overrides.iter().find(|o| o.step == step),
+                )
+                .value();
                 view! {
                     <div class="flex items-center justify-between gap-3 py-0.5">
-                        <span class="text-sm text-muted-foreground">{label}</span>
+                        <span class="text-sm text-muted-foreground">{step.label()}</span>
                         <Select
                             value=Signal::derive(move || current.clone())
                             options=Signal::derive(team_step_options)
-                            on_change=Callback::new(move |choice: String| {
-                                save.dispatch((step_owned.clone(), choice));
+                            on_change=Callback::new(move |value: String| {
+                                if let Some(choice) = TeamStepChoice::parse(&value) {
+                                    save.dispatch((step, choice));
+                                }
                             })
                         />
                     </div>
                 }
             }).collect_view()}
-            {move || failure().map(|message| view! {
-                <p class="text-xs text-destructive">{message}</p>
-            })}
         </div>
     }
 }
@@ -748,8 +813,8 @@ fn TransitionRuleRow(rule: TransitionRuleDisplay) -> impl IntoView {
 fn format_rule_description(trigger_event: &str) -> String {
     match trigger_event {
         "pr_opened" => "When a PR linked to the issue is opened or marked ready for review".to_string(),
-        "pr_merged" => "When the last PR that closes the issue is merged".to_string(),
-        "pr_closed" => "When the last PR that closes the issue is closed without merge".to_string(),
+        "pr_merged" => "When the last open PR linked to the issue is merged".to_string(),
+        "pr_closed" => "When a PR that closes the issue is closed without merge (and no other PR is linked)".to_string(),
         other => other.to_string(),
     }
 }

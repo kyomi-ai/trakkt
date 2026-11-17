@@ -3720,12 +3720,13 @@ fn render_github_link(link: GitHubLinkDisplay) -> impl IntoView {
 
 /// What a pull request link does to the issue, in words. `branch_title` is the
 /// ordinary case (the PR is about this issue) and says nothing extra.
-fn link_kind_note(kind: &str) -> Option<&'static str> {
+fn link_kind_note(kind: trakkt_types::enums::LinkKind) -> Option<&'static str> {
+    use trakkt_types::enums::LinkKind;
     match kind {
-        "closing" => Some("Closes this issue"),
-        "contributing" => Some("Part of this issue"),
-        "related" => Some("Mentions this issue"),
-        _ => None,
+        LinkKind::Closing => Some("Closes this issue"),
+        LinkKind::Contributing => Some("Part of this issue"),
+        LinkKind::Related => Some("Mentions this issue"),
+        LinkKind::BranchTitle => None,
     }
 }
 
@@ -3741,7 +3742,7 @@ fn render_pr_link(link: GitHubLinkDisplay) -> impl IntoView {
     };
     let author_text = link.author_login.as_deref().map(|a| format!("@{a}"));
     let time_text = relative_time(&link.created_at);
-    let kind_note = link_kind_note(&link.link_kind);
+    let kind_note = link_kind_note(link.link_kind);
     let url = link.url.clone();
     let repo = link.repo_full_name.clone();
 

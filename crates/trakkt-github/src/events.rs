@@ -21,6 +21,14 @@ use crate::schema::{self, CreateLinkParams, GitHubInstallation};
 // Pull Request Processing
 // ===========================================================================
 
+/// What processing a `pull_request` event left for the status automation.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PullRequestOutcome {
+    /// Issues an edit unlinked from the PR. A completion that was held back by
+    /// this PR (an open closing sibling) may now be due.
+    pub released_issue_ids: Vec<String>,
+}
+
 /// Process a `pull_request` webhook event.
 ///
 /// Reads link intent from the PR title, body, and branch name, validates the
@@ -35,16 +43,16 @@ pub async fn process_pull_request(
     payload: &serde_json::Value,
     ws_manager: Option<&WebSocketManager>,
     app_url: &str,
-) -> trakkt_core::Result<()> {
+) -> trakkt_core::Result<PullRequestOutcome> {
     let current = schema::get_installation_by_id(db, &installation.installation_id).await?;
     let Some(current) = current else {
-        return Ok(());
+        return Ok(PullRequestOutcome::default());
     };
     let repository = payload
         .pointer("/repository/full_name")
         .and_then(serde_json::Value::as_str);
     if !repository.is_some_and(|repo| current.allows_repository(repo)) {
-        return Ok(());
+        return Ok(PullRequestOutcome::default());
     }
     let installation = &current;
     let admission = schema::ConnectionAdmission {
@@ -56,7 +64,7 @@ pub async fn process_pull_request(
         Some(pr) => pr,
         None => {
             tracing::warn!("pull_request event missing 'pull_request' field");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -66,7 +74,7 @@ pub async fn process_pull_request(
         Some(t) => t.to_string(),
         None => {
             tracing::warn!("pull_request event missing title");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -78,7 +86,7 @@ pub async fn process_pull_request(
         Some(b) => b.to_string(),
         None => {
             tracing::warn!("pull_request event missing head.ref");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -86,7 +94,7 @@ pub async fn process_pull_request(
         Some(n) => n,
         None => {
             tracing::warn!("pull_request event missing number");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -94,7 +102,7 @@ pub async fn process_pull_request(
         Some(u) => u.to_string(),
         None => {
             tracing::warn!("pull_request event missing html_url");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -121,20 +129,45 @@ pub async fn process_pull_request(
         Some(r) => r.to_string(),
         None => {
             tracing::warn!("pull_request event missing repository.full_name");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
     // ── Determine PR state ────────────────────────────────────────────────
 
-    let pr_state = determine_pr_state(action, merged, draft);
+    let github_state = pr.get("state").and_then(|v| v.as_str());
+    let mut pr_state = determine_pr_state(action, merged, draft, github_state);
+
+    // A finished PR does not become open again because an edit or a late or
+    // repeated delivery says so: only `reopened` does. Otherwise a stale
+    // `open` would hold back every sibling PR's completion.
+    let existing = schema::list_pr_links_by_ref(
+        db,
+        &installation.workspace_id,
+        &repo,
+        &pr_number.to_string(),
+    )
+    .await?;
+    let existing_terminal = existing.iter().find_map(|l| {
+        l.state
+            .as_deref()
+            .filter(|s| matches!(*s, "merged" | "closed"))
+    });
+    if let Some(terminal) = existing_terminal
+        && matches!(pr_state.as_str(), "open" | "draft")
+        && action != "reopened"
+    {
+        tracing::info!(pr_number, repo = %repo, action, kept = terminal,
+            "Ignoring an open state for a PR already finished");
+        pr_state = terminal.to_string();
+    }
 
     // ── Read link intent ──────────────────────────────────────────────────
     //
     // The title and branch are working links; a bare key in the body is a
     // mention. A magic word raises any of them, `skip` removes the issue.
 
-    let links = patterns::combine(vec![
+    let link_set = patterns::combine(vec![
         patterns::parse_text(&title, LinkKind::BranchTitle, app_url),
         patterns::parse_text(body.as_deref().unwrap_or(""), LinkKind::Related, app_url),
         patterns::parse_text(&branch_name, LinkKind::BranchTitle, app_url),
@@ -144,7 +177,7 @@ pub async fn process_pull_request(
 
     let mut valid_issue_ids: Vec<String> = Vec::new();
 
-    for (issue_ref, link_kind) in &links {
+    for (issue_ref, link_kind) in &link_set.links {
         let issue = match validate_issue_ref(db, &installation.workspace_id, issue_ref).await? {
             Some(i) => i,
             None => continue,
@@ -173,6 +206,33 @@ pub async fn process_pull_request(
 
         valid_issue_ids.push(issue.issue_id.clone());
     }
+
+    // `Ignore X-1` also removes the branch link an earlier push made for X-1.
+    let mut skipped_issue_ids: Vec<String> = Vec::new();
+    for issue_ref in &link_set.skipped {
+        if let Some(issue) = validate_issue_ref(db, &installation.workspace_id, issue_ref).await? {
+            skipped_issue_ids.push(issue.issue_id);
+        }
+    }
+    if !skipped_issue_ids.is_empty() {
+        schema::delete_branch_links_for_issues(
+            db,
+            &installation.workspace_id,
+            &repo,
+            &branch_name,
+            &skipped_issue_ids,
+            Some(&admission),
+        )
+        .await?;
+    }
+
+    // Issues this PR no longer links, so their held-back completion can be
+    // re-evaluated.
+    let released_issue_ids: Vec<String> = existing
+        .iter()
+        .filter(|l| !valid_issue_ids.contains(&l.issue_id))
+        .map(|l| l.issue_id.clone())
+        .collect();
 
     // ── For "edited" action, remove stale links ───────────────────────────
 
@@ -246,7 +306,13 @@ pub async fn process_pull_request(
         "Processed pull_request event"
     );
 
-    Ok(())
+    Ok(PullRequestOutcome {
+        released_issue_ids: if action == "edited" {
+            released_issue_ids
+        } else {
+            Vec::new()
+        },
+    })
 }
 
 // ===========================================================================
@@ -600,10 +666,18 @@ async fn resolve_author_actor(db: &DbPool, email: Option<&str>) -> Option<String
 }
 
 /// Determine the PR state string from the webhook action and PR flags.
-fn determine_pr_state(action: &str, merged: bool, draft: bool) -> String {
-    if action == "closed" && merged {
+///
+/// The payload's own `merged` and `state` decide whether the PR is finished,
+/// not only the action: an `edited` delivery on a merged PR is still merged.
+fn determine_pr_state(
+    action: &str,
+    merged: bool,
+    draft: bool,
+    github_state: Option<&str>,
+) -> String {
+    if merged {
         "merged".to_string()
-    } else if action == "closed" {
+    } else if action == "closed" || github_state == Some("closed") {
         "closed".to_string()
     } else if draft {
         "draft".to_string()
@@ -669,51 +743,57 @@ mod tests {
 
     #[test]
     fn pr_state_merged() {
-        assert_eq!(determine_pr_state("closed", true, false), "merged");
+        assert_eq!(determine_pr_state("closed", true, false, None), "merged");
     }
 
     #[test]
     fn pr_state_closed_not_merged() {
-        assert_eq!(determine_pr_state("closed", false, false), "closed");
+        assert_eq!(determine_pr_state("closed", false, false, None), "closed");
     }
 
     #[test]
     fn pr_state_draft() {
-        assert_eq!(determine_pr_state("opened", false, true), "draft");
+        assert_eq!(determine_pr_state("opened", false, true, None), "draft");
     }
 
     #[test]
     fn pr_state_open() {
-        assert_eq!(determine_pr_state("opened", false, false), "open");
+        assert_eq!(determine_pr_state("opened", false, false, None), "open");
     }
 
     #[test]
     fn pr_state_reopened_draft() {
         // Draft takes precedence when not closed
-        assert_eq!(determine_pr_state("reopened", false, true), "draft");
+        assert_eq!(determine_pr_state("reopened", false, true, None), "draft");
     }
 
     #[test]
     fn pr_state_closed_merged_overrides_draft() {
         // Merged takes precedence over draft when action is "closed"
-        assert_eq!(determine_pr_state("closed", true, true), "merged");
+        assert_eq!(determine_pr_state("closed", true, true, None), "merged");
     }
 
     #[test]
     fn pr_state_synchronize() {
-        assert_eq!(determine_pr_state("synchronize", false, false), "open");
+        assert_eq!(
+            determine_pr_state("synchronize", false, false, None),
+            "open"
+        );
     }
 
     #[test]
     fn pr_state_ready_for_review() {
         // When a PR is marked ready, draft=false
-        assert_eq!(determine_pr_state("ready_for_review", false, false), "open");
+        assert_eq!(
+            determine_pr_state("ready_for_review", false, false, None),
+            "open"
+        );
     }
 
     #[test]
     fn pr_state_converted_to_draft() {
         assert_eq!(
-            determine_pr_state("converted_to_draft", false, true),
+            determine_pr_state("converted_to_draft", false, true, None),
             "draft"
         );
     }

@@ -36,3 +36,31 @@ CREATE TABLE github_automation_settings (
     workspace_id TEXT NOT NULL PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     linkback_enabled INTEGER NOT NULL DEFAULT 1
 );
+
+-- A rule's identity is its trigger. Which link kinds may fire a step is now
+-- decided in code from the link's kind, so `close_intent_required` goes. A
+-- workspace that had both variants of a trigger keeps the one that applied to
+-- closing links (the `true` row if there is one).
+CREATE TABLE github_transition_rules_new (
+    rule_id TEXT NOT NULL PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    trigger_event TEXT NOT NULL,
+    target_status_category TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(workspace_id, trigger_event)
+);
+
+INSERT INTO github_transition_rules_new (
+    rule_id, workspace_id, trigger_event, target_status_category, enabled, created_at
+)
+SELECT r.rule_id, r.workspace_id, r.trigger_event, r.target_status_category, r.enabled, r.created_at
+FROM github_transition_rules r
+WHERE r.rule_id = (
+        SELECT r2.rule_id FROM github_transition_rules r2
+        WHERE r2.workspace_id = r.workspace_id AND r2.trigger_event = r.trigger_event
+        ORDER BY r2.close_intent_required DESC, r2.rule_id
+        LIMIT 1);
+
+DROP TABLE github_transition_rules;
+ALTER TABLE github_transition_rules_new RENAME TO github_transition_rules;

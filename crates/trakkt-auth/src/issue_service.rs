@@ -1444,6 +1444,15 @@ pub async fn update_issue_with_admission(
         None
     };
 
+    // Compare-and-set for callers that decided from an earlier read.
+    if let (Some(expected), Some((current, _))) = (&updates.expected_status_id, &previous_status)
+        && expected != current
+    {
+        return Err(trakkt_core::Error::Conflict(
+            "issue status changed since it was read".into(),
+        ));
+    }
+
     // Bind dynamically. Map to rows_affected() inside the closure so both
     // backend arms return the same type (u64).
     let affected: u64 = trakkt_core::tx_with!(&mut tx, |e| {

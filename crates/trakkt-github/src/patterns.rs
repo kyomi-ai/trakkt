@@ -59,44 +59,7 @@ pub fn extract_issue_refs(text: &str) -> Vec<IssueRef> {
 // docs/ARCHITECTURE.md) links on *intent*: a magic word before the key, the
 // branch name, or the PR title. Everything else is a mention.
 
-/// What a link between a GitHub object and an issue is allowed to do.
-///
-/// Ordered weakest to strongest; when several sources name the same issue the
-/// strongest wins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum LinkKind {
-    /// Shown on the issue and the PR. Never changes status.
-    Related,
-    /// The key is in the branch name or the PR title. Starts the issue.
-    BranchTitle,
-    /// A non-closing magic word (`Refs`, `Part of`, ...). Starts the issue.
-    Contributing,
-    /// A closing magic word (`Fixes`, `Closes`, ...). Starts and completes.
-    Closing,
-}
-
-impl LinkKind {
-    /// The value stored in `github_links.link_kind`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Related => "related",
-            Self::BranchTitle => "branch_title",
-            Self::Contributing => "contributing",
-            Self::Closing => "closing",
-        }
-    }
-
-    /// Parse the stored value. Unknown values are an error, not a default.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "related" => Some(Self::Related),
-            "branch_title" => Some(Self::BranchTitle),
-            "contributing" => Some(Self::Contributing),
-            "closing" => Some(Self::Closing),
-            _ => None,
-        }
-    }
-}
+pub use trakkt_types::enums::LinkKind;
 
 /// Words that link with closing behaviour. Exactly Linear's list.
 const CLOSING_WORDS: &[&str] = &[
@@ -142,23 +105,25 @@ enum WordIntent {
     Skip,
 }
 
-static MAGIC_WORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+/// Every magic word with what it means, longest first so `fixes` is not read
+/// as `fix` + `es`. The one place the lists above are joined.
+static MAGIC_WORDS: LazyLock<Vec<(String, WordIntent)>> = LazyLock::new(|| {
     let mut words: Vec<(String, WordIntent)> = Vec::new();
-    for w in CLOSING_WORDS {
-        words.push(((*w).into(), WordIntent::Link(LinkKind::Closing)));
+    let groups: [(&[&str], WordIntent); 4] = [
+        (CLOSING_WORDS, WordIntent::Link(LinkKind::Closing)),
+        (CONTRIBUTING_WORDS, WordIntent::Link(LinkKind::Contributing)),
+        (RELATED_WORDS, WordIntent::Link(LinkKind::Related)),
+        (SKIP_WORDS, WordIntent::Skip),
+    ];
+    for (list, intent) in groups {
+        words.extend(list.iter().map(|w| ((*w).to_string(), intent)));
     }
-    for w in CONTRIBUTING_WORDS {
-        words.push(((*w).into(), WordIntent::Link(LinkKind::Contributing)));
-    }
-    for w in RELATED_WORDS {
-        words.push(((*w).into(), WordIntent::Link(LinkKind::Related)));
-    }
-    for w in SKIP_WORDS {
-        words.push(((*w).into(), WordIntent::Skip));
-    }
-    // Longest first so `fixes` is not read as `fix` + `es`.
     words.sort_by_key(|(w, _)| std::cmp::Reverse(w.len()));
-    let alternation = words
+    words
+});
+
+static MAGIC_WORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    let alternation = MAGIC_WORDS
         .iter()
         .map(|(w, _)| regex::escape(w).replace(' ', r"\s+"))
         .collect::<Vec<_>>()
@@ -172,18 +137,10 @@ fn word_intent(word: &str) -> Option<WordIntent> {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
-    let is = |list: &[&str]| list.contains(&normalized.as_str());
-    if is(CLOSING_WORDS) {
-        Some(WordIntent::Link(LinkKind::Closing))
-    } else if is(CONTRIBUTING_WORDS) {
-        Some(WordIntent::Link(LinkKind::Contributing))
-    } else if is(RELATED_WORDS) {
-        Some(WordIntent::Link(LinkKind::Related))
-    } else if is(SKIP_WORDS) {
-        Some(WordIntent::Skip)
-    } else {
-        None
-    }
+    MAGIC_WORDS
+        .iter()
+        .find(|(w, _)| *w == normalized)
+        .map(|(_, intent)| *intent)
 }
 
 static BARE_KEY_TOKEN_RE: LazyLock<Regex> =
@@ -254,6 +211,14 @@ fn read_ref_list(rest: &str, app_host: Option<&str>) -> Vec<IssueRef> {
     found
 }
 
+/// Record `kind` for `issue_ref`, keeping the strongest kind seen for it.
+fn raise_kind(list: &mut Vec<(IssueRef, LinkKind)>, issue_ref: IssueRef, kind: LinkKind) {
+    match list.iter_mut().find(|(r, _)| *r == issue_ref) {
+        Some((_, existing)) => *existing = (*existing).max(kind),
+        None => list.push((issue_ref, kind)),
+    }
+}
+
 /// The outcome of reading one piece of text.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TextIntent {
@@ -270,27 +235,27 @@ pub fn parse_text(text: &str, bare: LinkKind, app_url: &str) -> TextIntent {
     let app_host = host_of(app_url);
     let mut kinds: Vec<(IssueRef, LinkKind)> = Vec::new();
     let mut skipped = HashSet::new();
-    let mut raise =
-        |issue_ref: IssueRef, kind: LinkKind| match kinds.iter_mut().find(|(r, _)| *r == issue_ref)
-        {
-            Some((_, existing)) => *existing = (*existing).max(kind),
-            None => kinds.push((issue_ref, kind)),
-        };
     for m in MAGIC_WORD_RE.find_iter(text) {
         let Some(intent) = word_intent(m.as_str()) else {
             continue;
         };
         for issue_ref in read_ref_list(&text[m.end()..], app_host.as_deref()) {
             match intent {
-                WordIntent::Link(kind) => raise(issue_ref, kind),
+                WordIntent::Link(kind) => raise_kind(&mut kinds, issue_ref, kind),
                 WordIntent::Skip => {
                     skipped.insert(issue_ref);
                 }
             }
         }
     }
+    // A key with a magic word already has the author's stated intent; the
+    // bare default only applies to keys named without one, so `Related to X-1`
+    // in a PR title is related, not a title link.
+    let worded: HashSet<IssueRef> = kinds.iter().map(|(r, _)| r.clone()).collect();
     for issue_ref in extract_issue_refs(text) {
-        raise(issue_ref, bare);
+        if !worded.contains(&issue_ref) {
+            raise_kind(&mut kinds, issue_ref, bare);
+        }
     }
     kinds.retain(|(r, _)| !skipped.contains(r));
     TextIntent {
@@ -299,22 +264,28 @@ pub fn parse_text(text: &str, bare: LinkKind, app_url: &str) -> TextIntent {
     }
 }
 
+/// The final link set of one GitHub object.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LinkSet {
+    /// The strongest kind per issue, in order of first appearance.
+    pub links: Vec<(IssueRef, LinkKind)>,
+    /// Issues a `skip`/`ignore` removed. A link to them must not exist.
+    pub skipped: HashSet<IssueRef>,
+}
+
 /// Combine the pieces of one GitHub object (title, body, branch, ...) into
 /// the final link set: the strongest kind per issue, and `skip` in any piece
 /// removing the issue altogether, branch name included.
-pub fn combine(parts: Vec<TextIntent>) -> Vec<(IssueRef, LinkKind)> {
+pub fn combine(parts: Vec<TextIntent>) -> LinkSet {
     let skipped: HashSet<IssueRef> = parts.iter().flat_map(|p| p.skipped.clone()).collect();
-    let mut combined: Vec<(IssueRef, LinkKind)> = Vec::new();
+    let mut links: Vec<(IssueRef, LinkKind)> = Vec::new();
     for (issue_ref, kind) in parts.into_iter().flat_map(|p| p.refs) {
         if skipped.contains(&issue_ref) {
             continue;
         }
-        match combined.iter_mut().find(|(r, _)| *r == issue_ref) {
-            Some((_, existing)) => *existing = (*existing).max(kind),
-            None => combined.push((issue_ref, kind)),
-        }
+        raise_kind(&mut links, issue_ref, kind);
     }
-    combined
+    LinkSet { links, skipped }
 }
 
 #[cfg(test)]
@@ -588,8 +559,8 @@ mod tests {
         );
         assert_eq!(
             kinds("Related to TRA-1", LinkKind::BranchTitle),
-            vec![(r("TRA", 1), LinkKind::BranchTitle)],
-            "the strongest source wins, a relation word never weakens a title link"
+            vec![(r("TRA", 1), LinkKind::Related)],
+            "an explicit relation word overrides the text's bare default"
         );
     }
 
@@ -603,7 +574,7 @@ mod tests {
         );
         let branch = parse_text("tra-2-thing", LinkKind::BranchTitle, APP);
         assert_eq!(
-            combine(vec![title, body, branch]),
+            combine(vec![title, body, branch]).links,
             vec![
                 (r("TRA", 1), LinkKind::Closing),
                 (r("TRA", 3), LinkKind::Related)

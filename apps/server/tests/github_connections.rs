@@ -18,6 +18,7 @@ use trakkt_core::{
     test_helpers::{seed_team, seed_user, seed_workspace},
 };
 use trakkt_github::schema::{self, GitHubInstallation};
+use trakkt_types::enums::{GitHubAutomationStep, StatusCategory};
 use trakkt_server::state::AppState;
 
 const WORKSPACE: &str = "github-workspace";
@@ -506,76 +507,8 @@ async fn reopen_by_hand(f: &Fixture) {
 
 #[tokio::test]
 async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_nothing() {
-    use axum::{
-        Json,
-        extract::State,
-        http::{HeaderMap, Uri},
-    };
-    use std::sync::{Arc, Mutex};
-    type Calls = Arc<Mutex<Vec<(String, String)>>>;
-    async fn github_fixture(
-        State(calls): State<Calls>,
-        uri: Uri,
-        headers: HeaderMap,
-    ) -> Json<Value> {
-        let path = uri.path().to_owned();
-        let authorization = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .expect("all GitHub requests carry credentials")
-            .to_owned();
-        calls
-            .lock()
-            .expect("lock fixture request ledger")
-            .push((path.clone(), authorization));
-        if path.ends_with("/access_tokens") {
-            let token = match path.as_str() {
-                "/app/installations/101/access_tokens" => "fixture-personal-token",
-                "/app/installations/202/access_tokens" => "fixture-org-token",
-                _ => panic!("unexpected installation token request: {path}"),
-            };
-            Json(
-                json!({"token":token,"expires_at":(chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()}),
-            )
-        } else {
-            assert!(
-                path.ends_with("/comments"),
-                "unexpected outbound mutation: {path}"
-            );
-            Json(json!({"id":1}))
-        }
-    }
-    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind isolated GitHub fixture");
-    let endpoint = format!(
-        "http://{}",
-        listener.local_addr().expect("read fixture address")
-    );
-    let api = Router::new()
-        .fallback(github_fixture)
-        .with_state(calls.clone());
-    let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, api)
-            .with_graceful_shutdown(async {
-                stopped.await.expect("receive fixture shutdown");
-            })
-            .await
-            .expect("serve isolated GitHub fixture");
-    });
     let mut f = fixture().await;
-    f.state.github_client = Some(Arc::new(
-        trakkt_github::GitHubClient::for_test_endpoint(42, &TEST_KEY, &endpoint)
-            .expect("build loopback-only GitHub client"),
-    ));
-    f.router = Router::new()
-        .nest("/webhooks", trakkt_server::routes::github::routes())
-        .with_state(f.state.clone());
-    schema::seed_default_transition_rules(&f.state.db, WORKSPACE)
-        .await
-        .expect("seed shared workspace rules");
+    let stub = GithubStub::attach(&mut f).await;
     let foreign_before = trakkt_auth::issue_service::get_issue_by_id(&f.state.db, &f.foreign_issue)
         .await
         .expect("read foreign ticket")
@@ -598,9 +531,7 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
             // The ticket is Done from the first PR's merge. Opening another PR
             // that names it is not a decision to reopen it.
             let comment_count = || {
-                calls
-                    .lock()
-                    .expect("count comments")
+                stub.requests()
                     .iter()
                     .filter(|(path, _)| path.ends_with("/comments"))
                     .count()
@@ -701,7 +632,7 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
             .as_deref(),
         Some("Done")
     );
-    let before_disconnect = calls.lock().expect("snapshot outgoing calls").clone();
+    let before_disconnect = stub.requests();
     let comments: Vec<_> = before_disconnect
         .iter()
         .filter(|(path, _)| path.ends_with("/comments"))
@@ -756,7 +687,7 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
     )
     .await;
     assert_eq!(
-        *calls.lock().expect("check disconnected outgoing ledger"),
+        stub.requests(),
         before_disconnect
     );
     assert_eq!(
@@ -789,14 +720,12 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
         started
     );
     assert_eq!(
-        calls
-            .lock()
-            .expect("read other account outgoing call")
+        stub.requests()
             .last()
             .expect("other account posts comment"),
         &(
-            "/repos/fixture-org/repo/issues/4/comments".into(),
-            "Bearer fixture-org-token".into()
+            "/repos/fixture-org/repo/issues/4/comments".to_string(),
+            "Bearer fixture-org-token".to_string()
         )
     );
     assert_eq!(
@@ -808,8 +737,7 @@ async fn shared_merge_rules_use_each_account_token_and_disconnected_events_send_
         foreign_before
     );
     assert!(links(&f, &f.foreign_issue).await.is_empty());
-    shutdown.send(()).expect("stop GitHub fixture listener");
-    trakkt_core::test_helpers::task::join_soon(server, "GitHub fixture graceful shutdown").await;
+    stub.stop().await;
 }
 
 #[tokio::test]
@@ -1058,32 +986,50 @@ async fn signed_all_to_selected_fetches_retained_repositories_and_cannot_revive_
 // stub, because the incident was a webhook delivery that moved tickets. Every
 // case reads the ticket's status back through the issue service.
 
-/// A loopback GitHub that answers token and comment requests and remembers the
-/// comment bodies, so a test can assert what was (not) posted on the PR.
+/// A loopback GitHub that answers token and comment requests. It records every
+/// request (path and credentials) and every comment body, so a test can assert
+/// what was, and was not, sent to GitHub and with whose token.
 struct GithubStub {
+    requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     comments: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    server: Option<tokio::task::JoinHandle<()>>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<()>,
 }
 
 impl GithubStub {
     async fn attach(f: &mut Fixture) -> Self {
-        use axum::{Json, extract::State};
+        use axum::{Json, extract::State, http::HeaderMap};
         use std::sync::{Arc, Mutex};
+        type Requests = Arc<Mutex<Vec<(String, String)>>>;
         type Comments = Arc<Mutex<Vec<String>>>;
         async fn answer(
-            State(comments): State<Comments>,
+            State((requests, comments)): State<(Requests, Comments)>,
             uri: axum::http::Uri,
+            headers: HeaderMap,
             body: String,
         ) -> Json<Value> {
-            if uri.path().ends_with("/access_tokens") {
-                return Json(json!({"token":"stub-token","expires_at":
+            let path = uri.path().to_owned();
+            let authorization = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .expect("all GitHub requests carry credentials")
+                .to_owned();
+            requests
+                .lock()
+                .expect("lock request ledger")
+                .push((path.clone(), authorization));
+            if path.ends_with("/access_tokens") {
+                let token = match path.as_str() {
+                    "/app/installations/101/access_tokens" => "fixture-personal-token",
+                    "/app/installations/202/access_tokens" => "fixture-org-token",
+                    _ => panic!("unexpected installation token request: {path}"),
+                };
+                return Json(json!({"token":token,"expires_at":
                     (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()}));
             }
             assert!(
-                uri.path().ends_with("/comments"),
-                "unexpected outbound mutation: {}",
-                uri.path()
+                path.ends_with("/comments"),
+                "unexpected outbound mutation: {path}"
             );
             let parsed: Value = serde_json::from_str(&body).expect("comment body is JSON");
             comments
@@ -1092,12 +1038,15 @@ impl GithubStub {
                 .push(parsed["body"].as_str().unwrap_or_default().to_owned());
             Json(json!({"id":1}))
         }
+        let requests: Requests = Arc::new(Mutex::new(Vec::new()));
         let comments: Comments = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind GitHub stub");
         let endpoint = format!("http://{}", listener.local_addr().expect("stub address"));
-        let api = Router::new().fallback(answer).with_state(comments.clone());
+        let api = Router::new()
+            .fallback(answer)
+            .with_state((requests.clone(), comments.clone()));
         let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             axum::serve(listener, api)
@@ -1118,23 +1067,25 @@ impl GithubStub {
             .await
             .expect("seed default workspace rules");
         Self {
+            requests,
             comments,
-            shutdown: Some(shutdown),
-            server: Some(server),
+            shutdown,
+            server,
         }
+    }
+
+    /// Every request GitHub received: (path, authorization header).
+    fn requests(&self) -> Vec<(String, String)> {
+        self.requests.lock().expect("read request ledger").clone()
     }
 
     fn comments(&self) -> Vec<String> {
         self.comments.lock().expect("read comment ledger").clone()
     }
 
-    async fn stop(mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(server) = self.server.take() {
-            trakkt_core::test_helpers::task::join_soon(server, "GitHub stub shutdown").await;
-        }
+    async fn stop(self) {
+        self.shutdown.send(()).expect("stop GitHub stub listener");
+        trakkt_core::test_helpers::task::join_soon(self.server, "GitHub stub shutdown").await;
     }
 }
 
@@ -1210,8 +1161,7 @@ async fn a_pull_request_that_only_mentions_a_ticket_never_changes_it_or_comments
     stub.stop().await;
 }
 
-fn mentions(f: &Fixture, comments: &[String]) -> usize {
-    let _ = f;
+fn status_comments(comments: &[String]) -> usize {
     comments.iter().filter(|c| c.contains("Status moved")).count()
 }
 
@@ -1226,7 +1176,7 @@ async fn fixes_starts_on_open_and_completes_on_merge_and_says_so_once_each() {
     assert_eq!(status_category(&f, &f.issue).await, "completed");
     let comments = stub.comments();
     assert_eq!(comments.len(), 2, "one comment per real change: {comments:?}");
-    assert_eq!(mentions(&f, &comments), 1);
+    assert_eq!(status_comments(&comments), 1);
     stub.stop().await;
 }
 
@@ -1301,13 +1251,81 @@ async fn two_closing_prs_complete_the_ticket_only_after_both_merge() {
 }
 
 #[tokio::test]
-async fn a_pr_closed_without_merging_never_completes_the_ticket() {
+async fn a_closing_pr_closed_without_merging_cancels_the_ticket_only_when_nothing_else_is_linked() {
     let mut f = fixture().await;
     let stub = GithubStub::attach(&mut f).await;
     let pr = Pr::new(22, "Abandoned", "Fixes KEY-1", "feature/abandoned");
     send(&f, "closed-open", &pr, "opened", false).await;
     send(&f, "closed-close", &pr, "closed", false).await;
-    assert_ne!(status_category(&f, &f.issue).await, "completed");
+    // The existing workspace rule (closed -> cancelled) applies, and under the
+    // Completed/Cancelled guard that is final: a later PR cannot undo it.
+    assert_eq!(status_category(&f, &f.issue).await, "cancelled");
+    assert_eq!(stub.comments().len(), 2, "{:?}", stub.comments());
+    let replacement = Pr::new(23, "Replacement", "Fixes KEY-1", "feature/replacement");
+    send(&f, "closed-replacement-open", &replacement, "opened", false).await;
+    send(&f, "closed-replacement-merge", &replacement, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "cancelled");
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_pr_closed_without_merging_leaves_the_ticket_alone_unless_it_alone_said_it_closes_it() {
+    // Contributing, branch/title and related PRs never cancel.
+    for (label, body, branch) in [
+        ("refs", "Refs KEY-1", "feature/x"),
+        ("branch", "", "feature/KEY-1-x"),
+        ("related", "Related to KEY-1", "feature/y"),
+    ] {
+        let mut f = fixture().await;
+        let stub = GithubStub::attach(&mut f).await;
+        let pr = Pr::new(24, "Work", body, branch);
+        send(&f, &format!("{label}-open"), &pr, "opened", false).await;
+        let after_open = status_category(&f, &f.issue).await;
+        send(&f, &format!("{label}-close"), &pr, "closed", false).await;
+        assert_eq!(status_category(&f, &f.issue).await, after_open, "{label}");
+        stub.stop().await;
+    }
+    // A closing PR abandoned while a sibling is still open leaves the ticket.
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let a = Pr::new(25, "One", "Fixes KEY-1", "feature/a");
+    let b = Pr::new(26, "Two", "Fixes KEY-1", "feature/b");
+    send(&f, "sibling-open-a", &a, "opened", false).await;
+    send(&f, "sibling-open-b", &b, "opened", false).await;
+    send(&f, "sibling-close-a", &a, "closed", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn an_open_contributing_or_branch_pr_holds_back_a_closing_merge_but_a_mention_does_not() {
+    for (label, body, branch, holds) in [
+        ("contributing", "Refs KEY-1", "feature/x", true),
+        ("branch", "", "feature/KEY-1-x", true),
+        ("related", "Related to KEY-1", "feature/y", false),
+    ] {
+        let mut f = fixture().await;
+        let stub = GithubStub::attach(&mut f).await;
+        let sibling = Pr::new(27, "Sibling", body, branch);
+        let closing = Pr::new(28, "Fix", "Fixes KEY-1", "feature/fix");
+        send(&f, &format!("{label}-open-sibling"), &sibling, "opened", false).await;
+        send(&f, &format!("{label}-open-fix"), &closing, "opened", false).await;
+        send(&f, &format!("{label}-merge-fix"), &closing, "closed", true).await;
+        let expected = if holds { "started" } else { "completed" };
+        assert_eq!(status_category(&f, &f.issue).await, expected, "{label}");
+        stub.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn a_branch_or_title_link_completes_on_merge_like_a_closing_word() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let pr = Pr::new(29, "KEY-1: tidy the page", "", "feature/tidy");
+    send(&f, "title-open", &pr, "opened", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    send(&f, "title-merge", &pr, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "completed");
     stub.stop().await;
 }
 
@@ -1401,7 +1419,7 @@ async fn editing_a_pr_to_add_or_drop_a_magic_word_changes_the_link_kind() {
 async fn linkback_can_be_turned_off_without_stopping_the_status_change() {
     let mut f = fixture().await;
     let stub = GithubStub::attach(&mut f).await;
-    schema::set_linkback_enabled(&f.state.db, WORKSPACE, false)
+    schema::set_linkback_enabled(&f.state.db, WORKSPACE, false, None)
         .await
         .expect("turn linkback off");
     let pr = Pr::new(60, "Tidy", "Fixes KEY-1", "feature/quiet");
@@ -1416,7 +1434,7 @@ async fn a_team_can_silence_or_retarget_a_step_and_the_workspace_default_returns
     let mut f = fixture().await;
     let stub = GithubStub::attach(&mut f).await;
     let team = "github-team";
-    schema::set_team_transition_rule(&f.state.db, WORKSPACE, team, "pr_opened", None)
+    schema::set_team_transition_rule(&f.state.db, WORKSPACE, team, GitHubAutomationStep::PrOpened, None, None)
         .await
         .expect("team opts out of the opened step");
     let pr = Pr::new(70, "Tidy", "Fixes KEY-1", "feature/team");
@@ -1426,15 +1444,210 @@ async fn a_team_can_silence_or_retarget_a_step_and_the_workspace_default_returns
         "backlog",
         "a no-action team rule beats the workspace default"
     );
-    schema::set_team_transition_rule(&f.state.db, WORKSPACE, team, "pr_opened", Some("unstarted"))
+    schema::set_team_transition_rule(&f.state.db, WORKSPACE, team, GitHubAutomationStep::PrOpened, Some(StatusCategory::Unstarted), None)
         .await
         .expect("team retargets the opened step");
     send(&f, "team-reopen", &pr, "reopened", false).await;
     assert_eq!(status_category(&f, &f.issue).await, "unstarted");
-    schema::clear_team_transition_rule(&f.state.db, WORKSPACE, team, "pr_opened")
+    schema::clear_team_transition_rule(&f.state.db, WORKSPACE, team, GitHubAutomationStep::PrOpened, None)
         .await
         .expect("remove the override");
     send(&f, "team-ready", &pr, "ready_for_review", false).await;
     assert_eq!(status_category(&f, &f.issue).await, "started");
+    stub.stop().await;
+}
+
+async fn link_state(f: &Fixture, issue_id: &str, number: &str) -> Option<String> {
+    links(f, issue_id)
+        .await
+        .into_iter()
+        .find(|l| l.link_type == "pull_request" && l.ref_identifier == number)
+        .and_then(|l| l.state)
+}
+
+#[tokio::test]
+async fn a_merge_held_back_by_an_open_sibling_completes_when_the_sibling_is_closed_unmerged() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let a = Pr::new(80, "Part one", "Fixes KEY-1", "feature/a");
+    let b = Pr::new(81, "Part two", "Fixes KEY-1", "feature/b");
+    send(&f, "abandon-open-a", &a, "opened", false).await;
+    send(&f, "abandon-open-b", &b, "opened", false).await;
+    send(&f, "abandon-merge-a", &a, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started", "held by B");
+    send(&f, "abandon-close-b", &b, "closed", false).await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "completed",
+        "B was abandoned, A merged and said it fixes the ticket"
+    );
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn editing_a_merged_pr_leaves_it_merged_so_it_never_blocks_its_sibling() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let a = Pr::new(82, "Part one", "Fixes KEY-1", "feature/a");
+    let b = Pr::new(83, "Part two", "Fixes KEY-1", "feature/b");
+    send(&f, "edit-merged-open-a", &a, "opened", false).await;
+    send(&f, "edit-merged-open-b", &b, "opened", false).await;
+    send(&f, "edit-merged-merge-a", &a, "closed", true).await;
+    // A typo fix on the merged PR. GitHub's payload says it is merged.
+    let mut edited = a.event(&f.personal, "edited", true);
+    edited["pull_request"]["state"] = json!("closed");
+    deliver(&f, "pull_request", "edit-merged-edit-a", edited).await;
+    assert_eq!(link_state(&f, &f.issue, "82").await.as_deref(), Some("merged"));
+    // A stale open-looking delivery for the finished PR changes nothing either.
+    deliver(
+        &f,
+        "pull_request",
+        "edit-merged-stale-open-a",
+        a.event(&f.personal, "opened", false),
+    )
+    .await;
+    assert_eq!(link_state(&f, &f.issue, "82").await.as_deref(), Some("merged"));
+    send(&f, "edit-merged-merge-b", &b, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "completed");
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_merge_held_back_by_a_sibling_is_released_when_the_sibling_stops_closing_the_ticket() {
+    for (label, body) in [("downgrade", "Related to KEY-1"), ("drop", "no ticket here"), ("skip", "Ignore KEY-1")] {
+        let mut f = fixture().await;
+        let stub = GithubStub::attach(&mut f).await;
+        let a = Pr::new(84, "Part one", "Fixes KEY-1", "feature/a");
+        let b = Pr::new(85, "Part two", "Fixes KEY-1", "feature/b");
+        send(&f, &format!("{label}-open-a"), &a, "opened", false).await;
+        send(&f, &format!("{label}-open-b"), &b, "opened", false).await;
+        send(&f, &format!("{label}-merge-a"), &a, "closed", true).await;
+        assert_eq!(status_category(&f, &f.issue).await, "started", "{label}: held by B");
+        let reworded = Pr::new(85, "Part two", body, "feature/b");
+        send(&f, &format!("{label}-edit-b"), &reworded, "edited", false).await;
+        assert_eq!(
+            status_category(&f, &f.issue).await,
+            "completed",
+            "{label}: B no longer works on the ticket, so A's merge completes it"
+        );
+        stub.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn a_stale_open_pr_in_an_unreachable_repository_does_not_block_completion() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let elsewhere = Pr::new(86, "Other half", "Fixes KEY-1", "feature/elsewhere");
+    deliver(
+        &f,
+        "pull_request",
+        "unreachable-open",
+        elsewhere.event(&f.organization, "opened", false),
+    )
+    .await;
+    // The organization's connection goes away; its PR can never report again.
+    schema::disconnect_installation(&f.state.db, &f.organization.installation_id, WORKSPACE)
+        .await
+        .expect("disconnect the organization connection");
+    let here = Pr::new(87, "This half", "Fixes KEY-1", "feature/here");
+    send(&f, "unreachable-open-here", &here, "opened", false).await;
+    send(&f, "unreachable-merge-here", &here, "closed", true).await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "completed",
+        "the disconnected repository's PR cannot hold the merge forever"
+    );
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_status_update_decided_from_an_earlier_read_never_overwrites_a_newer_status() {
+    let f = fixture().await;
+    let started =
+        trakkt_auth::status_service::get_status_by_category(&f.state.db, WORKSPACE, "started")
+            .await
+            .expect("resolve started status")
+            .expect("started status seeded");
+    let issue = trakkt_auth::issue_service::get_issue_by_id(&f.state.db, &f.issue)
+        .await
+        .expect("read ticket")
+        .expect("issue exists");
+    // The automation read `started`; by the time it writes, the ticket is elsewhere.
+    let stale_read = trakkt_types::models::IssueUpdate {
+        status_id: Some(started.status_id),
+        expected_status_id: Some("a-status-the-ticket-has-left".into()),
+        ..Default::default()
+    };
+    let result = trakkt_auth::issue_service::update_issue(
+        &f.state.db,
+        WORKSPACE,
+        &issue.team_key,
+        issue.number,
+        &stale_read,
+        None,
+        trakkt_types::enums::ActionSource::Github,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(trakkt_core::Error::Conflict(_))),
+        "{result:?}"
+    );
+    assert_eq!(status_category(&f, &f.issue).await, "backlog");
+}
+
+#[tokio::test]
+async fn ignore_removes_the_branch_link_an_earlier_push_made() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let mut payload = push(&f.personal);
+    payload["ref"] = json!("refs/heads/feature/KEY-1-rework");
+    payload["commits"] = json!([]);
+    deliver(&f, "push", "ignore-push-first", payload).await;
+    assert_eq!(
+        links(&f, &f.issue).await.iter().filter(|l| l.link_type == "branch").count(),
+        1,
+        "the push linked the branch"
+    );
+    let pr = Pr::new(88, "Rework", "Ignore KEY-1", "feature/KEY-1-rework");
+    send(&f, "ignore-pr-after", &pr, "opened", false).await;
+    assert!(
+        links(&f, &f.issue).await.is_empty(),
+        "the PR said ignore, so no link to the ticket remains"
+    );
+    assert_eq!(status_category(&f, &f.issue).await, "backlog");
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn manual_completion_comments_on_the_closing_pr_only_while_linkback_is_on() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let pr = Pr::new(89, "Tidy", "Fixes KEY-1", "feature/manual");
+    send(&f, "manual-open", &pr, "opened", false).await;
+    let before = stub.comments().len();
+    let client = f.state.github_client.clone().expect("stub client attached");
+    let notify = || {
+        trakkt_github::transitions::notify_github_links_on_completion(
+            &f.state.db,
+            &client,
+            &f.state.encryption_key,
+            &f.issue,
+            "KEY",
+            1,
+            "Identical KEY-1 in separate workspaces",
+            "Done",
+            "http://localhost",
+        )
+    };
+    notify().await.expect("notify with linkback on");
+    assert_eq!(stub.comments().len(), before + 1, "linkback on comments");
+    schema::set_linkback_enabled(&f.state.db, WORKSPACE, false, None)
+        .await
+        .expect("turn linkback off");
+    notify().await.expect("notify with linkback off");
+    assert_eq!(stub.comments().len(), before + 1, "linkback off posts nothing");
     stub.stop().await;
 }

@@ -242,7 +242,7 @@ async fn github_webhook(
                     schema::mark_event_processed(&state.db, &event_id).await?;
                     return Ok(Json(json!({})));
                 }
-                let link_result = trakkt_github::events::process_pull_request(
+                let processed = trakkt_github::events::process_pull_request(
                     &state.db,
                     inst,
                     action.as_deref().unwrap_or(""),
@@ -253,7 +253,7 @@ async fn github_webhook(
                 .await;
 
                 // After link processing succeeds, apply automatic status transitions.
-                if link_result.is_ok() {
+                if let Ok(outcome) = &processed {
                     if !inst.is_active() {
                         tracing::debug!(
                             installation_id = %inst.installation_id,
@@ -267,6 +267,7 @@ async fn github_webhook(
                             &inst.workspace_id,
                             action.as_deref().unwrap_or(""),
                             &payload,
+                            &outcome.released_issue_ids,
                             &state.encryption_key,
                             Some(&state.ws_manager),
                             &state.config.frontend_url,
@@ -277,7 +278,7 @@ async fn github_webhook(
                     }
                 }
 
-                Some(link_result)
+                Some(processed.map(|_| ()))
             } else {
                 tracing::warn!(event = %event_key, "pull_request event with no installation — marking processed");
                 Some(Ok(()))

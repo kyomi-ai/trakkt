@@ -7,6 +7,7 @@
 
 use trakkt_core::DbPool;
 use trakkt_core::sql_compat;
+use trakkt_types::enums::{GitHubAutomationStep, StatusCategory};
 
 // ─── Row types ───────────────────────────────────────────────────────────────
 
@@ -150,7 +151,6 @@ pub struct GitHubTransitionRule {
     pub rule_id: String,
     pub workspace_id: String,
     pub trigger_event: String,
-    pub close_intent_required: bool,
     pub target_status_category: String,
     pub enabled: bool,
     pub created_at: String,
@@ -1158,30 +1158,6 @@ pub async fn list_pr_links_by_ref(
     Ok(rows)
 }
 
-/// Find the closing PR links for an issue.
-///
-/// Used for outbound notifications when an issue is manually completed.
-pub async fn list_closing_pr_links_for_issue(
-    db: &DbPool,
-    issue_id: &str,
-) -> trakkt_core::Result<Vec<GitHubLink>> {
-    let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
-        db,
-        GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, link_kind, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE issue_id = $1 AND link_type = $2 AND link_kind = $3",
-        issue_id,
-        "pull_request",
-        crate::patterns::LinkKind::Closing.as_str()
-    )?;
-    Ok(rows)
-}
-
 /// Every pull request link on an issue, whatever its kind or state.
 ///
 /// Used to decide whether a merge is the last one: the merge status applies
@@ -1331,7 +1307,7 @@ pub async fn list_transition_rules(
     let rows: Vec<GitHubTransitionRule> = trakkt_core::db_fetch_all!(
         db,
         GitHubTransitionRule,
-        "SELECT rule_id, workspace_id, trigger_event, close_intent_required, \
+        "SELECT rule_id, workspace_id, trigger_event, \
                 target_status_category, enabled, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM github_transition_rules \
@@ -1342,52 +1318,37 @@ pub async fn list_transition_rules(
     Ok(rows)
 }
 
-/// Seed the default transition rules for a workspace.
+/// Seed the default transition rules for a workspace: a PR opened or marked
+/// ready starts the issue, a merge completes it, and a closing PR closed
+/// without merge cancels it (see docs/ARCHITECTURE.md for when).
 ///
 /// Uses INSERT ... ON CONFLICT DO NOTHING so this is idempotent.
 pub async fn seed_default_transition_rules(
     db: &DbPool,
     workspace_id: &str,
 ) -> trakkt_core::Result<()> {
-    let is_pg = db.is_postgres();
-    let now = sql_compat::now(is_pg);
-    let bool_true = sql_compat::bool_true(is_pg);
-    let bool_false = sql_compat::bool_false(is_pg);
-
-    let rule_id_1 = uuid::Uuid::new_v4().to_string();
-    let rule_id_2 = uuid::Uuid::new_v4().to_string();
-    let rule_id_3 = uuid::Uuid::new_v4().to_string();
-
-    // pr_opened -> started (no close intent required)
-    let sql = format!(
-        "INSERT INTO github_transition_rules \
-         (rule_id, workspace_id, trigger_event, close_intent_required, \
-          target_status_category, enabled, created_at) \
-         VALUES ($1, $2, $3, {bool_false}, $4, {bool_true}, {now}) \
-         ON CONFLICT DO NOTHING"
-    );
-    trakkt_core::db_execute!(db, &sql, &rule_id_1, workspace_id, "pr_opened", "started")?;
-
-    // pr_merged -> completed (close intent required)
-    let sql = format!(
-        "INSERT INTO github_transition_rules \
-         (rule_id, workspace_id, trigger_event, close_intent_required, \
-          target_status_category, enabled, created_at) \
-         VALUES ($1, $2, $3, {bool_true}, $4, {bool_true}, {now}) \
-         ON CONFLICT DO NOTHING"
-    );
-    trakkt_core::db_execute!(db, &sql, &rule_id_2, workspace_id, "pr_merged", "completed")?;
-
-    // pr_closed -> cancelled (close intent required)
-    let sql = format!(
-        "INSERT INTO github_transition_rules \
-         (rule_id, workspace_id, trigger_event, close_intent_required, \
-          target_status_category, enabled, created_at) \
-         VALUES ($1, $2, $3, {bool_true}, $4, {bool_true}, {now}) \
-         ON CONFLICT DO NOTHING"
-    );
-    trakkt_core::db_execute!(db, &sql, &rule_id_3, workspace_id, "pr_closed", "cancelled")?;
-
+    let now = sql_compat::now(db.is_postgres());
+    let bool_true = sql_compat::bool_true(db.is_postgres());
+    for (step, category) in [
+        (GitHubAutomationStep::PrOpened, StatusCategory::Started),
+        (GitHubAutomationStep::PrMerged, StatusCategory::Completed),
+        (GitHubAutomationStep::PrClosed, StatusCategory::Cancelled),
+    ] {
+        let sql = format!(
+            "INSERT INTO github_transition_rules \
+             (rule_id, workspace_id, trigger_event, target_status_category, enabled, created_at) \
+             VALUES ($1, $2, $3, $4, {bool_true}, {now}) \
+             ON CONFLICT DO NOTHING"
+        );
+        trakkt_core::db_execute!(
+            db,
+            &sql,
+            uuid::Uuid::new_v4().to_string(),
+            workspace_id,
+            step.as_str(),
+            category.as_str()
+        )?;
+    }
     Ok(())
 }
 
@@ -1429,14 +1390,6 @@ pub async fn update_transition_rule_enabled_with_delivery(
 
 // ─── per-team automation ─────────────────────────────────────────────────────
 
-/// The automation steps a rule can configure. A draft PR, a PR opened or marked
-/// ready for review, a merge, and a close without merge.
-pub const AUTOMATION_TRIGGERS: [&str; 4] = ["pr_draft", "pr_opened", "pr_merged", "pr_closed"];
-
-/// The status categories a rule can target.
-pub const STATUS_CATEGORIES: [&str; 5] =
-    ["backlog", "unstarted", "started", "completed", "cancelled"];
-
 /// A team's override of one workspace default rule. A `None` target means the
 /// step does nothing for that team.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
@@ -1466,6 +1419,30 @@ pub async fn list_team_transition_rules(
     )?)
 }
 
+/// Record a settings change in the sync log so other open settings pages
+/// refresh. Team rules and the linkback switch reuse the shared-rule entity
+/// type: the client only needs to know integration settings changed.
+async fn record_settings_change(
+    tx: &mut trakkt_core::db::DbTx,
+    batch: &mut trakkt_auth::sync_log_service::SyncBatch<'_>,
+    entity_id: &str,
+    workspace_id: &str,
+    payload: serde_json::Value,
+) -> trakkt_core::Result<()> {
+    use trakkt_auth::sync_log_service::SyncAudience;
+    batch
+        .record(
+            tx,
+            trakkt_types::sync::entity_types::GITHUB_TRANSITION_RULE,
+            entity_id,
+            workspace_id,
+            SyncAudience::Workspace,
+            trakkt_types::sync::SyncActionType::Update,
+            Some(payload),
+        )
+        .await
+}
+
 /// Set a team's rule for one step, replacing any existing one.
 ///
 /// `target` of `None` makes the step do nothing for that team.
@@ -1473,23 +1450,14 @@ pub async fn set_team_transition_rule(
     db: &DbPool,
     workspace_id: &str,
     team_id: &str,
-    trigger_event: &str,
-    target: Option<&str>,
+    step: GitHubAutomationStep,
+    target: Option<StatusCategory>,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    if !AUTOMATION_TRIGGERS.contains(&trigger_event) {
-        return Err(trakkt_core::Error::BadRequest(format!(
-            "unknown automation step '{trigger_event}'"
-        )));
-    }
-    if let Some(category) = target
-        && !STATUS_CATEGORIES.contains(&category)
-    {
-        return Err(trakkt_core::Error::BadRequest(format!(
-            "unknown status category '{category}'"
-        )));
-    }
-    let in_workspace = trakkt_core::db_fetch_optional!(
-        db,
+    use trakkt_auth::sync_log_service::SyncBatch;
+    let mut tx = db.begin().await?;
+    let in_workspace = trakkt_core::tx_fetch_optional!(
+        &mut tx,
         (String,),
         "SELECT team_id FROM teams WHERE team_id = $1 AND workspace_id = $2",
         team_id,
@@ -1498,7 +1466,7 @@ pub async fn set_team_transition_rule(
     if in_workspace.is_none() {
         return Err(trakkt_core::Error::NotFound("Team not found".into()));
     }
-    let now = sql_compat::now(db.is_postgres());
+    let now = sql_compat::now(tx.is_postgres());
     let sql = format!(
         "INSERT INTO github_team_transition_rules \
          (rule_id, workspace_id, team_id, trigger_event, target_status_category, created_at) \
@@ -1506,16 +1474,25 @@ pub async fn set_team_transition_rule(
          ON CONFLICT (team_id, trigger_event) \
          DO UPDATE SET target_status_category = EXCLUDED.target_status_category"
     );
-    trakkt_core::db_execute!(
-        db,
+    trakkt_core::tx_execute!(
+        &mut tx,
         &sql,
         uuid::Uuid::new_v4().to_string(),
         workspace_id,
         team_id,
-        trigger_event,
-        target
+        step.as_str(),
+        target.map(|c| c.as_str())
     )?;
-    Ok(())
+    let mut batch = SyncBatch::new();
+    record_settings_change(
+        &mut tx,
+        &mut batch,
+        &format!("{team_id}:{}", step.as_str()),
+        workspace_id,
+        serde_json::json!({"team_id":team_id,"trigger_event":step.as_str(),"target_status_category":target.map(|c| c.as_str())}),
+    )
+    .await?;
+    batch.commit_and_deliver(tx, ws_manager).await
 }
 
 /// Remove a team's rule for one step, so the workspace default applies again.
@@ -1523,24 +1500,36 @@ pub async fn clear_team_transition_rule(
     db: &DbPool,
     workspace_id: &str,
     team_id: &str,
-    trigger_event: &str,
+    step: GitHubAutomationStep,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    trakkt_core::db_execute!(
-        db,
+    use trakkt_auth::sync_log_service::SyncBatch;
+    let mut tx = db.begin().await?;
+    trakkt_core::tx_execute!(
+        &mut tx,
         "DELETE FROM github_team_transition_rules \
          WHERE workspace_id = $1 AND team_id = $2 AND trigger_event = $3",
         workspace_id,
         team_id,
-        trigger_event
+        step.as_str()
     )?;
-    Ok(())
+    let mut batch = SyncBatch::new();
+    record_settings_change(
+        &mut tx,
+        &mut batch,
+        &format!("{team_id}:{}", step.as_str()),
+        workspace_id,
+        serde_json::json!({"team_id":team_id,"trigger_event":step.as_str(),"cleared":true}),
+    )
+    .await?;
+    batch.commit_and_deliver(tx, ws_manager).await
 }
 
 /// A team's override for one step, if it has one.
 pub async fn get_team_transition_rule(
     db: &DbPool,
     team_id: &str,
-    trigger_event: &str,
+    step: GitHubAutomationStep,
 ) -> trakkt_core::Result<Option<GitHubTeamTransitionRule>> {
     Ok(trakkt_core::db_fetch_optional!(
         db,
@@ -1550,14 +1539,14 @@ pub async fn get_team_transition_rule(
          FROM github_team_transition_rules \
          WHERE team_id = $1 AND trigger_event = $2",
         team_id,
-        trigger_event
+        step.as_str()
     )?)
 }
 
 // ─── github_automation_settings ──────────────────────────────────────────────
 
-/// Whether the workspace posts a comment on the PR when a link changes status.
-/// On unless the workspace turned it off.
+/// Whether the workspace posts a comment on the PR when automation changes an
+/// issue's status. On unless the workspace turned it off.
 pub async fn linkback_enabled(db: &DbPool, workspace_id: &str) -> trakkt_core::Result<bool> {
     let setting = trakkt_core::db_fetch_optional!(
         db,
@@ -1573,16 +1562,67 @@ pub async fn set_linkback_enabled(
     db: &DbPool,
     workspace_id: &str,
     enabled: bool,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
 ) -> trakkt_core::Result<()> {
-    trakkt_core::db_execute!(
-        db,
+    use trakkt_auth::sync_log_service::SyncBatch;
+    let mut tx = db.begin().await?;
+    trakkt_core::tx_execute!(
+        &mut tx,
         "INSERT INTO github_automation_settings (workspace_id, linkback_enabled) \
          VALUES ($1, $2) \
          ON CONFLICT (workspace_id) DO UPDATE SET linkback_enabled = EXCLUDED.linkback_enabled",
         workspace_id,
         enabled
     )?;
-    Ok(())
+    let mut batch = SyncBatch::new();
+    record_settings_change(
+        &mut tx,
+        &mut batch,
+        workspace_id,
+        workspace_id,
+        serde_json::json!({"workspace_id":workspace_id,"linkback_enabled":enabled}),
+    )
+    .await?;
+    batch.commit_and_deliver(tx, ws_manager).await
+}
+
+/// Delete the branch links an earlier push made for issues a pull request on
+/// that branch tells us to skip.
+pub async fn delete_branch_links_for_issues(
+    db: &DbPool,
+    workspace_id: &str,
+    repo_full_name: &str,
+    branch: &str,
+    issue_ids: &[String],
+    admission: Option<&dyn trakkt_core::db::TransactionAdmission>,
+) -> trakkt_core::Result<u64> {
+    if issue_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = db.begin().await?;
+    if let Some(admission) = admission {
+        admission.admit(&mut tx).await?;
+    }
+    let (in_clause, _) = trakkt_core::db::in_clause_placeholders(issue_ids.len(), 5);
+    let sql = format!(
+        "DELETE FROM github_links \
+         WHERE workspace_id = $1 AND link_type = $2 AND repo_full_name = $3 \
+               AND ref_identifier = $4 AND issue_id IN {in_clause}"
+    );
+    let affected: u64 = trakkt_core::tx_with!(&mut tx, |executor| {
+        let mut query = sqlx::query(&sql)
+            .bind(workspace_id)
+            .bind("branch")
+            .bind(repo_full_name)
+            .bind(branch);
+        for id in issue_ids {
+            query = query.bind(id);
+        }
+        let result = query.execute(executor).await?;
+        Ok::<u64, sqlx::Error>(result.rows_affected())
+    })?;
+    tx.commit().await?;
+    Ok(affected)
 }
 
 #[cfg(test)]

@@ -377,7 +377,8 @@ by the **link kind**, never by "a key was found". Modelled on
 [2022](https://linear.app/changelog/2022-02-03-github-commit-linking) and
 [2023](https://linear.app/changelog/2023-11-15-github-workflow-updates) changelogs.
 Code: `crates/trakkt-github/src/patterns.rs` (reading intent),
-`events.rs` (links), `transitions.rs` (status).
+`events.rs` (links), `transitions.rs` (status); `LinkKind`,
+`GitHubAutomationStep` and `StatusCategory` live in `trakkt-types`.
 
 **Link sources**
 
@@ -396,21 +397,24 @@ Code: `crates/trakkt-github/src/patterns.rs` (reading intent),
 | `skip` / `ignore` + key | no link at all, even if the branch name has the key |
 
 When several sources name one issue the strongest kind wins
-(`closing` > `contributing` > `branch_title` > `related`); `skip` in any part of the
-PR removes the issue entirely. The words are exactly Linear's lists
-(`CLOSING_WORDS`, `CONTRIBUTING_WORDS`, `RELATED_WORDS`, `SKIP_WORDS`); several keys
-may follow one word (`Fixes ENG-123, DES-5, and ENG-256`); a word must directly
-precede the key (`Fixes the crash in TRA-5` is a mention). A URL only counts when
-its host is this application's.
+(`closing` > `contributing` > `branch_title` > `related`); within one piece of text a
+magic word decides the key, so `Related to X-1` in a PR title is related, not a title
+link; `skip` in any part of the PR removes the issue entirely. The words are exactly
+Linear's lists (`CLOSING_WORDS`, `CONTRIBUTING_WORDS`, `RELATED_WORDS`,
+`SKIP_WORDS`); several keys may follow one word (`Fixes ENG-123, DES-5, and
+ENG-256`); a word must directly precede the key (`Fixes the crash in TRA-5` is a
+mention). A URL only counts when its host is this application's. `Ignore X-1` removes
+the PR link and the branch link an earlier push made for it; a later push to that
+branch can show the branch row again, which is display only and never drives status.
 
 **What each kind does** (one table: `behavior()` in `transitions.rs`)
 
-| Kind | Draft / opened / ready for review | Merged / closed without merge |
-| --- | --- | --- |
-| `closing` | fires | fires |
-| `contributing` | fires | never |
-| `branch_title` | fires | never (proposed deviation, see below) |
-| `related` | never | never |
+| Kind | Starts (draft, opened, ready, reopened) | Holds back others while open | Completes on merge | Cancels when closed unmerged |
+| --- | --- | --- | --- | --- |
+| `closing` | yes | yes | yes | yes |
+| `branch_title` | yes | yes | yes | no |
+| `contributing` | yes | yes | no | no |
+| `related` | no | no | no | no |
 
 `related` links are shown on the issue and the PR and never change status or post a
 comment. Commit mentions stay activity only.
@@ -419,20 +423,26 @@ comment. Commit mentions stay activity only.
 (`pr_opened`, also fired by `reopened`), *merged* (`pr_merged`) and *closed without
 merge* (`pr_closed`). A draft PR fires `pr_draft`, which has no default rule, so a
 draft does nothing until a team configures it; `ready_for_review` fires `pr_opened`.
-Automation fires on lifecycle events, not on edits. The workspace rules
-(`github_transition_rules`, defaults: opened -> started, merged -> completed,
-closed -> cancelled) are the default; a **team** may override any step
-(`github_team_transition_rules`) with a status category or *no action*. The rule's
-`close_intent_required` column is no longer consulted: which kinds may fire which
-step is the `behavior()` table's job.
+The workspace rules (`github_transition_rules`, one per step; defaults: opened ->
+started, merged -> completed, closed -> cancelled) are the default; a **team** may
+override any step (`github_team_transition_rules`) with a status category or *no
+action*. Which link kinds may fire a step is decided in code by the table above, not
+by a column.
 
-**Order of decisions** for each linked issue: the kind may fire the step; a rule
-exists (team override, else enabled workspace rule); for merged/closed, no *other*
-closing PR on the issue is still open or draft (the merge status applies when the
-last one merges, and a PR closed without merging is never a merge); the move is
-forward and the issue is not completed or cancelled.
+**Order of decisions** for each linked issue. *Draft / opened*: the kind starts; a
+rule exists (team override, else enabled workspace rule); the move is forward and the
+issue is not completed or cancelled. *Merge, close and edit* are settled across all
+of the issue's PRs (`Run::settle_issue`), because completion is a property of the
+issue, not of one event: while any working-link PR on the issue is open or draft
+nothing completes (the merge status applies when the *last* one is done); then, if a
+completing PR merged, the `pr_merged` rule runs. That is re-evaluated whenever a PR
+lets go of the issue: a sibling merging, being closed without merge, or being edited
+so it no longer links or no longer works on the issue. PRs in a repository the
+connection no longer reaches are ignored, since they can never report again. The
+status write is a compare-and-set on the status the decision read, so a person's
+concurrent change is never overwritten.
 
-**Deliberate deviations from Linear** (decided by the owner unless marked proposed)
+**Deliberate deviations from Linear** (owner decisions)
 
 - GitHub events never move a *Completed or Cancelled* issue (PR #366). Linear does
   not document this; we keep it on purpose.
@@ -442,23 +452,33 @@ forward and the issue is not completed or cancelled.
 - A bare key in a PR body is a related-only link: shown, never acts.
 - Cross-repository mentions have no special case: a PR in any connected repository
   follows the same rules, so a key named without a working link changes nothing.
-- Proposed (pending owner confirmation): a `branch_title` link starts but does not
-  complete the issue on merge, which matches the behaviour before this change and the
-  safe reading of the incident; Linear completes on merge for branch-linked PRs.
-  Flipping `completes` on that row of `behavior()` (and the matching row of
-  `expected_category` in the tests) changes it.
-- A PR closed without merging cancels the issue only through the existing workspace
-  `pr_closed` rule, only for `closing` links, and only when no other closing PR is
-  open or already merged. Linear does not do this.
+- A PR that closes an issue and is **closed without merging** cancels it, through the
+  existing workspace `pr_closed` rule, only for `closing` links and only when no other
+  working-link PR on the issue is open and none has merged. Linear takes no action on
+  a close. Because of the Completed/Cancelled guard, that cancellation is final: a
+  reopened or replacement PR cannot undo it, only a person can. Turn the rule off, or
+  set the team's step to *no action*, if that is not wanted.
+- Editing a PR is not an automation step. A PR opened with a bare mention and later
+  edited to `Fixes X-1` starts the issue at the next opened/ready/reopened event, or
+  completes it on merge; an edit does re-evaluate a completion that the PR was
+  holding back.
+- Only a stale `open` is repaired for finished PRs: a `merged` or `closed` link never
+  returns to open except by `reopened`.
 
-**Linkback.** The bot comment on the PR is posted only when a link actually changed
-the issue's status, and can be turned off per workspace
-(`github_automation_settings.linkback_enabled`, Settings > Integrations).
+**Linkback.** The bot comment on the PR is posted only when automation actually
+changed the issue's status, and the per-workspace switch
+(`github_automation_settings.linkback_enabled`, Settings > Integrations) covers it and
+the comment posted when an issue is completed by hand. Team rule and linkback writes
+are recorded in the sync log (entity `GITHUB_TRANSITION_RULE`) so open settings pages
+refresh.
 
-**Not built** (tracked as follow-ups): the review-requested step (TRA-10116), the
-ready-to-merge step (TRA-10117), and per-target-branch overrides with regex and no
-action (TRA-10118). Assigning the linker to an unassigned issue is not built and not
-planned (owner decision).
+**Compatibility.** The REST/MCP `list_issue_github_links` response replaces
+`close_intent` with `link_kind` on each link.
+
+**Not built** (owner decision: separate tickets): the review-requested step
+(TRA-10116), the ready-to-merge step (TRA-10117), and per-target-branch overrides
+with regex and no action (TRA-10118). Assigning the linker to an unassigned issue is
+not built and not planned (owner decision).
 
 ### Deployment Modes
 
