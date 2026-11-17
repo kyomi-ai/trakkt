@@ -1534,24 +1534,18 @@ pub async fn update_issue_with_admission(
     if let Some((old_status_id, old_status_name)) = previous_status
         && old_status_id != issue.status_id
     {
-        let new_status_name = trakkt_core::tx_fetch_one!(
+        let (new_status_name, new_status_category) = trakkt_core::tx_fetch_one!(
             &mut tx,
-            (String,),
-            "SELECT name FROM statuses WHERE status_id = $1",
+            (String, String),
+            "SELECT name, category FROM statuses WHERE status_id = $1",
             &issue.status_id
-        )?
-        .0;
+        )?;
         // An issue that reaches Completed or Cancelled, by any path, has nothing
         // left to complete: a GitHub merge held back for it is no longer pending.
         // Leaving the mark would re-complete the issue after someone reopens it.
-        let finished = trakkt_core::tx_fetch_one!(
-            &mut tx,
-            (String,),
-            "SELECT category FROM statuses WHERE status_id = $1",
-            &issue.status_id
-        )?
-        .0;
-        if matches!(finished.as_str(), "completed" | "cancelled") {
+        if trakkt_types::enums::StatusCategory::parse(&new_status_category)
+            .is_some_and(|c| c.is_closed())
+        {
             trakkt_core::tx_execute!(
                 &mut tx,
                 "UPDATE github_links SET completion_pending = $1 WHERE issue_id = $2",

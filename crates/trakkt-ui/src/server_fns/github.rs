@@ -65,6 +65,28 @@ use super::{AuthenticatedContext, IntoServerFnError, require_workspace_admin};
 // Server functions
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Release completions held back by PRs on a connection whose reach just
+/// changed (disconnected, reauthorized). Best-effort: a failure is logged and
+/// never fails the settings action that triggered it.
+#[cfg(feature = "ssr")]
+async fn settle_held_completions(ctx: &super::ServerContext, workspace_id: &str) {
+    let (Some(client), Some(key)) = (ctx.github_client.as_deref(), ctx.encryption_key.as_deref())
+    else {
+        return;
+    };
+    if let Err(e) = trakkt_github::transitions::settle_pending_completions(
+        &ctx.db,
+        client,
+        workspace_id,
+        key,
+        ctx.ws_manager.as_ref(),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "Failed to settle held completions after a connection change");
+    }
+}
+
 /// Query visible GitHub connections for the workspace.
 #[server(prefix = "/leptos-api")]
 pub async fn get_github_integration_status() -> Result<GitHubIntegrationStatus, ServerFnError> {
@@ -220,7 +242,7 @@ pub async fn complete_github_authorization(
         .encryption_key
         .as_deref()
         .ok_or_else(|| ServerFnError::new("Credential encryption not configured"))?;
-    trakkt_github::authorization::complete_connection_with_delivery(
+    let workspace_id = trakkt_github::authorization::complete_connection_with_delivery(
         &ctx.db,
         client,
         key,
@@ -230,7 +252,9 @@ pub async fn complete_github_authorization(
         ctx.ws_manager.as_ref(),
     )
     .await
-    .into_sfn()
+    .into_sfn()?;
+    settle_held_completions(&ctx, &workspace_id).await;
+    Ok(workspace_id)
 }
 
 /// Disconnect one owned connection while retaining its GitHub installation and history.
@@ -245,7 +269,9 @@ pub async fn disconnect_github(connection_id: String) -> Result<(), ServerFnErro
         ac.ctx.ws_manager.as_ref(),
     )
     .await
-    .into_sfn()
+    .into_sfn()?;
+    settle_held_completions(&ac.ctx, &ac.ws_id).await;
+    Ok(())
 }
 
 /// Remove an inactive settings card, retaining installation history and ownership.

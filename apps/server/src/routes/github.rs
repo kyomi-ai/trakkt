@@ -208,12 +208,16 @@ async fn github_webhook(
     let result = match event_key.as_str() {
         // Installation lifecycle events — handle synchronously
         "installation.deleted" => Some(if let Some(inst) = &installation {
-            schema::uninstall_installation_with_delivery(
+            let uninstalled = schema::uninstall_installation_with_delivery(
                 &state.db,
                 &inst.installation_id,
                 Some(&state.ws_manager),
             )
-            .await
+            .await;
+            if uninstalled.is_ok() {
+                settle_after_reach_change(&state, &inst.workspace_id).await;
+            }
+            uninstalled
         } else {
             Ok(())
         }),
@@ -405,37 +409,29 @@ async fn handle_installation_unsuspend(
         account = %inst.account_login,
         "GitHub installation unsuspended"
     );
-    settle_after_reconnect(state, &inst.installation_id).await;
+    settle_after_reach_change(state, &inst.workspace_id).await;
     Ok(())
 }
 
-/// A connection that was away can have missed merges and closes. Settle the
-/// issues it holds open PRs on, so a completion held back by one of them is not
-/// left waiting for an event that will never come. Best-effort: failures are
-/// logged, never fail the delivery.
-async fn settle_after_reconnect(state: &AppState, installation_id: &str) {
+/// A connection whose reach changed (unsuspended, repositories changed,
+/// uninstalled) can have missed merges and closes. Release the completions held
+/// back by PRs it may no longer be able to report on, so they are not left
+/// waiting for an event that will never come. Best-effort: failures are logged,
+/// never fail the delivery.
+async fn settle_after_reach_change(state: &AppState, workspace_id: &str) {
     let Some(client) = state.github_client.as_deref() else {
         return;
     };
-    let current = match schema::get_installation_by_id(&state.db, installation_id).await {
-        Ok(Some(current)) => current,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(error = %e, "Could not reload the connection to settle its PRs");
-            return;
-        }
-    };
-    if let Err(e) = trakkt_github::transitions::settle_connection_issues(
+    if let Err(e) = trakkt_github::transitions::settle_pending_completions(
         &state.db,
         client,
-        &current,
+        workspace_id,
         &state.encryption_key,
         Some(&state.ws_manager),
-        &state.config.frontend_url,
     )
     .await
     {
-        tracing::warn!(error = %e, installation_id, "Failed to settle PRs after reconnect");
+        tracing::warn!(error = %e, workspace_id, "Failed to settle held completions after a connection change");
     }
 }
 
@@ -498,7 +494,7 @@ async fn handle_installation_repos_changed(
         selection = %selection,
         "GitHub installation repositories updated"
     );
-    settle_after_reconnect(state, &inst.installation_id).await;
+    settle_after_reach_change(state, &inst.workspace_id).await;
     Ok(())
 }
 

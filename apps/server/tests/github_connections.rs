@@ -478,31 +478,7 @@ async fn invalid_signature_cannot_record_or_mutate_a_connection() {
 /// Put the ticket back in Backlog the way a person would. A GitHub event never
 /// reopens finished work, so a test that needs it open again has to say so.
 async fn reopen_by_hand(f: &Fixture) {
-    let issue = trakkt_auth::issue_service::get_issue_by_id(&f.state.db, &f.issue)
-        .await
-        .expect("read the ticket to reopen")
-        .expect("issue exists");
-    let backlog =
-        trakkt_auth::status_service::get_status_by_category(&f.state.db, WORKSPACE, "backlog")
-            .await
-            .expect("resolve backlog status")
-            .expect("backlog status seeded");
-    trakkt_auth::issue_service::update_issue(
-        &f.state.db,
-        WORKSPACE,
-        &issue.team_key,
-        issue.number,
-        &trakkt_types::models::IssueUpdate {
-            status_id: Some(backlog.status_id),
-            ..Default::default()
-        },
-        None,
-        trakkt_types::enums::ActionSource::Api,
-        None,
-        None,
-    )
-    .await
-    .expect("reopen the ticket by hand");
+    move_by_hand(f, "backlog").await;
 }
 
 #[tokio::test]
@@ -1924,6 +1900,82 @@ async fn a_merged_pr_in_a_repository_that_is_gone_still_counts_as_the_fix() {
         status_category(&f, &f.issue).await,
         "completed",
         "the merged fix released the hold; it must not be cancelled because its repository left"
+    );
+    stub.stop().await;
+}
+
+/// Personal PR A merges while organization PR X is open, so the completion is
+/// held. Returns the stub, ready for the connection to lose reach.
+async fn hold_a_merge_behind_an_organization_pr(f: &mut Fixture, tag: &str) -> GithubStub {
+    let stub = GithubStub::attach(f).await;
+    let x = Pr::new(110, "Other half", "Fixes KEY-1", "feature/elsewhere");
+    deliver(f, "pull_request", &format!("{tag}-open-x"), x.event(&f.organization, "opened", false)).await;
+    let a = Pr::new(111, "This half", "Fixes KEY-1", "feature/here");
+    send(f, &format!("{tag}-open-a"), &a, "opened", false).await;
+    send(f, &format!("{tag}-merge-a"), &a, "closed", true).await;
+    assert_eq!(status_category(f, &f.issue).await, "started", "{tag}: held by the organization PR");
+    stub
+}
+
+#[tokio::test]
+async fn removing_the_repository_of_the_holding_pr_releases_the_held_merge() {
+    let mut f = fixture().await;
+    let stub = hold_a_merge_behind_an_organization_pr(&mut f, "repo-removed").await;
+    deliver(
+        &f,
+        "installation_repositories",
+        "repo-removed-event",
+        json!({"action":"removed","installation":{"id":f.organization.github_installation_id},
+            "repository_selection":"selected","repositories_added":[],
+            "repositories_removed":[{"full_name":"fixture-org/repo"}]}),
+    )
+    .await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "completed",
+        "the repository that held the merge can no longer report"
+    );
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn uninstalling_the_connection_of_the_holding_pr_releases_the_held_merge() {
+    let mut f = fixture().await;
+    let stub = hold_a_merge_behind_an_organization_pr(&mut f, "uninstalled").await;
+    deliver(
+        &f,
+        "installation",
+        "uninstalled-event",
+        json!({"action":"deleted","installation":{"id":f.organization.github_installation_id}}),
+    )
+    .await;
+    assert_eq!(status_category(&f, &f.issue).await, "completed");
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn the_settings_actions_settle_held_merges_through_the_same_sweep() {
+    // Disconnecting from settings and completing a reauthorization both call
+    // `settle_pending_completions`; one issue failing never stops the others.
+    let mut f = fixture().await;
+    let stub = hold_a_merge_behind_an_organization_pr(&mut f, "settings").await;
+    schema::disconnect_installation(&f.state.db, &f.organization.installation_id, WORKSPACE)
+        .await
+        .expect("disconnect the organization connection");
+    let client = f.state.github_client.clone().expect("stub client attached");
+    trakkt_github::transitions::settle_pending_completions(
+        &f.state.db,
+        &client,
+        WORKSPACE,
+        &f.state.encryption_key,
+        None,
+    )
+    .await
+    .expect("sweep after the connection change");
+    assert_eq!(status_category(&f, &f.issue).await, "completed");
+    assert!(
+        pending_marks(&f).await.iter().all(|p| !p),
+        "the held merge is settled"
     );
     stub.stop().await;
 }

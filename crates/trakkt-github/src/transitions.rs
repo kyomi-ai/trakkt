@@ -333,26 +333,6 @@ struct Finished<'a> {
     merged: bool,
 }
 
-/// Everything one webhook event needs while moving issues.
-struct Run<'a> {
-    db: &'a DbPool,
-    github_client: &'a GitHubClient,
-    installation: &'a GitHubInstallation,
-    workspace_id: &'a str,
-    repo: &'a str,
-    pr_number: i64,
-    encryption_key: &'a [u8; 32],
-    ws_manager: Option<&'a trakkt_auth::websocket::WebSocketManager>,
-    base_url: &'a str,
-    linkback: bool,
-    /// Installation tokens fetched during this event, by installation id. A
-    /// `None` means the fetch failed and is not retried for this event.
-    tokens: std::collections::HashMap<String, Option<String>>,
-    /// Set when the connection stopped admitting outbound requests; the rest
-    /// of the event still moves issues, it just stops commenting.
-    comments_blocked: bool,
-}
-
 /// What every event handled in one call shares.
 #[derive(Clone, Copy)]
 struct Env<'a> {
@@ -364,24 +344,37 @@ struct Env<'a> {
     base_url: &'a str,
 }
 
+/// Everything one webhook event needs while moving issues.
+struct Run<'a> {
+    env: Env<'a>,
+    /// The connection the event came in on. `None` for a sweep that settles
+    /// held completions after a connection's reach changed: such a run only
+    /// moves issues, it posts nothing on any PR.
+    installation: Option<&'a GitHubInstallation>,
+    repo: &'a str,
+    pr_number: i64,
+    linkback: bool,
+    /// Installation tokens fetched during this event, by installation id. A
+    /// `None` means the fetch failed and is not retried for this event.
+    tokens: std::collections::HashMap<String, Option<String>>,
+    /// Set when the connection stopped admitting outbound requests; the rest
+    /// of the event still moves issues, it just stops commenting.
+    comments_blocked: bool,
+}
+
 impl<'a> Run<'a> {
     fn new(
         env: Env<'a>,
-        installation: &'a GitHubInstallation,
+        installation: Option<&'a GitHubInstallation>,
         repo: &'a str,
         pr_number: i64,
         linkback: bool,
     ) -> Self {
         Self {
-            db: env.db,
-            github_client: env.github_client,
+            env,
             installation,
-            workspace_id: env.workspace_id,
             repo,
             pr_number,
-            encryption_key: env.encryption_key,
-            ws_manager: env.ws_manager,
-            base_url: env.base_url,
             linkback,
             tokens: std::collections::HashMap::new(),
             comments_blocked: false,
@@ -392,10 +385,10 @@ impl<'a> Run<'a> {
     async fn token_for(&mut self, installation: &GitHubInstallation, repo: &str) -> Option<String> {
         if !self.tokens.contains_key(&installation.installation_id) {
             let token = match get_installation_token(
-                self.db,
-                self.github_client,
+                self.env.db,
+                self.env.github_client,
                 installation,
-                self.encryption_key,
+                self.env.encryption_key,
                 repo,
             )
             .await
@@ -423,13 +416,14 @@ impl<'a> Run<'a> {
         issue_id: &str,
         step: GitHubAutomationStep,
     ) -> trakkt_core::Result<()> {
-        let Some(issue) = trakkt_auth::issue_service::get_issue_by_id(self.db, issue_id).await?
+        let Some(issue) =
+            trakkt_auth::issue_service::get_issue_by_id(self.env.db, issue_id).await?
         else {
             tracing::warn!(issue_id, "Linked issue not found — skipping transition");
             return Ok(());
         };
         let Some(ResolvedRule::Target(target)) =
-            resolve_rule(self.db, self.workspace_id, &issue.team_id, step).await?
+            resolve_rule(self.env.db, self.env.workspace_id, &issue.team_id, step).await?
         else {
             return Ok(());
         };
@@ -452,14 +446,14 @@ impl<'a> Run<'a> {
         step: GitHubAutomationStep,
     ) -> trakkt_core::Result<()> {
         let Some(target_status) = trakkt_auth::status_service::get_status_by_category(
-            self.db,
-            self.workspace_id,
+            self.env.db,
+            self.env.workspace_id,
             target.as_str(),
         )
         .await?
         else {
             tracing::warn!(
-                workspace_id = %self.workspace_id,
+                workspace_id = %self.env.workspace_id,
                 category = %target,
                 "No status found in target category for transition rule — skipping"
             );
@@ -476,22 +470,28 @@ impl<'a> Run<'a> {
         };
 
         #[cfg(test)]
-        schema::mutation_pause::wait(&self.installation.installation_id).await;
-        let admission = schema::ConnectionAdmission {
-            installation: self.installation,
-            repository: self.repo,
-        };
+        if let Some(installation) = self.installation {
+            schema::mutation_pause::wait(&installation.installation_id).await;
+        }
+        let admission = self
+            .installation
+            .map(|installation| schema::ConnectionAdmission {
+                installation,
+                repository: self.repo,
+            });
         match trakkt_auth::issue_service::update_issue_with_admission(
-            self.db,
-            self.workspace_id,
+            self.env.db,
+            self.env.workspace_id,
             &issue.team_key,
             issue.number,
             &updates,
             None, // No actor user — system-initiated
             trakkt_types::enums::ActionSource::Github,
             Some("GitHub"),
-            self.ws_manager,
-            Some(&admission),
+            self.env.ws_manager,
+            admission
+                .as_ref()
+                .map(|a| a as &dyn trakkt_core::db::TransactionAdmission),
         )
         .await
         {
@@ -532,14 +532,17 @@ impl<'a> Run<'a> {
         target_status_name: &str,
         step: GitHubAutomationStep,
     ) -> trakkt_core::Result<()> {
+        let Some(installation) = self.installation else {
+            return Ok(());
+        };
         if !self.linkback || self.comments_blocked {
             return Ok(());
         }
-        let (installation, repo) = (self.installation, self.repo);
+        let repo = self.repo;
         let Some(token) = self.token_for(installation, repo).await else {
             return Ok(());
         };
-        let outbound = match schema::admit_outbound(self.db, self.installation, self.repo).await {
+        let outbound = match schema::admit_outbound(self.env.db, installation, repo).await {
             Ok(outbound) => outbound,
             Err(e) => {
                 // The connection stopped admitting requests. Issues still move
@@ -555,9 +558,10 @@ impl<'a> Run<'a> {
             issue.number,
             &issue.title,
             target_status_name,
-            self.base_url,
+            self.env.base_url,
         );
         if let Err(e) = self
+            .env
             .github_client
             .create_comment(&token, self.repo, self.pr_number as u64, &comment_body)
             .await
@@ -588,10 +592,11 @@ impl<'a> Run<'a> {
         let Some(token) = self.token_for(&installation, &repo).await else {
             return Ok(());
         };
-        let Ok(outbound) = schema::admit_outbound(self.db, &installation, &repo).await else {
+        let Ok(outbound) = schema::admit_outbound(self.env.db, &installation, &repo).await else {
             return Ok(());
         };
         let fetched = self
+            .env
             .github_client
             .get_pull_request(&token, &repo, number)
             .await;
@@ -606,7 +611,7 @@ impl<'a> Run<'a> {
         let state = pull.link_state();
         if holder.link.state.as_deref() != Some(state) {
             schema::update_link_state(
-                self.db,
+                self.env.db,
                 &holder.link.link_id,
                 state,
                 holder.link.title.as_deref(),
@@ -617,7 +622,7 @@ impl<'a> Run<'a> {
             if pull.merged == Some(true)
                 && kind_may_fire(holder.kind, GitHubAutomationStep::PrMerged)
             {
-                schema::set_completion_pending(self.db, &holder.link.link_id, true).await?;
+                schema::set_completion_pending(self.env.db, &holder.link.link_id, true).await?;
                 holder.link.completion_pending = true;
             }
         }
@@ -642,7 +647,7 @@ impl<'a> Run<'a> {
         issue_id: &str,
         finished: Option<&Finished<'_>>,
     ) -> trakkt_core::Result<()> {
-        let mut siblings = reachable_pr_links(self.db, issue_id).await?;
+        let mut siblings = reachable_pr_links(self.env.db, issue_id).await?;
         for sibling in &mut siblings {
             let is_this_pr = finished.is_some_and(|f| sibling.is_same_pr(f.repo, f.number));
             if sibling.is_open() && behavior(sibling.kind).working && !is_this_pr {
@@ -663,7 +668,7 @@ impl<'a> Run<'a> {
             .any(|l| l.is_open() && behavior(l.kind).working)
         {
             if let (true, Some((_, l))) = (this_completes, this) {
-                schema::set_completion_pending(self.db, &l.link.link_id, true).await?;
+                schema::set_completion_pending(self.env.db, &l.link.link_id, true).await?;
             }
             return Ok(());
         }
@@ -683,7 +688,7 @@ impl<'a> Run<'a> {
         };
         self.apply_step(issue_id, step).await?;
         if release {
-            schema::clear_completion_pending_for_issue(self.db, issue_id).await?;
+            schema::clear_completion_pending_for_issue(self.env.db, issue_id).await?;
         }
         Ok(())
     }
@@ -756,7 +761,7 @@ pub async fn apply_transition_rules(
             ws_manager,
             base_url,
         },
-        installation,
+        Some(installation),
         repo,
         pr_number,
         schema::linkback_enabled(db, workspace_id).await?,
@@ -789,58 +794,36 @@ pub async fn apply_transition_rules(
     Ok(())
 }
 
-/// Re-evaluate the issues a connection holds open PRs on, once it can report
-/// again (unsuspended, or its repositories changed).
+/// Release held-back completions after a connection's reach changed.
 ///
-/// A merge or close that happened while the connection was away was never
-/// delivered, so a completion held back by one of its open PRs would wait for an
-/// event that never comes. Settling each such issue checks the PR with GitHub
-/// (`verify_holder`), which finds the merge and releases the held completion.
-pub async fn settle_connection_issues(
+/// A completion is held back while another PR on the issue is open. When the
+/// connection that PR came in on is unsuspended, reauthorized, loses the
+/// repository, or is disconnected or uninstalled, its merge or close may never
+/// have been delivered, and nothing else will ever wake the issue. Every issue
+/// with a `completion_pending` mark is the retry key: each is settled again, and
+/// `verify_holder` asks GitHub about whichever open PR still holds it. One issue
+/// failing does not stop the rest. A sweep moves issues; it posts no comment.
+pub async fn settle_pending_completions(
     db: &DbPool,
     github_client: &GitHubClient,
-    installation: &GitHubInstallation,
+    workspace_id: &str,
     encryption_key: &[u8; 32],
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
-    base_url: &str,
 ) -> trakkt_core::Result<()> {
-    if !installation.is_active() {
-        return Ok(());
-    }
-    let open_links = trakkt_core::db_fetch_all!(
-        db,
-        schema::GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, link_kind, completion_pending, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE installation_id = $1 AND link_type = $2 AND state IN ('open', 'draft')",
-        &installation.installation_id,
-        "pull_request"
-    )?;
-    let linkback = schema::linkback_enabled(db, &installation.workspace_id).await?;
     let env = Env {
         db,
         github_client,
-        workspace_id: &installation.workspace_id,
+        workspace_id,
         encryption_key,
         ws_manager,
-        base_url,
+        // A sweep posts no comment, so no link is ever built from this.
+        base_url: "",
     };
-    let mut settled = std::collections::HashSet::new();
-    for link in &open_links {
-        if !installation.allows_repository(&link.repo_full_name)
-            || !settled.insert(link.issue_id.as_str())
-        {
-            continue;
+    let mut run = Run::new(env, None, "", 0, false);
+    for issue_id in schema::list_issue_ids_with_pending_completion(db, workspace_id).await? {
+        if let Err(e) = run.settle_issue(&issue_id, None).await {
+            tracing::warn!(error = %e, issue_id = %issue_id, "Could not settle a held completion");
         }
-        let Ok(number) = link.ref_identifier.parse::<i64>() else {
-            continue;
-        };
-        let mut run = Run::new(env, installation, &link.repo_full_name, number, linkback);
-        run.settle_issue(&link.issue_id, None).await?;
     }
     Ok(())
 }

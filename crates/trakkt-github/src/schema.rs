@@ -24,6 +24,22 @@ pub fn pr_link_state(merged: bool, closed: bool, draft: bool) -> &'static str {
     }
 }
 
+/// `SELECT` over `github_links` with every column `GitHubLink` reads, followed
+/// by the caller's clauses. One column list for every query of the table.
+macro_rules! link_select {
+    ($($clauses:literal),+) => {
+        concat!(
+            "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
+                    github_id, github_node_id, repo_full_name, ref_identifier, \
+                    title, state, url, author_login, link_kind, completion_pending, \
+                    CAST(created_at AS TEXT) AS created_at, \
+                    CAST(updated_at AS TEXT) AS updated_at \
+             FROM github_links ",
+            $($clauses),+
+        )
+    };
+}
+
 // ─── Row types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -922,14 +938,10 @@ pub async fn list_links_for_issue(
     let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
         db,
         GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, link_kind, completion_pending, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE issue_id = $1 \
-         ORDER BY created_at DESC",
+        link_select!(
+            "WHERE issue_id = $1 \
+         ORDER BY created_at DESC"
+        ),
         issue_id
     )?;
     Ok(rows)
@@ -1071,14 +1083,10 @@ pub async fn upsert_link_with_admission(
     let row = trakkt_core::tx_fetch_one!(
         &mut tx,
         GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, link_kind, completion_pending, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE workspace_id = $1 AND issue_id = $2 AND link_type = $3 \
-               AND repo_full_name = $4 AND ref_identifier = $5",
+        link_select!(
+            "WHERE workspace_id = $1 AND issue_id = $2 AND link_type = $3 \
+               AND repo_full_name = $4 AND ref_identifier = $5"
+        ),
         params.workspace_id,
         params.issue_id,
         params.link_type,
@@ -1160,20 +1168,36 @@ pub async fn list_pr_links_by_ref(
     let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
         db,
         GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, link_kind, completion_pending, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE workspace_id = $1 AND link_type = $2 \
-               AND repo_full_name = $3 AND ref_identifier = $4",
+        link_select!(
+            "WHERE workspace_id = $1 AND link_type = $2 \
+               AND repo_full_name = $3 AND ref_identifier = $4"
+        ),
         workspace_id,
         "pull_request",
         repo_full_name,
         ref_identifier
     )?;
     Ok(rows)
+}
+
+/// Issues in a workspace with a held-back completion: a closing PR merged but
+/// the issue was not completed because another PR was still open.
+pub async fn list_issue_ids_with_pending_completion(
+    db: &DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Vec<String>> {
+    Ok(trakkt_core::db_fetch_all!(
+        db,
+        (String,),
+        "SELECT DISTINCT issue_id FROM github_links \
+         WHERE workspace_id = $1 AND link_type = $2 AND completion_pending = $3",
+        workspace_id,
+        "pull_request",
+        true
+    )?
+    .into_iter()
+    .map(|(issue_id,)| issue_id)
+    .collect())
 }
 
 /// Every pull request link on an issue, whatever its kind or state.
@@ -1187,13 +1211,7 @@ pub async fn list_pr_links_for_issue(
     let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
         db,
         GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, link_kind, completion_pending, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE issue_id = $1 AND link_type = $2",
+        link_select!("WHERE issue_id = $1 AND link_type = $2"),
         issue_id,
         "pull_request"
     )?;
@@ -1258,10 +1276,12 @@ pub async fn set_completion_pending(
          WHERE link_id = $2 AND ($1 = $3 OR EXISTS ( \
              SELECT 1 FROM issues i JOIN statuses s ON s.status_id = i.status_id \
              WHERE i.issue_id = github_links.issue_id \
-               AND s.category NOT IN ('completed', 'cancelled')))",
+               AND s.category NOT IN ($4, $5)))",
         pending,
         link_id,
-        false
+        false,
+        StatusCategory::Completed.as_str(),
+        StatusCategory::Cancelled.as_str()
     )?;
     Ok(())
 }
