@@ -445,14 +445,19 @@ issue, not of one event:
   last open PR lets go: by merging, being closed without merge, or being edited so it
   no longer works on the issue. Nothing else completes an issue, so an old merge is
   never re-applied after a person reopens the issue, and a PR that only mentions the
-  issue never completes it.
+  issue never completes it. The mark is cleared when the issue reaches Completed or
+  Cancelled by any path (in the same transaction as the status change), and cannot be
+  set on an issue that is already finished.
 - A PR closed without merging is never a merge. It cancels the issue (the
   `pr_closed` rule) only when it is a `closing` link, no other working-link PR is
   open and none has merged.
-- PRs in a repository the workspace has permanently let go of (connection removed,
-  disconnected, uninstalled, or the repository dropped from the selection) are
-  ignored, since they can never report again; a suspended connection or one
-  reconciling its scope is temporary and still counts.
+- An *open* PR in a repository the workspace has permanently let go of (connection
+  removed, disconnected, uninstalled, or the repository dropped from the selection) is
+  ignored, since it can never report again; a suspended connection or one reconciling
+  its scope is temporary and still counts. Merged and closed links are recorded facts
+  and count wherever their repository now is. When a connection comes back
+  (`installation.unsuspend`, repositories added or removed) the issues it holds open
+  PRs on are settled, so a merge missed while it was away releases a held completion.
 - The status write is a compare-and-set on the status the decision read, so a
   person's concurrent change is never overwritten.
 - A finished PR never returns to open except by `reopened` (a merged PR never does);

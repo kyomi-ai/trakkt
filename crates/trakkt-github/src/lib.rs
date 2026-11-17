@@ -84,15 +84,11 @@ pub struct PullRequest {
 impl PullRequest {
     /// The value stored in `github_links.state` for what GitHub says right now.
     pub fn link_state(&self) -> &'static str {
-        if self.merged == Some(true) {
-            "merged"
-        } else if self.state == "closed" {
-            "closed"
-        } else if self.draft == Some(true) {
-            "draft"
-        } else {
-            "open"
-        }
+        schema::pr_link_state(
+            self.merged == Some(true),
+            self.state == "closed",
+            self.draft == Some(true),
+        )
     }
 }
 

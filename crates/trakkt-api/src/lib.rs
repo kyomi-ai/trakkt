@@ -153,7 +153,9 @@ impl From<trakkt_core::Error> for ApiError {
             trakkt_core::Error::Unauthorized(msg) => ApiError::Unauthorized(msg),
             trakkt_core::Error::Forbidden(msg) => ApiError::Forbidden(msg),
             trakkt_core::Error::BadRequest(msg) => ApiError::BadRequest(msg),
-            trakkt_core::Error::Conflict(msg) => ApiError::Conflict(msg),
+            trakkt_core::Error::Conflict(msg) | trakkt_core::Error::PreconditionFailed(msg) => {
+                ApiError::Conflict(msg)
+            }
             trakkt_core::Error::TooManyRequests(msg, _) => ApiError::TooManyRequests(msg),
             trakkt_core::Error::NotImplemented(msg) => ApiError::NotImplemented(msg),
             trakkt_core::Error::ServiceUnavailable(msg) => ApiError::ServiceUnavailable(msg),

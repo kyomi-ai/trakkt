@@ -169,10 +169,11 @@ async fn resolve_rule(
         .transpose()
 }
 
-/// A PR link on an issue with its parsed kind.
+/// A PR link on an issue with its parsed kind and the connection it came in on.
 struct PrLink {
     link: schema::GitHubLink,
     kind: LinkKind,
+    installation: GitHubInstallation,
 }
 
 impl PrLink {
@@ -189,37 +190,36 @@ impl PrLink {
     }
 }
 
-/// Every PR link on an issue whose repository can still, in principle, report.
+/// The PR links on an issue that still count.
 ///
-/// Links in a repository the workspace has permanently let go of (connection
-/// removed, disconnected, uninstalled, or the repository dropped from the
-/// selection) can never receive their merge or close event, so their stored
-/// `open` is not evidence of anything and must not hold back a completion. A
-/// connection that is only suspended or reconciling its scope is temporary, so
-/// its links still count.
+/// An *open* link in a repository that can never report again (see
+/// [`GitHubInstallation::may_still_report`]) is dropped: its stored `open` is
+/// not evidence of anything and must not hold back a completion. A merged or
+/// closed link is a recorded fact and counts wherever its repository now is.
 async fn reachable_pr_links(db: &DbPool, issue_id: &str) -> trakkt_core::Result<Vec<PrLink>> {
     let mut installations: std::collections::HashMap<String, Option<GitHubInstallation>> =
         std::collections::HashMap::new();
-    let mut reachable = Vec::new();
+    let mut kept = Vec::new();
     for link in schema::list_pr_links_for_issue(db, issue_id).await? {
         if !installations.contains_key(&link.installation_id) {
             let installation = schema::get_installation_by_id(db, &link.installation_id).await?;
             installations.insert(link.installation_id.clone(), installation);
         }
-        let live = installations[&link.installation_id]
-            .as_ref()
-            .is_some_and(|i| {
-                i.archived_at.is_none()
-                    && i.disconnected_at.is_none()
-                    && i.uninstalled_at.is_none()
-                    && (i.repository_scope_pending || i.repository_in_scope(&link.repo_full_name))
-            });
-        if live {
-            let kind = link.kind()?;
-            reachable.push(PrLink { link, kind });
+        let Some(installation) = installations[&link.installation_id].clone() else {
+            continue;
+        };
+        let open = matches!(link.state.as_deref(), Some("open" | "draft"));
+        if open && !installation.may_still_report(&link.repo_full_name) {
+            continue;
         }
+        let kind = link.kind()?;
+        kept.push(PrLink {
+            link,
+            kind,
+            installation,
+        });
     }
-    Ok(reachable)
+    Ok(kept)
 }
 
 // ─── Token Management ──────────────────────────────────────────────────────
@@ -353,7 +353,41 @@ struct Run<'a> {
     comments_blocked: bool,
 }
 
-impl Run<'_> {
+/// What every event handled in one call shares.
+#[derive(Clone, Copy)]
+struct Env<'a> {
+    db: &'a DbPool,
+    github_client: &'a GitHubClient,
+    workspace_id: &'a str,
+    encryption_key: &'a [u8; 32],
+    ws_manager: Option<&'a trakkt_auth::websocket::WebSocketManager>,
+    base_url: &'a str,
+}
+
+impl<'a> Run<'a> {
+    fn new(
+        env: Env<'a>,
+        installation: &'a GitHubInstallation,
+        repo: &'a str,
+        pr_number: i64,
+        linkback: bool,
+    ) -> Self {
+        Self {
+            db: env.db,
+            github_client: env.github_client,
+            installation,
+            workspace_id: env.workspace_id,
+            repo,
+            pr_number,
+            encryption_key: env.encryption_key,
+            ws_manager: env.ws_manager,
+            base_url: env.base_url,
+            linkback,
+            tokens: std::collections::HashMap::new(),
+            comments_blocked: false,
+        }
+    }
+
     /// An installation token, fetched on first use.
     async fn token_for(&mut self, installation: &GitHubInstallation, repo: &str) -> Option<String> {
         if !self.tokens.contains_key(&installation.installation_id) {
@@ -544,11 +578,7 @@ impl Run<'_> {
     /// If GitHub cannot be asked, the sibling keeps holding.
     async fn verify_holder(&mut self, holder: &mut PrLink) -> trakkt_core::Result<()> {
         let repo = holder.link.repo_full_name.clone();
-        let Some(installation) =
-            schema::get_installation_by_id(self.db, &holder.link.installation_id).await?
-        else {
-            return Ok(());
-        };
+        let installation = holder.installation.clone();
         let Ok(number) = holder.link.ref_identifier.parse::<u64>() else {
             return Ok(());
         };
@@ -717,20 +747,20 @@ pub async fn apply_transition_rules(
         return Ok(());
     }
 
-    let mut run = Run {
-        db,
-        github_client,
+    let mut run = Run::new(
+        Env {
+            db,
+            github_client,
+            workspace_id,
+            encryption_key,
+            ws_manager,
+            base_url,
+        },
         installation,
-        workspace_id,
         repo,
         pr_number,
-        encryption_key,
-        ws_manager,
-        base_url,
-        linkback: schema::linkback_enabled(db, workspace_id).await?,
-        tokens: std::collections::HashMap::new(),
-        comments_blocked: false,
-    };
+        schema::linkback_enabled(db, workspace_id).await?,
+    );
 
     match event {
         Event::Step(step) => {
@@ -755,6 +785,62 @@ pub async fn apply_transition_rules(
                 run.settle_issue(issue_id, finished.as_ref()).await?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Re-evaluate the issues a connection holds open PRs on, once it can report
+/// again (unsuspended, or its repositories changed).
+///
+/// A merge or close that happened while the connection was away was never
+/// delivered, so a completion held back by one of its open PRs would wait for an
+/// event that never comes. Settling each such issue checks the PR with GitHub
+/// (`verify_holder`), which finds the merge and releases the held completion.
+pub async fn settle_connection_issues(
+    db: &DbPool,
+    github_client: &GitHubClient,
+    installation: &GitHubInstallation,
+    encryption_key: &[u8; 32],
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+    base_url: &str,
+) -> trakkt_core::Result<()> {
+    if !installation.is_active() {
+        return Ok(());
+    }
+    let open_links = trakkt_core::db_fetch_all!(
+        db,
+        schema::GitHubLink,
+        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
+                github_id, github_node_id, repo_full_name, ref_identifier, \
+                title, state, url, author_login, link_kind, completion_pending, \
+                CAST(created_at AS TEXT) AS created_at, \
+                CAST(updated_at AS TEXT) AS updated_at \
+         FROM github_links \
+         WHERE installation_id = $1 AND link_type = $2 AND state IN ('open', 'draft')",
+        &installation.installation_id,
+        "pull_request"
+    )?;
+    let linkback = schema::linkback_enabled(db, &installation.workspace_id).await?;
+    let env = Env {
+        db,
+        github_client,
+        workspace_id: &installation.workspace_id,
+        encryption_key,
+        ws_manager,
+        base_url,
+    };
+    let mut settled = std::collections::HashSet::new();
+    for link in &open_links {
+        if !installation.allows_repository(&link.repo_full_name)
+            || !settled.insert(link.issue_id.as_str())
+        {
+            continue;
+        }
+        let Ok(number) = link.ref_identifier.parse::<i64>() else {
+            continue;
+        };
+        let mut run = Run::new(env, installation, &link.repo_full_name, number, linkback);
+        run.settle_issue(&link.issue_id, None).await?;
     }
     Ok(())
 }

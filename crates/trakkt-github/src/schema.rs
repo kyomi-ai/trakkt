@@ -9,6 +9,21 @@ use trakkt_core::DbPool;
 use trakkt_core::sql_compat;
 use trakkt_types::enums::{GitHubAutomationStep, StatusCategory};
 
+/// The `github_links.state` of a pull request, from what GitHub says about it.
+/// One precedence for every source (webhook payload, REST response): merged,
+/// then closed, then draft, then open.
+pub fn pr_link_state(merged: bool, closed: bool, draft: bool) -> &'static str {
+    if merged {
+        "merged"
+    } else if closed {
+        "closed"
+    } else if draft {
+        "draft"
+    } else {
+        "open"
+    }
+}
+
 // ─── Row types ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -70,6 +85,19 @@ impl GitHubInstallation {
     /// NULL means all only when the verified selection says all; [] means none.
     pub fn allows_repository(&self, repository: &str) -> bool {
         self.is_active() && self.repository_in_scope(repository)
+    }
+
+    /// Whether a PR in `repository` can still, in principle, report to us.
+    ///
+    /// Permanently gone connections (removed, disconnected, uninstalled) and
+    /// repositories dropped from the selection can never deliver another event.
+    /// A connection that is only suspended, or reconciling its scope, is
+    /// temporary: it will be back, so its PRs still count.
+    pub fn may_still_report(&self, repository: &str) -> bool {
+        self.archived_at.is_none()
+            && self.disconnected_at.is_none()
+            && self.uninstalled_at.is_none()
+            && (self.repository_scope_pending || self.repository_in_scope(repository))
     }
 
     /// Whether the connection's repository selection covers `repository`,
@@ -1215,6 +1243,10 @@ pub async fn update_link_state(
 }
 
 /// Mark whether a link's merge is waiting to be applied to its issue.
+///
+/// Setting the mark is a no-op once the issue is completed or cancelled: a
+/// completion that already happened is not pending, and a mark left on a
+/// finished issue would re-complete it after a person reopens it.
 pub async fn set_completion_pending(
     db: &DbPool,
     link_id: &str,
@@ -1222,9 +1254,14 @@ pub async fn set_completion_pending(
 ) -> trakkt_core::Result<()> {
     trakkt_core::db_execute!(
         db,
-        "UPDATE github_links SET completion_pending = $1 WHERE link_id = $2",
+        "UPDATE github_links SET completion_pending = $1 \
+         WHERE link_id = $2 AND ($1 = $3 OR EXISTS ( \
+             SELECT 1 FROM issues i JOIN statuses s ON s.status_id = i.status_id \
+             WHERE i.issue_id = github_links.issue_id \
+               AND s.category NOT IN ('completed', 'cancelled')))",
         pending,
-        link_id
+        link_id,
+        false
     )?;
     Ok(())
 }

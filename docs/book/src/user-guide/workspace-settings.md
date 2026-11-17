@@ -56,7 +56,7 @@ Several keys can follow one word: `Fixes TRA-12, TRA-13 and TRA-14`. The word ha
 
 - A **draft** PR does nothing until it is marked ready for review (a team can give the draft step its own rule). Reopening a PR starts the issue like opening it.
 - When a PR merges, the issue is completed **only after the last open PR linked to it is done**: a merge that has to wait is applied when the last open PR merges, is closed without merging, or is edited so it no longer works on the issue. A PR closed without merging does not complete anything on its own. Trakkt checks an open PR with GitHub before letting it hold a merge back.
-- A PR that closes an issue and is **closed without merging** moves it to **Cancelled** when no other linked PR is open and none has merged. Under the rule below that is final.
+- A PR that closes an issue and is **closed without merging** moves it to **Cancelled** when no other PR working on the issue is open and none has merged. Under the rule below that is final.
 - Issues are **never moved backwards**, and **Completed or Cancelled issues are never moved by GitHub**: reopening finished work is your decision.
 - Editing a PR never starts an issue: it starts at the next open, ready or reopen event, or completes when the PR merges. An edit only releases a merge that was waiting.
 - When automation changes an issue's status it comments on the PR. Turn that off in **Settings > Integrations > Team automation**; the switch covers the comment posted when you complete an issue by hand as well.

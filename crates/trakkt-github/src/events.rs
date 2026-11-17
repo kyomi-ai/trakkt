@@ -667,15 +667,12 @@ fn determine_pr_state(
     draft: bool,
     github_state: Option<&str>,
 ) -> String {
-    if merged {
-        "merged".to_string()
-    } else if action == "closed" || github_state == Some("closed") {
-        "closed".to_string()
-    } else if draft {
-        "draft".to_string()
-    } else {
-        "open".to_string()
-    }
+    schema::pr_link_state(
+        merged,
+        action == "closed" || github_state == Some("closed"),
+        draft,
+    )
+    .to_string()
 }
 
 /// A validated issue reference — just the ID we need for link creation.

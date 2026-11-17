@@ -1695,19 +1695,29 @@ async fn nothing_but_a_held_back_merge_ever_completes_a_reopened_ticket() {
     let mention_two = Pr::new(92, "More notes", "Related to KEY-1", "feature/more");
     send(&f, "reopen-mention2-open", &mention_two, "opened", false).await;
     send(&f, "reopen-mention2-merge", &mention_two, "closed", true).await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "backlog",
+        "edits and mentions leave the reopened ticket exactly where the person put it"
+    );
+    assert!(
+        comments_after(&stub, baseline).await.is_empty(),
+        "mentions and edits posted nothing: {:?}",
+        comments_after(&stub, baseline).await
+    );
+    // A contributing PR may start the ticket, and its merge must not complete it.
     let contributes = Pr::new(93, "Groundwork", "Refs KEY-1", "feature/ground");
     send(&f, "reopen-contrib-open", &contributes, "opened", false).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    let after_open = comments_after(&stub, baseline).await;
+    assert_eq!(after_open.len(), 1, "{after_open:?}");
+    assert!(after_open[0].contains("Status moved to"), "{after_open:?}");
     send(&f, "reopen-contrib-merge", &contributes, "closed", true).await;
-
-    let after = status_category(&f, &f.issue).await;
-    assert_ne!(after, "completed", "an old merge was applied again");
-    assert!(
-        comments_after(&stub, baseline)
-            .await
-            .iter()
-            .all(|c| !c.contains("marked as")),
-        "no completion was announced: {:?}",
-        comments_after(&stub, baseline).await
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    assert_eq!(
+        comments_after(&stub, baseline).await.len(),
+        1,
+        "the contributing merge announced nothing"
     );
     stub.stop().await;
 }
@@ -1787,5 +1797,133 @@ async fn a_merged_pr_never_becomes_open_again_and_a_closed_one_only_by_reopening
     assert_eq!(link_state(&f, &f.issue, "99").await.as_deref(), Some("closed"));
     send(&f, "fence-reopen-closed", &closed, "reopened", false).await;
     assert_eq!(link_state(&f, &f.issue, "99").await.as_deref(), Some("open"));
+    stub.stop().await;
+}
+
+async fn move_by_hand(f: &Fixture, category: &str) {
+    let issue = trakkt_auth::issue_service::get_issue_by_id(&f.state.db, &f.issue)
+        .await
+        .expect("read the ticket to move")
+        .expect("issue exists");
+    let status = trakkt_auth::status_service::get_status_by_category(&f.state.db, WORKSPACE, category)
+        .await
+        .expect("resolve status")
+        .expect("status seeded");
+    trakkt_auth::issue_service::update_issue(
+        &f.state.db,
+        WORKSPACE,
+        &issue.team_key,
+        issue.number,
+        &trakkt_types::models::IssueUpdate {
+            status_id: Some(status.status_id),
+            ..Default::default()
+        },
+        None,
+        trakkt_types::enums::ActionSource::Api,
+        None,
+        None,
+    )
+    .await
+    .expect("move the ticket by hand");
+}
+
+async fn pending_marks(f: &Fixture) -> Vec<bool> {
+    links(f, &f.issue)
+        .await
+        .into_iter()
+        .filter(|l| l.link_type == "pull_request")
+        .map(|l| l.completion_pending)
+        .collect()
+}
+
+#[tokio::test]
+async fn finishing_the_ticket_by_hand_clears_a_held_merge_so_it_cannot_come_back() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let a = Pr::new(100, "Part one", "Fixes KEY-1", "feature/a");
+    let b = Pr::new(101, "Part two", "Fixes KEY-1", "feature/b");
+    send(&f, "hand-open-a", &a, "opened", false).await;
+    send(&f, "hand-open-b", &b, "opened", false).await;
+    send(&f, "hand-merge-a", &a, "closed", true).await;
+    assert!(pending_marks(&f).await.contains(&true), "A's merge is held back by B");
+    // A person finishes the ticket, then reopens it for follow-up work.
+    move_by_hand(&f, "completed").await;
+    assert!(!pending_marks(&f).await.contains(&true), "finishing it settled the held merge");
+    move_by_hand(&f, "started").await;
+    send(&f, "hand-close-b", &b, "closed", false).await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "started",
+        "the held merge must not re-complete a ticket a person reopened"
+    );
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_mark_cannot_be_set_on_a_ticket_that_is_already_finished() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let a = Pr::new(102, "Fix", "Fixes KEY-1", "feature/a");
+    send(&f, "late-open-a", &a, "opened", false).await;
+    send(&f, "late-merge-a", &a, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "completed");
+    let link = links(&f, &f.issue).await.into_iter().next().expect("the PR link");
+    // A settle that read a sibling as open lost a race with the completion.
+    schema::set_completion_pending(&f.state.db, &link.link_id, true)
+        .await
+        .expect("late mark attempt");
+    assert!(!pending_marks(&f).await.contains(&true));
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_connection_coming_back_settles_a_merge_it_missed_while_away() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let elsewhere = Pr::new(103, "Other half", "Fixes KEY-1", "feature/elsewhere");
+    deliver(&f, "pull_request", "away-open", elsewhere.event(&f.organization, "opened", false)).await;
+    let here = Pr::new(104, "This half", "Fixes KEY-1", "feature/here");
+    send(&f, "away-open-here", &here, "opened", false).await;
+    schema::suspend_installation(&f.state.db, &f.organization.installation_id)
+        .await
+        .expect("suspend the organization connection");
+    send(&f, "away-merge-here", &here, "closed", true).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started", "held by the suspended PR");
+    // The organization's PR merged while the connection was away; that event was dropped.
+    stub.set_pull("fixture-org/repo", 103, "closed", true);
+    deliver(
+        &f,
+        "installation",
+        "away-unsuspend",
+        json!({"action":"unsuspend","installation":{"id":f.organization.github_installation_id}}),
+    )
+    .await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "completed",
+        "nothing else would ever have released the held merge"
+    );
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_merged_pr_in_a_repository_that_is_gone_still_counts_as_the_fix() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let merged_elsewhere = Pr::new(105, "The fix", "Fixes KEY-1", "feature/elsewhere");
+    deliver(&f, "pull_request", "gone-open", merged_elsewhere.event(&f.organization, "opened", false)).await;
+    let here = Pr::new(106, "Also this", "Fixes KEY-1", "feature/here");
+    send(&f, "gone-open-here", &here, "opened", false).await;
+    deliver(&f, "pull_request", "gone-merge", merged_elsewhere.event(&f.organization, "closed", true)).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started", "held by the open PR here");
+    schema::disconnect_installation(&f.state.db, &f.organization.installation_id, WORKSPACE)
+        .await
+        .expect("disconnect the organization connection");
+    send(&f, "gone-close-here", &here, "closed", false).await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "completed",
+        "the merged fix released the hold; it must not be cancelled because its repository left"
+    );
     stub.stop().await;
 }

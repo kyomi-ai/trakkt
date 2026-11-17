@@ -405,7 +405,38 @@ async fn handle_installation_unsuspend(
         account = %inst.account_login,
         "GitHub installation unsuspended"
     );
+    settle_after_reconnect(state, &inst.installation_id).await;
     Ok(())
+}
+
+/// A connection that was away can have missed merges and closes. Settle the
+/// issues it holds open PRs on, so a completion held back by one of them is not
+/// left waiting for an event that will never come. Best-effort: failures are
+/// logged, never fail the delivery.
+async fn settle_after_reconnect(state: &AppState, installation_id: &str) {
+    let Some(client) = state.github_client.as_deref() else {
+        return;
+    };
+    let current = match schema::get_installation_by_id(&state.db, installation_id).await {
+        Ok(Some(current)) => current,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not reload the connection to settle its PRs");
+            return;
+        }
+    };
+    if let Err(e) = trakkt_github::transitions::settle_connection_issues(
+        &state.db,
+        client,
+        &current,
+        &state.encryption_key,
+        Some(&state.ws_manager),
+        &state.config.frontend_url,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, installation_id, "Failed to settle PRs after reconnect");
+    }
 }
 
 /// Handle `installation_repositories.added` and `.removed` — update the
@@ -467,6 +498,7 @@ async fn handle_installation_repos_changed(
         selection = %selection,
         "GitHub installation repositories updated"
     );
+    settle_after_reconnect(state, &inst.installation_id).await;
     Ok(())
 }
 

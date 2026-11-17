@@ -90,8 +90,7 @@ impl IntoResponse for Error {
             Error::PreconditionFailed(msg) => (StatusCode::PRECONDITION_FAILED, msg.clone()),
             Error::TooManyRequests(msg, retry_after) => {
                 let body = serde_json::json!({ "detail": msg });
-                let mut response =
-                    (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
                 if let Ok(val) = retry_after.to_string().parse() {
                     response.headers_mut().insert("retry-after", val);
                 }
@@ -101,38 +100,23 @@ impl IntoResponse for Error {
             Error::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             Error::Internal(msg) => {
                 tracing::error!("internal error: {msg}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".into(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".into())
             }
             Error::Sqlx(e) => {
                 tracing::error!("database error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".into(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".into())
             }
             Error::Redis(e) => {
                 tracing::error!("redis error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".into(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".into())
             }
             Error::SerdeJson(e) => {
                 tracing::error!("serialization error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".into(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".into())
             }
             Error::Migrate(e) => {
                 tracing::error!("migration error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".into(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".into())
             }
         };
 
