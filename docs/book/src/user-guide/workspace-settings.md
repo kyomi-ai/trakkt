@@ -38,11 +38,32 @@ Connect your GitHub organization to link pull requests, branches, and commits to
 - **Not connected** -- the GitHub App is configured but your workspace is not connected. Click **Connect GitHub** to start the installation flow.
 - **Connected** -- your GitHub organization is linked. You can see which repositories are connected and disconnect the integration if needed.
 
-When connected, Trakkt can automatically link PRs and commits that reference issue identifiers (e.g., `TRA-35`) in their title or description.
+When connected, Trakkt links a pull request to an issue by **intent**, the way Linear does. A key such as `TRA-35` in a PR description is only a mention.
 
-The default automation rules move linked tickets to **Started** when a PR opens and **Completed** when a PR merges with `Closes TRA-35`, `Fixes TRA-35`, or `Resolves TRA-35` in its title or body. A plain reference such as `TRA-35` links the ticket without closing it on merge. Repeat the closing phrase for each ticket you want completed.
+### How a PR links to an issue
 
-The default rules also move a ticket to **Cancelled** when its PR closes without merging and contains a closing phrase. Workspace admins can toggle each rule in the Integrations page. Your workspace must have statuses in the corresponding categories for transitions to apply.
+| What the PR says | Link | What it does |
+| --- | --- | --- |
+| The key in the **branch name** or the **PR title** | Working link | Starts the issue when the PR opens, completes it when the PR merges |
+| `Closes`, `Fixes`, `Resolves`, `Completes`, `Implements` (and their `-es`, `-ed`, `-ing` forms) before the key | Closing | Starts the issue; completes it when the PR merges |
+| `Refs`, `References`, `Part of`, `Contributes to`, `Toward`, `Towards` before the key | Contributing | Starts the issue; never completes it |
+| `Related to`, `Relates to` before the key, or a bare key in the description | Related | Shown on the issue and the PR; never changes status |
+| `Skip` or `Ignore` before the key | None | No link and no automation, even if the branch name has the key |
+
+Several keys can follow one word: `Fixes TRA-12, TRA-13 and TRA-14`. The word has to come directly before the key, so `Fixes the crash described in TRA-12` only mentions it. A full Trakkt issue URL works like a key. Words in PR comments never link. A magic word in a PR's title or description decides that key's link; a bare key in the title is a working link, a bare key in the description is related.
+
+### What the automation does
+
+- A **draft** PR does nothing until it is marked ready for review (a team can give the draft step its own rule). Reopening a PR starts the issue like opening it.
+- When a PR merges, the issue is completed **only after the last open PR linked to it is done**: a merge that has to wait is applied when the last open PR merges, is closed without merging, or is edited so it no longer works on the issue. A PR closed without merging does not complete anything on its own. Trakkt checks an open PR with GitHub before letting it hold a merge back.
+- A PR that closes an issue and is **closed without merging** moves it to **Cancelled** when no other PR working on the issue is open and none has merged. Under the rule below that is final.
+- Issues are **never moved backwards**, and **Completed or Cancelled issues are never moved by GitHub**: reopening finished work is your decision.
+- Editing a PR never starts an issue: it starts at the next open, ready or reopen event, or completes when the PR merges. An edit only releases a merge that was waiting.
+- When automation changes an issue's status it comments on the PR. Turn that off in **Settings > Integrations > Team automation**; the switch covers the comment posted when you complete an issue by hand as well.
+
+The default rules (PR opened or ready -> **Started**, last PR merged -> **Completed**, closing PR closed without merge -> **Cancelled**) apply workspace-wide, and workspace admins can toggle each one in the Integrations page. Under **Team automation** a team can replace any step for its own issues with a different status or turn it off. Your workspace must have statuses in the corresponding categories for transitions to apply.
+
+The REST and MCP `list_issue_github_links` response carries a `link_kind` (`closing`, `contributing`, `branch_title` or `related`) on each link in place of the old `close_intent` flag.
 
 ## Billing
 

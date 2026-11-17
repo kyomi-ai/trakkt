@@ -620,7 +620,7 @@ pub async fn complete_connection_with_delivery(
     state: &str,
     code: &str,
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
-) -> Result<String> {
+) -> Result<ConnectedInstallation> {
     client.oauth_config()?;
     let current = load_state(db, state, user_id, "oauth").await?;
     let installation_id = current.installation_id.ok_or_else(invalid_state)?;
@@ -639,8 +639,19 @@ pub async fn complete_connection_with_delivery(
             "Reconnect must authorize the same GitHub account".into(),
         ));
     }
-    bind_verified_connection(db, user_id, &current, &verified, ws_manager).await?;
-    Ok(current.workspace_id)
+    let installation_id =
+        bind_verified_connection(db, user_id, &current, &verified, ws_manager).await?;
+    Ok(ConnectedInstallation {
+        workspace_id: current.workspace_id,
+        installation_id,
+    })
+}
+
+/// The connection an authorization just bound, and the workspace it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedInstallation {
+    pub workspace_id: String,
+    pub installation_id: String,
 }
 
 /// Atomic reusable ownership primitive. Must be invoked inside the binding
@@ -703,7 +714,7 @@ async fn bind_verified_connection(
     state: &ConnectionState,
     verified: &VerifiedConnection,
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
-) -> Result<()> {
+) -> Result<String> {
     let archived_generations: std::collections::BTreeMap<i64, i64> =
         match state.archived_installation_generations.as_deref() {
             Some(encoded) => serde_json::from_str(encoded)
@@ -828,7 +839,7 @@ async fn bind_verified_connection(
                 ));
             }
             tx.commit().await?;
-            return Ok(());
+            return Ok(existing.0.clone());
         }
         let sql = format!(
             "UPDATE github_installations SET github_account_id = $2, account_login = $3, account_type = $4, suspended_at = NULL, disconnected_at = NULL, uninstalled_at = NULL, archived_at = NULL, authorization_verified_at = {}, access_token_encrypted = NULL, token_expires_at = NULL, token_generation = token_generation + 1, repository_scope_pending = {}, repository_selection = $7, target_repos = {repos_cast} WHERE installation_id = $5 AND github_installation_id = $1",
@@ -892,27 +903,24 @@ async fn bind_verified_connection(
         }
     }
     batch.record(&mut tx, "GITHUB_INSTALLATION", &id, &state.workspace_id, SyncAudience::Workspace, action, Some(serde_json::json!({"installation_id": id, "workspace_id": state.workspace_id, "github_installation_id": verified.installation_id, "account_login": verified.account_login, "account_type": verified.account_type, "github_account_id": verified.account_id, "target_repos": verified.repos}))).await?;
-    for (event, close_intent, category) in [
-        ("pr_opened", false, "started"),
-        ("pr_merged", true, "completed"),
-        ("pr_closed", true, "cancelled"),
-    ] {
+    for (step, category) in crate::schema::DEFAULT_RULES {
+        let (event, category) = (step.as_str(), category.as_str());
         let rule_id = uuid::Uuid::new_v4().to_string();
         let inserted = trakkt_core::tx_execute!(
             &mut tx,
-            "INSERT INTO github_transition_rules (rule_id, workspace_id, trigger_event, close_intent_required, target_status_category, enabled) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+            "INSERT INTO github_transition_rules (rule_id, workspace_id, trigger_event, target_status_category, enabled) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
             &rule_id,
             &state.workspace_id,
             event,
-            close_intent,
             category,
             true
         )?;
         if inserted.rows_affected() == 1 {
-            batch.record(&mut tx, "GITHUB_TRANSITION_RULE", &rule_id, &state.workspace_id, SyncAudience::Workspace, SyncActionType::Insert, Some(serde_json::json!({"rule_id": rule_id, "workspace_id": state.workspace_id, "trigger_event": event, "close_intent_required": close_intent, "target_status_category": category, "enabled": true}))).await?;
+            batch.record(&mut tx, "GITHUB_TRANSITION_RULE", &rule_id, &state.workspace_id, SyncAudience::Workspace, SyncActionType::Insert, Some(serde_json::json!({"rule_id": rule_id, "workspace_id": state.workspace_id, "trigger_event": event, "target_status_category": category, "enabled": true}))).await?;
         }
     }
-    batch.commit_and_deliver(tx, ws_manager).await
+    batch.commit_and_deliver(tx, ws_manager).await?;
+    Ok(id)
 }
 
 /// Operator identity reconciliation is separate from user authorization: it
@@ -1347,7 +1355,7 @@ mod tests {
             trakkt_core::test_helpers::seed_team(db,"archive-team","workspace-a","ARC").await.expect("seed archive history team");
             trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed archive history statuses");
             let issue = trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"archive-team".into(),creator_id:"admin-a".into(),title:"Historical linked ticket".into(),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create historical linked issue");
-            crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&row.installation_id,link_type:"pull_request",github_id:Some(700),github_node_id:None,repo_full_name:"example/repo",ref_identifier:"700",title:Some("Historical PR"),state:Some("merged"),url:"https://github.com/example/repo/pull/700",author_login:Some("fixture-user"),close_intent:true}).await.expect("seed historical PR link");
+            crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&row.installation_id,link_type:"pull_request",github_id:Some(700),github_node_id:None,repo_full_name:"example/repo",ref_identifier:"700",title:Some("Historical PR"),state:Some("merged"),url:"https://github.com/example/repo/pull/700",author_login:Some("fixture-user"),link_kind:crate::patterns::LinkKind::Closing,allows_reopen:false}).await.expect("seed historical PR link");
             let event = crate::schema::create_event(db,"archive-history",Some(&row.installation_id),"pull_request",Some("closed"),None).await.expect("seed historical webhook event");
             let before = snapshot(db).await;
             assert!(crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a").await.is_err(),"active connections require disconnect first");
@@ -1561,7 +1569,7 @@ mod tests {
             "SELECT link_id, installation_id, workspace_id FROM github_links ORDER BY link_id"
         )
         .expect("snapshot ordered historical links");
-        let rules = trakkt_core::db_fetch_all!(db, (String, String, String, bool, String, bool), "SELECT rule_id, workspace_id, trigger_event, close_intent_required, target_status_category, enabled FROM github_transition_rules ORDER BY rule_id").expect("snapshot ordered transition rules");
+        let rules = trakkt_core::db_fetch_all!(db, (String, String, String, String, bool), "SELECT rule_id, workspace_id, trigger_event, target_status_category, enabled FROM github_transition_rules ORDER BY rule_id").expect("snapshot ordered transition rules");
         let sync_count = trakkt_core::db_fetch_scalar!(db, i64, "SELECT COUNT(*) FROM sync_log")
             .expect("snapshot sync log");
         (
@@ -1601,7 +1609,7 @@ mod tests {
             assert_eq!(before,snapshot(db).await,"confirmation starts OAuth without connection mutation");
             assert!(complete_connection(db,&github.client,&KEY,"admin-a",&state,"valid").await.is_err());
             assert_eq!(before,snapshot(db).await);
-            let destination=complete_connection_with_delivery(db,&github.client,&KEY,"admin-b",&state,"valid",None).await.expect("verified direct installation");
+            let destination=complete_connection_with_delivery(db,&github.client,&KEY,"admin-b",&state,"valid",None).await.expect("verified direct installation").workspace_id;
             assert_eq!(destination,"workspace-b","completion returns state-bound destination");
             let row=crate::schema::get_installation_by_github_id(db,123).await.expect("read direct binding").expect("direct binding exists");
             assert_eq!(row.workspace_id,"workspace-b");
@@ -1741,7 +1749,7 @@ mod tests {
             trakkt_core::test_helpers::seed_team(db,"legacy-team","workspace-a","LEG").await.expect("seed linked issue team");
             trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed linked issue statuses");
             let issue=trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"legacy-team".into(),creator_id:"admin-a".into(),title:"Historical link".into(),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create issue with a historical GitHub link");
-            let link=crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&legacy.installation_id,link_type:"pull_request",github_id:Some(500),github_node_id:None,repo_full_name:"old/repo",ref_identifier:"1",title:Some("Historical pull request"),state:Some("open"),url:"https://github.com/old/repo/pull/1",author_login:Some("old-login"),close_intent:false}).await.expect("seed historical GitHub link");
+            let link=crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&legacy.installation_id,link_type:"pull_request",github_id:Some(500),github_node_id:None,repo_full_name:"old/repo",ref_identifier:"1",title:Some("Historical pull request"),state:Some("open"),url:"https://github.com/old/repo/pull/1",author_login:Some("old-login"),link_kind:crate::patterns::LinkKind::Related,allows_reopen:false}).await.expect("seed historical GitHub link");
             crate::schema::suspend_installation(db,&legacy.installation_id).await.expect("suspend legacy installation");
             let metadata=crate::schema::get_installation_by_id(db,&legacy.installation_id).await.expect("read legacy metadata").expect("legacy exists");
             let response: GitHubInstallationDetails=serde_json::from_value(details(&Scenario::default())).expect("decode trusted identity evidence");
@@ -1922,16 +1930,16 @@ mod tests {
                     reconnect_account(db,&github.client,&row).await;
                     let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load fresh generation").expect("exists");
                     if event == 2 {
-                        crate::events::process_pull_request(db,&row,"edited",&pr,None).await.expect("seed status PR link");
+                        crate::events::process_pull_request(db,&row,"edited",&pr,None,"https://trakkt.test").await.expect("seed status PR link");
                     }
                     let links_before = trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM github_links").expect("link count");
                     let activities_before = trakkt_core::db_fetch_scalar!(db,i64,"SELECT COUNT(*) FROM issue_activities").expect("activity count");
                     let (reached,resume) = crate::schema::mutation_pause::register(&row.installation_id);
                     let process = async {
                         match event {
-                            0 => crate::events::process_pull_request(db,&row,"opened",&pr,None).await,
-                            1 => crate::events::process_push(db,&row,&push,None).await,
-                            _ => crate::transitions::apply_transition_rules(db,&github.client,&row,"workspace-a","opened",&pr,&KEY,None,"http://localhost").await,
+                            0 => crate::events::process_pull_request(db,&row,"opened",&pr,None,"https://trakkt.test").await.map(|_| ()),
+                            1 => crate::events::process_push(db,&row,&push,None,"https://trakkt.test").await,
+                            _ => crate::transitions::apply_transition_rules(db,&github.client,&row,"workspace-a","opened",&pr,&[],&KEY,None,"http://localhost").await,
                         }
                     };
                     let change = async {
@@ -1977,8 +1985,8 @@ mod tests {
                 let number = 900 + n as i64;
                 let pr = serde_json::json!({"repository":{"full_name":"example/repo"},"pull_request":{"number":number,"title":reference,"body":"","head":{"ref":reference},"base":{"ref":"main"},"html_url":format!("https://github.com/example/repo/pull/{number}"),"draft":false,"merged":false}});
                 let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load connection").expect("exists");
-                crate::events::process_pull_request(db,&row,"opened",&pr,None).await.expect("link the PR to the issue");
-                crate::transitions::apply_transition_rules(db,&github.client,&row,"workspace-a","opened",&pr,&KEY,None,"http://localhost").await.expect("apply transition rules");
+                crate::events::process_pull_request(db,&row,"opened",&pr,None,"https://trakkt.test").await.expect("link the PR to the issue");
+                crate::transitions::apply_transition_rules(db,&github.client,&row,"workspace-a","opened",&pr,&[],&KEY,None,"http://localhost").await.expect("apply transition rules");
 
                 let after = trakkt_auth::issue_service::get_issue_by_id(db,&issue.issue_id).await.expect("reload issue").expect("exists");
                 if may_move {
@@ -1987,6 +1995,196 @@ mod tests {
                     assert_eq!(after.status_id,start.status_id,"a PR that names a {category} issue must leave it {category}, but it is now {}",after.status_name);
                 }
             }
+        }
+    }
+
+    /// What the automation must do, written out as plain data rather than
+    /// derived from the code under test: link kind x PR event x starting status
+    /// category. Defaults: opened/ready/reopened -> started, merged -> completed,
+    /// closed without merge -> cancelled (closing links only).
+    /// The matrix team also maps a draft to unstarted so the draft rows test the
+    /// kind gate (with no rule a draft does nothing at all). A related link never
+    /// moves anything; only a closing link's merge completes; a PR closed without
+    /// merging changes nothing; moves are forward only; completed or cancelled
+    /// issues are never touched.
+    fn expected_category(kind: crate::patterns::LinkKind, event: &str, start: &'static str) -> &'static str {
+        use crate::patterns::LinkKind::*;
+        let target = match (kind, event) {
+            (Related, _) => None,
+            (_, "draft") => Some("unstarted"),
+            (_, "opened" | "ready_for_review" | "reopened") => Some("started"),
+            (Closing | BranchTitle, "merged") => Some("completed"),
+            (Closing, "closed") => Some("cancelled"),
+            (_, "merged" | "closed" | "edited") => None,
+            other => panic!("unmodelled event {other:?}"),
+        };
+        match (target, start) {
+            (None, _) | (_, "completed" | "cancelled") => start,
+            (Some("unstarted"), "backlog") => "unstarted",
+            (Some("started"), "backlog" | "unstarted") => "started",
+            (Some("completed"), "backlog" | "unstarted" | "started") => "completed",
+            (Some("cancelled"), "backlog" | "unstarted" | "started") => "cancelled",
+            _ => start,
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        /// TRA-10115 acceptance: for each link kind, each PR event and each
+        /// starting status category, the resulting status, through the real
+        /// `apply_transition_rules` on both backends.
+        async fn link_kind_by_event_by_starting_category_decides_the_status(db) {
+            use crate::patterns::LinkKind;
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            trakkt_core::test_helpers::seed_team(db,"matrix-team","workspace-a","MTX").await.expect("seed team");
+            trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed statuses");
+            // No linkback comments: this test is about status.
+            crate::schema::set_linkback_enabled(db,"workspace-a",false,None).await.expect("turn linkback off");
+            // Give the team a draft rule so the draft rows exercise the kind gate.
+            crate::schema::set_team_transition_rule(db,"workspace-a","matrix-team",trakkt_types::enums::GitHubAutomationStep::PrDraft,Some(trakkt_types::enums::StatusCategory::Unstarted),None).await.expect("team maps a draft to todo");
+            let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load connection").expect("exists");
+
+            let kinds = [LinkKind::Closing, LinkKind::Contributing, LinkKind::BranchTitle, LinkKind::Related];
+            // (event name, webhook action, draft flag, merged flag, stored PR state)
+            let events = [
+                ("draft","opened",true,false,"draft"),
+                ("opened","opened",false,false,"open"),
+                ("ready_for_review","ready_for_review",false,false,"open"),
+                ("reopened","reopened",false,false,"open"),
+                ("merged","closed",false,true,"merged"),
+                ("closed","closed",false,false,"closed"),
+                ("edited","edited",false,false,"open"),
+            ];
+            let categories = ["backlog","unstarted","started","completed","cancelled"];
+            let mut number = 1000_i64;
+            let mut cases = 0;
+            for kind in kinds {
+                for (event, action, draft, merged, state) in events {
+                    for start in categories {
+                        number += 1;
+                        let issue = trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"matrix-team".into(),creator_id:"admin-a".into(),title:format!("{kind:?} {event} from {start}"),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create issue");
+                        let start_status = trakkt_auth::status_service::get_status_by_category(db,"workspace-a",start).await.expect("look up status").expect("category has a status");
+                        if start != "backlog" {
+                            trakkt_auth::issue_service::update_issue(db,"workspace-a","MTX",issue.number,&trakkt_types::models::IssueUpdate {status_id:Some(start_status.status_id.clone()),..Default::default()},Some("admin-a"),trakkt_types::enums::ActionSource::User,None,None).await.expect("move issue to its starting status");
+                        }
+                        crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&row.installation_id,link_type:"pull_request",github_id:Some(number),github_node_id:None,repo_full_name:"example/repo",ref_identifier:&number.to_string(),title:Some("matrix"),state:Some(state),url:&format!("https://github.com/example/repo/pull/{number}"),author_login:None,link_kind:kind,allows_reopen:false}).await.expect("seed the link");
+                        let payload = serde_json::json!({"repository":{"full_name":"example/repo"},"pull_request":{"number":number,"title":"matrix","body":"","head":{"ref":"matrix"},"base":{"ref":"main"},"html_url":format!("https://github.com/example/repo/pull/{number}"),"draft":draft,"merged":merged}});
+                        crate::transitions::apply_transition_rules(db,&github.client,&row,"workspace-a",action,&payload,&[],&KEY,None,"http://localhost").await.expect("apply transition rules");
+                        let after = trakkt_auth::issue_service::get_issue_by_id(db,&issue.issue_id).await.expect("reload issue").expect("exists");
+                        assert_eq!(after.status_category,expected_category(kind,event,start),"{kind:?} link, PR {event}, issue starting in {start}");
+                        cases += 1;
+                    }
+                }
+            }
+            assert_eq!(cases,140);
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        /// The link-intent migration run against rows written by the schema
+        /// before it: only what can be shown to be a closing or branch link
+        /// keeps its power; everything else becomes related.
+        async fn link_intent_migration_backfills_kinds_conservatively(db) {
+            seed(db).await;
+            let github = controlled(Scenario::default()).await;
+            add_account(db,&github.client,123).await;
+            trakkt_core::test_helpers::seed_team(db,"backfill-team","workspace-a","BKF").await.expect("seed team");
+            trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed statuses");
+            let row = crate::schema::get_installation_by_github_id(db,123).await.expect("load connection").expect("exists");
+            let issue = trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"backfill-team".into(),creator_id:"admin-a".into(),title:"Linked before the migration".into(),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create issue");
+            // Reconstruct the preceding schema.
+            trakkt_core::db_execute!(db,"DROP TABLE github_team_transition_rules").expect("remove new team rules table");
+            trakkt_core::db_execute!(db,"DROP TABLE github_automation_settings").expect("remove new settings table");
+            trakkt_core::db_execute!(db,"ALTER TABLE github_links DROP COLUMN link_kind").expect("remove link_kind");
+            trakkt_core::db_execute!(db,"ALTER TABLE github_links DROP COLUMN completion_pending").expect("remove completion_pending");
+            let add_old = if db.is_postgres() {"ALTER TABLE github_links ADD COLUMN close_intent BOOLEAN NOT NULL DEFAULT false"} else {"ALTER TABLE github_links ADD COLUMN close_intent INTEGER NOT NULL DEFAULT 0"};
+            trakkt_core::db_execute!(db,add_old).expect("restore close_intent");
+            // Rules as the preceding schema stored them, including a workspace
+            // that kept both variants of a trigger and the retired pr_closed step.
+            trakkt_core::db_execute!(db,"DROP TABLE github_transition_rules").expect("remove the new rules table");
+            let old_rules = if db.is_postgres() {"CREATE TABLE github_transition_rules (rule_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE, trigger_event TEXT NOT NULL, close_intent_required BOOLEAN NOT NULL DEFAULT false, target_status_category TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(workspace_id, trigger_event, close_intent_required))"} else {"CREATE TABLE github_transition_rules (rule_id TEXT NOT NULL PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE, trigger_event TEXT NOT NULL, close_intent_required INTEGER NOT NULL DEFAULT 0, target_status_category TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), UNIQUE(workspace_id, trigger_event, close_intent_required))"};
+            trakkt_core::db_execute!(db,old_rules).expect("restore the preceding rules table");
+            for (rule_id,workspace,trigger,close_intent,category,enabled) in [("a1","workspace-a","pr_opened",false,"started",true),("a2","workspace-a","pr_opened",true,"unstarted",true),("a3","workspace-a","pr_merged",true,"completed",true),("a4","workspace-a","pr_closed",true,"cancelled",true),("b1","workspace-b","pr_opened",false,"started",true),("b2","workspace-b","pr_merged",false,"completed",true),("b3","workspace-b","pr_merged",true,"cancelled",false)] {
+                trakkt_core::db_execute!(db,"INSERT INTO github_transition_rules (rule_id, workspace_id, trigger_event, close_intent_required, target_status_category, enabled) VALUES ($1,$2,$3,$4,$5,$6)",rule_id,workspace,trigger,close_intent,category,enabled).expect("seed a preceding rule");
+            }
+            // (link_type, ref, close_intent) -> expected kind after migration
+            let rows = [
+                ("pull_request","1",true,"closing"),
+                ("pull_request","2",false,"related"),
+                ("branch","feature/BKF-1",false,"branch_title"),
+                ("commit","abc123",true,"closing"),
+                ("commit","def456",false,"related"),
+            ];
+            for (link_type,reference,close_intent,_) in rows {
+                trakkt_core::db_execute!(db,"INSERT INTO github_links (link_id, workspace_id, issue_id, installation_id, link_type, repo_full_name, ref_identifier, url, close_intent) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",uuid::Uuid::new_v4().to_string(),"workspace-a",&issue.issue_id,&row.installation_id,link_type,"example/repo",reference,"https://example.test",close_intent).expect("seed pre-migration link");
+            }
+            let migration = if db.is_postgres() {include_str!("../../../apps/server/migrations/20261117000000_github_link_intent.sql")} else {include_str!("../../../apps/server/migrations-sqlite/20261117000000_github_link_intent.sql")};
+            trakkt_core::db_with_pool!(db,|pool| sqlx::raw_sql(migration).execute(pool).await.map(|_| ())).expect("apply the exact paired migration to populated rows");
+            let migrated = crate::schema::list_links_for_issue(db,&issue.issue_id).await.expect("read migrated links");
+            assert_eq!(migrated.len(),rows.len());
+            for (link_type,reference,_,expected) in rows {
+                let link = migrated.iter().find(|l| l.link_type == link_type && l.ref_identifier == reference).expect("link survives");
+                assert_eq!(link.link_kind,expected,"{link_type} {reference}");
+            }
+            assert!(crate::schema::linkback_enabled(db,"workspace-a").await.expect("defaults"),"linkback defaults on");
+            let mut rules: Vec<(String,String,String)> = crate::schema::list_transition_rules(db,"workspace-a").await.expect("read migrated rules").into_iter().chain(crate::schema::list_transition_rules(db,"workspace-b").await.expect("read second workspace rules")).map(|r| (r.workspace_id,r.trigger_event,r.target_status_category)).collect();
+            rules.sort();
+            assert_eq!(rules,vec![
+                ("workspace-a".to_string(),"pr_closed".to_string(),"cancelled".to_string()),
+                ("workspace-a".to_string(),"pr_merged".to_string(),"completed".to_string()),
+                ("workspace-a".to_string(),"pr_opened".to_string(),"unstarted".to_string()),
+                ("workspace-b".to_string(),"pr_merged".to_string(),"completed".to_string()),
+                ("workspace-b".to_string(),"pr_opened".to_string(),"started".to_string()),
+            ],"one rule per trigger: the variant that applied to closing links, unless it was disabled and the other was not");
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        async fn team_rules_validate_their_input_replace_rather_than_duplicate_and_sync(db) {
+            use trakkt_types::enums::{GitHubAutomationStep::*, StatusCategory};
+            seed(db).await;
+            trakkt_core::test_helpers::seed_team(db,"rule-team","workspace-a","RUL").await.expect("seed team");
+            trakkt_core::test_helpers::seed_team(db,"other-team","workspace-b","OTH").await.expect("seed foreign team");
+            let sync_rows = || async { trakkt_core::db_fetch_all!(db,(String,),"SELECT entity_type FROM sync_log WHERE entity_type = 'GITHUB_TRANSITION_RULE'").expect("read sync entries").len() };
+            let before = sync_rows().await;
+            assert!(crate::schema::set_team_transition_rule(db,"workspace-a","other-team",PrOpened,Some(StatusCategory::Started),None).await.is_err(),"another workspace's team");
+            assert!(crate::schema::set_team_transition_rule(db,"workspace-a","missing-team",PrOpened,Some(StatusCategory::Started),None).await.is_err(),"unknown team");
+            assert!(crate::schema::list_team_transition_rules(db,"workspace-a").await.expect("list").is_empty(),"rejected input writes nothing");
+            assert_eq!(sync_rows().await,before,"rejected input syncs nothing");
+            crate::schema::set_team_transition_rule(db,"workspace-a","rule-team",PrOpened,Some(StatusCategory::Started),None).await.expect("first write");
+            crate::schema::set_team_transition_rule(db,"workspace-a","rule-team",PrOpened,None,None).await.expect("replace with no action");
+            let rules = crate::schema::list_team_transition_rules(db,"workspace-a").await.expect("list");
+            assert_eq!(rules.len(),1,"one row per team and step");
+            assert_eq!(rules[0].target_status_category,None);
+            assert_eq!(sync_rows().await,before + 2,"every write syncs once");
+            crate::schema::clear_team_transition_rule(db,"workspace-a","rule-team",PrOpened,None).await.expect("clear");
+            assert!(crate::schema::list_team_transition_rules(db,"workspace-a").await.expect("list").is_empty());
+            crate::schema::set_linkback_enabled(db,"workspace-a",false,None).await.expect("off");
+            assert!(!crate::schema::linkback_enabled(db,"workspace-a").await.expect("read"));
+            crate::schema::set_linkback_enabled(db,"workspace-a",true,None).await.expect("on again");
+            assert!(crate::schema::linkback_enabled(db,"workspace-a").await.expect("read"));
+            assert_eq!(sync_rows().await,before + 5,"clear and both linkback writes sync");
+        }
+    }
+
+    trakkt_core::dual_backend_test! {
+        /// A failing sync write rolls the whole settings change back.
+        async fn team_rule_and_linkback_writes_roll_back_with_their_sync_entry(db) {
+            use trakkt_types::enums::{GitHubAutomationStep::*, StatusCategory};
+            seed(db).await;
+            trakkt_core::test_helpers::seed_team(db,"rb-team","workspace-a","RBK").await.expect("seed team");
+            trakkt_core::test_helpers::dual_backend::reject_sync_log_inserts_of_type(db,"GITHUB_TRANSITION_RULE").await;
+            assert!(crate::schema::set_team_transition_rule(db,"workspace-a","rb-team",PrOpened,Some(StatusCategory::Started),None).await.is_err());
+            assert!(crate::schema::list_team_transition_rules(db,"workspace-a").await.expect("list").is_empty(),"the rule rolled back");
+            assert!(crate::schema::set_linkback_enabled(db,"workspace-a",false,None).await.is_err());
+            assert!(crate::schema::linkback_enabled(db,"workspace-a").await.expect("read"),"linkback is still on");
+            // Clearing is a converted write too: a rule that exists must survive a failed clear.
+            trakkt_core::test_helpers::dual_backend::clear_sync_log_rejection(db).await;
+            crate::schema::set_team_transition_rule(db,"workspace-a","rb-team",PrOpened,Some(StatusCategory::Started),None).await.expect("seed the rule to clear");
+            trakkt_core::test_helpers::dual_backend::reject_sync_log_inserts_of_type(db,"GITHUB_TRANSITION_RULE").await;
+            assert!(crate::schema::clear_team_transition_rule(db,"workspace-a","rb-team",PrOpened,None).await.is_err());
+            assert_eq!(crate::schema::list_team_transition_rules(db,"workspace-a").await.expect("list").len(),1,"the rule survived the failed clear");
         }
     }
 

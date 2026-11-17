@@ -638,6 +638,7 @@ pub async fn update_issue(
         estimate: params.estimate,
         sort_order: params.sort_order,
         team_id: move_team_id,
+        ..Default::default()
     };
 
     let issue = issue_service::update_issue(

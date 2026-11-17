@@ -208,12 +208,16 @@ async fn github_webhook(
     let result = match event_key.as_str() {
         // Installation lifecycle events — handle synchronously
         "installation.deleted" => Some(if let Some(inst) = &installation {
-            schema::uninstall_installation_with_delivery(
+            let uninstalled = schema::uninstall_installation_with_delivery(
                 &state.db,
                 &inst.installation_id,
                 Some(&state.ws_manager),
             )
-            .await
+            .await;
+            if uninstalled.is_ok() {
+                settle_after_reach_change(&state, inst).await;
+            }
+            uninstalled
         } else {
             Ok(())
         }),
@@ -242,17 +246,18 @@ async fn github_webhook(
                     schema::mark_event_processed(&state.db, &event_id).await?;
                     return Ok(Json(json!({})));
                 }
-                let link_result = trakkt_github::events::process_pull_request(
+                let processed = trakkt_github::events::process_pull_request(
                     &state.db,
                     inst,
                     action.as_deref().unwrap_or(""),
                     &payload,
                     Some(&state.ws_manager),
+                    &state.config.frontend_url,
                 )
                 .await;
 
                 // After link processing succeeds, apply automatic status transitions.
-                if link_result.is_ok() {
+                if let Ok(outcome) = &processed {
                     if !inst.is_active() {
                         tracing::debug!(
                             installation_id = %inst.installation_id,
@@ -266,6 +271,7 @@ async fn github_webhook(
                             &inst.workspace_id,
                             action.as_deref().unwrap_or(""),
                             &payload,
+                            &outcome.released_issue_ids,
                             &state.encryption_key,
                             Some(&state.ws_manager),
                             &state.config.frontend_url,
@@ -276,7 +282,7 @@ async fn github_webhook(
                     }
                 }
 
-                Some(link_result)
+                Some(processed.map(|_| ()))
             } else {
                 tracing::warn!(event = %event_key, "pull_request event with no installation — marking processed");
                 Some(Ok(()))
@@ -292,6 +298,7 @@ async fn github_webhook(
                         inst,
                         &payload,
                         Some(&state.ws_manager),
+                        &state.config.frontend_url,
                     )
                     .await,
                 )
@@ -402,7 +409,22 @@ async fn handle_installation_unsuspend(
         account = %inst.account_login,
         "GitHub installation unsuspended"
     );
+    settle_after_reach_change(state, inst).await;
     Ok(())
+}
+
+/// A connection whose reach changed can have missed merges and closes: release
+/// the completions held back by its PRs. See `settle_after_reach_change`.
+async fn settle_after_reach_change(state: &AppState, installation: &schema::GitHubInstallation) {
+    trakkt_github::transitions::settle_after_reach_change(
+        &state.db,
+        state.github_client.as_deref(),
+        Some(&state.encryption_key),
+        &installation.workspace_id,
+        &installation.installation_id,
+        Some(&state.ws_manager),
+    )
+    .await;
 }
 
 /// Handle `installation_repositories.added` and `.removed` — update the
@@ -464,6 +486,7 @@ async fn handle_installation_repos_changed(
         selection = %selection,
         "GitHub installation repositories updated"
     );
+    settle_after_reach_change(state, inst).await;
     Ok(())
 }
 

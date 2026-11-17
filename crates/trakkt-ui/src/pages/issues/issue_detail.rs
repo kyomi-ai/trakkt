@@ -3718,6 +3718,18 @@ fn render_github_link(link: GitHubLinkDisplay) -> impl IntoView {
     }
 }
 
+/// What a pull request link does to the issue, in words. `branch_title` is the
+/// ordinary case (the PR is about this issue) and says nothing extra.
+fn link_kind_note(kind: trakkt_types::enums::LinkKind) -> Option<&'static str> {
+    use trakkt_types::enums::LinkKind;
+    match kind {
+        LinkKind::Closing => Some("Closes this issue"),
+        LinkKind::Contributing => Some("Part of this issue"),
+        LinkKind::Related => Some("Mentions this issue"),
+        LinkKind::BranchTitle => None,
+    }
+}
+
 /// Render a pull request link row.
 fn render_pr_link(link: GitHubLinkDisplay) -> impl IntoView {
     let icon_class = link.state.as_deref().map(pr_state_color).unwrap_or("text-muted-foreground");
@@ -3730,7 +3742,7 @@ fn render_pr_link(link: GitHubLinkDisplay) -> impl IntoView {
     };
     let author_text = link.author_login.as_deref().map(|a| format!("@{a}"));
     let time_text = relative_time(&link.created_at);
-    let close_intent = link.close_intent;
+    let kind_note = link_kind_note(link.link_kind);
     let url = link.url.clone();
     let repo = link.repo_full_name.clone();
 
@@ -3766,13 +3778,9 @@ fn render_pr_link(link: GitHubLinkDisplay) -> impl IntoView {
                     <span>{"\u{2022}"}</span>
                     <span>{time_text}</span>
                 </div>
-                {if close_intent {
-                    Some(view! {
-                        <span class="text-xs text-muted-foreground italic">"Closes this issue"</span>
-                    })
-                } else {
-                    None
-                }}
+                {kind_note.map(|note| view! {
+                    <span class="text-xs text-muted-foreground italic">{note}</span>
+                })}
             </div>
         </div>
     }

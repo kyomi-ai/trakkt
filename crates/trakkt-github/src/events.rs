@@ -2,9 +2,10 @@
 
 //! Event processing for GitHub webhook events.
 //!
-//! Processes `pull_request` and `push` events by extracting issue references
-//! from PR titles, bodies, branch names, and commit messages, then creating
-//! or updating GitHub links in the database.
+//! Processes `pull_request` and `push` events by reading link intent from PR
+//! titles, bodies, branch names, and commit messages, then creating or
+//! updating GitHub links in the database. What a link may do is its
+//! [`LinkKind`]; see `patterns` and docs/ARCHITECTURE.md.
 
 use std::collections::HashSet;
 
@@ -13,34 +14,45 @@ use trakkt_auth::websocket::WebSocketManager;
 use trakkt_core::DbPool;
 use trakkt_types::enums::ActionSource;
 
-use crate::patterns::{self, IssueRef};
+use crate::patterns::{self, IssueRef, LinkKind};
 use crate::schema::{self, CreateLinkParams, GitHubInstallation};
 
 // ===========================================================================
 // Pull Request Processing
 // ===========================================================================
 
+/// What processing a `pull_request` event left for the status automation.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PullRequestOutcome {
+    /// Issues an edit unlinked from the PR. A completion that was held back by
+    /// this PR (an open closing sibling) may now be due.
+    pub released_issue_ids: Vec<String>,
+}
+
 /// Process a `pull_request` webhook event.
 ///
-/// Extracts issue references from the PR title, body, and branch name,
-/// validates them against the database, and upserts GitHub links. For
-/// "edited" actions, also removes links to issues no longer referenced.
+/// Reads link intent from the PR title, body, and branch name, validates the
+/// issues against the database, and upserts GitHub links carrying the kind of
+/// link each one is. For "edited" actions, also removes links to issues no
+/// longer referenced. `app_url` is this application's base URL, the only host
+/// whose issue URLs count as references.
 pub async fn process_pull_request(
     db: &DbPool,
     installation: &GitHubInstallation,
     action: &str,
     payload: &serde_json::Value,
     ws_manager: Option<&WebSocketManager>,
-) -> trakkt_core::Result<()> {
+    app_url: &str,
+) -> trakkt_core::Result<PullRequestOutcome> {
     let current = schema::get_installation_by_id(db, &installation.installation_id).await?;
     let Some(current) = current else {
-        return Ok(());
+        return Ok(PullRequestOutcome::default());
     };
     let repository = payload
         .pointer("/repository/full_name")
         .and_then(serde_json::Value::as_str);
     if !repository.is_some_and(|repo| current.allows_repository(repo)) {
-        return Ok(());
+        return Ok(PullRequestOutcome::default());
     }
     let installation = &current;
     let admission = schema::ConnectionAdmission {
@@ -52,7 +64,7 @@ pub async fn process_pull_request(
         Some(pr) => pr,
         None => {
             tracing::warn!("pull_request event missing 'pull_request' field");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -62,7 +74,7 @@ pub async fn process_pull_request(
         Some(t) => t.to_string(),
         None => {
             tracing::warn!("pull_request event missing title");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -74,7 +86,7 @@ pub async fn process_pull_request(
         Some(b) => b.to_string(),
         None => {
             tracing::warn!("pull_request event missing head.ref");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -82,7 +94,7 @@ pub async fn process_pull_request(
         Some(n) => n,
         None => {
             tracing::warn!("pull_request event missing number");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -90,7 +102,7 @@ pub async fn process_pull_request(
         Some(u) => u.to_string(),
         None => {
             tracing::warn!("pull_request event missing html_url");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
@@ -117,43 +129,43 @@ pub async fn process_pull_request(
         Some(r) => r.to_string(),
         None => {
             tracing::warn!("pull_request event missing repository.full_name");
-            return Ok(());
+            return Ok(PullRequestOutcome::default());
         }
     };
 
     // ── Determine PR state ────────────────────────────────────────────────
 
-    let pr_state = determine_pr_state(action, merged, draft);
+    let github_state = pr.get("state").and_then(|v| v.as_str());
+    let pr_state = determine_pr_state(action, merged, draft, github_state);
 
-    // ── Collect text and extract refs ─────────────────────────────────────
+    // The links this PR had before this event: an edit may unlink some, and the
+    // issues they leave need their held-back completion re-evaluated. (A
+    // finished PR never returns to open except by `reopened`: that rule is part
+    // of the upsert, so concurrent deliveries cannot defeat it.)
+    let existing = schema::list_pr_links_by_ref(
+        db,
+        &installation.workspace_id,
+        &repo,
+        &pr_number.to_string(),
+    )
+    .await?;
 
-    let mut text = title.clone();
-    if let Some(ref b) = body {
-        text.push(' ');
-        text.push_str(b);
-    }
+    // ── Read link intent ──────────────────────────────────────────────────
+    //
+    // The title and branch are working links; a bare key in the body is a
+    // mention. A magic word raises any of them, `skip` removes the issue.
 
-    let text_refs = patterns::extract_issue_refs(&text);
-    let branch_refs = patterns::extract_issue_refs(&branch_name);
-
-    // Merge and deduplicate
-    let mut seen = HashSet::new();
-    let mut all_refs = Vec::new();
-    for r in text_refs.into_iter().chain(branch_refs) {
-        if seen.insert(r.clone()) {
-            all_refs.push(r);
-        }
-    }
-
-    // Extract close intent refs from the text (not the branch name)
-    let close_refs = patterns::extract_close_intent_refs(&text);
-    let close_set: HashSet<IssueRef> = close_refs.into_iter().collect();
+    let link_set = patterns::combine(vec![
+        patterns::parse_text(&title, LinkKind::BranchTitle, app_url),
+        patterns::parse_text(body.as_deref().unwrap_or(""), LinkKind::Related, app_url),
+        patterns::parse_text(&branch_name, LinkKind::BranchTitle, app_url),
+    ]);
 
     // ── Validate refs and upsert links ────────────────────────────────────
 
     let mut valid_issue_ids: Vec<String> = Vec::new();
 
-    for issue_ref in &all_refs {
+    for (issue_ref, link_kind) in &link_set.links {
         let issue = match validate_issue_ref(db, &installation.workspace_id, issue_ref).await? {
             Some(i) => i,
             None => continue,
@@ -174,7 +186,8 @@ pub async fn process_pull_request(
                 state: Some(&pr_state),
                 url: &html_url,
                 author_login: author.as_deref(),
-                close_intent: close_set.contains(issue_ref),
+                link_kind: *link_kind,
+                allows_reopen: action == "reopened",
             },
             Some(&admission),
         )
@@ -182,6 +195,34 @@ pub async fn process_pull_request(
 
         valid_issue_ids.push(issue.issue_id.clone());
     }
+
+    // `Ignore X-1` also removes the branch link an earlier push made for X-1.
+    let mut skipped_issue_ids: Vec<String> = Vec::new();
+    for issue_ref in &link_set.skipped {
+        if let Some(issue) = validate_issue_ref(db, &installation.workspace_id, issue_ref).await? {
+            skipped_issue_ids.push(issue.issue_id);
+        }
+    }
+    if !skipped_issue_ids.is_empty() {
+        schema::delete_links_with_admission(
+            db,
+            &installation.workspace_id,
+            "branch",
+            &repo,
+            &branch_name,
+            schema::LinkScope::Only(&skipped_issue_ids),
+            Some(&admission),
+        )
+        .await?;
+    }
+
+    // Issues this PR no longer links, so their held-back completion can be
+    // re-evaluated.
+    let released_issue_ids: Vec<String> = existing
+        .iter()
+        .filter(|l| !valid_issue_ids.contains(&l.issue_id))
+        .map(|l| l.issue_id.clone())
+        .collect();
 
     // ── For "edited" action, remove stale links ───────────────────────────
 
@@ -192,7 +233,7 @@ pub async fn process_pull_request(
             "pull_request",
             &repo,
             &pr_number.to_string(),
-            &valid_issue_ids,
+            schema::LinkScope::KeepOnly(&valid_issue_ids),
             Some(&admission),
         )
         .await?;
@@ -255,7 +296,13 @@ pub async fn process_pull_request(
         "Processed pull_request event"
     );
 
-    Ok(())
+    Ok(PullRequestOutcome {
+        released_issue_ids: if action == "edited" {
+            released_issue_ids
+        } else {
+            Vec::new()
+        },
+    })
 }
 
 // ===========================================================================
@@ -264,13 +311,15 @@ pub async fn process_pull_request(
 
 /// Process a `push` webhook event.
 ///
-/// Extracts issue references from the branch name and each commit message,
-/// validates them against the database, and upserts GitHub links.
+/// Reads the branch name and each commit message, validates the issues against
+/// the database, and upserts GitHub links. A commit never changes status, so
+/// its link kind only decides how the link is shown.
 pub async fn process_push(
     db: &DbPool,
     installation: &GitHubInstallation,
     payload: &serde_json::Value,
     ws_manager: Option<&WebSocketManager>,
+    app_url: &str,
 ) -> trakkt_core::Result<()> {
     let current = schema::get_installation_by_id(db, &installation.installation_id).await?;
     let Some(current) = current else {
@@ -316,12 +365,12 @@ pub async fn process_push(
 
     // ── Process branch refs ───────────────────────────────────────────────
 
-    let branch_refs = patterns::extract_issue_refs(&branch_name);
+    let branch_refs = patterns::parse_text(&branch_name, LinkKind::BranchTitle, app_url).refs;
     let branch_url = format!("https://github.com/{repo}/tree/{branch_name}");
     let mut total_branch_links: usize = 0;
     let mut branch_issue_ids: Vec<String> = Vec::new();
 
-    for issue_ref in &branch_refs {
+    for (issue_ref, _) in &branch_refs {
         if let Some(issue) = validate_issue_ref(db, &installation.workspace_id, issue_ref).await? {
             schema::upsert_link_with_admission(
                 db,
@@ -338,7 +387,8 @@ pub async fn process_push(
                     state: None,
                     url: &branch_url,
                     author_login: None,
-                    close_intent: false,
+                    link_kind: LinkKind::BranchTitle,
+                    allows_reopen: false,
                 },
                 Some(&admission),
             )
@@ -438,14 +488,12 @@ pub async fn process_push(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let commit_refs = patterns::extract_issue_refs(message);
-        let close_refs = patterns::extract_close_intent_refs(message);
-        let close_set: HashSet<IssueRef> = close_refs.into_iter().collect();
+        let commit_refs = patterns::parse_text(message, LinkKind::Related, app_url).refs;
 
         // Use the first line of the commit message as the link title
         let commit_title = message.lines().next().unwrap_or(message);
 
-        for issue_ref in &commit_refs {
+        for (issue_ref, link_kind) in &commit_refs {
             if let Some(issue) =
                 validate_issue_ref(db, &installation.workspace_id, issue_ref).await?
             {
@@ -464,7 +512,8 @@ pub async fn process_push(
                         state: None,
                         url: &url,
                         author_login: author_login.as_deref(),
-                        close_intent: close_set.contains(issue_ref),
+                        link_kind: *link_kind,
+                        allows_reopen: false,
                     },
                     Some(&admission),
                 )
@@ -609,16 +658,21 @@ async fn resolve_author_actor(db: &DbPool, email: Option<&str>) -> Option<String
 }
 
 /// Determine the PR state string from the webhook action and PR flags.
-fn determine_pr_state(action: &str, merged: bool, draft: bool) -> String {
-    if action == "closed" && merged {
-        "merged".to_string()
-    } else if action == "closed" {
-        "closed".to_string()
-    } else if draft {
-        "draft".to_string()
-    } else {
-        "open".to_string()
-    }
+///
+/// The payload's own `merged` and `state` decide whether the PR is finished,
+/// not only the action: an `edited` delivery on a merged PR is still merged.
+fn determine_pr_state(
+    action: &str,
+    merged: bool,
+    draft: bool,
+    github_state: Option<&str>,
+) -> String {
+    schema::pr_link_state(
+        merged,
+        action == "closed" || github_state == Some("closed"),
+        draft,
+    )
+    .to_string()
 }
 
 /// A validated issue reference — just the ID we need for link creation.
@@ -678,51 +732,57 @@ mod tests {
 
     #[test]
     fn pr_state_merged() {
-        assert_eq!(determine_pr_state("closed", true, false), "merged");
+        assert_eq!(determine_pr_state("closed", true, false, None), "merged");
     }
 
     #[test]
     fn pr_state_closed_not_merged() {
-        assert_eq!(determine_pr_state("closed", false, false), "closed");
+        assert_eq!(determine_pr_state("closed", false, false, None), "closed");
     }
 
     #[test]
     fn pr_state_draft() {
-        assert_eq!(determine_pr_state("opened", false, true), "draft");
+        assert_eq!(determine_pr_state("opened", false, true, None), "draft");
     }
 
     #[test]
     fn pr_state_open() {
-        assert_eq!(determine_pr_state("opened", false, false), "open");
+        assert_eq!(determine_pr_state("opened", false, false, None), "open");
     }
 
     #[test]
     fn pr_state_reopened_draft() {
         // Draft takes precedence when not closed
-        assert_eq!(determine_pr_state("reopened", false, true), "draft");
+        assert_eq!(determine_pr_state("reopened", false, true, None), "draft");
     }
 
     #[test]
     fn pr_state_closed_merged_overrides_draft() {
         // Merged takes precedence over draft when action is "closed"
-        assert_eq!(determine_pr_state("closed", true, true), "merged");
+        assert_eq!(determine_pr_state("closed", true, true, None), "merged");
     }
 
     #[test]
     fn pr_state_synchronize() {
-        assert_eq!(determine_pr_state("synchronize", false, false), "open");
+        assert_eq!(
+            determine_pr_state("synchronize", false, false, None),
+            "open"
+        );
     }
 
     #[test]
     fn pr_state_ready_for_review() {
         // When a PR is marked ready, draft=false
-        assert_eq!(determine_pr_state("ready_for_review", false, false), "open");
+        assert_eq!(
+            determine_pr_state("ready_for_review", false, false, None),
+            "open"
+        );
     }
 
     #[test]
     fn pr_state_converted_to_draft() {
         assert_eq!(
-            determine_pr_state("converted_to_draft", false, true),
+            determine_pr_state("converted_to_draft", false, true, None),
             "draft"
         );
     }

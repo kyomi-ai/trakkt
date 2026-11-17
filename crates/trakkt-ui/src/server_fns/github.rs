@@ -8,6 +8,7 @@
 
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
+use trakkt_types::enums::{GitHubAutomationStep, LinkKind, StatusCategory};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared types (available on both client and server)
@@ -17,9 +18,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionRuleDisplay {
     pub rule_id: String,
-    pub trigger_event: String,
-    pub close_intent_required: bool,
-    pub target_status_category: String,
+    pub step: GitHubAutomationStep,
+    pub target: StatusCategory,
     pub enabled: bool,
 }
 
@@ -64,6 +64,25 @@ use super::{AuthenticatedContext, IntoServerFnError, require_workspace_admin};
 // ─────────────────────────────────────────────────────────────────────────────
 // Server functions
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// A settings action changed a connection's reach: release the completions held
+/// back by its PRs. See `trakkt_github::transitions::settle_after_reach_change`.
+#[cfg(feature = "ssr")]
+async fn settle_after_reach_change(
+    ctx: &super::ServerContext,
+    workspace_id: &str,
+    installation_id: &str,
+) {
+    trakkt_github::transitions::settle_after_reach_change(
+        &ctx.db,
+        ctx.github_client.as_deref(),
+        ctx.encryption_key.as_deref(),
+        workspace_id,
+        installation_id,
+        ctx.ws_manager.as_ref(),
+    )
+    .await;
+}
 
 /// Query visible GitHub connections for the workspace.
 #[server(prefix = "/leptos-api")]
@@ -220,7 +239,7 @@ pub async fn complete_github_authorization(
         .encryption_key
         .as_deref()
         .ok_or_else(|| ServerFnError::new("Credential encryption not configured"))?;
-    trakkt_github::authorization::complete_connection_with_delivery(
+    let connected = trakkt_github::authorization::complete_connection_with_delivery(
         &ctx.db,
         client,
         key,
@@ -230,7 +249,9 @@ pub async fn complete_github_authorization(
         ctx.ws_manager.as_ref(),
     )
     .await
-    .into_sfn()
+    .into_sfn()?;
+    settle_after_reach_change(&ctx, &connected.workspace_id, &connected.installation_id).await;
+    Ok(connected.workspace_id)
 }
 
 /// Disconnect one owned connection while retaining its GitHub installation and history.
@@ -245,7 +266,9 @@ pub async fn disconnect_github(connection_id: String) -> Result<(), ServerFnErro
         ac.ctx.ws_manager.as_ref(),
     )
     .await
-    .into_sfn()
+    .into_sfn()?;
+    settle_after_reach_change(&ac.ctx, &ac.ws_id, &connection_id).await;
+    Ok(())
 }
 
 /// Remove an inactive settings card, retaining installation history and ownership.
@@ -261,7 +284,9 @@ pub async fn remove_github(connection_id: String) -> Result<(), ServerFnError> {
         ac.ctx.ws_manager.as_ref(),
     )
     .await
-    .into_sfn()
+    .into_sfn()?;
+    settle_after_reach_change(&ac.ctx, &ac.ws_id, &connection_id).await;
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,16 +306,24 @@ pub async fn get_transition_rules() -> Result<Vec<TransitionRuleDisplay>, Server
         .await
         .into_sfn()?;
 
-    Ok(rules
+    rules
         .into_iter()
-        .map(|r| TransitionRuleDisplay {
-            rule_id: r.rule_id,
-            trigger_event: r.trigger_event,
-            close_intent_required: r.close_intent_required,
-            target_status_category: r.target_status_category,
-            enabled: r.enabled,
+        .map(|r| {
+            Ok(TransitionRuleDisplay {
+                step: GitHubAutomationStep::parse(&r.trigger_event).ok_or_else(|| {
+                    ServerFnError::new(format!("unknown automation step '{}'", r.trigger_event))
+                })?,
+                target: StatusCategory::parse(&r.target_status_category).ok_or_else(|| {
+                    ServerFnError::new(format!(
+                        "unknown status category '{}'",
+                        r.target_status_category
+                    ))
+                })?,
+                rule_id: r.rule_id,
+                enabled: r.enabled,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Toggle the `enabled` flag on a single transition rule.
@@ -316,6 +349,146 @@ pub async fn toggle_transition_rule(rule_id: String, enabled: bool) -> Result<()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Team automation server functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One team's override of one automation step, for display. A `None` target
+/// means the step does nothing for that team.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamStepSetting {
+    pub step: GitHubAutomationStep,
+    pub target: Option<StatusCategory>,
+}
+
+/// A team and its automation overrides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamAutomationDisplay {
+    pub team_id: String,
+    pub key: String,
+    pub name: String,
+    pub overrides: Vec<TeamStepSetting>,
+}
+
+/// Workspace automation beyond the shared rules: the linkback comment and each
+/// team's overrides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationSettingsDisplay {
+    pub linkback_enabled: bool,
+    pub teams: Vec<TeamAutomationDisplay>,
+}
+
+/// Read the workspace's linkback setting and every team's overrides.
+///
+/// Requires workspace admin role.
+#[server(prefix = "/leptos-api")]
+pub async fn get_automation_settings() -> Result<AutomationSettingsDisplay, ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    let db = ac.db();
+
+    let teams = trakkt_auth::team_service::list_teams(db, &ac.ws_id, None)
+        .await
+        .into_sfn()?;
+    let rules = trakkt_github::schema::list_team_transition_rules(db, &ac.ws_id)
+        .await
+        .into_sfn()?;
+    let linkback_enabled = trakkt_github::schema::linkback_enabled(db, &ac.ws_id)
+        .await
+        .into_sfn()?;
+
+    let mut display = Vec::with_capacity(teams.len());
+    for team in teams {
+        let mut overrides = Vec::new();
+        for rule in rules.iter().filter(|r| r.team_id == team.team_id) {
+            let step = GitHubAutomationStep::parse(&rule.trigger_event).ok_or_else(|| {
+                ServerFnError::new(format!("unknown automation step '{}'", rule.trigger_event))
+            })?;
+            let target = rule
+                .target_status_category
+                .as_deref()
+                .map(|c| {
+                    StatusCategory::parse(c)
+                        .ok_or_else(|| ServerFnError::new(format!("unknown status category '{c}'")))
+                })
+                .transpose()?;
+            overrides.push(TeamStepSetting { step, target });
+        }
+        display.push(TeamAutomationDisplay {
+            overrides,
+            team_id: team.team_id,
+            key: team.key,
+            name: team.name,
+        });
+    }
+    Ok(AutomationSettingsDisplay {
+        linkback_enabled,
+        teams: display,
+    })
+}
+
+/// Set a team's override for one automation step. A `None` target makes the
+/// step do nothing for this team.
+///
+/// Requires workspace admin role.
+#[server(prefix = "/leptos-api")]
+pub async fn set_team_automation_rule(
+    team_id: String,
+    step: GitHubAutomationStep,
+    target: Option<StatusCategory>,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    trakkt_github::schema::set_team_transition_rule(
+        ac.db(),
+        &ac.ws_id,
+        &team_id,
+        step,
+        target,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()
+}
+
+/// Remove a team's override for one step, so the workspace rule applies again.
+///
+/// Requires workspace admin role.
+#[server(prefix = "/leptos-api")]
+pub async fn clear_team_automation_rule(
+    team_id: String,
+    step: GitHubAutomationStep,
+) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    trakkt_github::schema::clear_team_transition_rule(
+        ac.db(),
+        &ac.ws_id,
+        &team_id,
+        step,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()
+}
+
+/// Turn the PR linkback comment on or off for the workspace.
+///
+/// Requires workspace admin role.
+#[server(prefix = "/leptos-api")]
+pub async fn set_github_linkback(enabled: bool) -> Result<(), ServerFnError> {
+    let ac = AuthenticatedContext::extract().await?;
+    require_workspace_admin(&ac.auth)?;
+    trakkt_github::schema::set_linkback_enabled(
+        ac.db(),
+        &ac.ws_id,
+        enabled,
+        ac.ctx.ws_manager.as_ref(),
+    )
+    .await
+    .into_sfn()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GitHub link display types and server functions
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -330,7 +503,7 @@ pub struct GitHubLinkDisplay {
     pub state: Option<String>,
     pub url: String,
     pub author_login: Option<String>,
-    pub close_intent: bool,
+    pub link_kind: LinkKind,
     pub created_at: String,
 }
 
@@ -352,9 +525,10 @@ pub async fn list_github_links_for_issue(
         .await
         .into_sfn()?;
 
-    let display_links: Vec<GitHubLinkDisplay> = links
-        .into_iter()
-        .map(|link| GitHubLinkDisplay {
+    let mut display_links = Vec::with_capacity(links.len());
+    for link in links {
+        let link_kind = link.kind().into_sfn()?;
+        display_links.push(GitHubLinkDisplay {
             link_id: link.link_id,
             link_type: link.link_type,
             repo_full_name: link.repo_full_name,
@@ -363,10 +537,10 @@ pub async fn list_github_links_for_issue(
             state: link.state,
             url: link.url,
             author_login: link.author_login,
-            close_intent: link.close_intent,
+            link_kind,
             created_at: link.created_at,
-        })
-        .collect();
+        });
+    }
 
     Ok(display_links)
 }

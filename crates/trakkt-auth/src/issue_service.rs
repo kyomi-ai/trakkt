@@ -1444,6 +1444,20 @@ pub async fn update_issue_with_admission(
         None
     };
 
+    // Compare-and-set for callers that decided from an earlier read.
+    if let Some(expected) = &updates.expected_status_id {
+        let Some((current, _)) = &previous_status else {
+            return Err(trakkt_core::Error::BadRequest(
+                "expected_status_id needs a status_id to update".into(),
+            ));
+        };
+        if expected != current {
+            return Err(trakkt_core::Error::PreconditionFailed(
+                "issue status changed since it was read".into(),
+            ));
+        }
+    }
+
     // Bind dynamically. Map to rows_affected() inside the closure so both
     // backend arms return the same type (u64).
     let affected: u64 = trakkt_core::tx_with!(&mut tx, |e| {
@@ -1520,13 +1534,25 @@ pub async fn update_issue_with_admission(
     if let Some((old_status_id, old_status_name)) = previous_status
         && old_status_id != issue.status_id
     {
-        let new_status_name = trakkt_core::tx_fetch_one!(
+        let (new_status_name, new_status_category) = trakkt_core::tx_fetch_one!(
             &mut tx,
-            (String,),
-            "SELECT name FROM statuses WHERE status_id = $1",
+            (String, String),
+            "SELECT name, category FROM statuses WHERE status_id = $1",
             &issue.status_id
-        )?
-        .0;
+        )?;
+        // An issue that reaches Completed or Cancelled, by any path, has nothing
+        // left to complete: a GitHub merge held back for it is no longer pending.
+        // Leaving the mark would re-complete the issue after someone reopens it.
+        if trakkt_types::enums::StatusCategory::parse(&new_status_category)
+            .is_some_and(|c| c.is_closed())
+        {
+            trakkt_core::tx_execute!(
+                &mut tx,
+                "UPDATE github_links SET completion_pending = $1 WHERE issue_id = $2",
+                false,
+                &issue.issue_id
+            )?;
+        }
         let recorder = crate::activity_service::ActivityRecorder::new_with_optional_actor(
             db,
             workspace_id,

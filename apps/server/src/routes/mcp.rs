@@ -461,7 +461,9 @@ async fn handle_tools_call(
                 trakkt_core::Error::NotFound(msg) => (-32602, msg.clone()),
                 trakkt_core::Error::BadRequest(msg) => (-32602, msg.clone()),
                 trakkt_core::Error::Forbidden(msg) => (-32001, msg.clone()),
-                trakkt_core::Error::Conflict(msg) => (-32602, msg.clone()),
+                trakkt_core::Error::Conflict(msg) | trakkt_core::Error::PreconditionFailed(msg) => {
+                    (-32602, msg.clone())
+                }
                 trakkt_core::Error::TooManyRequests(msg, _) => (-32000, msg.clone()),
                 trakkt_core::Error::NotImplemented(msg) => (-32601, msg.clone()),
                 trakkt_core::Error::ServiceUnavailable(msg) => (-32000, msg.clone()),

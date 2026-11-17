@@ -7,6 +7,38 @@
 
 use trakkt_core::DbPool;
 use trakkt_core::sql_compat;
+use trakkt_types::enums::{GitHubAutomationStep, StatusCategory};
+
+/// The `github_links.state` of a pull request, from what GitHub says about it.
+/// One precedence for every source (webhook payload, REST response): merged,
+/// then closed, then draft, then open.
+pub fn pr_link_state(merged: bool, closed: bool, draft: bool) -> &'static str {
+    if merged {
+        "merged"
+    } else if closed {
+        "closed"
+    } else if draft {
+        "draft"
+    } else {
+        "open"
+    }
+}
+
+/// `SELECT` over `github_links` with every column `GitHubLink` reads, followed
+/// by the caller's clauses. One column list for every query of the table.
+macro_rules! link_select {
+    ($($clauses:literal),+) => {
+        concat!(
+            "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
+                    github_id, github_node_id, repo_full_name, ref_identifier, \
+                    title, state, url, author_login, link_kind, completion_pending, \
+                    CAST(created_at AS TEXT) AS created_at, \
+                    CAST(updated_at AS TEXT) AS updated_at \
+             FROM github_links ",
+            $($clauses),+
+        )
+    };
+}
 
 // ─── Row types ───────────────────────────────────────────────────────────────
 
@@ -45,6 +77,16 @@ pub struct GitHubInstallation {
     pub repository_scope_pending: bool,
 }
 
+impl GitHubLink {
+    /// The stored kind. A value the schema's CHECK would have rejected is a
+    /// corrupt row, which must not be read as a permissive default.
+    pub fn kind(&self) -> trakkt_core::Result<crate::patterns::LinkKind> {
+        crate::patterns::LinkKind::parse(&self.link_kind).ok_or_else(|| {
+            trakkt_core::Error::Internal(format!("unknown link kind '{}'", self.link_kind))
+        })
+    }
+}
+
 impl GitHubInstallation {
     /// Legacy connections stay quarantined until user authorization revalidates identity.
     pub fn is_active(&self) -> bool {
@@ -58,9 +100,25 @@ impl GitHubInstallation {
 
     /// NULL means all only when the verified selection says all; [] means none.
     pub fn allows_repository(&self, repository: &str) -> bool {
-        if !self.is_active() {
-            return false;
-        }
+        self.is_active() && self.repository_in_scope(repository)
+    }
+
+    /// Whether a PR in `repository` can still, in principle, report to us.
+    ///
+    /// Permanently gone connections (removed, disconnected, uninstalled) and
+    /// repositories dropped from the selection can never deliver another event.
+    /// A connection that is only suspended, or reconciling its scope, is
+    /// temporary: it will be back, so its PRs still count.
+    pub fn may_still_report(&self, repository: &str) -> bool {
+        self.archived_at.is_none()
+            && self.disconnected_at.is_none()
+            && self.uninstalled_at.is_none()
+            && (self.repository_scope_pending || self.repository_in_scope(repository))
+    }
+
+    /// Whether the connection's repository selection covers `repository`,
+    /// whatever state the connection is in.
+    pub fn repository_in_scope(&self, repository: &str) -> bool {
         if self.repository_selection == "all" {
             return true;
         }
@@ -96,7 +154,12 @@ pub struct GitHubLink {
     pub state: Option<String>,
     pub url: String,
     pub author_login: Option<String>,
-    pub close_intent: bool,
+    /// What this link may do; see [`crate::patterns::LinkKind`].
+    pub link_kind: String,
+    /// A completing PR merged but the issue was not completed because another
+    /// working-link PR was still open. The completion is released later.
+    #[serde(skip_serializing)]
+    pub completion_pending: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -139,7 +202,6 @@ pub struct GitHubTransitionRule {
     pub rule_id: String,
     pub workspace_id: String,
     pub trigger_event: String,
-    pub close_intent_required: bool,
     pub target_status_category: String,
     pub enabled: bool,
     pub created_at: String,
@@ -876,14 +938,10 @@ pub async fn list_links_for_issue(
     let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
         db,
         GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, close_intent, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE issue_id = $1 \
-         ORDER BY created_at DESC",
+        link_select!(
+            "WHERE issue_id = $1 \
+         ORDER BY created_at DESC"
+        ),
         issue_id
     )?;
     Ok(rows)
@@ -945,13 +1003,16 @@ pub struct CreateLinkParams<'a> {
     pub state: Option<&'a str>,
     pub url: &'a str,
     pub author_login: Option<&'a str>,
-    pub close_intent: bool,
+    pub link_kind: crate::patterns::LinkKind,
+    /// A `reopened` event: the only thing that may take a closed PR back to
+    /// open. A merged PR never leaves `merged`.
+    pub allows_reopen: bool,
 }
 
 /// Upsert a GitHub link — create or update on conflict.
 ///
 /// On conflict (same workspace, issue, link_type, repo, ref_identifier),
-/// update the mutable fields: title, state, url, author_login, close_intent,
+/// update the mutable fields: title, state, url, author_login, link_kind,
 /// github_id, github_node_id. Returns the resulting row.
 pub async fn upsert_link(
     db: &DbPool,
@@ -974,21 +1035,26 @@ pub async fn upsert_link_with_admission(
     }
     let is_pg = tx.is_postgres();
     let now = sql_compat::now(is_pg);
+    let no_reopen = sql_compat::bool_false(is_pg);
     let link_id = uuid::Uuid::new_v4().to_string();
 
     let sql = format!(
         "INSERT INTO github_links \
          (link_id, workspace_id, issue_id, installation_id, link_type, \
           github_id, github_node_id, repo_full_name, ref_identifier, \
-          title, state, url, author_login, close_intent, created_at, updated_at) \
+          title, state, url, author_login, link_kind, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, {now}, {now}) \
          ON CONFLICT (workspace_id, issue_id, link_type, repo_full_name, ref_identifier) \
          DO UPDATE SET \
             title = EXCLUDED.title, \
-            state = EXCLUDED.state, \
+            state = CASE \
+                WHEN github_links.state = 'merged' THEN 'merged' \
+                WHEN github_links.state = 'closed' AND EXCLUDED.state IN ('open', 'draft') \
+                     AND $15 = {no_reopen} THEN 'closed' \
+                ELSE EXCLUDED.state END, \
             url = EXCLUDED.url, \
             author_login = EXCLUDED.author_login, \
-            close_intent = EXCLUDED.close_intent, \
+            link_kind = EXCLUDED.link_kind, \
             github_id = EXCLUDED.github_id, \
             github_node_id = EXCLUDED.github_node_id, \
             updated_at = {now}"
@@ -1009,21 +1075,18 @@ pub async fn upsert_link_with_admission(
         params.state,
         params.url,
         params.author_login,
-        params.close_intent
+        params.link_kind.as_str(),
+        params.allows_reopen
     )?;
 
     // Fetch the row — either newly created or updated (conflict case).
     let row = trakkt_core::tx_fetch_one!(
         &mut tx,
         GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, close_intent, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE workspace_id = $1 AND issue_id = $2 AND link_type = $3 \
-               AND repo_full_name = $4 AND ref_identifier = $5",
+        link_select!(
+            "WHERE workspace_id = $1 AND issue_id = $2 AND link_type = $3 \
+               AND repo_full_name = $4 AND ref_identifier = $5"
+        ),
         params.workspace_id,
         params.issue_id,
         params.link_type,
@@ -1034,89 +1097,63 @@ pub async fn upsert_link_with_admission(
     Ok(row)
 }
 
-/// Delete all links for a specific GitHub object (by type+repo+ref_identifier) in a
-/// workspace where the issue_id is NOT in the provided keep list.
-///
-/// Used when a PR is edited and refs are removed — the keep list contains the
-/// issue IDs still referenced, and any other links for this PR are deleted.
-/// Returns the number of rows deleted.
-pub async fn delete_links_not_matching_issues(
-    db: &DbPool,
-    workspace_id: &str,
-    link_type: &str,
-    repo_full_name: &str,
-    ref_identifier: &str,
-    keep_issue_ids: &[String],
-) -> trakkt_core::Result<u64> {
-    delete_links_with_admission(
-        db,
-        workspace_id,
-        link_type,
-        repo_full_name,
-        ref_identifier,
-        keep_issue_ids,
-        None,
-    )
-    .await
+/// Which of a GitHub object's links a delete touches.
+pub enum LinkScope<'a> {
+    /// Every link except those to these issues (a PR was edited and some keys
+    /// are no longer referenced). Empty means every link.
+    KeepOnly(&'a [String]),
+    /// Only the links to these issues (a skip removes a branch link).
+    Only(&'a [String]),
 }
 
-/// Delete stale links while holding authorization through the commit.
+/// Delete links for a specific GitHub object (by type+repo+ref_identifier) in a
+/// workspace, as selected by `scope`, holding an optional authorization
+/// admission lock. Returns the number of links deleted.
 pub async fn delete_links_with_admission(
     db: &DbPool,
     workspace_id: &str,
     link_type: &str,
     repo_full_name: &str,
     ref_identifier: &str,
-    keep_issue_ids: &[String],
+    scope: LinkScope<'_>,
     admission: Option<&dyn trakkt_core::db::TransactionAdmission>,
 ) -> trakkt_core::Result<u64> {
+    let (negate, ids) = match scope {
+        LinkScope::KeepOnly(ids) => (true, ids),
+        LinkScope::Only(ids) => (false, ids),
+    };
+    if !negate && ids.is_empty() {
+        return Ok(0);
+    }
     let mut tx = db.begin().await?;
     if let Some(admission) = admission {
         admission.admit(&mut tx).await?;
     }
-    if keep_issue_ids.is_empty() {
-        // Delete all links for this object in this workspace
-        let result = trakkt_core::tx_execute!(
-            &mut tx,
-            "DELETE FROM github_links \
-             WHERE workspace_id = $1 AND link_type = $2 \
-                   AND repo_full_name = $3 AND ref_identifier = $4",
-            workspace_id,
-            link_type,
-            repo_full_name,
-            ref_identifier
-        )?;
-        let affected = result.rows_affected();
-        tx.commit().await?;
-        return Ok(affected);
-    }
-
-    // Build IN clause for the keep list.
-    let (in_clause, _) = trakkt_core::db::in_clause_placeholders(keep_issue_ids.len(), 5);
-    let sql = format!(
+    let mut sql = String::from(
         "DELETE FROM github_links \
          WHERE workspace_id = $1 AND link_type = $2 \
-               AND repo_full_name = $3 AND ref_identifier = $4 \
-               AND issue_id NOT IN {in_clause}"
+               AND repo_full_name = $3 AND ref_identifier = $4",
     );
-
-    // Dynamically bind the keep_issue_ids. Use db_with_pool! since the
-    // number of binds is variable and the macros expect a fixed list.
-    let rows_affected: u64 = trakkt_core::tx_with!(&mut tx, |executor| {
+    if !ids.is_empty() {
+        let (in_clause, _) = trakkt_core::db::in_clause_placeholders(ids.len(), 5);
+        let not = if negate { "NOT " } else { "" };
+        sql.push_str(&format!(" AND issue_id {not}IN {in_clause}"));
+    }
+    // The number of binds varies, so use tx_with! instead of a fixed-arity macro.
+    let affected: u64 = trakkt_core::tx_with!(&mut tx, |executor| {
         let mut query = sqlx::query(&sql)
             .bind(workspace_id)
             .bind(link_type)
             .bind(repo_full_name)
             .bind(ref_identifier);
-        for id in keep_issue_ids {
+        for id in ids {
             query = query.bind(id);
         }
         let result = query.execute(executor).await?;
         Ok::<u64, sqlx::Error>(result.rows_affected())
     })?;
-
     tx.commit().await?;
-    Ok(rows_affected)
+    Ok(affected)
 }
 
 /// Find all PR links for a specific PR (by workspace, repo, and PR number).
@@ -1131,14 +1168,10 @@ pub async fn list_pr_links_by_ref(
     let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
         db,
         GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, close_intent, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE workspace_id = $1 AND link_type = $2 \
-               AND repo_full_name = $3 AND ref_identifier = $4",
+        link_select!(
+            "WHERE workspace_id = $1 AND link_type = $2 \
+               AND repo_full_name = $3 AND ref_identifier = $4"
+        ),
         workspace_id,
         "pull_request",
         repo_full_name,
@@ -1147,26 +1180,58 @@ pub async fn list_pr_links_by_ref(
     Ok(rows)
 }
 
-/// Find all PR links for a specific issue that have close_intent set.
+/// Issues in a workspace with a held-back completion: a closing PR merged but
+/// the issue was not completed because another PR was still open.
+pub async fn list_issue_ids_with_pending_completion(
+    db: &DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Vec<String>> {
+    Ok(trakkt_core::db_fetch_all!(
+        db,
+        (String,),
+        "SELECT DISTINCT issue_id FROM github_links \
+         WHERE workspace_id = $1 AND link_type = $2 AND completion_pending = $3",
+        workspace_id,
+        "pull_request",
+        true
+    )?
+    .into_iter()
+    .map(|(issue_id,)| issue_id)
+    .collect())
+}
+
+/// Issues with an open or draft pull request on one connection.
+pub async fn list_issue_ids_with_open_links_on(
+    db: &DbPool,
+    installation_id: &str,
+) -> trakkt_core::Result<Vec<String>> {
+    Ok(trakkt_core::db_fetch_all!(
+        db,
+        (String,),
+        "SELECT DISTINCT issue_id FROM github_links \
+         WHERE installation_id = $1 AND link_type = $2 AND state IN ('open', 'draft')",
+        installation_id,
+        "pull_request"
+    )?
+    .into_iter()
+    .map(|(issue_id,)| issue_id)
+    .collect())
+}
+
+/// Every pull request link on an issue, whatever its kind or state.
 ///
-/// Used for outbound notifications when an issue is manually completed.
-pub async fn list_close_intent_links_for_issue(
+/// Used to decide whether a merge is the last one: the merge status applies
+/// only when no other closing pull request is still open.
+pub async fn list_pr_links_for_issue(
     db: &DbPool,
     issue_id: &str,
 ) -> trakkt_core::Result<Vec<GitHubLink>> {
     let rows: Vec<GitHubLink> = trakkt_core::db_fetch_all!(
         db,
         GitHubLink,
-        "SELECT link_id, workspace_id, issue_id, installation_id, link_type, \
-                github_id, github_node_id, repo_full_name, ref_identifier, \
-                title, state, url, author_login, close_intent, \
-                CAST(created_at AS TEXT) AS created_at, \
-                CAST(updated_at AS TEXT) AS updated_at \
-         FROM github_links \
-         WHERE issue_id = $1 AND link_type = $2 AND close_intent = $3",
+        link_select!("WHERE issue_id = $1 AND link_type = $2"),
         issue_id,
-        "pull_request",
-        true
+        "pull_request"
     )?;
     Ok(rows)
 }
@@ -1210,6 +1275,48 @@ pub async fn update_link_state(
         "UPDATE github_links SET state = $1, title = $2, updated_at = {now} WHERE link_id = $3"
     );
     trakkt_core::db_execute!(db, &sql, state, title, link_id)?;
+    Ok(())
+}
+
+/// Mark whether a link's merge is waiting to be applied to its issue.
+///
+/// Setting the mark is a no-op once the issue is completed or cancelled: a
+/// completion that already happened is not pending, and a mark left on a
+/// finished issue would re-complete it after a person reopens it.
+pub async fn set_completion_pending(
+    db: &DbPool,
+    link_id: &str,
+    pending: bool,
+) -> trakkt_core::Result<()> {
+    trakkt_core::db_execute!(
+        db,
+        "UPDATE github_links SET completion_pending = $1 \
+         WHERE link_id = $2 AND ($1 = $3 OR EXISTS ( \
+             SELECT 1 FROM issues i JOIN statuses s ON s.status_id = i.status_id \
+             WHERE i.issue_id = github_links.issue_id \
+               AND s.category NOT IN ($4, $5)))",
+        pending,
+        link_id,
+        false,
+        StatusCategory::Completed.as_str(),
+        StatusCategory::Cancelled.as_str()
+    )?;
+    Ok(())
+}
+
+/// A held completion has been decided, one way or the other: nothing on the
+/// issue is pending any more.
+pub async fn clear_completion_pending_for_issue(
+    db: &DbPool,
+    issue_id: &str,
+) -> trakkt_core::Result<()> {
+    trakkt_core::db_execute!(
+        db,
+        "UPDATE github_links SET completion_pending = $1 WHERE issue_id = $2 AND completion_pending = $3",
+        false,
+        issue_id,
+        true
+    )?;
     Ok(())
 }
 
@@ -1296,7 +1403,7 @@ pub async fn list_transition_rules(
     let rows: Vec<GitHubTransitionRule> = trakkt_core::db_fetch_all!(
         db,
         GitHubTransitionRule,
-        "SELECT rule_id, workspace_id, trigger_event, close_intent_required, \
+        "SELECT rule_id, workspace_id, trigger_event, \
                 target_status_category, enabled, \
                 CAST(created_at AS TEXT) AS created_at \
          FROM github_transition_rules \
@@ -1307,6 +1414,15 @@ pub async fn list_transition_rules(
     Ok(rows)
 }
 
+/// The default workspace rules: a PR opened or marked ready starts the issue, a
+/// merge completes it, and a closing PR closed without merge cancels it (see
+/// docs/ARCHITECTURE.md for when). One list for every place that seeds them.
+pub const DEFAULT_RULES: [(GitHubAutomationStep, StatusCategory); 3] = [
+    (GitHubAutomationStep::PrOpened, StatusCategory::Started),
+    (GitHubAutomationStep::PrMerged, StatusCategory::Completed),
+    (GitHubAutomationStep::PrClosed, StatusCategory::Cancelled),
+];
+
 /// Seed the default transition rules for a workspace.
 ///
 /// Uses INSERT ... ON CONFLICT DO NOTHING so this is idempotent.
@@ -1314,45 +1430,24 @@ pub async fn seed_default_transition_rules(
     db: &DbPool,
     workspace_id: &str,
 ) -> trakkt_core::Result<()> {
-    let is_pg = db.is_postgres();
-    let now = sql_compat::now(is_pg);
-    let bool_true = sql_compat::bool_true(is_pg);
-    let bool_false = sql_compat::bool_false(is_pg);
-
-    let rule_id_1 = uuid::Uuid::new_v4().to_string();
-    let rule_id_2 = uuid::Uuid::new_v4().to_string();
-    let rule_id_3 = uuid::Uuid::new_v4().to_string();
-
-    // pr_opened -> started (no close intent required)
-    let sql = format!(
-        "INSERT INTO github_transition_rules \
-         (rule_id, workspace_id, trigger_event, close_intent_required, \
-          target_status_category, enabled, created_at) \
-         VALUES ($1, $2, $3, {bool_false}, $4, {bool_true}, {now}) \
-         ON CONFLICT DO NOTHING"
-    );
-    trakkt_core::db_execute!(db, &sql, &rule_id_1, workspace_id, "pr_opened", "started")?;
-
-    // pr_merged -> completed (close intent required)
-    let sql = format!(
-        "INSERT INTO github_transition_rules \
-         (rule_id, workspace_id, trigger_event, close_intent_required, \
-          target_status_category, enabled, created_at) \
-         VALUES ($1, $2, $3, {bool_true}, $4, {bool_true}, {now}) \
-         ON CONFLICT DO NOTHING"
-    );
-    trakkt_core::db_execute!(db, &sql, &rule_id_2, workspace_id, "pr_merged", "completed")?;
-
-    // pr_closed -> cancelled (close intent required)
-    let sql = format!(
-        "INSERT INTO github_transition_rules \
-         (rule_id, workspace_id, trigger_event, close_intent_required, \
-          target_status_category, enabled, created_at) \
-         VALUES ($1, $2, $3, {bool_true}, $4, {bool_true}, {now}) \
-         ON CONFLICT DO NOTHING"
-    );
-    trakkt_core::db_execute!(db, &sql, &rule_id_3, workspace_id, "pr_closed", "cancelled")?;
-
+    let now = sql_compat::now(db.is_postgres());
+    let bool_true = sql_compat::bool_true(db.is_postgres());
+    for (step, category) in DEFAULT_RULES {
+        let sql = format!(
+            "INSERT INTO github_transition_rules \
+             (rule_id, workspace_id, trigger_event, target_status_category, enabled, created_at) \
+             VALUES ($1, $2, $3, $4, {bool_true}, {now}) \
+             ON CONFLICT DO NOTHING"
+        );
+        trakkt_core::db_execute!(
+            db,
+            &sql,
+            uuid::Uuid::new_v4().to_string(),
+            workspace_id,
+            step.as_str(),
+            category.as_str()
+        )?;
+    }
     Ok(())
 }
 
@@ -1389,6 +1484,204 @@ pub async fn update_transition_rule_enabled_with_delivery(
     }
     let mut batch = SyncBatch::new();
     batch.record(&mut tx, trakkt_types::sync::entity_types::GITHUB_TRANSITION_RULE, rule_id, workspace_id, SyncAudience::Workspace, trakkt_types::sync::SyncActionType::Update, Some(serde_json::json!({"rule_id":rule_id,"workspace_id":workspace_id,"enabled":enabled}))).await?;
+    batch.commit_and_deliver(tx, ws_manager).await
+}
+
+// ─── per-team automation ─────────────────────────────────────────────────────
+
+/// A team's override of one workspace default rule. A `None` target means the
+/// step does nothing for that team.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
+pub struct GitHubTeamTransitionRule {
+    pub rule_id: String,
+    pub workspace_id: String,
+    pub team_id: String,
+    pub trigger_event: String,
+    pub target_status_category: Option<String>,
+    pub created_at: String,
+}
+
+/// List a workspace's per-team rules.
+pub async fn list_team_transition_rules(
+    db: &DbPool,
+    workspace_id: &str,
+) -> trakkt_core::Result<Vec<GitHubTeamTransitionRule>> {
+    Ok(trakkt_core::db_fetch_all!(
+        db,
+        GitHubTeamTransitionRule,
+        "SELECT rule_id, workspace_id, team_id, trigger_event, target_status_category, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM github_team_transition_rules \
+         WHERE workspace_id = $1 \
+         ORDER BY team_id ASC, trigger_event ASC",
+        workspace_id
+    )?)
+}
+
+/// Record a settings change in the sync log so other open settings pages
+/// refresh. Team rules and the linkback switch reuse the shared-rule entity
+/// type: the client only needs to know integration settings changed.
+async fn record_settings_change(
+    tx: &mut trakkt_core::db::DbTx,
+    batch: &mut trakkt_auth::sync_log_service::SyncBatch<'_>,
+    entity_id: &str,
+    workspace_id: &str,
+    payload: serde_json::Value,
+) -> trakkt_core::Result<()> {
+    use trakkt_auth::sync_log_service::SyncAudience;
+    batch
+        .record(
+            tx,
+            trakkt_types::sync::entity_types::GITHUB_TRANSITION_RULE,
+            entity_id,
+            workspace_id,
+            SyncAudience::Workspace,
+            trakkt_types::sync::SyncActionType::Update,
+            Some(payload),
+        )
+        .await
+}
+
+/// Set a team's rule for one step, replacing any existing one.
+///
+/// `target` of `None` makes the step do nothing for that team.
+pub async fn set_team_transition_rule(
+    db: &DbPool,
+    workspace_id: &str,
+    team_id: &str,
+    step: GitHubAutomationStep,
+    target: Option<StatusCategory>,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    use trakkt_auth::sync_log_service::SyncBatch;
+    let mut tx = db.begin().await?;
+    let in_workspace = trakkt_core::tx_fetch_optional!(
+        &mut tx,
+        (String,),
+        "SELECT team_id FROM teams WHERE team_id = $1 AND workspace_id = $2",
+        team_id,
+        workspace_id
+    )?;
+    if in_workspace.is_none() {
+        return Err(trakkt_core::Error::NotFound("Team not found".into()));
+    }
+    let now = sql_compat::now(tx.is_postgres());
+    let sql = format!(
+        "INSERT INTO github_team_transition_rules \
+         (rule_id, workspace_id, team_id, trigger_event, target_status_category, created_at) \
+         VALUES ($1, $2, $3, $4, $5, {now}) \
+         ON CONFLICT (team_id, trigger_event) \
+         DO UPDATE SET target_status_category = EXCLUDED.target_status_category"
+    );
+    trakkt_core::tx_execute!(
+        &mut tx,
+        &sql,
+        uuid::Uuid::new_v4().to_string(),
+        workspace_id,
+        team_id,
+        step.as_str(),
+        target.map(|c| c.as_str())
+    )?;
+    let mut batch = SyncBatch::new();
+    record_settings_change(
+        &mut tx,
+        &mut batch,
+        &format!("{team_id}:{}", step.as_str()),
+        workspace_id,
+        serde_json::json!({"team_id":team_id,"trigger_event":step.as_str(),"target_status_category":target.map(|c| c.as_str())}),
+    )
+    .await?;
+    batch.commit_and_deliver(tx, ws_manager).await
+}
+
+/// Remove a team's rule for one step, so the workspace default applies again.
+pub async fn clear_team_transition_rule(
+    db: &DbPool,
+    workspace_id: &str,
+    team_id: &str,
+    step: GitHubAutomationStep,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    use trakkt_auth::sync_log_service::SyncBatch;
+    let mut tx = db.begin().await?;
+    trakkt_core::tx_execute!(
+        &mut tx,
+        "DELETE FROM github_team_transition_rules \
+         WHERE workspace_id = $1 AND team_id = $2 AND trigger_event = $3",
+        workspace_id,
+        team_id,
+        step.as_str()
+    )?;
+    let mut batch = SyncBatch::new();
+    record_settings_change(
+        &mut tx,
+        &mut batch,
+        &format!("{team_id}:{}", step.as_str()),
+        workspace_id,
+        serde_json::json!({"team_id":team_id,"trigger_event":step.as_str(),"cleared":true}),
+    )
+    .await?;
+    batch.commit_and_deliver(tx, ws_manager).await
+}
+
+/// A team's override for one step, if it has one.
+pub async fn get_team_transition_rule(
+    db: &DbPool,
+    team_id: &str,
+    step: GitHubAutomationStep,
+) -> trakkt_core::Result<Option<GitHubTeamTransitionRule>> {
+    Ok(trakkt_core::db_fetch_optional!(
+        db,
+        GitHubTeamTransitionRule,
+        "SELECT rule_id, workspace_id, team_id, trigger_event, target_status_category, \
+                CAST(created_at AS TEXT) AS created_at \
+         FROM github_team_transition_rules \
+         WHERE team_id = $1 AND trigger_event = $2",
+        team_id,
+        step.as_str()
+    )?)
+}
+
+// ─── github_automation_settings ──────────────────────────────────────────────
+
+/// Whether the workspace posts a comment on the PR when automation changes an
+/// issue's status. On unless the workspace turned it off.
+pub async fn linkback_enabled(db: &DbPool, workspace_id: &str) -> trakkt_core::Result<bool> {
+    let setting = trakkt_core::db_fetch_optional!(
+        db,
+        (bool,),
+        "SELECT linkback_enabled FROM github_automation_settings WHERE workspace_id = $1",
+        workspace_id
+    )?;
+    Ok(setting.is_none_or(|(enabled,)| enabled))
+}
+
+/// Turn the PR linkback comment on or off for a workspace.
+pub async fn set_linkback_enabled(
+    db: &DbPool,
+    workspace_id: &str,
+    enabled: bool,
+    ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
+) -> trakkt_core::Result<()> {
+    use trakkt_auth::sync_log_service::SyncBatch;
+    let mut tx = db.begin().await?;
+    trakkt_core::tx_execute!(
+        &mut tx,
+        "INSERT INTO github_automation_settings (workspace_id, linkback_enabled) \
+         VALUES ($1, $2) \
+         ON CONFLICT (workspace_id) DO UPDATE SET linkback_enabled = EXCLUDED.linkback_enabled",
+        workspace_id,
+        enabled
+    )?;
+    let mut batch = SyncBatch::new();
+    record_settings_change(
+        &mut tx,
+        &mut batch,
+        workspace_id,
+        workspace_id,
+        serde_json::json!({"workspace_id":workspace_id,"linkback_enabled":enabled}),
+    )
+    .await?;
     batch.commit_and_deliver(tx, ws_manager).await
 }
 

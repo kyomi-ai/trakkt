@@ -384,6 +384,12 @@ pub struct IssueUpdate {
     pub estimate: Option<Option<i32>>,
     pub sort_order: Option<Option<f64>>,
     pub team_id: Option<String>,
+    /// Apply this update only if the issue is still in this status when the
+    /// update's transaction locks it; otherwise the update fails with a
+    /// conflict and changes nothing. Internal compare-and-set for automations
+    /// that decided from an earlier read; never deserialized from a request.
+    #[serde(skip)]
+    pub expected_status_id: Option<String>,
 }
 
 /// A relation between two issues (e.g. "blocks").

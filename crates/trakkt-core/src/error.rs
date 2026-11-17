@@ -23,6 +23,11 @@ pub enum Error {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// A compare-and-set write found the row no longer in the state the caller
+    /// decided from. Nothing was written; the caller re-reads or gives up.
+    #[error("precondition failed: {0}")]
+    PreconditionFailed(String),
+
     #[error("too many requests: {0}")]
     TooManyRequests(String, u64),
 
@@ -82,6 +87,7 @@ impl IntoResponse for Error {
             Error::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             Error::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Error::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            Error::PreconditionFailed(msg) => (StatusCode::PRECONDITION_FAILED, msg.clone()),
             Error::TooManyRequests(msg, retry_after) => {
                 let body = serde_json::json!({ "detail": msg });
                 let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();

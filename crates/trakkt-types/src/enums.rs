@@ -40,6 +40,27 @@ impl StatusCategory {
         }
     }
 
+    /// Parse the stored value. Unknown values are an error, never a default.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|c| c.as_str() == value)
+    }
+
+    /// Where the category sits on the way from idea to finished. Completed
+    /// and cancelled are both an end.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Self::Backlog => 0,
+            Self::Unstarted => 1,
+            Self::Started => 2,
+            Self::Completed | Self::Cancelled => 3,
+        }
+    }
+
+    /// Whether the issue's work is over.
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled)
+    }
+
     pub fn icon_name(&self) -> &'static str {
         match self {
             Self::Backlog => "status_backlog",
@@ -54,6 +75,95 @@ impl StatusCategory {
 impl std::fmt::Display for StatusCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// What a link between a GitHub object and an issue is allowed to do.
+///
+/// Ordered weakest to strongest; when several sources name the same issue the
+/// strongest wins. See docs/ARCHITECTURE.md, "GitHub Link Intent".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkKind {
+    /// Shown on the issue and the PR. Never changes status.
+    Related,
+    /// The key is in the branch name or the PR title. Starts the issue.
+    BranchTitle,
+    /// A non-closing magic word (`Refs`, `Part of`, ...). Starts the issue.
+    Contributing,
+    /// A closing magic word (`Fixes`, `Closes`, ...). Starts and completes.
+    Closing,
+}
+
+impl LinkKind {
+    /// The value stored in `github_links.link_kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Related => "related",
+            Self::BranchTitle => "branch_title",
+            Self::Contributing => "contributing",
+            Self::Closing => "closing",
+        }
+    }
+
+    /// Parse the stored value. Unknown values are an error, not a default.
+    pub fn parse(value: &str) -> Option<Self> {
+        [
+            Self::Related,
+            Self::BranchTitle,
+            Self::Contributing,
+            Self::Closing,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == value)
+    }
+}
+
+/// A step of the GitHub status automation that a team can configure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubAutomationStep {
+    /// A PR was opened as a draft, or converted to one.
+    PrDraft,
+    /// A PR was opened, reopened, or marked ready for review.
+    PrOpened,
+    /// A PR was merged.
+    PrMerged,
+    /// A PR was closed without merging.
+    PrClosed,
+}
+
+impl GitHubAutomationStep {
+    pub fn all() -> &'static [GitHubAutomationStep] {
+        &[
+            Self::PrDraft,
+            Self::PrOpened,
+            Self::PrMerged,
+            Self::PrClosed,
+        ]
+    }
+
+    /// The value stored in `trigger_event`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PrDraft => "pr_draft",
+            Self::PrOpened => "pr_opened",
+            Self::PrMerged => "pr_merged",
+            Self::PrClosed => "pr_closed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|s| s.as_str() == value)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PrDraft => "PR opened as draft",
+            Self::PrOpened => "PR opened or ready for review",
+            Self::PrMerged => "PR merged",
+            Self::PrClosed => "PR closed without merge",
+        }
     }
 }
 

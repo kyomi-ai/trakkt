@@ -366,6 +366,143 @@ All list endpoints support `?status=`, `?priority=`, `?label=`, `?assignee=`, `?
 }
 ```
 
+### GitHub Link Intent
+
+The GitHub integration follows Linear's model: a key found in text is not a link.
+A link is made by *intent*, and what a link may do to an issue's status is decided
+by the **link kind**, never by "a key was found". Modelled on
+[Linear's GitHub integration](https://linear.app/docs/github) and its
+[2019](https://linear.app/changelog/2019-07-11-github-workflow-configuration),
+[2020](https://linear.app/changelog/2020-05-05),
+[2022](https://linear.app/changelog/2022-02-03-github-commit-linking) and
+[2023](https://linear.app/changelog/2023-11-15-github-workflow-updates) changelogs.
+Code: `crates/trakkt-github/src/patterns.rs` (reading intent),
+`events.rs` (links), `transitions.rs` (status); `LinkKind`,
+`GitHubAutomationStep` and `StatusCategory` live in `trakkt-types`.
+
+**Link sources**
+
+| Source | Link kind |
+| --- | --- |
+| Branch name containing the key | `branch_title` |
+| PR title containing the key | `branch_title` |
+| Closing magic word + key (title, body) | `closing` |
+| Non-closing magic word + key | `contributing` |
+| Relation word + key | `related` |
+| Full issue URL of this application after a magic word | the word's kind |
+| Bare key in the PR **body** | `related` |
+| Bare key in a commit message | `related` |
+| Magic word in a commit message | the word's kind (a commit never changes status) |
+| Anything in a PR *comment* | no link: only `pull_request` and `push` events are processed |
+| `skip` / `ignore` + key | no link at all, even if the branch name has the key |
+
+When several sources name one issue the strongest kind wins
+(`closing` > `contributing` > `branch_title` > `related`); within one piece of text a
+magic word decides the key, so `Related to X-1` in a PR title is related, not a title
+link; `skip` in any part of the PR removes the issue entirely. The words are exactly
+Linear's lists (`CLOSING_WORDS`, `CONTRIBUTING_WORDS`, `RELATED_WORDS`,
+`SKIP_WORDS`); several keys may follow one word (`Fixes ENG-123, DES-5, and
+ENG-256`); a word must directly precede the key (`Fixes the crash in TRA-5` is a
+mention). A URL only counts when its host is this application's. `Ignore X-1` removes
+the PR link and the branch link an earlier push made for it; a later push to that
+branch can show the branch row again, which is display only and never drives status.
+
+**What each kind does** (one table: `behavior()` in `transitions.rs`)
+
+| Kind | Starts (draft, opened, ready, reopened) | Holds back others while open | Completes on merge | Cancels when closed unmerged |
+| --- | --- | --- | --- | --- |
+| `closing` | yes | yes | yes | yes |
+| `branch_title` | yes | yes | yes | no |
+| `contributing` | yes | yes | no | no |
+| `related` | no | no | no | no |
+
+`related` links are shown on the issue and the PR and never change status or post a
+comment. Commit mentions stay activity only.
+
+**Automation steps.** Built: *draft* (`pr_draft`), *opened / ready for review*
+(`pr_opened`, also fired by `reopened`), *merged* (`pr_merged`) and *closed without
+merge* (`pr_closed`). A draft PR fires `pr_draft`, which has no default rule, so a
+draft does nothing until a team configures it; `ready_for_review` fires `pr_opened`.
+The workspace rules (`github_transition_rules`, one per step; defaults: opened ->
+started, merged -> completed, closed -> cancelled) are the default; a **team** may
+override any step (`github_team_transition_rules`) with a status category or *no
+action*. Which link kinds may fire a step is decided in code by the table above, not
+by a column.
+
+**Order of decisions** for each linked issue. *Draft / opened*: the kind starts; a
+rule exists (team override, else enabled workspace rule); the move is forward and the
+issue is not completed or cancelled. *Merge, close and edit* are settled across all
+of the issue's PRs (`Run::settle_issue`), because completion is a property of the
+issue, not of one event:
+
+- While any working-link PR on the issue is open or draft nothing completes: the
+  merge status applies when the *last* one is done. Before an open sibling is allowed
+  to hold a merge back it is checked against GitHub (`verify_holder`): a missed
+  webhook (a suspended connection, a dropped delivery) must not block the issue for
+  good, and if GitHub cannot be asked the sibling keeps holding.
+- A completing PR that merges while another is open leaves a `completion_pending`
+  mark on its link. That held-back completion is released, and only then, when the
+  last open PR lets go: by merging, being closed without merge, or being edited so it
+  no longer works on the issue. Nothing else completes an issue, so an old merge is
+  never re-applied after a person reopens the issue, and a PR that only mentions the
+  issue never completes it. The mark is cleared when the issue reaches Completed or
+  Cancelled by any path (in the same transaction as the status change), and cannot be
+  set on an issue that is already finished.
+- A PR closed without merging is never a merge. It cancels the issue (the
+  `pr_closed` rule) only when it is a `closing` link, no other working-link PR is
+  open and none has merged.
+- An *open* PR in a repository the workspace has permanently let go of (connection
+  removed, disconnected, uninstalled, or the repository dropped from the selection) is
+  ignored, since it can never report again; a suspended connection or one reconciling
+  its scope is temporary and still counts. Merged and closed links are recorded facts
+  and count wherever their repository now is. Whenever a connection's reach changes
+  (unsuspended, repositories added or removed, uninstalled, disconnected or removed from
+  settings, reauthorized) `settle_after_reach_change` settles again every issue with a
+  `completion_pending` mark and every issue with an open PR on that connection
+  (its PR may be the issue's only one, so no mark exists). `verify_holder` asks GitHub
+  about whichever open PR still holds an issue, and one issue failing does not stop the
+  rest. A sweep moves issues and posts no PR comment. Every entry point that changes
+  a connection's reach calls it.
+- The status write is a compare-and-set on the status the decision read, so a
+  person's concurrent change is never overwritten.
+- A finished PR never returns to open except by `reopened` (a merged PR never does);
+  that rule lives in the link upsert, so concurrent or late deliveries cannot defeat it.
+
+**Deliberate deviations from Linear** (owner decisions)
+
+- GitHub events never move a *Completed or Cancelled* issue (PR #366). Linear does
+  not document this; we keep it on purpose.
+- *Forward-only*: a GitHub event never moves an issue backwards or sideways. Status
+  categories rank backlog < unstarted < started < completed/cancelled; the target
+  must outrank the current category, so In Review is never pulled back to In Progress.
+- A bare key in a PR body is a related-only link: shown, never acts.
+- Cross-repository mentions have no special case: a PR in any connected repository
+  follows the same rules, so a key named without a working link changes nothing.
+- A PR that closes an issue and is **closed without merging** cancels it, through the
+  existing workspace `pr_closed` rule, only for `closing` links and only when no other
+  working-link PR on the issue is open and none has merged (a closed `related` PR or
+  a mention does not matter). Linear takes no action on
+  a close. Because of the Completed/Cancelled guard, that cancellation is final: a
+  reopened or replacement PR cannot undo it, only a person can. Turn the rule off, or
+  set the team's step to *no action*, if that is not wanted.
+- Editing a PR never starts an issue. A PR opened with a bare mention and later
+  edited to `Fixes X-1` starts the issue at the next opened/ready/reopened event, or
+  completes it on merge. An edit only releases a completion the PR was holding back.
+
+**Linkback.** The bot comment on the PR is posted only when automation actually
+changed the issue's status, and the per-workspace switch
+(`github_automation_settings.linkback_enabled`, Settings > Integrations) covers it and
+the comment posted when an issue is completed by hand. Team rule and linkback writes
+are recorded in the sync log (entity `GITHUB_TRANSITION_RULE`) so open settings pages
+refresh.
+
+**Compatibility.** The REST/MCP `list_issue_github_links` response replaces
+`close_intent` with `link_kind` on each link.
+
+**Not built**: the review-requested step, the ready-to-merge step, and per-target-branch
+overrides with regex and no action. Assigning the linker to an unassigned issue is
+not built and not planned.
+
 ### Deployment Modes
 
 | Mode | Trigger | Database | KV | Auth |
