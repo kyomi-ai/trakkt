@@ -18,6 +18,11 @@ UPDATE github_links SET link_kind = 'branch_title' WHERE link_type = 'branch' AN
 
 ALTER TABLE github_links DROP COLUMN close_intent;
 
+-- A completing PR that merged while another working-link PR was still open has
+-- not completed its issue yet; this marks that held-back completion so it is
+-- released later, and only then.
+ALTER TABLE github_links ADD COLUMN completion_pending BOOLEAN NOT NULL DEFAULT false;
+
 -- Per-team automation. A row replaces the workspace default rule for one
 -- trigger on that team's issues. A NULL target means "no action".
 CREATE TABLE github_team_transition_rules (
@@ -40,12 +45,13 @@ CREATE TABLE github_automation_settings (
 -- A rule's identity is its trigger. Which link kinds may fire a step is now
 -- decided in code from the link's kind, so `close_intent_required` goes. A
 -- workspace that had both variants of a trigger keeps the one that applied to
--- closing links (the `true` row if there is one).
+-- closing links (the `true` row if there is one), preferring an enabled rule so
+-- a disabled variant never switches the automation off.
 DELETE FROM github_transition_rules r
 WHERE r.rule_id <> (
         SELECT r2.rule_id FROM github_transition_rules r2
         WHERE r2.workspace_id = r.workspace_id AND r2.trigger_event = r.trigger_event
-        ORDER BY r2.close_intent_required DESC, r2.rule_id
+        ORDER BY r2.enabled DESC, r2.close_intent_required DESC, r2.rule_id
         LIMIT 1);
 ALTER TABLE github_transition_rules DROP COLUMN close_intent_required;
 ALTER TABLE github_transition_rules ADD CONSTRAINT github_transition_rules_workspace_trigger_key UNIQUE (workspace_id, trigger_event);

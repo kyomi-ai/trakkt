@@ -136,11 +136,12 @@ pub async fn process_pull_request(
     // ── Determine PR state ────────────────────────────────────────────────
 
     let github_state = pr.get("state").and_then(|v| v.as_str());
-    let mut pr_state = determine_pr_state(action, merged, draft, github_state);
+    let pr_state = determine_pr_state(action, merged, draft, github_state);
 
-    // A finished PR does not become open again because an edit or a late or
-    // repeated delivery says so: only `reopened` does. Otherwise a stale
-    // `open` would hold back every sibling PR's completion.
+    // The links this PR had before this event: an edit may unlink some, and the
+    // issues they leave need their held-back completion re-evaluated. (A
+    // finished PR never returns to open except by `reopened`: that rule is part
+    // of the upsert, so concurrent deliveries cannot defeat it.)
     let existing = schema::list_pr_links_by_ref(
         db,
         &installation.workspace_id,
@@ -148,19 +149,6 @@ pub async fn process_pull_request(
         &pr_number.to_string(),
     )
     .await?;
-    let existing_terminal = existing.iter().find_map(|l| {
-        l.state
-            .as_deref()
-            .filter(|s| matches!(*s, "merged" | "closed"))
-    });
-    if let Some(terminal) = existing_terminal
-        && matches!(pr_state.as_str(), "open" | "draft")
-        && action != "reopened"
-    {
-        tracing::info!(pr_number, repo = %repo, action, kept = terminal,
-            "Ignoring an open state for a PR already finished");
-        pr_state = terminal.to_string();
-    }
 
     // ── Read link intent ──────────────────────────────────────────────────
     //
@@ -199,6 +187,7 @@ pub async fn process_pull_request(
                 url: &html_url,
                 author_login: author.as_deref(),
                 link_kind: *link_kind,
+                allows_reopen: action == "reopened",
             },
             Some(&admission),
         )
@@ -215,12 +204,13 @@ pub async fn process_pull_request(
         }
     }
     if !skipped_issue_ids.is_empty() {
-        schema::delete_branch_links_for_issues(
+        schema::delete_links_with_admission(
             db,
             &installation.workspace_id,
+            "branch",
             &repo,
             &branch_name,
-            &skipped_issue_ids,
+            schema::LinkScope::Only(&skipped_issue_ids),
             Some(&admission),
         )
         .await?;
@@ -243,7 +233,7 @@ pub async fn process_pull_request(
             "pull_request",
             &repo,
             &pr_number.to_string(),
-            &valid_issue_ids,
+            schema::LinkScope::KeepOnly(&valid_issue_ids),
             Some(&admission),
         )
         .await?;
@@ -398,6 +388,7 @@ pub async fn process_push(
                     url: &branch_url,
                     author_login: None,
                     link_kind: LinkKind::BranchTitle,
+                    allows_reopen: false,
                 },
                 Some(&admission),
             )
@@ -522,6 +513,7 @@ pub async fn process_push(
                         url: &url,
                         author_login: author_login.as_deref(),
                         link_kind: *link_kind,
+                        allows_reopen: false,
                     },
                     Some(&admission),
                 )

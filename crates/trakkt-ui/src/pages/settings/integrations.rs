@@ -771,8 +771,8 @@ fn TransitionRuleRow(rule: TransitionRuleDisplay) -> impl IntoView {
     let rule_id = rule.rule_id.clone();
     let (enabled, set_enabled) = signal(rule.enabled);
 
-    let description = format_rule_description(&rule.trigger_event);
-    let target = format_target_status(&rule.target_status_category);
+    let description = format_rule_description(rule.step);
+    let target = format_target_status(rule.target.as_str());
 
     let toggle_action = Action::new(move |new_val: &bool| {
         let rid = rule_id.clone();
@@ -810,12 +810,18 @@ fn TransitionRuleRow(rule: TransitionRuleDisplay) -> impl IntoView {
     }
 }
 
-fn format_rule_description(trigger_event: &str) -> String {
-    match trigger_event {
-        "pr_opened" => "When a PR linked to the issue is opened or marked ready for review".to_string(),
-        "pr_merged" => "When the last open PR linked to the issue is merged".to_string(),
-        "pr_closed" => "When a PR that closes the issue is closed without merge (and no other PR is linked)".to_string(),
-        other => other.to_string(),
+fn format_rule_description(step: GitHubAutomationStep) -> String {
+    match step {
+        GitHubAutomationStep::PrDraft => "When a PR is opened as a draft".to_string(),
+        GitHubAutomationStep::PrOpened => {
+            "When a PR linked to the issue is opened or marked ready for review".to_string()
+        }
+        GitHubAutomationStep::PrMerged => {
+            "When the last open PR linked to the issue is merged".to_string()
+        }
+        GitHubAutomationStep::PrClosed => {
+            "When a PR that closes the issue is closed without merge, with no other PR open or merged on it".to_string()
+        }
     }
 }
 

@@ -892,7 +892,8 @@ async fn bind_verified_connection(
         }
     }
     batch.record(&mut tx, "GITHUB_INSTALLATION", &id, &state.workspace_id, SyncAudience::Workspace, action, Some(serde_json::json!({"installation_id": id, "workspace_id": state.workspace_id, "github_installation_id": verified.installation_id, "account_login": verified.account_login, "account_type": verified.account_type, "github_account_id": verified.account_id, "target_repos": verified.repos}))).await?;
-    for (event, category) in [("pr_opened", "started"), ("pr_merged", "completed"), ("pr_closed", "cancelled")] {
+    for (step, category) in crate::schema::DEFAULT_RULES {
+        let (event, category) = (step.as_str(), category.as_str());
         let rule_id = uuid::Uuid::new_v4().to_string();
         let inserted = trakkt_core::tx_execute!(
             &mut tx,
@@ -1342,7 +1343,7 @@ mod tests {
             trakkt_core::test_helpers::seed_team(db,"archive-team","workspace-a","ARC").await.expect("seed archive history team");
             trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed archive history statuses");
             let issue = trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"archive-team".into(),creator_id:"admin-a".into(),title:"Historical linked ticket".into(),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create historical linked issue");
-            crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&row.installation_id,link_type:"pull_request",github_id:Some(700),github_node_id:None,repo_full_name:"example/repo",ref_identifier:"700",title:Some("Historical PR"),state:Some("merged"),url:"https://github.com/example/repo/pull/700",author_login:Some("fixture-user"),link_kind:crate::patterns::LinkKind::Closing}).await.expect("seed historical PR link");
+            crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&row.installation_id,link_type:"pull_request",github_id:Some(700),github_node_id:None,repo_full_name:"example/repo",ref_identifier:"700",title:Some("Historical PR"),state:Some("merged"),url:"https://github.com/example/repo/pull/700",author_login:Some("fixture-user"),link_kind:crate::patterns::LinkKind::Closing,allows_reopen:false}).await.expect("seed historical PR link");
             let event = crate::schema::create_event(db,"archive-history",Some(&row.installation_id),"pull_request",Some("closed"),None).await.expect("seed historical webhook event");
             let before = snapshot(db).await;
             assert!(crate::schema::remove_installation(db,&row.installation_id,"workspace-a","admin-a").await.is_err(),"active connections require disconnect first");
@@ -1736,7 +1737,7 @@ mod tests {
             trakkt_core::test_helpers::seed_team(db,"legacy-team","workspace-a","LEG").await.expect("seed linked issue team");
             trakkt_auth::status_service::seed_default_statuses(db,"workspace-a").await.expect("seed linked issue statuses");
             let issue=trakkt_auth::issue_service::create_issue(db,&trakkt_types::models::CreateIssueParams {workspace_id:"workspace-a".into(),team_id:"legacy-team".into(),creator_id:"admin-a".into(),title:"Historical link".into(),description:None,priority:0,assignee_id:None,due_date:None,label_ids:Vec::new(),project_id:None,milestone_id:None,estimate:None},None).await.expect("create issue with a historical GitHub link");
-            let link=crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&legacy.installation_id,link_type:"pull_request",github_id:Some(500),github_node_id:None,repo_full_name:"old/repo",ref_identifier:"1",title:Some("Historical pull request"),state:Some("open"),url:"https://github.com/old/repo/pull/1",author_login:Some("old-login"),link_kind:crate::patterns::LinkKind::Related}).await.expect("seed historical GitHub link");
+            let link=crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&legacy.installation_id,link_type:"pull_request",github_id:Some(500),github_node_id:None,repo_full_name:"old/repo",ref_identifier:"1",title:Some("Historical pull request"),state:Some("open"),url:"https://github.com/old/repo/pull/1",author_login:Some("old-login"),link_kind:crate::patterns::LinkKind::Related,allows_reopen:false}).await.expect("seed historical GitHub link");
             crate::schema::suspend_installation(db,&legacy.installation_id).await.expect("suspend legacy installation");
             let metadata=crate::schema::get_installation_by_id(db,&legacy.installation_id).await.expect("read legacy metadata").expect("legacy exists");
             let response: GitHubInstallationDetails=serde_json::from_value(details(&Scenario::default())).expect("decode trusted identity evidence");
@@ -2055,7 +2056,7 @@ mod tests {
                         if start != "backlog" {
                             trakkt_auth::issue_service::update_issue(db,"workspace-a","MTX",issue.number,&trakkt_types::models::IssueUpdate {status_id:Some(start_status.status_id.clone()),..Default::default()},Some("admin-a"),trakkt_types::enums::ActionSource::User,None,None).await.expect("move issue to its starting status");
                         }
-                        crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&row.installation_id,link_type:"pull_request",github_id:Some(number),github_node_id:None,repo_full_name:"example/repo",ref_identifier:&number.to_string(),title:Some("matrix"),state:Some(state),url:&format!("https://github.com/example/repo/pull/{number}"),author_login:None,link_kind:kind}).await.expect("seed the link");
+                        crate::schema::upsert_link(db,&crate::schema::CreateLinkParams {workspace_id:"workspace-a",issue_id:&issue.issue_id,installation_id:&row.installation_id,link_type:"pull_request",github_id:Some(number),github_node_id:None,repo_full_name:"example/repo",ref_identifier:&number.to_string(),title:Some("matrix"),state:Some(state),url:&format!("https://github.com/example/repo/pull/{number}"),author_login:None,link_kind:kind,allows_reopen:false}).await.expect("seed the link");
                         let payload = serde_json::json!({"repository":{"full_name":"example/repo"},"pull_request":{"number":number,"title":"matrix","body":"","head":{"ref":"matrix"},"base":{"ref":"main"},"html_url":format!("https://github.com/example/repo/pull/{number}"),"draft":draft,"merged":merged}});
                         crate::transitions::apply_transition_rules(db,&github.client,&row,"workspace-a",action,&payload,&[],&KEY,None,"http://localhost").await.expect("apply transition rules");
                         let after = trakkt_auth::issue_service::get_issue_by_id(db,&issue.issue_id).await.expect("reload issue").expect("exists");
@@ -2084,6 +2085,7 @@ mod tests {
             trakkt_core::db_execute!(db,"DROP TABLE github_team_transition_rules").expect("remove new team rules table");
             trakkt_core::db_execute!(db,"DROP TABLE github_automation_settings").expect("remove new settings table");
             trakkt_core::db_execute!(db,"ALTER TABLE github_links DROP COLUMN link_kind").expect("remove link_kind");
+            trakkt_core::db_execute!(db,"ALTER TABLE github_links DROP COLUMN completion_pending").expect("remove completion_pending");
             let add_old = if db.is_postgres() {"ALTER TABLE github_links ADD COLUMN close_intent BOOLEAN NOT NULL DEFAULT false"} else {"ALTER TABLE github_links ADD COLUMN close_intent INTEGER NOT NULL DEFAULT 0"};
             trakkt_core::db_execute!(db,add_old).expect("restore close_intent");
             // Rules as the preceding schema stored them, including a workspace
@@ -2091,8 +2093,8 @@ mod tests {
             trakkt_core::db_execute!(db,"DROP TABLE github_transition_rules").expect("remove the new rules table");
             let old_rules = if db.is_postgres() {"CREATE TABLE github_transition_rules (rule_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE, trigger_event TEXT NOT NULL, close_intent_required BOOLEAN NOT NULL DEFAULT false, target_status_category TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(workspace_id, trigger_event, close_intent_required))"} else {"CREATE TABLE github_transition_rules (rule_id TEXT NOT NULL PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE, trigger_event TEXT NOT NULL, close_intent_required INTEGER NOT NULL DEFAULT 0, target_status_category TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), UNIQUE(workspace_id, trigger_event, close_intent_required))"};
             trakkt_core::db_execute!(db,old_rules).expect("restore the preceding rules table");
-            for (rule_id,workspace,trigger,close_intent,category) in [("a1","workspace-a","pr_opened",false,"started"),("a2","workspace-a","pr_opened",true,"unstarted"),("a3","workspace-a","pr_merged",true,"completed"),("a4","workspace-a","pr_closed",true,"cancelled"),("b1","workspace-b","pr_opened",false,"started")] {
-                trakkt_core::db_execute!(db,"INSERT INTO github_transition_rules (rule_id, workspace_id, trigger_event, close_intent_required, target_status_category) VALUES ($1,$2,$3,$4,$5)",rule_id,workspace,trigger,close_intent,category).expect("seed a preceding rule");
+            for (rule_id,workspace,trigger,close_intent,category,enabled) in [("a1","workspace-a","pr_opened",false,"started",true),("a2","workspace-a","pr_opened",true,"unstarted",true),("a3","workspace-a","pr_merged",true,"completed",true),("a4","workspace-a","pr_closed",true,"cancelled",true),("b1","workspace-b","pr_opened",false,"started",true),("b2","workspace-b","pr_merged",false,"completed",true),("b3","workspace-b","pr_merged",true,"cancelled",false)] {
+                trakkt_core::db_execute!(db,"INSERT INTO github_transition_rules (rule_id, workspace_id, trigger_event, close_intent_required, target_status_category, enabled) VALUES ($1,$2,$3,$4,$5,$6)",rule_id,workspace,trigger,close_intent,category,enabled).expect("seed a preceding rule");
             }
             // (link_type, ref, close_intent) -> expected kind after migration
             let rows = [
@@ -2120,8 +2122,9 @@ mod tests {
                 ("workspace-a".to_string(),"pr_closed".to_string(),"cancelled".to_string()),
                 ("workspace-a".to_string(),"pr_merged".to_string(),"completed".to_string()),
                 ("workspace-a".to_string(),"pr_opened".to_string(),"unstarted".to_string()),
+                ("workspace-b".to_string(),"pr_merged".to_string(),"completed".to_string()),
                 ("workspace-b".to_string(),"pr_opened".to_string(),"started".to_string()),
-            ],"one rule per trigger, keeping the variant that applied to closing links");
+            ],"one rule per trigger: the variant that applied to closing links, unless it was disabled and the other was not");
         }
     }
 
@@ -2164,6 +2167,12 @@ mod tests {
             assert!(crate::schema::list_team_transition_rules(db,"workspace-a").await.expect("list").is_empty(),"the rule rolled back");
             assert!(crate::schema::set_linkback_enabled(db,"workspace-a",false,None).await.is_err());
             assert!(crate::schema::linkback_enabled(db,"workspace-a").await.expect("read"),"linkback is still on");
+            // Clearing is a converted write too: a rule that exists must survive a failed clear.
+            trakkt_core::test_helpers::dual_backend::clear_sync_log_rejection(db).await;
+            crate::schema::set_team_transition_rule(db,"workspace-a","rb-team",PrOpened,Some(StatusCategory::Started),None).await.expect("seed the rule to clear");
+            trakkt_core::test_helpers::dual_backend::reject_sync_log_inserts_of_type(db,"GITHUB_TRANSITION_RULE").await;
+            assert!(crate::schema::clear_team_transition_rule(db,"workspace-a","rb-team",PrOpened,None).await.is_err());
+            assert_eq!(crate::schema::list_team_transition_rules(db,"workspace-a").await.expect("list").len(),1,"the rule survived the failed clear");
         }
     }
 

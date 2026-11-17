@@ -18,8 +18,8 @@ use trakkt_types::enums::{GitHubAutomationStep, LinkKind, StatusCategory};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionRuleDisplay {
     pub rule_id: String,
-    pub trigger_event: String,
-    pub target_status_category: String,
+    pub step: GitHubAutomationStep,
+    pub target: StatusCategory,
     pub enabled: bool,
 }
 
@@ -281,15 +281,24 @@ pub async fn get_transition_rules() -> Result<Vec<TransitionRuleDisplay>, Server
         .await
         .into_sfn()?;
 
-    Ok(rules
+    rules
         .into_iter()
-        .map(|r| TransitionRuleDisplay {
-            rule_id: r.rule_id,
-            trigger_event: r.trigger_event,
-            target_status_category: r.target_status_category,
-            enabled: r.enabled,
+        .map(|r| {
+            Ok(TransitionRuleDisplay {
+                step: GitHubAutomationStep::parse(&r.trigger_event).ok_or_else(|| {
+                    ServerFnError::new(format!("unknown automation step '{}'", r.trigger_event))
+                })?,
+                target: StatusCategory::parse(&r.target_status_category).ok_or_else(|| {
+                    ServerFnError::new(format!(
+                        "unknown status category '{}'",
+                        r.target_status_category
+                    ))
+                })?,
+                rule_id: r.rule_id,
+                enabled: r.enabled,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Toggle the `enabled` flag on a single transition rule.

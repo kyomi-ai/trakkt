@@ -433,14 +433,30 @@ by a column.
 rule exists (team override, else enabled workspace rule); the move is forward and the
 issue is not completed or cancelled. *Merge, close and edit* are settled across all
 of the issue's PRs (`Run::settle_issue`), because completion is a property of the
-issue, not of one event: while any working-link PR on the issue is open or draft
-nothing completes (the merge status applies when the *last* one is done); then, if a
-completing PR merged, the `pr_merged` rule runs. That is re-evaluated whenever a PR
-lets go of the issue: a sibling merging, being closed without merge, or being edited
-so it no longer links or no longer works on the issue. PRs in a repository the
-connection no longer reaches are ignored, since they can never report again. The
-status write is a compare-and-set on the status the decision read, so a person's
-concurrent change is never overwritten.
+issue, not of one event:
+
+- While any working-link PR on the issue is open or draft nothing completes: the
+  merge status applies when the *last* one is done. Before an open sibling is allowed
+  to hold a merge back it is checked against GitHub (`verify_holder`): a missed
+  webhook (a suspended connection, a dropped delivery) must not block the issue for
+  good, and if GitHub cannot be asked the sibling keeps holding.
+- A completing PR that merges while another is open leaves a `completion_pending`
+  mark on its link. That held-back completion is released, and only then, when the
+  last open PR lets go: by merging, being closed without merge, or being edited so it
+  no longer works on the issue. Nothing else completes an issue, so an old merge is
+  never re-applied after a person reopens the issue, and a PR that only mentions the
+  issue never completes it.
+- A PR closed without merging is never a merge. It cancels the issue (the
+  `pr_closed` rule) only when it is a `closing` link, no other working-link PR is
+  open and none has merged.
+- PRs in a repository the workspace has permanently let go of (connection removed,
+  disconnected, uninstalled, or the repository dropped from the selection) are
+  ignored, since they can never report again; a suspended connection or one
+  reconciling its scope is temporary and still counts.
+- The status write is a compare-and-set on the status the decision read, so a
+  person's concurrent change is never overwritten.
+- A finished PR never returns to open except by `reopened` (a merged PR never does);
+  that rule lives in the link upsert, so concurrent or late deliveries cannot defeat it.
 
 **Deliberate deviations from Linear** (owner decisions)
 
@@ -454,16 +470,14 @@ concurrent change is never overwritten.
   follows the same rules, so a key named without a working link changes nothing.
 - A PR that closes an issue and is **closed without merging** cancels it, through the
   existing workspace `pr_closed` rule, only for `closing` links and only when no other
-  working-link PR on the issue is open and none has merged. Linear takes no action on
+  working-link PR on the issue is open and none has merged (a closed `related` PR or
+  a mention does not matter). Linear takes no action on
   a close. Because of the Completed/Cancelled guard, that cancellation is final: a
   reopened or replacement PR cannot undo it, only a person can. Turn the rule off, or
   set the team's step to *no action*, if that is not wanted.
-- Editing a PR is not an automation step. A PR opened with a bare mention and later
+- Editing a PR never starts an issue. A PR opened with a bare mention and later
   edited to `Fixes X-1` starts the issue at the next opened/ready/reopened event, or
-  completes it on merge; an edit does re-evaluate a completion that the PR was
-  holding back.
-- Only a stale `open` is repaired for finished PRs: a `merged` or `closed` link never
-  returns to open except by `reopened`.
+  completes it on merge. An edit only releases a completion the PR was holding back.
 
 **Linkback.** The bot comment on the PR is posted only when automation actually
 changed the issue's status, and the per-workspace switch
@@ -475,10 +489,9 @@ refresh.
 **Compatibility.** The REST/MCP `list_issue_github_links` response replaces
 `close_intent` with `link_kind` on each link.
 
-**Not built** (owner decision: separate tickets): the review-requested step
-(TRA-10116), the ready-to-merge step (TRA-10117), and per-target-branch overrides
-with regex and no action (TRA-10118). Assigning the linker to an unassigned issue is
-not built and not planned (owner decision).
+**Not built**: the review-requested step, the ready-to-merge step, and per-target-branch
+overrides with regex and no action. Assigning the linker to an unassigned issue is
+not built and not planned.
 
 ### Deployment Modes
 

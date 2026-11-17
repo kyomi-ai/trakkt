@@ -55,10 +55,10 @@ Several keys can follow one word: `Fixes TRA-12, TRA-13 and TRA-14`. The word ha
 ### What the automation does
 
 - A **draft** PR does nothing until it is marked ready for review (a team can give the draft step its own rule). Reopening a PR starts the issue like opening it.
-- When a PR merges, the issue is completed **only after the last open PR linked to it is done**. A PR closed without merging does not complete anything; if a sibling PR already merged, the issue is completed when the last open one closes.
-- A PR that closes an issue and is **closed without merging** moves it to **Cancelled** when nothing else is linked. Under the rule below that is final.
+- When a PR merges, the issue is completed **only after the last open PR linked to it is done**: a merge that has to wait is applied when the last open PR merges, is closed without merging, or is edited so it no longer works on the issue. A PR closed without merging does not complete anything on its own. Trakkt checks an open PR with GitHub before letting it hold a merge back.
+- A PR that closes an issue and is **closed without merging** moves it to **Cancelled** when no other linked PR is open and none has merged. Under the rule below that is final.
 - Issues are **never moved backwards**, and **Completed or Cancelled issues are never moved by GitHub**: reopening finished work is your decision.
-- Editing a PR is not an event of its own: an issue starts at the next open, ready or reopen event, or when the PR merges.
+- Editing a PR never starts an issue: it starts at the next open, ready or reopen event, or completes when the PR merges. An edit only releases a merge that was waiting.
 - When automation changes an issue's status it comments on the PR. Turn that off in **Settings > Integrations > Team automation**; the switch covers the comment posted when you complete an issue by hand as well.
 
 The default rules (PR opened or ready -> **Started**, last PR merged -> **Completed**, closing PR closed without merge -> **Cancelled**) apply workspace-wide, and workspace admins can toggle each one in the Integrations page. Under **Team automation** a team can replace any step for its own issues with a different status or turn it off. Your workspace must have statuses in the corresponding categories for transitions to apply.

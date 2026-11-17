@@ -69,8 +69,9 @@ struct KindBehavior {
     working: bool,
     /// Its merge may complete the issue.
     completes: bool,
-    /// Its PR closed without merging may cancel the issue (when nothing else
-    /// is linked). Only an explicit closing word says the PR was the work.
+    /// Its PR closed without merging may cancel the issue (when no other working
+    /// PR is open and none merged). Only an explicit closing word says the PR was
+    /// the work.
     cancels_when_abandoned: bool,
 }
 
@@ -182,14 +183,20 @@ impl PrLink {
     fn is_merged(&self) -> bool {
         self.link.state.as_deref() == Some("merged")
     }
+
+    fn is_same_pr(&self, repo: &str, number: &str) -> bool {
+        self.link.repo_full_name == repo && self.link.ref_identifier == number
+    }
 }
 
-/// Every PR link on an issue that can still hear from GitHub.
+/// Every PR link on an issue whose repository can still, in principle, report.
 ///
-/// A link in a repository the connection no longer reaches (removed from the
-/// installation, disconnected, uninstalled) can never receive its merge or
-/// close event, so its stored `open` state is not evidence of anything and
-/// must not hold back a completion.
+/// Links in a repository the workspace has permanently let go of (connection
+/// removed, disconnected, uninstalled, or the repository dropped from the
+/// selection) can never receive their merge or close event, so their stored
+/// `open` is not evidence of anything and must not hold back a completion. A
+/// connection that is only suspended or reconciling its scope is temporary, so
+/// its links still count.
 async fn reachable_pr_links(db: &DbPool, issue_id: &str) -> trakkt_core::Result<Vec<PrLink>> {
     let mut installations: std::collections::HashMap<String, Option<GitHubInstallation>> =
         std::collections::HashMap::new();
@@ -201,7 +208,12 @@ async fn reachable_pr_links(db: &DbPool, issue_id: &str) -> trakkt_core::Result<
         }
         let live = installations[&link.installation_id]
             .as_ref()
-            .is_some_and(|i| i.allows_repository(&link.repo_full_name));
+            .is_some_and(|i| {
+                i.archived_at.is_none()
+                    && i.disconnected_at.is_none()
+                    && i.uninstalled_at.is_none()
+                    && (i.repository_scope_pending || i.repository_in_scope(&link.repo_full_name))
+            });
         if live {
             let kind = link.kind()?;
             reachable.push(PrLink { link, kind });
@@ -282,7 +294,7 @@ async fn get_installation_token(
 
 /// Format a bot comment for a status transition triggered by a PR event.
 fn format_transition_comment(
-    trigger: &str,
+    step: GitHubAutomationStep,
     issue_team_key: &str,
     issue_number: i32,
     issue_title: &str,
@@ -292,19 +304,19 @@ fn format_transition_comment(
     let issue_ref = format!("{issue_team_key}-{issue_number}");
     let issue_url = format!("{base_url}/issues/{issue_team_key}-{issue_number}");
 
-    match trigger {
-        "pr_merged" => {
+    match step {
+        GitHubAutomationStep::PrMerged => {
             format!(
                 "[{issue_ref}]({issue_url}): *{issue_title}* — marked as **{target_status_name}**"
             )
         }
-        "pr_opened" => {
+        GitHubAutomationStep::PrOpened => {
             format!(
                 "Linked to [{issue_ref}]({issue_url}): *{issue_title}*\n\
                  Status moved to **{target_status_name}**"
             )
         }
-        _ => {
+        GitHubAutomationStep::PrDraft | GitHubAutomationStep::PrClosed => {
             format!(
                 "[{issue_ref}]({issue_url}): *{issue_title}* — moved to **{target_status_name}**"
             )
@@ -313,6 +325,13 @@ fn format_transition_comment(
 }
 
 // ─── Main Transition Orchestration ─────────────────────────────────────────
+
+/// The PR whose `closed` event is being processed.
+struct Finished<'a> {
+    repo: &'a str,
+    number: &'a str,
+    merged: bool,
+}
 
 /// Everything one webhook event needs while moving issues.
 struct Run<'a> {
@@ -326,15 +345,68 @@ struct Run<'a> {
     ws_manager: Option<&'a trakkt_auth::websocket::WebSocketManager>,
     base_url: &'a str,
     linkback: bool,
-    /// The installation token, fetched on the first comment that needs one.
-    /// `Some(None)` means the fetch failed and is not retried for this event.
-    token: Option<Option<String>>,
+    /// Installation tokens fetched during this event, by installation id. A
+    /// `None` means the fetch failed and is not retried for this event.
+    tokens: std::collections::HashMap<String, Option<String>>,
     /// Set when the connection stopped admitting outbound requests; the rest
     /// of the event still moves issues, it just stops commenting.
     comments_blocked: bool,
 }
 
 impl Run<'_> {
+    /// An installation token, fetched on first use.
+    async fn token_for(&mut self, installation: &GitHubInstallation, repo: &str) -> Option<String> {
+        if !self.tokens.contains_key(&installation.installation_id) {
+            let token = match get_installation_token(
+                self.db,
+                self.github_client,
+                installation,
+                self.encryption_key,
+                repo,
+            )
+            .await
+            {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        installation_id = %installation.installation_id,
+                        "Failed to get an installation token — continuing without GitHub"
+                    );
+                    None
+                }
+            };
+            self.tokens
+                .insert(installation.installation_id.clone(), token);
+        }
+        self.tokens[&installation.installation_id].clone()
+    }
+
+    /// Fire a step for an issue: the team's rule, else the workspace rule, then
+    /// the forward-only and Completed/Cancelled guards.
+    async fn apply_step(
+        &mut self,
+        issue_id: &str,
+        step: GitHubAutomationStep,
+    ) -> trakkt_core::Result<()> {
+        let Some(issue) = trakkt_auth::issue_service::get_issue_by_id(self.db, issue_id).await?
+        else {
+            tracing::warn!(issue_id, "Linked issue not found — skipping transition");
+            return Ok(());
+        };
+        let Some(ResolvedRule::Target(target)) =
+            resolve_rule(self.db, self.workspace_id, &issue.team_id, step).await?
+        else {
+            return Ok(());
+        };
+        let current = parse_category(&issue.status_category)?;
+        let Some(target) = decide(current, target) else {
+            tracing::debug!(issue_id, status = %issue.status_name, step = %step.as_str(), "Leaving the issue alone");
+            return Ok(());
+        };
+        self.move_issue(&issue, target, step).await
+    }
+
     /// Move an issue to a status category and say so on the PR.
     ///
     /// The update is a compare-and-set on the status the decision was made
@@ -343,7 +415,7 @@ impl Run<'_> {
         &mut self,
         issue: &trakkt_types::models::IssueWithDetails,
         target: StatusCategory,
-        label: &str,
+        step: GitHubAutomationStep,
     ) -> trakkt_core::Result<()> {
         let Some(target_status) = trakkt_auth::status_service::get_status_by_category(
             self.db,
@@ -393,12 +465,12 @@ impl Run<'_> {
                 tracing::info!(
                     issue_key = %issue.team_key,
                     issue_number = issue.number,
-                    step = %label,
+                    step = %step.as_str(),
                     target_status = %target_status.name,
                     "Applied automatic status transition"
                 );
             }
-            Err(trakkt_core::Error::Conflict(_)) => {
+            Err(trakkt_core::Error::PreconditionFailed(_)) => {
                 tracing::debug!(
                     issue_id = %issue.issue_id,
                     "Issue status changed while the automation decided — leaving it alone"
@@ -415,7 +487,7 @@ impl Run<'_> {
             }
         }
 
-        self.post_linkback(issue, &target_status.name, label).await
+        self.post_linkback(issue, &target_status.name, step).await
     }
 
     /// Post the bot comment on the PR (best-effort): only for a real change,
@@ -424,35 +496,13 @@ impl Run<'_> {
         &mut self,
         issue: &trakkt_types::models::IssueWithDetails,
         target_status_name: &str,
-        label: &str,
+        step: GitHubAutomationStep,
     ) -> trakkt_core::Result<()> {
         if !self.linkback || self.comments_blocked {
             return Ok(());
         }
-        if self.token.is_none() {
-            self.token = Some(
-                match get_installation_token(
-                    self.db,
-                    self.github_client,
-                    self.installation,
-                    self.encryption_key,
-                    self.repo,
-                )
-                .await
-                {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            installation_id = %self.installation.installation_id,
-                            "Failed to get installation token for bot comments — transitions still apply"
-                        );
-                        None
-                    }
-                },
-            );
-        }
-        let Some(Some(token)) = &self.token else {
+        let (installation, repo) = (self.installation, self.repo);
+        let Some(token) = self.token_for(installation, repo).await else {
             return Ok(());
         };
         let outbound = match schema::admit_outbound(self.db, self.installation, self.repo).await {
@@ -466,7 +516,7 @@ impl Run<'_> {
             }
         };
         let comment_body = format_transition_comment(
-            label,
+            step,
             &issue.team_key,
             issue.number,
             &issue.title,
@@ -475,7 +525,7 @@ impl Run<'_> {
         );
         if let Err(e) = self
             .github_client
-            .create_comment(token, self.repo, self.pr_number as u64, &comment_body)
+            .create_comment(&token, self.repo, self.pr_number as u64, &comment_body)
             .await
         {
             tracing::warn!(
@@ -488,39 +538,111 @@ impl Run<'_> {
         outbound.commit().await
     }
 
+    /// Check an open sibling against GitHub before letting it hold a
+    /// completion back. A webhook can be missed (a suspended connection, a
+    /// dropped delivery), and a stale `open` would block the issue for good.
+    /// If GitHub cannot be asked, the sibling keeps holding.
+    async fn verify_holder(&mut self, holder: &mut PrLink) -> trakkt_core::Result<()> {
+        let repo = holder.link.repo_full_name.clone();
+        let Some(installation) =
+            schema::get_installation_by_id(self.db, &holder.link.installation_id).await?
+        else {
+            return Ok(());
+        };
+        let Ok(number) = holder.link.ref_identifier.parse::<u64>() else {
+            return Ok(());
+        };
+        if !installation.allows_repository(&repo) {
+            return Ok(());
+        }
+        let Some(token) = self.token_for(&installation, &repo).await else {
+            return Ok(());
+        };
+        let Ok(outbound) = schema::admit_outbound(self.db, &installation, &repo).await else {
+            return Ok(());
+        };
+        let fetched = self
+            .github_client
+            .get_pull_request(&token, &repo, number)
+            .await;
+        outbound.commit().await?;
+        let pull = match fetched {
+            Ok(pull) => pull,
+            Err(e) => {
+                tracing::warn!(error = %e, repo = %repo, number, "Could not verify an open PR — it keeps holding");
+                return Ok(());
+            }
+        };
+        let state = pull.link_state();
+        if holder.link.state.as_deref() != Some(state) {
+            schema::update_link_state(
+                self.db,
+                &holder.link.link_id,
+                state,
+                holder.link.title.as_deref(),
+            )
+            .await?;
+            holder.link.state = Some(state.to_string());
+            // Its merge was missed: it is a held-back completion now.
+            if pull.merged == Some(true)
+                && kind_may_fire(holder.kind, GitHubAutomationStep::PrMerged)
+            {
+                schema::set_completion_pending(self.db, &holder.link.link_id, true).await?;
+                holder.link.completion_pending = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Re-evaluate an issue against all of its PRs after one of them finished
     /// or changed what it links.
     ///
     /// While any working-link PR is open nothing completes: the merge status
-    /// applies when the *last* one is done. Then, if a completing PR merged,
-    /// the issue is completed, whichever event lets go of it: a sibling merging,
-    /// being closed without merge, or being edited so it no longer links the
-    /// issue. A PR closed without merging is never a merge on its own; it
-    /// cancels the issue only if it is `abandoned_by` (this event's PR), says
-    /// it closes the issue, and nothing else linked has merged.
+    /// applies when the *last* one is done. A completing PR that merges while
+    /// another is open leaves a `completion_pending` mark on its link, and that
+    /// held-back completion is released, and only then, when the last open PR
+    /// lets go: by merging, being closed without merge, or being edited so it no
+    /// longer works on the issue. Nothing else completes an issue, so an old
+    /// merge is never re-applied after a person reopens the issue, and a PR that
+    /// only mentions the issue never completes it. A PR closed without merging
+    /// is never a merge; it cancels the issue only if it is the one that just
+    /// `finished`, says it closes the issue, and nothing else linked has merged.
     async fn settle_issue(
         &mut self,
         issue_id: &str,
-        abandoned_by: Option<(&str, &str)>,
+        finished: Option<&Finished<'_>>,
     ) -> trakkt_core::Result<()> {
-        let siblings = reachable_pr_links(self.db, issue_id).await?;
+        let mut siblings = reachable_pr_links(self.db, issue_id).await?;
+        for sibling in &mut siblings {
+            let is_this_pr = finished.is_some_and(|f| sibling.is_same_pr(f.repo, f.number));
+            if sibling.is_open() && behavior(sibling.kind).working && !is_this_pr {
+                self.verify_holder(sibling).await?;
+            }
+        }
+        let this = finished.and_then(|f| {
+            siblings
+                .iter()
+                .find(|l| l.is_same_pr(f.repo, f.number))
+                .map(|l| (f, l))
+        });
+        let this_completes = this.is_some_and(|(f, l)| {
+            f.merged && kind_may_fire(l.kind, GitHubAutomationStep::PrMerged)
+        });
         if siblings
             .iter()
             .any(|l| l.is_open() && behavior(l.kind).working)
         {
+            if let (true, Some((_, l))) = (this_completes, this) {
+                schema::set_completion_pending(self.db, &l.link.link_id, true).await?;
+            }
             return Ok(());
         }
-        let step = if siblings
-            .iter()
-            .any(|l| l.is_merged() && behavior(l.kind).completes)
-        {
+        let release = this_completes || siblings.iter().any(|l| l.link.completion_pending);
+        let step = if release {
             GitHubAutomationStep::PrMerged
-        } else if let Some((repo, number)) = abandoned_by
-            && siblings.iter().any(|l| {
-                l.link.repo_full_name == repo
-                    && l.link.ref_identifier == number
-                    && behavior(l.kind).cancels_when_abandoned
-            })
+        } else if let Some((f, l)) = this
+            && !f.merged
+            && kind_may_fire(l.kind, GitHubAutomationStep::PrClosed)
             && !siblings
                 .iter()
                 .any(|l| l.is_merged() && behavior(l.kind).working)
@@ -529,21 +651,11 @@ impl Run<'_> {
         } else {
             return Ok(());
         };
-        let Some(issue) = trakkt_auth::issue_service::get_issue_by_id(self.db, issue_id).await?
-        else {
-            return Ok(());
-        };
-        let Some(ResolvedRule::Target(target)) =
-            resolve_rule(self.db, self.workspace_id, &issue.team_id, step).await?
-        else {
-            return Ok(());
-        };
-        let current = parse_category(&issue.status_category)?;
-        let Some(target) = decide(current, target) else {
-            tracing::debug!(issue_id, status = %issue.status_name, "Leaving the issue alone");
-            return Ok(());
-        };
-        self.move_issue(&issue, target, step.as_str()).await
+        self.apply_step(issue_id, step).await?;
+        if release {
+            schema::clear_completion_pending_for_issue(self.db, issue_id).await?;
+        }
+        Ok(())
     }
 }
 
@@ -599,8 +711,8 @@ pub async fn apply_transition_rules(
     };
 
     // Find all PR links for this PR in this workspace.
-    let links =
-        schema::list_pr_links_by_ref(db, workspace_id, repo, &pr_number.to_string()).await?;
+    let pr_ref = pr_number.to_string();
+    let links = schema::list_pr_links_by_ref(db, workspace_id, repo, &pr_ref).await?;
     if links.is_empty() && released_issue_ids.is_empty() {
         return Ok(());
     }
@@ -616,38 +728,16 @@ pub async fn apply_transition_rules(
         ws_manager,
         base_url,
         linkback: schema::linkback_enabled(db, workspace_id).await?,
-        token: None,
+        tokens: std::collections::HashMap::new(),
         comments_blocked: false,
     };
 
     match event {
         Event::Step(step) => {
             for link in &links {
-                if !kind_may_fire(link.kind()?, step) {
-                    continue;
+                if kind_may_fire(link.kind()?, step) {
+                    run.apply_step(&link.issue_id, step).await?;
                 }
-                let Some(issue) =
-                    trakkt_auth::issue_service::get_issue_by_id(db, &link.issue_id).await?
-                else {
-                    tracing::warn!(issue_id = %link.issue_id, "Linked issue not found — skipping transition");
-                    continue;
-                };
-                let Some(ResolvedRule::Target(target)) =
-                    resolve_rule(db, workspace_id, &issue.team_id, step).await?
-                else {
-                    continue;
-                };
-                let current = parse_category(&issue.status_category)?;
-                let Some(target) = decide(current, target) else {
-                    tracing::debug!(
-                        issue_id = %link.issue_id,
-                        status = %issue.status_name,
-                        step = %step.as_str(),
-                        "Leaving the issue alone"
-                    );
-                    continue;
-                };
-                run.move_issue(&issue, target, step.as_str()).await?;
             }
         }
         Event::Settle => {
@@ -655,11 +745,14 @@ pub async fn apply_transition_rules(
             issue_ids.extend(released_issue_ids.iter().map(String::as_str));
             issue_ids.sort_unstable();
             issue_ids.dedup();
-            let pr_ref = pr_number.to_string();
-            // Closed without merging: this PR is what may cancel the issue.
-            let abandoned = (action == "closed" && !merged).then_some((repo, pr_ref.as_str()));
+            // A `closed` event names the PR that finished; an edit names none.
+            let finished = (action == "closed").then_some(Finished {
+                repo,
+                number: &pr_ref,
+                merged,
+            });
             for issue_id in issue_ids {
-                run.settle_issue(issue_id, abandoned).await?;
+                run.settle_issue(issue_id, finished.as_ref()).await?;
             }
         }
     }
@@ -922,7 +1015,7 @@ mod tests {
     #[test]
     fn format_comment_pr_merged() {
         let comment = format_transition_comment(
-            "pr_merged",
+            PrMerged,
             "TRA",
             17,
             "Fix login timeout",
@@ -938,7 +1031,7 @@ mod tests {
     #[test]
     fn format_comment_pr_opened() {
         let comment = format_transition_comment(
-            "pr_opened",
+            PrOpened,
             "ENG",
             42,
             "Add caching layer",
@@ -954,7 +1047,7 @@ mod tests {
     #[test]
     fn format_comment_pr_closed() {
         let comment = format_transition_comment(
-            "pr_closed",
+            PrClosed,
             "BUG",
             3,
             "Some bug",

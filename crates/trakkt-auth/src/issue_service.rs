@@ -1445,12 +1445,17 @@ pub async fn update_issue_with_admission(
     };
 
     // Compare-and-set for callers that decided from an earlier read.
-    if let (Some(expected), Some((current, _))) = (&updates.expected_status_id, &previous_status)
-        && expected != current
-    {
-        return Err(trakkt_core::Error::Conflict(
-            "issue status changed since it was read".into(),
-        ));
+    if let Some(expected) = &updates.expected_status_id {
+        let Some((current, _)) = &previous_status else {
+            return Err(trakkt_core::Error::BadRequest(
+                "expected_status_id needs a status_id to update".into(),
+            ));
+        };
+        if expected != current {
+            return Err(trakkt_core::Error::PreconditionFailed(
+                "issue status changed since it was read".into(),
+            ));
+        }
     }
 
     // Bind dynamically. Map to rows_affected() inside the closure so both

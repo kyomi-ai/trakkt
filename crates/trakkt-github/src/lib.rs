@@ -75,9 +75,25 @@ pub struct PullRequest {
     pub title: String,
     pub state: String,
     pub merged: Option<bool>,
+    pub draft: Option<bool>,
     pub html_url: String,
     pub head: PullRequestHead,
     pub user: Option<GitHubUser>,
+}
+
+impl PullRequest {
+    /// The value stored in `github_links.state` for what GitHub says right now.
+    pub fn link_state(&self) -> &'static str {
+        if self.merged == Some(true) {
+            "merged"
+        } else if self.state == "closed" {
+            "closed"
+        } else if self.draft == Some(true) {
+            "draft"
+        } else {
+            "open"
+        }
+    }
 }
 
 /// The head (source) branch of a pull request.
