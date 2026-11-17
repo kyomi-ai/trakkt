@@ -341,18 +341,25 @@ struct Env<'a> {
     workspace_id: &'a str,
     encryption_key: &'a [u8; 32],
     ws_manager: Option<&'a trakkt_auth::websocket::WebSocketManager>,
+}
+
+/// The PR an event is about, and the connection it came in on: what a status
+/// move needs to be admitted and what a linkback comment needs to be posted.
+#[derive(Clone, Copy)]
+struct PrContext<'a> {
+    installation: &'a GitHubInstallation,
+    repo: &'a str,
+    pr_number: i64,
     base_url: &'a str,
 }
 
 /// Everything one webhook event needs while moving issues.
 struct Run<'a> {
     env: Env<'a>,
-    /// The connection the event came in on. `None` for a sweep that settles
-    /// held completions after a connection's reach changed: such a run only
-    /// moves issues, it posts nothing on any PR.
-    installation: Option<&'a GitHubInstallation>,
-    repo: &'a str,
-    pr_number: i64,
+    /// The PR the event is about. `None` for a sweep that settles held
+    /// completions after a connection's reach changed: such a run only moves
+    /// issues, it is admitted by no connection and posts nothing on any PR.
+    pr: Option<PrContext<'a>>,
     linkback: bool,
     /// Installation tokens fetched during this event, by installation id. A
     /// `None` means the fetch failed and is not retried for this event.
@@ -363,18 +370,10 @@ struct Run<'a> {
 }
 
 impl<'a> Run<'a> {
-    fn new(
-        env: Env<'a>,
-        installation: Option<&'a GitHubInstallation>,
-        repo: &'a str,
-        pr_number: i64,
-        linkback: bool,
-    ) -> Self {
+    fn new(env: Env<'a>, pr: Option<PrContext<'a>>, linkback: bool) -> Self {
         Self {
             env,
-            installation,
-            repo,
-            pr_number,
+            pr,
             linkback,
             tokens: std::collections::HashMap::new(),
             comments_blocked: false,
@@ -470,15 +469,13 @@ impl<'a> Run<'a> {
         };
 
         #[cfg(test)]
-        if let Some(installation) = self.installation {
-            schema::mutation_pause::wait(&installation.installation_id).await;
+        if let Some(pr) = self.pr {
+            schema::mutation_pause::wait(&pr.installation.installation_id).await;
         }
-        let admission = self
-            .installation
-            .map(|installation| schema::ConnectionAdmission {
-                installation,
-                repository: self.repo,
-            });
+        let admission = self.pr.map(|pr| schema::ConnectionAdmission {
+            installation: pr.installation,
+            repository: pr.repo,
+        });
         match trakkt_auth::issue_service::update_issue_with_admission(
             self.env.db,
             self.env.workspace_id,
@@ -532,17 +529,16 @@ impl<'a> Run<'a> {
         target_status_name: &str,
         step: GitHubAutomationStep,
     ) -> trakkt_core::Result<()> {
-        let Some(installation) = self.installation else {
+        let Some(pr) = self.pr else {
             return Ok(());
         };
         if !self.linkback || self.comments_blocked {
             return Ok(());
         }
-        let repo = self.repo;
-        let Some(token) = self.token_for(installation, repo).await else {
+        let Some(token) = self.token_for(pr.installation, pr.repo).await else {
             return Ok(());
         };
-        let outbound = match schema::admit_outbound(self.env.db, installation, repo).await {
+        let outbound = match schema::admit_outbound(self.env.db, pr.installation, pr.repo).await {
             Ok(outbound) => outbound,
             Err(e) => {
                 // The connection stopped admitting requests. Issues still move
@@ -558,18 +554,18 @@ impl<'a> Run<'a> {
             issue.number,
             &issue.title,
             target_status_name,
-            self.env.base_url,
+            pr.base_url,
         );
         if let Err(e) = self
             .env
             .github_client
-            .create_comment(&token, self.repo, self.pr_number as u64, &comment_body)
+            .create_comment(&token, pr.repo, pr.pr_number as u64, &comment_body)
             .await
         {
             tracing::warn!(
                 error = %e,
-                repo = %self.repo,
-                pr_number = self.pr_number,
+                repo = %pr.repo,
+                pr_number = pr.pr_number,
                 "Failed to post bot comment on PR — transition was applied successfully"
             );
         }
@@ -759,11 +755,13 @@ pub async fn apply_transition_rules(
             workspace_id,
             encryption_key,
             ws_manager,
-            base_url,
         },
-        Some(installation),
-        repo,
-        pr_number,
+        Some(PrContext {
+            installation,
+            repo,
+            pr_number,
+            base_url,
+        }),
         schema::linkback_enabled(db, workspace_id).await?,
     );
 
@@ -798,29 +796,53 @@ pub async fn apply_transition_rules(
 ///
 /// A completion is held back while another PR on the issue is open. When the
 /// connection that PR came in on is unsuspended, reauthorized, loses the
-/// repository, or is disconnected or uninstalled, its merge or close may never
-/// have been delivered, and nothing else will ever wake the issue. Every issue
-/// with a `completion_pending` mark is the retry key: each is settled again, and
-/// `verify_holder` asks GitHub about whichever open PR still holds it. One issue
-/// failing does not stop the rest. A sweep moves issues; it posts no comment.
-pub async fn settle_pending_completions(
+/// repository, or is removed, disconnected or uninstalled, its merge or close
+/// may never have been delivered, and nothing else will ever wake the issue.
+/// Every issue with a `completion_pending` mark is settled again, and so is every
+/// issue with an open working PR on `reached`, the connection that just changed
+/// (its PR may be the issue's only one, so no mark exists). `verify_holder` asks
+/// GitHub about whichever open PR still holds an issue. One issue failing does
+/// not stop the rest. A sweep moves issues; it posts no comment.
+///
+/// Every entry point that changes a connection's reach calls this, best-effort:
+/// a failure is logged and never fails the action that triggered it. Without a
+/// GitHub client or key there is nothing to ask, so it does nothing.
+pub async fn settle_after_reach_change(
     db: &DbPool,
-    github_client: &GitHubClient,
+    github_client: Option<&GitHubClient>,
+    encryption_key: Option<&[u8; 32]>,
     workspace_id: &str,
-    encryption_key: &[u8; 32],
+    reached_installation_id: Option<&str>,
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
-) -> trakkt_core::Result<()> {
+) {
+    let (Some(github_client), Some(encryption_key)) = (github_client, encryption_key) else {
+        return;
+    };
     let env = Env {
         db,
         github_client,
         workspace_id,
         encryption_key,
         ws_manager,
-        // A sweep posts no comment, so no link is ever built from this.
-        base_url: "",
     };
-    let mut run = Run::new(env, None, "", 0, false);
-    for issue_id in schema::list_issue_ids_with_pending_completion(db, workspace_id).await? {
+    if let Err(e) = settle_held_completions(env, reached_installation_id).await {
+        tracing::warn!(error = %e, workspace_id, "Failed to settle held completions after a connection change");
+    }
+}
+
+async fn settle_held_completions(
+    env: Env<'_>,
+    reached_installation_id: Option<&str>,
+) -> trakkt_core::Result<()> {
+    let mut issue_ids =
+        schema::list_issue_ids_with_pending_completion(env.db, env.workspace_id).await?;
+    if let Some(installation_id) = reached_installation_id {
+        issue_ids.extend(schema::list_issue_ids_with_open_links_on(env.db, installation_id).await?);
+    }
+    issue_ids.sort_unstable();
+    issue_ids.dedup();
+    let mut run = Run::new(env, None, false);
+    for issue_id in issue_ids {
         if let Err(e) = run.settle_issue(&issue_id, None).await {
             tracing::warn!(error = %e, issue_id = %issue_id, "Could not settle a held completion");
         }

@@ -620,7 +620,7 @@ pub async fn complete_connection_with_delivery(
     state: &str,
     code: &str,
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
-) -> Result<String> {
+) -> Result<ConnectedInstallation> {
     client.oauth_config()?;
     let current = load_state(db, state, user_id, "oauth").await?;
     let installation_id = current.installation_id.ok_or_else(invalid_state)?;
@@ -639,8 +639,19 @@ pub async fn complete_connection_with_delivery(
             "Reconnect must authorize the same GitHub account".into(),
         ));
     }
-    bind_verified_connection(db, user_id, &current, &verified, ws_manager).await?;
-    Ok(current.workspace_id)
+    let installation_id =
+        bind_verified_connection(db, user_id, &current, &verified, ws_manager).await?;
+    Ok(ConnectedInstallation {
+        workspace_id: current.workspace_id,
+        installation_id,
+    })
+}
+
+/// The connection an authorization just bound, and the workspace it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedInstallation {
+    pub workspace_id: String,
+    pub installation_id: String,
 }
 
 /// Atomic reusable ownership primitive. Must be invoked inside the binding
@@ -703,7 +714,7 @@ async fn bind_verified_connection(
     state: &ConnectionState,
     verified: &VerifiedConnection,
     ws_manager: Option<&trakkt_auth::websocket::WebSocketManager>,
-) -> Result<()> {
+) -> Result<String> {
     let archived_generations: std::collections::BTreeMap<i64, i64> =
         match state.archived_installation_generations.as_deref() {
             Some(encoded) => serde_json::from_str(encoded)
@@ -828,7 +839,7 @@ async fn bind_verified_connection(
                 ));
             }
             tx.commit().await?;
-            return Ok(());
+            return Ok(existing.0.clone());
         }
         let sql = format!(
             "UPDATE github_installations SET github_account_id = $2, account_login = $3, account_type = $4, suspended_at = NULL, disconnected_at = NULL, uninstalled_at = NULL, archived_at = NULL, authorization_verified_at = {}, access_token_encrypted = NULL, token_expires_at = NULL, token_generation = token_generation + 1, repository_scope_pending = {}, repository_selection = $7, target_repos = {repos_cast} WHERE installation_id = $5 AND github_installation_id = $1",
@@ -908,7 +919,8 @@ async fn bind_verified_connection(
             batch.record(&mut tx, "GITHUB_TRANSITION_RULE", &rule_id, &state.workspace_id, SyncAudience::Workspace, SyncActionType::Insert, Some(serde_json::json!({"rule_id": rule_id, "workspace_id": state.workspace_id, "trigger_event": event, "target_status_category": category, "enabled": true}))).await?;
         }
     }
-    batch.commit_and_deliver(tx, ws_manager).await
+    batch.commit_and_deliver(tx, ws_manager).await?;
+    Ok(id)
 }
 
 /// Operator identity reconciliation is separate from user authorization: it
@@ -1597,7 +1609,7 @@ mod tests {
             assert_eq!(before,snapshot(db).await,"confirmation starts OAuth without connection mutation");
             assert!(complete_connection(db,&github.client,&KEY,"admin-a",&state,"valid").await.is_err());
             assert_eq!(before,snapshot(db).await);
-            let destination=complete_connection_with_delivery(db,&github.client,&KEY,"admin-b",&state,"valid",None).await.expect("verified direct installation");
+            let destination=complete_connection_with_delivery(db,&github.client,&KEY,"admin-b",&state,"valid",None).await.expect("verified direct installation").workspace_id;
             assert_eq!(destination,"workspace-b","completion returns state-bound destination");
             let row=crate::schema::get_installation_by_github_id(db,123).await.expect("read direct binding").expect("direct binding exists");
             assert_eq!(row.workspace_id,"workspace-b");

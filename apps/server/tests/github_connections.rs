@@ -1956,26 +1956,83 @@ async fn uninstalling_the_connection_of_the_holding_pr_releases_the_held_merge()
 #[tokio::test]
 async fn the_settings_actions_settle_held_merges_through_the_same_sweep() {
     // Disconnecting from settings and completing a reauthorization both call
-    // `settle_pending_completions`; one issue failing never stops the others.
+    // `settle_after_reach_change`; one issue failing never stops the others.
     let mut f = fixture().await;
     let stub = hold_a_merge_behind_an_organization_pr(&mut f, "settings").await;
     schema::disconnect_installation(&f.state.db, &f.organization.installation_id, WORKSPACE)
         .await
         .expect("disconnect the organization connection");
     let client = f.state.github_client.clone().expect("stub client attached");
-    trakkt_github::transitions::settle_pending_completions(
+    trakkt_github::transitions::settle_after_reach_change(
         &f.state.db,
-        &client,
+        Some(&client),
+        Some(&f.state.encryption_key),
         WORKSPACE,
-        &f.state.encryption_key,
+        Some(&f.organization.installation_id),
         None,
     )
-    .await
-    .expect("sweep after the connection change");
+    .await;
     assert_eq!(status_category(&f, &f.issue).await, "completed");
     assert!(
         pending_marks(&f).await.iter().all(|p| !p),
         "the held merge is settled"
     );
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn a_connection_coming_back_recovers_a_merge_it_missed_even_when_that_was_the_only_pr() {
+    let mut f = fixture().await;
+    let stub = GithubStub::attach(&mut f).await;
+    let only = Pr::new(120, "The only PR", "Fixes KEY-1", "feature/only");
+    deliver(&f, "pull_request", "only-open", only.event(&f.organization, "opened", false)).await;
+    assert_eq!(status_category(&f, &f.issue).await, "started");
+    schema::suspend_installation(&f.state.db, &f.organization.installation_id)
+        .await
+        .expect("suspend the organization connection");
+    // It merged while the connection was away; that delivery was dropped.
+    stub.set_pull("fixture-org/repo", 120, "closed", true);
+    deliver(
+        &f,
+        "installation",
+        "only-unsuspend",
+        json!({"action":"unsuspend","installation":{"id":f.organization.github_installation_id}}),
+    )
+    .await;
+    assert_eq!(
+        status_category(&f, &f.issue).await,
+        "completed",
+        "no mark exists for a lone PR, so the connection's own open PRs are checked"
+    );
+    stub.stop().await;
+}
+
+#[tokio::test]
+async fn removing_a_suspended_connection_releases_the_merge_its_open_pr_was_holding() {
+    let mut f = fixture().await;
+    let stub = hold_a_merge_behind_an_organization_pr(&mut f, "removed").await;
+    schema::suspend_installation(&f.state.db, &f.organization.installation_id)
+        .await
+        .expect("suspend the organization connection");
+    schema::remove_installation(
+        &f.state.db,
+        &f.organization.installation_id,
+        WORKSPACE,
+        "github-owner",
+    )
+    .await
+    .expect("remove the suspended connection card");
+    // The settings action that removed it ends with this call.
+    let client = f.state.github_client.clone().expect("stub client attached");
+    trakkt_github::transitions::settle_after_reach_change(
+        &f.state.db,
+        Some(&client),
+        Some(&f.state.encryption_key),
+        WORKSPACE,
+        Some(&f.organization.installation_id),
+        None,
+    )
+    .await;
+    assert_eq!(status_category(&f, &f.issue).await, "completed");
     stub.stop().await;
 }

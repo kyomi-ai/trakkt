@@ -65,26 +65,23 @@ use super::{AuthenticatedContext, IntoServerFnError, require_workspace_admin};
 // Server functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Release completions held back by PRs on a connection whose reach just
-/// changed (disconnected, reauthorized). Best-effort: a failure is logged and
-/// never fails the settings action that triggered it.
+/// A settings action changed a connection's reach: release the completions held
+/// back by its PRs. See `trakkt_github::transitions::settle_after_reach_change`.
 #[cfg(feature = "ssr")]
-async fn settle_held_completions(ctx: &super::ServerContext, workspace_id: &str) {
-    let (Some(client), Some(key)) = (ctx.github_client.as_deref(), ctx.encryption_key.as_deref())
-    else {
-        return;
-    };
-    if let Err(e) = trakkt_github::transitions::settle_pending_completions(
+async fn settle_held_completions(
+    ctx: &super::ServerContext,
+    workspace_id: &str,
+    installation_id: &str,
+) {
+    trakkt_github::transitions::settle_after_reach_change(
         &ctx.db,
-        client,
+        ctx.github_client.as_deref(),
+        ctx.encryption_key.as_deref(),
         workspace_id,
-        key,
+        Some(installation_id),
         ctx.ws_manager.as_ref(),
     )
-    .await
-    {
-        tracing::warn!(error = %e, "Failed to settle held completions after a connection change");
-    }
+    .await;
 }
 
 /// Query visible GitHub connections for the workspace.
@@ -242,7 +239,7 @@ pub async fn complete_github_authorization(
         .encryption_key
         .as_deref()
         .ok_or_else(|| ServerFnError::new("Credential encryption not configured"))?;
-    let workspace_id = trakkt_github::authorization::complete_connection_with_delivery(
+    let connected = trakkt_github::authorization::complete_connection_with_delivery(
         &ctx.db,
         client,
         key,
@@ -253,8 +250,8 @@ pub async fn complete_github_authorization(
     )
     .await
     .into_sfn()?;
-    settle_held_completions(&ctx, &workspace_id).await;
-    Ok(workspace_id)
+    settle_held_completions(&ctx, &connected.workspace_id, &connected.installation_id).await;
+    Ok(connected.workspace_id)
 }
 
 /// Disconnect one owned connection while retaining its GitHub installation and history.
@@ -270,7 +267,7 @@ pub async fn disconnect_github(connection_id: String) -> Result<(), ServerFnErro
     )
     .await
     .into_sfn()?;
-    settle_held_completions(&ac.ctx, &ac.ws_id).await;
+    settle_held_completions(&ac.ctx, &ac.ws_id, &connection_id).await;
     Ok(())
 }
 
@@ -287,7 +284,9 @@ pub async fn remove_github(connection_id: String) -> Result<(), ServerFnError> {
         ac.ctx.ws_manager.as_ref(),
     )
     .await
-    .into_sfn()
+    .into_sfn()?;
+    settle_held_completions(&ac.ctx, &ac.ws_id, &connection_id).await;
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

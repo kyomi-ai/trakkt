@@ -215,7 +215,7 @@ async fn github_webhook(
             )
             .await;
             if uninstalled.is_ok() {
-                settle_after_reach_change(&state, &inst.workspace_id).await;
+                settle_after_reach_change(&state, inst).await;
             }
             uninstalled
         } else {
@@ -409,30 +409,22 @@ async fn handle_installation_unsuspend(
         account = %inst.account_login,
         "GitHub installation unsuspended"
     );
-    settle_after_reach_change(state, &inst.workspace_id).await;
+    settle_after_reach_change(state, inst).await;
     Ok(())
 }
 
-/// A connection whose reach changed (unsuspended, repositories changed,
-/// uninstalled) can have missed merges and closes. Release the completions held
-/// back by PRs it may no longer be able to report on, so they are not left
-/// waiting for an event that will never come. Best-effort: failures are logged,
-/// never fail the delivery.
-async fn settle_after_reach_change(state: &AppState, workspace_id: &str) {
-    let Some(client) = state.github_client.as_deref() else {
-        return;
-    };
-    if let Err(e) = trakkt_github::transitions::settle_pending_completions(
+/// A connection whose reach changed can have missed merges and closes: release
+/// the completions held back by its PRs. See `settle_after_reach_change`.
+async fn settle_after_reach_change(state: &AppState, installation: &schema::GitHubInstallation) {
+    trakkt_github::transitions::settle_after_reach_change(
         &state.db,
-        client,
-        workspace_id,
-        &state.encryption_key,
+        state.github_client.as_deref(),
+        Some(&state.encryption_key),
+        &installation.workspace_id,
+        Some(&installation.installation_id),
         Some(&state.ws_manager),
     )
-    .await
-    {
-        tracing::warn!(error = %e, workspace_id, "Failed to settle held completions after a connection change");
-    }
+    .await;
 }
 
 /// Handle `installation_repositories.added` and `.removed` — update the
@@ -494,7 +486,7 @@ async fn handle_installation_repos_changed(
         selection = %selection,
         "GitHub installation repositories updated"
     );
-    settle_after_reach_change(state, &inst.workspace_id).await;
+    settle_after_reach_change(state, inst).await;
     Ok(())
 }
 

@@ -456,11 +456,13 @@ issue, not of one event:
   ignored, since it can never report again; a suspended connection or one reconciling
   its scope is temporary and still counts. Merged and closed links are recorded facts
   and count wherever their repository now is. Whenever a connection's reach changes
-  (unsuspended, repositories added or removed, uninstalled, disconnected from
-  settings, reauthorized) every issue with a `completion_pending` mark is settled
-  again (`settle_pending_completions`): the mark is the retry key, `verify_holder`
-  asks GitHub about whichever open PR still holds it, and one issue failing does not
-  stop the rest. A sweep moves issues and posts no PR comment.
+  (unsuspended, repositories added or removed, uninstalled, disconnected or removed from
+  settings, reauthorized) `settle_after_reach_change` settles again every issue with a
+  `completion_pending` mark and every issue with an open working PR on that connection
+  (its PR may be the issue's only one, so no mark exists). `verify_holder` asks GitHub
+  about whichever open PR still holds an issue, and one issue failing does not stop the
+  rest. A sweep moves issues and posts no PR comment. Every entry point that changes
+  a connection's reach calls it.
 - The status write is a compare-and-set on the status the decision read, so a
   person's concurrent change is never overwritten.
 - A finished PR never returns to open except by `reopened` (a merged PR never does);

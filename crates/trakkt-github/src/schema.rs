@@ -1200,6 +1200,24 @@ pub async fn list_issue_ids_with_pending_completion(
     .collect())
 }
 
+/// Issues with an open or draft pull request on one connection.
+pub async fn list_issue_ids_with_open_links_on(
+    db: &DbPool,
+    installation_id: &str,
+) -> trakkt_core::Result<Vec<String>> {
+    Ok(trakkt_core::db_fetch_all!(
+        db,
+        (String,),
+        "SELECT DISTINCT issue_id FROM github_links \
+         WHERE installation_id = $1 AND link_type = $2 AND state IN ('open', 'draft')",
+        installation_id,
+        "pull_request"
+    )?
+    .into_iter()
+    .map(|(issue_id,)| issue_id)
+    .collect())
+}
+
 /// Every pull request link on an issue, whatever its kind or state.
 ///
 /// Used to decide whether a merge is the last one: the merge status applies
