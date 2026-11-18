@@ -726,6 +726,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5913,7 +5919,7 @@ name = "trakkt-api"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "schemars",
  "serde_json",
  "sqlx",
@@ -5941,7 +5947,7 @@ dependencies = [
  "async-stripe-webhook",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bcrypt",
  "chrono",
  "dashmap",
@@ -5975,7 +5981,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "dirs",
@@ -6008,7 +6014,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "dashmap",
  "futures-util",
@@ -6030,7 +6036,7 @@ name = "trakkt-github"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "hex",
  "hmac",
@@ -6063,7 +6069,7 @@ dependencies = [
  "async-stripe-webhook",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "dashmap",
  "futures-util",
@@ -6115,7 +6121,7 @@ dependencies = [
  "any_spawner",
  "arborium-sysroot",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "console_error_panic_hook",
  "futures",
