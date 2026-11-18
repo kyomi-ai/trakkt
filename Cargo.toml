@@ -49,7 +49,7 @@ base64 = "0.22"
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 # Redis
-redis = { version = "0.29", features = ["tokio-rustls-comp", "connection-manager"] }
+redis = { version = "1.8", features = ["tokio-rustls-comp", "connection-manager"] }
 # HTTP client (for external APIs: Anthropic, Stripe, Slack, etc.)
 # Uses native-roots so reqwest trusts both public CAs and our internal CA
 # (distributed via trust-manager's SSL_CERT_FILE bundle).
