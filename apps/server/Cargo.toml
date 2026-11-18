@@ -42,7 +42,7 @@ dashmap = { workspace = true }
 async-trait = { workspace = true }
 rust-embed = "8"
 any_spawner = { version = "0.3", features = ["tokio"] }
-tokio-tungstenite = { version = "0.28", default-features = false }
+tokio-tungstenite = { version = "0.29", default-features = false }
 async-stripe-webhook = { workspace = true }
 async-stripe-shared = { workspace = true }
 async-stripe-types = { workspace = true }
