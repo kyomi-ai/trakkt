@@ -77,7 +77,7 @@ rand = "0.9"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "hostname", "builder", "pool"] }
 
 # TOTP 2FA
-totp-rs = { version = "5", features = ["otpauth", "gen_secret", "qr"] }
+totp-rs = { version = "6", features = ["otpauth", "gen_secret", "qr"] }
 
 # URL encoding (Content-Disposition filenames)
 percent-encoding = "2"
